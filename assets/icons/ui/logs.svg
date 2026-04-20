@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="logs">
+  <!-- Source geometry is aligned with ui-hc/logs.svg (Tabler-based). -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #1EA7FF)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #8A3FFC)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #1EA7FF;
+      --nrr-icon-end: #8A3FFC;
+      --nrr-icon-stroke-width: 2.9;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #59D0FF;
+        --nrr-icon-end: #B18CFF;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #000000;
+        --nrr-icon-end: #000000;
+        --nrr-icon-stroke-width: 3.2;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #ffffff;
+        --nrr-icon-end: #ffffff;
+      }
+    }
+  </style>
+  <title>logs</title>
+  <rect x="8" y="4.95" width="12" height="2.1" rx="1.05" fill="url(#nrr-grad)"/>
+  <rect x="8" y="10.95" width="12" height="2.1" rx="1.05" fill="url(#nrr-grad)"/>
+  <rect x="8" y="16.95" width="12" height="2.1" rx="1.05" fill="url(#nrr-grad)"/>
+  <circle cx="4.7" cy="6" r="1.3" fill="url(#nrr-grad)"/>
+  <circle cx="4.7" cy="12" r="1.3" fill="url(#nrr-grad)"/>
+  <circle cx="4.7" cy="18" r="1.3" fill="url(#nrr-grad)"/>
+</svg>

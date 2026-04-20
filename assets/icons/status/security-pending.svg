@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="security-pending">
+  <!-- Source icon: Tabler Icons (MIT), name: shield-question -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #8A3FFC)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #1EA7FF)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #8A3FFC;
+      --nrr-icon-end: #1EA7FF;
+      --nrr-icon-stroke-width: 2.2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #BA96FF;
+        --nrr-icon-end: #71CCFF;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #000000;
+        --nrr-icon-end: #000000;
+        --nrr-icon-stroke-width: 2.8;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #ffffff;
+        --nrr-icon-end: #ffffff;
+      }
+    }
+  </style>
+  <title>security-pending</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M15.065 19.732c-.95 .557 -1.98 .986 -3.065 1.268a12 12 0 0 1 -8.5 -15a12 12 0 0 0 8.5 -3a12 12 0 0 0 8.5 3c.51 1.738 .617 3.55 .333 5.303" />
+  <path d="M19 22v.01" />
+  <path d="M19 19a2.003 2.003 0 0 0 .914 -3.782a1.98 1.98 0 0 0 -2.414 .483" />
+  </g>
+</svg>
