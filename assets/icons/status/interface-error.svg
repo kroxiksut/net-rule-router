@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="interface-error">
+  <!-- Source icon: Tabler Icons (MIT), name: circle-x -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #FF5E5E)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #FF8A3D)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #FF5E5E;
+      --nrr-icon-end: #FF8A3D;
+      --nrr-icon-stroke-width: 2.2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #FF9A9A;
+        --nrr-icon-end: #FFC06F;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #000000;
+        --nrr-icon-end: #000000;
+        --nrr-icon-stroke-width: 2.8;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #ffffff;
+        --nrr-icon-end: #ffffff;
+      }
+    }
+  </style>
+  <title>interface-error</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0" />
+  <path d="M10 10l4 4m0 -4l-4 4" />
+  </g>
+  
+</svg>

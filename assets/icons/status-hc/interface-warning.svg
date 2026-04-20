@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="interface-warning">
+  <!-- High-contrast accessibility variant derived from Tabler-based icon set -->
+  <title>interface-warning high contrast</title>
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0" />
+  </g>
+  <rect x="11.15" y="8.6" width="1.7" height="5.4" rx="0.85" fill="currentColor"/><circle cx="12" cy="16.7" r="1.25" fill="currentColor"/>
+</svg>

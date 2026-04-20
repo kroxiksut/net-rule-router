@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="add">
+  <!-- High-contrast accessibility variant derived from Tabler-based icon set -->
+  <title>add high contrast</title>
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3c7.2 0 9 1.8 9 9c0 7.2 -1.8 9 -9 9c-7.2 0 -9 -1.8 -9 -9c0 -7.2 1.8 -9 9 -9" />
+  <path d="M15 12h-6" />
+  <path d="M12 9v6" />
+  </g>
+  
+</svg>

@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="route-secondary">
+  <!-- Source icon: Tabler Icons (MIT), name: circle-arrow-right -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #7DDC1F)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #D6E800)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #7DDC1F;
+      --nrr-icon-end: #D6E800;
+      --nrr-icon-stroke-width: 2.2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #A6EA62;
+        --nrr-icon-end: #EEFF8C;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #000000;
+        --nrr-icon-end: #000000;
+        --nrr-icon-stroke-width: 2.8;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #ffffff;
+        --nrr-icon-end: #ffffff;
+      }
+    }
+  </style>
+  <title>route-secondary</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0 -18" />
+  <path d="M16 12l-4 -4" />
+  <path d="M16 12h-8" />
+  <path d="M12 16l4 -4" />
+  </g>
+</svg>
