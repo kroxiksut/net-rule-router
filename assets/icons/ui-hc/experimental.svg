@@ -1,0 +1,13 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="experimental">
+  <!-- High-contrast accessibility variant derived from Tabler flask; completed with liquid details -->
+  <title>experimental high contrast</title>
+  <g stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path fill="none" d="M9 3l6 0" />
+    <path fill="none" d="M10 9l4 0" />
+    <path fill="none" d="M10 3v6l-4 11a.7 .7 0 0 0 .5 1h11a.7 .7 0 0 0 .5 -1l-4 -11v-6" />
+    <path fill="currentColor" fill-opacity="0.2" stroke="none" d="M8 20h8c.25 0 .35 -.14 .27 -.37l-1.14 -3.13h-6.26l-1.14 3.13c-.08 .23 .02 .37 .27 .37z" />
+    <path fill="none" d="M8.8 16.5c.9 .6 1.9 .9 3.2 .9c1.3 0 2.3 -.3 3.2 -.9" />
+    <path fill="none" d="M10 14h.01" />
+    <path fill="none" d="M14 15h.01" />
+  </g>
+</svg>
