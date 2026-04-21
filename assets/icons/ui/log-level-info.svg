@@ -1,0 +1,41 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="log-level-info">
+  <!-- Source icon: Tabler Icons (MIT), name: info-circle -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #0EA5E9)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #2563EB)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #0EA5E9;
+      --nrr-icon-end: #2563EB;
+      --nrr-icon-stroke-width: 2.2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #38BDF8;
+        --nrr-icon-end: #60A5FA;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #0F172A;
+        --nrr-icon-end: #0F172A;
+        --nrr-icon-stroke-width: 2.8;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #FFFFFF;
+        --nrr-icon-end: #FFFFFF;
+      }
+    }
+  </style>
+  <title>log level info</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" />
+    <path d="M12 9h.01" />
+    <path d="M11 12h1v4h1" />
+  </g>
+</svg>

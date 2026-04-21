@@ -1,0 +1,16 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="pro">
+  <!-- High-contrast accessibility variant: PRO badge with rounded filled text -->
+  <title>pro high contrast</title>
+
+  <rect x="3" y="5" width="18" height="14" rx="3.4"
+        fill="currentColor" fill-opacity="0.18"
+        stroke="currentColor" stroke-width="3"/>
+
+  <text x="12" y="15.2"
+        text-anchor="middle"
+        font-family="Arial Rounded MT Bold, Trebuchet MS, Segoe UI, Arial, sans-serif"
+        font-size="7.4"
+        font-weight="800"
+        letter-spacing="0.45"
+        fill="currentColor">PRO</text>
+</svg>

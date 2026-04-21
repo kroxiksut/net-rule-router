@@ -1,0 +1,48 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="experimental">
+  <!-- Source icon: Tabler Icons (MIT), name: flask; completed with liquid details -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #10B981)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #059669)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #10B981;
+      --nrr-icon-end: #059669;
+      --nrr-icon-stroke-width: 2.2;
+      --nrr-icon-fill-opacity: 0.22;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #34D399;
+        --nrr-icon-end: #10B981;
+        --nrr-icon-fill-opacity: 0.28;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #0F172A;
+        --nrr-icon-end: #0F172A;
+        --nrr-icon-stroke-width: 2.8;
+        --nrr-icon-fill-opacity: 0.24;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #FFFFFF;
+        --nrr-icon-end: #FFFFFF;
+      }
+    }
+  </style>
+  <title>experimental</title>
+  <g stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path fill="none" d="M9 3l6 0" />
+    <path fill="none" d="M10 9l4 0" />
+    <path fill="none" d="M10 3v6l-4 11a.7 .7 0 0 0 .5 1h11a.7 .7 0 0 0 .5 -1l-4 -11v-6" />
+    <path fill="url(#nrr-grad)" fill-opacity="var(--nrr-icon-fill-opacity)" stroke="none" d="M8 20h8c.25 0 .35 -.14 .27 -.37l-1.14 -3.13h-6.26l-1.14 3.13c-.08 .23 .02 .37 .27 .37z" />
+    <path fill="none" d="M8.8 16.5c.9 .6 1.9 .9 3.2 .9c1.3 0 2.3 -.3 3.2 -.9" />
+    <path fill="none" d="M10 14h.01" />
+    <path fill="none" d="M14 15h.01" />
+  </g>
+</svg>
