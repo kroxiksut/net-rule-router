@@ -1,0 +1,14 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="icon_log_clear">
+  <!-- High-contrast bold trash icon tuned for small-size visibility -->
+  <title>icon log clear high contrast</title>
+
+  <g stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M4 7h16" />
+    <path d="M9 7v-3a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v3" />
+    <path d="M5.2 7l1 12a2 2 0 0 0 2 2h7.6a2 2 0 0 0 2 -2l1 -12" />
+  </g>
+
+  <rect x="9.2" y="10.4" width="1.35" height="7.2" rx="0.35" fill="currentColor" fill-opacity="0.3" />
+  <rect x="11.35" y="10.4" width="1.35" height="7.2" rx="0.35" fill="currentColor" fill-opacity="0.3" />
+  <rect x="13.5" y="10.4" width="1.35" height="7.2" rx="0.35" fill="currentColor" fill-opacity="0.3" />
+</svg>
