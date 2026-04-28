@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="clear">
+  <!-- UI variant with explicit filled bars -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="#1EA7FF"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
+    </linearGradient>
+  </defs>
+  <title>clear</title>
+  <g fill="url(#nrr-grad)">
+    <rect x="7.2" y="5.1" width="13.0" height="1.8" rx="0.9" />
+    <rect x="5.2" y="11.1" width="13.0" height="1.8" rx="0.9" />
+    <rect x="3.2" y="17.1" width="13.0" height="1.8" rx="0.9" />
+  </g>
+</svg>

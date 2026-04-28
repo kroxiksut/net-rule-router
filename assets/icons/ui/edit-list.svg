@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="edit-list">
+  <!-- UI variant with explicit filled subtitle bars -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="#1EA7FF"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
+    </linearGradient>
+  </defs>
+  <title>edit-list</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.5 19h-5.5a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v3" />
+    <path d="M18.42 15.61a2.1 2.1 0 0 1 2.97 2.97l-3.39 3.42h-3v-3l3.42 -3.39" />
+  </g>
+  <g fill="url(#nrr-grad)">
+    <rect x="6.0" y="11.1" width="6.4" height="1.8" rx="0.9" />
+    <rect x="13.6" y="11.1" width="3.8" height="1.8" rx="0.9" />
+    <rect x="6.0" y="14.2" width="6.8" height="1.8" rx="0.9" />
+  </g>
+</svg>
