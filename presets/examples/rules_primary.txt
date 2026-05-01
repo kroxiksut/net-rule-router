@@ -1,0 +1,24 @@
+# NetRuleRouter preset — version 1
+# name: Example — Primary Route
+# description: Routes general web and streaming traffic via the primary interface
+# author: NetRuleRouter
+# preset_version: 1
+
+--- Zones
+*.ru           # all .ru TLD traffic
+
+--- Domains
+streaming.example.com    # streaming service
+updates.example.org      # vendor update endpoint
+
+--- IP
+# (no IP rules in this example)
+
+--- Windows
+# (no application rules in this example)
+
+--- Linux
+# (reserved — not applied on Windows)
+
+--- MacOS
+# (reserved — not applied on Windows)

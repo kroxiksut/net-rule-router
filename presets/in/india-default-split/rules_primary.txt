@@ -1,0 +1,32 @@
+﻿# NetRuleRouter preset - version 1
+# name: India Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+in
+
+--- Domains
+airtel.in
+*.airtel.in
+jio.com
+*.jio.com
+vi.in
+*.vi.in
+paytm.com
+*.paytm.com
+flipkart.com
+*.flipkart.com
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

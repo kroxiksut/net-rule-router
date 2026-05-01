@@ -1,0 +1,30 @@
+﻿# NetRuleRouter preset - version 1
+# name: Oman Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+om
+
+--- Domains
+omantel.om
+*.omantel.om
+ooredoo.om
+*.ooredoo.om
+gov.om
+*.gov.om
+rop.gov.om
+*.rop.gov.om
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

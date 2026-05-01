@@ -1,0 +1,32 @@
+﻿# NetRuleRouter preset - version 1
+# name: Saudi Arabia Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+sa
+
+--- Domains
+stc.com.sa
+*.stc.com.sa
+mobily.com.sa
+*.mobily.com.sa
+zain.com.sa
+*.zain.com.sa
+absher.sa
+*.absher.sa
+sdaia.gov.sa
+*.sdaia.gov.sa
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

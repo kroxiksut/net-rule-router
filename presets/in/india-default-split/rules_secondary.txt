@@ -1,0 +1,99 @@
+﻿# NetRuleRouter preset - version 1
+# name: India Default Split - Secondary Route
+# description: Foreign social, messaging, developer, and AI services routed to secondary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+# Keep empty to avoid over-broad routing by TLD
+
+--- Domains
+facebook.com
+*.facebook.com
+instagram.com
+*.instagram.com
+threads.com
+*.threads.com
+x.com
+*.x.com
+twitter.com
+*.twitter.com
+youtube.com
+*.youtube.com
+googlevideo.com
+*.googlevideo.com
+tiktok.com
+*.tiktok.com
+discord.com
+*.discord.com
+reddit.com
+*.reddit.com
+linkedin.com
+*.linkedin.com
+telegram.org
+*.telegram.org
+t.me
+*.t.me
+whatsapp.com
+*.whatsapp.com
+signal.org
+*.signal.org
+openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+perplexity.ai
+*.perplexity.ai
+mistral.ai
+*.mistral.ai
+api.mistral.ai
+cohere.com
+*.cohere.com
+cursor.com
+*.cursor.com
+openrouter.ai
+*.openrouter.ai
+midjourney.com
+*.midjourney.com
+jetbrains.com
+*.jetbrains.com
+plugins.jetbrains.com
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+telegram.exe
+WhatsAp*.exe
+discord.exe
+signal.exe
+viber.exe
+line.exe
+skype.exe
+zoom.exe
+slack.exe
+chatgpt.exe
+claude.exe
+poe.exe
+codex.exe
+codex*.exe
+Cursor.exe
+Windsurf.exe
+jetbrains-toolbox.exe
+idea64.exe
+pycharm64.exe
+webstorm64.exe
+clion64.exe
+rider64.exe
+goland64.exe
+fleet.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)
