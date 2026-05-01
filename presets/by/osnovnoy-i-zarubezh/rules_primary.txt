@@ -1,0 +1,85 @@
+﻿# NetRuleRouter preset - version 1
+# name: BY Osnovnoy I Zarubezh - Primary Route
+# description: Belarus/local and regional services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+by
+xn--90ais
+ru
+xn--p1ai
+
+--- Domains
+# Regional services commonly used in Belarus
+vk.com
+*.vk.com
+vk.cc
+*.vk.cc
+vk.me
+*.vk.me
+userapi.com
+*.userapi.com
+vkuser.net
+*.vkuser.net
+vkuseraudio.net
+*.vkuseraudio.net
+
+my.com
+*.my.com
+icq.com
+*.icq.com
+ok.com
+*.ok.com
+
+# Yandex and related infrastructure on global TLDs
+yandex.com
+*.yandex.com
+yandex.net
+*.yandex.net
+yastatic.net
+*.yastatic.net
+yandexcloud.net
+*.yandexcloud.net
+ya.cc
+*.ya.cc
+
+# Belarus and regional ecosystems using global domains
+2gis.com
+*.2gis.com
+avito.com
+*.avito.com
+ozon.com
+*.ozon.com
+
+# Security and utility services on global TLDs
+kaspersky.com
+*.kaspersky.com
+drweb.com
+*.drweb.com
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Direct route preferred for local/regional desktop apps
+YandexDis*.exe
+DiskO*.exe
+Cloud.exe
+mail.ru_cloud*.exe
+
+vk.exe
+vkteams.exe
+vkplay.exe
+gamecenter.exe
+
+icq.exe
+tamtam.exe
+2gis.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)
+

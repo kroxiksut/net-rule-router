@@ -1,0 +1,32 @@
+﻿# NetRuleRouter preset - version 1
+# name: Iran Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+ir
+
+--- Domains
+irancell.ir
+*.irancell.ir
+mci.ir
+*.mci.ir
+snapp.ir
+*.snapp.ir
+digikala.com
+*.digikala.com
+cafebazaar.ir
+*.cafebazaar.ir
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

@@ -1,0 +1,55 @@
+﻿# NetRuleRouter preset - version 1
+# name: AE UAE Default Split - Primary Route
+# description: Local UAE and regional services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+ae
+xn--mgbaam7a8h
+
+--- Domains
+# UAE telecom and government/public services
+etisalat.ae
+*.etisalat.ae
+du.ae
+*.du.ae
+tdra.gov.ae
+*.tdra.gov.ae
+u.ae
+*.u.ae
+gov.ae
+*.gov.ae
+
+# UAE banking and commerce examples
+emiratesnbd.com
+*.emiratesnbd.com
+adcb.com
+*.adcb.com
+fab.ae
+*.fab.ae
+careem.com
+*.careem.com
+noon.com
+*.noon.com
+
+# Regional and local media/services often expected on direct route
+bayut.com
+*.bayut.com
+dubizzle.com
+*.dubizzle.com
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+careem*.exe
+noon*.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)
+

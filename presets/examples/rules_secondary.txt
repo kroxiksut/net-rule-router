@@ -1,0 +1,26 @@
+# NetRuleRouter preset — version 1
+# name: Example — Secondary Route (VPN)
+# description: Routes corporate and sensitive traffic via the secondary (VPN) interface
+# author: NetRuleRouter
+# preset_version: 1
+
+--- Zones
+corp-internal  # internal corporate zone
+
+--- Domains
+corp.example.com           # corporate portal
+*.internal.example.net     # all internal subdomains
+mail.example.com           # corporate mail
+
+--- IP
+203.0.113.7                # corporate gateway IP
+
+--- Windows
+outlook.exe                # corporate mail client
+# powershell.exe           # disabled: only enable for corporate managed devices
+
+--- Linux
+# (reserved — not applied on Windows)
+
+--- MacOS
+# (reserved — not applied on Windows)

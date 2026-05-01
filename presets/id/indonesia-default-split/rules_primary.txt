@@ -1,0 +1,47 @@
+﻿# NetRuleRouter preset - version 1
+# name: ID Indonesia Default Split - Primary Route
+# description: Indonesia/local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+id
+
+--- Domains
+# Indonesia telecom and public ecosystem
+telkomsel.com
+*.telkomsel.com
+indosatooredoo.com
+*.indosatooredoo.com
+xl.co.id
+*.xl.co.id
+smartfren.com
+*.smartfren.com
+kominfo.go.id
+*.kominfo.go.id
+
+# Local digital ecosystem
+go-jek.com
+*.go-jek.com
+gojek.com
+*.gojek.com
+tokopedia.com
+*.tokopedia.com
+bukalapak.com
+*.bukalapak.com
+blibli.com
+*.blibli.com
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+Gojek*.exe
+Tokopedia*.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

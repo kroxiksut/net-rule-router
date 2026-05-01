@@ -1,0 +1,48 @@
+﻿# NetRuleRouter preset - version 1
+# name: EG Egypt Default Split - Primary Route
+# description: Egypt/local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+eg
+
+--- Domains
+# Egypt telecom and public ecosystem
+telecomegypt.com.eg
+*.telecomegypt.com.eg
+te.eg
+*.te.eg
+orange.eg
+*.orange.eg
+etisalat.eg
+*.etisalat.eg
+vodafone.com.eg
+*.vodafone.com.eg
+
+# Government and local services
+gov.eg
+*.gov.eg
+cbe.org.eg
+*.cbe.org.eg
+
+# Regional commerce/services commonly used
+amazon.eg
+*.amazon.eg
+jumia.com.eg
+*.jumia.com.eg
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+vodafone*.exe
+orange*.exe
+etisalat*.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

@@ -1,0 +1,32 @@
+﻿# NetRuleRouter preset - version 1
+# name: Kazakhstan Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+kz
+
+--- Domains
+egov.kz
+*.egov.kz
+kaspi.kz
+*.kaspi.kz
+halykbank.kz
+*.halykbank.kz
+krisha.kz
+*.krisha.kz
+kolesa.kz
+*.kolesa.kz
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

@@ -1,0 +1,30 @@
+﻿# NetRuleRouter preset - version 1
+# name: Kuwait Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+kw
+
+--- Domains
+stc.com.kw
+*.stc.com.kw
+zain.com
+*.zain.com
+ooredoo.com.kw
+*.ooredoo.com.kw
+e.gov.kw
+*.e.gov.kw
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

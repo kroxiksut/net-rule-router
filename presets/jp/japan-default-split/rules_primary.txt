@@ -1,0 +1,32 @@
+﻿# NetRuleRouter preset - version 1
+# name: Japan Default Split - Primary Route
+# description: Local services routed to primary
+# author: NetRuleRouter contributors (AI draft)
+# preset_version: 1
+
+--- Zones
+jp
+
+--- Domains
+docomo.ne.jp
+*.docomo.ne.jp
+softbank.jp
+*.softbank.jp
+au.com
+*.au.com
+rakuten.co.jp
+*.rakuten.co.jp
+yahoo.co.jp
+*.yahoo.co.jp
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Local/region-oriented desktop apps (examples)
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)

@@ -1,0 +1,278 @@
+﻿# NetRuleRouter preset - version 1
+# name: RU Osnovnoy I Zarubezh - Secondary Route
+# description: Foreign social, messaging, AI, and related apps routed to secondary
+# author: NetRuleRouter contributors
+# preset_version: 1
+
+--- Zones
+# Keep empty to avoid over-broad routing by TLD
+
+--- Domains
+# Meta ecosystem
+facebook.com
+*.facebook.com
+fb.com
+*.fb.com
+messenger.com
+*.messenger.com
+instagram.com
+*.instagram.com
+cdninstagram.com
+*.cdninstagram.com
+fbcdn.net
+*.fbcdn.net
+facebook.net
+*.facebook.net
+fbsbx.com
+*.fbsbx.com
+threads.net
+*.threads.net
+threads.com
+*.threads.com
+
+# X (Twitter) ecosystem
+x.com
+*.x.com
+twitter.com
+*.twitter.com
+t.co
+*.t.co
+twimg.com
+*.twimg.com
+xusercontent.com
+*.xusercontent.com
+
+# YouTube ecosystem
+youtube.com
+*.youtube.com
+youtu.be
+googlevideo.com
+*.googlevideo.com
+ytimg.com
+*.ytimg.com
+
+# TikTok ecosystem
+tiktok.com
+*.tiktok.com
+tiktokv.com
+*.tiktokv.com
+musical.ly
+*.musical.ly
+byteoversea.com
+*.byteoversea.com
+ibyteimg.com
+*.ibyteimg.com
+tiktokcdn.com
+*.tiktokcdn.com
+
+# Discord and community platforms
+discord.com
+*.discord.com
+discord.gg
+discordapp.com
+*.discordapp.com
+discord.media
+*.discord.media
+reddit.com
+*.reddit.com
+redd.it
+redditstatic.com
+*.redditstatic.com
+redditmedia.com
+*.redditmedia.com
+
+# Professional and streaming social platforms
+linkedin.com
+*.linkedin.com
+licdn.com
+*.licdn.com
+twitch.tv
+*.twitch.tv
+jtvnw.net
+*.jtvnw.net
+ttvnw.net
+*.ttvnw.net
+pinterest.com
+*.pinterest.com
+pinimg.com
+*.pinimg.com
+snapchat.com
+*.snapchat.com
+sc-cdn.net
+*.sc-cdn.net
+bsky.app
+*.bsky.app
+
+# Foreign messengers and communication tools
+telegram.org
+*.telegram.org
+t.me
+*.t.me
+telegram.me
+*.telegram.me
+whatsapp.com
+*.whatsapp.com
+whatsapp.net
+*.whatsapp.net
+signal.org
+*.signal.org
+signal.me
+*.signal.me
+viber.com
+*.viber.com
+viber.me
+*.viber.me
+line.me
+*.line.me
+line-apps.com
+*.line-apps.com
+wechat.com
+*.wechat.com
+qq.com
+*.qq.com
+skype.com
+*.skype.com
+zoom.us
+*.zoom.us
+slack.com
+*.slack.com
+
+# Foreign AI and developer AI ecosystems
+openai.com
+*.openai.com
+chatgpt.com
+*.chatgpt.com
+z.ai
+*.z.ai
+anthropic.com
+*.anthropic.com
+claude.ai
+*.claude.ai
+perplexity.ai
+*.perplexity.ai
+poe.com
+*.poe.com
+character.ai
+*.character.ai
+mistral.ai
+*.mistral.ai
+chat.mistral.ai
+lechat.mistral.ai
+api.mistral.ai
+huggingface.co
+*.huggingface.co
+replicate.com
+*.replicate.com
+stability.ai
+*.stability.ai
+cohere.com
+*.cohere.com
+cursor.com
+*.cursor.com
+openrouter.ai
+*.openrouter.ai
+midjourney.com
+*.midjourney.com
+runwayml.com
+*.runwayml.com
+leonardo.ai
+*.leonardo.ai
+civitai.com
+*.civitai.com
+x.ai
+*.x.ai
+grok.com
+*.grok.com
+
+# Google and Microsoft AI entry points
+gemini.google.com
+ai.google.dev
+notebooklm.google.com
+aistudio.google.com
+copilot.microsoft.com
+
+# JetBrains ecosystem
+jetbrains.com
+*.jetbrains.com
+jb.gg
+*.jb.gg
+intellij.net
+*.intellij.net
+account.jetbrains.com
+plugins.jetbrains.com
+downloads.marketplace.jetbrains.com
+download.jetbrains.com
+download-cdn.jetbrains.com
+resources.jetbrains.com
+data.services.jetbrains.com
+api.jetbrains.ai
+youtrack.cloud
+*.youtrack.cloud
+teamcity.com
+*.teamcity.com
+jetbrains.space
+*.jetbrains.space
+toolbox.app
+*.toolbox.app
+
+--- IP
+# Intentionally left empty: do not pin DNS resolver IPs in presets
+
+--- Windows
+# Messaging and social apps
+telegram.exe
+WhatsAp*.exe
+discord.exe
+signal.exe
+viber.exe
+line.exe
+skype.exe
+zoom.exe
+slack.exe
+teams.exe
+wechat.exe
+
+# AI desktop wrappers and launchers (common names)
+chatgpt.exe
+claude.exe
+poe.exe
+codex.exe
+codex*.exe
+Cursor.exe
+Windsurf.exe
+
+# JetBrains IDE and tooling apps
+jetbrains-toolbox.exe
+idea.exe
+idea64.exe
+pycharm.exe
+pycharm64.exe
+webstorm.exe
+webstorm64.exe
+phpstorm.exe
+phpstorm64.exe
+clion.exe
+clion64.exe
+rider.exe
+rider64.exe
+datagrip.exe
+datagrip64.exe
+rubymine.exe
+rubymine64.exe
+goland.exe
+goland64.exe
+dataspell.exe
+dataspell64.exe
+aqua.exe
+aqua64.exe
+gateway.exe
+gateway64.exe
+fleet.exe
+mps.exe
+
+--- Linux
+# (reserved - not applied on Windows)
+
+--- MacOS
+# (reserved - not applied on Windows)
+
