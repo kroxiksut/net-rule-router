@@ -1,106 +1,185 @@
+<div align="center">
+
+<img src="assets/icons/app/icon-128.png" alt="NetRuleRouter" width="96" height="96" />
+
 # NetRuleRouter
 
-English is the default project documentation language for AI-facing files.
-The synchronized Russian version of this README is available in `README_RU.md`.
+**Decide which traffic goes through which connection — by domain, IP, or app.**
 
-## Overview
+A Windows-first network policy manager that routes your traffic across the
+interfaces you *already have*: primary internet, a VPN, a second provider, Wi-Fi,
+Ethernet. No tunnel of its own, no cloud, no account.
 
-NetRuleRouter is a Windows-first network policy and traffic routing manager.
+[![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#license)
+![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)
+![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
 
-The product is designed to help a user control how traffic is routed across already existing network interfaces such as:
-- primary internet + VPN
-- provider A + provider B
-- Wi-Fi + Ethernet
-- Wi-Fi + VPN
+[Russian version → README_RU.md](README_RU.md)
 
-NetRuleRouter is not positioned as:
-- a VPN client
-- an anonymity tool
-- a censorship bypass tool
-- a proxy manager
-- a cloud-first service
+</div>
 
-## Product Direction
+---
 
-The current product direction fixed in the repository is:
-- Windows-first
-- local-first
-- predictable rule behavior
-- transparent diagnostics
-- safe rollback
-- tray-based daily control
-- service-based startup behavior
-- strong Free tier with a clear Pro expansion path
+## What it is
 
-## Free Version
-The current Free version is centered around:
-- exactly 2 active routes: `primary` and `secondary`
-- one active configuration at a time
-- rules by application
-- rules by exact FQDN
-- rules by subdomain / suffix
-- rules by individual IP address
-- local SQLite cache for FQDN/IP mapping and explain mode
-- open, text-based presets with YAML as the primary format
-- RU and EN localization as baseline languages
-- Fail-Closed behavior when `secondary` is unavailable
+NetRuleRouter lets you say *"send `*.bank.com` and this one app over my primary
+line, send everything else over the VPN"* — and have that policy enforced
+predictably, locally, with a clear audit trail of every decision.
 
-Recommended rule matching priority:
-1. exact FQDN
-2. subdomain / suffix
-3. exact IP
-4. application
-5. default route
+Typical setups:
 
-## Technology Direction
+- **Primary internet + VPN** — keep latency-sensitive or geo-locked services on the direct line, route the rest through the VPN.
+- **Provider A + Provider B** — split traffic across two uplinks.
+- **Wi-Fi + Ethernet / Wi-Fi + VPN** — pin specific destinations to a specific interface.
 
-The planned implementation direction is:
-- `Rust` for core logic
-- `Qt` for desktop GUI
+## What it is *not*
 
-The intended split of responsibilities is:
-- Rust for rule engine, system integration, configuration, cache, logging, and diagnostics
-- Qt GUI for presentation, user interaction, tray integration, and communication with the Rust core
+It is **not** a VPN client, an anonymity tool, a censorship-bypass tool, a proxy
+manager, or a cloud service. It manages routing across the connections you set up
+yourself — it doesn't create or hide them.
 
-Business logic should stay in Rust wherever practical. The Rust-to-Qt boundary should stay explicit, narrow, and maintainable.
-The product is expected to expose a Windows tray application for everyday control, while the background part starts with Windows as a service.
+## Highlights
 
-## Repository Status
+- 🧭 **Two-route model (Free)** — a `primary` and a `secondary` route, one active config at a time.
+- 🎯 **Three ways to match traffic** — by domain (label + all subdomains), by exact IPv4, or by application (Windows process name).
+- 🔒 **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
+- 🔍 **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
+- 📦 **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
+- 🪟 **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup.
+- ♿ **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
+- 🌐 **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
+- 🛡️ **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.
 
-The repository is currently documentation-first.
+## How routing decisions are made
 
-At this stage it contains:
-- working documentation
-- project structure scaffolding
-- AI context and project rules
+For each destination the engine walks rules from most specific to least specific
+and stops at the first match:
 
-Implementation code, build scripts, and runnable application entry points are not yet present in the repository.
+| # | Rule type | Example | Tier |
+|---|-----------|---------|------|
+| 1 | Exact domain (FQDN) | `api.bank.com` | Free |
+| 2 | Subdomain / suffix | `*.bank.com` | Free |
+| 3 | Zone (TLD / internal suffix) | `.ru`, `.com`, `.intra` | Free (domain zones) |
+| 4 | Exact IPv4 address | `203.0.113.7` | Free |
+| 5 | Application (process name) | `chrome.exe` | Free |
+| 6 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed | — |
 
-## Repository Structure
+Notes:
 
-Repository structure is documented in `STRUCTURE.md` and `STRUCTURE_RU.md`.
+- The **Exact-IP vs Zone** order is configurable (by default a more specific exact IP wins over a zone).
+- A rule may combine an address match **and** an app match — both must hold (logical **AND**).
+- **IPv6, CIDR subnets, IP ranges, ports, and protocols are Pro-edition** features.
+- The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
-## Key Documents
+## Presets
 
-- `AI_CONTEXT.md` and `AI_RULES.md` capture the AI-facing working baseline for the project
-- `ARCHITECTURE.md` captures the current baseline architecture model
-- `SECURITY.md` captures the baseline security model, trust boundaries for policy changes, and update-check expectations
-- `STRUCTURE.md` captures the maintained repository structure baseline
+`presets/` ships open, text-based rule packs you can import as a starting point —
+including country-based "domestic vs. abroad" splits for several regions
+(`ru`, `cn`, `ir`, `tr`, `in`, `id`, `vn`, `kz`, and more). Each pack is two plain
+files, `rules_primary.txt` / `rules_secondary.txt`, with metadata in header comments:
 
-## Dependency and License Policy
+```text
+# NetRuleRouter preset - version 1
+# name: CN Mainland Split - Primary Route
+# preset_version: 1
 
-Code license:
-- `MPL-2.0`
+--- Zones
+cn              # .cn
 
-Important dependency rule:
-- dependencies must remain compatible with future commercial distribution goals
-- `Qt Community` modules and all other dependencies must be checked for commercial-use suitability before they are treated as approved
-- dependencies with unclear licensing must not be treated as approved by default
+--- Domains
+qq.com
+*.qq.com
+alibaba.com
+*.alibaba.com
+```
 
-The license choice is fixed.
-This repository does not yet include the full license text.
+The full format is documented in [`FORMATS.md`](FORMATS.md).
 
-## Documentation Sync
+> The bundled country presets are AI-authored drafts meant as a convenient
+> starting point, not authoritative routing advice — review and adapt them
+> before relying on them.
 
-`README.md` and `README_RU.md` are intended to stay synchronized.
-When one is updated, the other should be updated in the same change set.
+## Build from source
+
+> Windows-first; macOS and Linux are planned once the Windows baseline is stable.
+
+**Prerequisites:** a recent Rust toolchain, a Qt 6 development install, and CMake.
+`scripts/bootstrap.ps1` checks the environment and prepares your `.env`.
+
+```powershell
+# 1. Bootstrap prerequisites and .env
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+
+# 2. Build the launcher + native Qt host
+cargo build -p nrr-launcher -p nrr-qt-host
+
+# 3. Run
+.\target\debug\NetRuleRouter.exe          # main GUI
+.\target\debug\NetRuleRouterTray.exe      # tray
+
+# …or via the helper script
+.\scripts\run.ps1 -Component gui
+.\scripts\run.ps1 -Component tray
+```
+
+The background service (applies and enforces policy on startup) is installed with
+`scripts/install-service.ps1` and removed with `scripts/uninstall-service.ps1`.
+
+Quality gate (fmt + clippy + tests + license/dependency audit):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
+```
+
+## Configuration & data
+
+- **UI preferences** (theme, language, accessibility, route labels, last section…) live in managed local storage and survive updates.
+- **Active config** — one at a time in Free; rules live in the two plain-text preset files.
+- **Caches & state** — local SQLite (`nrr_fqdn_ip_cache.db`, `nrr_service_state.db`); audit and operational logs as NDJSON.
+- Locale files are read at runtime; drop a schema-valid `de.json` into the user locales dir and it appears in the language picker — no new release required.
+
+## Security & privacy
+
+- No mandatory login for core local routing.
+- Telemetry is **off by default**; no hidden background network actions.
+- Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
+- Update checks (Free) are user-initiated, use only official sources, and can never silently install, apply, or change routing behavior.
+
+See [`SECURITY.md`](SECURITY.md) for the full trust model.
+
+## Roadmap
+
+**Free (current):** two-route model, one active config, domain / exact-IP / app
+rules, presets, explain mode, Fail-Closed, RU/EN.
+
+**Pro (planned):** multiple saved profiles and scenario libraries, 2+N adapters,
+richer rule types (IPv6, CIDR, ports, protocols), per-site / per-app routing across
+3+ routes, and automated switching. Pro imports Free configs as a starting point;
+the desktop UI stays a native Qt app in both editions.
+
+## Documentation
+
+| File | What's in it |
+|------|--------------|
+| [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
+| [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
+| [`FORMATS.md`](FORMATS.md) | Preset & rule file format |
+
+## License
+
+NetRuleRouter is licensed under **MPL-2.0**.
+
+It is designed to be usable both as a standalone application and as an embeddable
+first-layer routing component inside other products — contributions and
+integrations are welcome. If your product uses NetRuleRouter, please credit it and
+link back to the project. All runtime dependencies must remain compatible with
+commercial distribution (MIT / Apache-2.0 / BSD / MPL-2.0 / ISC); dependencies with
+unclear licensing are not approved by default.
+
+*(The full license text is not yet bundled in this repository.)*
+
+---
+
+<div align="center">
+<sub><code>README.md</code> and <code>README_RU.md</code> are kept in sync — update both in the same change.</sub>
+</div>
