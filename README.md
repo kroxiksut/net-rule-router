@@ -41,7 +41,7 @@ yourself — it doesn't create or hide them.
 ## Highlights
 
 - 🧭 **Two-route model (Free)** — a `primary` and a `secondary` route, one active config at a time.
-- 🎯 **Three ways to match traffic** — by domain (label + all subdomains), by exact IPv4, or by application (Windows process name).
+- 🎯 **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (Windows process name).
 - 🔒 **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
 - 🔍 **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - 📦 **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
