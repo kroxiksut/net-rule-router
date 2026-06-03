@@ -25,3 +25,64 @@ target
 **/*_ru.md
 !**/README_RU.md
 !**/README_ru.md
+TASKS.md
+
+# AI-facing and internal working docs — kept local, never published
+AI_CONTEXT*
+AI_RULES*
+ARCHITECTURE*
+CLAUDE*
+LESSONS_LEARNED*
+TECHNICAL*
+OLD_TASKS_RU*
+
+# Local environment overrides
+.env
+.env.*
+!.env.example
+.cargo-home/
+.cargo/
+
+# Local user-only runtime data
+configs/local/
+presets/local/
+
+# Book notes — local only, not for the repo
+notes/
+
+# VS Code local settings
+.vscode/
+.history/
+*.code-workspace
+
+# Editor and IDE state
+.idea/
+.vscode/
+.codex/
+.claude/
+*.swp
+*.swo
+*~
+
+# Qt / Qt Creator local files and generated artifacts
+*.pro.user
+*.pro.user.*
+*.pri.user
+*.qbs.user
+CMakeLists.txt.user
+.qmake.stash
+cmake-build-*/
+build-*/
+CMakeCache.txt
+CMakeFiles/
+Makefile.Debug
+Makefile.Release
+object_script.*.Debug
+object_script.*.Release
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qmlc
+*.jsc
+*.qrc.depends
