@@ -1,44 +1,18 @@
-﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="rule-type-ip">
-  <!-- Alternative icon: IP address -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="rule-type-ip">
+  <!-- IP/device chip. Paths only (QtSvg renders gradient strokes reliably on
+       <path> but not on bare <rect>/<circle>); literal stops (QtSvg ignores
+       CSS var()/@media — high-contrast handled by the ui-hc/ variant). -->
   <defs>
     <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
-      <stop offset="0" stop-color="var(--nrr-icon-start, #1EA7FF)"/>
-      <stop offset="1" stop-color="var(--nrr-icon-end, #8A3FFC)"/>
+      <stop offset="0" stop-color="#1EA7FF"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
     </linearGradient>
   </defs>
-  <style>
-    :root {
-      --nrr-icon-start: #1EA7FF;
-      --nrr-icon-end: #8A3FFC;
-      --nrr-icon-stroke-width: 2.2;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --nrr-icon-start: #59D0FF;
-        --nrr-icon-end: #B18CFF;
-      }
-    }
-    @media (prefers-contrast: more) {
-      :root {
-        --nrr-icon-start: #000000;
-        --nrr-icon-end: #000000;
-        --nrr-icon-stroke-width: 2.8;
-      }
-    }
-    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
-      :root {
-        --nrr-icon-start: #ffffff;
-        --nrr-icon-end: #ffffff;
-      }
-    }
-  </style>
-  <title>rule type ip alt</title>
-  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="3" y="6" width="18" height="12" rx="2" />
-    <rect x="6" y="10" width="3" height="4" rx="0.8" />
-    <rect x="10.5" y="10" width="3" height="4" rx="0.8" />
-    <rect x="15" y="10" width="3" height="4" rx="0.8" />
-    <circle cx="9.8" cy="12" r="0.35" />
-    <circle cx="14.3" cy="12" r="0.35" />
+  <title>rule type ip</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 6 h14 a2 2 0 0 1 2 2 v8 a2 2 0 0 1 -2 2 h-14 a2 2 0 0 1 -2 -2 v-8 a2 2 0 0 1 2 -2 z" />
+    <path d="M7.5 10 v4" />
+    <path d="M12 10 v4" />
+    <path d="M16.5 10 v4" />
   </g>
 </svg>
