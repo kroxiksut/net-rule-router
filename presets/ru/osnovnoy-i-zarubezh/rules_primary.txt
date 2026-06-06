@@ -5,9 +5,9 @@
 # preset_version: 1
 
 --- Zones
-ru
-xn--p1ai
-su
+ru          # Российская Федерация (.ru)
+рф          # Российская Федерация (.рф, Punycode xn--p1ai)
+su          # Историческая зона СССР (.su)
 
 --- Domains
 # Russian services on global TLDs

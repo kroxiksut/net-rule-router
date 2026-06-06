@@ -5,7 +5,7 @@
 # preset_version: 1
 
 --- Zones
-jp
+jp              # Japan (.jp)
 
 --- Domains
 docomo.ne.jp

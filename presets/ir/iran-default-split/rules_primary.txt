@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-ir
+ir              # Islamic Republic of Iran (.ir)
+ایران            # Iran (.ایران, Punycode xn--mgba3a4f16a)
 
 --- Domains
 irancell.ir

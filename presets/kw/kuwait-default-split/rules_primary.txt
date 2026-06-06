@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-kw
+kw              # State of Kuwait (.kw)
+الكويت           # Kuwait (.الكويت, Punycode xn--mgbcpq6gpa1a)
 
 --- Domains
 stc.com.kw

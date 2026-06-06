@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-eg
+eg              # Arab Republic of Egypt (.eg)
+مصر             # Egypt (.مصر, Punycode xn--wgbh1c)
 
 --- Domains
 # Egypt telecom and public ecosystem

@@ -5,7 +5,10 @@
 # preset_version: 1
 
 --- Zones
-in
+in              # Republic of India (.in)
+भारत             # India, Hindi (.भारत, Punycode xn--h2brj9c)
+ভারত            # India, Bengali (.ভারত, Punycode xn--45brj9c)
+இந்தியா          # India, Tamil (.இந்தியா, Punycode xn--xkc2dl3a5ee0h)
 
 --- Domains
 airtel.in

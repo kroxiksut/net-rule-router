@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-qa
+qa              # State of Qatar (.qa)
+قطر             # Qatar (.قطر, Punycode xn--wgbl6a)
 
 --- Domains
 ooredoo.qa

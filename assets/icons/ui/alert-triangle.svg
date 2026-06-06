@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="alert-triangle">
+  <!-- Source icon: Tabler Icons (MIT), name: alert-triangle -->
+  <defs>
+    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="var(--nrr-icon-start, #EF4444)"/>
+      <stop offset="1" stop-color="var(--nrr-icon-end, #DC2626)"/>
+    </linearGradient>
+  </defs>
+  <style>
+    :root {
+      --nrr-icon-start: #EF4444;
+      --nrr-icon-end: #DC2626;
+      --nrr-icon-stroke-width: 2.2;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #F87171;
+        --nrr-icon-end: #EF4444;
+      }
+    }
+    @media (prefers-contrast: more) {
+      :root {
+        --nrr-icon-start: #B91C1C;
+        --nrr-icon-end: #B91C1C;
+        --nrr-icon-stroke-width: 2.8;
+      }
+    }
+    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
+      :root {
+        --nrr-icon-start: #FCA5A5;
+        --nrr-icon-end: #FCA5A5;
+      }
+    }
+  </style>
+  <title>alert triangle</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="var(--nrr-icon-stroke-width)" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.24 3.957l-8.422 14.06a1.989 1.989 0 0 0 1.7 2.983h16.845a1.989 1.989 0 0 0 1.7 -2.983l-8.423 -14.06a1.989 1.989 0 0 0 -3.4 0z" />
+    <path d="M12 9v4" />
+    <path d="M12 16h.01" />
+  </g>
+</svg>

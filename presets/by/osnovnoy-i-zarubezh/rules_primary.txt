@@ -5,10 +5,10 @@
 # preset_version: 1
 
 --- Zones
-by
-xn--90ais
-ru
-xn--p1ai
+by              # Республика Беларусь (.by)
+бел             # Беларусь (.бел, Punycode xn--90ais)
+ru              # Российская Федерация (.ru)
+рф              # Российская Федерация (.рф, Punycode xn--p1ai)
 
 --- Domains
 # Regional services commonly used in Belarus

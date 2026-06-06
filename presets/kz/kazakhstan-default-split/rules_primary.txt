@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-kz
+kz              # Republic of Kazakhstan (.kz)
+қаз             # Kazakhstan (.қаз, Punycode xn--80ao21a)
 
 --- Domains
 egov.kz
