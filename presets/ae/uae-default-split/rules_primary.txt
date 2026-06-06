@@ -5,8 +5,8 @@
 # preset_version: 1
 
 --- Zones
-ae
-xn--mgbaam7a8h
+ae                   # ОАЭ / United Arab Emirates (.ae)
+امارات                # ОАЭ (.امارات, Punycode xn--mgbaam7a8h)
 
 --- Domains
 # UAE telecom and government/public services

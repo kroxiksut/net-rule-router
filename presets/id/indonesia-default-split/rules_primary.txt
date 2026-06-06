@@ -5,7 +5,7 @@
 # preset_version: 1
 
 --- Zones
-id
+id              # Republic of Indonesia (.id)
 
 --- Domains
 # Indonesia telecom and public ecosystem

@@ -5,9 +5,9 @@
 # preset_version: 1
 
 --- Zones
-cn
-xn--fiqs8s
-xn--fiqz9s
+cn              # КНР / People's Republic of China (.cn)
+中国             # China simplified (.中国, Punycode xn--fiqs8s)
+中國             # China traditional (.中國, Punycode xn--fiqz9s)
 
 --- Domains
 # Core Chinese ecosystem

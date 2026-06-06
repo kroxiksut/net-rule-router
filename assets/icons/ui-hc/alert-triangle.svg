@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="alert-triangle">
+  <!-- High-contrast accessibility variant derived from Tabler alert-triangle.
+       Danger semantics → kept an explicit saturated red (instead of the usual
+       currentColor) so the revoke-admin warning reads as red on both light and
+       dark high-contrast backgrounds; stroke widened for legibility. -->
+  <title>alert triangle high contrast</title>
+  <g fill="none" stroke="#FF3B30" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.24 3.957l-8.422 14.06a1.989 1.989 0 0 0 1.7 2.983h16.845a1.989 1.989 0 0 0 1.7 -2.983l-8.423 -14.06a1.989 1.989 0 0 0 -3.4 0z" />
+    <path d="M12 9v4" />
+    <path d="M12 16h.01" />
+  </g>
+</svg>

@@ -5,7 +5,7 @@
 # preset_version: 1
 
 --- Zones
-bh
+bh              # Kingdom of Bahrain (.bh)
 
 --- Domains
 batelco.com

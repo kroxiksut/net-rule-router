@@ -5,7 +5,8 @@
 # preset_version: 1
 
 --- Zones
-sa
+sa              # Kingdom of Saudi Arabia (.sa)
+السعودية         # Saudi Arabia (.السعودية, Punycode xn--mgberp4a5d4ar)
 
 --- Domains
 stc.com.sa
