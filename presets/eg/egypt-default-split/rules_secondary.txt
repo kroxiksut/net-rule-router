@@ -129,6 +129,8 @@ anthropic.com
 *.anthropic.com
 claude.ai
 *.claude.ai
+claude.com
+*.claude.com
 perplexity.ai
 *.perplexity.ai
 poe.com

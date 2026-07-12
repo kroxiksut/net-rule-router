@@ -1,99 +1,70 @@
-﻿# NetRuleRouter preset - version 1
-# name: RU Osnovnoy I Zarubezh - Primary Route
-# description: Domestic traffic and Russian services on global TLDs routed to primary
-# author: NetRuleRouter contributors
-# preset_version: 1
-
 --- Zones
-ru          # Российская Федерация (.ru)
-рф          # Российская Федерация (.рф, Punycode xn--p1ai)
-su          # Историческая зона СССР (.su)
+ru  # Российская Федерация (.ru)
+su  # Историческая зона СССР (.su)
+рф  # Российская Федерация (.рф, Punycode xn--p1ai)
 
 --- Domains
-# Russian services on global TLDs
-vk.com
-*.vk.com
-vk.cc
-*.vk.cc
-vk.me
-*.vk.me
-userapi.com
-*.userapi.com
-vkuser.net
-*.vkuser.net
-vkuseraudio.net
-*.vkuseraudio.net
-
-my.com
-*.my.com
-icq.com
-*.icq.com
-
-# Yandex and related infrastructure on global TLDs
-yandex.com
-*.yandex.com
-yandex.net
-*.yandex.net
-yastatic.net
-*.yastatic.net
-yandexcloud.net
-*.yandexcloud.net
-ya.cc
-*.ya.cc
-
-# Russian services with non-RU domains
 2gis.com
-*.2gis.com
 avito.com
-*.avito.com
-ozon.com
-*.ozon.com
-
-# Russian finance and security brands on global TLDs
-sberbank.com
-*.sberbank.com
-qiwi.com
-*.qiwi.com
-webmoney.com
-*.webmoney.com
-kaspersky.com
-*.kaspersky.com
 drweb.com
-*.drweb.com
-
-# Additional domestic ecosystems and media with global TLDs
-litres.com
-*.litres.com
+icq.com
 ivi.com
-*.ivi.com
+kaspersky.com
+litres.com
+my.com
 ok.com
+ozon.com
+qiwi.com
+sberbank.com
+userapi.com
+vk.cc
+vk.com
+vk.me
+vkuser.net
+vkuseraudio.net
+webmoney.com
+ya.cc
+yandex.com
+yandex.net
+yandexcloud.net
+yastatic.net
+*.2gis.com
+*.avito.com
+*.drweb.com
+*.icq.com
+*.ivi.com
+*.kaspersky.com
+*.litres.com
+*.my.com
 *.ok.com
-
---- IP
-# Intentionally left empty: do not pin DNS resolver IPs in presets
+*.ozon.com
+*.qiwi.com
+*.sberbank.com
+*.userapi.com
+*.vk.cc
+*.vk.com
+*.vk.me
+*.vkuser.net
+*.vkuseraudio.net
+*.webmoney.com
+*.ya.cc
+*.yandex.com
+*.yandex.net
+*.yandexcloud.net
+*.yastatic.net
 
 --- Windows
-# Russian desktop apps where direct (non-VPN) route is often preferable
-YandexDis*.exe
-DiskO*.exe
-Cloud.exe
-mail.ru_cloud*.exe
-
-vk.exe
-vkteams.exe
-vkplay.exe
-gamecenter.exe
-
-icq.exe
-tamtam.exe
-
 2gis.exe
-kavfs.exe
+Cloud.exe
+DiskO*.exe
+YandexDis*.exe
 avp.exe
-
---- Linux
-# (reserved - not applied on Windows)
-
---- MacOS
-# (reserved - not applied on Windows)
-
+gamecenter.exe
+hidemy.name VPN 3.0.exe
+icq.exe
+kavfs.exe
+mail.ru_cloud*.exe
+tamtam.exe
+vk.exe
+vkplay.exe
+vkteams.exe
