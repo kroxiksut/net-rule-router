@@ -40,15 +40,15 @@ yourself — it doesn't create or hide them.
 
 ## Highlights
 
-- 🧭 **Two-route model (Free)** — a `primary` and a `secondary` route, one active config at a time.
-- 🎯 **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (Windows process name).
-- 🔒 **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
-- 🔍 **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
-- 📦 **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
-- 🪟 **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup.
-- ♿ **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
-- 🌐 **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
-- 🛡️ **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.
+- **Two-route model (Free)** — a `primary` and a `secondary` route, one active config at a time.
+- **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (Windows process name).
+- **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
+- **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
+- **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
+- **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup.
+- **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
+- **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
+- **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.
 
 ## How routing decisions are made
 
@@ -134,7 +134,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ## Configuration & data
 
 - **UI preferences** (theme, language, accessibility, route labels, last section…) live in managed local storage and survive updates.
-- **Active config** — one at a time in Free; rules live in the two plain-text preset files.
+- **Active config** — one at a time in Free, **per Windows user**: your daily rule edits are your own (no administrator prompt) and apply only to you, while an administrator can set a shared **baseline** that every user falls back to until they customize. "Reset to baseline" drops your changes. Rules live in the two plain-text preset files.
 - **Caches & state** — local SQLite (`nrr_fqdn_ip_cache.db`, `nrr_service_state.db`); audit and operational logs as NDJSON.
 - Locale files are read at runtime; drop a schema-valid `de.json` into the user locales dir and it appears in the language picker — no new release required.
 
@@ -176,7 +176,8 @@ link back to the project. All runtime dependencies must remain compatible with
 commercial distribution (MIT / Apache-2.0 / BSD / MPL-2.0 / ISC); dependencies with
 unclear licensing are not approved by default.
 
-*(The full license text is not yet bundled in this repository.)*
+The full license text is in [`LICENSE`](LICENSE); the application also shows
+it in the License window (Ctrl+Shift+L).
 
 ---
 
