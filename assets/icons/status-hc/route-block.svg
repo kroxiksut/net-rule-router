@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="route-block">
+  <!-- High-contrast accessibility variant derived from Tabler-based icon set (ban) -->
+  <title>route-block high contrast</title>
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3a9 9 0 1 0 0 18a9 9 0 0 0 0 -18" />
+    <path d="M5.7 5.7l12.6 12.6" />
+  </g>
+</svg>
