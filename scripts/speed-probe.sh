@@ -25,12 +25,24 @@
 #   ./scripts/speed-probe.sh --url https://example.com --url https://www.google.com/generate_204
 #   ./scripts/speed-probe.sh --no-default-urls --url https://example.com
 #   ./scripts/speed-probe.sh --adapter "LAN=192.168.0.5" --adapter "VPN=10.88.0.2"
+#   ./scripts/speed-probe.sh -a eth0 -a tun0
+#   ./scripts/speed-probe.sh -a eth0,tun0
+#
+# Default (no -a / --adapter): interfaces are auto-enumerated by walking
+# /sys/class/net, keeping only operstate == "up", dropping "lo", dropping the
+# product's own TUN adapter (name matching "NetRuleRouter" or with an IPv4 in
+# 198.18.0.0/15), and dropping interfaces with no IPv4 address. Loopback
+# (127.*) and link-local (169.254.*) addresses are always skipped regardless
+# of source. Explicit -a selection bypasses the TUN filter.
+#
+# -a <name> bypasses the default filter entirely and probes exactly the
+# named interface(s) (as reported by `ip link`), repeatable or
+# comma-separated, looked up regardless of operstate; an unknown interface
+# name or an interface with no IPv4 address is a hard usage error (exit 2).
 #
 # --adapter entries are "alias=source-ip" (alias is only a display label) or
-# a bare IP (used as its own label). When no --adapter is given, all "up"
-# IPv4 interfaces are auto-enumerated via `ip -o -4 addr show up`. Loopback
-# (127.*) and link-local (169.254.*) addresses are always skipped, whether
-# auto-detected or user-supplied.
+# a bare IP (used as its own label) — a manual escape hatch for source IPs
+# not visible as a named interface. -a and --adapter are mutually exclusive.
 
 set -uo pipefail
 
@@ -39,11 +51,11 @@ MAX_BYTES=$((20 * 1024 * 1024))
 URLS=()
 USE_DEFAULT_URLS=1
 ADAPTER_SPECS=()
+ADAPTER_NAMES=()
 
 DEFAULT_URLS=(
     "https://ya.ru"
     "https://www.google.com/generate_204"
-    "https://www.youtube.com"
     "https://speed.cloudflare.com/__down?bytes=2000000"
 )
 
@@ -61,6 +73,12 @@ Options:
                           probe the built-in default URLs.
   --adapter SPEC         Add "alias=source-ip" or a bare source IP
                           (repeatable). Disables auto-enumeration.
+  -a, --adapter-name NAME
+                          Select an interface by name (as shown by `ip
+                          link`), bypassing the default up/IPv4 filter.
+                          Repeatable, or a single comma-separated list.
+                          Disables auto-enumeration. Mutually exclusive
+                          with --adapter.
   --timeout SECONDS      Per-probe max time in seconds (default: 15).
   --max-bytes N          Abort a probe if the response exceeds N bytes
                           (default: 20971520, i.e. 20 MiB).
@@ -71,6 +89,8 @@ Examples:
   ./scripts/speed-probe.sh --timeout 10
   ./scripts/speed-probe.sh --url https://example.com
   ./scripts/speed-probe.sh --adapter "LAN=192.168.0.5" --adapter "VPN=10.88.0.2"
+  ./scripts/speed-probe.sh -a eth0 -a tun0
+  ./scripts/speed-probe.sh -a eth0,tun0
 EOF
 }
 
@@ -97,6 +117,12 @@ while [ $# -gt 0 ]; do
             ADAPTER_SPECS+=("$2")
             shift 2
             ;;
+        -a|--adapter-name)
+            [ $# -ge 2 ] || { echo "speed-probe.sh: $1 requires an argument" >&2; exit 2; }
+            IFS=',' read -r -a _names <<< "$2"
+            ADAPTER_NAMES+=("${_names[@]}")
+            shift 2
+            ;;
         --timeout)
             [ $# -ge 2 ] || { echo "speed-probe.sh: --timeout requires an argument" >&2; exit 2; }
             TIMEOUT="$2"
@@ -119,6 +145,11 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "${#ADAPTER_NAMES[@]}" -gt 0 ] && [ "${#ADAPTER_SPECS[@]}" -gt 0 ]; then
+    echo "speed-probe.sh: specify only one of -a/--adapter-name or --adapter" >&2
+    exit 2
+fi
+
 if [ "$USE_DEFAULT_URLS" -eq 1 ] || [ "$KEEP_DEFAULT_URLS" -eq 1 ]; then
     URLS=("${DEFAULT_URLS[@]}" "${URLS[@]:-}")
 fi
@@ -140,6 +171,33 @@ is_loopback_or_link_local() {
     esac
 }
 
+is_fake_ip_range() {
+    # 198.18.0.0/15 covers 198.18.x.x and 198.19.x.x
+    case "$1" in
+        198.18.*|198.19.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_tun_adapter() {
+    # Check if interface name matches NetRuleRouter (case-insensitive)
+    case "${1,,}" in
+        *netrulerouter*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_virtual_adapter() {
+    # Check if interface name matches a virtual adapter pattern.
+    # VirtualBox, Docker, bridge, and hypervisor virtual adapters.
+    case "$1" in
+        vboxnet*|docker*|br-*|veth*|virbr*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
 ADAPTER_ALIASES=()
 ADAPTER_IPS=()
 
@@ -159,7 +217,38 @@ add_adapter() {
     ADAPTER_IPS+=("$ip")
 }
 
-if [ "${#ADAPTER_SPECS[@]}" -gt 0 ]; then
+# Resolve one interface name to its IPv4 address(es), bypassing the
+# operstate/loopback/IPv4-presence filter used by auto-enumeration below.
+# Errors out (exit 2) if the interface does not exist or has no IPv4
+# address — this is the explicit "-a" selection path, so a typo or a
+# not-yet-configured interface must fail loudly, not silently drop.
+add_named_adapter() {
+    local name="$1"
+    if [ ! -e "/sys/class/net/$name" ]; then
+        local available
+        available=$(cd /sys/class/net 2>/dev/null && echo * )
+        echo "speed-probe.sh: no such adapter: '$name'. Available adapters: ${available:-<none>}" >&2
+        exit 2
+    fi
+    local addrs
+    addrs=$(ip -o -4 addr show dev "$name" 2>/dev/null | awk '{print $4}')
+    if [ -z "$addrs" ]; then
+        echo "speed-probe.sh: adapter '$name' has no usable IPv4 address" >&2
+        exit 2
+    fi
+    local addr ip_only
+    while read -r addr; do
+        [ -n "$addr" ] || continue
+        ip_only="${addr%%/*}"
+        add_adapter "$name" "$ip_only"
+    done <<< "$addrs"
+}
+
+if [ "${#ADAPTER_NAMES[@]}" -gt 0 ]; then
+    for name in "${ADAPTER_NAMES[@]}"; do
+        add_named_adapter "$name"
+    done
+elif [ "${#ADAPTER_SPECS[@]}" -gt 0 ]; then
     for spec in "${ADAPTER_SPECS[@]}"; do
         if [[ "$spec" == *"="* ]]; then
             add_adapter "${spec%%=*}" "${spec#*=}"
@@ -168,18 +257,33 @@ if [ "${#ADAPTER_SPECS[@]}" -gt 0 ]; then
         fi
     done
 else
-    # Auto-enumerate "up" IPv4 interfaces: iface name is field 2, "inet
-    # a.b.c.d/nn" is fields 3-4 in `ip -o -4 addr show up` output.
-    while read -r _ ifname family addr _; do
-        [ "$family" = "inet" ] || continue
+    # Auto-enumerate: walk /sys/class/net, keep operstate == "up", skip
+    # "lo", skip the TUN adapter, skip virtual adapters, and skip interfaces
+    # with no IPv4 address.
+    for ifpath in /sys/class/net/*; do
+        [ -e "$ifpath" ] || continue
+        ifname=$(basename "$ifpath")
         [ "$ifname" = "lo" ] && continue
+        if is_tun_adapter "$ifname"; then
+            continue
+        fi
+        if is_virtual_adapter "$ifname"; then
+            continue
+        fi
+        operstate=$(cat "$ifpath/operstate" 2>/dev/null || echo "unknown")
+        [ "$operstate" = "up" ] || continue
+        addr=$(ip -o -4 addr show dev "$ifname" 2>/dev/null | awk '{print $4; exit}')
+        [ -n "$addr" ] || continue
         ip_only="${addr%%/*}"
+        if is_fake_ip_range "$ip_only"; then
+            continue
+        fi
         add_adapter "$ifname" "$ip_only"
-    done < <(ip -o -4 addr show up 2>/dev/null)
+    done
 fi
 
 if [ "${#ADAPTER_IPS[@]}" -eq 0 ]; then
-    echo "speed-probe.sh: no usable adapters found (all candidates were loopback/link-local, or none are up with an IPv4 address). Pass --adapter explicitly." >&2
+    echo "speed-probe.sh: no usable adapters found (all candidates were loopback/link-local, or none are up with an IPv4 address). Pass -a/--adapter-name or --adapter explicitly." >&2
     exit 2
 fi
 
