@@ -24,12 +24,27 @@
 #       -Urls "https://example.com","https://www.google.com/generate_204"
 #   powershell -ExecutionPolicy Bypass -File .\scripts\speed-probe.ps1 `
 #       -Adapters "LAN=192.168.0.5","VPN=10.88.0.2"
+#   powershell -ExecutionPolicy Bypass -File .\scripts\speed-probe.ps1 `
+#       -Adapter "Ethernet","OpenVPN TAP"
+#
+# Default (no -Adapter / -Adapters): adapters are auto-enumerated via
+# Get-NetAdapter, keeping only Status -eq 'Up', dropping Bluetooth adapters
+# (InterfaceDescription/Name matching "Bluetooth"), loopback/pseudo
+# adapters (InterfaceDescription/Name matching "Loopback"), the product's
+# own TUN adapter (InterfaceDescription/Name matching "NetRuleRouter" or with
+# an IPv4 in 198.18.0.0/15), and adapters with no IPv4 address. Loopback
+# (127.*) and link-local (169.254.*) addresses are always skipped regardless
+# of source. Explicit -Adapter selection bypasses the TUN filter.
+#
+# -Adapter <name[]> bypasses the default filter entirely and probes exactly
+# the named adapters (Get-NetAdapter Name/InterfaceAlias), looked up
+# regardless of Status or Bluetooth/loopback class; an unknown name or an
+# adapter with no IPv4 address is a hard usage error (exit 2).
 #
 # -Adapters entries are "Alias=SourceIP" (Alias is only a display label) or
-# a bare IP (used as its own label). When -Adapters is omitted, all "Up"
-# adapters carrying a private/global IPv4 address are auto-enumerated via
-# Get-NetIPConfiguration; loopback (127.*) and link-local (169.254.*)
-# addresses are always skipped, whether auto-detected or user-supplied.
+# a bare IP (used as its own label) — a manual escape hatch for source IPs
+# Windows doesn't expose as a named adapter. -Adapter and -Adapters are
+# mutually exclusive.
 
 [CmdletBinding()]
 param(
@@ -37,9 +52,11 @@ param(
     [string[]] $Urls = @(
         'https://ya.ru',
         'https://www.google.com/generate_204',
-        'https://www.youtube.com',
         'https://speed.cloudflare.com/__down?bytes=2000000'
     ),
+
+    [Parameter()]
+    [string[]] $Adapter = @(),
 
     [Parameter()]
     [string[]] $Adapters = @(),
@@ -60,18 +77,96 @@ function Test-LoopbackOrLinkLocal {
     return $false
 }
 
+function Test-BluetoothAdapter {
+    param($NetAdapter)
+    if ($NetAdapter.InterfaceDescription -match 'Bluetooth') { return $true }
+    if ($NetAdapter.Name -match 'Bluetooth') { return $true }
+    return $false
+}
+
+function Test-LoopbackAdapter {
+    param($NetAdapter)
+    if ($NetAdapter.InterfaceDescription -match 'Loopback') { return $true }
+    if ($NetAdapter.Name -match 'Loopback') { return $true }
+    return $false
+}
+
+function Test-TunAdapter {
+    param($NetAdapter)
+    if ($NetAdapter.InterfaceDescription -match 'NetRuleRouter') { return $true }
+    if ($NetAdapter.Name -match 'NetRuleRouter') { return $true }
+    return $false
+}
+
+function Test-VirtualAdapter {
+    param($NetAdapter)
+    # VirtualBox Host-Only adapter
+    if ($NetAdapter.InterfaceDescription -match 'VirtualBox') { return $true }
+    if ($NetAdapter.Name -match 'vboxnet') { return $true }
+    # Hyper-V virtual adapter
+    if ($NetAdapter.InterfaceDescription -match 'Hyper-V') { return $true }
+    if ($NetAdapter.Name -match '^vEthernet') { return $true }
+    # Docker bridge adapter
+    if ($NetAdapter.Name -match '^docker') { return $true }
+    if ($NetAdapter.Name -match '^br-') { return $true }
+    return $false
+}
+
+function Test-FakeIpRange {
+    param([string] $IpAddress)
+    # 198.18.0.0/15 covers 198.18.x.x and 198.19.x.x
+    if ($IpAddress -like '198.18.*') { return $true }
+    if ($IpAddress -like '198.19.*') { return $true }
+    return $false
+}
+
+function Get-AdapterIPv4List {
+    param($NetAdapter)
+    $ips = New-Object System.Collections.Generic.List[string]
+    $ipConfig = Get-NetIPAddress -InterfaceIndex $NetAdapter.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    foreach ($addr in $ipConfig) {
+        $ip = $addr.IPAddress
+        if ([string]::IsNullOrWhiteSpace($ip)) { continue }
+        if (Test-LoopbackOrLinkLocal $ip) { continue }
+        $ips.Add($ip)
+    }
+    return $ips
+}
+
 function Get-AutoAdapters {
     $found = New-Object System.Collections.Generic.List[object]
-    $configs = Get-NetIPConfiguration -ErrorAction SilentlyContinue
-    foreach ($cfg in $configs) {
-        if ($null -eq $cfg.NetAdapter) { continue }
-        if ($cfg.NetAdapter.Status -ne 'Up') { continue }
-        if ($null -eq $cfg.IPv4Address) { continue }
-        foreach ($addr in $cfg.IPv4Address) {
-            $ip = $addr.IPAddress
-            if ([string]::IsNullOrWhiteSpace($ip)) { continue }
-            if (Test-LoopbackOrLinkLocal $ip) { continue }
-            $found.Add([PSCustomObject]@{ Alias = $cfg.NetAdapter.InterfaceAlias; IP = $ip })
+    $netAdapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+    foreach ($na in $netAdapters) {
+        if (Test-BluetoothAdapter $na) { continue }
+        if (Test-LoopbackAdapter $na) { continue }
+        if (Test-TunAdapter $na) { continue }
+        if (Test-VirtualAdapter $na) { continue }
+        foreach ($ip in (Get-AdapterIPv4List $na)) {
+            if (Test-FakeIpRange $ip) { continue }
+            $found.Add([PSCustomObject]@{ Alias = $na.InterfaceAlias; IP = $ip })
+        }
+    }
+    return $found
+}
+
+function Get-NamedAdapters {
+    param([string[]] $Names)
+    $found = New-Object System.Collections.Generic.List[object]
+    $allAdapters = Get-NetAdapter -ErrorAction SilentlyContinue
+    foreach ($name in $Names) {
+        $na = $allAdapters | Where-Object { $_.Name -eq $name -or $_.InterfaceAlias -eq $name } | Select-Object -First 1
+        if ($null -eq $na) {
+            $available = ($allAdapters | ForEach-Object { $_.Name }) -join ', '
+            Write-Error "Adapter not found: '$name'. Available adapters: $available"
+            exit 2
+        }
+        $ips = Get-AdapterIPv4List $na
+        if ($ips.Count -eq 0) {
+            Write-Error "Adapter '$name' has no usable IPv4 address."
+            exit 2
+        }
+        foreach ($ip in $ips) {
+            $found.Add([PSCustomObject]@{ Alias = $na.InterfaceAlias; IP = $ip })
         }
     }
     return $found
@@ -113,7 +208,14 @@ if ($null -eq $curlCmd) {
     exit 2
 }
 
-if ($Adapters.Count -gt 0) {
+if ($Adapter.Count -gt 0 -and $Adapters.Count -gt 0) {
+    Write-Error "Specify only one of -Adapter or -Adapters."
+    exit 2
+}
+
+if ($Adapter.Count -gt 0) {
+    $rawAdapters = Get-NamedAdapters $Adapter
+} elseif ($Adapters.Count -gt 0) {
     $rawAdapters = $Adapters | ForEach-Object { ConvertFrom-AdapterSpec $_ }
 } else {
     $rawAdapters = Get-AutoAdapters
@@ -128,7 +230,7 @@ foreach ($a in $rawAdapters) {
 }
 
 if ($adapterList.Count -eq 0) {
-    Write-Error "No usable adapters found (all candidates were loopback/link-local, or none are Up with an IPv4 address). Pass -Adapters explicitly."
+    Write-Error "No usable adapters found (all candidates were Bluetooth/loopback, or none are Up with an IPv4 address). Pass -Adapter or -Adapters explicitly."
     exit 2
 }
 
