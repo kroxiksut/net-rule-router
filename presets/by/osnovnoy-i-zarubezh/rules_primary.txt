@@ -12,51 +12,35 @@ ru              # Российская Федерация (.ru)
 
 --- Domains
 # Regional services commonly used in Belarus
-vk.com
 *.vk.com
-vk.cc
 *.vk.cc
-vk.me
 *.vk.me
-userapi.com
 *.userapi.com
-vkuser.net
 *.vkuser.net
-vkuseraudio.net
 *.vkuseraudio.net
 
-my.com
 *.my.com
-icq.com
 *.icq.com
-ok.com
 *.ok.com
 
 # Yandex and related infrastructure on global TLDs
-yandex.com
 *.yandex.com
-yandex.net
 *.yandex.net
-yastatic.net
 *.yastatic.net
-yandexcloud.net
 *.yandexcloud.net
-ya.cc
 *.ya.cc
 
 # Belarus and regional ecosystems using global domains
-2gis.com
 *.2gis.com
-avito.com
 *.avito.com
-ozon.com
 *.ozon.com
 
 # Security and utility services on global TLDs
-kaspersky.com
 *.kaspersky.com
-drweb.com
 *.drweb.com
+
+# Google services stay on the main route; the AI hosts are routed separately
+*.google.com
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets

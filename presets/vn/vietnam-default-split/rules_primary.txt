@@ -8,15 +8,11 @@
 vn              # Socialist Republic of Vietnam (.vn)
 
 --- Domains
-viettel.vn
+*.google.com
 *.viettel.vn
-vnpt.com.vn
 *.vnpt.com.vn
-vinaphone.com.vn
 *.vinaphone.com.vn
-fpt.vn
 *.fpt.vn
-tiki.vn
 *.tiki.vn
 
 --- IP

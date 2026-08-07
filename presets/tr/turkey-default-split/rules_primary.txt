@@ -8,15 +8,11 @@
 tr              # Republic of Türkiye (.tr)
 
 --- Domains
-turkiye.gov.tr
+*.google.com
 *.turkiye.gov.tr
-turkcell.com.tr
 *.turkcell.com.tr
-vodafone.com.tr
 *.vodafone.com.tr
-turktelekom.com.tr
 *.turktelekom.com.tr
-hepsiburada.com
 *.hepsiburada.com
 
 --- IP

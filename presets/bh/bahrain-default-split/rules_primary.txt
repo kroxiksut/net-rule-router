@@ -8,13 +8,10 @@
 bh              # Kingdom of Bahrain (.bh)
 
 --- Domains
-batelco.com
 *.batelco.com
-stc.com.bh
+*.google.com
 *.stc.com.bh
-bahrain.bh
 *.bahrain.bh
-e.gov.bh
 *.e.gov.bh
 
 --- IP

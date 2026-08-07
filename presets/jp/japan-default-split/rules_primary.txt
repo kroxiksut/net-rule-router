@@ -8,15 +8,11 @@
 jp              # Japan (.jp)
 
 --- Domains
-docomo.ne.jp
 *.docomo.ne.jp
-softbank.jp
+*.google.com
 *.softbank.jp
-au.com
 *.au.com
-rakuten.co.jp
 *.rakuten.co.jp
-yahoo.co.jp
 *.yahoo.co.jp
 
 --- IP

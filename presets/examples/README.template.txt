@@ -14,7 +14,7 @@ Files:
 - rules_secondary.txt (optional)
 
 Notes:
-- Rules must follow NetRuleRouter Free-edition syntax.
+- Rules must follow NetRuleRouter rules-file syntax.
 - Do not include device-specific values (adapter IDs, local IPs).
 - Keep rules focused; avoid catch-all wildcard rules.
 - README may be in English or the country's language.

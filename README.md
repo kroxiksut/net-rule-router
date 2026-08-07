@@ -31,6 +31,7 @@ Typical setups:
 - **Primary internet + VPN** — keep latency-sensitive or geo-locked services on the direct line, route the rest through the VPN.
 - **Provider A + Provider B** — split traffic across two uplinks.
 - **Wi-Fi + Ethernet / Wi-Fi + VPN** — pin specific destinations to a specific interface.
+- **Any adapter Windows can see** works as the additional route — including USB network gadgets (RNDIS/ECM boards, phone tethering), Bluetooth PAN, or a virtual-machine adapter set aside for development and testing.
 
 ## What it is *not*
 
@@ -40,12 +41,14 @@ yourself — it doesn't create or hide them.
 
 ## Highlights
 
-- **Two-route model (Free)** — a `primary` and a `secondary` route, one active config at a time.
+- **Two-route model** — a `primary` and a `secondary` route, one active config at a time.
 - **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (Windows process name).
+- **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
+- **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
-- **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup.
+- **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
 - **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
 - **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.
@@ -55,21 +58,26 @@ yourself — it doesn't create or hide them.
 For each destination the engine walks rules from most specific to least specific
 and stops at the first match:
 
-| # | Rule type | Example | Tier |
-|---|-----------|---------|------|
-| 1 | Exact domain (FQDN) | `api.bank.com` | Free |
-| 2 | Subdomain / suffix | `*.bank.com` | Free |
-| 3 | Zone (TLD / internal suffix) | `.ru`, `.com`, `.intra` | Free (domain zones) |
-| 4 | Exact IPv4 address | `203.0.113.7` | Free |
-| 5 | Application (process name) | `chrome.exe` | Free |
-| 6 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed | — |
+| # | Rule type | Example |
+|---|-----------|---------|
+| 1 | Exact domain (FQDN) | `api.bank.com` |
+| 2 | Subdomain / suffix | `*.bank.com` |
+| 3 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
+| 4 | Exact IPv4 address | `203.0.113.7` |
+| 5 | Application (process name) | `chrome.exe` |
+| 6 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
 
 Notes:
 
 - The **Exact-IP vs Zone** order is configurable (by default a more specific exact IP wins over a zone).
 - A rule may combine an address match **and** an app match — both must hold (logical **AND**).
-- **IPv6, CIDR subnets, IP ranges, ports, and protocols are Pro-edition** features.
+- **IPv6, CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
+
+> **If you want your favourite blocked sites to keep opening while NetRuleRouter
+> is running, add them to the rules of the additional (secondary) route** —
+> otherwise, with your VPN connected, they may fail to open. **After adding or
+> removing rules, always press Apply: rules take effect only once applied.**
 
 ## Presets
 
@@ -134,28 +142,43 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ## Configuration & data
 
 - **UI preferences** (theme, language, accessibility, route labels, last section…) live in managed local storage and survive updates.
-- **Active config** — one at a time in Free, **per Windows user**: your daily rule edits are your own (no administrator prompt) and apply only to you, while an administrator can set a shared **baseline** that every user falls back to until they customize. "Reset to baseline" drops your changes. Rules live in the two plain-text preset files.
-- **Caches & state** — local SQLite (`nrr_fqdn_ip_cache.db`, `nrr_service_state.db`); audit and operational logs as NDJSON.
+- **Active config** — one at a time, **per Windows user**: your daily rule edits are your own (no administrator prompt) and apply only to you, while an administrator can set a shared **baseline** that every user falls back to until they customize. "Reset to baseline" drops your changes. Rules live in the two plain-text preset files.
+- **Caches & state** — local SQLite (`nrr_fqdn_ip_cache.db`, `nrr_service_state.db`); audit and operational logs as NDJSON. See [`docs/en/cache-and-seeding.md`](docs/en/cache-and-seeding.md) for how the FQDN/IP cache fills up, including opt-in browser-history seeding. These databases are for the app to manage — editing them with third-party tools is unsupported and at your own risk; see [`docs/en/where-files-live.md`](docs/en/where-files-live.md).
 - Locale files are read at runtime; drop a schema-valid `de.json` into the user locales dir and it appears in the language picker — no new release required.
+
+## Administrative console
+
+A terminal console (`nrr-cli`) ships with the app. It installs, starts, stops
+and inspects the background service, and `diag doctor` prints one report you can
+paste into a bug instead of three screenshots. Routing policy stays in the app —
+the console never edits or applies rules and has no machine-readable output, so
+it is a way to keep one machine healthy, not an automation API. See
+[`docs/en/cli.md`](docs/en/cli.md).
 
 ## Security & privacy
 
 - No mandatory login for core local routing.
 - Telemetry is **off by default**; no hidden background network actions.
 - Privileged policy changes go over a local, DACL-protected named-pipe IPC boundary — there is no localhost HTTP control plane for privileged mutations.
-- Update checks (Free) are user-initiated, use only official sources, and can never silently install, apply, or change routing behavior.
+- Update checks are user-initiated, use only official sources, and can never silently install, apply, or change routing behavior.
 
 See [`SECURITY.md`](SECURITY.md) for the full trust model.
 
 ## Roadmap
 
-**Free (current):** two-route model, one active config, domain / exact-IP / app
-rules, presets, explain mode, Fail-Closed, RU/EN.
+**Current:** two-route model, one active config per Windows user over a shared
+administrator baseline, domain / zone / exact-IP / app rules, per-name routing,
+presets, explain mode, Fail-Closed, suggested addresses, diagnostics archive,
+administrative console, RU/EN.
 
-**Pro (planned):** multiple saved profiles and scenario libraries, 2+N adapters,
-richer rule types (IPv6, CIDR, ports, protocols), per-site / per-app routing across
-3+ routes, and automated switching. Pro imports Free configs as a starting point;
-the desktop UI stays a native Qt app in both editions.
+**In progress:** Linux support (the platform-specific pieces sit behind one
+interface per capability, so the shared decision logic is already OS-neutral),
+then macOS.
+
+**Explored for the future:** multiple saved profiles and scenario libraries,
+2+N adapters, richer rule types (IPv6, CIDR, ports, protocols), per-site /
+per-app routing across 3+ routes, and automated switching. The desktop UI
+stays a native Qt app throughout.
 
 ## Documentation
 
@@ -164,6 +187,13 @@ the desktop UI stays a native Qt app in both editions.
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
 | [`FORMATS.md`](FORMATS.md) | Preset & rule file format |
+| [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
+| [`docs/en/blocked-site-browser-errors.md`](docs/en/blocked-site-browser-errors.md) | What a browser error means when a routed site does not open |
+| [`docs/en/cache-and-seeding.md`](docs/en/cache-and-seeding.md) | How the FQDN/IP cache fills up, including opt-in browser-history seeding |
+| [`docs/en/where-files-live.md`](docs/en/where-files-live.md) | Where settings, rules, caches and logs are stored |
+| [`docs/en/diagnostic-archive.md`](docs/en/diagnostic-archive.md) | What goes into a diagnostic archive, and what never does |
+| [`docs/en/recovering-network-access.md`](docs/en/recovering-network-access.md) | Getting the network back if something goes wrong |
+| [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
 
 ## License
 
