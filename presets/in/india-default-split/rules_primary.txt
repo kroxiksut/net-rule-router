@@ -11,15 +11,11 @@ in              # Republic of India (.in)
 இந்தியா          # India, Tamil (.இந்தியா, Punycode xn--xkc2dl3a5ee0h)
 
 --- Domains
-airtel.in
 *.airtel.in
-jio.com
+*.google.com
 *.jio.com
-vi.in
 *.vi.in
-paytm.com
 *.paytm.com
-flipkart.com
 *.flipkart.com
 
 --- IP

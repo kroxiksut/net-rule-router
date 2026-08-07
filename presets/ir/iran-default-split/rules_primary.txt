@@ -9,15 +9,10 @@ ir              # Islamic Republic of Iran (.ir)
 ایران            # Iran (.ایران, Punycode xn--mgba3a4f16a)
 
 --- Domains
-irancell.ir
 *.irancell.ir
-mci.ir
 *.mci.ir
-snapp.ir
 *.snapp.ir
-digikala.com
 *.digikala.com
-cafebazaar.ir
 *.cafebazaar.ir
 
 --- IP

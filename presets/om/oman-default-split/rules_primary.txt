@@ -8,13 +8,10 @@
 om
 
 --- Domains
-omantel.om
+*.google.com
 *.omantel.om
-ooredoo.om
 *.ooredoo.om
-gov.om
 *.gov.om
-rop.gov.om
 *.rop.gov.om
 
 --- IP

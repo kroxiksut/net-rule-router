@@ -74,16 +74,16 @@ Typical metadata header in rules files:
 ## Content guidelines
 
 - One pack = one clear use case.
-- Rules must be valid NetRuleRouter Free-edition syntax.
+- Rules must be valid NetRuleRouter rules-file syntax.
 - Do not include device-specific values (adapter IDs, local IP addresses).
 - Use inline comments (`# comment`) for non-obvious rules.
 - Keep rulesets focused; avoid catch-all wildcard rules.
 
-## Pro-only sections
+## Extended sections
 
-Packs may include Pro-only sections (`--- CIDR`, `--- Ports`, and others).
-Free edition imports such files safely: Pro-only rules are preserved but not
-applied to routing policy.
+Packs may include sections this version does not recognise (`--- CIDR`,
+`--- Ports`, and others). Such files import safely: unrecognised rules are
+preserved but not applied to routing policy.
 
 ## Validation limits
 

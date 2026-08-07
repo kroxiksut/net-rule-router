@@ -20,11 +20,13 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Ignore localized Markdown docs except README variants
+# Ignore localized Markdown docs except README variants and user docs in docs/
 **/*_RU.md
 **/*_ru.md
 !**/README_RU.md
 !**/README_ru.md
+!docs/**/*_RU.md
+!docs/**/*_ru.md
 TASKS.md
 
 # AI-facing and internal working docs — kept local, never published
@@ -35,6 +37,11 @@ CLAUDE*
 LESSONS_LEARNED*
 TECHNICAL*
 OLD_TASKS_RU*
+# Deferred feature-design backlog — local only for now
+FEATURES*
+# Internal design documents: they describe HOW a mechanism works inside, which
+# belongs in notes/, not in the published tree.
+*_DESIGN.md
 
 # Local environment overrides
 .env
@@ -49,6 +56,9 @@ presets/local/
 
 # Book notes — local only, not for the repo
 notes/
+
+# For errors files for coding agents
+errors/
 
 # VS Code local settings
 .vscode/
@@ -86,3 +96,14 @@ ui_*.h
 *.qmlc
 *.jsc
 *.qrc.depends
+
+# One-off maintenance and probing scripts: useful locally, not part of the product.
+scripts/dev/
+__pycache__/
+*.pyc
+
+# Conflict copies left by the file-sync client next to the original.
+# scripts/clean-sync-duplicates.* deletes them; this keeps one from being committed.
+* (2).*
+* (3).*
+* (4).*

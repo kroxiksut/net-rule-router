@@ -9,15 +9,11 @@ sa              # Kingdom of Saudi Arabia (.sa)
 السعودية         # Saudi Arabia (.السعودية, Punycode xn--mgberp4a5d4ar)
 
 --- Domains
-stc.com.sa
+*.google.com
 *.stc.com.sa
-mobily.com.sa
 *.mobily.com.sa
-zain.com.sa
 *.zain.com.sa
-absher.sa
 *.absher.sa
-sdaia.gov.sa
 *.sdaia.gov.sa
 
 --- IP

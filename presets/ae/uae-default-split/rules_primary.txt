@@ -10,33 +10,22 @@ ae                   # ОАЭ / United Arab Emirates (.ae)
 
 --- Domains
 # UAE telecom and government/public services
-etisalat.ae
 *.etisalat.ae
-du.ae
 *.du.ae
-tdra.gov.ae
+*.google.com
 *.tdra.gov.ae
-u.ae
 *.u.ae
-gov.ae
 *.gov.ae
 
 # UAE banking and commerce examples
-emiratesnbd.com
 *.emiratesnbd.com
-adcb.com
 *.adcb.com
-fab.ae
 *.fab.ae
-careem.com
 *.careem.com
-noon.com
 *.noon.com
 
 # Regional and local media/services often expected on direct route
-bayut.com
 *.bayut.com
-dubizzle.com
 *.dubizzle.com
 
 --- IP

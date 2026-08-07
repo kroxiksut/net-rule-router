@@ -11,57 +11,36 @@ cn              # КНР / People's Republic of China (.cn)
 
 --- Domains
 # Core Chinese ecosystem
-qq.com
 *.qq.com
-wechat.com
 *.wechat.com
-weixin.qq.com
 *.weixin.qq.com
-qpic.cn
 *.qpic.cn
 
 # Tencent products
-tencent.com
 *.tencent.com
-wegame.com
 *.wegame.com
 
 # Alibaba ecosystem
-alibaba.com
 *.alibaba.com
-taobao.com
 *.taobao.com
-tmall.com
 *.tmall.com
-alipay.com
 *.alipay.com
-aliexpress.com
 *.aliexpress.com
 
 # Baidu ecosystem
-baidu.com
 *.baidu.com
-bdimg.com
 *.bdimg.com
 
 # ByteDance / Douyin ecosystem
-douyin.com
 *.douyin.com
-ixigua.com
 *.ixigua.com
-bytedance.com
 *.bytedance.com
 
 # Other major domestic platforms
-bilibili.com
 *.bilibili.com
-bilibili.tv
 *.bilibili.tv
-jd.com
 *.jd.com
-xiaomi.com
 *.xiaomi.com
-huawei.com
 *.huawei.com
 
 --- IP

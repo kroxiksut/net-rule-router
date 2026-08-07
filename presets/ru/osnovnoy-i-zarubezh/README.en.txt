@@ -7,7 +7,8 @@ Tested on: Windows format validation baseline
 Summary:
 This pack is a practical baseline for RU traffic split.
 - Primary route: RU zones and major domestic services on global TLDs.
-- Secondary route: foreign social networks, messengers, AI platforms, and related apps.
+- Secondary route: foreign social networks, messengers, AI platforms, torrent
+  trackers, and related apps.
 
 Important notes:
 - Review and adapt to your own risk profile and provider behavior.

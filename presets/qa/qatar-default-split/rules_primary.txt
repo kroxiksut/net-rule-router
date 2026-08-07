@@ -9,13 +9,10 @@ qa              # State of Qatar (.qa)
 قطر             # Qatar (.قطر, Punycode xn--wgbl6a)
 
 --- Domains
-ooredoo.qa
+*.google.com
 *.ooredoo.qa
-vodafone.qa
 *.vodafone.qa
-hukoomi.gov.qa
 *.hukoomi.gov.qa
-qnb.com
 *.qnb.com
 
 --- IP

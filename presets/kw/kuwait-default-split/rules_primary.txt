@@ -9,13 +9,10 @@ kw              # State of Kuwait (.kw)
 الكويت           # Kuwait (.الكويت, Punycode xn--mgbcpq6gpa1a)
 
 --- Domains
-stc.com.kw
+*.google.com
 *.stc.com.kw
-zain.com
 *.zain.com
-ooredoo.com.kw
 *.ooredoo.com.kw
-e.gov.kw
 *.e.gov.kw
 
 --- IP

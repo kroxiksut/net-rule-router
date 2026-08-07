@@ -9,15 +9,11 @@ kz              # Republic of Kazakhstan (.kz)
 қаз             # Kazakhstan (.қаз, Punycode xn--80ao21a)
 
 --- Domains
-egov.kz
 *.egov.kz
-kaspi.kz
+*.google.com
 *.kaspi.kz
-halykbank.kz
 *.halykbank.kz
-krisha.kz
 *.krisha.kz
-kolesa.kz
 *.kolesa.kz
 
 --- IP

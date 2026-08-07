@@ -9,28 +9,21 @@ id              # Republic of Indonesia (.id)
 
 --- Domains
 # Indonesia telecom and public ecosystem
-telkomsel.com
 *.telkomsel.com
-indosatooredoo.com
 *.indosatooredoo.com
-xl.co.id
 *.xl.co.id
-smartfren.com
 *.smartfren.com
-kominfo.go.id
 *.kominfo.go.id
 
 # Local digital ecosystem
-go-jek.com
 *.go-jek.com
-gojek.com
 *.gojek.com
-tokopedia.com
 *.tokopedia.com
-bukalapak.com
 *.bukalapak.com
-blibli.com
 *.blibli.com
+
+# Google services stay on the main route; the AI hosts are routed separately
+*.google.com
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
