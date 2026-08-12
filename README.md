@@ -101,7 +101,7 @@ alibaba.com
 *.alibaba.com
 ```
 
-The full format is documented in [`FORMATS.md`](FORMATS.md).
+The full format is documented in [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md).
 
 > The bundled country presets are AI-authored drafts meant as a convenient
 > starting point, not authoritative routing advice — review and adapt them
@@ -186,8 +186,9 @@ stays a native Qt app throughout.
 |------|--------------|
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
-| [`FORMATS.md`](FORMATS.md) | Preset & rule file format |
+| [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md) | Preset & rule file format |
 | [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
+| [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md) | Who sees what once a site is routed — and what routing deliberately leaves alone |
 | [`docs/en/blocked-site-browser-errors.md`](docs/en/blocked-site-browser-errors.md) | What a browser error means when a routed site does not open |
 | [`docs/en/cache-and-seeding.md`](docs/en/cache-and-seeding.md) | How the FQDN/IP cache fills up, including opt-in browser-history seeding |
 | [`docs/en/where-files-live.md`](docs/en/where-files-live.md) | Where settings, rules, caches and logs are stored |
