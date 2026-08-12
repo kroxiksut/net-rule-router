@@ -8,6 +8,13 @@ jobs:
   baseline:
     runs-on: windows-latest
 
+    # No Qt on the runner, and every step that touches cargo builds the Qt
+    # host's build script — bootstrap runs `cargo check --workspace` before the
+    # quality gate is reached. Job scope, not step scope: setting it on one step
+    # only moves the failure to whichever step runs first.
+    env:
+      NRR_SKIP_QT_HOST: "1"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,9 +39,7 @@ jobs:
 
       - name: Run quality baseline
         shell: pwsh
-        # No Qt on the runner: the Rust gate (fmt, clippy, tests, cargo-deny)
-        # runs, the C++ Qt host is skipped. Building it here would need a full
-        # Qt install per run.
-        env:
-          NRR_SKIP_QT_HOST: "1"
+        # The Rust gate (fmt, clippy, tests, cargo-deny) runs; the C++ Qt host
+        # is skipped by the job-level switch above. Building it here would need
+        # a full Qt install per run.
         run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
