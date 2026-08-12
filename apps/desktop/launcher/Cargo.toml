@@ -1,0 +1,100 @@
+[package]
+name = "nrr-launcher"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# User-facing entry-points produced by this crate.
+[[bin]]
+name = "NetRuleRouter"
+path = "src/gui_main.rs"
+
+[[bin]]
+name = "NetRuleRouterTray"
+path = "src/tray_main.rs"
+
+[lib]
+name = "nrr_launcher"
+path = "src/lib.rs"
+
+[dependencies]
+nrr-application = { path = "../../../core/application" }
+nrr-ui-support = { path = "../../../core/ui-support" }
+nrr-mock-backend = { path = "../../../core/mock-backend" }
+nrr-shared = { path = "../../../shared/contracts" }
+nrr-desktop-gui = { path = "../gui" }
+nrr-desktop-tray = { path = "../tray" }
+nrr-qt-host = { path = "../qt-host" }
+# Block 16.8.2 — legacy-preferences migration flow uses the IpcClient
+# trait to send `MigrationStatusGet` / `RoutePolicyUpdate` /
+# `MigrationMarkComplete` to the running service. The migration helper
+# is generic over `IpcClient`, so this dep is only needed for the
+# trait + the canonical wire `IpcClientError` types; the production
+# wiring of `NamedPipeIpcClient` lands in 16.11 alongside the
+# BackendFacadeHandle switch.
+nrr-ipc-client = { path = "../../../core/ipc-client" }
+# Block 16.QoL+0 — GUI-only sidecar SQLite for rule comments,
+# foreign-OS passthrough sections, and pending-apply state. The
+# launcher owns the singleton handle and dispatches `sidecar.*`
+# RPC operations locally (they don't cross the IPC boundary to the
+# service — see `sidecar_handlers.rs`).
+nrr-storage-sidecar = { path = "../../../core/storage-sidecar" }
+# Block 16.QoL+ — session elevation broker ("one UAC per session"). The
+# launcher dispatches privileged mutations that the service rejects with
+# `Forbidden` through the elevated broker (one UAC, reused all session),
+# and the launcher binary doubles as the broker process when started with
+# `--nrr-elevated-broker`. All Win32/unsafe lives in this crate so the
+# launcher stays unsafe-free.
+nrr-broker = { path = "../broker" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# Block 16.QoL+5 — local canonical-rules-hash RPC computes SHA-256
+# of `nrr_shared::rules_json::to_canonical_string` output so the GUI
+# can drift-compare against the service's wire `content_hash`
+# without dragging a crypto dep through every consumer of the
+# contracts crate (see `shared/contracts/src/rules_json.rs` rationale).
+sha2 = "0.10"
+# Block 16.QoL+1 Phase 2 — typed error envelope for preset.* RPC ops.
+# Kept narrow to the launcher's local handlers; the parser itself in
+# `nrr-shared::preset_parser` is total and doesn't surface errors.
+thiserror = "1"
+# Block 16.HW-0717 (П1) — archive localization: copy the service-built
+# diagnostic zip into the user's %TEMP%\NetRuleRouter and append the
+# GUI-side launcher logs into the copy. Same major as nrr-diagnostics.
+zip = "2"
+# Local wall-clock timestamps for the zip entries `archive_localize` appends
+# (launcher logs, service log tail) — same rationale and version band as
+# `nrr-diagnostics`' own zip-entry stamping. `time::now_local` is unsound in
+# a multithreaded process, so this is chrono-only.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Block 16.HW-0717 (П2) — once-a-day anonymous GET of the public GitHub
+# latest-release endpoint (background thread, 5 s timeout, cache-gated).
+# The only HTTP client in the workspace; keep it launcher-only.
+ureq = { version = "2", features = ["json"] }
+# Block 16.HW-0717 (П4) — the VpnCandidate DTO for the local
+# `local.vpn.discover` handler (neutral type; the Windows mechanism is a
+# Windows-only dep below).
+nrr-platform-api = { path = "../../../core/platform/api" }
+
+# Block 16.HW-0717 (П4) — Windows VPN-client discovery mechanism, used by the
+# non-elevated onboarding scan (processes + Uninstall registry). Windows-only.
+[target.'cfg(windows)'.dependencies]
+nrr-platform-windows = { path = "../../../core/platform/windows" }
+
+# The Unix mechanism behind `PathRegistrationPort` (a line in the user's shell
+# start-up file), used by the Settings action that puts the administrative
+# console on PATH. Selected in `console_path.rs` where Windows selects the
+# per-user environment store above.
+[target.'cfg(unix)'.dependencies]
+nrr-platform-linux = { path = "../../../core/platform/linux" }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

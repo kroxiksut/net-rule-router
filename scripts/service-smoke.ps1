@@ -1,18 +1,18 @@
-# Block 14.2 manual smoke checklist for the Windows service scaffold.
+# Manual smoke checklist for the Windows service scaffold.
 #
 # Run as Administrator. The script walks the canonical SCM lifecycle
 # (install → query → start → query → stop → query → uninstall → query)
 # so a regression in the service entrypoint is visible in one command.
 #
-# What this checks (block 14.2 acceptance criteria):
+# What this checks:
 #   - install/uninstall flow returns success
 #   - `sc query` reports STARTED/RUNNING after start
 #   - `sc query` reports STOPPED after stop
 #   - service binary path resolves correctly
 #   - executable boots without GUI dependencies (no Qt host spawned)
 #
-# Out of scope here: bootstrap pipeline (14.3), policy load (14.4),
-# IPC server (14.5), apply attempts (14.9), Event Log writes (14.2.x).
+# Out of scope here: bootstrap pipeline, policy load, IPC server, apply
+# attempts, Event Log writes.
 
 [CmdletBinding()]
 param(

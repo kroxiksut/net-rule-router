@@ -1,0 +1,26 @@
+[package]
+name = "nrr-desktop-gui"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Library-only after 13.R-GUI.4. The user-facing `NetRuleRouter.exe` is now
+# produced by `nrr-launcher`; this crate contributes the QML context emitter
+# (`ui_surface::write_qt_context_file_at`), launch-request parser, prefs
+# round-trip, and the section-rendering helpers consumed by the launcher.
+[lib]
+name = "nrr_desktop_gui"
+path = "src/lib.rs"
+
+[dependencies]
+nrr-application = { path = "../../../core/application" }
+nrr-ui-support = { path = "../../../core/ui-support" }
+nrr-mock-backend = { path = "../../../core/mock-backend" }
+nrr-shared = { path = "../../../shared/contracts" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true

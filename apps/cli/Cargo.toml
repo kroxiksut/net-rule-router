@@ -1,0 +1,38 @@
+[package]
+name = "nrr-cli"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# The administrative console: service lifecycle, diagnostics and network
+# recovery. Policy management (rules, apply, switching) is not here and is not
+# coming here — that surface belongs to the GUI.
+#
+# This crate holds no OS-specific logic. Every privileged action goes through a
+# platform port, so the only per-OS code is the one line that picks an
+# implementation.
+[[bin]]
+name = "nrr-cli"
+path = "src/main.rs"
+
+[dependencies]
+# The service-control port this console drives.
+nrr-platform-api = { path = "../../core/platform/api" }
+# Product identity: the console prints and derives names, never types them.
+nrr-shared = { path = "../../shared/contracts" }
+
+[target.'cfg(windows)'.dependencies]
+# The SCM implementation of the service-control port.
+nrr-platform-windows = { path = "../../core/platform/windows" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The systemd implementation of the same port.
+nrr-platform-linux = { path = "../../core/platform/linux" }
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "2"
+
+[lints]
+workspace = true

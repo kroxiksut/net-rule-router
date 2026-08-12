@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "language": "en",
+    "label": "English",
+    "nativeLabel": "English",
+    "version": "1.0",
+    "fallbacks": ["en"]
+  },
+  "menu": {
+    "file": "File",
+    "tools": "Tools"
+  },
+  "section": {
+    "interfaces-routes": "Interfaces and routes",
+    "settings": "Settings"
+  },
+  "dialog": {
+    "load-list": {
+      "title": "Load rule list",
+      "note": "Select a file to preview before replacing active rules."
+    }
+  },
+  "status": {
+    "rules-imported": "Rules were imported successfully."
+  },
+  "rules": {
+    "count": {
+      "one": "%1 rule",
+      "few": "%1 rules",
+      "many": "%1 rules",
+      "other": "%1 rules"
+    }
+  }
+}

@@ -1,6 +1,6 @@
-# Block 16.16 — install the NetRuleRouter Windows service from the
-# command line. Mirrors the GUI's `nrrServiceController.installService()`
-# bridge call: same SCM API path, different driver.
+# Install the NetRuleRouter Windows service from the command line.
+# Mirrors the GUI's `nrrServiceController.installService()` bridge call:
+# same SCM API path, different driver.
 #
 # Self-elevates via UAC if not already running as Administrator. The
 # script locates the service binary in target/debug or target/release

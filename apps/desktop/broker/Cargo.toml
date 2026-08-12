@@ -1,0 +1,65 @@
+[package]
+name = "nrr-broker"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Block 16.QoL+ — session elevation broker ("one UAC per session").
+#
+# A long-lived ELEVATED copy of the launcher binary
+# (`NetRuleRouter.exe --nrr-elevated-broker`) that holds one privileged
+# `NamedPipeIpcClient` to the service and relays privileged mutations on
+# behalf of the non-elevated GUI launcher. The first privileged mutation
+# triggers a single UAC prompt; every later mutation reuses the broker
+# without prompting. The broker dies with the launcher.
+#
+# This crate isolates all Win32 / `unsafe` so the launcher stays
+# unsafe-free (consistent with `nrr-ipc-client` / `nrr-windows-service`
+# owning the pipe-server unsafe). It re-uses the wire codec and the
+# production `NamedPipeIpcClient` from `nrr-ipc-client`; it never reaches
+# into service internals.
+#
+# Dependency direction (CLAUDE.md): apps/launcher -> apps/broker;
+# apps/broker -> nrr-ipc-client + nrr-shared.
+
+[lib]
+name = "nrr_broker"
+path = "src/lib.rs"
+
+[dependencies]
+nrr-ipc-client = { path = "../../../core/ipc-client" }
+nrr-shared = { path = "../../../shared/contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 256-bit session nonce that binds the broker's local channel to the
+# exact launcher process that spawned it (defence in depth beyond the
+# owner-SID DACL). MIT/Apache, already in the dependency tree.
+getrandom = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 bindings for the broker's local named-pipe server:
+# CreateNamedPipeW + owner-restricted SDDL, overlapped ConnectNamedPipe
+# waited alongside the parent-process handle (lifecycle), client PID/SID
+# identification (GetNamedPipeClientProcessId + GetTokenInformation), and
+# the CreateFileW client side. Same `windows` 0.58 band as the rest of
+# the workspace.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    # Block 16 (2026-06-27) #7 — start a DemandStart service from the
+    # unprivileged launcher using the granted SERVICE_START right (no UAC).
+    "Win32_System_Services",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

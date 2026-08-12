@@ -3,7 +3,7 @@
        <path> but not on bare <rect>/<circle>); literal stops (QtSvg ignores
        CSS var()/@media — high-contrast handled by the ui-hc/ variant). -->
   <defs>
-    <linearGradient id="nrr-grad" x1="0" y1="0" x2="24" y2="24">
+    <linearGradient id="nrr-grad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="24" y2="24">
       <stop offset="0" stop-color="#1EA7FF"/>
       <stop offset="1" stop-color="#8A3FFC"/>
     </linearGradient>

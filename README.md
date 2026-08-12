@@ -6,12 +6,14 @@
 
 **Decide which traffic goes through which connection — by domain, IP, or app.**
 
-A Windows-first network policy manager that routes your traffic across the
+A desktop network policy manager that routes your traffic across the
 interfaces you *already have*: primary internet, a VPN, a second provider, Wi-Fi,
 Ethernet. No tunnel of its own, no cloud, no account.
 
+Windows builds today; Linux is in progress, macOS next.
+
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#license)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)
+![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
 
 [Russian version → README_RU.md](README_RU.md)
@@ -38,6 +40,40 @@ Typical setups:
 It is **not** a VPN client, an anonymity tool, a censorship-bypass tool, a proxy
 manager, or a cloud service. It manages routing across the connections you set up
 yourself — it doesn't create or hide them.
+
+## Quick start
+
+1. **Unpack and run.** Unpack the archive anywhere — Desktop, the root of a
+   drive, a USB stick — start `NetRuleRouter.exe` and accept the licence
+   agreement. Ready-made archives are not published yet; `scripts/package-windows.ps1`
+   builds one that runs on a machine without Qt or Rust (see
+   [Build from source](#build-from-source)).
+2. **Install the background service.** The welcome window offers *"Install and
+   start the service"* — confirm the UAC prompt. Without the service the app
+   runs in preview mode: rules can be edited, but nothing is applied.
+3. **Pick a starting rule set.** The first-run wizard offers a country preset,
+   a built-in demo set, two `.txt` files of your own, or an empty start.
+4. **Assign the two routes.** On the *Interfaces & routes* screen say which
+   adapter is the main route and which is the additional one (your VPN, a
+   second provider, a second Wi-Fi), and where traffic matching no rule goes.
+5. **Save the set as your own** — *Settings → Presets & settings → My rule
+   sets*: point it at a folder of your own, then *"Save current rules as a
+   set"*. Sets that stay in the application folder are replaced by the next
+   update; a set in your own folder survives it.
+6. **Add your own sites** (see the note below), then press **Apply** — rules
+   take effect only once applied.
+
+> **One-time step after installation.** The service routes exactly what the
+> rules say and nothing else. Sites that used to open for you over the VPN
+> will keep going out over the main connection until they appear in the rules
+> of the additional (secondary) route — a preset cannot know your personal
+> list. Go through the sites you care about and add them yourself: in the
+> **Rules** section of the app, or straight into `rules_secondary.txt` in your
+> rule-set folder. Then press **Apply**. You do this once — from then on the
+> list travels with your rule set.
+
+The full walkthrough, including what to do if you lose network access, is in
+[`docs/en/quickstart.md`](docs/en/quickstart.md).
 
 ## Highlights
 
@@ -74,10 +110,11 @@ Notes:
 - **IPv6, CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
-> **If you want your favourite blocked sites to keep opening while NetRuleRouter
-> is running, add them to the rules of the additional (secondary) route** —
-> otherwise, with your VPN connected, they may fail to open. **After adding or
-> removing rules, always press Apply: rules take effect only once applied.**
+> A destination that matches no rule takes the default route — so a site
+> belongs in the rules of the additional (secondary) route if that is where
+> you want it to go; see the one-time step in [Quick start](#quick-start).
+> **After adding or removing rules, always press Apply: rules take effect only
+> once applied.**
 
 ## Presets
 
@@ -109,7 +146,9 @@ The full format is documented in [`docs/en/rules-file-format.md`](docs/en/rules-
 
 ## Build from source
 
-> Windows-first; macOS and Linux are planned once the Windows baseline is stable.
+> The commands below are for Windows. Every script has a `*.sh` counterpart
+> for Linux, where the port is in progress and not release-tested yet; macOS
+> comes after it.
 
 **Prerequisites:** a recent Rust toolchain, a Qt 6 development install, and CMake.
 `scripts/bootstrap.ps1` checks the environment and prepares your `.env`.
@@ -138,6 +177,22 @@ Quality gate (fmt + clippy + tests + license/dependency audit):
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 ```
+
+### Preparing a build for distribution
+
+`scripts/package-windows.ps1` turns the checkout into a folder that runs on a
+clean Windows machine — no Qt, no Rust toolchain, no repository, no installer:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Zip
+```
+
+The package lands in `C:\temp\NetRuleRouter\dist\NetRuleRouter`; `-Zip` puts
+`NetRuleRouter-windows-x64-<version>+<commit>.zip` beside it. It carries the
+GUI, tray, service, console, the Qt runtime, and the QML / locale / preset /
+config tree, plus a `build-info.json` stamp (version, revision, build time)
+and a short `READ-ME.txt` for whoever unpacks it. Parameters and layout:
+[`docs/en/packaging-windows.md`](docs/en/packaging-windows.md).
 
 ## Configuration & data
 
@@ -186,6 +241,7 @@ stays a native Qt app throughout.
 |------|--------------|
 | [`SECURITY.md`](SECURITY.md) | Security model & trust boundaries |
 | [`STRUCTURE.md`](STRUCTURE.md) | Repository layout |
+| [`docs/en/quickstart.md`](docs/en/quickstart.md) | Quick start: from install to the first applied rule |
 | [`docs/en/rules-file-format.md`](docs/en/rules-file-format.md) | Preset & rule file format |
 | [`docs/en/routing-modes.md`](docs/en/routing-modes.md) | The routing switches: what each one buys you, and how they combine |
 | [`docs/en/what-routing-changes.md`](docs/en/what-routing-changes.md) | Who sees what once a site is routed — and what routing deliberately leaves alone |
@@ -195,6 +251,8 @@ stays a native Qt app throughout.
 | [`docs/en/diagnostic-archive.md`](docs/en/diagnostic-archive.md) | What goes into a diagnostic archive, and what never does |
 | [`docs/en/recovering-network-access.md`](docs/en/recovering-network-access.md) | Getting the network back if something goes wrong |
 | [`docs/en/cli.md`](docs/en/cli.md) | The `nrr-cli` console: verbs, exit codes, and what it deliberately does not do |
+| [`docs/en/building-windows.md`](docs/en/building-windows.md) | Building from source on Windows: toolchain, Qt, common failures |
+| [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md) | Producing a portable package for distribution |
 
 ## License
 

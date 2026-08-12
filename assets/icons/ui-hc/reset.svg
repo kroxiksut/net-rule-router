@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="reset">
+  <!-- High-contrast accessibility variant derived from Tabler-based icon set -->
+  <title>reset high contrast</title>
+  <g fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3.06 13a9 9 0 1 0 .49 -4.087" />
+    <path d="M3 4.001v5h5" />
+    <path d="M12 8v4l2 2" />
+  </g>
+</svg>

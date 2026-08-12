@@ -1,10 +1,9 @@
-# Block 16.16 — show NetRuleRouter service status. Read-only, no
-# elevation required.
+# Show NetRuleRouter service status. Read-only, no elevation required.
 #
 # Combines `sc.exe query` (SCM-canonical state) with a one-line
-# diagnostic banner from the service binary's `status` subcommand
-# (block 14.2). Useful as a quick check from any terminal — equivalent
-# to the GUI's `nrrServiceController.status` property.
+# diagnostic banner from the service binary's `status` subcommand.
+# Useful as a quick check from any terminal — equivalent to the GUI's
+# `nrrServiceController.status` property.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\service-status.ps1

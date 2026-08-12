@@ -1,0 +1,9 @@
+# NetRuleRouter preset — version 1
+# name: Invalid bare-glob preset
+# description: Windows section contains bare `*` which is rejected as AppGlobTooWide
+
+--- Domains
+example.com
+
+--- Windows
+*

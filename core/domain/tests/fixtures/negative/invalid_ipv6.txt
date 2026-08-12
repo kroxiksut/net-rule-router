@@ -1,0 +1,9 @@
+# NetRuleRouter preset — version 1
+# name: Invalid IPv6 preset
+# description: IP section contains an IPv6 address; rejected as Ipv6NotSupportedInFree in Free edition
+
+--- Domains
+example.com
+
+--- IP
+2001:db8::1

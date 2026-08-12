@@ -1,0 +1,35 @@
+[package]
+name = "nrr-storage-sidecar"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# GUI-only sidecar database for metadata that never reaches the service:
+#   - rule_metadata (user-typed comments keyed by rule signature)
+#   - passthrough   (raw text of `--- Linux`/`--- MacOS`/etc. sections
+#                    captured during preset import for round-trip export)
+#   - pending_apply (last `_buildRulesJson` snapshot + summary kept until
+#                    the service becomes reachable and the user accepts or
+#                    discards the change; TTL 7 days)
+#
+# Per-user database lives at `%APPDATA%\NetRuleRouter\gui_metadata.db` on
+# Windows. Override via `NRR_SIDECAR_PATH` for tests and headless drivers.
+#
+# Allowed deps: rusqlite (bundled), thiserror.
+# Forbidden:    nrr-storage (service-side), nrr-shared (wire schemas),
+#               nrr-service-runtime, nrr-platform-windows, any UI crate.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

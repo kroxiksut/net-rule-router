@@ -1,0 +1,32 @@
+# NetRuleRouter preset — version 1
+# name: Corporate VPN — Full Pack (Pro)
+# description: Routes corporate traffic via VPN with Pro-only CIDR and port rules
+# author: NetRuleRouter
+# preset_version: 1
+
+--- Zones
+corp-internal              # internal corporate zone
+
+--- Domains
+corp.example.com           # corporate portal
+*.internal.example.net     # all internal subdomains
+
+--- IP
+203.0.113.7                # corporate gateway
+
+--- Windows
+outlook.exe                # corporate mail client
+
+--- Linux
+# (reserved — not applied on Windows)
+
+--- MacOS
+# (reserved — not applied on Windows)
+
+--- CIDR
+10.0.0.0/8                 # internal network range (Pro only)
+192.168.0.0/16             # local RFC-1918 range (Pro only)
+
+--- Ports
+443                        # HTTPS (Pro only)
+80                         # HTTP (Pro only)

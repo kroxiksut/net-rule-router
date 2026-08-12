@@ -1,0 +1,27 @@
+[package]
+name = "nrr-storage"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-domain = { path = "../domain" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+bitflags = "2"
+sha2 = "0.10"
+# Block 16.QoL+8 — HMAC-SHA256 over canonical revision row content
+# for tamper detection. Key lives in DPAPI-protected per-user storage
+# (LocalSystem profile); the algorithm itself stays in this crate
+# because it's a pure function of the row bytes.
+hmac = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

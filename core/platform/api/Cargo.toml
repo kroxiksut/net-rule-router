@@ -1,0 +1,49 @@
+[package]
+name = "nrr-platform-api"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Block 19 — neutral platform-port API. Holds the OS-agnostic port TRAIT and
+# value-type DEFINITIONS that `service-runtime` codes against; the per-OS
+# backends (`nrr-platform-windows`, and later `-linux`/`-macos`) `impl` these.
+# HARD RULE: no OS-specific dependencies here — this crate MUST compile on every
+# target (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, …). See the
+# policy/mechanism seam in CLAUDE.md (Block 19) and the port split map in
+# TASKS_RU.md §19 "Карта разделения платформенных портов".
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Block 19 — OS CSPRNG for the DB-MAC signing key (`key_store::generate_signing_key`).
+# Cross-platform (Linux/macOS/Windows) — keeps this crate OS-neutral.
+getrandom = "0.3"
+# Block 19 — the neutral platform value-types (`types::*`: RouteEntry, WfpFilterSpec,
+# …) are (de)serialised across the IPC/persistence boundary; serde is OS-neutral.
+serde = { version = "1", features = ["derive"] }
+# Block 19 — the neutral WFP session apply logic (`wfp`) emits skip/abort
+# diagnostics via structured tracing spans. `tracing` is pure-Rust and OS-neutral.
+tracing = "0.1"
+# Block 19 — `snapshot` computes SHA-256 hashes of the platform state for
+# idempotency/rollback; sha2 is pure-Rust and OS-neutral.
+sha2 = "0.10"
+# Block 19 — `interface_rows` neutral types + `from_wire_dto` reference the wire
+# DTOs and route-role enums in nrr-shared (contracts crate, fully OS-neutral).
+nrr-shared = { path = "../../../shared/contracts" }
+# Block 19.2 — the neutral enforcement data-model (`enforcement`) is keyed by the
+# cross-OS `UserPrincipal` (Win SID / Linux uid / macOS uid). `nrr-domain` is the
+# pure decision layer and is itself OS-neutral (depends only on nrr-shared), so
+# this keeps `platform → domain` — an allowed direction — with no cycle.
+nrr-domain = { path = "../../domain" }
+
+[dev-dependencies]
+# `hosts_file` tests write a temp hosts file + exercise the mtime cache.
+tempfile = "3"
+# `snapshot` tests round-trip `PlatformStateSnapshot` through JSON; OS-neutral.
+serde_json = "1"
+
+[lints]
+workspace = true
