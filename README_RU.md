@@ -103,7 +103,7 @@ alibaba.com
 *.alibaba.com
 ```
 
-Полный формат описан в [`FORMATS.md`](FORMATS.md).
+Полный формат описан в [`docs/ru/rules-file-format.md`](docs/ru/rules-file-format.md).
 
 > Встроенные страновые пресеты — это черновики, подготовленные с помощью ИИ, как
 > удобная отправная точка, а не авторитетная рекомендация по маршрутизации.
@@ -190,9 +190,10 @@ explain mode, Fail-Closed, предлагаемые адреса, диагнос
 |------|------------|
 | [`SECURITY.md`](SECURITY.md) | Модель безопасности и границы доверия |
 | [`STRUCTURE.md`](STRUCTURE.md) | Структура репозитория |
-| [`FORMATS.md`](FORMATS.md) | Формат файлов пресетов и правил |
+| [`docs/ru/rules-file-format.md`](docs/ru/rules-file-format.md) | Формат файлов пресетов и правил |
 | [`docs/ru/quickstart.md`](docs/ru/quickstart.md) | Быстрый старт: от установки до первого применённого правила |
 | [`docs/ru/routing-modes.md`](docs/ru/routing-modes.md) | Переключатели маршрутизации: что даёт каждый и как их сочетать |
+| [`docs/ru/what-routing-changes.md`](docs/ru/what-routing-changes.md) | Кто что видит, когда сайт идёт по правилу, и чего маршрутизация сознательно не трогает |
 | [`docs/ru/blocked-site-browser-errors.md`](docs/ru/blocked-site-browser-errors.md) | Что означает ошибка браузера, когда маршрутизируемый сайт не открывается |
 | [`docs/ru/cache-and-seeding.md`](docs/ru/cache-and-seeding.md) | Как заполняется кэш FQDN/IP, включая засев из истории браузера |
 | [`docs/ru/where-files-live.md`](docs/ru/where-files-live.md) | Где хранятся настройки, правила, кэши и логи |
