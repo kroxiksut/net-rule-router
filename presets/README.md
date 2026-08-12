@@ -59,7 +59,7 @@ request with rules and interface translations for the software.
 ## Rules file format
 
 Rules files use the same plain-text format as working rules files (see
-`FORMATS.md`, sections 1 and 3).
+[Rules File Format](../docs/en/rules-file-format.md), sections 1 and 3).
 
 Typical metadata header in rules files:
 

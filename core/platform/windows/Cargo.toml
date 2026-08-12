@@ -1,0 +1,144 @@
+[package]
+name = "nrr-platform-windows"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Block 15.1: Windows platform apply layer.
+# Dependency direction (CLAUDE.md): platform → domain/contracts.
+# Forbidden: nrr-application, nrr-service-runtime, nrr-desktop-gui,
+#            nrr-desktop-tray, nrr-launcher, nrr-mock-backend.
+# See tests/dependency_boundary.rs.
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Block 15.7: compile browser-stub infrastructure only when enabled.
+# Default off — minimises attack surface.
+browser-stub = []
+
+[dependencies]
+# Block 19 — neutral platform-port definitions this crate implements. The
+# per-OS mechanism (Win32) lives here; the trait/type contracts live in the API.
+nrr-platform-api = { path = "../api" }
+nrr-shared  = { path = "../../../shared/contracts" }
+nrr-storage = { path = "../../storage" }
+# Block 16.HW-0719 (C): read the browsers' History SQLite (Chrome/Edge `urls`,
+# Firefox `moz_places`) for the opt-in browser-history seed. Bundled SQLite, same
+# version as nrr-storage.
+rusqlite    = { version = "0.32", features = ["bundled"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha2        = "0.10"
+# Block 16.QoL+8 Phase B: OS CSPRNG for the DB-MAC signing key. Used by
+# the platform-agnostic `key_store::generate_signing_key` so the
+# service-runtime bootstrap never hand-rolls randomness.
+getrandom   = "0.3"
+# Block 16.QoL+8 Phase B: warn-on-failure logging for best-effort ACL
+# tightening on the key blob.
+tracing     = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+ipconfig = "0.3"
+# Service Control Manager bindings behind the neutral `ServiceControlPort`
+# (`service_control.rs`): register/remove/start/stop/query the background
+# service. MIT/Apache, same crate and version band the service binary used
+# before the mechanism moved here.
+windows-service = "0.7"
+# Block D (fake-IP, slice 2): Wintun bindings — the Windows mechanism behind
+# `nrr_platform_api::fake_ip::TunAdapterPort`. Windows is the only OS without a
+# usermode TUN of its own; Linux/macOS use their native `/dev/net/tun` / `utun`.
+# The crate is MIT and is a cargo dependency; the DRIVER itself is WireGuard
+# LLC's signed `wintun.dll`, vendored under `third_party/wintun/` with its
+# prebuilt-binaries licence (redistribution is permitted only alongside software
+# that uses it via the published API — which is exactly this binding).
+# `verify_binary_signature` makes the loader refuse any `wintun.dll` that is not
+# Authenticode-signed, so a swapped-in DLL cannot impersonate the real driver.
+wintun-bindings = { version = "0.7", features = ["verify_binary_signature"] }
+# TODO(block-15.2): pin exact feature flags after Win32 API survey.
+# Declared early so CI can verify the crate compiles on Windows.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    # Block 16.12.A.0: IP_ADAPTER_ADDRESSES_LH transitively pulls in
+    # NDIS types (NET_LUID_LH, NET_IF_*) which the windows crate gates
+    # behind a separate feature flag.
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinSock",
+    # Block 16.9.4: HKCU\...\Run autostart helper.
+    "Win32_System_Registry",
+    # Block 16.12.A.0: FwpmEngineOpen0 takes a SEC_WINNT_AUTH_IDENTITY_W
+    # parameter and we use the RPC_C_AUTHN_WINNT constant.
+    "Win32_System_Rpc",
+    # Block 16.12.A.0: FwpmEngineOpen0 is gated behind Win32_Security in
+    # windows-rs 0.58 because SEC_WINNT_AUTH_IDENTITY_W references it.
+    "Win32_Security",
+    # Block 16.12.A.0: ConvertStringSecurityDescriptorToSecurityDescriptorW
+    # + ConvertSecurityDescriptorToStringSecurityDescriptorW for the
+    # FWPM_CONDITION_ALE_USER_ID round-trip (string SID ↔ SDDL ↔ SD blob).
+    "Win32_Security_Authorization",
+    # Block 16.12.A.0: LocalFree releases the buffer returned by the
+    # SDDL conversion APIs (and only LocalFree — not HeapFree/free).
+    "Win32_System_Memory",
+    # Block 16 (2026-06-27): WTSGetActiveConsoleSessionId + WTSQueryUserToken
+    # resolve the active console user's token for the service-driven routing
+    # scope (enforce the console user's policy from boot, with no app running).
+    "Win32_System_RemoteDesktop",
+    # Block 16.QoL+8 Phase B: CryptProtectData / CryptUnprotectData
+    # (per-user DPAPI, no CRYPTPROTECT_LOCAL_MACHINE) protect the
+    # DB-MAC signing key at rest. CRYPT_INTEGER_BLOB + CRYPTPROTECT_FLAGS
+    # come from the same feature.
+    "Win32_Security_Cryptography",
+    # Block 16.12.A.1: DnsQuery_W + DNS_RECORDW + DnsFree power the
+    # production DNS resolver. The W-form takes a wide hostname and
+    # returns a *DNS_RECORDA chain in windows-rs 0.58 (the binding
+    # types the linked list as DNS_RECORDA even for DnsQuery_W; the
+    # body layout is identical and we cast to DNS_RECORDW at use site
+    # to read the wide pName/Data union).
+    "Win32_NetworkManagement_Dns",
+    # Block 16.18 (β): passive DNS observation via the
+    # Microsoft-Windows-DNS-Client ETW provider. Real-time trace session
+    # (StartTraceW / EnableTraceEx2 / OpenTraceW / ProcessTrace /
+    # ControlTraceW) + TDH event parsing (TdhGetProperty) to read the
+    # QueryName + QueryResults of event 3008 (DNS query completed).
+    "Win32_System_Diagnostics_Etw",
+    # OpenTraceW + EVENT_TRACE_LOGFILEW are gated behind this in
+    # windows-rs 0.58 (the logfile struct embeds a FILETIME).
+    "Win32_System_Time",
+    # Block 16.HW-0707: OpenProcess + QueryFullProcessImageNameW resolve a
+    # connect event's PID → full image path so the connection trace can show
+    # the owning process (the Kernel-Network ETW event carries only the PID).
+    "Win32_System_Threading",
+    # Block 19 (app_path_resolver): EnumProcesses snapshots the running-process
+    # PID set; each PID is then resolved to its full image path (via the
+    # Threading APIs above) so an `Application` rule's exe name/glob can match a
+    # currently-running process image.
+    "Win32_System_ProcessStatus",
+    # Block 16.HW-0716 (system_info): GlobalMemoryStatusEx + MEMORYSTATUSEX read
+    # total physical RAM for the diagnostic archive's system_info.json.
+    "Win32_System_SystemInformation",
+    # Broadcasting WM_SETTINGCHANGE("Environment") after a per-user PATH write
+    # (path_registration): without it Explorer keeps handing newly launched
+    # programs the environment it cached, so the change would only appear after
+    # a sign-out. SendMessageTimeoutW + HWND_BROADCAST + SMTO_ABORTIFHUNG bound
+    # the broadcast so one hung window cannot block the caller.
+    "Win32_UI_WindowsAndMessaging",
+    # SetStdHandle points this process's error stream at its own log file
+    # (process_error_stream): a launcher started by another process otherwise
+    # writes its diagnostics into the parent's captured stream.
+    "Win32_System_Console",
+    # 2026-07-24: QueryDosDeviceW maps a drive letter to its NT device name so
+    # an app-id blob can be derived without opening the executable (self-
+    # protected AV binaries deny the open FwpmGetAppIdFromFileName0 performs).
+    "Win32_Storage_FileSystem",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

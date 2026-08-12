@@ -1,0 +1,20 @@
+[package]
+name = "nrr-qt-host"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+build = "build.rs"
+
+# Build-only crate: `build.rs` drives the CMake compilation of
+# `nrr_qt_native_host.exe`. The lib only re-exports the absolute path of the
+# produced C++ binary (`NATIVE_HOST_EXE` const) for `nrr-launcher` to pick up.
+[lib]
+name = "nrr_qt_host"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,53 @@
+[package]
+name = "nrr-ipc-client"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Block 16.2 — Named-pipe IPC client used by GUI and tray to talk to the
+# service. Sync API + background reader thread + reconnect state machine.
+#
+# Dependency direction (CLAUDE.md):
+#   nrr-ipc-client → nrr-shared, nrr-application
+#
+# Forbidden: nrr-service-runtime, nrr-windows-service, nrr-platform-windows,
+#            nrr-storage, nrr-diagnostics, UI crates, mock-backend.
+# (Server-side pieces are out of bounds; the client must round-trip through
+#  the wire protocol only, never call into service internals.)
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-shared      = { path = "../../shared/contracts" }
+nrr-application = { path = "../application" }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# For contract tests: verify that the wire format the client emits is
+# accepted by the production router. dev-dep only — production code in
+# this crate does NOT reach into service-runtime.
+nrr-service-runtime = { path = "../services/service-runtime" }
+# Block 16.4: snapshot_cache.rs unit tests use isolated temp directories
+# to exercise file-based cache write/read/expiry/invalidation behaviour.
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+# Direct Win32 bindings for the named-pipe client transport: CreateFileW,
+# ReadFile/WriteFile against the pipe handle, OpenSCManagerW + OpenServiceW
+# + QueryServiceStatusEx for service-status probe.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true

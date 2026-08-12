@@ -1,0 +1,98 @@
+[package]
+name = "nrr-service-runtime"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Service-runtime crate: orchestration layer that the Windows background
+# service entrypoint sits on top of. Block 14.1 establishes the dependency
+# boundary that protects this crate from accidentally pulling in UI-only
+# code (theme, tray, first_run, ui_preferences, QML/C++ bridge, GUI/tray
+# binaries, mock preview backends).
+#
+# Allowed direction: nrr-service-runtime -> domain / application / storage /
+# diagnostics / platform-windows / shared-contracts. The reverse direction
+# (any of those depending on nrr-service-runtime) and any UI dependency
+# direction are forbidden. The integration test under
+# `tests/dependency_boundary.rs` enforces this at `cargo test` time by
+# reading this Cargo.toml via include_str! and rejecting forbidden crate
+# names — see the test for the canonical list.
+
+[dependencies]
+nrr-application = { path = "../../application" }
+nrr-diagnostics = { path = "../../diagnostics" }
+nrr-domain = { path = "../../domain" }
+# Block 19 (19.0.3) — service-runtime codes against the NEUTRAL platform ports,
+# value-types and logic (now in nrr-platform-api), so it compiles on Linux/macOS.
+# The Windows Win32 BACKEND is a cfg(windows)-only dependency (see below).
+nrr-platform-api = { path = "../../platform/api" }
+nrr-shared = { path = "../../../shared/contracts" }
+nrr-storage = { path = "../../storage" }
+# Block 14.5 IPC server uses serde-friendly DTOs to wire request/response
+# envelopes; the actual Named Pipe transport (see `ipc.rs` doc-block)
+# layers on top of these types.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Block 16.7: production adapters emit tracing events that the
+# `NdjsonTracingLayer` (block 16.6) routes into the operational NDJSON.
+# Service-runtime is downstream of `nrr-diagnostics`, which already pulls
+# `tracing` as a regular dep — adding it here makes the dependency
+# explicit instead of relying on transitive resolution.
+tracing = "0.1"
+# Block 16.9.2: ActivationCoordinator wraps a SQLite Connection in
+# Arc<Mutex<Connection>> so the storage repos can borrow it across
+# Phase 1 / Phase 3 transactions. nrr-storage already re-exports the
+# pieces we need but the Connection type itself comes from rusqlite.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Block 16.14.A: ProductionPresetExporter computes SHA-256 over the
+# unwrapped canonical txt bytes (used by the GUI as
+# `last_file_synced_hash_<role>` for divergence detection on close).
+# `sha2` is already a transitive dep via nrr-diagnostics and
+# nrr-storage; named here so the boundary check stays explicit.
+sha2 = "0.10"
+# Block 16.14.A: PresetExportGet and SettingsExportFull responses wrap
+# file bytes in base64 (RFC 4648 standard alphabet, padded) so the
+# wire framing stays text-safe.
+base64 = "0.22"
+# Block D (fake-IP, slice 3): the userspace TCP/IP stack that terminates
+# flows addressed to the fake pool. Minimal feature set — IP medium only
+# (the TUN adapter is L3), v4+v6, TCP sockets; UDP replies are hand-built
+# with the `wire` types, so no UDP socket machinery is pulled in.
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }
+# Fake-IP relay dialer: `std` cannot bind a TCP socket's source address before
+# connecting; `socket2` can, and that bind is how a relayed flow is steered
+# onto the adapter its route policy chose.
+socket2 = "0.6"
+
+# Block 19 (19.0.3) — the Windows platform BACKEND (production Win32 impls +
+# live adapter enumeration) is only needed when building for Windows. All the
+# neutral ports/types/logic service-runtime codes against live in the
+# unconditional `nrr-platform-api` above, so the crate compiles on Linux.
+[target.'cfg(windows)'.dependencies]
+nrr-platform-windows = { path = "../../platform/windows" }
+
+# Block 19.1: the Linux backend, mirror of the Windows block above. Currently
+# STUB impls (Block 19.1 skeleton) selected under cfg(not(windows)); the real
+# nftables/rtnetlink mechanism lands in Block 19.2.
+[target.'cfg(not(windows))'.dependencies]
+nrr-platform-linux = { path = "../../platform/linux" }
+
+[dev-dependencies]
+# Bootstrap tests use a temp directory to exercise the full
+# StorageProfile::TestTemp pipeline without touching %ProgramData%.
+tempfile = "3"
+# Block 16.HW-0717 (archive enrichment) — the export-handler test reads the
+# produced zip to assert the diagnostics level ships the extra sections.
+zip = "2"
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+# NetRuleRouter preset — version 1
+# name: Built-in demo (primary route)
+# description: Tiny showcase set covering each rule kind. Replace with your own rules before relying on routing.
+# author: NetRuleRouter
+# preset_version: 1
+
+--- Zones
+local                # All hosts in your internal .local zone
+
+--- Domains
+example.com          # Exact FQDN — only this hostname matches
+*.cdn.example.net    # Suffix — any subdomain of cdn.example.net
+# *.staging.example.com  # Disabled rule — toggle on when you need staging
+
+--- IP
+203.0.113.7          # Single exact IPv4 address (documentation range)
+
+--- Windows
+chrome.exe           # Process name match (case-insensitive on Windows)
+*vpn*.exe            # Glob — any process whose name contains "vpn"
+
+--- Linux
+
+--- MacOS

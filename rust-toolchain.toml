@@ -1,0 +1,7 @@
+# Pins the workspace toolchain so the quality gate (fmt + clippy -D warnings
+# + test + cargo-deny) stays reproducible and does not silently drift, as it
+# did when stable rolled 1.79 -> 1.94.1 between sessions (block 16.19.0b).
+# Bump deliberately, re-running the full clippy sweep on the new version.
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]

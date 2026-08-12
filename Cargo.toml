@@ -1,0 +1,43 @@
+﻿[workspace]
+members = [
+  "core",
+  "core/domain",
+  "core/application",
+  "core/platform/api",
+  "core/platform/windows",
+  "core/platform/linux",
+  "core/storage",
+  "core/storage-sidecar",
+  "core/diagnostics",
+  "core/ui-support",
+  "core/mock-backend",
+  "core/services/service-runtime",
+  "core/services/windows-service",
+  "core/services/linux-service",
+  "core/ipc-client",
+  "shared/contracts",
+  "apps/cli",
+  "apps/desktop/qt-host",
+  "apps/desktop/gui",
+  "apps/desktop/tray",
+  "apps/desktop/launcher",
+  "apps/desktop/broker",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-prealpha"
+edition = "2021"
+rust-version = "1.94.1"
+license = "MPL-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "deny"
+expect_used = "warn"

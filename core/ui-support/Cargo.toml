@@ -1,0 +1,22 @@
+[package]
+name = "nrr-ui-support"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-shared = { path = "../../shared/contracts" }
+
+[dev-dependencies]
+# Used by `ui_preferences` tests to spin up scratch directories that are
+# auto-removed on drop. Replaces the prior `std::env::temp_dir().join(...)`
+# pattern which leaked `nrr-ui-preferences-tests-*` dirs into `%TEMP%`.
+tempfile = "3"
+
+[lints]
+workspace = true

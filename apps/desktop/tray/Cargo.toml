@@ -1,0 +1,24 @@
+[package]
+name = "nrr-desktop-tray"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Library-only after 13.R-GUI.4. The user-facing `NetRuleRouterTray.exe` is
+# now produced by `nrr-launcher`; this crate contributes
+# `write_qt_tray_context_file` and supporting types consumed by the launcher.
+[lib]
+name = "nrr_desktop_tray"
+path = "src/lib.rs"
+
+[dependencies]
+nrr-application = { path = "../../../core/application" }
+nrr-ui-support = { path = "../../../core/ui-support" }
+nrr-shared = { path = "../../../shared/contracts" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lints]
+workspace = true

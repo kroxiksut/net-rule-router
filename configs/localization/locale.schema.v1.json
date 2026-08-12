@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://netrulerouter.local/schemas/locale.schema.v1.json",
+  "title": "NetRuleRouter locale schema v1",
+  "type": "object",
+  "required": ["metadata"],
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["language", "label", "nativeLabel", "version", "fallbacks"],
+      "additionalProperties": false,
+      "properties": {
+        "language": {
+          "type": "string",
+          "minLength": 2,
+          "pattern": "^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1
+        },
+        "nativeLabel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^1\\.[0-9]+$"
+        },
+        "fallbacks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 2,
+            "pattern": "^[a-z]{2,3}(?:-[a-z0-9]{2,8})*$"
+          }
+        }
+      }
+    }
+  },
+  "patternProperties": {
+    "^(?!metadata$)[a-z0-9][a-z0-9-]*$": {
+      "$ref": "#/$defs/namespaceNode"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "namespaceNode": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z0-9][a-z0-9-]*$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "$ref": "#/$defs/namespaceNode"
+          }
+        ]
+      }
+    }
+  }
+}

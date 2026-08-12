@@ -1,0 +1,11 @@
+# Workspace Clippy configuration.
+#
+# The workspace lints deny `unwrap_used` and warn on `expect_used`
+# (`[workspace.lints.clippy]` in Cargo.toml) to keep PRODUCTION code panic-free.
+# Test code legitimately uses `unwrap()`/`expect()` to assert invariants, so we
+# exempt it here rather than sprinkling `#[allow(...)]` across every `mod tests`.
+# This keeps `cargo clippy --all-targets -- -D warnings` green without weakening
+# the production guarantee. (Added 2026-06-06, block 16.19.0 — needed once the
+# stable toolchain rolled to 1.94, whose Clippy flags expect/unwrap in tests.)
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

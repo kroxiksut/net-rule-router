@@ -6,9 +6,16 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$target = if ($env:NRR_RUST_TARGET) { $env:NRR_RUST_TARGET } else { 'x86_64-pc-windows-msvc' }
+& (Join-Path $PSScriptRoot 'clean-sync-duplicates.ps1')
 
-$args = @('build', '--workspace', '--target', $target)
+# No default --target: an explicit triplet sends artifacts to
+# target\<triplet>\<profile>\, which install-service.ps1 / run.ps1 don't look
+# in and forces a from-scratch build tree. Host-triple default keeps
+# everything under target\<profile>\.
+$args = @('build', '--workspace')
+if ($env:NRR_RUST_TARGET) {
+    $args += @('--target', $env:NRR_RUST_TARGET)
+}
 if ($Profile -eq 'release') {
     $args += '--release'
 }

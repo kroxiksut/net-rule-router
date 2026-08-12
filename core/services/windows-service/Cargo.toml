@@ -1,0 +1,88 @@
+[package]
+name = "nrr-windows-service"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Thin Windows entrypoint binary. All orchestration lives in
+# `nrr-service-runtime` (block 14.1). This crate carries the SCM glue
+# (block 14.2): service_main, control handler, status reporter,
+# install/uninstall, and console mode.
+
+# The crate name states the PLATFORM (it is the Windows-only entrypoint);
+# the produced executable states the ROLE, and that name is identical on
+# every OS (`nrr-service` here, `nrr-serviced` + an `nrr-service` alias on
+# Unix). Cross-platform scripts and documentation name one binary.
+[[bin]]
+name = "nrr-service"
+path = "src/main.rs"
+
+[dependencies]
+nrr-application = { path = "../../application" }
+nrr-domain      = { path = "../../domain" }
+nrr-ipc-client  = { path = "../../ipc-client" }
+nrr-service-runtime = { path = "../service-runtime" }
+nrr-shared = { path = "../../../shared/contracts" }
+# Needed only to construct the production `StorageProfile` for the
+# bootstrap config; no direct DB access from this binary — that goes
+# through the runtime managers.
+nrr-storage = { path = "../../storage" }
+# Block 16.7.6 — `runtime_deps.rs` constructs the production
+# `SupervisedRuntimeDeps` bundle. It uses `LogRetentionPolicy` /
+# `ManualCleanupScope` from `nrr-diagnostics` and the
+# `AdapterMonitor` / `WindowsApiAdapterSource` / `ProductionWindowsApi`
+# trio from `nrr-platform-windows`.
+nrr-diagnostics = { path = "../../diagnostics" }
+nrr-platform-windows = { path = "../../platform/windows" }
+# HW-0719 (C): neutral browser-history + DNS-resolver port types for the opt-in
+# seeder wiring (trait objects; the Windows impls come from platform-windows).
+nrr-platform-api = { path = "../../platform/api" }
+# Block 16.9.7 — runtime_deps opens a shared `Arc<Mutex<Connection>>`
+# for the settings IPC handlers and emits operational tracing on
+# autostart-probe failures.
+rusqlite = "0.32"
+tracing = "0.1"
+# Wire-format codec uses serde_json for length-prefixed JSON frames.
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+# Standard Rust binding for Windows Service Control Manager. MIT/Apache
+# (allowed under our license policy). 0.7 is the current major; pinned
+# to that band so SCM API surface stays stable through block 14.x.
+windows-service = "0.7"
+# Direct Win32 bindings for the named-pipe IPC server (block 16.1):
+# CreateNamedPipeW, ConnectNamedPipe, ReadFile/WriteFile on pipe handles,
+# SDDL → SECURITY_DESCRIPTOR conversion, OpenProcess + token info for
+# caller identity classification.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    # Block 16 (2026-06-27) #7 — service start-mode reconfigure + the targeted
+    # SERVICE_START DACL grant: ChangeServiceConfigW / QueryServiceConfigW /
+    # {Query,Set}ServiceObjectSecurity, and WTS session enumeration to resolve
+    # the console user's SID from a (non-SYSTEM) elevated process.
+    "Win32_System_Services",
+    "Win32_System_RemoteDesktop",
+] }
+
+[dev-dependencies]
+# Isolated temp directories for the stderr-capture file tests.
+tempfile = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+# Compiles `resources/app.rc` (the app icon) into the PE resource section
+# so the service executable carries the NetRuleRouter icon. Same crate and
+# single icon source as the launcher (`apps/desktop/launcher`).
+embed-resource = "2"
+
+[lints]
+workspace = true

@@ -60,6 +60,13 @@ notes/
 # For errors files for coding agents
 errors/
 
+# Captured runtime output. The service's own logs live under `errors/` and in
+# %ProgramData%, but a log or an NDJSON dump copied next to the sources for a
+# quick look carries hostnames, addresses and process names — never publish one
+# by accident.
+*.log
+*.ndjson
+
 # VS Code local settings
 .vscode/
 .history/
@@ -70,6 +77,9 @@ errors/
 .vscode/
 .codex/
 .claude/
+# Visual Studio's own workspace state: a multi-megabyte content index, a
+# SQLite browse database and per-user window layout. Local by nature.
+.vs/
 *.swp
 *.swo
 *~
@@ -85,6 +95,12 @@ cmake-build-*/
 build-*/
 CMakeCache.txt
 CMakeFiles/
+# An in-tree CMake/packaging output directory. `build-*/` above only catches
+# the suffixed variants; a plain `build/` or `dist/` next to the sources is one
+# stray `-B build` away.
+/build/
+/dist/
+**/build/CMakeCache.txt
 Makefile.Debug
 Makefile.Release
 object_script.*.Debug
@@ -97,8 +113,14 @@ ui_*.h
 *.jsc
 *.qrc.depends
 
-# One-off maintenance and probing scripts: useful locally, not part of the product.
-scripts/dev/
+# Developer scripts. The default is "internal" — task-list migrations and other
+# one-offs that only make sense against this checkout's own bookkeeping. The
+# exceptions below are tools anyone working on the code can reuse.
+# The pattern excludes the directory's CONTENTS, not the directory: git cannot
+# re-include a file whose parent directory is excluded.
+scripts/dev/*
+!scripts/dev/probe_hosts.py
+!scripts/dev/merge-duplicate-locale-keys.py
 __pycache__/
 *.pyc
 

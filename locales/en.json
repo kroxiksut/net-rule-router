@@ -1,0 +1,2709 @@
+{
+  "metadata": {
+    "language": "en",
+    "label": "English",
+    "nativeLabel": "English",
+    "version": "1.0",
+    "fallbacks": [
+      "en"
+    ]
+  },
+  "progress": {
+    "gui-started": "NetRuleRouter started.",
+    "eula-accepted": "License agreement accepted.",
+    "eula-declined": "License agreement declined — exiting.",
+    "first-run-wizard-shown": "Showing first-run setup (not completed yet).",
+    "connecting": "Connecting to the service…",
+    "connected": "Connected to the service.",
+    "offline": "Service not reachable — working offline.",
+    "reconnected": "Reconnected to the service.",
+    "disconnected": "Lost connection to the service.",
+    "subscribed": "Subscribed to live status updates.",
+    "subscribe-failed": "Could not subscribe to status updates.",
+    "log-title": "Startup & connection log",
+    "log-empty": "No events yet.",
+    "show-log": "Connection log",
+    "service-install-running": "Installing the service…",
+    "service-install-ok": "Service installed.",
+    "service-start-running": "Starting the service…",
+    "service-start-ok": "Service started.",
+    "service-stop-running": "Stopping the service…",
+    "service-stop-ok": "Service stopped.",
+    "service-restart-running": "Restarting the service…",
+    "service-uninstall-running": "Uninstalling the service…",
+    "service-uninstall-ok": "Service uninstalled.",
+    "service-failed": "Service operation failed",
+    "service-uac-declined": "Administrator prompt declined — operation cancelled."
+  },
+  "menu": {
+    "file": "File",
+    "view": "View",
+    "tools": "Tools",
+    "help": "Help"
+  },
+  "section": {
+    "interfaces-routes": "Interfaces and routes",
+    "rules": "Rules",
+    "diagnostics": "Diagnostics",
+    "logs": "Logs",
+    "settings": "Settings"
+  },
+  "action": {
+    "ok": "OK",
+    "copy": "Copy",
+    "copied": "Copied",
+    "collapse-navigation": "Collapse navigation",
+    "expand-navigation": "Expand navigation",
+    "full-reset": "Full reset…",
+    "open-main-window": "Open NetRuleRouter",
+    "open-about-window": "About",
+    "open-license-window": "Licenses",
+    "open-logs-folder": "Open logs folder",
+    "exit-application": "Exit",
+    "load-rule-list": "Load rules list...",
+    "browse": "Browse...",
+    "change": "Change...",
+    "import": "Import",
+    "update-rules-from-file": "Update rules from file",
+    "import-preset": "Import preset...",
+    "export-current-rule-list": "Export current list...",
+    "export-settings": "Export settings...",
+    "add": "Add",
+    "edit": "Edit",
+    "delete": "Delete",
+    "refresh": "Refresh",
+    "clear": "Clear",
+    "export": "Export",
+    "apply": "Apply",
+    "apply-tooltip-clean": "Everything on screen is already applied.",
+    "apply-tooltip-pending": "Send the changes on screen to the background service.",
+    "apply-tooltip-service-stopped": "The rules on screen are not applied to the service. It is stopped, so Apply saves them to your rules file for now and stays available until the service can take them.",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "close": "Close",
+    "copy-row": "Copy row",
+    "copy-message": "Copy message",
+    "copy-value": "Copy: ",
+    "next": "Next",
+    "back": "Back",
+    "finish": "Finish",
+    "search": "Search",
+    "reset-defaults": "Reset to defaults",
+    "revoke-admin": "Revoke admin approval",
+    "revoke-admin-tooltip": "End the temporary administrator approval granted this session. The next change will ask for approval again.",
+    "launch-on-startup": "Launch window on startup",
+    "minimize-to-tray": "Minimize to tray instead of close",
+    "refresh-interfaces": "Refresh interfaces",
+    "check-service-status": "Check service status",
+    "safe-rollback": "Safe rollback",
+    "temporary-disable-product-impact": "Temporarily disable product impact",
+    "check-for-updates": "Check for updates",
+    "reset-application-settings": "Reset application settings",
+    "pause-rules": "Disable rules",
+    "resume-rules": "Enable rules",
+    "collapse-submenu": "Collapse submenu",
+    "expand-submenu": "Expand submenu"
+  },
+  "label": {
+    "mode": "Mode",
+    "primary": "Primary",
+    "secondary": "Secondary",
+    "block": "Block",
+    "service": "Service",
+    "version": "Version",
+    "license": "License",
+    "build-channel": "Build channel",
+    "project-url": "Project",
+    "rule-type": "Rule type",
+    "target-route": "Target route",
+    "match-value": "Match value",
+    "comment": "Comment",
+    "yes": "Yes",
+    "no": "No",
+    "disabled": "disabled",
+    "language-ru": "Russian",
+    "language-en": "English"
+  },
+  "settings": {
+    "category": {
+      "application": "Application",
+      "presets": "Presets and settings"
+    },
+    "service": {
+      "title": "Service management",
+      "description": "NetRuleRouter runs as a Windows background service. Install or manage it from here. Administrator rights (a UAC prompt) are required for install / uninstall / start / stop.",
+      "pipe-path-label": "IPC pipe",
+      "last-checked": "Last checked",
+      "admin-hint": "These actions require administrator approval — asked once per session.",
+      "status": {
+        "running": "Running",
+        "stopped": "Stopped",
+        "start-pending": "Starting...",
+        "stop-pending": "Stopping...",
+        "not-installed": "Not installed",
+        "unknown": "Unknown",
+        "transition-hint": "This is normal and usually takes a few seconds — no action needed."
+      },
+      "reason": {
+        "not-registered": "Service is not registered in the system."
+      },
+      "action": {
+        "install": "Install service",
+        "uninstall": "Uninstall service",
+        "start": "Start service",
+        "stop": "Stop service",
+        "stop-tooltip": "Stops the background service. By default all routes are removed and every connection returns to your main connection; leak-protection blocks are always removed. (Turn on \"Keep matched routes on the additional adapter\" in Settings to keep your routed sites on the additional adapter — e.g. a work/corporate adapter.) Note: simply closing the app keeps routing active, because the service keeps running.",
+        "restart": "Restart service",
+        "open-logs": "Open service logs folder",
+        "gc-orphan-comments": "Clear orphan comments"
+      },
+      "auto-start": "Start with Windows",
+      "auto-start-help": "Service starts automatically on system boot when enabled.",
+      "start-mode": {
+        "heading": "When the service starts",
+        "with-windows": {
+          "label": "Start with Windows (recommended)"
+        },
+        "on-app-launch": {
+          "label": "Start when the app opens"
+        },
+        "help": "“Start with Windows” keeps your rules enforced from boot, before anyone logs in (best for always-on or managed setups). “Start when the app opens” runs the service only while you use NetRuleRouter and lets the app start it without an administrator prompt every time. Changing this needs administrator approval."
+      },
+      "launch-tray": {
+        "label": "Also start the tray at sign-in",
+        "description": "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “Start the tray automatically at sign-in” in General."
+      },
+      "crash-recovery": "Service will auto-restart up to 3 times after failures.",
+      "admin-auto-revoke": {
+        "title": "Administrator rights",
+        "disable-label": "Do not revoke administrator approval automatically",
+        "minutes-label": "Revoke after this long unused (minutes)",
+        "note": "After you approve administrator access, it stays available without new prompts. If it sits unused for this long, the app gives it up on its own; the next administrative action will ask again."
+      },
+      "logs-path-unavailable": "Service logs folder path unavailable."
+    },
+    "console": {
+      "title": "Command-line console",
+      "description": "NetRuleRouter ships a small console for service tasks: install, start, stop and check the service. Add its folder to your PATH to run it as \"nrr-cli\" from any terminal.",
+      "path-registered": "The console can be run from any terminal.",
+      "path-not-registered": "The console can only be run from its own folder — and in PowerShell you still have to spell it \".\\nrr-cli.exe\", because a bare name is not searched for in the current directory.",
+      "folder-label": "Console folder",
+      "add-to-path": "Add console to PATH",
+      "add-to-path-tooltip": "Adds the console's folder to your personal PATH. It affects your account only, needs no administrator rights, and changes nothing else on the list.",
+      "path-added": "The console was added to your PATH.",
+      "path-already-present": "The console was already on your PATH.",
+      "path-failed": "Could not add the console to your PATH.",
+      "new-terminal-hint": "Terminals that are already open keep the PATH they started with. Open a new one, or run this line in the current one:",
+      "profile-file-hint": "The line was added to %1."
+    },
+    "presets": {
+      "title": "Presets and settings",
+      "description": "Import or export rules in plain-text format. Each route has its own preset file; the other route's rules are carried over from the active revision on import.",
+      "import-primary": "Import primary route preset...",
+      "import-secondary": "Import secondary route preset...",
+      "export-primary": "Export primary route preset...",
+      "export-secondary": "Export secondary route preset...",
+      "full-settings-description": "Export adapter bindings, behavior mode, and rules-file paths as a single YAML file. Useful for backing up or transferring your settings.",
+      "export-full-settings": "Export full settings (YAML)...",
+      "bundled-presets": {
+        "title": "Bundled presets",
+        "label": "Show the bundled-preset quick-load row in Rules",
+        "description": "Shows a quick-load dropdown of bundled country/demo presets above the rules table. The \"Hide\" button on that row also turns this off."
+      },
+      "user-folder": {
+        "title": "My rule sets",
+        "description": "Point the quick-load dropdown at your own folder instead of the sets that come with the app. The folder can hold \"rules_primary.txt\" and \"rules_secondary.txt\" directly, or one subfolder per set — each subfolder's name becomes the entry in the dropdown.",
+        "placeholder": "Using the rule sets that come with the app",
+        "reset": "Use bundled sets",
+        "dialog-title": "Choose the folder with your rule sets",
+        "use-bundled-path": "Point at the sets that come with the app"
+      },
+      "save-as-set": {
+        "button": "Save current rules as a set...",
+        "needs-folder": "Choose a folder above first — that is where a new set is saved.",
+        "title": "Save rules as a set",
+        "prompt": "The current rules of both routes are saved as a new set in your folder. Name it so you can tell it apart later, for example \"work\" or \"home\".",
+        "name-placeholder": "Set name",
+        "name-invalid": "A name cannot contain \\ / : or \"..\" — it is a folder name, not a path.",
+        "confirm": "Save set"
+      },
+      "bundled-write-warning": {
+        "title": "This folder belongs to the app",
+        "body": "You are saving into the folder the app keeps its own rule sets in. Updating the app replaces that folder, and your set is lost with it. Pick a folder of your own above to keep sets safely.",
+        "dont-ask": "I understand — do not ask again",
+        "confirm": "Save here anyway"
+      },
+      "import-dialog-title": "Choose preset file to import",
+      "export-dialog-title": "Save preset as...",
+      "full-settings-dialog-title": "Save settings export as...",
+      "yaml-filter": "YAML files (*.yaml)",
+      "full-settings-exported": "Full settings exported."
+    },
+    "group": {
+      "general": "General",
+      "appearance": "Appearance",
+      "accessibility": "Accessibility",
+      "language": "Language",
+      "route-labels": "Route names",
+      "logs-diagnostics": "Logs and diagnostics",
+      "routing-behavior": "Routing behavior",
+      "experimental": "Experimental features",
+      "updates": "Check for updates",
+      "presets": "Preset import",
+      "block-notices": "Blocked-connection notices"
+    },
+    "note": {
+      "logs-diagnostics": "Preview controls are available on dedicated screens.",
+      "experimental": "This section is reserved for upcoming experimental options.",
+      "route-labels": "You can rename the two routes for the UI without changing routing behavior.",
+      "presets": "When enabled, selecting a preset for one route automatically opens a file picker for the other route."
+    },
+    "experimental": {
+      "in-development": "In development",
+      "allow-mode-a": {
+        "label": "Allow kill-switch mode A (legacy)",
+        "note": "Mode A is a legacy enforcement mode kept only for historical reference. It is not maintained, may not work, and can be removed in a future release. Mode B (the local DNS resolver) is the supported mechanism. Turn this on only if you specifically need to pick mode A in the routing settings."
+      },
+      "detailed-mode": {
+        "label": "Detailed mode",
+        "note": "Shows the fine-grained fake-IP switches (UDP relay, instant reset) under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way."
+      },
+      "pre-flight-apply-policy": {
+        "label": "Offer the pre-flight apply-check policy",
+        "note": "Adds \"Pre-flight, then all-or-nothing\" to the apply failure policy in Settings → Routing. The pre-flight checks themselves are still in development — until they land, this option behaves the same as All or nothing."
+      },
+      "isp-block-candidates": {
+        "label": "Suggest a rule when a site is blocked by your provider",
+        "note": "When a site will not open because your internet provider is blocking it, NetRuleRouter offers to move that site to your additional route instead of leaving it unreachable."
+      }
+    },
+    "field": {
+      "show-notifications": "Show notifications",
+      "notify-suggestion-changes": "Tell me when the suggested-addresses list changes",
+      "notify-block-notices": "Tell me when a connection gets blocked",
+      "hide-block-notice-addresses": "Hide addresses in these notifications",
+      "hide-block-notice-addresses-tooltip": "Replaces the destination with a generic label instead of the real hostname — useful when your screen is being shared or recorded.",
+      "reopen-last-section": "Open last section on startup",
+      "auto-confirm-adapter-id": "Auto-confirm a reinstalled additional adapter when its name matches",
+      "auto-confirm-adapter-id-tooltip": "When an additional adapter is reinstalled and gets a new ID, re-bind it automatically if the saved name uniquely matches a live adapter. Turn off to confirm each change manually via the banner.",
+      "tooltips": "Enable tooltips",
+      "ui-scale": "UI scale",
+      "theme": "Theme",
+      "system-font": "System font",
+      "route-primary-label": "Primary route name",
+      "route-secondary-label": "Secondary route name",
+      "route-behavior-mode": "Default routing behavior",
+      "block-secondary-traffic": "Block connections when secondary is unavailable",
+      "rules-file-change-mode": "When rules file changes on disk",
+      "include-child-processes": "Apply rules to child processes",
+      "show-other-os-rules": "Show rules for other operating systems",
+      "import-both-files-together": "Import both route files together"
+    },
+    "system-font": {
+      "option-system-default": "System default",
+      "option-segoe-ui": "Segoe UI",
+      "option-arial": "Arial",
+      "option-tahoma": "Tahoma",
+      "option-verdana": "Verdana"
+    },
+    "routing": {
+      "show-more": "Show details",
+      "show-less": "Hide details",
+      "zone-ip-priority": {
+        "label": "Zone vs. IP priority",
+        "description": "When a Zone rule and an Exact IP rule both match the same destination, choose which takes priority.",
+        "option-prefer-ip": "Exact IP wins (default)",
+        "option-prefer-zone": "Zone wins"
+      },
+      "failure-policy": {
+        "title": "Apply failure policy",
+        "description": "Choose how the service handles partial failures during multi-step rule application.",
+        "option": {
+          "best-effort": {
+            "label": "Best effort (recommended)",
+            "description": "Rules that can't be enforced on this host (app not installed, host not yet resolved, missing adapter) are skipped and reported; the rest are applied. Default."
+          },
+          "all-or-nothing": {
+            "label": "All or nothing",
+            "description": "If any single rule can't be enforced, the whole apply rolls back. Exact-or-nothing."
+          },
+          "pre-flight": {
+            "label": "Pre-flight, then all-or-nothing (experimental)",
+            "description": "Run predictable-failure checks before applying. Apply still rolls back on real errors. The checks themselves are still in development — this behaves the same as All or nothing today.",
+            "description-stale": "Selected, but the Experimental opt-in for this option is off. The checks are still in development — this behaves the same as All or nothing today."
+          }
+        },
+        "requires-elevation": "Changing this setting requires administrator elevation."
+      },
+      "pause": {
+        "title": "Apply rules",
+        "status-active": "Rules are active",
+        "status-paused": "Rules are disabled",
+        "action-disable": "Disable rules",
+        "action-enable": "Enable rules",
+        "persistence-hint": "Disabling stops applying rules until you re-enable them. Setting persists across restarts.",
+        "paused-since": "Paused since {timestamp}",
+        "no-tray-warning": "Tray is not running. Rules apply only while the tray is active."
+      },
+      "default-route": {
+        "title": "Default route for unmatched traffic",
+        "description": "Where traffic that matches no rule is sent. Rules always take priority. Default: primary route."
+      },
+      "enforcement-mode": {
+        "label": "How routed traffic is enforced",
+        "option-reactive": "Reactive leak protection (Mode A, default)",
+        "option-resolver": "Local DNS resolver (Mode B) — enforce before connect",
+        "note": "Mode B sends system DNS through a local resolver so a routed site is enforced before its first packet — closing the leak window Mode A can't. It is invasive (redirects DNS) and IPv4-only; leave it off unless you are testing it. Changing this applies immediately — no service restart needed."
+      },
+      "dns-via-secondary": {
+        "label": "DNS through the tunnel",
+        "note": "Site names are looked up through the additional connection instead of your provider's resolver, so the provider can neither see nor alter the answers. Some providers return a wrong or empty address for certain sites, which makes those sites fail to load even when routing is correct. If the additional connection is not available, lookups fall back to the main one. Off by default."
+      },
+      "dns-fast-answers": {
+        "label": "Fast DNS answers",
+        "note": "Answer apps immediately; route protection finishes in the background. Turning this off can slow down page loads."
+      },
+      "fake-ip": {
+        "label": "Route sites over virtual addresses (fake-IP)",
+        "note": "Each routed site is answered with its own virtual address, so routing stays per-site even when several sites share one real server address — and protection no longer races the first connection. Requires Mode B (local DNS resolver). On Windows, turning this on loads the bundled Wintun virtual-adapter driver (signed by WireGuard LLC). Off by default.",
+        "driver-status": "Virtual-adapter driver (Wintun): "
+      },
+      "fake-ip-udp-relay": {
+        "label": "Fake-IP UDP relay (experimental)",
+        "note": "Carry QUIC/HTTP-3 through the relay instead of forcing browsers to fall back to TCP."
+      },
+      "fake-ip-instant-rst": {
+        "label": "Instant reset when the additional route is unavailable",
+        "note": "On (default): apps get an immediate connection reset when the additional route can't be resolved, so they can retry or fail over right away. Off: connections are held for up to 10 seconds while the route comes back, instead of resetting immediately."
+      },
+      "mode-a-coverage": {
+        "label": "When the additional route is unavailable (Mode A)",
+        "option-fail-closed-unknown": "Block all unresolved traffic (default, safest)",
+        "option-per-ip": "Block only the learned addresses of routed sites (may briefly leak)",
+        "note": "Applies while leak protection is armed and the additional adapter is down or unresolved. “Block all unresolved traffic” closes the gap where a routed site rotates to a fresh, not-yet-learned IP that would otherwise leak over the primary link. VPN clients and apps routed to the primary adapter stay exempt so the tunnel can always reconnect."
+      },
+      "hosts-bypass": {
+        "label": "Resolve routed domains bypassing the hosts file",
+        "note": "On (default): routed domains are resolved directly against your DNS server, so a local hosts/adblock entry pinning a routed site to 127.0.0.1 cannot silently disable its routing. Turn off only if you rely on hosts-file overrides for the sites you route."
+      },
+      "auto-rules": {
+        "title": "Auto-rules",
+        "label": "Missing companion domains",
+        "mode-off": "Off",
+        "mode-suggest": "Suggest only (default)",
+        "mode-auto": "Apply automatically",
+        "note": "A routed site often loads its images and video from other domains your rules do not list, so the page opens but its content does not. By default NetRuleRouter collects these missing domains and offers them in the tray — nothing is added to your rules without your confirmation. “Apply automatically” adds them for you; “Off” stops collecting them altogether.",
+        "auto-save-note": "Added addresses are written straight into the rules files your routes are linked to.",
+        "eager-label": "Offer content-delivery domains without waiting for analysis",
+        "eager-note": "Off by default. Content-delivery domains are usually named alike, so this makes media load sooner. Advertising and tracking networks are named alike too, so some of what appears will not be worth routing — review before you accept it."
+      },
+      "doh-lockdown": {
+        "title": "Block browser DoH/DoT",
+        "label": "Block browser DoH/DoT",
+        "note": "Off by default. Browsers that resolve names over DNS-over-HTTPS (DoH) or DNS-over-TLS (DoT) hide their queries, so routed sites resolved that way bypass leak protection. Turning this on blocks known encrypted-DNS endpoints so name resolution falls back to plaintext DNS that NetRuleRouter can observe.",
+        "scope-label": "When to apply",
+        "scope-leak-protection-only": "Only while leak protection is active (recommended)",
+        "scope-always": "Always",
+        "scope-leak-protection-only-note": "Blocks encrypted DNS only while a block-all leak guard is armed, where DoH would otherwise defeat observation. Leaves DoH working the rest of the time. Recommended.",
+        "scope-always-note": "Blocks encrypted DNS at all times, even when leak protection is off — maximum observability, but it breaks DoH/HTTP-3 for every app and can slow name resolution.",
+        "details": "Blocking works by denying connections to a known list of DoH/DoT resolver endpoints (edited below). Apps then fall back to the operating system's plaintext DNS, which the observer reads to keep routing and leak protection accurate. Some apps pin their own resolver and may show connection errors until DoH is turned off in their own settings; this does not affect apps that use the system resolver.",
+        "resolvers": {
+          "manage": "Manage resolver list",
+          "hide": "Hide resolver list",
+          "requires-admin": "This is a shared, machine-wide list. Saving changes requires administrator approval.",
+          "description": "Endpoints blocked when the lockdown is active. Add a public resolver by IP address or hostname; untick a row to keep it in the list but stop blocking it.",
+          "filter": "Filter by address or note…",
+          "kind-ip": "IP",
+          "kind-host": "Host",
+          "remove": "Remove",
+          "loading": "Loading…",
+          "empty": "No resolvers in the list.",
+          "add-target": "IP address or hostname",
+          "add-comment": "Note (provider / country)",
+          "add": "Add",
+          "save": "Save resolver list",
+          "saved": "Resolver list saved.",
+          "save-failed": "Could not save the resolver list: ",
+          "load-failed": "Could not load the resolver list: ",
+          "uac-declined": "Administrator approval was declined; the resolver list was not saved."
+        }
+      },
+      "hosts-file": {
+        "label": "OS hosts file",
+        "open-folder": "Open folder",
+        "note": "The OS hosts file can redirect or block a hostname before NetRuleRouter sees it (ad-block lists often map hosts to 127.0.0.1). NetRuleRouter never edits it — open the folder to inspect or edit it yourself (requires administrator)."
+      },
+      "hosts-group": {
+        "title": "Hosts file"
+      },
+      "liveness-window": {
+        "label": "Secondary tunnel liveness window",
+        "option-disabled": "Disabled (default)",
+        "option-custom": "Custom…",
+        "seconds-unit": "seconds",
+        "custom-range": "Seconds — from 5 to 3600.",
+        "note": "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, leak protection fail-closes even if no traffic has failed yet. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings."
+      },
+      "rule-lock": {
+        "heading": "Who can change the rules",
+        "allow": {
+          "label": "Allow users to change routing rules",
+          "tooltip": "On (default): anyone signed in to this computer can add, edit and apply their own routing rules. Turn it off on company laptops, or for parental control, so only an administrator decides where traffic goes."
+        },
+        "help": "Affects the whole machine and needs administrator approval. While it is off, the Rules view is read-only for everyone: viewing, searching and exporting still work, but adding, editing, applying, importing and resetting to the baseline are turned off. The background service refuses the change as well, so the lock does not depend on this window."
+      },
+      "system-level": {
+        "title": "System-level routing (requires administrator)"
+      },
+      "vpn-client": {
+        "title": "Your VPN client",
+        "note": "Point NetRuleRouter at the program you use as your VPN so its traffic keeps flowing over your main link while leak protection is on.",
+        "current": "Current: {name}",
+        "none": "Not set",
+        "set-up": "Set up my VPN",
+        "change": "Change"
+      },
+      "shared-addresses": {
+        "title": "Shared addresses (one IP serving several sites)",
+        "routing-axis": "While the secondary adapter is up: whether a shared IP is routed through it.",
+        "blocking-axis": "While the secondary adapter is down: whether shared addresses are blocked."
+      },
+      "kill-switch": {
+        "title": "Leak protection",
+        "set-up-vpn": "Set up my VPN",
+        "enable-label": "Enable kill switch / leak protection (block traffic when the additional adapter is down)",
+        "enable-note": "Off by default. While off, nothing is blocked — if the additional adapter drops, traffic falls back to your main link (this can expose your real address, which is fine if you don't need blocking). Turn it on to reveal the blocking options below.",
+        "always-on": "While leak protection is ON and the additional adapter can't be reached — it is down, not started, or was reinstalled under a new name — traffic matched by your rules is blocked instead of leaking over your primary route. Choose what happens below.",
+        "label": "Leak protection: if a site routed to the additional adapter is unavailable, block it instead of leaking over the primary route",
+        "summary": "If the additional adapter drops, traffic matched by your rules is blocked instead of leaking over your primary route.",
+        "description": "Closes the leak window with no race. Protection is armed automatically as soon as an additional adapter is assigned, and it stays armed whenever that adapter can't be found — it is down, was never started, or was reinstalled under a new name/ID (common with VPNs). In every one of those cases traffic that should use the adapter is blocked rather than sent over the primary route under your real address. What gets blocked depends on the routing behavior above: 'only selected' protects the matched destinations — the sites, IPs and applications you routed to the additional adapter; 'everything via the additional adapter' blocks all traffic except your local network, DHCP and the route exceptions. Traffic you did NOT route to the additional adapter keeps using your normal connection by design, so a ping to a random site you never routed is not blocked.",
+        "coverage-note": "How coverage works: protection tracks the IP addresses a routed site resolves to, learned by watching your system's DNS. It extends automatically as new addresses appear (e.g. when a site behind a CDN rotates IPs), but a brand-new address has a brief unprotected moment until it is seen. Apps that resolve names themselves over DNS-over-HTTPS (DoH) bypass this — turn off DoH in the browser/app for full protection. A diagnostic ping is the hardest case: it fires a single packet the instant a name resolves — before protection can catch up — and pinging a bare IP address skips name-based routing entirely; neither reflects how apps normally connect.",
+        "block-all-label": "When the additional adapter is unavailable, block ALL traffic (kill-switch), not just its routed sites",
+        "block-all-note": "Most aggressive: while the additional adapter is down, only your local network and already-known primary sites keep working — everything else, including ping and new name (DNS) lookups, is blocked. This is what stops routed sites (and ICMP) from leaking to the primary link. Requires the leak-guard (fail-closed) to be on. While armed, the FIRST connection to a newly-seen allowed site can fail — its permit installs right after the name is first observed, so a refresh a second later goes through. Note: leak protection currently covers IPv4 only.",
+        "block-all-alert": "Heads up: with this on, if the additional adapter (VPN) goes down your normal internet stops too — only your local network keeps working — until it comes back. Leave it off if you want your main connection to keep working when the VPN drops.",
+        "allow-dns-label": "Allow name resolution over the main link while blocked (keep zones resolving)",
+        "allow-dns-note": "On by default: a narrow exception (port 53 only) keeps name resolution working over your main link while blocked, so zones keep resolving — a deliberate, narrow DNS leak. Turn this off only for strict blocking: with DNS cut too, you have no working internet at all until the block clears. Useful with the local DNS resolver (Mode B) so zone rules keep working.",
+        "shared-strict-label": "Strict: also block addresses shared with regular sites (may break them)",
+        "shared-strict-note": "Off (smart, recommended): an address that a routed site shares with an ordinary site is not blocked, so the ordinary site keeps working — at the cost of the routed site's traffic to that shared address not being protected while the additional adapter is down. On (strict): every routed address is blocked, including shared ones — no leak, but co-hosted ordinary sites (for example google.com sharing addresses with routed Google services) stop opening while the block is active.",
+        "shared-smart-warning": "Kill-switch strictness is reduced: shared addresses excluded from blocking — ",
+        "shared-smart-list-title": "Excluded addresses",
+        "shared-smart-list-unavailable": "The running service reports how many addresses were excluded, but not which ones.",
+        "copy-addresses": "Copy addresses",
+        "block-all-active-banner": "Leak protection is blocking unknown traffic: the additional adapter can't be found (down, not started, or reinstalled under a new ID). Sites open as they become known; reconnect the VPN or re-bind the adapter to lift the block.",
+        "block-all-warn-label": "Warn when leak protection blocks all unknown traffic",
+        "block-all-warn-note": "On by default: a banner appears while the full block is active. Turn it off if you deliberately keep the service running with the VPN disconnected (e.g. from OS startup) and don't want the reminder.",
+        "failure-mode": {
+          "label": "If the additional adapter can't be found or is unavailable (offline)",
+          "option-fail-closed": "Block traffic (recommended)",
+          "option-fail-open": "Allow traffic and warn me",
+          "desc-fail-closed": "Safest: if NetRuleRouter can't find the additional adapter (it's down, or the binding is stale), matched traffic is blocked instead of leaking over the primary route. Leak protection always works.",
+          "desc-fail-open": "Convenience: if the additional adapter can't be found, matched traffic keeps flowing over the primary route and a warning is shown. Your real address may be exposed."
+        },
+        "protocols": {
+          "label": "Protocols leak protection cuts",
+          "tcp": "TCP",
+          "udp": "UDP",
+          "icmp": "ICMP (ping)",
+          "igmp": "IGMP",
+          "gre": "GRE",
+          "esp": "ESP",
+          "other": "Other (legacy)",
+          "desc": "Which IP protocols leak protection drops. ICMP covers ping/traceroute. TCP/UDP are enforced at the connection layer; ICMP/IGMP/GRE/ESP at the packet layer. All on by default — uncheck to let a protocol through even while the block is active.",
+          "tcp-tooltip": "Most web, email and app traffic (HTTP/HTTPS and similar).",
+          "udp-tooltip": "DNS, video calls, games and other real-time traffic.",
+          "icmp-tooltip": "Ping and traceroute. These live only at the packet layer, so ICMP must be checked for the block to stop a ping.",
+          "igmp-tooltip": "Multicast group membership on the local network.",
+          "gre-tooltip": "A tunnelling protocol used by some VPNs (e.g. PPTP).",
+          "esp-tooltip": "Encrypted IPsec VPN payloads.",
+          "other-tooltip": "Legacy option: previously blocked every remaining IP protocol system-wide. The emergency block now cuts only the named protocols above; exotic protocols outside this list are not blocked."
+        }
+      }
+    },
+    "logs": {
+      "level": {
+        "label": "Log detail level",
+        "description": "Controls how much detail appears in the Logs screen and is written to the log store.",
+        "option-info": "Info",
+        "option-warning": "Warning",
+        "option-debug": "Debug",
+        "option-critical": "Critical only",
+        "desc-info": "Normal operation messages. Recommended for everyday use.",
+        "desc-warning": "Warnings about recoverable conditions (stale cache, brief unavailability).",
+        "desc-debug": "Detailed trace output — rule matching decisions and availability snapshots.",
+        "desc-critical": "Critical errors only. Minimum log volume."
+      }
+    },
+    "advanced": {
+      "browser-stub": {
+        "label": "Browser stub on connection block",
+        "description": "When Fail-Closed blocks a browser connection, show a built-in stub page instead of a silent connection error. Requires the process to be identified as a known browser.",
+        "experimental-warning": "Experimental — behaviour may change without notice."
+      }
+    },
+    "routing-behavior": {
+      "ip-routing-note": "Routing works by IP address. A website that checks and shows your IP (like <a href=\"https://2ip.ru\">2ip.ru</a> or <a href=\"https://whatismyipaddress.com\">whatismyipaddress.com</a>) can still display your provider's address: its measurement endpoint often lives on a different IP than the page itself, or a single IP is shared by several sites. If you use a general-purpose VPN as the additional adapter, such a site can also keep showing your provider's IP and country when it is not one of your routed rules — that traffic goes over your primary link, while your routed sites still go through the VPN. This is a known limitation, not a routing failure. Per-site (per-hostname) steering on a shared IP is not supported yet.",
+      "include-subdomains": {
+        "label": "Also cover subdomains for domain rules (treat “example.com” as “example.com” + “*.example.com”)",
+        "note": "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only."
+      },
+      "shared-ip": {
+        "label": "When a routed domain shares an IP address with other sites",
+        "option-majority-of-ip": "Route the shared IP only if most sites on it are yours (balanced)",
+        "option-majority-of-rules": "Route the shared IP only if it holds most of your rules (cautious)",
+        "option-any-rule-domain": "Always route the whole shared IP (aggressive)",
+        "note": "Some sites (e.g. behind Cloudflare) share one IP with unrelated sites, and IP routing can't tell them apart. “Balanced” routes such an IP through the additional adapter only when your sites are the majority on it; “Cautious” only when that IP carries most of your rules; “Aggressive” always routes it (the others on it come along too). Truly separating two sites on one IP by name is not implemented in the current version."
+      },
+      "mode": {
+        "prefer-primary": {
+          "label": "Selected sites only (via the additional adapter)",
+          "description": "Only the sites, IPs and apps in your rules use the additional adapter; all other traffic stays on your main connection. It routes by resolved IP address, so sites on shared CDNs or apps using DNS-over-HTTPS can occasionally slip onto your main connection. For a guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”."
+        },
+        "prefer-secondary-when-available": {
+          "label": "Everything via the additional adapter",
+          "description": "All traffic goes through the additional adapter while it is available. If it drops, traffic falls back to your main connection — your real address may be exposed until it reconnects."
+        },
+        "strict-secondary-fail-closed": {
+          "label": "Everything via the additional adapter — no leaks",
+          "description": "All traffic goes through the additional adapter. If it drops, everything is blocked — nothing ever leaks over your main connection. This is the strongest no-leak guarantee (recommended when you use a VPN). Requires an additional adapter to be assigned.",
+          "warning": "If the additional adapter becomes unavailable, ALL traffic is blocked until it reconnects or you change this setting."
+        }
+      },
+      "default-mode-note": "When no additional adapter is configured, your main connection is used by default.",
+      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops."
+    },
+    "revisions": {
+      "retention": {
+        "title": "Revisions retention",
+        "description": "Controls how long superseded, rejected, and rolled-back revisions are kept before pruning.",
+        "superseded-days": "Keep superseded revisions for (days)",
+        "superseded-count": "Maximum superseded revisions",
+        "rejected-days": "Keep rejected revisions for (days)",
+        "rolledback-days": "Keep rolled-back revisions for (days)",
+        "rolledback-count": "Maximum rolled-back revisions",
+        "pin-lkg": "Always keep last known-good revision",
+        "pin-lkg-hint": "The most recent superseded revision is pinned and excluded from age and count limits.",
+        "last-cleanup": "Last cleanup: {timestamp}",
+        "last-cleanup-never": "Last cleanup: never",
+        "save": "Save",
+        "saved": "Saved"
+      }
+    },
+    "autosave": {
+      "label": "Save changes automatically after",
+      "unit": "s",
+      "pending": "Unsaved — saving shortly",
+      "help": "Changes on this page are saved automatically once you stop editing, when you press Apply, and when you leave the page. Reset restores the factory defaults."
+    },
+    "general": {
+      "autostart": {
+        "label": "Start NetRuleRouter tray automatically at sign-in",
+        "description": "Adds an entry under HKEY_CURRENT_USER\\…\\Run that launches the tray icon.",
+        "state": {
+          "enabled": "Enabled",
+          "disabled": "Disabled",
+          "overridden": "Registry value points to another binary — toggle to repair.",
+          "absent": "No autostart entry."
+        }
+      },
+      "show-welcome": {
+        "label": "Show welcome wizard again...",
+        "description": "Re-runs the first-launch flow: service install prompt (if not yet installed) and then the preset wizard. Useful when you want to import a different starter rule set."
+      },
+      "autoload": {
+        "title": "Auto-load rules on startup",
+        "label": "Load rules from the last-used files automatically at startup",
+        "description": "When off, NetRuleRouter shows whatever the service already has and does not re-read the files on launch. The remembered file paths are kept."
+      },
+      "merge-conflict": {
+        "title": "Merging file and app rules",
+        "union": "Ask me (resolve each conflict)",
+        "file-wins": "File wins (prefer the linked file)",
+        "service-wins": "Service wins (prefer the active rules)",
+        "description": "When you merge a linked rules file with the rules the app is already enforcing, this decides who wins for a rule that exists on both sides but differs. \"Ask me\" keeps both and lets you pick per rule; \"File wins\" / \"Service wins\" resolve automatically."
+      },
+      "forget-binding": {
+        "label": "Forget file binding",
+        "description": "Clears the remembered rules file paths. The next launch loads nothing from disk — you see exactly what the service has."
+      },
+      "import-only-active": {
+        "title": "Importing presets",
+        "label": "Import only active rules",
+        "description": "When on, rules that are turned off in the imported preset (for example application rules, which can't route yet) are skipped instead of added as disabled rows. Turn off to import everything."
+      }
+    },
+    "updates": {
+      "not-implemented": "This feature is not yet implemented and will be available in a future release.",
+      "compat-banner-mode": {
+        "label": "Compatibility banner",
+        "option-auto": "Show on mismatch (automatic)",
+        "option-always": "Always show",
+        "option-never": "Never show",
+        "description": "Controls when the GUI shows the version-mismatch banner. \"Automatic\" only warns on an incompatible protocol."
+      }
+    },
+    "traffic": {
+      "category": "Traffic statistics",
+      "title": "Traffic statistics",
+      "description": "How much traffic goes through the additional (VPN) adapter versus directly over the primary — received and sent per adapter.",
+      "through-secondary": "Through additional adapter",
+      "through-primary": "Through primary adapter",
+      "received": "Received",
+      "sent": "Sent",
+      "period": "Period",
+      "period-today": "Today",
+      "period-today-note": "All traffic accounted by the service today, with or without the additional adapter",
+      "period-session": "Additional adapter session",
+      "period-session-note": "Counted while the additional adapter session is active",
+      "session-none": "The additional adapter has not come up yet — no session so far",
+      "session-last": "Showing the last finished session",
+      "master-toggle": "Count traffic",
+      "count-loopback": "Count local (localhost) traffic",
+      "count-virtual": "Count virtual (VM) adapters",
+      "retention-days": "Keep daily history for (days)",
+      "export-csv": "Export CSV",
+      "export-unit": "Export units",
+      "reset": "Reset statistics",
+      "no-data": "No data yet — counting starts once traffic flows.",
+      "service-stopped": "Statistics are not being collected while the service is stopped.",
+      "total-session": "Session total",
+      "total-all-time": "Total (all time)",
+      "role-primary": "Primary",
+      "role-secondary": "Additional",
+      "role-loopback": "Local (localhost)",
+      "role-virtual": "Virtual (VM)",
+      "tunnel-overlap-note": "While a VPN session is active, the primary row excludes traffic that transited into the tunnel.",
+      "address-local": "IP",
+      "address-external": "external"
+    },
+    "storage": {
+      "title": "Storage usage",
+      "description": "On-disk footprint of the service state, cache, and log stores.",
+      "state-db": "Service state database",
+      "cache-db": "FQDN/IP cache",
+      "operational-logs": "Operational logs",
+      "audit-logs": "Audit logs",
+      "total": "Total",
+      "refresh": "Refresh",
+      "scanning": "Scanning…",
+      "unavailable": "Unavailable"
+    },
+    "diagnostics": {
+      "service-stability": {
+        "title": "Service stability",
+        "help": "These options only affect the control channel (IPC). Network policy enforcement runs independently.",
+        "save": "Save",
+        "saved": "Saved",
+        "save-failed": "Save failed",
+        "reset": "Reset",
+        "reset-tooltip": "Reset to factory defaults (recoverable, 20 restarts, 100 ms, 5 s)",
+        "ipc": {
+          "policy": {
+            "label": "Control-channel failure policy",
+            "recoverable": {
+              "label": "Recoverable (recommended)",
+              "help": "If the GUI ↔ service control channel fails, the supervisor restarts it automatically. Policy enforcement keeps running. After all retry attempts are exhausted, the GUI marks the channel as unavailable but the service continues operating."
+            },
+            "critical": {
+              "label": "Critical (fail-fast)",
+              "help": "Any control-channel failure puts the service into recovery mode. Policy enforcement halts until the operator restarts the service. Use for strict compliance scenarios."
+            }
+          },
+          "max-restarts": {
+            "label": "Max restart attempts"
+          },
+          "backoff-base": {
+            "label": "Initial backoff (ms)"
+          },
+          "backoff-cap": {
+            "label": "Max backoff (s)"
+          },
+          "cap-below-base": "Max backoff must be greater than or equal to initial backoff."
+        },
+        "verbose": {
+          "label": "Verbose service logging",
+          "tooltip": "When enabled, the service writes tracing::debug events to operational NDJSON. Applies immediately, no restart required.",
+          "help": "Useful for diagnosing rare IPC or mutation issues. Leave off in normal operation — log volume grows substantially."
+        }
+      },
+      "conn-trace": {
+        "heading": "Connection trace (diagnostic)",
+        "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Requires service restart.",
+        "ndjson": {
+          "label": "Write connection trace to service log (NDJSON)",
+          "tooltip": "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/additional adapter)."
+        },
+        "gui": {
+          "label": "Show connection trace in diagnostics (GUI)",
+          "tooltip": "Surfaces the connection trace in the diagnostics log view (also writes it to NDJSON)."
+        },
+        "help": "Privacy-sensitive: the trace contains per-connection process names and remote addresses. Leave off in normal operation."
+      },
+      "rule-scope": {
+        "heading": "When routing rules are enforced",
+        "service-driven": {
+          "label": "Keep enforcing while the service runs (even when the app is closed)",
+          "tooltip": "On (default): the service enforces your rules continuously — from boot, even with no window or tray icon open — until the service is stopped. Best for always-on or managed/business setups. Off: rules apply only while the app or tray is running; fully exiting the app removes every added route and returns the network to normal."
+        },
+        "help": "Affects the whole machine and needs administrator approval. On = always-on (managed/business deployments). Off = active only while you keep the app open. Stopping the service always clears the routes."
+      },
+      "routing-stop": {
+        "heading": "When routing is paused or the service stops",
+        "persist": {
+          "label": "Keep rule routes on the additional adapter after pause/stop (route persistence, not leak protection)",
+          "tooltip": "Default (off): full teardown — every route is removed and ALL traffic returns to your main connection; matched sites stop using the additional adapter. Turn ON to keep the matched routes on the additional adapter — useful for a work/corporate additional adapter, so you keep reaching corporate resources while general routing is paused; for a general-purpose additional adapter leave it off so everything returns to your main connection. NetRuleRouter's overlays are still removed either way. Leak-protection blocks are always removed on pause/stop, so a paused or stopped service can never lock you out."
+        },
+        "help": "Applies to both “safe disable”/pause and stopping the service. Affects the whole machine and needs administrator approval. Note: simply closing the app keeps routing active because the background service keeps running — use Stop service (or Disable) to turn routing off."
+      },
+      "cache-refresh": {
+        "heading": "Address cache refresh",
+        "label": "Re-resolve routed sites every",
+        "unit": "min",
+        "help": "How often a routed site's IP addresses are refreshed (1 min – 24 h). Site IPs rarely change, so a longer interval means less network activity; the last known address is always kept and used for routing and leak-protection until a fresh one is obtained, so lengthening this never weakens blocking."
+      },
+      "show-audit-tab": {
+        "label": "Show security audit tab",
+        "help": "The security audit trail is always recorded, regardless of this setting. This only shows or hides the audit viewing tab in the Logs view."
+      }
+    },
+    "block-notices": {
+      "forever": "Forever",
+      "mutes": {
+        "heading": "Active mutes",
+        "row-host": "Host: {name}",
+        "row-app": "Application: {name}",
+        "row-all": "All blocked-connection notices",
+        "until-timestamp": "Until {timestamp}",
+        "empty": "No active mutes.",
+        "loading": "Loading…",
+        "load-failed": "Could not load the mute list: ",
+        "remove-failed": "Could not remove the mute: ",
+        "clear-failed": "Could not clear the mutes: ",
+        "row-reason": "Reason: {name}"
+      },
+      "add": {
+        "heading": "Add a mute",
+        "description": "The notification's quick-mute options only offer a few fixed lengths. Use this form for a duration of your own, or to mute indefinitely.",
+        "scope-label": "What to mute",
+        "scope-all": "Every blocked-connection notice",
+        "scope-host": "One host",
+        "scope-app": "One application",
+        "host-placeholder": "Hostname, exactly as shown in the notification",
+        "app-placeholder": "Application (process) name, exactly as shown in the notification",
+        "duration-label": "For how long",
+        "duration-unit-minutes": "Minutes",
+        "duration-unit-hours": "Hours",
+        "duration-unit-days": "Days",
+        "failed": "Could not add the mute: ",
+        "saved": "Mute added."
+      }
+    }
+  },
+  "vpn-onboarding": {
+    "title": "Your VPN client",
+    "heading": "Do you use a VPN?",
+    "intro": "Point NetRuleRouter at it so it keeps working when leak protection is on. We look at your running programs and installed apps — nothing is sent anywhere.",
+    "multi-hint": "Tick every program that's part of your VPN — for example a client together with its background service or command-line helper. All of them will keep working over your main link.",
+    "scan": "Scan for VPN apps",
+    "scan-again": "Scan again",
+    "scanning": "Scanning…",
+    "empty": "No VPN apps found. If you use one, pick it manually below.",
+    "not-scanned-yet": "Run a scan to look for VPN apps.",
+    "scan-failed": "Could not scan for VPN apps. You can pick your VPN manually below.",
+    "running": "running now",
+    "not-found": "not found — pick manually",
+    "source-running-process": "detected as a running program",
+    "source-installed-program": "found among installed programs",
+    "manual-pick": "My VPN isn't listed / pick it manually",
+    "select-all": "Select all",
+    "clear-selection": "Clear selection",
+    "manual-pick-title": "Choose your VPN program",
+    "manual-pick-filter": "Programs (*.exe)",
+    "manual-pick-all": "All files (*)",
+    "confirm": "This is my VPN",
+    "skip": "I don't use a VPN",
+    "confirmed-status": "NetRuleRouter will keep {name} working over your main link while leak protection is on.",
+    "confirmed-status-no-path": "Noted {name} as your VPN. Pick its program file to finish setup.",
+    "confirmed-status-multi": "NetRuleRouter will keep your {count} VPN programs working over your main link while leak protection is on.",
+    "skipped-status": "No VPN set up. You can set one up later from Settings -> Routing.",
+    "service-write-failed": "Could not save to the routing service — will retry on next apply.",
+    "manual-pick-status": "Choose your VPN program file…"
+  },
+  "app-groups": {
+    "title": "Application and device routes",
+    "subtitle": "detected on this computer",
+    "open-button": "Set up routes",
+    "entry-note": "Assign a route to the virtual machines, emulators and peer-to-peer apps found on this computer.",
+    "tab-virtualization": "Virtual machines and emulators",
+    "tab-peer-to-peer": "Torrents and P2P",
+    "scan-again": "Scan again",
+    "scanning": "Scanning…",
+    "empty": "Nothing detected on this computer. You can add a program as an ordinary application rule.",
+    "vm-note": "Virtual machine traffic follows the route assigned to its program. The default is the main route. A machine's local networks (host-to-guest access) always keep working, whichever route you pick.",
+    "p2p-note": "These programs are not blocked unless emergency block (kill switch) is on. The assigned route applies to their bulk connections; their peers are not added to zone rules.",
+    "group": {
+      "hypervisor": "Hypervisors",
+      "kernel-virtual-net": "Kernel virtual networks",
+      "android-emulator": "Android emulators",
+      "console-emulator": "Console emulators",
+      "bittorrent": "BitTorrent",
+      "p2p-file-sharing": "P2P file sharing and sync",
+      "crypto-node": "Crypto nodes"
+    },
+    "group-assignable-hint": "route can be assigned",
+    "group-display-only-hint": "for information only",
+    "kernel-nat-note": "WSL, Hyper-V and Docker traffic is handled by the kernel and does not belong to any process, so it cannot be assigned a route — it always uses the main route. Flexible routing for these environments is planned for the future.",
+    "route-locked": "Main",
+    "badge-running": "running",
+    "badge-installed": "installed",
+    "badge-feature": "system component",
+    "footer-note": "Can't find your program? Add it as an ordinary application rule, or tell us through any channel — the dictionary keeps growing.",
+    "apply": "Apply",
+    "cancel": "Cancel",
+    "confirmed-status": "Routes updated for {count} program(s).",
+    "legend-running": "running — the process is active right now",
+    "legend-installed": "installed — found in the program list",
+    "legend-feature": "system component — detected via an OS service"
+  },
+  "routing": {
+    "status": {
+      "active": "Routing active",
+      "paused": "Routing paused",
+      "no-tray": "Tray offline",
+      "no-rules": "No rules configured",
+      "disconnected": "Service not connected",
+      "error": "Routing error",
+      "card-title": "Routing state",
+      "detail-active": "Rules apply on this user session.",
+      "detail-paused": "Rules are disabled until you re-enable them.",
+      "detail-no-tray": "Run the tray icon to apply rules on this session.",
+      "detail-no-rules": "Add rules in the Rules section, then click Save and review.",
+      "detail-disconnected": "Showing preview data. Install and start the NetRuleRouter service to apply rules.",
+      "tray-tooltip-paused": "Rules disabled — click to enable"
+    }
+  },
+  "theme": {
+    "light": "Light",
+    "dark": "Dark",
+    "system": "System",
+    "high-contrast": "High contrast"
+  },
+  "a11y": {
+    "high-contrast": "High contrast",
+    "enhanced-focus": "Enhanced focus",
+    "simplified-labels": "Simplified labels",
+    "tray": {
+      "status-text": {
+        "preview-mode": "Preview mode: policy changes are not applied in GUI shell v1.",
+        "checking-status": "Checking whether the service is reachable and whether your rules are being applied.",
+        "no-active-policy": "Active policy application is not running: the interface remains in safe preparation mode.",
+        "service-unavailable": "Service is unavailable: policy application actions are temporarily unavailable."
+      },
+      "setup-state": {
+        "allowed": "Action is available in the current setup state.",
+        "soft-guided": "Action is available but first-run guidance should be shown before editing policy.",
+        "blocked-until-wizard-completion": "Action is blocked until the first-run wizard is completed."
+      },
+      "preview-only-note": "In block 2 this action remains preview-only and does not apply policy.",
+      "action-label": {
+        "open-main-window": "Open NetRuleRouter",
+        "interfaces-routes": "Interfaces and routes",
+        "rules": "Rules",
+        "diagnostics": "Diagnostics",
+        "logs": "Logs",
+        "settings": "Settings",
+        "open-about-window": "About",
+        "open-license-window": "License",
+        "open-logs-folder": "Open logs folder",
+        "exit-application": "Exit",
+        "refresh-interfaces": "Refresh interfaces",
+        "check-service-status": "Check service status",
+        "safe-rollback": "Safe rollback",
+        "temporary-disable-product-impact": "Temporarily disable product impact",
+        "check-for-updates": "Check for updates"
+      },
+      "action-description": {
+        "open-main-window": "Open the main NetRuleRouter window.",
+        "interfaces-routes": "Open interfaces and routes screen.",
+        "rules": "Open rules screen.",
+        "diagnostics": "Open diagnostics screen.",
+        "logs": "Open logs screen.",
+        "settings": "Open settings screen.",
+        "open-about-window": "Open About window.",
+        "open-license-window": "Open license window.",
+        "open-logs-folder": "Open the logs folder.",
+        "exit-application": "Exit the application.",
+        "refresh-interfaces": "Refresh network interface snapshot.",
+        "check-service-status": "Check service status.",
+        "safe-rollback": "Trigger safe rollback flow.",
+        "temporary-disable-product-impact": "Temporarily disable product impact.",
+        "check-for-updates": "Check for application updates."
+      }
+    }
+  },
+  "dialog": {
+    "offline-backlog": {
+      "title": "Changes made while the service was stopped",
+      "body": "The service is running again. These changes were made while it was stopped and are not in effect yet.",
+      "rules-summary": "Rules: {added} added, {removed} removed",
+      "preview": "Preview",
+      "preview-description": "Show what would change in the service; nothing is applied.",
+      "discard-hint": "Discarding only stops the offer — the rules stay in the table and nothing on screen is lost.",
+      "discard": "Discard",
+      "later": "Later",
+      "later-description": "Keep the changes pending and ask again next time the service connects.",
+      "apply-all": "Apply all"
+    },
+    "offline-pending": {
+      "row": "{setting}: {value}",
+      "value-on": "On",
+      "value-off": "Off",
+      "protocols-all": "All protocols",
+      "protocols-none": "None",
+      "stop-policy-persist": "Keep matched routes",
+      "stop-policy-teardown": "Remove all routes (default)"
+    },
+    "full-reset": {
+      "title": "Full reset",
+      "body": "This resets ALL application settings to defaults, clears the rules applied by the service (back to an empty post-install state), and wipes saved comments and logs. The Windows service is NOT uninstalled. This cannot be undone.",
+      "ack": "I understand this erases all settings and applied rules",
+      "cancel": "Cancel",
+      "confirm": "Reset everything"
+    },
+    "full-reset-done": {
+      "title": "Full reset complete",
+      "body": "Full reset is done. To apply it the program and the tray must be fully closed. Close them now?",
+      "service-warn": "Note: some service-side data could not be cleared (administrator approval may be required, or a temporary error occurred). Re-run the reset.",
+      "later": "Later",
+      "close-now": "Close everything now"
+    },
+    "notice": {
+      "ok": "OK"
+    },
+    "nothing-to-apply": {
+      "title": "Nothing to apply",
+      "body": "There are no changes to apply — the current rules already match what is active."
+    },
+    "reset-baseline-noop": {
+      "title": "Already on baseline",
+      "body": "You have no custom rules — the baseline rules are already in effect."
+    },
+    "first-run": {
+      "title": "First run"
+    },
+    "rule": {
+      "add": "Add",
+      "edit": "Edit",
+      "enabled-on": "Rule is enabled (applied to routing)",
+      "enabled-off": "Rule is disabled (kept in the file, not applied)",
+      "duplicate-title": "Rule already exists",
+      "duplicate-body": "A rule with the same type, value, and target route already exists ({id}). Open the existing rule to change it, or cancel to keep editing the new one.",
+      "duplicate-open-existing": "Open existing"
+    },
+    "load-list": {
+      "title": "Load rule list",
+      "intro": "Pick one or two preset .txt files — one per route. Leaving a slot empty keeps that route's current rules untouched.",
+      "file-for-route": "Rules file for: {route}",
+      "no-file-selected": "(no file selected)",
+      "pick-primary-title": "Choose primary route preset file",
+      "pick-secondary-title": "Choose secondary route preset file",
+      "same-file-conflict": "The same file cannot be selected for both the primary and the secondary route at the same time.",
+      "mode-heading": "Import mode",
+      "mode-replace": "Replace current rules with the imported set",
+      "mode-replace-description": "Existing rules for the imported route(s) are cleared first.",
+      "mode-merge": "Merge — add new rules, skip duplicates",
+      "mode-merge-description": "Keeps current rules (with your manual edits and comments). Imported rules with the same type, value and route are skipped."
+    },
+    "license": {
+      "note": "Third-party notices and full texts are wired as a separate step."
+    },
+    "import-rule-file-not-found": {
+      "title": "Rules file not found",
+      "message": "The rules file from the imported configuration was not found at its stored path. Choose how to proceed.",
+      "action-browse": "Browse for file...",
+      "action-skip": "Skip — start with empty rules",
+      "action-cancel": "Cancel import"
+    },
+    "preset-import": {
+      "error": {
+        "file-too-large": {
+          "title": "File too large",
+          "description": "The preset file exceeds the 1 MB size limit. Reduce the number of rules or split across multiple files."
+        },
+        "encoding-error": {
+          "title": "Encoding error",
+          "description": "The file is not valid UTF-8. Open it in a text editor and re-save with UTF-8 encoding."
+        },
+        "too-many-rules": {
+          "title": "Too many rules",
+          "description": "The preset file contains more than 9,999 rules, which exceeds the active rule limit. Remove some rules and try again."
+        },
+        "match-value-too-long": {
+          "title": "Match value too long",
+          "description": "One or more match values in this file exceed the 260-character limit. Shorten them and try again."
+        }
+      },
+      "action": {
+        "view-error-details": "View error details",
+        "open-in-external-editor": "Open in external editor",
+        "retry": "Retry import"
+      },
+      "warning": {
+        "pro-section-skipped": "Contains extended sections — their rules are not applied in this version"
+      }
+    },
+    "review-diff": {
+      "title": "Review changes",
+      "title-readonly": "Preview parked changes",
+      "summary-empty": "No structural changes detected.",
+      "summary-counts": "{sids} SID(s); +{added} / -{removed} filters; {warnings} pre-flight warning(s)",
+      "reset-summary": "Discard {count} custom rule(s) and restore the baseline rules.",
+      "column-added": "Added",
+      "column-removed": "Removed",
+      "column-modified": "Modified or retargeted",
+      "column-empty": "(none)",
+      "pro-sections-title": "Extended sections preserved as-is",
+      "pro-section-line": "{name}: {count} rules preserved (not applied)",
+      "risk-heading": "Risk assessment",
+      "signals-heading": "Detected signals",
+      "approve": "Approve and activate",
+      "approve-description": "Proceed to the activation confirmation step",
+      "apply": "Apply changes",
+      "apply-description": "Apply the reviewed rule set and start the activation",
+      "cancel": "Cancel",
+      "cancel-description": "Cancel the activation and keep the previous rule set",
+      "close": "Close",
+      "close-description": "Close the preview without applying anything",
+      "apply-from-preview": "Apply…",
+      "apply-from-preview-description": "Close the preview and open the activation flow for these parked changes",
+      "no-elevation-warning": "NetRuleRouter is not running as Administrator. When you apply, Windows will ask for administrator approval once — after you approve it, this and later changes apply without prompting again until you close the app.",
+      "session-elevation-active": "You granted administrator approval for this session. Changes apply without another prompt. This temporary approval ends when you close NetRuleRouter."
+    },
+    "reload-from-service": {
+      "title": "Load active rules from the service?",
+      "body": "You have unsaved changes to the rules. Loading the active rules from the service will discard them. Continue?",
+      "confirm": "Discard and load"
+    },
+    "unroutable-secondary": {
+      "title": "This adapter cannot carry traffic out",
+      "adapter-line": "Adapter: {name}",
+      "body-assign": "You are about to assign it as your additional route.",
+      "body-kill-switch": "It is currently assigned as your additional route.",
+      "reason-virtual-host-only": "It looks like a host-only virtual adapter (VirtualBox, VMware or Hyper-V internal) and it has no gateway, so it has no way out to the network.",
+      "reason-no-forwarding-path": "It has no gateway and no route out, so there is nowhere for it to send traffic.",
+      "effect-routing": "Rules that point at the additional route will not be routed through it.",
+      "effect-kill-switch-on": "Leak protection is on, so those destinations are BLOCKED instead: the sites behind those rules stop loading.",
+      "effect-kill-switch-off": "Leak protection is off right now, so nothing is blocked. If you turn it on later, those destinations will be blocked.",
+      "effect-kill-switch-arming": "Once leak protection is on, those destinations are BLOCKED instead: the sites behind those rules stop loading.",
+      "confirm-assign": "Assign anyway",
+      "confirm-kill-switch": "Turn it on anyway",
+      "cancel-description": "Leave everything as it is"
+    },
+    "factory-preset-save": {
+      "title": "This file belongs to the app's own rule sets",
+      "body": "The rules file you are saving to is one of the sets that come with the app, and the next update replaces that folder — anything saved there would be lost. Save into a folder of your own instead, or save here anyway if that is what you want.",
+      "choose-folder": "Save into my folder..."
+    },
+    "overwrite-set": {
+      "title": "This set already has saved rules",
+      "body": "The folder you chose already has a primary or additional-route rules file in it. Saving here replaces them."
+    },
+    "empty-service-rules": {
+      "title": "The service has no active rules",
+      "body": "The background service is currently enforcing 0 rules. Loading its state will remove all {count} rule(s) shown here. Your rules files on disk are not touched. Continue?",
+      "confirm": "Clear the rules"
+    },
+    "safe-rollback": {
+      "title": "Roll back to the previous configuration?",
+      "body": "The service will restore the last-known-good routing configuration and re-apply it. Your current active rules will be replaced. This requires administrator rights. Continue?",
+      "confirm": "Roll back"
+    },
+    "service-not-running": {
+      "title": "Service not running",
+      "body": "The NetRuleRouter service is not running. Rule changes cannot be applied to the network until it is. You can start the service now, save your rules to a file, park the changes for later, or cancel.",
+      "save-to-file-description": "Write the current rules to your rules files. This works with the service stopped.",
+      "stale-pending-warning": "There is already a parked changeset (+{added} / -{removed} / ~{modified}). Choosing \"Work without service\" will replace it.",
+      "start-service": "Start service",
+      "start-service-description": "Start the Windows service (requires administrator privileges).",
+      "install-service": "Install service…",
+      "install-service-description": "Install the Windows service (requires administrator privileges) and start it.",
+      "work-without": "Work without service",
+      "work-without-description": "Park the changes locally; they will not be applied to the network until the service is running.",
+      "cancel": "Cancel",
+      "cancel-description": "Dismiss the dialog without applying or parking the changes."
+    },
+    "export-options": {
+      "title": "Export options",
+      "body": "Customize what to include in the preset file.",
+      "include-comments": "Include rule comments",
+      "include-comments-description": "When on, each rule's ` # comment` suffix is written to the file. Turn off to share rules without your personal notes.",
+      "no-comments-hint": "Comments will be stripped from the exported file. Existing comments in the app are not affected.",
+      "cancel": "Cancel",
+      "confirm": "Export"
+    },
+    "drift": {
+      "title": "Rules drift detected",
+      "body": "The rules stored in your file, shown in the app, and applied by the service no longer agree. Pick how to resolve.",
+      "col-route": "Route",
+      "col-file": "File",
+      "col-gui": "App",
+      "col-service": "Service",
+      "row-primary": "Primary",
+      "row-secondary": "Secondary",
+      "no-file": "(no file)",
+      "summary-primary": "Primary route: {kind}",
+      "summary-secondary": "Secondary route: {kind}",
+      "mismatch-all-three-differ": "all three sources differ",
+      "mismatch-file-vs-gui": "file differs from app",
+      "mismatch-gui-vs-service": "app differs from service",
+      "mismatch-file-vs-service": "file differs from service",
+      "mismatch-none": "in sync",
+      "load-from-file": "Load from file",
+      "load-from-file-description": "Load the saved file(s) into the app table, replacing local edits. Apply when ready.",
+      "accept-service": "Accept service state",
+      "accept-service-description": "Discard local edits and roll back the app to what the service holds.",
+      "apply-gui": "Apply app state",
+      "apply-gui-description": "Open the review flow and push the current app state to the service.",
+      "show-diff": "Show differences",
+      "show-diff-description": "Open a read-only diff of the current app rules against the service.",
+      "clear-all": "Clear everything",
+      "clear-all-description": "Remove all rules from the app and the service. This cannot be undone.",
+      "not-now": "Not now",
+      "not-now-description": "Dismiss the dialog. The banner stays until the drift is resolved.",
+      "merge": "Merge…",
+      "merge-description": "Your linked rules file and the service's active rules have diverged. Merge combines both instead of choosing one side."
+    },
+    "merge": {
+      "title": "Merge file and app rules",
+      "body": "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.",
+      "bucket-file-only": "Only in the file",
+      "bucket-service-only": "Only in the app",
+      "bucket-conflicts": "Conflicts",
+      "pick-file": "File",
+      "pick-service": "App",
+      "apply": "Merge and review",
+      "cancel": "Cancel",
+      "badge-block": "Block",
+      "no-op": "The file and the app rules already match — nothing to merge.",
+      "loading": "Comparing file and app rules…",
+      "error": "Could not build the merge preview.",
+      "unresolved-hint": "Pick a side for every conflict before merging."
+    },
+    "drift-clear-all": {
+      "title": "Clear all rules",
+      "body": "This removes ALL rules from the app and pushes an empty revision to the service, so no routing rules remain. This cannot be undone.",
+      "ack": "I understand this removes all rules everywhere",
+      "cancel": "Cancel",
+      "confirm": "Clear everything"
+    },
+    "auto-rules-mode": {
+      "title": "Turn on “Apply automatically”?",
+      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime by switching back to “Suggest only”.",
+      "confirm": "Turn on"
+    },
+    "first-launch-install": {
+      "title": "Welcome to NetRuleRouter",
+      "body-1": "NetRuleRouter applies routing rules from a Windows background service so they persist across reboots and user sessions.",
+      "body-2": "Installing the service requires Administrator approval (UAC). After install, the service starts automatically.",
+      "body-3": "You can skip this step and use NetRuleRouter in read-only preview mode, but routing rules will not apply.",
+      "install-button": "Install and start service (recommended)",
+      "skip-button": "Continue without service (limited)",
+      "learn-more": "Learn more"
+    },
+    "third-party": {
+      "tab": "Third-party components",
+      "intro": "Components from other authors that are shipped with the product. For executable components the application checks the copy on this computer and shows what it found.",
+      "loading": "Checking components…",
+      "load-failed": "Could not read component information: ",
+      "bridge-unavailable": "Component information is unavailable: no connection to the service.",
+      "empty": "This build ships no components from other authors.",
+      "publisher": "Author",
+      "required-for": "Used for",
+      "file": "File",
+      "checksum": "Checksum (SHA-256)",
+      "open-homepage": "Author's site",
+      "verdict-genuine": "Genuine",
+      "verdict-genuine-note": "The file on disk matches the build shipped with the product and carries a valid signature from its publisher.",
+      "verdict-untrusted": "Does not match",
+      "verdict-untrusted-note": "The file on disk is not the build shipped with the product, or its signature could not be confirmed. Reinstall the product.",
+      "verdict-missing": "Not installed",
+      "verdict-missing-note": "The component is not installed, so the feature that needs it is unavailable. Everything else keeps working.",
+      "verdict-not-applicable": "Attribution only",
+      "signature-valid": "Signed by",
+      "signature-signer-mismatch": "Signed by someone else:",
+      "signature-invalid": "Signature is not valid",
+      "signature-unsigned": "Not signed",
+      "signature-not-checked": "Signature was not checked",
+      "feature": {
+        "fake-ip": "Per-site virtual addresses (fake-IP)",
+        "user-interface": "Application interface"
+      }
+    },
+    "eula": {
+      "title": "License agreement",
+      "heading": "Please read and accept the agreement to continue",
+      "subheading": "Installing, running, or using NetRuleRouter means you accept the terms below.",
+      "text-accessible-name": "License agreement text",
+      "acknowledge": "I have read and accept the terms of the agreement",
+      "acknowledge-description": "Required acknowledgement before you can accept the agreement and use the program",
+      "accept": "Accept and continue",
+      "decline": "Decline and exit",
+      "switch-to-english": "English",
+      "switch-to-russian": "Русский"
+    },
+    "uac-required": {
+      "title": "Administrator approval required",
+      "body": "This action requires Administrator privileges. Click Continue to approve the UAC prompt that follows.",
+      "continue": "Continue",
+      "cancel": "Cancel",
+      "declined-title": "Action cancelled",
+      "declined-body": "The Administrator prompt was declined. You can retry from Settings → Service management."
+    },
+    "admin-required": {
+      "title": "Administrator rights required",
+      "body": "Applying rules changes Windows routing filters, which requires administrator rights. Close NetRuleRouter and start it again as administrator (right-click → \"Run as administrator\"), then apply the changes. Viewing rules and the service status works without administrator rights."
+    },
+    "first-run-wizard": {
+      "title": "Welcome to NetRuleRouter",
+      "description": "Choose how to populate your initial rule set. You can always change this later via the Rules toolbar or Settings → Presets.",
+      "view-eula": "View EULA",
+      "option-country-preset": "Load country preset ({country})",
+      "option-country-preset-description": "Detected from your OS locale. Imports the bundled pack for your region.",
+      "option-country-not-available": "No country preset is bundled for your region — pick a different option.",
+      "option-builtin-demo": "Use built-in demo rules",
+      "option-builtin-demo-description": "A tiny showcase set covering each rule kind. Replace with your own later.",
+      "option-open-file": "Open my rules...",
+      "option-open-file-description": "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.",
+      "pick-primary-title": "Choose primary route preset file",
+      "pick-secondary-title": "Choose secondary route preset file",
+      "primary-file-label": "Primary:",
+      "secondary-file-label": "Secondary:",
+      "no-file-selected": "(no file selected)",
+      "browse-button": "Browse...",
+      "change-button": "Change...",
+      "clear-button": "Clear",
+      "import-button": "Import selected files",
+      "option-start-empty": "Start empty",
+      "option-start-empty-description": "No rules. Add or import them whenever you want.",
+      "protection-title": "Protection",
+      "protection-description": "Recommended for everyone. Each of these can be changed later in Settings.",
+      "protection-kill-switch": "Block routed traffic when the additional route is down",
+      "protection-doh-lockdown": "Keep browsers from resolving routed sites past NetRuleRouter",
+      "protection-fake-ip": "Route sites by name, so an address shared with another site is not dragged along",
+      "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
+      "close": "Continue"
+    },
+    "preset-review": {
+      "title": "Review preset import",
+      "intro": "The file contains sections that need a decision before import.",
+      "duplicates-heading": "Duplicate sections",
+      "duplicates-hint": "These sections appear more than once in the file. Pick how to combine them.",
+      "duplicate-row": "Section \"{name}\" appears {n} times",
+      "duplicate-known-tag": "(known section — all rules merged)",
+      "duplicate-merge": "Merge (concatenate contents)",
+      "duplicate-last-wins": "Use only the last occurrence",
+      "duplicate-ignore": "Skip this section entirely",
+      "unknowns-heading": "Unrecognised sections",
+      "unknowns-hint": "We didn't recognise these sections. Tell us what they are, or keep them as-is for export.",
+      "unknown-row": "--- {name} ({n} lines)",
+      "what-is-this": "What is this?",
+      "classify-passthrough": "Preserve for other OS / tools (default)",
+      "classify-zones": "Zones",
+      "classify-domains": "Domains",
+      "classify-ip": "IP addresses",
+      "classify-windows": "Windows applications",
+      "classify-skip": "Skip (discard)",
+      "apply": "Apply"
+    },
+    "save-before-close": {
+      "title": "Save rule changes?",
+      "intro": "Active rules differ from the files you imported. Without saving, those edits will be rolled back.",
+      "warning-no-file": "Without a file, rules will NOT be applied on the next launch.",
+      "row-no-path": "(no file yet — choose with Save As...)",
+      "save-selected": "Save selected",
+      "save-as": "Save As...",
+      "discard-rollback": "Discard & rollback",
+      "cancel": "Cancel",
+      "confirm-discard-title": "Discard active changes?",
+      "confirm-discard-body": "Active rule edits will be rolled back. This cannot be undone."
+    },
+    "confirm-activate": {
+      "title": "Confirm activation",
+      "body-low": "These changes look safe. Apply them now?",
+      "body-medium": "These changes affect routing scope. Apply them now?",
+      "body-high": "These changes have a high impact on routing. Apply them now?",
+      "body-critical": "These changes could lock you out of the network. Read the risk signals carefully before confirming.",
+      "checkbox-understand": "I understand the risk and want to proceed",
+      "checkbox-understand-description": "Required acknowledgement before applying a Critical-risk activation",
+      "confirm": "Apply changes",
+      "confirm-description": "Apply the reviewed rule set and start the activation",
+      "cancel": "Cancel",
+      "cancel-description": "Cancel the activation and keep the previous rule set"
+    },
+    "review-expired": {
+      "title": "Review session expired",
+      "body": "Your confirmation token expired before the change was applied. Compare the changes again to refresh the review.",
+      "compare-again": "Compare again",
+      "compare-again-description": "Re-run the review against the current rule set",
+      "cancel": "Cancel",
+      "cancel-description": "Dismiss the dialog without retrying the review"
+    },
+    "safe-disable": {
+      "title": "Safe disable",
+      "body": "Temporarily disable enforcement and remove all routes and filters owned by NetRuleRouter. The service stays running; you can re-enable at any time. This action is audited.",
+      "reason-label": "Reason (required)",
+      "reason-placeholder": "Why are you disabling protection?",
+      "reason-required": "Please describe the reason — it is recorded in the audit trail.",
+      "confirm": "Disable now",
+      "confirm-description": "Temporarily disable enforcement with the provided reason",
+      "cancel": "Cancel",
+      "cancel-description": "Dismiss the dialog and leave enforcement active",
+      "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again.",
+      "stub-pending": "Safe disable RPC bridge is not yet wired. Intent captured locally (see logs)."
+    }
+  },
+  "status": {
+    "setting-not-applied": "The background service did not apply this change — the switch was reset to what the service actually holds.",
+    "offline-change-recorded": "The background service is unavailable — your change was saved and will be offered to apply when it reconnects.",
+    "offline-pending-applied": "Your saved changes were applied.",
+    "offline-pending-auto-applied": "Applied the changes made while the service was stopped.",
+    "offline-pending-discarded": "Your saved changes were discarded.",
+    "offline-pending-apply-failed": "Could not apply the saved changes; they are still pending.",
+    "bindings-require-service": "Adapter bindings can only be changed while the background service is running.",
+    "refresh-requested": "Refresh requested",
+    "presets-hidden": "Bundled presets hidden. Re-enable them in Settings → Presets.",
+    "admin-revoked": "Administrator approval revoked. The next change will ask for approval again.",
+    "admin-auto-revoked": "Administrator approval was revoked automatically after sitting unused.",
+    "route-mode-applied": "Default route for unmatched traffic updated.",
+    "route-mode-uac-declined": "Administrator approval was declined; the default route was not changed.",
+    "route-mode-failed": "Could not update the default route: ",
+    "route-binding-uac-declined": "Administrator approval was declined; the adapter binding was not saved to the service, so routing will not be enforced.",
+    "route-binding-failed": "Could not save the adapter binding to the service: ",
+    "full-reset-running": "Performing full reset…",
+    "bundled-preset-empty": "Could not read the selected bundled preset.",
+    "user-presets-folder-empty": "No rule sets found in your folder — showing the sets that come with the app.",
+    "user-presets-folder-set": "The quick-load dropdown now lists the rule sets in your folder.",
+    "user-presets-folder-cleared": "The quick-load dropdown is back to the rule sets that come with the app.",
+    "bundled-presets-path-unknown": "Could not locate the folder with the sets that come with the app.",
+    "rules-folder-suggestion": "Keep your rule sets in this folder? It then becomes the place the app loads and saves rule sets from.",
+    "rules-folder-suggestion-accept": "Remember this folder",
+    "save-as-set-folder-failed": "Could not create the set folder. Check that the folder above is writable.",
+    "save-as-set-failed": "Could not save the set. See logs for details.",
+    "save-as-set-done": "Saved as a set: ",
+    "save-as-set-name-invalid": "Choose a plain file name for the set — it becomes the set's folder name.",
+    "save-as-set-overwrite-cancelled": "Nothing was saved — the set already had files there.",
+    "defaults-restored": "Defaults restored",
+    "rule-removed": "Rule removed",
+    "rules-cleared": "All rules cleared from the app.",
+    "diagnostics-refreshed": "Diagnostics refreshed",
+    "logs-export-preview": "Logs export (preview)",
+    "cache-cleared": "Cache cleared: {count} resolution(s) removed.",
+    "cache-cleared-failed": "Failed to clear cache: ",
+    "logs-clear-not-wired": "Logs clear is preview-only — service opcode is not wired yet.",
+    "bridge-unavailable": "Service bridge not connected.",
+    "import-read-failed": "Cannot read preset file. See logs for details.",
+    "no-source-file-bound": "No source file is bound yet. Use “Load rule list…” first.",
+    "export-rpc-failed": "Export failed: ",
+    "export-write-failed": "Cannot write preset file to the chosen path.",
+    "export-completed": "Preset exported.",
+    "export-nothing-to-export": "There are no rules to export yet.",
+    "rules-saved-service-stopped": "The service is not running, so the rules were not applied — saving them to your rules file instead.",
+    "rules-saved-service-stopped-short": "Service stopped — saving to your rules file",
+    "rules-saved-not-applied": "Rules saved to your rules file. The service is stopped, so they are not applied yet — Apply stays available until it starts.",
+    "rules-saved-not-applied-short": "Saved to your rules file — not applied yet",
+    "preset-import-dry-run-failed": "Preset import dry-run failed: ",
+    "preset-import-offline": "Imported {count} rules into the GUI. Service is unreachable — start the service and use 'Save and review...' to push them.",
+    "preset-import-needs-elevation": "Could not get administrator approval to import the preset. Approve the prompt next time, or re-launch NetRuleRouter as Administrator.",
+    "preset-import-failed": "Failed to import preset: ",
+    "preset-import-completed": "Preset imported and activated ({count} rules).",
+    "preset-import-passthrough-suffix": "Preserved foreign-OS sections: {sections}.",
+    "preset-import-section-entry": "{name} ({count} lines)",
+    "preset-review-cancelled": "Preset import cancelled by user.",
+    "wizard-import-failed": "First-run wizard import failed: ",
+    "wizard-completed": "Welcome — initial rules imported.",
+    "auto-open-loading": "Loading rules from {path}...",
+    "auto-open-file-missing": "Auto-open file not found at {path}. Choose a file to attach.",
+    "auto-open-completed": "Rules loaded from disk.",
+    "file-binding-forgotten": "File binding cleared. Rules will not be auto-loaded on next launch.",
+    "rules-refresh-failed": "Could not load the active rules from the service.",
+    "rules-refreshed-from-service": "Loaded {count} active rule(s) from the service.",
+    "rollback-discard-completed": "Changes discarded.",
+    "rollback-discard-failed": "Failed to roll back changes: ",
+    "demo-rules-loaded": "Demo rules loaded. Review and confirm to activate.",
+    "demo-rules-all-present": "All demo rules are already present. Nothing added.",
+    "logs-cleared": "Operational logs cleared: {count} file(s), {size}",
+    "logs-cleared-failed": "Failed to clear logs: ",
+    "diag-mode-enabled": "Extended diagnostics enabled.",
+    "diag-mode-disabled": "Extended diagnostics disabled.",
+    "diag-mode-failed": "Failed to change diagnostic mode: ",
+    "log-retention-saved": "Retention settings saved.",
+    "log-retention-failed": "Failed to save retention settings: ",
+    "copied-to-clipboard": "Copied to clipboard.",
+    "rules-activate-completed": "Rules activated.",
+    "rules-activate-failed": "Failed to activate rules: ",
+    "reset-baseline-completed": "Reset to baseline rules. Reloading the active rules...",
+    "reset-baseline-failed": "Could not reset to baseline: ",
+    "baseline-needs-service": "Connect to the service to edit the baseline rules.",
+    "baseline-activate-completed": "Baseline rules updated for all users on this computer.",
+    "activate-uac-declined": "Administrator approval was cancelled — changes were not applied. Click Apply again to retry.",
+    "rules-activate-needs-elevation": "Could not get administrator approval to apply the changes. Approve the prompt next time, or re-launch NetRuleRouter as Administrator, then re-run the review.",
+    "preview-applied": "Preview changes applied. Settings are saved on close.",
+    "language-applied": "Interface language was updated.",
+    "no-destructive-actions": "No destructive operations are bound in block 2.",
+    "changes-applied": "Changes applied.",
+    "changes-cancelled": "Changes reverted.",
+    "rule-updated": "Rule updated",
+    "rule-added": "Rule added",
+    "rule-added-disabled": "Rule added but disabled — it will not affect routing until you enable it.",
+    "rule-duplicate": "A rule with the same type, value and route already exists (R-{id}). Edit that one instead.",
+    "rules-bulk-enabled": "{n} rule(s) enabled.",
+    "rules-bulk-disabled": "{n} rule(s) disabled.",
+    "rules-bulk-moved": "{n} rule(s) moved to {route}.",
+    "rules-bulk-deleted": "{n} rule(s) deleted.",
+    "rules-limit-reached": "Up to {max} active rules are supported.",
+    "rules-serialize-failed": "Internal error while preparing rules — see logs",
+    "role-unassigned": "{role} unassigned from this adapter.",
+    "setup-completed": "Setup completed",
+    "manual-refresh": "Manual refresh",
+    "interfaces-refreshed": "Interfaces list refreshed.",
+    "rollback-submitting": "Submitting safe rollback…",
+    "rollback-submitted": "Safe rollback submitted. The service is restoring the previous configuration.",
+    "rollback-failed": "Safe rollback failed: ",
+    "logs-folder-preview": "Logs folder opening is in preview mode.",
+    "updates-not-implemented": "Update check is not implemented yet.",
+    "import-preset-preview": "Preset import preview is available.",
+    "locale-files-warning": "Some locale files were loaded with warnings.",
+    "locale-files-rejected": "Some locale files were rejected. See logs for details.",
+    "safe-disable": {
+      "requested": "Safe disable requested",
+      "cancelled": "Safe disable cancelled",
+      "completed": "Safe disable applied",
+      "intent-captured": "Safe disable intent captured (RPC bridge pending — see logs)"
+    },
+    "pending-apply-parked": "Changes parked. They will be applied when the service is running again.",
+    "pending-apply-waiting": "Waiting for the service to come online…",
+    "pending-apply-timeout": "Could not connect to the service. Changes parked; see logs for details.",
+    "pending-apply-park-failed": "Failed to park changes locally; see logs.",
+    "pending-apply-discarded": "Parked changes discarded.",
+    "pending-apply-preview-failed": "Could not load the diff for the parked changes; see logs.",
+    "drift-recheck-offline": "The service is not running, so the rules it applies cannot be compared right now.",
+    "sidecar-comments-gc-unavailable": "Comment storage is not available in this build.",
+    "sidecar-comments-gc-failed": "Failed to clear orphan comments; see logs.",
+    "sidecar-comments-gc-done": "Cleared {n} orphan comment(s).",
+    "drift-banner": "Rules in the file, the app, and the service do not all agree.",
+    "drift-banner-empty-service": "The service has none of your rules — nothing is being routed yet.",
+    "drift-banner-apply": "Apply rules",
+    "drift-banner-apply-description": "Send the rules shown in the app to the background service.",
+    "drift-banner-details": "Details…",
+    "drift-banner-details-description": "Open the drift dialog to inspect hashes and pick a resolution.",
+    "merge-banner": "Your rules file and the app's rules have diverged — you can merge them.",
+    "merge-banner-open-description": "Open the merge dialog to combine the file and the app rules.",
+    "empty-rules-banner": "No rules are active — the service isn't routing anything. The rule set is empty (it may have been reset). Add rules or import a preset.",
+    "unapplied-rules-banner": "The app has rules that aren't applied yet — the service is enforcing none. Apply them now.",
+    "empty-rules-banner-button": "Open Rules",
+    "empty-rules-banner-button-description": "Open the Rules section to add rules or import a preset.",
+    "revision-integrity-banner": "The rule set was changed outside the app, so it was not applied — the service is running on the last verified version.",
+    "revision-integrity-banner-button-description": "Open Diagnostics to see which rule set was rejected and confirm the alert.",
+    "app-unresolved-banner": "These app rules are applied, but their program wasn't found here: {apps}. NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules. Launch the app, or check the program name in Rules.",
+    "app-unresolved-banner-button": "Open Rules",
+    "app-unresolved-banner-button-description": "Open the Rules section to review your application rules.",
+    "app-unresolved-banner-dismiss": "Dismiss",
+    "app-unresolved-more": "+{n} more",
+    "bound-file-out-of-date": "The bound rules file is out of date. Save it to keep your export in sync.",
+    "bound-file-save": "Save to file",
+    "bound-file-save-description": "Export the active rules back to the bound rules file.",
+    "bound-file-save-tooltip": "The applied rules changed, so your linked rules file is out of date. Click to update it.",
+    "bound-file-save-destination": "Saves to:",
+    "bound-file-saved": "Bound rules file saved.",
+    "save-as-cancelled": "Save As cancelled — nothing more was saved.",
+    "bound-file-none-linked": "No rules file is linked yet — you will be asked where to save.",
+    "bound-file-already-current": "Your rules file already holds these rules.",
+    "vpn-split-conflict": "Your additional adapter \"{name}\" is connected, but NetRuleRouter keeps general traffic on your main connection — only your {n} rule(s) go through it. To route all traffic through it, change the routing mode in Settings → Routing behavior.",
+    "vpn-split-conflict-dismiss": "Got it — don't show this for this adapter again",
+    "vpn-split-conflict-fulltunnel": "Route everything through the additional adapter",
+    "vpn-split-conflict-fulltunnel-description": "Switch to \"prefer secondary\" so all traffic uses the additional adapter, not just the rule-matched destinations.",
+    "vpn-split-conflict-switched": "Switched to routing all traffic through the additional adapter.",
+    "secondary-reconfirm": "Your secondary adapter \"{name}\" looks reinstalled (new ID). Re-confirm it so the stored binding matches.",
+    "secondary-reconfirm-button": "Re-confirm adapter",
+    "secondary-reconfirm-button-description": "Update the stored secondary adapter binding to the reinstalled adapter.",
+    "secondary-unresolved": "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.",
+    "secondary-unresolved-button": "Open Interfaces and routes",
+    "secondary-unresolved-button-description": "Open Interfaces and routes to start or re-select the additional adapter.",
+    "policy-inactive-not-delivered": "The service is running, but your rules are not being applied: it never received which adapter to send them through. Send it now.",
+    "policy-inactive-no-adapter": "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes.",
+    "policy-inactive-send": "Send adapter to the service",
+    "policy-inactive-send-description": "Send the additional adapter selected in the app to the background service so your rules start being routed.",
+    "secondary-rebound": "Secondary adapter re-confirmed.",
+    "secondary-auto-confirmed": "Additional adapter ID changed — auto-confirmed by matching name.",
+    "drift-rolled-back-to-service": "Local rule edits discarded; app now matches service state.",
+    "drift-loaded-from-file": "Loaded {count} rule(s) from file into the app. Review and apply when ready.",
+    "drift-clear-all-running": "Clearing all rules…",
+    "drift-cleared-all": "All rules cleared from the app and the service.",
+    "drift-clear-all-failed": "Local rules cleared, but the service was not updated (administrator approval or a connection is required).",
+    "compat-banner-body": "Incompatible versions: service {sv} (protocol {sp}), app {gv} (protocol {gp}). Update the {target}.",
+    "compat-banner-target-gui": "app",
+    "compat-banner-target-service": "service",
+    "compat-banner-update": "Open updates page",
+    "compat-banner-update-description": "Open the project's releases page in the default browser.",
+    "include-subdomains-on": "Domain rules now also cover subdomains.",
+    "include-subdomains-off": "Domain rules now match the exact domain only.",
+    "include-subdomains-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "include-subdomains-failed": "Could not update the subdomain setting: ",
+    "shared-ip-policy-set": "Shared-IP handling updated.",
+    "shared-ip-policy-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "shared-ip-policy-failed": "Could not update shared-IP handling: ",
+    "kill-switch-on": "Leak protection enabled: matched traffic is blocked if the additional adapter drops.",
+    "kill-switch-off": "Leak protection disabled.",
+    "kill-switch-uac-declined": "Administrator approval was declined; leak protection was not changed.",
+    "kill-switch-failed": "Could not update leak protection: ",
+    "kill-switch-protocols-applied": "Leak protection protocols updated.",
+    "kill-switch-fail-closed-on": "Leak protection set to fail-closed: traffic is blocked if the additional adapter can't be found.",
+    "kill-switch-fail-closed-off": "Leak protection set to fail-open: traffic is allowed (with a warning) if the additional adapter can't be found.",
+    "kill-switch-block-all-on": "Kill-switch on: while the additional adapter is down, all traffic is blocked except your local network and already-known primary sites.",
+    "kill-switch-block-all-off": "Kill-switch: while the additional adapter is down, only its routed sites are blocked now.",
+    "kill-switch-block-all-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "kill-switch-block-all-failed": "Could not update the kill-switch setting: ",
+    "kill-switch-enabled-on": "Leak protection enabled. Choose how it blocks in the options below.",
+    "kill-switch-enabled-off": "Leak protection disabled. Nothing is blocked — while the additional adapter is down, traffic is allowed to leak (your choice).",
+    "kill-switch-enabled-uac-declined": "Administrator approval was declined; leak protection was not changed.",
+    "kill-switch-enabled-failed": "Could not update leak protection: ",
+    "allow-dns-over-primary-on": "While blocked, name resolution now works over your main link, so zones keep resolving.",
+    "allow-dns-over-primary-off": "Strict: while blocked, DNS is blocked over the main link too.",
+    "allow-dns-over-primary-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "allow-dns-over-primary-failed": "Could not update the DNS setting: ",
+    "policy-toggles-restored": "Your saved routing preferences were restored.",
+    "kill-switch-restored-from-prefs": "Leak protection was restored from your saved settings.",
+    "enforcement-mode-reactive": "Enforcement mode: reactive leak protection (Mode A). Applied — the local DNS resolver is off.",
+    "enforcement-mode-resolver": "Enforcement mode: local DNS resolver (Mode B). Applied — the local DNS resolver is now active.",
+    "enforcement-mode-uac-declined": "Administrator approval was declined; the mode was not changed.",
+    "enforcement-mode-failed": "Could not update the enforcement mode: ",
+    "dns-via-secondary-on": "DNS now goes through the tunnel.",
+    "dns-via-secondary-off": "DNS goes through the main connection again.",
+    "dns-via-secondary-failed": "Could not change where DNS goes: ",
+    "dns-fast-answers-on": "Fast DNS answers are on.",
+    "dns-fast-answers-off": "Fast DNS answers are off — every answer waits for route protection.",
+    "dns-fast-answers-failed": "Could not change the fast DNS answers setting: ",
+    "rule-lock-on": "Routing rules are locked — only an administrator can change them now.",
+    "rule-lock-off": "Users can change the routing rules on this computer.",
+    "rule-lock-failed": "Could not change who may edit the rules: ",
+    "rule-lock-needs-admin": "Only an administrator can change this. Approve the administrator prompt and try again.",
+    "fake-ip-on": "Virtual-address routing (fake-IP) is on.",
+    "fake-ip-off": "Virtual-address routing (fake-IP) is off.",
+    "fake-ip-failed": "Could not change the fake-IP setting: ",
+    "fake-ip-udp-relay-on": "Fake-IP UDP relay is on.",
+    "fake-ip-udp-relay-off": "Fake-IP UDP relay is off — QUIC falls back to TCP.",
+    "fake-ip-udp-relay-failed": "Could not change the fake-IP UDP relay setting: ",
+    "fake-ip-instant-rst-on": "Instant reset for the additional route is on.",
+    "fake-ip-instant-rst-off": "Instant reset is off — connections are held briefly instead of resetting.",
+    "fake-ip-instant-rst-failed": "Could not change the instant-reset setting: ",
+    "isp-block-candidates-on": "ISP block-page rule suggestions are on.",
+    "isp-block-candidates-off": "ISP block-page rule suggestions are off.",
+    "isp-block-candidates-failed": "Could not change the ISP block-page rule suggestions setting: ",
+    "mode-a-coverage-set": "Fallback blocking behavior updated.",
+    "mode-a-coverage-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "mode-a-coverage-failed": "Could not update the fallback blocking behavior: ",
+    "hosts-bypass-set": "Rule-domain resolution updated.",
+    "hosts-bypass-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "hosts-bypass-failed": "Could not update rule-domain resolution: ",
+    "auto-rules-added": "Addresses a routed site needs were added to your rules.",
+    "auto-rules-added-unsaved-short": "Addresses added — reload to see them",
+    "auto-rules-added-unsaved": "Addresses a routed site needs were added to your rules. Save or discard your edits, then reload the rules to see them.",
+    "bound-file-factory-not-saved": "Nothing was saved — the linked file is part of the app's own rule sets.",
+    "auto-rules-off": "Missing companion domains will no longer be collected.",
+    "auto-rules-eager-on": "Delivery-looking domains will be offered as soon as they appear.",
+    "auto-rules-eager-off": "Delivery-looking domains will be offered only after they prove related to a site.",
+    "auto-rules-suggest": "Missing companion domains will be offered for your confirmation.",
+    "auto-rules-auto": "Missing companion domains will be added to your rules automatically.",
+    "auto-rules-failed": "Could not update the auto-rules setting: ",
+    "doh-lockdown-on": "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.",
+    "doh-lockdown-off": "Browser DoH/DoT blocking disabled.",
+    "doh-lockdown-scope-set": "DoH/DoT blocking scope updated.",
+    "doh-lockdown-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "doh-lockdown-failed": "Could not update DoH/DoT blocking: ",
+    "browser-history-auto-seed-on": "The cache will be seeded from browser history automatically at service start.",
+    "browser-history-auto-seed-off": "Automatic browser-history seeding disabled.",
+    "browser-history-auto-seed-failed": "Could not update automatic browser-history seeding: ",
+    "kill-switch-shared-strict-on": "Strict kill switch: addresses shared with regular sites are blocked too.",
+    "kill-switch-shared-strict-off": "Smart kill switch: addresses shared with regular sites are not blocked.",
+    "kill-switch-shared-strict-failed": "Could not update the kill-switch shared-address mode: ",
+    "liveness-window-disabled": "Secondary tunnel liveness probe disabled.",
+    "liveness-window-set": "Secondary tunnel liveness window updated. Takes effect after the background service restarts.",
+    "liveness-window-uac-declined": "Administrator approval was declined; the liveness window was not changed.",
+    "liveness-window-failed": "Could not update the liveness window: ",
+    "system-routing-set": "System-level routing setting updated.",
+    "system-routing-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "system-routing-failed": "Could not update the setting: ",
+    "verbose-logging-enabled": "Verbose service logging enabled — applies immediately",
+    "verbose-logging-disabled": "Verbose service logging disabled — applies immediately",
+    "verbose-logging-failed": "Could not update verbose service logging: ",
+    "rules-drift-apply-requested": "Loading the rules from your files, then applying them to the service."
+  },
+  "interfaces": {
+    "preview-notice": "Selecting an interface here does not apply routing policy on its own.",
+    "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
+    "data-scope-note": "Interface data is read from Windows API; policy apply remains preview-only in block 2.",
+    "fail-closed": {
+      "banner-title": "Fail-Closed mode active",
+      "banner-body": "Secondary route is unavailable. Matched traffic is being blocked instead of leaking to the primary."
+    },
+    "secondary-absent": {
+      "banner-title": "The additional route is not available",
+      "banner-body": "The adapter you bound as the additional route is not present right now. Traffic your rules send there is blocked rather than leaked to the main route. Bring the connection back up, or assign another adapter to the role below."
+    },
+    "toggle": {
+      "show-bluetooth-adapters": "Show Bluetooth adapters",
+      "show-unavailable-adapters": "Show unavailable adapters"
+    },
+    "remembered": {
+      "toggle": "Show remembered adapters that are currently absent",
+      "badge": "remembered · currently absent",
+      "recovery-hint": "If the connection is back up, send the binding to the service again. Otherwise assign another adapter to this role in the list below."
+    },
+    "search": {
+      "label": "Find",
+      "placeholder": "Search adapters by name, IP or DNS",
+      "clear": "Clear"
+    },
+    "action": {
+      "unassign-primary": "Unassign primary",
+      "unassign-secondary": "Unassign secondary",
+      "assign-unavailable-tooltip": "Adapter is currently unavailable — the role will activate automatically when it comes back up."
+    },
+    "sort": {
+      "label": "Sort",
+      "default": "Default",
+      "vpn-like": "VPN-like first",
+      "primary-candidate": "Primary candidates first"
+    },
+    "connectivity": {
+      "available": "Connected",
+      "degraded": "Degraded",
+      "unavailable": "No connection",
+      "unknown": "Unknown",
+      "timeout": "Probe timeout"
+    },
+    "external-ip": {
+      "prefix": "ext IP",
+      "probe-button": "Check external address",
+      "probe-busy": "Checking…",
+      "probe-tooltip": "Asks a public address-reflection server what each adapter's address looks like from the internet. Sends one small packet per adapter; nothing else leaves the machine.",
+      "probe-done": "External address check finished.",
+      "probe-failed": "Could not determine the external address: ",
+      "resolved": "external IP resolved",
+      "not-checked": "external IP not checked",
+      "check-failed": "external IP check failed",
+      "rate-limited": "external IP rate-limited",
+      "blocked": "external IP blocked",
+      "last-known": "Last known external IP: %1 (as of %2)"
+    },
+    "classification": {
+      "regular-interface": "Regular interface",
+      "vpn-or-tunnel-likely": "Likely VPN/tunnel",
+      "virtual-or-tunnel-likely": "Likely virtual/tunnel",
+      "virtual-interface-likely": "Likely virtual interface",
+      "service-interface-likely": "Likely service interface",
+      "loopback": "Loopback (local)",
+      "wi-fi": "Wi-Fi",
+      "wifi": "Wi-Fi",
+      "ethernet": "Ethernet",
+      "vpn": "VPN tunnel",
+      "vpn-tunnel": "VPN tunnel",
+      "virtual": "Virtual",
+      "service": "Service",
+      "unknown": "Unknown"
+    },
+    "recommendation": {
+      "preferred-primary": "Recommended as primary",
+      "preferred-secondary": "Recommended as secondary",
+      "allowed-but-not-recommended": "Allowed but not recommended",
+      "not-recommended": "Not recommended"
+    },
+    "row": {
+      "summary": "Type: %1 | IP: %2 | Gateway: %3",
+      "summary-2": "DNS: %1 | Default route: %2 | State: %3"
+    },
+    "mode": {
+      "prefer-primary": "Selected sites only (via the additional adapter)",
+      "prefer-secondary-when-available": "Everything via the additional adapter",
+      "strict-secondary-fail-closed": "Everything via the additional adapter — no leaks"
+    },
+    "availability": {
+      "available": "Available",
+      "unavailable": "Unavailable",
+      "requires-check": "Requires check"
+    },
+    "state": {
+      "selected": "Selected",
+      "not-selected": "Not selected",
+      "unavailable": "Unavailable",
+      "requires-verification": "Requires verification",
+      "fail-closed-conflict": "Fail-Closed conflict"
+    }
+  },
+  "rules": {
+    "locked": {
+      "banner-title": "Rules are managed by your administrator",
+      "banner-body": "Changing rules is turned off on this computer. You can still view, search, filter and export them."
+    },
+    "preview-notice": "Rule changes take effect only after you review and apply them.",
+    "state": {
+      "pending-label": "Pending:",
+      "in-sync": "The rules match the service and your rules file.",
+      "not-applied": "Not applied to the service",
+      "not-applied-tooltip": "The rules shown here differ from the ones the service is enforcing. Apply them.",
+      "check-now": "Check now",
+      "check-now-tooltip": "Compare the rules on screen with your rules file and with the service right now.",
+      "unknown": "Not verified — the service isn't reachable right now."
+    },
+    "nav": {
+      "list": "Rules list",
+      "check-sync": "Check rules match"
+    },
+    "auto-origin": {
+      "site-companion": "Needed for {site} to work",
+      "vpn-client-bootstrap": "VPN client reconnection addresses",
+      "user-confirmed": "Accepted from a suggestion",
+      "block-notice-routed": "Routed from a block notice",
+      "badge": "Added for you",
+      "tooltip": "NetRuleRouter added this rule for {site} on {date}. You can turn it off or delete it like any rule of your own."
+    },
+    "bundled-preset": {
+      "label": "Bundled preset:",
+      "user-label": "My rule set:",
+      "load": "Load",
+      "hide": "Hide",
+      "hide-tooltip": "Hide the bundled-preset quick-load row. Re-enable it in Settings.",
+      "folder-empty-hint": "Your presets folder is empty — showing bundled sets"
+    },
+    "action": {
+      "save-and-review": "Save and review...",
+      "show-service-rules": "Show service rules",
+      "show-service-rules-tooltip": "Load the rules the service is currently enforcing into the table.",
+      "reset-to-baseline": "Reset to baseline rules",
+      "reset-to-baseline-tooltip": "Discard your custom rules and return to the baseline rules shared on this computer.",
+      "set-baseline": "Save as baseline (admin)",
+      "set-baseline-tooltip": "Administrator: make the current rules the baseline that every user on this computer falls back to. Asks for administrator approval.",
+      "load-demo-rules": "Load demo rules...",
+      "load-demo-rules-tooltip": "Merge the bundled built-in demo rules into the table and open the review flow.",
+      "import-from-file": "Import from file...",
+      "import-target-primary": "Replace primary route rules",
+      "import-target-secondary": "Replace secondary route rules",
+      "export-source-primary": "Export only the main route's rules to a file...",
+      "export-source-secondary": "Export only the additional route's rules to a file...",
+      "enable-rule": "Enable this rule",
+      "disable-rule": "Disable this rule",
+      "clear-all": "Clear all rules...",
+      "clear-all-tooltip": "Remove all rules from this app and the service. Without rules, the OS handles routing on its own.",
+      "clear-all-title": "Clear all rules?",
+      "clear-all-body": "All rules will be removed from this app and (when the service is running) from the service as well. The OS will route traffic without any NetRuleRouter overrides. This cannot be undone.",
+      "clear-all-confirm": "Clear all rules",
+      "select-row": "Select this rule for bulk actions",
+      "delete-single-title": "Delete this rule?",
+      "delete-single-body": "Rule {id} ({value}) will be removed from this app. Apply the change to the service later via 'Save and review...'.",
+      "delete-confirm": "Delete",
+      "save-rules": "Save rules...",
+      "save-as-set": "Save as a set (both routes)..."
+    },
+    "bulk": {
+      "selected-count": "{n} rule(s) selected",
+      "enable": "Enable",
+      "disable": "Disable",
+      "move-to-route": "Move to route",
+      "delete": "Delete...",
+      "delete-title": "Delete selected rules?",
+      "delete-body": "{n} selected rule(s) will be removed. You can apply the change to the service later via 'Save and review...'.",
+      "delete-confirm": "Delete",
+      "clear-selection": "Clear (Esc)"
+    },
+    "value": {
+      "punycode-hint": "Punycode: {ace}"
+    },
+    "dialog": {
+      "import-title": "Choose preset to import",
+      "export-title": "Save preset as...",
+      "export-set-title": "Save rules as a set...",
+      "export-title-primary": "Save primary rules as…",
+      "export-title-secondary": "Save additional-adapter rules as…",
+      "preset-filter": "Preset files (*.txt)",
+      "all-filter": "All files (*)"
+    },
+    "type": {
+      "zone": "Zone",
+      "application": "Application",
+      "domain": "Domain",
+      "exact-ip": "Exact IP"
+    },
+    "application-routing-note": "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
+    "app-browse": "Browse…",
+    "app-browse-title": "Select the application executable",
+    "app-browse-filter-exe": "Executables (*.exe)",
+    "app-browse-filter-all": "All files (*)",
+    "import-only-active": {
+      "label": "Import only active rules",
+      "tooltip": "When loading a preset, skip rules that are turned off in it (for example application rules, which can't route yet). Default comes from Settings → General; changing it here applies to imports this session only."
+    },
+    "placeholder": {
+      "zone": ".ru  (matches *.ru)",
+      "domain": "example.com",
+      "exact-ip": "192.0.2.1",
+      "application-windows": "browser.exe",
+      "application-linux": "browser",
+      "application-macos": "Browser.app"
+    },
+    "hint": {
+      "zone": "A single zone label — letters, digits, hyphens; an optional leading dot is allowed. Matches all hosts in the zone. Examples: .ru, ru, com, intra, corp.",
+      "domain": "FQDN (example.com) or wildcard suffix (*.example.com). Matches the domain itself and all subdomains. Examples: example.com, *.example.com, mail.example.com.",
+      "exact-ip": "Exact IPv4 address. Each octet 0–255; first octet ≥ 1. Examples: 192.0.2.1, 8.8.8.8, 203.0.113.7.",
+      "application-windows": "Process filename — .exe, .ps1, .bat or any executable script. Exact (browser.exe) or glob (*vpn*.exe).",
+      "application-linux": "Process filename, case-sensitive on Linux.",
+      "application-macos": "Process filename or app bundle id."
+    },
+    "comment": {
+      "max-length": "Up to {max} characters",
+      "char-counter": "{used}/{max}"
+    },
+    "sort": {
+      "label": "Sort",
+      "by-display-order": "Display order",
+      "by-match-value": "Match value (A–Z)",
+      "by-type": "Rule type",
+      "by-route": "Target route"
+    },
+    "column": {
+      "id": "ID",
+      "type": "Type",
+      "match-value": "Match value",
+      "route": "Route",
+      "comment": "Comment",
+      "enabled": "On",
+      "enabled-tooltip": "Click to toggle all visible rules on/off.",
+      "select-tooltip": "Select / deselect all visible rules for bulk actions."
+    },
+    "preview": {
+      "invalid-ip-comment": "preview: invalid IP — surfaces the strict validator"
+    },
+    "filter": {
+      "enabled": {
+        "label": "Status",
+        "all": "All",
+        "enabled-only": "Enabled only",
+        "disabled-only": "Disabled only",
+        "with-errors": "With errors"
+      },
+      "type": {
+        "label": "Type",
+        "all": "All types",
+        "zone": "Zone",
+        "domain": "Domain",
+        "exact-ip": "Exact IP",
+        "application": "Application"
+      },
+      "route": {
+        "label": "Route",
+        "all": "All routes"
+      },
+      "auto-added": "Auto-added only"
+    },
+    "search": {
+      "placeholder": "Search by match value or comment"
+    },
+    "source": {
+      "label": "Source:",
+      "open-folder": "Open folder",
+      "open-folder-tooltip": "Open the folder containing this rules file in Explorer."
+    },
+    "hosts-override": {
+      "blocked": "Blocked in hosts",
+      "redirected": "Redirected by system → {ip}",
+      "tooltip": "The operating system's hosts file resolves this hostname before NetRuleRouter sees any traffic, so NetRuleRouter cannot override it. Edit the OS hosts file to change this."
+    },
+    "duplicate-dialog": {
+      "title": "Duplicate rule",
+      "message": "This rule exists in both the primary and secondary lists. Choose which list to keep it in.",
+      "keep-in-primary": "Keep in primary",
+      "keep-in-secondary": "Keep in secondary",
+      "keep-in-both": "Keep in both"
+    },
+    "validation": {
+      "valid": "Valid",
+      "warning": "Valid with warnings",
+      "error": "Error — rule is inactive",
+      "match-value-empty": "Rule value is empty.",
+      "unknown-rule-type": "Unknown rule type.",
+      "match-value-invalid": {
+        "zone": "Zone is a single label — letters, digits, and hyphens only (no dots).",
+        "domain": "Enter a domain name (example.com) or a subdomain wildcard (*.example.com).",
+        "domain-too-long": "Domain is longer than 253 characters.",
+        "domain-glob-position": "Wildcard `*` is allowed only as a leading prefix (`*.example.com`).",
+        "exact-ip": "Enter a valid IPv4 address (e.g. 203.0.113.7).",
+        "exact-ip-octet-out-of-range": "Octet {octet} (position {position}) is out of range. Each octet must be 0–255.",
+        "exact-ip-first-octet-zero": "First octet must be ≥ 1 (0.x.x.x is reserved).",
+        "exact-ip-broadcast": "255.255.255.255 is the limited-broadcast address and cannot be routed.",
+        "application": "Enter a process filename or glob (e.g. browser.exe, *vpn*.exe, script.ps1)."
+      },
+      "match-value-warning": {
+        "exact-ip-loopback": "Loopback addresses (127.0.0.0/8) are unusual routing targets.",
+        "exact-ip-multicast": "Multicast addresses (224.0.0.0/4) are unusual routing targets.",
+        "zone-compound": "Compound zone (label.label) is accepted by the parser but unusual; consider a single-label zone."
+      }
+    },
+    "file-sync": {
+      "behavior": {
+        "label": "When the rules file changes on disk",
+        "notify": "Notify me",
+        "auto-apply": "Apply automatically"
+      },
+      "update-button": "Update rules from file"
+    },
+    "file-format": {
+      "section-hint": {
+        "zones": "Zone-level group routing. Matches all traffic for a named zone (e.g. .ru, corp-internal). Highest priority tier.",
+        "domains": "Domain name rules. Exact FQDN (example.com) or subdomain wildcard (*.example.com). Exact match takes priority over wildcard.",
+        "ip": "Exact IPv4 address rules. One address per entry. CIDR and IPv6 are not supported yet.",
+        "windows": "Windows application rules matched by process filename — exact or glob (e.g. *vpn*.exe). Applied on Windows only.",
+        "linux": "Linux application rules matched by process name. Stored in the file on all platforms, but applied only on Linux.",
+        "macos": "macOS application rules matched by bundle ID or process name. Stored in the file on all platforms, but applied only on macOS."
+      }
+    },
+    "pro-section": {
+      "badge-label": "Not applied",
+      "badge-tooltip": "Rules in this section are kept in the file but not applied in this version.",
+      "inactive-hint": "Not applied in this version"
+    },
+    "empty": {
+      "title": "No rules yet",
+      "body": "Add your first routing rule to start sending traffic through the secondary route.",
+      "cta": "Add your first rule",
+      "no-source": {
+        "title": "No rule set loaded",
+        "body": "Pick a rule set above and press Load, or add a rule by hand. The background service is not needed for this."
+      }
+    },
+    "suggestions": {
+      "chip": "Suggested addresses ({count})",
+      "chip-description": "Review addresses the service suggests adding to your rules.",
+      "body": "Without these addresses the sites you routed may not work fully. Checked ones will be added to your rules.",
+      "open": "Review",
+      "rejected": {
+        "restore": "Allow again"
+      },
+      "inbox": {
+        "nav-label": "Suggested addresses",
+        "action-forget-all": "Clear all",
+        "action-forget-all-tooltip": "Removes every suggestion together with your answers, so these addresses can be offered again later.",
+        "clear-all-title": "Clear all suggested addresses?",
+        "clear-all-body": "{count} suggestions will be forgotten together with your answers, so they can be offered again if they turn up beside your sites. This cannot be undone.",
+        "clear-all-confirm": "Clear all",
+        "show-more-count": "Show {count} more",
+        "title": "Addresses your sites need",
+        "intro": "These addresses were pulled in by sites you route. Adding one sends it through the additional route together with the site that needs it. Anything you leave alone keeps going through the main route.",
+        "empty": "Nothing is waiting for an answer right now.",
+        "needed-by": "Needed by:",
+        "consumer-on-primary": "on the main route",
+        "consumer-on-primary-hint": "This site goes through the main route. If you move the address into the tunnel, this site's traffic to it goes there too.",
+        "consumer-copy-hint": "Right-click to copy this name to the clipboard.",
+        "behavior-responds": "already works without the tunnel",
+        "behavior-stalls": "connections to it stall on the main route",
+        "sort": "Sort",
+        "sort-newest": "Newest first",
+        "sort-consumers": "By number of sites",
+        "sort-name": "By name",
+        "filter-active": "Showing only what {name} needs",
+        "filter-clear": "Show everything",
+        "action-add": "Add to the additional route",
+        "action-never": "Don't suggest again",
+        "selected": "{count} selected",
+        "search-placeholder": "Search by domain, host, or site",
+        "search-empty": "No addresses match your search.",
+        "select-all": "Select all",
+        "select-all-tooltip": "Select or clear every address currently shown.",
+        "action-forget": "Delete",
+        "action-forget-tooltip": "Removes the record entirely, answer and all, so the address is offered again if it turns up next to your sites."
+      },
+      "table": {
+        "intro": "Every address below was pulled in by a site you route. Adding one <b>sends it through the additional route together with the site that needs it</b> — <i>anything you leave alone keeps going through the main route</i>. A dismissed address <i>only stops being offered</i>; \"Allow again\" lifts that suppression and nothing else.",
+        "status-pending": "Pending",
+        "status-dismissed": "Dismissed",
+        "group-hosts": "{count} host(s) observed"
+      }
+    }
+  },
+  "connection": {
+    "banner": {
+      "connecting": "Connecting to service…",
+      "disconnected": "Service offline — showing locally-cached data",
+      "service-stopped": "NetRuleRouter service is stopped",
+      "service-not-installed": "NetRuleRouter service is not installed",
+      "protocol-mismatch": "Service version mismatch — please update NetRuleRouter"
+    },
+    "service-status": {
+      "connected": "OK",
+      "connecting": "connecting…",
+      "disconnected": "offline",
+      "service-stopped": "stopped",
+      "service-not-installed": "not installed",
+      "protocol-mismatch": "incompatible"
+    }
+  },
+  "first-run": {
+    "scenario": {
+      "quick-start": "Quick start",
+      "guided-default": "Guided default setup"
+    },
+    "step": {
+      "welcome": "Welcome",
+      "basic-scenario-selection": "Basic scenario selection",
+      "routes-setup": "Routes setup",
+      "rules-setup": "Rules setup",
+      "diagnostics-preview": "Diagnostics preview",
+      "finish": "Finish"
+    },
+    "state": {
+      "empty": "empty",
+      "semi-empty": "semi-empty",
+      "test-data-preview": "test-data-preview"
+    },
+    "notice": {
+      "list-editing-preview": "Opening or editing a list in first-run is preview/setup only and does not mean service policy was applied.",
+      "completion": "First-run completion opens interfaces/routes first; rule and diagnostics screens stay immediately available from sidebar."
+    }
+  },
+  "tray": {
+    "menu": {
+      "open": "Open",
+      "suggestions": "Suggested addresses",
+      "suggestions-count": "Suggested addresses ({count})",
+      "kill-switch-on": "Turn kill-switch on",
+      "kill-switch-off": "Turn kill-switch off",
+      "safe-disable": "Disable temporarily…",
+      "start-service": "Start service",
+      "stop-service": "Stop service"
+    },
+    "external": {
+      "label": "External IP",
+      "main-route": "Main route",
+      "additional-route": "Additional route",
+      "checking": "checking…",
+      "unknown": "check",
+      "last-known": "last known {when}"
+    },
+    "suggestions": {
+      "silence": "Do not suggest addresses",
+      "silenced": "Address suggestions: silenced",
+      "for-30-minutes": "For 30 minutes",
+      "for-2-hours": "For 2 hours",
+      "for-4-hours": "For 4 hours",
+      "for-8-hours": "For 8 hours",
+      "until-restart": "Until restart",
+      "resume": "Suggest again",
+      "stop-automatic": "Stop adding automatically"
+    },
+    "status": {
+      "preview-mode": "Preview mode",
+      "checking-status": "Checking status...",
+      "no-active-policy": "No active policy application",
+      "service-unavailable": "Service unavailable"
+    },
+    "status-accessibility": {
+      "preview-mode": "Preview mode: policy changes are not applied in GUI shell v1.",
+      "no-active-policy": "Active policy application is not running: the interface remains in safe preparation mode.",
+      "service-unavailable": "Service is unavailable: policy application actions are temporarily unavailable."
+    },
+    "action": {
+      "safe-disable": "Safe disable (temporary)…",
+      "open-window": "Open window",
+      "start-service": "Start service",
+      "stop-service": "Stop service",
+      "install-service": "Install service...",
+      "uninstall-service": "Uninstall service",
+      "exit": "Exit"
+    },
+    "tooltip": {
+      "service-running": "NetRuleRouter — Service running",
+      "service-stopped": "Service stopped — click to start",
+      "service-pending": "Service changing state...",
+      "service-not-installed": "Service not installed — click to install",
+      "service-unknown": "Cannot read service status",
+      "no-updates": "The service is running, but this app is not receiving updates from it",
+      "rules-applied": "NetRuleRouter — your rules are being applied",
+      "no-rules-applied": "NetRuleRouter — no rules are being applied yet"
+    },
+    "auto-rules": {
+      "title": "Addresses a site needs",
+      "body": "Found addresses without which {name} will not work fully.",
+      "item-companion-short": "← {name}",
+      "route-line-primary": "They will be added to the main route.",
+      "route-line-secondary": "They will be added to the additional route.",
+      "site-fallback": "a site you use",
+      "empty": "No addresses to suggest right now.",
+      "none-pending": "Nothing is waiting to be added right now.",
+      "list-accessible-name": "Suggested addresses",
+      "unchecked-declined": "Unchecked rows will be declined; you can bring them back later in the app.",
+      "detail-observations": "seen in {count} visits",
+      "detail-affinity": "belongs to this site {percent}% of the time",
+      "detail-match-kind": {
+        "exact": "this address only",
+        "suffix": "this address and its subdomains"
+      },
+      "signal": {
+        "brand-related": "shares a name with the site",
+        "delivery-name": "looks like a delivery address of the site",
+        "co-activity": "keeps appearing together with the site",
+        "isp-block-page": "your provider answered with a notice page instead of this site"
+      },
+      "action": {
+        "accept": "Add checked",
+        "always": "Add automatically from now on",
+        "details": "Details",
+        "dismiss": "Never suggest checked"
+      }
+    },
+    "auto-rules-mode-confirm": {
+      "title": "Turn on “Apply automatically”?",
+      "body": "From now on NetRuleRouter will add suggested addresses to your rules files by itself, without asking. You can undo this anytime in Settings → Routing, by switching back to “Suggest only”.",
+      "confirm": "Turn on"
+    },
+    "external-address": {
+      "title": "Additional route connected",
+      "body": "External address of the additional route: {address}",
+      "adapter": "Adapter: {name}"
+    },
+    "rules-drift": {
+      "title": "Your rule files differ from what is applied",
+      "body": "The rules saved in your files are not the ones being applied right now. Apply the files, or open the app to see the difference.",
+      "list-accessible-name": "Rule files that differ"
+    },
+    "block-notice": {
+      "title": "Connection blocked",
+      "title-route-down": "Additional route is unavailable",
+      "attempts": "{count} attempts",
+      "reason": {
+        "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
+        "not-covered-by-rules": "This app is confined to a route, and no rule covers this address there.",
+        "blocked-by-rule": "A rule blocks this address directly.",
+        "unspecified": "No further detail available."
+      },
+      "action": {
+        "route-to-secondary": "To additional route",
+        "open-routes": "Open routes",
+        "snooze": "Snooze",
+        "mute": "Don't show…"
+      },
+      "route-confirm": {
+        "title": "Route {name} via the additional link?",
+        "body": "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules."
+      },
+      "snooze": {
+        "title": "Snooze this notice",
+        "body": "Stop asking about {name} for a while.",
+        "for-15-minutes": "15 minutes",
+        "for-1-hour": "1 hour",
+        "for-8-hours": "8 hours",
+        "for-a-day": "For a day"
+      },
+      "mute": {
+        "title": "Don't show this notice again",
+        "body": "Choose what to stop hearing about {name}.",
+        "this-host": "This host",
+        "this-app": "This app",
+        "all": "All block notifications"
+      }
+    }
+  },
+  "diag": {
+    "copy-all-shown": "Copy all shown",
+    "copy-selected": "Copy selected",
+    "table": {
+      "select-hint": "Click a row to select it (Ctrl+click to toggle, Shift+click to extend), then press Ctrl+C to copy. Right-click for more options."
+    },
+    "section": {
+      "title": "Diagnostics and Logs",
+      "subtitle": "Log storage, audit trail, and diagnostic mode settings"
+    },
+    "status": {
+      "service-running": "Service running",
+      "service-degraded": "Service degraded",
+      "service-starting": "Service starting...",
+      "service-recovery-required": "Service requires recovery action",
+      "service-unavailable": "Service unavailable",
+      "audit-chain-ok": "Audit chain intact",
+      "audit-chain-mismatch": "Audit chain mismatch detected",
+      "cache-healthy": "Cache healthy",
+      "cache-stale": "Cache entries stale",
+      "cache-rebuilding": "Cache rebuild in progress",
+      "stale-data-warning": "Status data may be outdated"
+    },
+    "alert": {
+      "title-active": "Active security alert",
+      "title-acknowledged": "Acknowledged alert",
+      "action-acknowledge": "Acknowledge",
+      "action-acknowledge-confirm": "Mark this alert as acknowledged?",
+      "no-active-alerts": "No active alerts",
+      "unread-prefix": "Security alerts requiring attention:",
+      "ack-completed": "Security alert acknowledged.",
+      "ack-failed": "Failed to acknowledge alert: ",
+      "ack-unavailable": "Cannot acknowledge: service connection unavailable.",
+      "kind": {
+        "db-tamper-detected": "Database tampering detected",
+        "key-reset-with-existing-data": "Integrity key reset with existing data",
+        "tamper-alert-raised": "Tamper alert raised",
+        "integrity-failure-detected": "Integrity verification failed",
+        "untrusted-revision-rejected": "Rule set changed outside the app"
+      },
+      "kind-detail": {
+        "untrusted-revision-rejected": "The rule set was changed outside the app, so this revision was not applied. The service continues running on the last verified rule set. This can happen after restoring the database from a backup or moving the installation to a different machine."
+      }
+    },
+    "logs": {
+      "title": "Operational logs",
+      "empty": "No log entries",
+      "filter-all-levels": "All levels",
+      "filter-level": "Level",
+      "filter-category": "Category",
+      "filter-kind": "Event type",
+      "filter-time-range": "Time range",
+      "range-current-session": "Current session",
+      "range-all": "All history",
+      "level-trace": "Trace",
+      "level-debug": "Debug",
+      "level-info": "Info",
+      "level-warn": "Warning",
+      "level-error": "Error",
+      "clear-button": "Clear logs",
+      "clear-confirm-title": "Clear operational logs?",
+      "clear-confirm-body": "This will permanently delete log files. The audit trail will not be affected.",
+      "clear-dry-run-summary": "Would delete {count} files ({size})",
+      "export-button": "Export diagnostic archive"
+    },
+    "audit": {
+      "title": "Audit trail",
+      "empty": "No audit entries",
+      "chain-verified": "Hash chain verified",
+      "chain-warning": "Hash chain warning"
+    },
+    "retention": {
+      "section-title": "Retention settings",
+      "logs-max-age-label": "Keep logs for",
+      "logs-max-age-unit": "days",
+      "logs-max-size-label": "Maximum log storage",
+      "logs-max-size-unit": "MB",
+      "size-unit": {
+        "bytes": "Bytes",
+        "kb": "KB",
+        "mb": "MB",
+        "gb": "GB"
+      },
+      "audit-max-age-label": "Keep audit trail for",
+      "audit-max-age-unit": "days",
+      "audit-max-size-label": "Maximum audit storage",
+      "audit-max-size-unit": "MB",
+      "apply-button": "Apply"
+    },
+    "diagnostic-mode": {
+      "toggle-label": "Extended diagnostics",
+      "toggle-description": "Enables detailed routing and cache information in logs. Automatically expires.",
+      "ttl-1h": "1 hour",
+      "ttl-4h": "4 hours",
+      "ttl-restart": "Until restart",
+      "warning-banner": "Extended diagnostics are active. More detailed information is being logged.",
+      "expires-in": "Expires in {time}"
+    },
+    "storage-health": {
+      "logs-size": "Log storage: {size}",
+      "audit-size": "Audit storage: {size}",
+      "log-files": "{count} log file(s)",
+      "dropped-events": "{count} event(s) dropped",
+      "last-cleanup": "Last cleanup: {time}",
+      "dir-not-writable": "Log directory is not writable"
+    },
+    "service": {
+      "revision-label": "Active revision",
+      "pending-changes-label": "Pending changes"
+    },
+    "cache": {
+      "title": "Cache",
+      "entry-count": "Entries",
+      "clear-button": "Clear cache now",
+      "clear-app-button": "Clear app cache",
+      "clear-os-dns-button": "Clear OS DNS cache",
+      "os-flush-ok": "OS DNS cache flushed.",
+      "os-flush-failed": "Could not flush the OS DNS cache.",
+      "entries-button": "Show cache entries",
+      "entries-hide": "Hide cache entries",
+      "entries-search-placeholder": "Exact name or IP; *.google.com — subdomains; *google* — any match",
+      "entries-no-match": "No entries match your search",
+      "entries-title": "Cache entries",
+      "entries-empty": "No cache entries",
+      "entries-loading": "Loading cache entries...",
+      "entries-load-more": "Load more",
+      "entries-failed": "Failed to load cache entries: ",
+      "entries-bridge-unavailable": "Service bridge not connected — cache entries unavailable",
+      "entries-redacted-notice": "Hostnames and IPs are reduced for privacy. Enable Extended diagnostics for full detail.",
+      "entries-resolved": "resolved",
+      "entries-expires": "expires",
+      "col-hostname": "Host",
+      "col-ip": "IP",
+      "col-freshness": "Freshness",
+      "col-source": "Source",
+      "col-route": "Route",
+      "col-expires": "Expires",
+      "col-fake-ip": "Fake-IP",
+      "render-truncated": "Showing the first %1 of %2 matches — refine your search to narrow it.",
+      "seed-browser-history": {
+        "button": "Seed cache from browser history",
+        "note": "Resolves hosts from your browser history that match your rules (closes the gap for sites visited before the service started). Privacy: only names matching your rules are processed.",
+        "started": "Import started — hosts matching your rules will appear in the cache.",
+        "unavailable": "This feature is unavailable."
+      },
+      "auto-seed-label": "Seed the cache from browser history automatically at service start",
+      "auto-seed-privacy-note": "Only visited hostnames are read from local browser profiles — nothing is sent anywhere.",
+      "freshness": {
+        "fresh": "Fresh",
+        "stale-usable": "Stale (usable)",
+        "stale-not-usable": "Stale (not usable)",
+        "conflicting": "Conflicting",
+        "negative-cached": "Negative"
+      },
+      "source": {
+        "dns": "DNS",
+        "observed-from-traffic": "Observed",
+        "manual-refresh": "Manual refresh",
+        "imported-seed": "Imported",
+        "cache-rebuild": "Rebuilt",
+        "os-cache-seed": "OS cache",
+        "reverse-confirmed": "Reverse-confirmed",
+        "browser-history-seed": "Browser history"
+      },
+      "source-filter": {
+        "all": "All sources"
+      },
+      "freshness-filter": {
+        "all": "Any freshness",
+        "fresh": "Fresh",
+        "stale": "Stale"
+      },
+      "route-filter": {
+        "all": "All routes",
+        "none": "No rule"
+      },
+      "ttl": {
+        "min": "m",
+        "hour": "h",
+        "day": "d",
+        "expired": "expired"
+      }
+    },
+    "conn-trace": {
+      "title": "Connection trace",
+      "subtitle": "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. Works on demand, no service restart needed; the list is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.",
+      "entries-button": "Show recent connections",
+      "entries-refresh": "Refresh",
+      "entries-hide": "Hide connection trace",
+      "entries-search-placeholder": "Search all fields…",
+      "entries-redacted-notice": "Addresses are masked for privacy. Enable Extended diagnostics for full detail.",
+      "entries-failed": "Failed to load connection trace: ",
+      "entries-bridge-unavailable": "Service bridge not connected — connection trace unavailable",
+      "entries-loading": "Loading connections...",
+      "entries-empty": "No connections observed yet",
+      "entries-no-match": "No connections match the current filters",
+      "entries-load-more": "Load more",
+      "entries-from": "from",
+      "relay-for": "relay for %1",
+      "col-process": "Process",
+      "col-remote": "Remote",
+      "col-egress": "Egress",
+      "col-verdict": "Verdict",
+      "col-process-tip": "The application that opened the connection. Hover a row's process name to see its full path.",
+      "col-remote-tip": "The destination address and port the connection went to.",
+      "col-egress-tip": "Which network link the connection actually left through: Primary (your main link), Additional (the VPN/secondary link), Loopback (local, never leaves the PC), Other (another adapter), Unknown (couldn't be determined). This is observation only — it never changes routing.",
+      "col-verdict-tip": "Whether the connection was allowed or dropped. A \"Blocked\" row may be a Windows Firewall or antivirus drop — not necessarily NetRuleRouter.",
+      "show-blocked": "Show blocked",
+      "show-local": "Show local connections",
+      "show-local-tip": "Connections to your own machine or your local network (loopback, link-local, private LAN addresses). They never leave your network, so they say nothing about routing.",
+      "group-by-process": "Group by process",
+      "group-count": "connection(s)",
+      "leak-mismatch-tip": "Mismatch: this address belongs to a rule routed to the additional adapter, but the connection was allowed out over the PRIMARY link — a leak indicator.",
+      "verdict-note": "\"Blocked\" means the connection was dropped by a Windows filter — this can be Windows Firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.",
+      "egress": {
+        "primary": "Primary",
+        "secondary": "Additional (VPN)",
+        "loopback": "Loopback (local)",
+        "other": "Other",
+        "unknown": "Unknown"
+      },
+      "verdict": {
+        "permit": "Allowed",
+        "block": "Blocked",
+        "block-by-nrr": "Blocked (NetRuleRouter)",
+        "block-by-other": "Blocked (another program)",
+        "unknown": "—"
+      },
+      "proto": {
+        "tcp": "TCP",
+        "udp": "UDP",
+        "other": "Other"
+      }
+    },
+    "explain": {
+      "title": "Explain sample",
+      "subtitle": "Enter a hostname or IP to simulate the routing decision against the active rule set.",
+      "empty": "No probe has been run yet. Enter a query above and click Probe.",
+      "availability": {
+        "available": "Decision data available",
+        "decision-not-found": "Decision not found in history — try a synthetic probe",
+        "diagnostic-mode-required": "Enable Extended diagnostics to capture detailed explain output",
+        "lookup-unavailable": "Explain lookup is not available in this build",
+        "service-unavailable": "No active rules revision yet — save a rule first, then re-probe"
+      },
+      "reason": {
+        "rule-matched-zone": "Matched zone rule",
+        "rule-matched-suffix-domain": "Matched domain-suffix rule",
+        "rule-matched-exact-fqdn": "Matched exact-FQDN rule",
+        "rule-matched-exact-ip": "Matched exact-IP rule",
+        "rule-matched-application": "Matched application rule",
+        "no-rule-match": "No rule matched — default route applies"
+      },
+      "final-action": {
+        "route-primary": "Route via primary",
+        "route-secondary": "Route via secondary",
+        "route-none": "No route applied"
+      },
+      "probe-placeholder": "hostname or IP",
+      "probe-button": "Probe",
+      "probing": "Probing...",
+      "input-required": "Enter a hostname or IP to probe",
+      "bridge-unavailable": "Service bridge not connected — probe unavailable",
+      "route": {
+        "primary": "primary route",
+        "secondary": "secondary route",
+        "none": "no route",
+        "blocked": "blocked"
+      },
+      "enforcement": {
+        "blocked-unknown-under-block-all": "Note: “block all unresolved” is on and this name is not in the cache — while the additional adapter is unavailable this connection will be BLOCKED until the name is cached.",
+        "fail-closed-when-secondary-down": "Routed via the additional adapter: while it is unavailable this traffic is BLOCKED (leak protection), not sent over the main link.",
+        "collateral-blocked-strict": "Some of this site's addresses are SHARED with sites routed via the additional adapter. Strict kill switch is on: while the additional adapter is unavailable those shared addresses are blocked, so this site may not open.",
+        "collateral-smart-exempt": "Some of this site's addresses are shared with sites routed via the additional adapter. Smart kill switch keeps them unblocked, so this site works — but routed traffic to those shared addresses is not leak-protected.",
+        "collateral-risk-subdomain-rules": "This name is not cached, but sites under the same domain are routed via the additional adapter. Large services often serve both from the same addresses, so a strict kill switch may block this site while the additional adapter is unavailable."
+      }
+    },
+    "archive": {
+      "title": "Diagnostic archive export",
+      "folder-label": "Save folder",
+      "folder-placeholder": "%USERPROFILE%\\Documents\\NetRuleRouter",
+      "browse-button": "Browse...",
+      "folder-picker-title": "Select folder for diagnostic archive",
+      "service-owned-note": "The archive is saved in the service archives directory (per-user).",
+      "path-placeholder": "No archive exported yet",
+      "open-folder": "Open folder",
+      "state-ready": "Ready",
+      "state-exporting": "Exporting...",
+      "state-done": "Archive saved to {folder}",
+      "state-saved-with-size": "Archive saved: {path} ({size})",
+      "state-failed": "Export failed",
+      "state-cancelled": "Export cancelled",
+      "bridge-unavailable": "Service bridge not connected — export unavailable",
+      "session-only": "Only logs from the current session",
+      "log-budget": {
+        "label": "Log size limit in the archive",
+        "unlimited": "Unlimited"
+      },
+      "session-only-caption": "Skips log entries from previous days: the archive includes everything since the start of the day this session began, so app or service restarts during the day do not cut the history. Uncheck for the full log history.",
+      "level": {
+        "label": "Detail level",
+        "standard": "Standard (recommended)",
+        "diagnostics": "Full diagnostics",
+        "caption": "Full diagnostics adds extra cache, storage and decision detail and is less redacted. Only share it with support."
+      }
+    }
+  },
+  "logs": {
+    "tab": {
+      "operational": "Operational",
+      "audit": "Audit"
+    },
+    "pagination": {
+      "load-more": "Load more",
+      "loading": "Loading...",
+      "error-prefix": "Load failed"
+    },
+    "column": {
+      "time": "Time",
+      "level": "Level",
+      "category": "Category",
+      "kind": "Event type",
+      "message": "Message"
+    }
+  },
+  "audit": {
+    "column": {
+      "seq": "Seq",
+      "kind": "Kind",
+      "result": "Result",
+      "reason": "Reason",
+      "revision": "Revision"
+    },
+    "clear-disabled-tooltip": "The audit trail cannot be cleared by design. Use the Operational tab to clear runtime logs."
+  },
+  "risk": {
+    "level": {
+      "low": "Low",
+      "medium": "Medium",
+      "high": "High",
+      "critical": "Critical"
+    },
+    "signal": {
+      "broad-suffix-scope": "Broad suffix scope (TLD): *.{label} routes an entire top-level domain",
+      "moderate-suffix-scope": "Moderate suffix scope: *.{label} routes one apex and all subdomains",
+      "default-behavior-changed": "Default routing behaviour changed",
+      "mass-change-count": "Mass change: {count} rule changes in one revision",
+      "secondary-reroute": "{rule-count} rule(s) added or moved to the secondary route",
+      "unstable-interface-binding": "Network adapter binding changed",
+      "unknown-source": "Revision source could not be verified",
+      "linked-suspicious-delta": "Linked import shows a suspicious delta vs the previous check",
+      "rule-set-emptied": "All {prev-total} previous rules are being removed",
+      "high-removal-ratio": "{removed-pct}% of previous rules are being removed",
+      "overlapping-rules": "*.{apex} already covers {apex} itself and every subdomain — a separate exact-FQDN rule is redundant and can be removed, unless it deliberately routes elsewhere",
+      "fail-closed-activation": "Strict secondary fail-closed mode is being activated"
+    }
+  },
+  "mutations": {
+    "in-progress-tooltip": "Another operation is in progress. Wait for it to finish."
+  },
+  "errors": {
+    "rule-cap-exceeded": "Up to 9999 active rules are supported. This change would exceed the limit and was not applied.",
+    "unauthorized": "Authentication required",
+    "forbidden": "Permission denied",
+    "uac-declined": "Administrator approval is required to apply this change. The change was not applied.",
+    "invalid-version": "Service version is incompatible",
+    "malformed-request": "Request was rejected as malformed",
+    "busy-conflict": "Service is busy with another operation",
+    "precondition-failed": "Operation precondition not met",
+    "confirmation-expired": "Confirmation token expired — re-run review",
+    "confirmation-unknown": "Confirmation token unknown — re-run review",
+    "service-degraded": "Service is degraded — try again later",
+    "recovery-required": "Service requires user recovery action",
+    "internal": "Internal service error",
+    "transport-disconnected": "Service is offline",
+    "timeout": "Request timed out",
+    "bad-response": "Service returned a malformed response",
+    "serialization-failed": "Request could not be encoded",
+    "client-shutdown": "IPC client is shutting down",
+    "unknown-operation": "Unknown operation",
+    "unknown-preset-operation": "The rules-file export/parse operation isn't available.",
+    "malformed-preset-payload": "The rules-file request was malformed.",
+    "ipc-call-failed": "IPC call failed",
+    "rpc-timed-out": "Response timeout",
+    "safe-disable-rpc-pending": "Safe disable RPC bridge is not wired yet",
+    "rules-locked": "Your administrator manages the routing rules on this computer, so they cannot be changed here.",
+    "unknown": "Unknown error"
+  },
+  "unsaved-changes": {
+    "title": "Unsaved changes",
+    "body": {
+      "section-nav": "You have unsaved changes in {section}. Switch sections anyway?",
+      "generic-section": "this section",
+      "window-close": "You have unsaved changes. Close the window anyway?",
+      "app-quit": "You have unsaved changes. Quit NetRuleRouter anyway?",
+      "generic": "You have unsaved changes. Continue anyway?"
+    },
+    "detail": {
+      "rules-not-applied": "The rules on screen have not been applied to the service yet.",
+      "rules-not-saved": "The rules on screen have not been saved to your rules file yet. The service is stopped, so the file is the only place they can be kept."
+    },
+    "action": {
+      "discard": "Discard changes",
+      "save-continue": "Save and continue",
+      "cancel": "Cancel"
+    },
+    "accessible": {
+      "discard": "Discard unsaved changes and continue",
+      "save-continue": "Save unsaved changes and continue",
+      "cancel": "Cancel and stay on the current view"
+    }
+  },
+  "toast": {
+    "operation": {
+      "title": {
+        "rules-update": "Rules update",
+        "route-bindings-update": "Route bindings",
+        "preset-import": "Preset import",
+        "preset-export": "Preset export",
+        "settings-export": "Settings export",
+        "security-alert-ack": "Acknowledge alert",
+        "security-alert-resolve": "Resolve alert",
+        "safe-disable": "Safe disable",
+        "unknown": "Operation"
+      },
+      "phase": {
+        "running": "Running…",
+        "completed": "Completed",
+        "failed": "Failed"
+      },
+      "error": {
+        "generic": "Operation failed",
+        "with-code": "Operation failed ({code})"
+      },
+      "dismiss": "Dismiss",
+      "accessible": {
+        "dismiss": "Dismiss notification",
+        "running": "Operation in progress",
+        "completed": "Operation completed",
+        "failed": "Operation failed"
+      }
+    }
+  },
+  "notifications": {
+    "title": "Notifications",
+    "empty": "No notifications.",
+    "chip-label": "Notifications",
+    "chip-tooltip": "Show notifications",
+    "dismiss": "Dismiss",
+    "dismiss-all": "Dismiss all",
+    "dismiss-all-tooltip": "Removes every notice that can be dismissed. Ones that mirror a live state stay until the state itself changes.",
+    "mute-kind": "Stop showing these",
+    "app-unresolved": {
+      "title": "App rules applied, but some apps weren't found",
+      "body": "NetRuleRouter couldn't find these programs (they may not be installed in a standard location, or aren't running), so their traffic isn't routed by your rules: {apps}. Launch the app, or check the program name in Rules."
+    },
+    "strict-killswitch": {
+      "title": "Strict kill-switch is on",
+      "body": "While the additional adapter (VPN) is down, ALL internet is blocked except your local network — including normal browsing — until it comes back. Switch to the best-effort variant in Settings → Routing behavior if you want your main connection to keep working when the VPN drops.",
+      "action": "Open settings"
+    },
+    "kill-switch-restored": {
+      "title": "Leak protection restored",
+      "body": "Leak protection was turned back on from your saved settings (the background service had been reset). If you didn't expect this, you can turn it off in Settings → Routing behavior."
+    },
+    "update-available": {
+      "title": "A new version is available",
+      "body": "NetRuleRouter {version} has been released (you are running {current}). Open the download page to update.",
+      "action": "Open download page"
+    },
+    "auto-rule-candidates": {
+      "title": "Addresses waiting to be added",
+      "body": "The service found {count} addresses the sites you routed need."
+    },
+    "block-notice": {
+      "title": "Connection blocked",
+      "reason": {
+        "route-unavailable": "The route this connection needed was unavailable.",
+        "not-covered-by-rules": "No rule covers this connection, so the default action blocked it.",
+        "blocked-by-rule": "A rule blocks this connection.",
+        "unknown": "This connection was blocked."
+      },
+      "body": "{reason} Destination: {destination}. Application: {app}. Attempts: {attempts}.",
+      "destination-hidden": "a hidden destination",
+      "app-unknown": "unknown application"
+    }
+  },
+  "route": {
+    "primary": "Main",
+    "secondary": "Additional"
+  },
+  "block-reason": {
+    "route-unavailable": "Route outages",
+    "not-covered-by-rules": "Addresses no rule covers",
+    "blocked-by-rule": "Blocks by rule",
+    "any": "Blocks of this kind"
+  }
+}

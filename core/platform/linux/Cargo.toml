@@ -1,0 +1,34 @@
+[package]
+name = "nrr-platform-linux"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Block 19.1 (Slice 1) — Linux platform backend. Currently STUB `impl`s of the
+# neutral ports declared in `nrr-platform-api`, returning
+# `PlatformError::NotSupported`, so the higher layers (`service-runtime`) link
+# and run on Linux as a live skeleton that enforces nothing yet. The real
+# nftables / rtnetlink / systemd implementations land in Block 19.2 (Slice 2 —
+# needs a VM with root). This crate is OS-neutral by construction (pure Rust
+# over the api traits), so it compiles on every target and is selected by the
+# consumer under `#[cfg(target_os = "linux")]`.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-platform-api = { path = "../api" }
+nrr-shared = { path = "../../../shared/contracts" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Block 19.2 — `peer_cred.rs` needs `getsockopt(SO_PEERCRED)` / `struct ucred`
+# to identify an accepted AF_UNIX IPC caller (the Linux analog of the Windows
+# named-pipe token inspection). There is no stable `std` API for peer
+# credentials; `libc` is the idiomatic route. MIT/Apache, allowed by policy.
+# Linux-only: the module is `#[cfg(target_os = "linux")]`.
+libc = "0.2"
+
+[lints]
+workspace = true

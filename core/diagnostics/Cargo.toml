@@ -1,0 +1,39 @@
+[package]
+name = "nrr-diagnostics"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-domain  = { path = "../domain"  }
+nrr-storage = { path = "../storage" }
+nrr-shared  = { path = "../../shared/contracts" }
+# Chosen logging facade (block 13.1 decision). Custom NDJSON subscriber
+# implemented in block 13.4; all other crates instrument via this crate.
+tracing = "0.1"
+# Custom NDJSON tracing-subscriber layer (block 13.4). `tracing_subscriber::
+# reload` (used by block 16.HW-0716 P3's `TracingVerbosityHandle` for live
+# verbosity toggling) is part of the crate's core API, not gated behind a
+# separate Cargo feature — no feature-list change needed for it.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+# Required for deterministic NDJSON serialization of event types (block 13.2).
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+tempfile   = "3"
+zip        = "2"
+# Local wall-clock timestamps for zip entry mtimes. `chrono::Local::now()` is
+# used instead of the `time` crate's `OffsetDateTime::now_local()`, which is
+# gated behind an unsound "local-offset" feature that can fail
+# (`IndeterminateOffset`) in multithreaded processes such as the service.
+chrono     = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+
+[lints]
+workspace = true

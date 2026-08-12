@@ -1,0 +1,20 @@
+﻿[package]
+name = "nrr-core"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-shared = { path = "../shared/contracts" }
+nrr-application = { path = "./application" }
+nrr-ui-support = { path = "./ui-support" }
+nrr-mock-backend = { path = "./mock-backend" }
+nrr-platform-windows = { path = "./platform/windows" }
+
+[lints]
+workspace = true

@@ -1,0 +1,9 @@
+# NetRuleRouter preset — version 1
+# name: Duplicate domains preset
+# description: Two entries with the same domain; second occurrence produces DuplicateRuleInSameSet warning
+
+--- Domains
+example.com          # first occurrence
+example.com          # duplicate — triggers warning, second copy dropped
+*.cdn.example.com
+*.cdn.example.com    # duplicate wildcard

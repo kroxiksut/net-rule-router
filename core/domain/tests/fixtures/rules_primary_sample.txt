@@ -1,0 +1,35 @@
+# NetRuleRouter rules file — version 1
+#
+# Sample primary route rules file.
+# Rules in this file are applied to the PRIMARY network interface (direct connection).
+# Entries listed here are routed through the primary adapter;
+# everything else follows the default routing behavior configured in Settings.
+#
+# Syntax:
+#   value               — active rule
+#   value  # comment    — active rule with a label shown in the GUI
+#   # value             — disabled rule (GUI toggle-off)
+#   # free text         — ignored comment line
+
+--- Zones
+# corp-internal   # disabled: corporate zone placeholder
+
+--- Domains
+updates.example.org  # vendor update servers
+docs.example.org     # documentation portal
+corp.example.net
+# old.partner.com     # retired partner domain
+
+--- IP
+203.0.113.7
+# 198.51.100.1        # reserved for future use
+
+--- Windows
+# browser.exe         # uncomment to route browser traffic
+# powershell.exe
+
+--- Linux
+# curl
+
+--- MacOS
+# Safari

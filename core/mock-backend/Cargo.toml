@@ -1,0 +1,27 @@
+[package]
+name = "nrr-mock-backend"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nrr-domain = { path = "../domain" }
+nrr-shared = { path = "../../shared/contracts" }
+# Block 19 (19.0.3) — neutral platform types/logic (unconditional); Windows
+# backend only on Windows (see the cfg(windows) section below).
+nrr-platform-api = { path = "../platform/api" }
+nrr-diagnostics = { path = "../diagnostics" }
+# Block 16.D: the live adapter rich-row enrichment (the only `ipconfig`
+# consumer here) moved to `interface_rows`; the neutral types are re-exported
+# from nrr-platform-api, the Windows `collect_interfaces_rows` from the backend.
+
+[target.'cfg(windows)'.dependencies]
+nrr-platform-windows = { path = "../platform/windows" }
+
+[lints]
+workspace = true

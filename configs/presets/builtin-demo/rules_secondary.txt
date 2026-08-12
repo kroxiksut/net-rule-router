@@ -1,0 +1,19 @@
+# NetRuleRouter preset — version 1
+# name: Built-in demo (secondary route)
+# description: Tiny showcase set for the secondary route. Edit before depending on routing decisions.
+# author: NetRuleRouter
+# preset_version: 1
+
+--- Zones
+
+--- Domains
+*.corp.example.net   # Suffix — route all internal corp subdomains via the secondary
+
+--- IP
+
+--- Windows
+nordvpn.exe          # Force this VPN client through the secondary route
+
+--- Linux
+
+--- MacOS

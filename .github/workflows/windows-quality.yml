@@ -1,0 +1,40 @@
+﻿name: windows-quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  baseline:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Bootstrap workspace
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
+
+      - name: Run quality baseline
+        shell: pwsh
+        # No Qt on the runner: the Rust gate (fmt, clippy, tests, cargo-deny)
+        # runs, the C++ Qt host is skipped. Building it here would need a full
+        # Qt install per run.
+        env:
+          NRR_SKIP_QT_HOST: "1"
+        run: powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny

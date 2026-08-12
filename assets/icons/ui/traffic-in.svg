@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="traffic in">
+  <!-- Source icon: Tabler Icons (MIT), name: arrow-down -->
+  <defs>
+    <linearGradient id="nrr-grad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="#1EA7FF"/>
+      <stop offset="1" stop-color="#8A3FFC"/>
+    </linearGradient>
+  </defs>
+  <title>traffic in</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 5l0 14" />
+    <path d="M18 13l-6 6" />
+    <path d="M6 13l6 6" />
+  </g>
+</svg>

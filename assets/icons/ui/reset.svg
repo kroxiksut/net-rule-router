@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="reset">
+  <!-- Source icon: Tabler Icons (MIT), name: restore -->
+  <defs>
+    <linearGradient id="nrr-grad" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="24" y2="24">
+      <stop offset="0" stop-color="#FF5E5E"/>
+      <stop offset="1" stop-color="#FF8A3D"/>
+    </linearGradient>
+  </defs>
+
+  <title>reset</title>
+  <g fill="none" stroke="url(#nrr-grad)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3.06 13a9 9 0 1 0 .49 -4.087" />
+    <path d="M3 4.001v5h5" />
+    <path d="M12 8v4l2 2" />
+  </g>
+</svg>

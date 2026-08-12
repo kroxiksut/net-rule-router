@@ -1,0 +1,55 @@
+[package]
+name = "nrr-linux-service"
+version.workspace = true
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+license = "MPL-2.0"
+
+# Thin Linux daemon entrypoint binary — the sibling of `nrr-windows-service`.
+# All orchestration lives in `nrr-service-runtime`; this crate carries only the
+# systemd glue: argv dispatch, the install/uninstall executors over the pure
+# plans from `nrr-platform-linux::systemd`, a status banner, and the `run`
+# daemon body. The real enforcement supervisor + AF_UNIX IPC server land when a
+# systemd/root host is available (block 19.2).
+
+# The crate name states the PLATFORM; the produced executable states the ROLE.
+# The `d` suffix is the Unix daemon tradition; an `nrr-service` symlink is
+# installed alongside it so cross-platform scripts name a single binary.
+[[bin]]
+name = "nrr-serviced"
+path = "src/main.rs"
+
+# Cross-platform pieces (argv parsing, usage text) need only the OS-neutral
+# contracts crate, so the crate builds on the Windows dev host too — there only
+# a `linux-only` message reaches the OS verbs. All real machinery is Linux-gated.
+[dependencies]
+# Product identity: the daemon's own executable name is derived, not typed.
+nrr-shared = { path = "../../../shared/contracts" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure systemd unit/plan rendering + sd_notify + watchdog derivation +
+# SO_PEERCRED caller-identity for the AF_UNIX server, plus the systemd
+# implementation of the service-control port the install verbs drive.
+nrr-platform-linux = { path = "../../platform/linux" }
+# The neutral service-control port itself: the install/uninstall specs the
+# daemon hands the platform implementation.
+nrr-platform-api = { path = "../../platform/api" }
+# `run` bootstraps storage + installs the NDJSON tracing subscriber; both are
+# OS-neutral. Also provides the IPC router / server traits + envelopes the
+# AF_UNIX server dispatches through. The full ServiceSupervisor is Windows-only
+# for now (HW-gated).
+nrr-service-runtime = { path = "../service-runtime" }
+# Needed to construct the production `StorageProfile` for the bootstrap config.
+nrr-storage = { path = "../../storage" }
+# Wire codec (length-prefixed JSON frames) — the single source of truth shared
+# with the client (`nrr-ipc-client`).
+nrr-ipc-client = { path = "../../ipc-client" }
+tracing = "0.1"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Test-only: build a sample request envelope payload (`serde_json::json!`).
+serde_json = "1"
+
+[lints]
+workspace = true
