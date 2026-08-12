@@ -26,24 +26,6 @@ fn main() {
             "RelWithDebInfo".to_string()
         }
     });
-    let qt_prefix = env::var("CMAKE_PREFIX_PATH")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_qt_prefix);
-
-    // CMake caches the found Qt (`Qt6_DIR` etc.) inside the build dir, and a
-    // later `-DCMAKE_PREFIX_PATH=<new>` does NOT invalidate that cache — a Qt
-    // upgrade would silently keep linking the old version. Stamp the prefix
-    // and wipe the build dir when it changes.
-    let stamp = out_dir.join("qt-prefix.stamp");
-    let previous = fs::read_to_string(&stamp).unwrap_or_default();
-    if previous != qt_prefix {
-        if build_dir.exists() {
-            fs::remove_dir_all(&build_dir).expect("remove stale CMake build dir");
-        }
-        fs::write(&stamp, &qt_prefix).expect("write qt prefix stamp");
-    }
-
     println!("cargo:rerun-if-changed={}", native_dir.display());
     // A directory-level `rerun-if-changed` only tracks the directory entry's
     // own mtime, which (on Windows) does NOT change when a file *inside* it is
@@ -63,6 +45,10 @@ fn main() {
     // test suite run, the C++ host is not built. The baked path then names a
     // file that was never produced — the launcher's own missing-host check
     // reports that at startup, which is the honest outcome for such a build.
+    //
+    // Asked BEFORE the Qt prefix is resolved: resolving it is itself what fails
+    // on a machine with no Qt, so a switch consulted afterwards can never be
+    // reached by the builds it exists for.
     if env::var("NRR_SKIP_QT_HOST")
         .map(|value| value != "0")
         .unwrap_or(false)
@@ -76,6 +62,24 @@ fn main() {
             executable.display()
         );
         return;
+    }
+
+    let qt_prefix = env::var("CMAKE_PREFIX_PATH")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(default_qt_prefix);
+
+    // CMake caches the found Qt (`Qt6_DIR` etc.) inside the build dir, and a
+    // later `-DCMAKE_PREFIX_PATH=<new>` does NOT invalidate that cache — a Qt
+    // upgrade would silently keep linking the old version. Stamp the prefix
+    // and wipe the build dir when it changes.
+    let stamp = out_dir.join("qt-prefix.stamp");
+    let previous = fs::read_to_string(&stamp).unwrap_or_default();
+    if previous != qt_prefix {
+        if build_dir.exists() {
+            fs::remove_dir_all(&build_dir).expect("remove stale CMake build dir");
+        }
+        fs::write(&stamp, &qt_prefix).expect("write qt prefix stamp");
     }
 
     run(
