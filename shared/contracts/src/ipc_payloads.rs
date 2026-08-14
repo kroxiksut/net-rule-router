@@ -1220,7 +1220,7 @@ pub enum StatusUpdateEvent {
         /// Image name of the process that tried; empty when unknown.
         app: String,
         /// Reason slug (`"route-unavailable"` / `"not-covered-by-rules"` /
-        /// `"blocked-by-rule"`), drives the notice wording.
+        /// `"blocked-by-rule"` / `"unattributed"`), drives the notice wording.
         reason: String,
         /// Attempts folded into this episode so far.
         attempts: u64,

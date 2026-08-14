@@ -2180,6 +2180,7 @@
         "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
         "not-covered-by-rules": "This app is confined to a route, and no rule covers this address there.",
         "blocked-by-rule": "A rule blocks this address directly.",
+        "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
         "unspecified": "No further detail available."
       },
       "action": {
@@ -2689,6 +2690,7 @@
         "route-unavailable": "The route this connection needed was unavailable.",
         "not-covered-by-rules": "No rule covers this connection, so the default action blocked it.",
         "blocked-by-rule": "A rule blocks this connection.",
+        "unattributed": "NetRuleRouter blocked this connection, but could not identify which filter did it.",
         "unknown": "This connection was blocked."
       },
       "body": "{reason} Destination: {destination}. Application: {app}. Attempts: {attempts}.",
@@ -2704,6 +2706,7 @@
     "route-unavailable": "Route outages",
     "not-covered-by-rules": "Addresses no rule covers",
     "blocked-by-rule": "Blocks by rule",
+    "unattributed": "Blocks without an identified filter",
     "any": "Blocks of this kind"
   }
 }

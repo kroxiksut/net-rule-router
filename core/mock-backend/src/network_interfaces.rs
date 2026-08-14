@@ -868,7 +868,7 @@ fn recommendation_summary_for_class(class: RecommendationClass) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        assign_preview_roles, assign_recommendations, fallback_rows,
+        assign_preview_roles, assign_recommendations, decorate_interface_rows, fallback_rows,
         interface_diagnostics_checks_snapshot, interfaces_routes_preview_snapshot,
         InterfaceRouteRow, RouteSelectionRequest,
     };
@@ -1061,7 +1061,76 @@ mod tests {
 
     #[test]
     fn recommendation_engine_marks_primary_and_secondary_candidates() {
-        let snapshot = interfaces_routes_preview_snapshot(RouteSelectionRequest::default());
+        // Fixed two-adapter fixture (strong wired link + VPN-shaped tunnel) run
+        // through the same decoration path production uses for service-supplied
+        // rows, so the assertion doesn't depend on what the host machine enumerates.
+        let wired = InterfaceRouteRow {
+            persistent_id: "win-adapter:primary".to_string(),
+            adapter_name: "{PRIMARY-ADAPTER}".to_string(),
+            windows_name: "Primary".to_string(),
+            interface_description: "Primary adapter".to_string(),
+            interface_type: "Ethernet".to_string(),
+            is_bluetooth_like: false,
+            local_ip: "192.168.0.2".to_string(),
+            gateway: "192.168.0.1".to_string(),
+            dns_servers: "1.1.1.1".to_string(),
+            has_default_route: true,
+            has_forwarding_path: Some(true),
+            availability_status: super::BasicAvailabilityStatus::Available,
+            observed_facts: super::build_observed_facts(
+                super::BasicAvailabilityStatus::Available,
+                "192.168.0.2",
+                "192.168.0.1",
+            ),
+            derived_assessment: super::build_derived_assessment(
+                "Primary",
+                "Ethernet",
+                "Primary adapter",
+                "{PRIMARY-ADAPTER}",
+                "192.168.0.1",
+                "192.168.0.2",
+                true,
+                ConnectivityState::Available,
+            ),
+            recommendation: super::unknown_recommendation(),
+            selected_role: None,
+            route_state: RouteSelectionState::NotSelected,
+        };
+        let vpn_tunnel = InterfaceRouteRow {
+            persistent_id: "win-adapter:vpn-tunnel".to_string(),
+            adapter_name: "{VPN-ADAPTER}".to_string(),
+            windows_name: "VPN Tunnel".to_string(),
+            interface_description: "VPN tunnel adapter".to_string(),
+            interface_type: "Tunnel".to_string(),
+            is_bluetooth_like: false,
+            local_ip: "10.8.0.5".to_string(),
+            gateway: "-".to_string(),
+            dns_servers: "-".to_string(),
+            has_default_route: false,
+            has_forwarding_path: Some(false),
+            availability_status: super::BasicAvailabilityStatus::Available,
+            observed_facts: super::build_observed_facts(
+                super::BasicAvailabilityStatus::Available,
+                "10.8.0.5",
+                "-",
+            ),
+            derived_assessment: super::build_derived_assessment(
+                "VPN Tunnel",
+                "Tunnel",
+                "VPN tunnel adapter",
+                "{VPN-ADAPTER}",
+                "-",
+                "10.8.0.5",
+                false,
+                ConnectivityState::Degraded,
+            ),
+            recommendation: super::unknown_recommendation(),
+            selected_role: None,
+            route_state: RouteSelectionState::NotSelected,
+        };
+
+        let snapshot =
+            decorate_interface_rows(vec![wired, vpn_tunnel], &RouteSelectionRequest::default());
         assert!(snapshot.rows.iter().any(|row| {
             row.recommendation.class == nrr_shared::RecommendationClass::PreferredPrimary
         }));
@@ -1117,16 +1186,22 @@ mod tests {
 
     #[test]
     fn same_adapter_cannot_be_confirmed_for_primary_and_secondary() {
-        let snapshot = interfaces_routes_preview_snapshot(RouteSelectionRequest {
-            primary_candidate_id: Some("win-adapter:ethernet-fallback".to_string()),
-            primary_candidate_name: Some("Ethernet".to_string()),
-            primary_candidate_confirmed: true,
-            secondary_candidate_id: Some("win-adapter:ethernet-fallback".to_string()),
-            secondary_candidate_name: Some("Ethernet".to_string()),
-            secondary_candidate_confirmed: true,
-            include_bluetooth_adapters: false,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
-        });
+        // Deterministic fixture: live enumeration on a host without an
+        // "Ethernet"-named adapter would leave both roles unresolved and the
+        // assertions below vacuously true, so exercise the fallback dataset instead.
+        let snapshot = decorate_interface_rows(
+            fallback_rows(),
+            &RouteSelectionRequest {
+                primary_candidate_id: Some("win-adapter:ethernet-fallback".to_string()),
+                primary_candidate_name: Some("Ethernet".to_string()),
+                primary_candidate_confirmed: true,
+                secondary_candidate_id: Some("win-adapter:ethernet-fallback".to_string()),
+                secondary_candidate_name: Some("Ethernet".to_string()),
+                secondary_candidate_confirmed: true,
+                include_bluetooth_adapters: false,
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+            },
+        );
 
         assert!(snapshot.role_assignment_advisory.conflict_warning.is_some());
         let primary_count = snapshot

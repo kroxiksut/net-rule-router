@@ -219,7 +219,7 @@ fn run_primary(
     store: Option<UiPreferencesStore>,
     preferences: UiPreferences,
     request: LaunchRequest,
-    _guard: SingleInstanceGuard,
+    guard: SingleInstanceGuard,
 ) -> ExitCode {
     let tag = surface_tag(config.surface);
     // The single-instance lock for `tag` is confirmed held by this process
@@ -231,6 +231,16 @@ fn run_primary(
     // belongs in THIS surface's log, not in the log of whoever started it.
     // Done after the rotation so the redirected stream opens the fresh file.
     crate::diag_stream::capture_process_error_stream(&log_path);
+    if let Some(stale_pid) = guard.removed_stale_pid {
+        // Logged after rotation so it lands in the fresh log, not the one
+        // just moved to `.prev.log`.
+        diag_log(
+            tag,
+            &format!(
+                "NRR_LAUNCHER[primary] removed stale single-instance lock held by pid={stale_pid}"
+            ),
+        );
+    }
     diag_log(
         tag,
         &format!(
@@ -995,6 +1005,9 @@ pub fn path_to_file_url(path: &Path) -> String {
 pub struct SingleInstanceGuard {
     lock_path: PathBuf,
     _lock_file: File,
+    /// PID a stale lock was reclaimed from on this `acquire`, if any — surfaced
+    /// so the caller can log it once its own diagnostic log file is open.
+    removed_stale_pid: Option<u32>,
 }
 
 impl SingleInstanceGuard {
@@ -1003,6 +1016,7 @@ impl SingleInstanceGuard {
         fs::create_dir_all(&lock_directory)?;
 
         let lock_path = lock_directory.join(format!("{instance_key}.lock"));
+        let mut removed_stale_pid = None;
         for attempt in 0..2 {
             match OpenOptions::new()
                 .create_new(true)
@@ -1015,11 +1029,15 @@ impl SingleInstanceGuard {
                     return Ok(Some(Self {
                         lock_path,
                         _lock_file: lock_file,
+                        removed_stale_pid,
                     }));
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if attempt == 0 && cleanup_stale_lock_file(&lock_path)? {
-                        continue;
+                    if attempt == 0 {
+                        if let Some(pid) = cleanup_stale_lock_file(&lock_path)? {
+                            removed_stale_pid = Some(pid);
+                            continue;
+                        }
                     }
                     return Ok(None);
                 }
@@ -1044,26 +1062,31 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-fn cleanup_stale_lock_file(lock_path: &Path) -> io::Result<bool> {
+/// Removes `lock_path` if the PID recorded inside it belongs to no live
+/// process (or to a live process that is not this product's own binary —
+/// Windows freely reuses PIDs, so a bare `is_process_alive` would treat a
+/// crashed GUI's lock as held forever once its PID was recycled). Returns the
+/// reclaimed PID on removal, `None` when the lock is left in place.
+fn cleanup_stale_lock_file(lock_path: &Path) -> io::Result<Option<u32>> {
     let content = match fs::read_to_string(lock_path) {
         Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
 
     let Some(pid) = parse_pid_from_lock_content(&content) else {
-        return Ok(false);
+        return Ok(None);
     };
     if pid == std::process::id() {
-        return Ok(false);
+        return Ok(None);
     }
     if is_process_alive(pid) {
-        return Ok(false);
+        return Ok(None);
     }
 
     match fs::remove_file(lock_path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Ok(Some(pid)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1080,36 +1103,59 @@ fn parse_pid_from_lock_content(content: &str) -> Option<u32> {
     None
 }
 
+/// File name of the running binary (`NetRuleRouter.exe`, `NetRuleRouterTray.exe`,
+/// …), used to confirm a PID found alive is actually this product's own
+/// process and not an unrelated one that inherited a recycled PID.
+fn current_executable_file_name() -> Option<String> {
+    env::current_exe()
+        .ok()?
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
+}
+
+/// True unless the PID is confirmably a *dead* or *unrelated* process.
+/// The lock key is scoped to one surface, so only the binary that could have
+/// created it can hold it — an image-name mismatch means the PID was reused
+/// by something else. Any lookup failure (no permission, race) reports alive:
+/// stealing a live instance's lock is worse than leaving a stale one in place.
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    let Some(own_image_name) = current_executable_file_name() else {
+        return true;
+    };
 
     let filter = format!("PID eq {pid}");
     let mut command = Command::new("tasklist");
     command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
     apply_no_window(&mut command);
 
-    match command.output() {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(parse_tasklist_pid_from_csv_line)
-            .any(|active_pid| active_pid == pid),
-        Err(_) => false,
-    }
+    let Ok(output) = command.output() else {
+        return true;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_tasklist_csv_line)
+        .any(|(image_name, row_pid)| {
+            row_pid == pid && image_name.eq_ignore_ascii_case(&own_image_name)
+        })
 }
 
+/// Parses one `tasklist /FO CSV /NH` row into (image name, PID).
 #[cfg(windows)]
-fn parse_tasklist_pid_from_csv_line(line: &str) -> Option<u32> {
+fn parse_tasklist_csv_line(line: &str) -> Option<(String, u32)> {
     let trimmed = line.trim();
     if !trimmed.starts_with('"') {
         return None;
     }
     let mut fields = trimmed.split(',');
-    let _image_name = fields.next()?;
+    let image_name = fields.next()?.trim().trim_matches('"').to_owned();
     let raw_pid = fields.next()?.trim().trim_matches('"');
-    raw_pid.parse::<u32>().ok()
+    let pid = raw_pid.parse::<u32>().ok()?;
+    Some((image_name, pid))
 }
 
 #[cfg(not(windows))]
@@ -1117,12 +1163,21 @@ fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    // Unix single-instance lock cleanup: a live process still has a
-    // `/proc/<pid>` entry on Linux. `/proc` needs no external crate; a
-    // future macOS port (which lacks `/proc`) would swap this for a
-    // `kill(pid, 0)` probe. Being wrong "alive" only delays reclaiming a stale
-    // lock — it never steals one from a running instance.
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    let Some(own_image_name) = current_executable_file_name() else {
+        return true;
+    };
+
+    // `/proc/<pid>/exe` resolves to the running binary's path; a future
+    // macOS port (no `/proc`) would swap this for a `proc_pidpath` probe.
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(target) => target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == own_image_name)
+            .unwrap_or(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 #[cfg(test)]
@@ -1197,5 +1252,41 @@ mod tests {
 
         assert!(!path.exists());
         assert!(!dir.path().join("launcher-main.prev.log").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasklist_csv_line_parser_extracts_matching_image_name_and_pid() {
+        use super::parse_tasklist_csv_line;
+
+        assert_eq!(
+            parse_tasklist_csv_line(
+                "\"NetRuleRouter.exe\",\"12345\",\"Console\",\"1\",\"10,000 K\""
+            ),
+            Some(("NetRuleRouter.exe".to_string(), 12345))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasklist_csv_line_parser_extracts_an_unrelated_image_name_too() {
+        use super::parse_tasklist_csv_line;
+
+        // The parser only extracts fields; deciding whether the name matches
+        // ours is `is_process_alive`'s job, not the parser's.
+        assert_eq!(
+            parse_tasklist_csv_line("\"unrelated.exe\",\"12345\",\"Console\",\"1\",\"5,000 K\""),
+            Some(("unrelated.exe".to_string(), 12345))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tasklist_csv_line_parser_rejects_garbage() {
+        use super::parse_tasklist_csv_line;
+
+        assert_eq!(parse_tasklist_csv_line("INFO: No tasks are running."), None);
+        assert_eq!(parse_tasklist_csv_line(""), None);
+        assert_eq!(parse_tasklist_csv_line("\"OnlyOneField\""), None);
     }
 }

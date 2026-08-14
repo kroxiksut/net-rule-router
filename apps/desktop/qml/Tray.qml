@@ -869,6 +869,9 @@ SystemTrayIcon {
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason.blocked-by-rule",
                     "A rule blocks this address directly.")
+            case "unattributed":
+                return tr("tray.block-notice.reason.unattributed",
+                    "NetRuleRouter blocked this address, but could not identify which filter did it.")
             default:
                 return tr("tray.block-notice.reason.unspecified",
                     "No further detail available.")
@@ -1060,6 +1063,8 @@ SystemTrayIcon {
                 return tr("block-reason.not-covered-by-rules", "Addresses no rule covers")
             case "blocked-by-rule":
                 return tr("block-reason.blocked-by-rule", "Blocks by rule")
+            case "unattributed":
+                return tr("block-reason.unattributed", "Blocks without an identified filter")
             default:
                 return tr("block-reason.any", "Blocks of this kind")
         }
