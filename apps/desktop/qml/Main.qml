@@ -3083,6 +3083,9 @@ ApplicationWindow {
             case "blocked-by-rule":
                 return tr("notifications.block-notice.reason.blocked-by-rule",
                     "A rule blocks this connection.")
+            case "unattributed":
+                return tr("notifications.block-notice.reason.unattributed",
+                    "NetRuleRouter blocked this connection, but could not identify which filter did it.")
             default:
                 return tr("notifications.block-notice.reason.unknown",
                     "This connection was blocked.")

@@ -71,12 +71,6 @@ pub struct WfpConnectionObserver {
     events_raw: u64,
     /// Leaked `Arc<Mutex<…>>` ref handed to the callback; reclaimed on drop.
     ctx: *mut c_void,
-    /// Cache of `filter id → (is-an-NRR-filter, decoded NRR spec id)`, resolved
-    /// via `FwpmFilterGetById0` in `drain`. One filter drops many connections,
-    /// so attribution is a handful of lookups, not one per row. The spec id is
-    /// `None` when the filter is foreign or its `filterKey` does not carry our
-    /// namespace signature.
-    attribution_cache: Mutex<HashMap<u64, (bool, Option<u64>)>>,
 }
 
 // The raw handles are owned solely by this struct (closed once, on drop); the
@@ -94,10 +88,17 @@ impl ConnectionObservationSource for WfpConnectionObserver {
         // the WFP callback thread — so the trace can say "blocked by another
         // component" and never blame NRR for a firewall / antivirus drop.
         let engine = HANDLE(self.engine_raw as usize as *mut c_void);
+        // Attribution memo for THIS batch only. WFP hands out runtime filter ids
+        // from a reused pool, and a reconcile retires thousands of filters at a
+        // time — a memo that outlived the batch would answer for a filter that
+        // no longer exists.
+        let mut resolved: HashMap<u64, Option<(bool, Option<u64>)>> = HashMap::new();
         for obs in out.iter_mut() {
             if obs.verdict == ConnectionVerdict::Block {
                 if let Some(fid) = obs.drop_filter_id {
-                    let owner = self.resolve_owner(engine, fid);
+                    let owner = *resolved
+                        .entry(fid)
+                        .or_insert_with(|| resolve_owner(engine, fid));
                     obs.blocked_by_nrr = owner.map(|(is_ours, _)| is_ours);
                     obs.nrr_drop_spec_id = owner.and_then(|(_, spec_id)| spec_id);
                 }
@@ -207,59 +208,49 @@ impl WfpConnectionObserver {
             engine_raw: engine.0 as usize as u64,
             events_raw: events_handle.0 as usize as u64,
             ctx,
-            attribution_cache: Mutex::new(HashMap::new()),
         })
     }
+}
 
-    /// Resolve whether WFP filter `fid` belongs to NetRuleRouter, and — when it
-    /// does — its decoded NRR codegen spec id. Ownership test:
-    /// `subLayerKey == NRR_SUBLAYER_GUID` — every filter we add (rule
-    /// permits, kill-switch pins, fail-closed blocks, DoH lockdown) is created
-    /// in our sub-layer, while `providerKey` is left null (no BFE provider
-    /// object is registered); comparing the null `providerKey` against
-    /// [`NRR_PROVIDER_GUID`] alone would misclassify every one of our own
-    /// drops as `foreign`, so the provider comparison is kept only as a
-    /// forward-compatible fallback. The spec id comes from `filterKey` via
-    /// [`filter_id_from_guid`] — `None` when the guid does not carry our
-    /// namespace signature (a foreign filter, or one predating the
-    /// id-encoding scheme). Cached. Returns `None` when the lookup fails — so
-    /// a drop is NEVER falsely attributed to NetRuleRouter. Runs on the
-    /// consumer's drain thread, not the WFP callback thread.
-    fn resolve_owner(&self, engine: HANDLE, fid: u64) -> Option<(bool, Option<u64>)> {
-        if let Ok(cache) = self.attribution_cache.lock() {
-            if let Some(v) = cache.get(&fid) {
-                return Some(*v);
-            }
-        }
-        let mut filter_ptr: *mut FWPM_FILTER0 = std::ptr::null_mut();
-        // SAFETY: `engine` is an open WFP management handle; on success
-        // `FwpmFilterGetById0` writes a heap `FWPM_FILTER0` pointer we free below.
-        let code = unsafe { FwpmFilterGetById0(engine, fid, &mut filter_ptr) };
-        if code != 0 || filter_ptr.is_null() {
-            return None;
-        }
-        // SAFETY: on success `filter_ptr` is a valid `FWPM_FILTER0`; `providerKey`
-        // is either null or points to a `GUID` valid for this allocation;
-        // `subLayerKey` and `filterKey` are stored by value.
-        let (is_ours, filter_key) = unsafe {
-            let pk = (*filter_ptr).providerKey;
-            let is_ours = (*filter_ptr).subLayerKey == NRR_SUBLAYER_GUID
-                || (!pk.is_null() && *pk == NRR_PROVIDER_GUID);
-            (is_ours, (*filter_ptr).filterKey)
-        };
-        // SAFETY: free the buffer WFP allocated; we do not touch `filter_ptr` after.
-        unsafe {
-            FwpmFreeMemory0(&mut (filter_ptr as *mut c_void));
-        }
-        let spec_id = crate::win32_ffi::wfp_filter::filter_id_from_guid(&filter_key)
-            .map(|id| id.raw)
-            .filter(|_| is_ours);
-        let result = (is_ours, spec_id);
-        if let Ok(mut cache) = self.attribution_cache.lock() {
-            cache.insert(fid, result);
-        }
-        Some(result)
+/// Resolve whether WFP filter `fid` belongs to NetRuleRouter, and — when it
+/// does — its decoded NRR codegen spec id. Ownership test:
+/// `subLayerKey == NRR_SUBLAYER_GUID` — every filter we add (rule
+/// permits, kill-switch pins, fail-closed blocks, DoH lockdown) is created
+/// in our sub-layer, while `providerKey` is left null (no BFE provider
+/// object is registered); comparing the null `providerKey` against
+/// [`NRR_PROVIDER_GUID`] alone would misclassify every one of our own
+/// drops as `foreign`, so the provider comparison is kept only as a
+/// forward-compatible fallback. The spec id comes from `filterKey` via
+/// [`filter_id_from_guid`] — `None` when the guid does not carry our
+/// namespace signature (a foreign filter, or one predating the
+/// id-encoding scheme). Returns `None` when the lookup fails — so
+/// a drop is NEVER falsely attributed to NetRuleRouter. Runs on the
+/// consumer's drain thread, not the WFP callback thread.
+fn resolve_owner(engine: HANDLE, fid: u64) -> Option<(bool, Option<u64>)> {
+    let mut filter_ptr: *mut FWPM_FILTER0 = std::ptr::null_mut();
+    // SAFETY: `engine` is an open WFP management handle; on success
+    // `FwpmFilterGetById0` writes a heap `FWPM_FILTER0` pointer we free below.
+    let code = unsafe { FwpmFilterGetById0(engine, fid, &mut filter_ptr) };
+    if code != 0 || filter_ptr.is_null() {
+        return None;
     }
+    // SAFETY: on success `filter_ptr` is a valid `FWPM_FILTER0`; `providerKey`
+    // is either null or points to a `GUID` valid for this allocation;
+    // `subLayerKey` and `filterKey` are stored by value.
+    let (is_ours, filter_key) = unsafe {
+        let pk = (*filter_ptr).providerKey;
+        let is_ours = (*filter_ptr).subLayerKey == NRR_SUBLAYER_GUID
+            || (!pk.is_null() && *pk == NRR_PROVIDER_GUID);
+        (is_ours, (*filter_ptr).filterKey)
+    };
+    // SAFETY: free the buffer WFP allocated; we do not touch `filter_ptr` after.
+    unsafe {
+        FwpmFreeMemory0(&mut (filter_ptr as *mut c_void));
+    }
+    let spec_id = crate::win32_ffi::wfp_filter::filter_id_from_guid(&filter_key)
+        .map(|id| id.raw)
+        .filter(|_| is_ours);
+    Some((is_ours, spec_id))
 }
 
 impl Drop for WfpConnectionObserver {

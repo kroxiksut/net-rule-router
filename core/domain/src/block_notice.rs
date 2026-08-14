@@ -44,6 +44,10 @@ pub enum BlockReason {
     NotCoveredByRules,
     /// A rule says block outright.
     BlockedByRule,
+    /// Ours, but the filter behind it could not be identified. Naming a cause
+    /// here would send the user editing rules that may have nothing to do with
+    /// it — say only what is known.
+    Unattributed,
 }
 
 impl BlockReason {
@@ -54,6 +58,7 @@ impl BlockReason {
             Self::RouteUnavailable => "route-unavailable",
             Self::NotCoveredByRules => "not-covered-by-rules",
             Self::BlockedByRule => "blocked-by-rule",
+            Self::Unattributed => "unattributed",
         }
     }
 
@@ -64,6 +69,7 @@ impl BlockReason {
             "route-unavailable" => Some(Self::RouteUnavailable),
             "not-covered-by-rules" => Some(Self::NotCoveredByRules),
             "blocked-by-rule" => Some(Self::BlockedByRule),
+            "unattributed" => Some(Self::Unattributed),
             _ => None,
         }
     }

@@ -104,6 +104,29 @@ cargo build -p nrr-launcher -p nrr-qt-host -p nrr-windows-service
 .\scripts\install-service.ps1      # без -Profile возьмёт самый свежий бинарник (dev или release)
 ```
 
+### Сборка только C++ Qt-хоста
+
+Отдельной цели сборки у Qt-хоста нет — его собирает build-скрипт крейта
+`nrr-qt-host`, поэтому достаточно собрать этот крейт:
+
+```powershell
+cargo build -p nrr-qt-host              # dev
+cargo build -p nrr-qt-host --release    # release
+
+# принудительный переконфиг CMake после правок C++, которые не отслеживаются
+cargo clean -p nrr-qt-host; cargo build -p nrr-qt-host
+```
+
+Результат — `nrr_qt_native_host.exe` в
+`target\<профиль>\build\nrr-qt-host-*\out\qt-native-host-build\<конфигурация>\`.
+В `target\<профиль>\` он намеренно не копируется — лаунчер находит его по
+абсолютному пути, зашитому при сборке. Правки `CMakeLists.txt`,
+`src\main.cpp` и `resources\app.rc.in` подхватываются без `cargo clean`.
+
+В dev-сборке C++ хост собирается как `RelWithDebInfo`, а не `Debug`: символы
+сохраняются, а приложение линкуется с теми же библиотеками Qt, что и у
+пользователя. Если отлаживаете сам C++, задайте `NRR_QT_HOST_BUILD_TYPE=Debug`.
+
 ### Проверка качества (для контрибьюторов)
 
 ```powershell
@@ -120,6 +143,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\check.ps1 -RequireCargoDeny
 |------------|-------------|--------|
 | `CMAKE_PREFIX_PATH` | Qt установлен не под `C:\Qt` или нужна конкретная версия | `D:\Qt\6.11.1\msvc2022_64\lib\cmake` |
 | `NRR_QT_HOST_GENERATOR` | нестандартный генератор CMake (по умолчанию `Visual Studio 17 2022`) | `Ninja` |
+| `NRR_QT_HOST_BUILD_TYPE` | конфигурация CMake для C++ хоста (по умолчанию `Release` при `--release`, иначе `RelWithDebInfo`) | `Debug` |
+| `NRR_SKIP_QT_HOST` | собрать Rust-часть вообще без Qt — так делает CI; окно такие бинарники открыть не смогут | `1` |
 | `NRR_RUST_TARGET` | нестандартный rust-target (по умолчанию `x86_64-pc-windows-msvc`) | — |
 
 Задать на время сессии PowerShell:

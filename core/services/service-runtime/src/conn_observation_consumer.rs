@@ -701,6 +701,10 @@ impl ConnectionObservationConsumer {
                 process = process,
                 blocked_by = owner,
                 drop_filter_id = drop_filter_id.unwrap_or(0),
+                // The reason is decided from the SPEC id, not the runtime one:
+                // without it a line cannot tell "filter unidentified" from
+                // "identified, and none of the bands we can name".
+                spec_id = rec.nrr_drop_spec_id.unwrap_or(0),
                 "observed BLOCKED connection (first per app/destination this session)",
             );
         } else {
@@ -1131,12 +1135,15 @@ fn process_basename_lower(process_path: &str) -> String {
 /// blocked you" while the tunnel is down sends the user editing rules over an
 /// outage. While the posture is armed there is exactly one cause worth naming.
 ///
-/// Anything else attributed to us is an explicit rule Block action — the
-/// only remaining source of an OUR drop in production codegen once the bands
-/// above are ruled out — so it falls to [`BlockReason::BlockedByRule`].
-/// That is also the safest default when `default_block_id` is unknown (no
-/// active SID this batch): it never claims a route problem that may not
-/// exist.
+/// An identified filter in none of those bands is an explicit rule Block
+/// action — the only remaining source of an OUR drop in production codegen —
+/// so it falls to [`BlockReason::BlockedByRule`].
+///
+/// Without a spec id nothing is identified at all: the filter lookup can fail,
+/// and a filter retired between the drop and the lookup is gone by the time we
+/// ask. Claiming a rule there is the most specific and most likely wrong thing
+/// to say, so an unidentified drop outside the fail-closed window is
+/// [`BlockReason::Unattributed`].
 fn block_reason_for(
     spec_id: Option<u64>,
     killswitch_verified: bool,
@@ -1152,7 +1159,10 @@ fn block_reason_for(
     if fail_closed_armed {
         return BlockReason::RouteUnavailable;
     }
-    BlockReason::BlockedByRule
+    match spec_id {
+        Some(_) => BlockReason::BlockedByRule,
+        None => BlockReason::Unattributed,
+    }
 }
 
 /// Does `process_path`'s file name match any
@@ -1789,6 +1799,16 @@ mod tests {
         assert_eq!(
             block_reason_for(Some(5), false, None, false),
             BlockReason::BlockedByRule
+        );
+        // Unidentified filter: ours, but which one is unknown — say only that.
+        assert_eq!(
+            block_reason_for(None, false, Some(99), false),
+            BlockReason::Unattributed
+        );
+        // The fail-closed window still outranks it: there the cause is known.
+        assert_eq!(
+            block_reason_for(None, false, Some(99), true),
+            BlockReason::RouteUnavailable
         );
     }
 
