@@ -1024,10 +1024,17 @@ mod tests {
         let controller = RecordingController::default();
         let stop = StopToken::new();
         let stop_clone = stop.clone();
-        // Generous deadline: 3 attempts × supervisor backoff (≤1s each)
-        // + tick latency. 3 s is comfortably above worst case.
+        // Stop once the restart budget is exhausted, with a deadline as the
+        // backstop — same reason as the sibling tests: a fixed sleep starts
+        // before `bootstrap` and measures the machine, not the supervisor.
+        let binds_probe = Arc::clone(&server);
         let join = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while binds_probe.binds.load(Ordering::SeqCst) <= max_restarts as usize
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             stop_clone.request_stop();
         });
 
@@ -1136,9 +1143,18 @@ mod tests {
         let controller = RecordingController::default();
         let stop = StopToken::new();
         let stop_clone = stop.clone();
-        // 2.5 s gives the 1 s adapter-monitor interval at least 2 ticks.
+        // Stop on the second tick, with a deadline as the backstop. A fixed
+        // sleep measured the machine instead: it starts before `bootstrap`,
+        // so on a loaded runner storage init ate the budget and the monitor
+        // had only reached its first tick.
+        let calls_probe = Arc::clone(&counting);
         let join = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(2500));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while calls_probe.calls.load(Ordering::SeqCst) < 2
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
             stop_clone.request_stop();
         });
 
@@ -1151,7 +1167,7 @@ mod tests {
         let calls = counting.calls.load(Ordering::SeqCst);
         assert!(
             calls >= 2,
-            "expected adapter source to be polled ≥2 times in 2.5 s, got {calls}",
+            "expected adapter source to be polled ≥2 times within the deadline, got {calls}",
         );
     }
 
