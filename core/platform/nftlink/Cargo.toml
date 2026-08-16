@@ -1,0 +1,25 @@
+[package]
+name = "nftlink"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94.1"
+publish = false
+# MPL-2.0 while the crate lives in this workspace; it becomes
+# "MIT OR Apache-2.0" when it is split into its own repository. Relicensing is
+# only possible while every author is us — see CONTRIBUTING.md, which tells a
+# would-be contributor to open an issue instead of sending a patch.
+license = "MPL-2.0"
+description = "Direct-netlink access to the Linux nf_tables subsystem"
+# Deliberately EMPTY of `nrr-*` dependencies, and a test enforces that. This
+# crate speaks nf_tables and knows nothing about the product that hosts it —
+# that is what makes the eventual split a directory move rather than a rewrite.
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

@@ -179,6 +179,12 @@ pub fn parse_show_output(output: &str) -> ShowFacts {
         run_state: run_state_from_active_state(active_state),
         start_mode: start_mode_from_unit_file_state(unit_file_state),
         binary_path: exec_start_binary(exec_start),
+        // TODO: read the process start time. systemd carries it as
+        // `ExecMainStartTimestamp`, but its default rendering is a localised
+        // human string whose parsing differs across systemd versions; the
+        // `--timestamp=unix` form that would make this trivial is not old
+        // enough to rely on yet.
+        running_since: None,
     })
 }
 

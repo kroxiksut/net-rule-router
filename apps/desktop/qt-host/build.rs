@@ -64,10 +64,15 @@ fn main() {
         return;
     }
 
+    // Windows has no system Qt, so a prefix must be found or the configure step
+    // fails with an unhelpful message. On Linux the distribution's Qt6 is where
+    // CMake already looks, so an unset prefix is the normal case and passing an
+    // empty one would only override a working search.
     let qt_prefix = env::var("CMAKE_PREFIX_PATH")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_qt_prefix);
+        .or_else(|| cfg!(windows).then(default_qt_prefix))
+        .unwrap_or_default();
 
     // CMake caches the found Qt (`Qt6_DIR` etc.) inside the build dir, and a
     // later `-DCMAKE_PREFIX_PATH=<new>` does NOT invalidate that cache — a Qt
@@ -82,22 +87,36 @@ fn main() {
         fs::write(&stamp, &qt_prefix).expect("write qt prefix stamp");
     }
 
-    run(
-        Command::new("cmake")
-            .arg("-S")
-            .arg(&native_dir)
-            .arg("-B")
-            .arg(&build_dir)
-            .arg("-G")
-            .arg(
-                env::var("NRR_QT_HOST_GENERATOR")
-                    .unwrap_or_else(|_| "Visual Studio 17 2022".to_string()),
-            )
-            .arg("-A")
-            .arg("x64")
-            .arg(format!("-DCMAKE_PREFIX_PATH={qt_prefix}")),
-        "configure native Qt host",
-    );
+    let mut configure = Command::new("cmake");
+    configure
+        .arg("-S")
+        .arg(&native_dir)
+        .arg("-B")
+        .arg(&build_dir);
+    match env::var("NRR_QT_HOST_GENERATOR") {
+        Ok(generator) => {
+            configure.arg("-G").arg(generator);
+        }
+        // Visual Studio is a multi-config generator, hence the architecture
+        // argument and the per-config output directory below. Elsewhere CMake's
+        // own default (Unix Makefiles / Ninja) is right, and forcing one here
+        // would fail on a machine that has the other.
+        Err(_) if cfg!(windows) => {
+            configure
+                .arg("-G")
+                .arg("Visual Studio 17 2022")
+                .arg("-A")
+                .arg("x64");
+        }
+        Err(_) => {}
+    }
+    if !qt_prefix.is_empty() {
+        configure.arg(format!("-DCMAKE_PREFIX_PATH={qt_prefix}"));
+    }
+    // Single-config generators take the build type at configure time; the
+    // multi-config ones ignore it and take `--build --config` instead.
+    configure.arg(format!("-DCMAKE_BUILD_TYPE={config}"));
+    run(&mut configure, "configure native Qt host");
 
     run(
         Command::new("cmake")
@@ -110,6 +129,13 @@ fn main() {
         "build native Qt host",
     );
 
+    // A single-config generator writes straight into the build directory; the
+    // per-config subdirectory is a multi-config thing. Accept whichever landed.
+    let executable = if executable.exists() {
+        executable
+    } else {
+        build_dir.join(exe_name("nrr_qt_native_host"))
+    };
     if !executable.exists() {
         panic!(
             "native Qt host executable was not produced at '{}'",

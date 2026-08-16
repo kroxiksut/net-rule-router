@@ -8,6 +8,7 @@
 //! from any crate and the panic hook follow the new destination without anyone
 //! having to route through a logging facade.
 
+#![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
 use std::fs::OpenOptions;

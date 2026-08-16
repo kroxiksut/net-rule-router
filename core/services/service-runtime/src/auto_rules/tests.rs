@@ -1,4 +1,4 @@
-//! Behaviour tests for the companion-domain discovery engine.
+﻿//! Behaviour tests for the companion-domain discovery engine.
 //!
 //! The learning algorithm itself is proven in `nrr_domain::companion_affinity`;
 //! what is exercised here is the service-side contract around it — what each
@@ -1472,7 +1472,7 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
 #[test]
 fn a_delivery_named_host_is_not_suggested_from_one_visit_by_default() {
     let f = fixture(AutoRulesMode::Suggest);
-    one_visit(&f.engine, &["cdn.delivery.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.net"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 0);
@@ -1484,7 +1484,7 @@ fn a_delivery_named_host_is_not_suggested_from_one_visit_by_default() {
 #[test]
 fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
-    one_visit(&f.engine, &["cdn.delivery.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.net"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 1);
@@ -1492,7 +1492,7 @@ fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
     assert_eq!(candidates.len(), 1);
     // A delivery name generalizes to its domain, so what the user is offered
     // covers the whole CDN rather than the one host seen so far.
-    assert_eq!(candidates[0].proposed_match, "delivery.net");
+    assert_eq!(candidates[0].proposed_match, "edgefarm.net");
     assert_eq!(candidates[0].match_kind, AUTO_RULE_MATCH_KIND_SUFFIX);
     assert_eq!(candidates[0].signal, AUTO_RULE_SIGNAL_DELIVERY_NAME);
 }
@@ -1526,12 +1526,12 @@ fn a_parked_offer_covers_the_subdomains_of_what_it_proposes() {
 fn flipping_the_opt_in_reconfigures_the_live_ledger() {
     let opted_in = Arc::new(AtomicBool::new(false));
     let f = fixture_with_eager_delivery(Arc::clone(&opted_in));
-    one_visit(&f.engine, &["cdn.delivery.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.net"]);
     assert_eq!(f.engine.tick(SID, later()).parked, 0, "gated while off");
 
     opted_in.store(true, Ordering::Relaxed);
     f.engine.expire_settings_memo();
-    one_visit(&f.engine, &["cdn.delivery.net"]);
+    one_visit(&f.engine, &["assets.edgefarm.net"]);
 
     let summary = f.engine.tick(SID, later());
     assert_eq!(summary.parked, 1, "the new setting reached the ledger");

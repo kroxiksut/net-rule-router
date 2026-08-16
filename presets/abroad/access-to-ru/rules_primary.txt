@@ -1,0 +1,8 @@
+# NetRuleRouter preset — version 1
+# name: Access to RU from abroad — Primary
+# description: Primary route stays empty on purpose: everything not matched by the secondary rules goes out through the local provider
+# author: NetRuleRouter contributors
+# preset_version: 1
+
+# Правил здесь нет намеренно. Всё, что не совпало с правилами
+# дополнительного маршрута, идёт напрямую через местного провайдера.

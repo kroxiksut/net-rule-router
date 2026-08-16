@@ -611,16 +611,31 @@ user_pref("network.dns.disableIPv6", true);
         }
     }
 
+    // The `touch()` calls below mirror `discover_history_sources`'s join-call
+    // GRANULARITY exactly (same literal fragments, same number of `.join()`
+    // calls) rather than folding a whole relative path into one string. `\` is
+    // not a separator on Linux, so a vendor fragment like `r"Google\Chrome\User
+    // Data"` only ever names a real nested directory when it is pushed as its
+    // own `.join()` argument, matching production's `local.join(vendor_product)`
+    // — collapsed into one giant literal it silently stops matching on Linux,
+    // which is what made these tests fail there. This keeps the tests exercising
+    // real, portable discovery/grouping logic on both OSes without touching
+    // `discover_history_sources` itself.
+
     #[test]
     fn discovers_opera_family_direct_profile_layout() {
         let dir = tempfile::tempdir().unwrap();
         touch(
             &dir.path()
-                .join(r"Roaming\Opera Software\Opera Stable\History"),
+                .join("Roaming")
+                .join(r"Opera Software\Opera Stable")
+                .join("History"),
         );
         touch(
             &dir.path()
-                .join(r"Roaming\Opera Software\Opera GX Stable\History"),
+                .join("Roaming")
+                .join(r"Opera Software\Opera GX Stable")
+                .join("History"),
         );
         let sources = discover_history_sources(&roots(dir.path()));
         let labels: Vec<_> = sources.iter().map(|s| s.label).collect();
@@ -632,15 +647,24 @@ user_pref("network.dns.disableIPv6", true);
         let dir = tempfile::tempdir().unwrap();
         touch(
             &dir.path()
-                .join(r"Roaming\Mozilla\Firefox\Profiles\abc.default\places.sqlite"),
+                .join("Roaming")
+                .join(r"Mozilla\Firefox\Profiles")
+                .join("abc.default")
+                .join("places.sqlite"),
         );
         touch(
             &dir.path()
-                .join(r"Roaming\librewolf\Profiles\x.default\places.sqlite"),
+                .join("Roaming")
+                .join(r"librewolf\Profiles")
+                .join("x.default")
+                .join("places.sqlite"),
         );
         touch(
             &dir.path()
-                .join(r"Roaming\Waterfox\Profiles\y.default\places.sqlite"),
+                .join("Roaming")
+                .join(r"Waterfox\Profiles")
+                .join("y.default")
+                .join("places.sqlite"),
         );
         let sources = discover_history_sources(&roots(dir.path()));
         let labels: Vec<_> = sources.iter().map(|s| s.label).collect();
@@ -650,13 +674,25 @@ user_pref("network.dns.disableIPv6", true);
     #[test]
     fn discovers_arc_msix_package_by_prefix_scan() {
         let dir = tempfile::tempdir().unwrap();
-        touch(&dir.path().join(
-            r"Local\Packages\TheBrowserCompany.Arc_ttt1ap7aakyb4\LocalCache\Local\Arc\User Data\Default\History",
-        ));
+        touch(
+            &dir.path()
+                .join("Local")
+                .join("Packages")
+                .join("TheBrowserCompany.Arc_ttt1ap7aakyb4")
+                .join(r"LocalCache\Local\Arc\User Data")
+                .join("Default")
+                .join("History"),
+        );
         // Unrelated package must not match.
-        touch(&dir.path().join(
-            r"Local\Packages\SomeVendor.App_hash\LocalCache\Local\Arc\User Data\Default\History",
-        ));
+        touch(
+            &dir.path()
+                .join("Local")
+                .join("Packages")
+                .join("SomeVendor.App_hash")
+                .join(r"LocalCache\Local\Arc\User Data")
+                .join("Default")
+                .join("History"),
+        );
         let sources = discover_history_sources(&roots(dir.path()));
         let labels: Vec<_> = sources.iter().map(|s| s.label).collect();
         assert_eq!(labels, vec!["arc"]);
@@ -667,15 +703,24 @@ user_pref("network.dns.disableIPv6", true);
         let dir = tempfile::tempdir().unwrap();
         touch(
             &dir.path()
-                .join(r"Local\Google\Chrome\User Data\Default\History"),
+                .join("Local")
+                .join(r"Google\Chrome\User Data")
+                .join("Default")
+                .join("History"),
         );
         touch(
             &dir.path()
-                .join(r"Local\Google\Chrome\User Data\Profile 1\History"),
+                .join("Local")
+                .join(r"Google\Chrome\User Data")
+                .join("Profile 1")
+                .join("History"),
         );
         touch(
             &dir.path()
-                .join(r"Roaming\Mozilla\Firefox\Profiles\a.default\places.sqlite"),
+                .join("Roaming")
+                .join(r"Mozilla\Firefox\Profiles")
+                .join("a.default")
+                .join("places.sqlite"),
         );
         let sources = discover_history_sources(&roots(dir.path()));
         assert_eq!(summarize_sources(&sources), "chrome:2 firefox:1");

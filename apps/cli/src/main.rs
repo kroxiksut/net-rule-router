@@ -12,6 +12,8 @@
 
 mod doctor;
 mod exit;
+mod export;
+mod logs;
 mod parse;
 mod platform;
 mod verbs;
@@ -69,6 +71,11 @@ fn run(command: Command, exe: &str) -> u8 {
             print!("{}", doctor::render(&findings));
             doctor::exit_code(&findings, &facts.registration)
         }
+        Command::DiagLogs { tail } => {
+            logs::report(logs::read_tail(logs::log_directory(), tail), exe)
+        }
+        Command::DiagExport => export::run(exe),
+        Command::ResetNetwork { confirmed } => reset_network(confirmed, exe),
         Command::Install { start_mode } => with_port(exe, "install", |port| {
             let binary_path = match service_binary_path() {
                 Ok(path) => path,
@@ -155,6 +162,48 @@ fn run(command: Command, exe: &str) -> u8 {
                 Err(err) => report_failure("restart", &err, exe, "restart"),
             }
         }),
+        // What `doctor` recommends when the registered binary is a different
+        // copy than this one: remove the old registration (keeping the data)
+        // and register the binary shipped next to this console.
+        Command::Reinstall => with_port(exe, "reinstall", |port| {
+            let binary_path = match service_binary_path() {
+                Ok(path) => path,
+                Err(message) => {
+                    eprintln!("{message}");
+                    return exit::FAILED;
+                }
+            };
+            let previous = port.query().ok().flatten();
+            let start_mode = previous.as_ref().and_then(|report| report.start_mode);
+            if previous.is_some() {
+                if let Err(err) = port.uninstall(&ServiceUninstallSpec::keep_data()) {
+                    return report_failure("reinstall", &err, exe, "reinstall");
+                }
+            }
+            let mut spec = ServiceInstallSpec::production_defaults(binary_path);
+            // Keep whatever start mode was registered; a re-registration is not
+            // the place to silently change when the service starts.
+            if let Some(mode) = start_mode {
+                spec.start_mode = mode;
+            }
+            if let Err(err) = port.install(&spec) {
+                eprintln!(
+                    "The old registration was removed but the new one failed — \
+                     the service is NOT registered right now."
+                );
+                return report_failure("reinstall", &err, exe, "reinstall");
+            }
+            println!("Re-registered the {PRODUCT_NAME} service.");
+            println!("  binary:            {}", spec.binary_path.display());
+            println!("  start mode:        {}", spec.start_mode.slug());
+            match port.start(TRANSITION_TIMEOUT) {
+                Ok(()) => {
+                    println!("  service:           started");
+                    exit::SUCCESS
+                }
+                Err(err) => report_failure("reinstall", &err, exe, "start"),
+            }
+        }),
     }
 }
 
@@ -222,6 +271,66 @@ fn report_failure(operation: &str, err: &ServiceControlError, exe: &str, repeat_
         other => eprintln!("{operation} failed: {other}"),
     }
     exit::for_error(err)
+}
+
+/// Undo network state a crashed or hard-killed service left behind.
+///
+/// This console does not tear the state down itself — it runs the service
+/// binary's own reset verb. That binary is what applied the state and is the
+/// only thing that knows every piece of it; a second implementation here would
+/// be a copy that drifts, and the copy that runs during an outage is the worst
+/// place to discover the drift.
+fn reset_network(confirmed: bool, exe: &str) -> u8 {
+    let Some(verb) = platform::offline_reset_verb() else {
+        println!("There is nothing to reset on this platform.");
+        println!(
+            "The service does not apply network state here yet, so a crash leaves none behind."
+        );
+        return exit::UNSUPPORTED;
+    };
+    if !confirmed {
+        eprintln!("`{exe} reset-network` drops the network state the service applied:");
+        eprintln!("  packet filters, the DNS redirect, and the routes it added.");
+        eprintln!("Connections open right now may break. Re-run it as:");
+        eprintln!("  {exe} reset-network --confirm");
+        return exit::NOT_CONFIRMED;
+    }
+    let binary = match service_binary_path() {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("{message}");
+            return exit::FAILED;
+        }
+    };
+    // Inherited stdio: the service binary reports what it removed, and that
+    // report is the useful part of running this at all.
+    match std::process::Command::new(&binary).arg(verb).status() {
+        Ok(status) if status.success() => exit::SUCCESS,
+        Ok(status) => {
+            eprintln!(
+                "The service binary could not finish the reset ({}).",
+                describe_exit(&status)
+            );
+            // The one failure worth naming: this needs an elevated console, the
+            // same as every other verb that changes machine state.
+            eprintln!(
+                "If it reported an access error, re-run from a console started as administrator."
+            );
+            exit::FAILED
+        }
+        Err(err) => {
+            eprintln!("could not run `{} {verb}`: {err}", binary.display());
+            exit::FAILED
+        }
+    }
+}
+
+/// Human-readable form of a child process's exit status.
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by a signal".to_string(),
+    }
 }
 
 /// Absolute path of the service binary to register: the one sitting next to

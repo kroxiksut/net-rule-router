@@ -58,8 +58,12 @@ window, and the output you were waiting for would disappear with it.
 | `start` | Start the service | administrator |
 | `stop` | Stop the service | administrator |
 | `restart` | Stop, then start the service | administrator |
+| `reinstall` | Register the service from this directory and start it | administrator |
 | `status` | Whether the service is installed, running, and how it starts | anyone |
 | `diag doctor` | Check this installation and report what is wrong with it | anyone |
+| `diag logs` | Print the tail of the service's operational log | anyone |
+| `diag export` | Ask the service for a diagnostic archive and print its path | anyone |
+| `reset-network` | Remove network state a crashed service left behind | administrator |
 | `version` | Print the console version | anyone |
 | `help` | List the verbs, rendered from the same table this page documents | anyone |
 
@@ -69,9 +73,18 @@ Flags:
 |------|------|---------|
 | `--start-mode=<auto\|on-demand>` | `install` | Start with the operating system (default), or when the application is launched |
 | `--purge` | `uninstall` | Also delete the service-owned data directory. Your rule files are kept either way |
+| `--confirm` | `reset-network` | Required. Without it the command explains what it would drop and refuses |
+| `--tail=<N>` | `diag logs` | How many of the newest lines to print. Default 50, maximum 2000 |
 
 `status` answers without talking to the running service, because that is the
 question people ask precisely when the service is not answering.
+
+`reinstall` is the answer to what `diag doctor` reports when the registered
+service is a different copy than the one shipped next to this console — after an
+update unpacked elsewhere, the operating system keeps starting the previous
+binary. It registers the service from this directory and starts it, keeping the
+start mode that was registered and every piece of service-owned data: rules,
+settings and the audit trail all survive.
 
 `diag doctor` is the command to run before filing a bug. It checks the things
 that decide where a problem lives — is the service registered, is it running,
@@ -80,10 +93,29 @@ platform support a background service at all — and prints one report. That
 report names paths and service states only: no rules, no host names, no
 addresses, so it is safe to attach to an issue.
 
-Not in this build yet: `diag export` (collect the diagnostic archive from the
-console; the application already has the button) and `reset-network` (emergency
-network recovery; for now use the documented
-[recovery procedure](recovering-network-access.md)).
+`diag logs` prints the newest lines of the service's operational log exactly as
+the service wrote them, so what you paste into a report is the service's own
+text rather than this console's rendering of it. It reads a file and nothing
+else — no service needs to be running, which is the state people are in when
+they want a log. The security audit trail is a separate stream and is never
+printed here; it travels in the diagnostic archive instead. On an installation
+whose data directory is locked down, reading needs an elevated console; the
+command says so and exits with code 3 rather than reporting an empty log.
+
+`reset-network` is for the machine that lost the network because the service
+died without cleaning up after itself. It does not undo anything by itself: it
+runs the service binary's own reset, because the program that applied the state
+is the only one that knows every piece of it. Because open connections can drop
+when the state goes, the command refuses without `--confirm` and explains what
+it would remove. Where the service applies no network state yet, it says so and
+exits with code 6 rather than pretending to have cleaned something.
+
+`diag export` asks the service to build a diagnostic archive and prints where it
+put it. The console never assembles the archive itself: the application already
+has that button, and a second assembler would drift until the file you attach to
+a report depended on which surface produced it. This is therefore the one verb
+that needs a running service, and it says so rather than falling back to a
+locally-assembled approximation.
 
 ## Exit codes
 

@@ -299,8 +299,50 @@ impl ServiceControlPort for WindowsServiceControl {
             run_state,
             start_mode,
             binary_path,
+            running_since: status.process_id.and_then(process_start_time),
         }))
     }
+}
+
+/// Creation time of a running process, or `None` when it cannot be read (the
+/// process exited between the two calls, or the token lacks the right). Only
+/// ever used to answer "is the binary on disk newer than what is running", so a
+/// missing answer means "do not claim anything", never "assume stale".
+#[allow(unsafe_code)]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    use windows::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: `OpenProcess` returns a handle we close below on every path; the
+    // access mask is the least privileged one that allows `GetProcessTimes`.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: all four `FILETIME`s are valid writable locals for the call, and
+    // `handle` is the live handle opened above.
+    let read = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: closing the handle opened above, exactly once.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    read.ok()?;
+    Some(filetime_to_system_time(creation))
+}
+
+/// FILETIME is 100-nanosecond ticks since 1601-01-01 UTC; `SystemTime` counts
+/// from the Unix epoch, 11644473600 seconds later.
+fn filetime_to_system_time(ft: windows::Win32::Foundation::FILETIME) -> std::time::SystemTime {
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    const EPOCH_DIFFERENCE_SECONDS: u64 = 11_644_473_600;
+    let ticks = ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    let seconds = ticks / TICKS_PER_SECOND;
+    let nanos = ((ticks % TICKS_PER_SECOND) * 100) as u32;
+    std::time::UNIX_EPOCH
+        + std::time::Duration::new(seconds.saturating_sub(EPOCH_DIFFERENCE_SECONDS), nanos)
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

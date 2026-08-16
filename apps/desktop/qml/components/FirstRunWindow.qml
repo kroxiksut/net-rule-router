@@ -34,6 +34,19 @@ Window {
     property string detectedCountry: ""
     property string detectedCountryPack: ""
 
+    // Mirror pack for the same country under presets/abroad/ — for someone who
+    // lives elsewhere but still needs that country's services. The OS locale
+    // cannot tell the two apart (an emigrant keeps their language), so the
+    // wizard asks instead of guessing. Empty when no such pack is bundled.
+    property string detectedAbroadPack: ""
+    property bool livingAbroad: false
+
+    readonly property bool hasHomePack: detectedCountryPack !== ""
+    readonly property bool hasAbroadPack: detectedAbroadPack !== ""
+    readonly property bool hasAnyCountryPack: hasHomePack || hasAbroadPack
+    // The single available pack wins when only one of the two is bundled.
+    readonly property bool useAbroadPack: hasAbroadPack && (livingAbroad || !hasHomePack)
+
     // Two-file "Open my rules…" picker state. Either path may be
     // empty — the user can choose to import just one route. Both
     // non-empty → both-routes review flow; exactly one → single-route.
@@ -127,6 +140,7 @@ Window {
                 || typeof nrrNativeBridge.detectOsLocale !== "function") {
             detectedCountry = ""
             detectedCountryPack = ""
+            detectedAbroadPack = ""
             return
         }
         var loc = String(nrrNativeBridge.detectOsLocale() || "")
@@ -140,6 +154,12 @@ Window {
         var packs = []
         try { packs = JSON.parse(packsJson) } catch (e) { packs = [] }
         detectedCountryPack = (packs.length > 0) ? String(packs[0]) : ""
+
+        var abroadJson = String(nrrNativeBridge.listCountryPresets("abroad") || "[]")
+        var abroadPacks = []
+        try { abroadPacks = JSON.parse(abroadJson) } catch (e) { abroadPacks = [] }
+        var wanted = "access-to-" + cc
+        detectedAbroadPack = (cc !== "" && abroadPacks.indexOf(wanted) >= 0) ? wanted : ""
     }
 
     function _readPresetBytes(relativePath) {
@@ -170,9 +190,11 @@ Window {
     }
 
     function _applyCountryPreset() {
-        if (detectedCountryPack === "") return
-        var primRel = detectedCountry + "/" + detectedCountryPack + "/rules_primary.txt"
-        var secRel = detectedCountry + "/" + detectedCountryPack + "/rules_secondary.txt"
+        var dir = useAbroadPack ? "abroad" : detectedCountry
+        var pack = useAbroadPack ? detectedAbroadPack : detectedCountryPack
+        if (pack === "") return
+        var primRel = dir + "/" + pack + "/rules_primary.txt"
+        var secRel = dir + "/" + pack + "/rules_secondary.txt"
         var primB64 = _readPresetBytes(primRel)
         var secB64 = _readPresetBytes(secRel)
         _finishWith(primB64, secB64,
@@ -408,12 +430,48 @@ Window {
         ColumnLayout {
             Layout.fillWidth: true
             spacing: root.uiTheme.spacingXs
-            visible: firstRunWindow.detectedCountryPack !== ""
+            visible: firstRunWindow.hasAnyCountryPack
+
+            // Asked only when both directions ship a pack; with one of them the
+            // answer would change nothing.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+                visible: firstRunWindow.hasHomePack && firstRunWindow.hasAbroadPack
+                Label {
+                    text: root.tr("dialog.first-run-wizard.location-title",
+                        "Where are you?")
+                    color: root.textColor
+                    font.bold: true
+                }
+                ThemedRadioButton {
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    checked: !firstRunWindow.livingAbroad
+                    text: root.tr("dialog.first-run-wizard.location-home",
+                            "I am in {country}")
+                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                    onToggled: if (checked) firstRunWindow.livingAbroad = false
+                }
+                ThemedRadioButton {
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    checked: firstRunWindow.livingAbroad
+                    text: root.tr("dialog.first-run-wizard.location-abroad",
+                            "I am outside {country} and need access to its services")
+                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                    onToggled: if (checked) firstRunWindow.livingAbroad = true
+                }
+            }
+
             ThemedButton {
                 theme: root.uiTheme
                 Layout.fillWidth: true
-                text: root.tr("dialog.first-run-wizard.option-country-preset",
-                        "Load country preset ({country})")
+                text: (firstRunWindow.useAbroadPack
+                        ? root.tr("dialog.first-run-wizard.option-country-preset-abroad",
+                            "Load access preset ({country})")
+                        : root.tr("dialog.first-run-wizard.option-country-preset",
+                            "Load country preset ({country})"))
                     .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
                 icon.source: root.uiIconSource("load-list")
                 onClicked: firstRunWindow._applyCountryPreset()
@@ -423,8 +481,11 @@ Window {
                 Layout.leftMargin: root.uiTheme.spacingMd
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
-                text: root.tr("dialog.first-run-wizard.option-country-preset-description",
-                    "Detected from your OS locale. Imports the bundled pack for your region.")
+                text: firstRunWindow.useAbroadPack
+                    ? root.tr("dialog.first-run-wizard.option-country-preset-abroad-description",
+                        "Everything stays on your local provider; only that country's services take the additional route.")
+                    : root.tr("dialog.first-run-wizard.option-country-preset-description",
+                        "Detected from your OS locale. Imports the bundled pack for your region.")
             }
         }
         // Option 1 fallback note when no country pack found.
@@ -432,7 +493,7 @@ Window {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             color: root.mutedTextColor
-            visible: firstRunWindow.detectedCountryPack === ""
+            visible: !firstRunWindow.hasAnyCountryPack
             text: root.tr("dialog.first-run-wizard.option-country-not-available",
                 "No country preset is bundled for your region — pick a different option.")
         }

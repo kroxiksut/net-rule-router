@@ -108,6 +108,33 @@ impl Default for StopToken {
     }
 }
 
+// ── Teardown latch ───────────────────────────────────────────────────────────
+
+/// Process-wide "the stop teardown has begun" latch.
+///
+/// The stop token alone is not enough: background workers that were never
+/// handed a clone of it (the fake-IP watchdog, the debounced network-change
+/// re-arm) can still re-install routes and WFP filters *after* the teardown
+/// stripped them — and those survive the process, because the WFP session is
+/// non-dynamic. Anything that enforces must check this before it applies.
+static TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Latch the teardown. Called once, right after the stop token flips.
+pub fn begin_teardown() {
+    TEARDOWN_STARTED.store(true, Ordering::SeqCst);
+}
+
+/// Whether stop teardown has begun. Enforcement work must bail out on `true`.
+pub fn teardown_in_progress() -> bool {
+    TEARDOWN_STARTED.load(Ordering::SeqCst)
+}
+
+/// Clear the latch at runtime start so a second runtime in the same process
+/// (tests, console-mode restart) is not born already tearing down.
+pub fn clear_teardown() {
+    TEARDOWN_STARTED.store(false, Ordering::SeqCst);
+}
+
 // ── Lifecycle events ─────────────────────────────────────────────────────────
 
 /// Control codes the SCM dispatcher (or the console mode Ctrl+C

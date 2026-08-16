@@ -11,17 +11,6 @@
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
-
-use windows::Win32::Foundation::{HANDLE, NO_ERROR};
-use windows::Win32::NetworkManagement::IpHelper::{
-    CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyRouteChange2, MIB_IPFORWARD_ROW2,
-    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
-};
-use windows::Win32::Networking::WinSock::AF_UNSPEC;
-
-use crate::error::PlatformError;
-
 // The neutral port + OS-agnostic no-op live in `nrr-platform-api`.
 // Re-export them so consumers (`service-runtime`) keep importing from here.
 pub use nrr_platform_api::network_change::{
@@ -31,10 +20,27 @@ pub use nrr_platform_api::network_change::{
 
 // ── Windows impl (NotifyIpInterfaceChange + NotifyRouteChange2) ────────────────
 
+#[cfg(target_os = "windows")]
+use std::ffi::c_void;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HANDLE, NO_ERROR};
+#[cfg(target_os = "windows")]
+use windows::Win32::NetworkManagement::IpHelper::{
+    CancelMibChangeNotify2, NotifyIpInterfaceChange, NotifyRouteChange2, MIB_IPFORWARD_ROW2,
+    MIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE,
+};
+#[cfg(target_os = "windows")]
+use windows::Win32::Networking::WinSock::AF_UNSPEC;
+
+#[cfg(target_os = "windows")]
+use crate::error::PlatformError;
+
 /// Heap context handed to the OS as the callback's caller-context. Kept alive by
 /// the subscription guard and freed ONLY after both notifications are cancelled
 /// (see [`WindowsSubscriptionGuard::drop`]), so no in-flight callback can ever
 /// dereference a freed pointer.
+#[cfg(target_os = "windows")]
 struct ObserverContext {
     on_change: NetworkChangeCallback,
 }
@@ -44,6 +50,7 @@ struct ObserverContext {
 /// # Safety
 /// `context` must be the live `*mut ObserverContext` passed to the `Notify*`
 /// call (non-null, still alive because the notification has not been cancelled).
+#[cfg(target_os = "windows")]
 unsafe fn fire(context: *const c_void) {
     if context.is_null() {
         return;
@@ -61,6 +68,7 @@ unsafe fn fire(context: *const c_void) {
 
 /// `NotifyIpInterfaceChange` callback. The row/type are ignored — any interface
 /// change is a signal to re-evaluate routing.
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn interface_change_callback(
     caller_context: *const c_void,
     _row: *const MIB_IPINTERFACE_ROW,
@@ -71,6 +79,7 @@ unsafe extern "system" fn interface_change_callback(
 
 /// `NotifyRouteChange2` callback. Catches a secondary adapter silently changing/withdrawing
 /// its default route without a link-state transition.
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn route_change_callback(
     caller_context: *const c_void,
     _row: *const MIB_IPFORWARD_ROW2,
@@ -83,6 +92,7 @@ unsafe extern "system" fn route_change_callback(
 /// frees the context — order is load-bearing (free-before-cancel is a
 /// use-after-free, since `CancelMibChangeNotify2` is what guarantees no callback
 /// is still running).
+#[cfg(target_os = "windows")]
 struct WindowsSubscriptionGuard {
     interface_handle: HANDLE,
     route_handle: HANDLE,
@@ -93,9 +103,12 @@ struct WindowsSubscriptionGuard {
 // `CancelMibChangeNotify2` blocks until in-flight callbacks return, after which
 // the context is exclusively owned here and safe to free. The callbacks
 // themselves only read through the pointer.
+#[cfg(target_os = "windows")]
 unsafe impl Send for WindowsSubscriptionGuard {}
+#[cfg(target_os = "windows")]
 unsafe impl Sync for WindowsSubscriptionGuard {}
 
+#[cfg(target_os = "windows")]
 impl Drop for WindowsSubscriptionGuard {
     fn drop(&mut self) {
         // SAFETY: cancel both notifications first; each `CancelMibChangeNotify2`
@@ -118,9 +131,11 @@ impl Drop for WindowsSubscriptionGuard {
 /// Production observer: registers `NotifyIpInterfaceChange` (link up/down, IP
 /// add/remove) and `NotifyRouteChange2` (default-route add/remove) so a secondary adapter
 /// coming up or dropping re-drives routing within ~debounce, not ~1–30 s.
+#[cfg(target_os = "windows")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsNetworkChangeObserver;
 
+#[cfg(target_os = "windows")]
 impl NetworkChangeObserver for WindowsNetworkChangeObserver {
     fn subscribe(
         &self,

@@ -27,3 +27,25 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
 pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
     None
 }
+
+/// The service binary's own verb that tears down leftover network state, when
+/// this platform has one.
+///
+/// The console does not undo enforcement itself: the binary that applied the
+/// state is the only thing that knows how to remove it, and running that code
+/// twice — once properly, once re-implemented here — is how the two copies
+/// drift. So this names the verb and the console just runs it.
+///
+/// `None` where the platform has nothing to undo. On Linux enforcement is still
+/// a stub, so there is no leftover state and no verb to run; saying that plainly
+/// beats pretending the command worked.
+#[cfg(windows)]
+pub fn offline_reset_verb() -> Option<&'static str> {
+    Some("cleanup")
+}
+
+/// The service binary's own network-reset verb, when this platform has one.
+#[cfg(not(windows))]
+pub fn offline_reset_verb() -> Option<&'static str> {
+    None
+}

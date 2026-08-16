@@ -9,8 +9,11 @@
 //! # Crate boundaries
 //!
 //! `nrr-storage` depends on `nrr-domain` for shared types (`LookupResult`,
-//! `CacheEntryState`, `FreshnessThresholds`, `RevisionId`) and must not depend
-//! on `nrr-shared`, `nrr-application`, or any UI crate.
+//! `CacheEntryState`, `FreshnessThresholds`, `RevisionId`) and on
+//! `nrr-platform-api` for the production data/log roots — path shape is the
+//! platform layer's business, and deriving it a second time here is what made
+//! it drift. It must not depend on `nrr-shared`, `nrr-application`, or any UI
+//! crate.
 //!
 //! # Threading model
 //!

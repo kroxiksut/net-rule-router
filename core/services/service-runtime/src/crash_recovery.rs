@@ -158,6 +158,17 @@ pub enum RecoveryAuditRecord {
     RollbackCompleted {
         attempt_id: String,
     },
+    /// The rollback decision was taken but this layer did not perform one: the
+    /// marker is cleared and the routing state is brought back in line by the
+    /// startup reconcile instead.
+    ///
+    /// Exists so the trail never claims a rollback that nobody ran. An audit
+    /// entry that overstates what happened is worse than a missing one — it is
+    /// the record someone will reason from during an incident.
+    RollbackDeferred {
+        attempt_id: String,
+        reason: String,
+    },
     VerificationPassed {
         attempt_id: String,
     },
@@ -426,15 +437,16 @@ where
                 {
                     return RecoveryExecutionResult::AuditWriteFailed { detail: e };
                 }
-                // The apply layer executes the actual rollback. Here we
-                // record intent and clear the marker so the next boot sees
-                // a clean state.
-                // TODO:: invoke ApplyLayerPort::rollback(target_revision)
-                let _ = self
-                    .audit_sink
-                    .emit(RecoveryAuditRecord::RollbackCompleted {
-                        attempt_id: marker.attempt_id.clone(),
-                    });
+                // No rollback runs here, so the trail must not claim one
+                // completed. Clearing the marker is what this step really does;
+                // enforcement is brought back in line by the startup reconcile.
+                // TODO: invoke ApplyLayerPort::rollback(target_revision) so the
+                // revision is restored here instead of converged to later.
+                let _ = self.audit_sink.emit(RecoveryAuditRecord::RollbackDeferred {
+                    attempt_id: marker.attempt_id.clone(),
+                    reason: "no rollback executor wired; startup reconcile restores enforcement"
+                        .to_owned(),
+                });
                 match self.marker_store.clear() {
                     Ok(()) => {
                         let _ = self.audit_sink.emit(RecoveryAuditRecord::MarkerCleared {
@@ -714,6 +726,9 @@ mod tests {
         fn count(&self) -> usize {
             self.events.lock().unwrap().len()
         }
+        fn records(&self) -> Vec<RecoveryAuditRecord> {
+            self.events.lock().unwrap().clone()
+        }
     }
 
     impl RecoveryAuditSink for RecordingAuditSink {
@@ -779,6 +794,44 @@ mod tests {
         );
         // Marker must be cleared after rollback.
         assert!(c.marker_store.read().is_none(), "marker not cleared");
+    }
+
+    /// The audit trail is what someone reasons from during an incident, so it
+    /// must not claim a rollback this layer never performed — no executor is
+    /// wired yet, and enforcement is restored by the startup reconcile.
+    #[test]
+    fn the_trail_records_a_deferred_rollback_not_a_completed_one() {
+        let c = coord(
+            FakeMarkerStore::with(marker(ApplyPhase::Applying)),
+            RecordingAuditSink::ok(),
+        );
+        let decision = decide_recovery(&c.assess(), true, true);
+        let _ = c.execute(decision);
+
+        let records = c.audit_sink.records();
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, RecoveryAuditRecord::RollbackInitiated { .. })),
+            "the decision to roll back must still be recorded",
+        );
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, RecoveryAuditRecord::RollbackCompleted { .. })),
+            "nothing rolled back, so nothing may claim it completed: {records:?}",
+        );
+        let deferred = records
+            .iter()
+            .find_map(|r| match r {
+                RecoveryAuditRecord::RollbackDeferred { reason, .. } => Some(reason),
+                _ => None,
+            })
+            .expect("the trail must say the rollback was deferred");
+        assert!(
+            !deferred.is_empty(),
+            "a deferral without a reason is as opaque as silence",
+        );
     }
 
     #[test]

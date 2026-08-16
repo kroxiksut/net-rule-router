@@ -54,6 +54,13 @@ struct LaunchOptions {
     QString qmlPath;
     QString appIconPath;
     QString contextFilePath;
+    // Where the surfaces coordinate: single-instance locks, activation
+    // hand-off, shutdown flag. Passed by the launcher so the rule for choosing
+    // it is declared once, in Rust — recomputing it here agreed with the
+    // launcher on Windows only by coincidence, and would disagree on Linux,
+    // where the launcher uses the per-user XDG runtime directory rather than
+    // the shared `/tmp`.
+    QString runtimeDirectory;
     int autoCloseMs = 0;
 };
 
@@ -80,6 +87,9 @@ LaunchOptions parseLaunchOptions(const QStringList &arguments) {
         } else if (argument.startsWith("--nrr-auto-close-ms=")) {
             options.autoCloseMs =
                 argument.mid(QStringLiteral("--nrr-auto-close-ms=").size()).trimmed().toInt();
+        } else if (argument.startsWith("--nrr-runtime-dir=")) {
+            options.runtimeDirectory =
+                argument.mid(QStringLiteral("--nrr-runtime-dir=").size()).trimmed();
         }
     }
 
@@ -254,9 +264,16 @@ QString resolveAppIconPath(const LaunchOptions &options, const QString &applicat
     return QString();
 }
 
+// Set once from `--nrr-runtime-dir=` before anything touches a lock or a flag.
+// Empty only when the host was started without the argument (a hand-run of the
+// binary), which keeps the historical Windows path working.
+QString g_runtimeDirectoryOverride;
+
 QString appRuntimeDirectoryPath() {
     const QString path =
-        QDir::cleanPath(QDir::tempPath() + QStringLiteral("/NetRuleRouter"));
+        g_runtimeDirectoryOverride.isEmpty()
+            ? QDir::cleanPath(QDir::tempPath() + QStringLiteral("/NetRuleRouter"))
+            : g_runtimeDirectoryOverride;
     QDir().mkpath(path);
     return path;
 }
@@ -457,6 +474,12 @@ public:
             return {};
         }
 
+        // The launcher logs that it wrote the request; without this line nothing
+        // records that anyone read it, and a tray click that opens no window is
+        // indistinguishable from one that was never delivered.
+        std::printf("NRR_HOST_ACTIVATION_CONSUMED keys=%s\n",
+                    document.object().keys().join(QLatin1Char(',')).toUtf8().constData());
+        std::fflush(stdout);
         return document.object().toVariantMap();
     }
 
@@ -2968,6 +2991,28 @@ public:
         dispatch(QStringLiteral("restart"), QStringLiteral("restart"));
     }
 
+    /// Re-point the registration at the service binary shipped with THIS copy
+    /// of the app, then start it.
+    ///
+    /// One elevated process does remove→register→start, so the swap costs a
+    /// single UAC prompt. The path is never passed as an argument: the broker
+    /// runs one whitelisted token, and the binary registers itself.
+    Q_INVOKABLE void reinstallService() {
+        dispatch(QStringLiteral("reinstall"), QStringLiteral("reinstall"));
+    }
+
+    /// Emergency network recovery: run the service binary's own teardown of the
+    /// state it applied (packet filters, the DNS redirect, our routes).
+    ///
+    /// Deliberately the SAME verb the console drives, through the same elevated
+    /// broker: the program that applied the state is the only one that knows all
+    /// of it, and a second implementation would be a copy that drifts — found
+    /// out, if ever, during the outage it exists to fix. The confirmation is
+    /// QML's job; by the time this is called the user has already agreed.
+    Q_INVOKABLE void resetNetwork() {
+        dispatch(QStringLiteral("cleanup"), QStringLiteral("cleanup"));
+    }
+
     /// Switch the service start mode (admin-opt-in).
     /// `mode` is the wire slug: "with-windows" (= start with Windows /
     /// SERVICE_AUTO_START) or "on-app-launch" (= start when the app opens /
@@ -3481,6 +3526,13 @@ int main(int argc, char *argv[]) {
 
     const LaunchOptions options = parseLaunchOptions(QCoreApplication::arguments());
     const QString applicationDir = QCoreApplication::applicationDirPath();
+
+    // Adopt the launcher's coordination directory BEFORE the first flag is
+    // touched below — every lock and flag path is derived from it.
+    if (!options.runtimeDirectory.isEmpty()) {
+        g_runtimeDirectoryOverride =
+            QDir::cleanPath(normalizeLocalPath(options.runtimeDirectory));
+    }
 
     // A leftover shutdown flag from a previous tray "Exit" must not cause a
     // freshly launched process to terminate immediately. The flag is only

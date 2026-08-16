@@ -32,7 +32,9 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "windows")]
 use nrr_platform_api::error::PlatformError;
+#[cfg(target_os = "windows")]
 use nrr_platform_api::fake_ip::tun::{TunAdapterConfig, TunAdapterPort, TunControl, TunDevice};
 use nrr_platform_api::third_party::{
     ThirdPartyComponent, ThirdPartyComponentStatus, ThirdPartyIntegrityPort, WINTUN_COMPONENT,
@@ -624,9 +626,15 @@ mod tests {
 
     #[test]
     fn repository_layout_is_searched_upward_from_the_executable() {
-        let exe_dir = Path::new(r"D:\repo\target\debug");
-        let candidates = wintun_dll_candidates(None, Some(exe_dir));
-        let wanted = Path::new(r"D:\repo")
+        // Built from real path components rather than a Windows drive-letter
+        // string: `\` is not a separator on Linux, so a literal `r"D:\repo\..."`
+        // collapses to one component and the upward `.parent()` walk this test
+        // exercises never leaves it — `VENDORED_DIR` itself is already a
+        // portable forward-slash literal.
+        let repo_root = PathBuf::from("repo");
+        let exe_dir = repo_root.join("target").join("debug");
+        let candidates = wintun_dll_candidates(None, Some(&exe_dir));
+        let wanted = repo_root
             .join(VENDORED_DIR)
             .join(vendored_arch_dir())
             .join("wintun.dll");

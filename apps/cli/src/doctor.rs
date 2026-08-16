@@ -111,6 +111,29 @@ pub enum Registration {
     Unavailable(String),
 }
 
+/// What one of the directories the product needs looks like from here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectoryState {
+    /// Present, and its entries can be listed from this console.
+    Listable,
+    /// Present, but listing it was refused. Normal for the state directory —
+    /// only the service account may read it.
+    Present,
+    /// Nothing at that path yet.
+    Missing,
+    /// This platform declares no such directory.
+    Undefined,
+}
+
+/// A directory the product needs, as observed — never judged here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryFact {
+    /// Where it should be, when this platform declares one.
+    pub path: Option<PathBuf>,
+    /// What is actually there.
+    pub state: DirectoryState,
+}
+
 /// Everything the checks are judged against. Gathered by [`collect`]; every
 /// field is an observation, never a verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,6 +159,26 @@ pub struct Facts {
     /// Whether path comparison on this file system ignores case. An
     /// observation about the host, not a branch in the judgement.
     pub paths_are_case_insensitive: bool,
+    /// The service's state directory (databases, audit trail).
+    pub data_root: DirectoryFact,
+    /// The service's operational-log directory.
+    pub logs_dir: DirectoryFact,
+    /// What the service itself said when asked. `None` when the probe was not
+    /// attempted at all (no service manager on this platform).
+    pub service_answer: Option<ServiceAnswer>,
+}
+
+/// The outcome of asking the running service who it is.
+///
+/// Kept as a fact rather than a verdict so the judgement stays pure: silence is
+/// an ordinary answer here — the console is most useful when the service is
+/// dead — and only [`assess`] decides what silence is worth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceAnswer {
+    /// It answered, and reported this version of itself.
+    Answered { service_version: String },
+    /// It did not answer within the probe budget.
+    Silent,
 }
 
 /// Judge gathered facts. Pure: no I/O, no privilege, no clock.
@@ -221,6 +264,17 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         )),
     }
 
+    findings.push(directory_finding(
+        "state directory",
+        &facts.data_root,
+        "The service creates it on first start.",
+    ));
+    findings.push(directory_finding(
+        "log directory",
+        &facts.logs_dir,
+        "Nothing has been logged yet; start the service and repeat this check.",
+    ));
+
     if !facts.supports_background_service {
         findings.push(Finding::warn(
             "background service",
@@ -229,7 +283,74 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         ));
     }
 
+    // What the service says about itself, when it is up. Silence is only worth
+    // reporting when the service manager claims it IS running: a stopped service
+    // that does not answer is not a finding, it is the same fact stated twice.
+    if let Some(answer) = &facts.service_answer {
+        let claims_running = matches!(
+            &facts.registration,
+            Registration::Installed { run_state, .. } if *run_state == "running"
+        );
+        match (answer, claims_running) {
+            (ServiceAnswer::Answered { service_version }, _) => {
+                let detail = if service_version == facts.console_version {
+                    format!("{service_version} (same as this console)")
+                } else {
+                    format!(
+                        "{service_version} — this console is {}",
+                        facts.console_version
+                    )
+                };
+                // A version difference is worth naming but is not a failure:
+                // lifecycle verbs are version-neutral, and saying so beats an
+                // alarm the operator cannot act on.
+                findings.push(if service_version == facts.console_version {
+                    Finding::pass("service answered", detail)
+                } else {
+                    Finding::warn(
+                        "service answered",
+                        detail,
+                        "Console and service come from different builds; reinstall the service from this directory to match them.",
+                    )
+                });
+            }
+            (ServiceAnswer::Silent, true) => findings.push(Finding::fail(
+                "service answered",
+                "it is running but did not answer this console",
+                // Two causes, and the operator cannot tell them apart from
+                // here: the channel is not serving at all, or the running
+                // service predates this console and does not admit it yet.
+                // Restarting from this directory settles both.
+                "Either its request channel is not serving, or the running service is an older build that does not admit this console. Restart it from this directory and repeat the check.",
+            )),
+            (ServiceAnswer::Silent, false) => {}
+        }
+    }
+
     findings
+}
+
+/// Report one directory. A missing one is a warning, not a failure: before the
+/// first start there is nothing to find, and `doctor` exists to say so rather
+/// than to fail over it.
+fn directory_finding(title: &'static str, dir: &DirectoryFact, missing_hint: &str) -> Finding {
+    match (&dir.path, dir.state) {
+        (Some(path), DirectoryState::Listable) => Finding::pass(title, path.display().to_string()),
+        (Some(path), DirectoryState::Present) => Finding::pass(
+            title,
+            format!("{} (listing it needs elevation)", path.display()),
+        ),
+        (Some(path), _) => Finding::warn(
+            title,
+            format!("{} does not exist", path.display()),
+            missing_hint,
+        ),
+        (None, _) => Finding::warn(
+            title,
+            "this platform declares no such directory",
+            "This build has no production layout for the host OS.",
+        ),
+    }
 }
 
 /// How the console names itself in a hint the reader is meant to retype.
@@ -378,12 +499,14 @@ pub fn collect(port: Option<&dyn ServiceControlPort>) -> Facts {
     };
 
     let profile = PlatformProfile::current();
+    let registration = read_registration(port);
     Facts {
         console_version: env!("CARGO_PKG_VERSION"),
         console_path: console_path.clone(),
         service_binary: sibling(BinaryRole::Service),
         gui_binary: sibling(BinaryRole::Gui),
-        registration: read_registration(port),
+        service_answer: probe_service(&registration),
+        registration,
         platform_os: profile.os,
         enforcement_backend: profile.enforcement_backend,
         service_model: profile.service_model,
@@ -391,6 +514,79 @@ pub fn collect(port: Option<&dyn ServiceControlPort>) -> Facts {
         // Windows and macOS compare paths case-insensitively; Linux does not.
         // Gathered here so the judgement stays a pure function of its input.
         paths_are_case_insensitive: cfg!(any(windows, target_os = "macos")),
+        data_root: inspect_directory(nrr_platform_api::paths::production_data_root()),
+        logs_dir: inspect_directory(nrr_platform_api::paths::production_logs_dir()),
+    }
+}
+
+/// Ask the running service who it is.
+///
+/// Attempted only when the service manager says the service is installed — a
+/// probe against a service that is not there tells nobody anything and costs the
+/// connect budget. The probe is a handshake, nothing more: the console declares
+/// itself a console, and the answer carries the service's own version, which is
+/// the one fact this command cannot get from the file system.
+fn probe_service(registration: &Registration) -> Option<ServiceAnswer> {
+    if !matches!(registration, Registration::Installed { .. }) {
+        return None;
+    }
+    nrr_ipc_client::declare_client_kind(
+        nrr_shared::ipc_payloads::ContractNegotiateClientKind::Console,
+    );
+    let client = nrr_ipc_client::ServiceIpcClient::start();
+    let deadline = std::time::Instant::now() + PROBE_BUDGET;
+    loop {
+        match client.connection_status() {
+            nrr_ipc_client::ConnectionStatus::Connected => {
+                return Some(match client.negotiate_info() {
+                    Some(info) if !info.service_version.is_empty() => ServiceAnswer::Answered {
+                        service_version: info.service_version,
+                    },
+                    // Connected but the handshake carried no version: report the
+                    // connection, not a version we do not have.
+                    _ => ServiceAnswer::Answered {
+                        service_version: "unreported".to_string(),
+                    },
+                });
+            }
+            nrr_ipc_client::ConnectionStatus::NotInstalled
+            | nrr_ipc_client::ConnectionStatus::ServiceStopped => {
+                return Some(ServiceAnswer::Silent)
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(ServiceAnswer::Silent);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// How long the doctor waits for the service to answer. Short on purpose: this
+/// command is run when something is already wrong, and a diagnostic that hangs
+/// is worse than one that reports silence.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Look at one directory without needing the service to be alive. Listing is
+/// the access that matters: the state directory is readable only by the
+/// service account, so a refusal there is an observation, not a fault.
+fn inspect_directory(path: Option<PathBuf>) -> DirectoryFact {
+    let Some(path) = path else {
+        return DirectoryFact {
+            path: None,
+            state: DirectoryState::Undefined,
+        };
+    };
+    let state = if !path.is_dir() {
+        DirectoryState::Missing
+    } else if std::fs::read_dir(&path).is_ok() {
+        DirectoryState::Listable
+    } else {
+        DirectoryState::Present
+    };
+    DirectoryFact {
+        path: Some(path),
+        state,
     }
 }
 
@@ -452,12 +648,22 @@ mod tests {
             console_path: Some(installed_binary(BinaryRole::Console)),
             service_binary: Some(installed_binary(BinaryRole::Service)),
             gui_binary: Some(installed_binary(BinaryRole::Gui)),
+            // The service was never asked, so there is no answer to judge.
+            service_answer: None,
             registration,
             platform_os: "windows",
             enforcement_backend: "wfp",
             service_model: "scm",
             supports_background_service: true,
             paths_are_case_insensitive: true,
+            data_root: DirectoryFact {
+                path: Some(install_dir().join("state")),
+                state: DirectoryState::Present,
+            },
+            logs_dir: DirectoryFact {
+                path: Some(install_dir().join("logs")),
+                state: DirectoryState::Listable,
+            },
         }
     }
 
@@ -593,6 +799,107 @@ mod tests {
         let findings = assess(&facts);
         assert_eq!(find(&findings, "service binary").level, Level::Fail);
         assert_eq!(exit_code(&findings, &facts.registration), exit::FAILED);
+    }
+
+    #[test]
+    fn a_state_directory_that_cannot_be_listed_still_passes() {
+        // Only the service account may read it; a console that cannot list it
+        // has learned nothing bad. Saying why beats a permanent warning.
+        let findings = assess(&facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "running",
+        )));
+        let finding = find(&findings, "state directory");
+        assert_eq!(finding.level, Level::Pass);
+        assert!(
+            finding.detail.contains("needs elevation"),
+            "detail was: {}",
+            finding.detail
+        );
+    }
+
+    #[test]
+    fn a_missing_log_directory_warns_without_failing_the_run() {
+        // Before the first start there is nothing to find. `doctor` is run to
+        // look; exiting non-zero over an empty install trains everyone to
+        // ignore the code.
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "running",
+        ));
+        facts.logs_dir.state = DirectoryState::Missing;
+        let findings = assess(&facts);
+        assert_eq!(find(&findings, "log directory").level, Level::Warn);
+        assert_eq!(exit_code(&findings, &facts.registration), exit::SUCCESS);
+    }
+
+    #[test]
+    fn a_service_that_is_stopped_and_silent_is_not_reported_twice() {
+        // "Stopped" is already a finding of its own. Adding "and it did not
+        // answer" says nothing new and makes the report look worse than it is.
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "stopped",
+        ));
+        facts.service_answer = Some(ServiceAnswer::Silent);
+        let findings = assess(&facts);
+        assert!(findings.iter().all(|f| f.title != "service answered"));
+    }
+
+    #[test]
+    fn a_running_service_that_does_not_answer_is_a_failure() {
+        // The process is up but its request channel is not serving — the state
+        // the console exists to distinguish from "not running".
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "running",
+        ));
+        facts.service_answer = Some(ServiceAnswer::Silent);
+        let findings = assess(&facts);
+        assert_eq!(find(&findings, "service answered").level, Level::Fail);
+        assert_eq!(exit_code(&findings, &facts.registration), exit::FAILED);
+    }
+
+    #[test]
+    fn a_version_difference_warns_but_does_not_fail() {
+        // Lifecycle verbs are version-neutral, so a mismatch is worth naming and
+        // not worth failing over.
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "running",
+        ));
+        facts.service_answer = Some(ServiceAnswer::Answered {
+            service_version: "9.9.9-other".to_string(),
+        });
+        let findings = assess(&facts);
+        assert_eq!(find(&findings, "service answered").level, Level::Warn);
+        assert_eq!(exit_code(&findings, &facts.registration), exit::SUCCESS);
+
+        facts.service_answer = Some(ServiceAnswer::Answered {
+            service_version: facts.console_version.to_string(),
+        });
+        let findings = assess(&facts);
+        assert_eq!(find(&findings, "service answered").level, Level::Pass);
+    }
+
+    #[test]
+    fn a_platform_with_no_declared_directories_says_so_instead_of_naming_a_path() {
+        let mut facts = facts(installed(
+            Some(installed_binary(BinaryRole::Service)),
+            "running",
+        ));
+        facts.data_root = DirectoryFact {
+            path: None,
+            state: DirectoryState::Undefined,
+        };
+        let findings = assess(&facts);
+        let finding = find(&findings, "state directory");
+        assert_eq!(finding.level, Level::Warn);
+        assert!(
+            finding.detail.contains("no such directory"),
+            "detail was: {}",
+            finding.detail
+        );
     }
 
     #[test]

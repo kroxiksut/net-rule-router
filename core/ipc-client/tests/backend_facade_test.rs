@@ -1,17 +1,19 @@
 //! Integration tests for `IpcBackendFacade`.
 //!
 //! These tests exercise the full facade behaviour by injecting a
-//! [`FakeIpcClient`] sink in place of the real `NamedPipeIpcClient`.
-//! The fake routes typed responses for known operations and lets the
-//! test flip the connection status mid-flight to drive the
-//! cache-fallback paths documented in `backend_facade_impl.rs`.
+//! [`FakeIpcClient`] sink in place of a real transport. The fake routes
+//! typed responses for known operations and lets the test flip the
+//! connection status mid-flight to drive the cache-fallback paths
+//! documented in `backend_facade_impl.rs`.
+//!
+//! They run on every OS: the facade is transport-agnostic, and running the
+//! suite on Linux is what proves the named pipe was never load-bearing in it.
 //!
 //! End-to-end coverage against the real production handler registry
 //! lives in `nrr-service-runtime/tests/ipc_handlers_test.rs`; this
 //! suite focuses on the *facade* layer (timeout matrix, cache write,
 //! cache fallback, mutation invalidation, `clear_cache`, `force_reconnect`).
 
-#![cfg(target_os = "windows")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;

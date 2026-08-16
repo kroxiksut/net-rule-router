@@ -747,6 +747,30 @@ ApplicationWindow {
                         || _compatGuiVersion !== _compatServiceVersion))
                 : _compatProtocolMismatch)
     readonly property int compatBannerHeight: compatBannerVisible ? 36 : 0
+    // Which service binary Windows has registered, and which one ships with
+    // this copy of the app. They diverge when a newer build is unpacked
+    // elsewhere: the old binary keeps starting with Windows, so the user runs a
+    // new app against an old service without being told.
+    property string serviceRegisteredPath:      ""
+    property string serviceExpectedPath:        ""
+    property bool   serviceRegisteredElsewhere: false
+    property bool   serviceOlderThanApp:        false
+    // Same folder, replaced file, process still running the previous code —
+    // the registration is correct, so this one needs a restart, not a re-register.
+    property bool   serviceRestartNeeded:       false
+    readonly property bool serviceUpdateAvailable:
+        serviceRegisteredElsewhere || serviceOlderThanApp
+
+    /// Start the service — unless the registration points somewhere else, in
+    /// which case starting it would launch the copy the user is replacing.
+    function startServiceOrOfferUpdate() {
+        if (typeof nrrServiceController === "undefined" || !nrrServiceController) return
+        if (serviceRegisteredElsewhere) {
+            serviceUpdateDialog.open()
+            return
+        }
+        nrrServiceController.startService()
+    }
     // A visible, non-modal reminder that the rules on screen are not the rules
     // in the file — i.e. edits that were never applied. Applied rules reach the
     // file on their own. Deliberately NOT gated on an existing file path: a
@@ -5504,6 +5528,12 @@ ApplicationWindow {
         }
         if (quittingToTray || autoCloseMs > 0 || !prefs.minimizeToTrayInsteadOfClose) {
             close.accepted = true
+            // quitOnLastWindowClosed is off so close-to-tray can hide the
+            // window; a real close must therefore end the process itself, or it
+            // lives on windowless while still holding the single-instance lock,
+            // and every later tray click hands activation to a GUI that cannot
+            // show anything.
+            Qt.quit()
             return
         }
         // If the tray fails to spawn (binary not
@@ -5519,6 +5549,7 @@ ApplicationWindow {
         if (!traySpawned) {
             console.log("Main: tray spawn failed; closing application instead of hiding")
             close.accepted = true
+            Qt.quit()
             return
         }
         close.accepted = false
@@ -7146,14 +7177,24 @@ ApplicationWindow {
     // the service isn't connected. Three outcomes wired below: start /
     // install (escalates UAC, then re-arms the offline wait timer);
     // park to sidecar; cancel.
+    // Shared by every "start the service" affordance: starting a registration
+    // that points at another folder would launch the copy being replaced, so
+    // those paths offer the re-registration instead.
+    ServiceUpdateConfirmDialog {
+        id: serviceUpdateDialog
+        ownerRoot: window
+        onConfirmed: {
+            if (typeof nrrServiceController !== "undefined" && nrrServiceController) {
+                nrrServiceController.reinstallService()
+            }
+        }
+    }
+
     ServiceNotRunningDialog {
         id: serviceNotRunningDialog
         ownerRoot: window
         onStartServiceRequested: {
-            if (typeof nrrServiceController !== "undefined"
-                    && nrrServiceController) {
-                nrrServiceController.startService()
-            }
+            window.startServiceOrOfferUpdate()
             _armOfflineServiceStartTimer()
         }
         onInstallServiceRequested: {
@@ -7414,6 +7455,9 @@ ApplicationWindow {
         }
         if (_bannerServiceAction() === "install") {
             nrrServiceController.installService()
+        } else if (serviceRegisteredElsewhere) {
+            serviceUpdateDialog.open()
+            return
         } else {
             nrrServiceController.startService()
         }
@@ -7524,6 +7568,11 @@ ApplicationWindow {
             _compatGuiVersion      = String(payload["gui-version"] || "")
             _compatServiceProtocol = parseInt(payload["service-protocol"] || 0)
             _compatServiceVersion  = String(payload["service-version"] || "")
+            serviceRegisteredPath      = String(payload["service-registered-path"] || "")
+            serviceExpectedPath        = String(payload["service-expected-path"] || "")
+            serviceRegisteredElsewhere = payload["service-registered-elsewhere"] === true
+            serviceOlderThanApp        = payload["service-older-than-app"] === true
+            serviceRestartNeeded       = payload["service-restart-needed"] === true
         })
     }
 

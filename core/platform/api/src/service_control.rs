@@ -227,6 +227,14 @@ pub struct ServiceStatusReport {
     pub start_mode: Option<ServiceStartMode>,
     /// Registered binary path, when the manager exposes it.
     pub binary_path: Option<PathBuf>,
+    /// When the running service process started, when the OS exposes it.
+    ///
+    /// This is what separates "an update was installed" from "the update is
+    /// running": replacing the binary in place changes nothing about the
+    /// process already loaded from it, and the registration looks identical
+    /// before and after. A binary newer than this timestamp means the running
+    /// service is the previous build.
+    pub running_since: Option<std::time::SystemTime>,
 }
 
 // ── Errors ───────────────────────────────────────────────────────────────────

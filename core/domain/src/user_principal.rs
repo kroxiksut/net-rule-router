@@ -118,11 +118,47 @@ impl UserPrincipal {
     pub fn is_baseline(&self) -> bool {
         matches!(self, Self::Baseline)
     }
+
+    /// The numeric uid, when this principal is a Unix user.
+    ///
+    /// `None` for the baseline and for a Windows SID — the caller must decide
+    /// what a missing uid means rather than receiving a plausible zero, which
+    /// on Unix is root and would scope a rule to the wrong user entirely.
+    pub fn as_unix_uid(&self) -> Option<u32> {
+        let stored = match self {
+            Self::Baseline => return None,
+            Self::OsUser(s) => s.as_str(),
+        };
+        let digits = stored
+            .strip_prefix(LINUX_PRINCIPAL_SCHEME)
+            .or_else(|| stored.strip_prefix(MACOS_PRINCIPAL_SCHEME))?;
+        digits.parse::<u32>().ok()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Linux enforcement lowering scopes a rule with `meta skuid <uid>`, so
+    /// this is the one place the uid is recovered from the stored form.
+    #[test]
+    fn a_unix_principal_yields_its_uid_and_others_yield_none() {
+        assert_eq!(
+            UserPrincipal::from_linux_uid(1000).as_unix_uid(),
+            Some(1000)
+        );
+        assert_eq!(UserPrincipal::from_macos_uid(501).as_unix_uid(), Some(501));
+        assert_eq!(UserPrincipal::baseline().as_unix_uid(), None);
+        // A Windows SID has no uid — answering `Some(0)` here would silently
+        // scope a rule to root.
+        assert_eq!(
+            UserPrincipal::from_windows_sid("S-1-5-21-1-2-3-1001")
+                .expect("valid sid")
+                .as_unix_uid(),
+            None,
+        );
+    }
 
     #[test]
     fn baseline_round_trips_through_stored_form() {

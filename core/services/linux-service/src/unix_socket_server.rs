@@ -234,12 +234,19 @@ fn handle_connection(mut stream: UnixStream, router: Arc<IpcRouter>) {
         Err(_) => return, // getsockopt failure — nothing we can attribute; drop.
     };
     let principal: Option<UserPrincipal> = Some(identity.principal.clone());
+    // Peer credentials name the user, not the program, so this starts at the
+    // full profile and can only be narrowed — by what the caller declares in its
+    // handshake (see `narrow_profile_from_handshake`). A caller that declares
+    // nothing keeps the default; a caller that declares itself a console is held
+    // to a console's limits for the rest of the connection.
+    let mut profile = DEFAULT_CLIENT_PROFILE;
 
     loop {
         match read_frame::<_, IpcRequestEnvelope>(&mut stream) {
             Ok(request) => {
+                profile = narrow_profile_from_handshake(profile, &request);
                 let ctx = IpcRequestContext {
-                    client_profile: DEFAULT_CLIENT_PROFILE,
+                    client_profile: profile,
                     caller_is_elevated: identity.caller_is_elevated,
                     caller_principal: principal.clone(),
                 };
@@ -257,6 +264,30 @@ fn handle_connection(mut stream: UnixStream, router: Arc<IpcRouter>) {
                 break;
             }
         }
+    }
+}
+
+/// Apply a `contract.negotiate` handshake's declared client kind to the
+/// connection's profile.
+///
+/// Narrowing only, and permanently for the connection: a caller cannot regain
+/// capability by declaring something wider later, nor by declaring twice. Any
+/// other operation, or an unparseable handshake payload, leaves the profile
+/// untouched — a declaration is an opportunity to be trusted less, never a
+/// requirement.
+fn narrow_profile_from_handshake(
+    current: IpcClientProfile,
+    request: &IpcRequestEnvelope,
+) -> IpcClientProfile {
+    use nrr_shared::ipc::IpcOperationName;
+    use nrr_shared::ipc_payloads::ContractNegotiateRequest;
+
+    if request.operation != IpcOperationName::ContractNegotiate {
+        return current;
+    }
+    match serde_json::from_value::<ContractNegotiateRequest>(request.payload.clone()) {
+        Ok(negotiate) => current.narrowed_by(negotiate.client_kind.declared_ceiling()),
+        Err(_) => current,
     }
 }
 
@@ -408,6 +439,62 @@ mod tests {
             "got {outcome:?}"
         );
 
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+    }
+
+    /// The daemon's real registry answers the handshake instead of refusing it.
+    ///
+    /// The distinction this pins down: an "unhandled operation" error and a
+    /// broken transport look identical to a client, so a daemon that only ever
+    /// errors is indistinguishable from one that never connected.
+    #[test]
+    fn the_serving_registry_answers_the_handshake() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let router = {
+            let audit: Arc<dyn IpcAuditEmitter> = Arc::new(NoopIpcAuditEmitter);
+            let health = Arc::new(nrr_service_runtime::HealthAggregator::new());
+            Arc::new(IpcRouter::new(
+                crate::run::serving_registry_with(health),
+                audit,
+                1,
+            ))
+        };
+        let server = UnixDomainSocketServer::new_at(router, &sock);
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+
+        let mut client = {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match UnixStream::connect(&sock) {
+                    Ok(s) => break s,
+                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                    Err(e) => panic!("client connect failed: {e}"),
+                }
+            }
+        };
+        // A real handshake payload — the empty one the transport test uses is
+        // rejected by the handler, which would prove nothing about routing.
+        let mut request = sample_request();
+        request.payload = serde_json::json!({
+            "client-version": 1,
+            "client-kind": "gui",
+            "supported-features": [],
+        });
+        write_frame(&mut client, &request).expect("client writes request");
+        let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
+        assert!(
+            response.ok,
+            "contract.negotiate must be answered, got {:?}",
+            response.error
+        );
+
+        drop(client);
+        let _ = ticker.join().expect("ticker thread");
         acceptor.request_shutdown();
         acceptor.join_workers();
     }

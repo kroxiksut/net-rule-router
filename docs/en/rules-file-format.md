@@ -720,6 +720,7 @@ in the import dialog, and imports it. No special pack-import mechanism is
 required.
 
 Community presets can be contributed to the official repository via a pull
-request to the `presets/community/` directory, following the same process as
-locale file contributions. See `presets/README.md` for guidelines.
+request that adds a pack folder under `presets/<country-code>/`, or under a
+category folder such as `presets/abroad/`, following the same process as locale
+file contributions. See `presets/README.md` for guidelines.
 

@@ -85,6 +85,10 @@ pub mod routing;
 // Windows-only: the module talks to the Service Control Manager.
 #[cfg(windows)]
 pub mod service_control;
+// Named-kernel-mutex mechanism behind
+// `nrr_platform_api::single_instance::SingleInstancePort`.
+#[cfg(windows)]
+pub mod single_instance;
 pub mod snapshot;
 // Fake-IP mechanism behind `nrr_platform_api::fake_ip::stale_flows::StaleFlowReset`:
 // tears down TCP flows a restart left pointing at now-dead fake addresses.

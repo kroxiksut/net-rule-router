@@ -383,6 +383,13 @@ impl HealthReporter for HealthAggregator {
     fn worst_severity(&self) -> ServiceHealthSeverity {
         self.snapshot().worst_severity
     }
+    fn components(&self) -> Vec<(&'static str, ServiceHealthSeverity, String)> {
+        self.snapshot()
+            .components
+            .into_iter()
+            .map(|c| (c.component.slug(), c.severity, c.message))
+            .collect()
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

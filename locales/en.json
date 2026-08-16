@@ -180,7 +180,23 @@
         "minutes-label": "Revoke after this long unused (minutes)",
         "note": "After you approve administrator access, it stays available without new prompts. If it sits unused for this long, the app gives it up on its own; the next administrative action will ask again."
       },
-      "logs-path-unavailable": "Service logs folder path unavailable."
+      "logs-path-unavailable": "Service logs folder path unavailable.",
+      "recovery": {
+        "description": "If the service was killed without shutting down, its packet filters, DNS redirect and routes can stay behind and cut this machine off the network. This removes them.",
+        "action": "Restore network",
+        "tooltip": "Needs administrator rights. Connections open right now may drop."
+      },
+      "update": {
+        "elsewhere": "Windows starts the background service from another folder, not the one this application runs from.",
+        "older": "The running background service is an older build than this application.",
+        "detail": "Registered: %1\nThis application: %2",
+        "action": "Update service from this folder",
+        "tooltip": "Needs administrator rights. The service restarts, so routing pauses for a moment. Your rules and settings are kept."
+      },
+      "stale-process": {
+        "description": "The service program file was updated, but the service is still running the previous version. Restart it to run the update.",
+        "tooltip": "Needs administrator rights. Routing pauses for a moment while the service restarts."
+      }
     },
     "console": {
       "title": "Command-line console",
@@ -1268,6 +1284,11 @@
       "view-eula": "View EULA",
       "option-country-preset": "Load country preset ({country})",
       "option-country-preset-description": "Detected from your OS locale. Imports the bundled pack for your region.",
+      "location-title": "Where are you?",
+      "location-home": "I am in {country}",
+      "location-abroad": "I am outside {country} and need access to its services",
+      "option-country-preset-abroad": "Load access preset ({country})",
+      "option-country-preset-abroad-description": "Everything stays on your local provider; only that country's services take the additional route.",
       "option-country-not-available": "No country preset is bundled for your region — pick a different option.",
       "option-builtin-demo": "Use built-in demo rules",
       "option-builtin-demo-description": "A tiny showcase set covering each rule kind. Replace with your own later.",
@@ -1359,6 +1380,18 @@
       "cancel-description": "Dismiss the dialog and leave enforcement active",
       "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again.",
       "stub-pending": "Safe disable RPC bridge is not yet wired. Intent captured locally (see logs)."
+    },
+    "network-recovery": {
+      "title": "Restore network?",
+      "body": "The packet filters, DNS redirect and routes the service applied will be removed. Connections open right now may drop, and routing stays off until the service applies its rules again. Administrator rights are required.",
+      "cancel": "Cancel",
+      "confirm": "Restore network"
+    },
+    "service-update": {
+      "title": "Update the background service?",
+      "body": "The service will be registered from this folder and restarted. Routing pauses for a moment; your rules, settings and history are kept. Administrator rights are required.",
+      "cancel": "Cancel",
+      "confirm": "Update service"
     }
   },
   "status": {

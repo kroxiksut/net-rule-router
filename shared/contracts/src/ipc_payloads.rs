@@ -31,13 +31,34 @@ use crate::RouteRole;
 
 // ── ContractNegotiate ────────────────────────────────────────────────────────
 
-/// Stable identifier for the kind of client. The service uses it for
-/// audit attribution; see also `IpcClientProfile` in this crate.
+/// Stable identifier for the kind of client. Used for audit attribution and,
+/// where the OS cannot prove what connected, as a self-declaration that can
+/// only NARROW what the caller may do — see [`crate::ipc::IpcClientProfile`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ContractNegotiateClientKind {
     Gui,
     Tray,
+    /// The administrative console (`nrr-cli`). It reads and diagnoses; it never
+    /// changes policy, and says so on connect.
+    Console,
+}
+
+impl ContractNegotiateClientKind {
+    /// The profile a caller declaring this kind may hold at most.
+    ///
+    /// A declaration can only take capability away. On Windows the profile is
+    /// PROVEN from the connecting executable, so this narrows an already-known
+    /// answer; on Unix nothing proves the executable, so a caller that declares
+    /// itself a console is simply held to a console's limits. Neither case lets
+    /// a declaration grant anything.
+    pub const fn declared_ceiling(self) -> crate::ipc::IpcClientProfile {
+        match self {
+            Self::Gui => crate::ipc::IpcClientProfile::GuiInteractive,
+            Self::Tray => crate::ipc::IpcClientProfile::TrayLightweight,
+            Self::Console => crate::ipc::IpcClientProfile::AdminConsole,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,8 +99,10 @@ pub struct ContractNegotiateResponse {
 pub struct ServiceHealthRequest {}
 
 /// Wire-format mirror of the GUI's "service health" surface. `components`
-/// and `degraded_modes` are currently always empty; the fields are present
-/// in the wire schema so adding values later is non-breaking.
+/// carries the aggregator's per-component breakdown, so a `worst_severity` of
+/// "degraded" always names what is degraded. `degraded_modes` stays empty until
+/// the runtime tracks named modes; the field is in the schema so filling it
+/// later is non-breaking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ServiceHealthResponse {

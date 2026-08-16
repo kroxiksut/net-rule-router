@@ -77,22 +77,49 @@ fn every_country_preset_parses_without_panic() {
     }
 }
 
+/// `true` when the line carries a rule value — including a disabled one,
+/// which the format writes as `# value` with an optional inline comment.
+/// Prose comments and section headers are not rule lines.
+fn looks_like_rule_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with("---") {
+        return false;
+    }
+    match trimmed.strip_prefix('#') {
+        Some(rest) => {
+            let value = rest.split('#').next().unwrap_or("").trim();
+            !value.is_empty() && !value.contains(char::is_whitespace)
+        }
+        None => true,
+    }
+}
+
 #[test]
 fn every_country_preset_emits_at_least_one_rule_or_passthrough() {
-    // A preset that produces no rules and no passthrough is suspicious —
-    // it would mean either the file is empty (shouldn't ship) or the
-    // parser dropped everything. Each shipped preset should yield
-    // SOMETHING actionable.
+    // Zero output is legitimate for exactly one shape of file: a route a pack
+    // deliberately leaves empty so importing it clears that route. Such a file
+    // carries no rule lines at all and still announces itself with the preset
+    // header — that header is what separates "intentionally empty" from
+    // "shipped blank by accident". With rule lines present, zero output means
+    // the parser dropped them.
     let files = discover_preset_files();
     for path in &files {
         let text = fs::read_to_string(path).expect("read");
         let result = parse_canonical_rules(&text);
-        let nonempty = !result.rules.is_empty() || !result.passthrough.is_empty();
+        if !result.rules.is_empty() || !result.passthrough.is_empty() {
+            continue;
+        }
         assert!(
-            nonempty,
-            "{} produced zero rules AND zero passthrough — \
-             either the file is empty or the parser silently dropped \
-             its content",
+            !text.lines().any(looks_like_rule_line),
+            "{} has rule lines but produced zero rules AND zero passthrough — \
+             the parser silently dropped its content",
+            path.display(),
+        );
+        assert!(
+            text.lines()
+                .any(|l| l.trim_start().starts_with("# NetRuleRouter preset")),
+            "{} produced nothing and carries no preset header — an empty route \
+             must say so explicitly, otherwise the file looks forgotten",
             path.display(),
         );
     }

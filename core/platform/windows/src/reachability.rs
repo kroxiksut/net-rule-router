@@ -17,9 +17,6 @@
 
 #![allow(unsafe_code)]
 
-use std::net::Ipv4Addr;
-use std::time::Duration;
-
 // The neutral port + OS-agnostic impls live in `nrr-platform-api`.
 // Re-export them so consumers (`service-runtime`) keep importing them from here
 // unchanged.
@@ -27,11 +24,18 @@ pub use nrr_platform_api::reachability::{
     AlwaysReachableProbe, MockReachabilityProbe, ReachabilityProbe,
 };
 
+#[cfg(target_os = "windows")]
+use std::net::Ipv4Addr;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
+
 /// Production ICMP-echo probe (`IcmpCreateFile` / `IcmpSendEcho` /
 /// `IcmpCloseHandle`).
+#[cfg(target_os = "windows")]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WindowsIcmpProbe;
 
+#[cfg(target_os = "windows")]
 impl ReachabilityProbe for WindowsIcmpProbe {
     fn is_reachable(&self, target: Ipv4Addr, timeout: Duration) -> bool {
         icmp_echo_reachable(target, timeout)
@@ -40,13 +44,16 @@ impl ReachabilityProbe for WindowsIcmpProbe {
 
 /// A tiny fixed request payload — content is irrelevant, only that a reply
 /// comes back. 8 bytes keeps the round trip cheap.
+#[cfg(target_os = "windows")]
 const ICMP_REQUEST_DATA: [u8; 8] = *b"nrr-live";
 
 /// `IP_SUCCESS` from `ipexport.h`. A reply whose `Status` equals this means the
 /// target answered; any other status (unreachable, TTL expired, timeout) is not
 /// a live answer.
+#[cfg(target_os = "windows")]
 const IP_SUCCESS: u32 = 0;
 
+#[cfg(target_os = "windows")]
 fn icmp_echo_reachable(target: Ipv4Addr, timeout: Duration) -> bool {
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::NetworkManagement::IpHelper::{

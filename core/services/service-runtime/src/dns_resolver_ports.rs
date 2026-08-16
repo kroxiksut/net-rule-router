@@ -192,6 +192,10 @@ pub struct DirectUdpUpstreamResolver {
     /// binds to; when absent, every attempt uses `server` unbound — the
     /// historical behaviour.
     egress: Option<Arc<dyn crate::dns_egress::DnsEgressPolicy>>,
+    /// Live upstream choice for the primary path. When wired it supersedes
+    /// `server`, so a resolver that stops answering is retired here too and not
+    /// only on the listener's forward path.
+    pool: Option<Arc<crate::dns_upstream::UpstreamDnsPool>>,
 }
 
 /// Process-wide message-id sequence, seeded from the clock so ids differ
@@ -222,6 +226,7 @@ impl DirectUdpUpstreamResolver {
             timeout,
             attempts: attempts.max(1),
             egress: None,
+            pool: None,
         }
     }
 
@@ -233,14 +238,47 @@ impl DirectUdpUpstreamResolver {
         self
     }
 
+    /// Take the primary-path upstream from the live pool rather than the fixed
+    /// address given to [`Self::new`].
+    pub fn with_upstream_pool(mut self, pool: Arc<crate::dns_upstream::UpstreamDnsPool>) -> Self {
+        self.pool = Some(pool);
+        self
+    }
+
+    /// The primary-path server: the pool's current pick when wired, else the
+    /// fixed address.
+    fn primary_server(&self) -> std::net::SocketAddr {
+        self.pool
+            .as_ref()
+            .and_then(|pool| pool.current())
+            .unwrap_or(self.server)
+    }
+
     /// The upstream + source binding for one attempt. No policy — or a policy
-    /// that declines (feature off, secondary unusable) — means this resolver's
-    /// own configured server, unbound.
+    /// that declines (feature off, secondary unusable) — means the primary
+    /// server, unbound.
     fn egress_for(&self, attempt: u32) -> crate::dns_egress::DnsEgress {
         self.egress
             .as_ref()
             .and_then(|policy| policy.decide(attempt))
-            .unwrap_or_else(|| crate::dns_egress::DnsEgress::primary(self.server))
+            .unwrap_or_else(|| crate::dns_egress::DnsEgress::primary(self.primary_server()))
+    }
+
+    /// Report an attempt's outcome to the pool — but only for attempts that
+    /// actually went to the pool's server. A failure on the secondary link (or
+    /// to a public resolver) says nothing about the primary upstream's health.
+    fn note_attempt(&self, egress: &crate::dns_egress::DnsEgress, ok: bool) {
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        if egress.via_secondary || Some(egress.server) != pool.current() {
+            return;
+        }
+        if ok {
+            pool.note_success();
+        } else {
+            pool.note_failure();
+        }
     }
 
     /// Open the query socket for one attempt: bound to the egress policy's
@@ -437,10 +475,15 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
                         attempt,
                         "direct upstream A query answered",
                     );
+                    self.note_attempt(&egress, true);
                     return Ok(resolved);
                 }
-                Err(ResolveError::NoRecords) => return Err(ResolveError::NoRecords),
+                Err(ResolveError::NoRecords) => {
+                    self.note_attempt(&egress, true); // an answer, just an empty one
+                    return Err(ResolveError::NoRecords);
+                }
                 Err(e) => {
+                    self.note_attempt(&egress, false);
                     tracing::debug!(
                         target: "nrr::dns-resolver",
                         host = %hostname,

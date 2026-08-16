@@ -19,6 +19,9 @@ nrr-application = { path = "../../../core/application" }
 nrr-ui-support = { path = "../../../core/ui-support" }
 nrr-mock-backend = { path = "../../../core/mock-backend" }
 nrr-shared = { path = "../../../shared/contracts" }
+# "Open logs folder" must land in the directory the service actually writes to;
+# the roots are declared once in the platform layer, not re-derived here.
+nrr-platform-api = { path = "../../../core/platform/api" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

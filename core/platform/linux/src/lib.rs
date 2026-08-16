@@ -1,13 +1,15 @@
-//! Linux platform backend **stubs**.
+//! Linux platform backend.
 //!
 //! Mirrors `nrr-platform-windows`: the same neutral port traits from
-//! `nrr-platform-api`, but every implementation currently returns
-//! [`PlatformError::NotSupported`]. This lets `service-runtime` (whose policy /
-//! orchestration logic is already OS-neutral) LINK and run
-//! on Linux as a live skeleton — the caller constructs [`LinuxApi`] under
-//! `#[cfg(target_os = "linux")]` exactly where it constructs
-//! `ProductionWindowsApi` under `#[cfg(windows)]`, and the routing/WFP calls
-//! fail closed with `NotSupported` instead of routing anything.
+//! `nrr-platform-api`. The observation and host-integration ports are real
+//! (autostart, key store, service control, local time, interface counters,
+//! network change, reachability, app-path resolution, peer credentials, adapter
+//! enumeration); the ENFORCEMENT port [`LinuxApi`] is still a stub whose routing
+//! and packet-filter calls answer [`PlatformError::NotSupported`], because the
+//! nftables / rtnetlink mechanism has not landed. The caller constructs
+//! [`LinuxApi`] under `#[cfg(target_os = "linux")]` exactly where it constructs
+//! `ProductionWindowsApi` under `#[cfg(windows)]`, so `service-runtime` links
+//! and runs on Linux and fails closed instead of routing anything.
 //!
 //! The real mechanism (nftables `WfpEnginePort`, rtnetlink `RouteTablePort`,
 //! systemd service, unix-socket IPC, …) still needs a VM with root to build
@@ -100,6 +102,30 @@ pub mod logrotate;
 /// on every host; the file reads only return data on a real Linux host.
 pub mod system_info;
 
+/// The nftables ruleset our lowering produces, as our own type rather than any
+/// one library's schema. Two mechanisms render it — `nft --json` today, a
+/// direct-netlink crate later — so swapping them cannot change what is
+/// enforced. Pure data: buildable and testable on any host.
+pub mod nft_ir;
+
+/// Linux LOWERING of the neutral `EnforcementPlan` into [`nft_ir`] — the
+/// counterpart of `nrr_platform_windows::lower_windows`. Windows arbitrates
+/// with weight bands; here the same arbitration is rule ORDER plus terminal
+/// verdicts. Pure, so it is unit-tested on every host including the Windows dev
+/// machine; delivering the result to the kernel is a separate concern.
+pub mod lower_linux;
+
+/// Delivery of an [`nft_ir`] ruleset to the kernel through `nft --json`.
+/// Rendering the transaction is pure and tested on every host; only the call
+/// into `nft` is Linux-gated. A direct-netlink crate will replace this
+/// mechanism behind the same IR.
+pub mod nft_apply;
+
+/// The Linux `EnforcementBackend` — the neutral plan reconciled onto nftables.
+/// Thin by design: it joins [`lower_linux`] (pure) with [`nft_apply`] (the
+/// mechanism) and reports what could not be expressed rather than dropping it.
+pub mod nft_backend;
+
 /// Linux VPN-client discovery seam (design + stub).
 /// The neutral port lives in `nrr_platform_api::vpn_discovery`; this backend
 /// documents the /proc + `.desktop` + package-DB mechanism and returns an
@@ -124,6 +150,53 @@ pub mod fake_ip;
 /// verified on a real resolved host.
 pub mod dns_cache_read;
 
+/// Linux civil-time-offset backend behind
+/// `nrr_platform_api::local_time::LocalTimeZonePort`. `localtime_r` against the
+/// machine's tz database, so the answer is daylight-aware; the traffic ledger
+/// keys its rows by the user's local day and would otherwise roll them at
+/// midnight UTC.
+pub mod local_time;
+
+/// Linux per-interface octet counters behind
+/// `nrr_platform_api::interface_traffic::InterfaceCounterSource`.
+/// `/proc/net/dev` for the numbers, `/sys/class/net` for what each interface
+/// is. Parsing and classification are pure, so their tests run on every host.
+pub mod interface_traffic;
+
+/// Linux name→path resolution behind
+/// `nrr_platform_api::app_path_resolver::AppPathResolver`. Looks through
+/// `$PATH` and the Flatpak/Snap export directories, stripping the `.exe` the
+/// neutral layer guarantees — the one place that key meets a real filesystem.
+pub mod app_path_resolver;
+
+/// Linux network-topology change feed behind
+/// `nrr_platform_api::network_change::NetworkChangeObserver`. An rtnetlink
+/// socket on the link/address/route groups, so a tunnel coming up is known when
+/// it happens instead of at the next poll. Message framing is parsed by a pure
+/// function tested on every host; only the socket half is Linux-only.
+pub mod network_change;
+
+/// Linux active-reachability backend behind
+/// `nrr_platform_api::reachability::ReachabilityProbe`. ICMP echo over an
+/// unprivileged datagram ICMP socket. The packet codec is pure and tested on
+/// every host; only the socket half is Linux-only.
+pub mod reachability;
+
+/// Linux adapter enumeration — the answer Windows gets from one
+/// `GetAdaptersAddresses` call, assembled from `/sys/class/net` (identity, link
+/// state), `/proc/net/route` (gateways) and `getifaddrs` (addresses). Parsers
+/// are pure and tested on every host; only the reads are Linux-only.
+pub mod adapters;
+
+/// Abstract-socket mechanism behind
+/// `nrr_platform_api::single_instance::SingleInstancePort`.
+pub mod single_instance;
+
+/// The address half of adapter enumeration, kept apart because it is the one
+/// part that needs a syscall rather than a file.
+#[cfg(target_os = "linux")]
+mod adapters_addr;
+
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::types::{
@@ -131,8 +204,10 @@ use nrr_platform_api::types::{
 };
 use nrr_platform_api::windows_api::WindowsApiPort;
 
-/// Reason string every stub returns until the real Linux backend lands.
-const NOT_YET: &str = "the Linux platform backend is not implemented yet (Block 19.1 skeleton)";
+/// Reason string every stub returns until the real Linux backend lands. Read by
+/// a user in an error message, so it says what is missing, not where it is
+/// tracked.
+const NOT_YET: &str = "the Linux platform backend is not implemented yet";
 
 /// Convenience: the `NotSupported` error every stub returns.
 fn not_yet<T>() -> Result<T, PlatformError> {
@@ -160,6 +235,16 @@ impl WindowsApiPort for LinuxApi {
         not_yet()
     }
 
+    /// Implemented: enumeration is observation, not enforcement, so it does not
+    /// wait on the nftables backend the rest of this port is blocked behind.
+    /// Without it the routing layer cannot even name a link, and the GUI shows
+    /// mock interfaces on a real machine.
+    #[cfg(target_os = "linux")]
+    fn get_adapter_infos(&self) -> Result<Vec<AdapterInfo>, PlatformError> {
+        crate::adapters::collect_adapter_infos()
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn get_adapter_infos(&self) -> Result<Vec<AdapterInfo>, PlatformError> {
         not_yet()
     }
@@ -228,10 +313,6 @@ mod tests {
             Err(PlatformError::NotSupported { .. })
         ));
         assert!(matches!(
-            api.get_adapter_infos(),
-            Err(PlatformError::NotSupported { .. })
-        ));
-        assert!(matches!(
             api.interface_luid_for_index(3),
             Err(PlatformError::NotSupported { .. })
         ));
@@ -239,6 +320,37 @@ mod tests {
             api.wfp_engine_open(),
             Err(PlatformError::NotSupported { .. })
         ));
+    }
+
+    /// Enumeration is the exception, and deliberately so: it observes rather
+    /// than enforces, so it is not blocked behind the nftables backend.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adapter_enumeration_answers_on_a_live_host() {
+        let adapters = LinuxApi
+            .get_adapter_infos()
+            .expect("enumeration must work without the enforcement backend");
+        let loopback = adapters
+            .iter()
+            .find(|a| a.adapter_name == "lo")
+            .expect("every Linux host has a loopback interface");
+        assert!(
+            loopback
+                .ipv4_addresses
+                .contains(&std::net::Ipv4Addr::LOCALHOST),
+            "loopback must carry 127.0.0.1, got {:?}",
+            loopback.ipv4_addresses
+        );
+        assert_eq!(
+            loopback.interface_type,
+            nrr_platform_api::adapters::InterfaceType::Loopback
+        );
+        // The live-host lesson that cost a day: `operstate` reads `unknown` for
+        // loopback forever, and reading that as "down" hides a working link.
+        assert_ne!(
+            loopback.oper_status,
+            nrr_platform_api::adapters::IfOperStatus::Down
+        );
     }
 
     fn sample_route() -> RouteEntry {

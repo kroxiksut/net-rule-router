@@ -17,12 +17,14 @@
 #![cfg(target_os = "windows")]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, SystemTime};
 
 use nrr_ipc_client::wire::{read_frame, write_frame};
 use nrr_ipc_client::{ipc_error_to_wire, NamedPipeIpcClient};
 use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::product_identity::BinaryRole;
 
 use crate::protocol::{
     BrokerRequest, BrokerResponse, BrokerServerArgs, BROKER_PING, BROKER_SERVICE_CONTROL,
@@ -58,9 +60,18 @@ const ALLOWED_SERVICE_ACTIONS: &[&str] = &[
     "start",
     "stop",
     "restart",
+    // Re-point the registration at the service binary next to this broker and
+    // restart it. Single-token by necessity — the path is the binary's own, and
+    // `check_service_binary` has already confirmed it is our sibling.
+    "reinstall",
     // Single-token start-mode verbs.
     "set-start-auto",
     "set-start-demand",
+    // Emergency network recovery: strips leftover packet filters, the DNS
+    // redirect and our routes after a crash. Runs the service binary's own
+    // teardown — the same one the console drives — so there is exactly one
+    // implementation of "undo what we applied".
+    "cleanup",
 ];
 
 /// Path of the broker's own lifecycle log, `%TEMP%\NetRuleRouter\nrr-broker.log`.
@@ -109,6 +120,89 @@ fn rotate_broker_log(path: &std::path::Path) {
     let _ = std::fs::rename(path, &prev_path);
 }
 
+/// The directory this broker runs from — the product's install directory, since
+/// the broker is an elevated copy of the launcher.
+fn current_exe_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Whether `candidate` may be executed as the service binary.
+///
+/// The broker runs what it is told WITH AN ELEVATED TOKEN, so the path is the
+/// most dangerous field on the wire: whoever can speak to the broker would
+/// otherwise get arbitrary elevated execution, and the caller is a
+/// non-elevated GUI — exactly the boundary elevation exists to defend.
+///
+/// Two conditions, both cheap: the file must be named like the service binary
+/// (a rename cannot smuggle another program in), and it must live in the
+/// broker's own directory (the product ships its binaries together, so a path
+/// pointing anywhere else did not come from this installation). Pure over its
+/// inputs so both rules are testable without an elevated process.
+fn check_service_binary(candidate: &Path, broker_dir: Option<&Path>) -> Result<(), String> {
+    let expected = BinaryRole::Service.host_file_name();
+    let name = candidate
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    // Windows compares file names case-insensitively; matching that here keeps
+    // the check from rejecting a legitimate `NRR-SERVICE.EXE`.
+    if !name.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "service binary must be named `{expected}`, got `{name}`"
+        ));
+    }
+    let Some(broker_dir) = broker_dir else {
+        // Without a known install directory the name check is all there is;
+        // refusing outright would break the broker on a host whose own path
+        // cannot be read, which is not the caller's fault.
+        return Ok(());
+    };
+    let parent = candidate.parent().unwrap_or(Path::new(""));
+    if !same_directory(parent, broker_dir) {
+        return Err(format!(
+            "service binary must sit next to the application ({}), got `{}`",
+            broker_dir.display(),
+            parent.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether two paths name the same directory.
+///
+/// String equality is wrong here and refused every legitimate request: the
+/// caller is Qt, which spells paths with `/`, while this process derives its
+/// own directory from Windows with `\`. Canonicalising both is also the
+/// stricter check — it resolves `..`, short names and links before comparing,
+/// so nothing can dress up a foreign directory as this one. The separator
+/// fallback keeps a directory that cannot be canonicalised (removed, no rights)
+/// from being silently accepted on a technicality.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        return left == right;
+    }
+    normalised_dir(left) == normalised_dir(right)
+}
+
+/// Comparable spelling of a directory: one separator, no trailing one, and —
+/// on Windows, where the file system is case-insensitive — one case.
+fn normalised_dir(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let unified = if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text.into_owned()
+    };
+    let trimmed = unified.trim_end_matches(['\\', '/']).to_owned();
+    if cfg!(windows) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        trimmed
+    }
+}
+
 /// Run a privileged service-control action by executing the service binary
 /// subcommand. The broker is already elevated, so the child inherits the
 /// elevated token with NO new UAC prompt. `CREATE_NO_WINDOW` keeps the
@@ -117,6 +211,11 @@ fn rotate_broker_log(path: &std::path::Path) {
 fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
     if !ALLOWED_SERVICE_ACTIONS.contains(&action) {
         return BrokerResponse::err("malformed-request", format!("unknown action: {action}"));
+    }
+    if let Err(reason) = check_service_binary(Path::new(service_exe), current_exe_dir().as_deref())
+    {
+        broker_log(&format!("service-control: refused {service_exe}: {reason}"));
+        return BrokerResponse::err("malformed-request", reason);
     }
     broker_log(&format!("service-control: {action} via {service_exe}"));
     let mut cmd = Command::new(service_exe);
@@ -356,8 +455,72 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::rotate_broker_log;
+    use super::{check_service_binary, rotate_broker_log};
+    use nrr_shared::product_identity::BinaryRole;
     use std::fs;
+    use std::path::{Path, PathBuf};
+
+    fn service_name() -> &'static str {
+        BinaryRole::Service.host_file_name()
+    }
+
+    #[test]
+    fn the_shipped_service_binary_next_to_the_broker_is_accepted() {
+        let dir = PathBuf::from("C:/Program Files/NetRuleRouter");
+        let candidate = dir.join(service_name());
+        assert!(check_service_binary(&candidate, Some(&dir)).is_ok());
+    }
+
+    #[test]
+    fn another_program_wearing_the_right_folder_is_refused() {
+        // The whole point: the broker runs this WITH AN ELEVATED TOKEN, and the
+        // caller asking for it is a non-elevated GUI.
+        let dir = PathBuf::from("C:/Program Files/NetRuleRouter");
+        let candidate = dir.join("payload.exe");
+        let err = check_service_binary(&candidate, Some(&dir)).expect_err("must refuse");
+        assert!(err.contains("must be named"), "{err}");
+    }
+
+    #[test]
+    fn the_right_name_from_somewhere_else_is_refused() {
+        // A rename is free; the directory is what ties the binary to this
+        // installation.
+        let dir = PathBuf::from("C:/Program Files/NetRuleRouter");
+        let candidate = Path::new("C:/Users/Public/Downloads").join(service_name());
+        let err = check_service_binary(&candidate, Some(&dir)).expect_err("must refuse");
+        assert!(err.contains("must sit next to"), "{err}");
+    }
+
+    /// The caller is Qt, which spells every path with `/`; this process derives
+    /// its own directory from Windows, which spells it with `\`. Comparing the
+    /// two as strings refused every legitimate request — service control from
+    /// the GUI did nothing at all, with the reason visible only in the broker
+    /// log.
+    #[test]
+    fn the_same_directory_spelled_with_forward_slashes_is_accepted() {
+        let broker_dir = PathBuf::from(r"C:\temp\NetRuleRouter\target\debug");
+        let candidate = PathBuf::from("C:/temp/NetRuleRouter/target/debug").join(service_name());
+        assert!(
+            check_service_binary(&candidate, Some(&broker_dir)).is_ok(),
+            "a path differing only in separators names the same directory"
+        );
+    }
+
+    #[test]
+    fn directory_case_and_a_trailing_separator_do_not_change_the_verdict() {
+        let broker_dir = PathBuf::from(r"C:\Program Files\NetRuleRouter");
+        let candidate = PathBuf::from(r"c:\program files\netrulerouter\").join(service_name());
+        assert!(check_service_binary(&candidate, Some(&broker_dir)).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_install_directory_falls_back_to_the_name_check() {
+        // Not the caller's fault, and refusing everything would brick service
+        // control on such a host — but the name rule still applies.
+        let candidate = Path::new("C:/anywhere").join(service_name());
+        assert!(check_service_binary(&candidate, None).is_ok());
+        assert!(check_service_binary(Path::new("C:/anywhere/other.exe"), None).is_err());
+    }
 
     #[test]
     fn rotate_broker_log_moves_existing_file_to_prev() {

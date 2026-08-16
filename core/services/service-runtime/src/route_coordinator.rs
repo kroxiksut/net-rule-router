@@ -1056,6 +1056,14 @@ impl SecondaryRouteCoordinator {
     /// leave over a specific role's link — the fake-IP relay dials with these.
     /// A role yields `None` when it is unbound, unresolvable, or its adapter
     /// currently has no IPv4 address.
+    /// Interface index of the user's usable PRIMARY link, or `None` while it is
+    /// unbound or unresolvable. Callers that must send over the link the policy
+    /// routes traffic over — rather than over whichever link owns the OS default
+    /// route — ask this.
+    pub fn resolve_primary_interface_index(&self, sid: &str) -> Option<u32> {
+        self.resolve(sid).primary.map(|t| t.interface_index)
+    }
+
     pub fn resolve_egress_source_ips(&self, sid: &str) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
         let r = self.resolve(sid);
         let infos = match self.api.get_adapter_infos() {

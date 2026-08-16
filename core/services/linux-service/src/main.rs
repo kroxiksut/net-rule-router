@@ -19,6 +19,10 @@ mod cli;
 mod install;
 #[cfg(target_os = "linux")]
 mod run;
+// The Linux counterpart of `windows-service/runtime_deps.rs`: assembles the
+// dependency bundle the shared supervised runtime consumes.
+#[cfg(target_os = "linux")]
+mod runtime_deps;
 #[cfg(target_os = "linux")]
 mod unix_socket_server;
 
@@ -83,7 +87,7 @@ fn print_usage() {
 fn print_status() {
     println!("{DAEMON_NAME} {}", env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "linux")]
-    println!("platform: linux (systemd); enforcement backend: nftables (pending, block 19.2)");
+    println!("platform: linux (systemd); enforcement backend: nftables (not applying rules yet)");
     #[cfg(not(target_os = "linux"))]
     println!("platform: non-linux dev build — OS verbs are disabled");
 }

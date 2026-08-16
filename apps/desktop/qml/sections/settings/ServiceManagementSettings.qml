@@ -256,7 +256,7 @@ GroupBox {
                 enabled: !group._busy()
                 visible: group._serviceAvailable()
                     && _statusSlug(nrrServiceController.status) === "stopped"
-                onClicked: nrrServiceController.startService()
+                onClicked: root.startServiceOrOfferUpdate()
             }
             ThemedButton {
                 theme: root.uiTheme
@@ -295,6 +295,145 @@ GroupBox {
                 onClicked: nrrServiceController.uninstallService()
             }
             Item { Layout.fillWidth: true }
+        }
+
+        // ── The registered service is not this one ──
+        // An update ships a new service binary, but Windows keeps starting the
+        // one it has registered — so a newer app talks to an older service, or
+        // to a copy in the folder the user replaced. Neither is visible
+        // anywhere else, and only a re-registration fixes it.
+        ColumnLayout {
+            id: serviceUpdateBlock
+            Layout.fillWidth: true
+            Layout.topMargin: root.uiTheme.spacingSm
+            spacing: root.uiTheme.spacingXxs
+            visible: group._serviceAvailable() && root.serviceUpdateAvailable
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                text: root.serviceRegisteredElsewhere
+                    ? root.tr("settings.service.update.elsewhere",
+                        "Windows starts the background service from another folder, not the one this application runs from.")
+                    : root.tr("settings.service.update.older",
+                        "The running background service is an older build than this application.")
+            }
+            Label {
+                Layout.fillWidth: true
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.service.update.detail",
+                        "Registered: %1\nThis application: %2")
+                    .arg(root.serviceRegisteredPath || root.tr("settings.service.status.unknown", "unknown"))
+                    .arg(root.serviceExpectedPath || root.tr("settings.service.status.unknown", "unknown"))
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("settings.service.update.action", "Update service from this folder")
+                    icon.source: root.uiIconSource("refresh")
+                    highlighted: true
+                    enabled: !group._busy()
+                    onClicked: serviceUpdateConfirm.open()
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.tr("settings.service.update.tooltip",
+                        "Needs administrator rights. The service restarts, so routing pauses for a moment. Your rules and settings are kept.")
+                }
+                Item { Layout.fillWidth: true }
+            }
+        }
+
+        ServiceUpdateConfirmDialog {
+            id: serviceUpdateConfirm
+            ownerRoot: root
+            onConfirmed: nrrServiceController.reinstallService()
+        }
+
+        // ── The file was replaced, the old process is still running ──
+        // An update written over the same folder leaves the registration
+        // correct, so there is nothing to re-register — but the service in
+        // memory is still the previous build until it restarts.
+        ColumnLayout {
+            id: serviceRestartBlock
+            Layout.fillWidth: true
+            Layout.topMargin: root.uiTheme.spacingSm
+            spacing: root.uiTheme.spacingXxs
+            visible: group._serviceAvailable() && root.serviceRestartNeeded
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                text: root.tr("settings.service.stale-process.description",
+                    "The service program file was updated, but the service is still running the previous version. Restart it to run the update.")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("settings.service.action.restart", "Restart service")
+                    icon.source: root.uiIconSource("refresh")
+                    highlighted: true
+                    enabled: !group._busy()
+                    onClicked: nrrServiceController.restartService()
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.tr("settings.service.stale-process.tooltip",
+                        "Needs administrator rights. Routing pauses for a moment while the service restarts.")
+                }
+                Item { Layout.fillWidth: true }
+            }
+        }
+
+        // ── Emergency network recovery ──
+        // Separated from the lifecycle buttons above on purpose: those manage
+        // the service, this one undoes what the service left behind after a
+        // crash. Runs the service binary's own teardown through the same
+        // elevated broker the console uses — one implementation of "undo".
+        ColumnLayout {
+            id: recoveryBlock
+            Layout.fillWidth: true
+            Layout.topMargin: root.uiTheme.spacingSm
+            spacing: root.uiTheme.spacingXxs
+            // Hidden where the service applies no network state, rather than
+            // offering a button that would have nothing to undo. Capability
+            // query, not an OS check — the same gate every other section uses.
+            visible: group._serviceAvailable() && root.supports("killSwitch")
+
+            Label {
+                Layout.fillWidth: true
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.service.recovery.description",
+                    "If the service was killed without shutting down, its packet filters, DNS redirect and routes can stay behind and cut this machine off the network. This removes them.")
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("settings.service.recovery.action", "Restore network")
+                    icon.source: root.uiIconSource("refresh")
+                    enabled: !group._busy()
+                    onClicked: recoveryConfirm.open()
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.tr("settings.service.recovery.tooltip",
+                        "Needs administrator rights. Connections open right now may drop.")
+                }
+                Item { Layout.fillWidth: true }
+            }
+        }
+
+        NetworkRecoveryConfirmDialog {
+            id: recoveryConfirm
+            ownerRoot: root
+            onConfirmed: nrrServiceController.resetNetwork()
         }
 
         // ── #7 — service start mode (admin-opt-in) ──

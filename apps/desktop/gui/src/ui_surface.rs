@@ -367,34 +367,24 @@ fn default_archive_folder_hint() -> String {
 }
 
 fn resolve_logs_directory() -> Option<PathBuf> {
-    // The service writes operational logs to
-    // `%ProgramData%\NetRuleRouter\logs` (`Users:RX` ACL applied at
-    // install). The user-facing "Open logs folder" action MUST land
-    // there or the user sees an empty directory.
+    // The service's own operational-log directory, asked of the layer that
+    // declares it (`%ProgramData%\<product>\logs` on Windows,
+    // `/var/log/<product>` on Linux). The user-facing "Open logs folder"
+    // action MUST land there or the user sees an empty directory.
+    let leaf = nrr_platform_api::paths::product_dir_leaf();
     let mut candidates = Vec::new();
-    if let Some(program_data) = env::var_os("ProgramData") {
-        candidates.push(
-            PathBuf::from(program_data)
-                .join("NetRuleRouter")
-                .join("logs"),
-        );
-    }
-    candidates.push(PathBuf::from(r"C:\ProgramData\NetRuleRouter\logs"));
+    candidates.extend(nrr_platform_api::paths::production_logs_dir());
     // Fallbacks for environments where the service isn't installed
-    // (dev/test). We do NOT create the ProgramData fallback — the
-    // service owns that path and the GUI shouldn't be racing the
-    // ACL setup. Per-user candidates remain as last resort.
+    // (dev/test). We do NOT create the production one — the service owns
+    // that path and the GUI shouldn't be racing the ACL setup. Per-user
+    // candidates remain as last resort.
     if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        candidates.push(
-            PathBuf::from(local_app_data)
-                .join("NetRuleRouter")
-                .join("logs"),
-        );
+        candidates.push(PathBuf::from(local_app_data).join(leaf).join("logs"));
     }
     if let Some(app_data) = env::var_os("APPDATA") {
-        candidates.push(PathBuf::from(app_data).join("NetRuleRouter").join("logs"));
+        candidates.push(PathBuf::from(app_data).join(leaf).join("logs"));
     }
-    candidates.push(env::temp_dir().join("NetRuleRouter").join("logs"));
+    candidates.push(env::temp_dir().join(leaf).join("logs"));
 
     // Existing path wins; only fall through to create when nothing
     // is present (development scenario where the service has never

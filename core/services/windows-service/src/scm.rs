@@ -147,12 +147,16 @@ fn run_scm_inner() -> Result<(), ScmError> {
 
     let event_handler = move |control_event| -> ServiceControlHandlerResult {
         match control_event {
+            // Logged on arrival: without this line a stop that never completes
+            // is indistinguishable from a process that died on its own.
             ServiceControl::Stop => {
+                tracing::info!(target: "nrr::lifecycle", control = "stop", "SCM control received");
                 let _ = tx.send(LifecycleEvent::Stop);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Shutdown => {
+                tracing::info!(target: "nrr::lifecycle", control = "shutdown", "SCM control received");
                 let _ = tx.send(LifecycleEvent::Shutdown);
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError

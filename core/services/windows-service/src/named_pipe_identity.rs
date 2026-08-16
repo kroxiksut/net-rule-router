@@ -13,6 +13,7 @@
 //! |--------------|---------|
 //! | `NetRuleRouter.exe` | `IpcClientProfile::GuiInteractive` |
 //! | `NetRuleRouterTray.exe` | `IpcClientProfile::TrayLightweight` |
+//! | `nrr-cli.exe` | `IpcClientProfile::AdminConsole` (read/diagnose only) |
 //! | anything else | rejected (`UnknownProcess`) |
 //!
 //! `nrr-service.exe` is also rejected — the service must not talk to
@@ -106,6 +107,10 @@ fn classify_exe_basename(basename: &str) -> Option<IpcClientProfile> {
     match lower.as_str() {
         "netrulerouter.exe" => Some(IpcClientProfile::GuiInteractive),
         "netruleroutertray.exe" => Some(IpcClientProfile::TrayLightweight),
+        // The administrative console. Admitted so it can collect diagnostics
+        // through the same code path the application uses; the profile is what
+        // keeps it to reading — it cannot invoke a policy change even by bug.
+        "nrr-cli.exe" => Some(IpcClientProfile::AdminConsole),
         // Includes "nrr-service.exe" — explicitly rejected.
         _ => None,
     }
