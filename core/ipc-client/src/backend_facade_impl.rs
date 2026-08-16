@@ -1,8 +1,10 @@
 //! `IpcBackendFacade`.
 //!
-//! `BackendFacade` implementation that talks to the Windows service over
-//! the named-pipe transport and falls back to a file-based snapshot cache
-//! ([`crate::snapshot_cache`]) when the pipe is down.
+//! `BackendFacade` implementation that talks to the background service over
+//! this OS's transport ([`crate::ServiceIpcClient`] — named pipe on Windows,
+//! `AF_UNIX` socket on Linux) and falls back to a file-based snapshot cache
+//! ([`crate::snapshot_cache`]) when the channel is down. The facade itself
+//! never learns which of the two it is driving.
 //!
 //! ## Boundaries
 //!
@@ -49,15 +51,12 @@
 //! lives behind `Arc`). The GUI normally instantiates one and stores
 //! it in a global `OnceLock`.
 
-#![cfg(target_os = "windows")]
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 
-use crate::client::NamedPipeIpcClient;
 use crate::connection::{ConnectionStatus, IpcClient, IpcClientError};
 use crate::snapshot_cache::{CacheKey, FileCache};
 use nrr_application::backend_facade::UiPreferences;
@@ -241,11 +240,10 @@ pub fn ipc_operation_timeout(op: IpcOperationName) -> Duration {
 /// IPC-backed `BackendFacade` implementation. See module docs for
 /// failure-mode and threading semantics.
 ///
-/// Stored behind `Arc<dyn IpcClient>` rather than the concrete
-/// `NamedPipeIpcClient` so integration tests can inject a fake sink
-/// without touching the Win32 transport. The production wiring (GUI
-/// startup) builds with [`Self::with_named_pipe`], which boxes a
-/// real `NamedPipeIpcClient`.
+/// Stored behind `Arc<dyn IpcClient>` rather than a concrete transport, so
+/// integration tests can inject a fake sink without an OS channel — and so
+/// this layer never learns which OS it is on. The production wiring (GUI
+/// startup) builds with [`Self::with_service_transport`].
 #[derive(Clone)]
 pub struct IpcBackendFacade {
     client: Arc<dyn IpcClient>,
@@ -256,8 +254,8 @@ pub struct IpcBackendFacade {
 
 impl IpcBackendFacade {
     /// Build a facade over an existing client sink and cache. Tests
-    /// pass an in-process fake; production passes a real
-    /// `NamedPipeIpcClient` via [`Self::with_named_pipe`].
+    /// pass an in-process fake; production goes through
+    /// [`Self::with_service_transport`].
     pub fn new(client: Arc<dyn IpcClient>, cache: Arc<FileCache>) -> Self {
         Self {
             client,
@@ -266,11 +264,17 @@ impl IpcBackendFacade {
         }
     }
 
-    /// Production constructor: wrap a `NamedPipeIpcClient` and use the
-    /// default `%LOCALAPPDATA%\NetRuleRouter\snapshot_cache\` cache
-    /// root. Returns `CacheError` only if the cache directory cannot
-    /// be created; callers in production typically `.expect()` that.
-    pub fn with_named_pipe(client: Arc<NamedPipeIpcClient>) -> Result<Self, CacheError> {
+    /// Production constructor: wrap this OS's service transport
+    /// ([`crate::ServiceIpcClient`] — named pipe on Windows, `AF_UNIX` socket
+    /// on Linux) over the default cache root. Nothing but the transport
+    /// differs; the cache policy, the timeouts and the degraded-mode behaviour
+    /// are the neutral ones.
+    ///
+    /// Returns `CacheError` only if the cache directory cannot be created;
+    /// callers in production typically `.expect()` that.
+    pub fn with_service_transport(
+        client: Arc<crate::ServiceIpcClient>,
+    ) -> Result<Self, CacheError> {
         let cache = Arc::new(FileCache::at_default_location()?);
         // Sweep stragglers from previous schema versions on first use so
         // the directory doesn't accumulate forever.

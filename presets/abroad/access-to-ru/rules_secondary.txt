@@ -1,0 +1,56 @@
+# NetRuleRouter preset — version 1
+# name: Access to RU from abroad — Secondary
+# description: Russian zones, services and apps routed through a secondary route with an exit in Russia
+# author: NetRuleRouter contributors
+# preset_version: 1
+
+--- Zones
+ru  # Российская Федерация (.ru)
+su  # Историческая зона СССР (.su)
+рф  # Российская Федерация (.рф, Punycode xn--p1ai)
+
+--- Domains
+*.2gis.com
+*.avito.com
+*.drweb.com
+*.habr.com
+*.ivi.com
+*.litres.com
+*.moex.com          # Московская биржа
+*.more.tv
+*.my.com
+*.ok.com
+*.okko.tv
+*.ozon.com
+*.premier.one
+*.sberbank.com
+*.userapi.com
+*.vk.cc
+*.vk.com
+*.vk.me
+*.vkuser.net
+*.vkuseraudio.net
+*.webmoney.com
+*.ya.cc
+*.yandex.com
+*.yandex.net
+*.yandexcloud.net
+*.yastatic.net
+*.zvuk.com
+# *.icq.com    # сервис закрыт, включать незачем
+# *.kaspersky.com    # обновления обычно доступны и напрямую
+# *.qiwi.com    # лицензия отозвана, сервис не работает
+
+--- Windows
+2gis.exe
+gamecenter.exe    # VK Play Game Center
+tamtam.exe
+vk.exe
+vkplay.exe
+vkteams.exe
+# Cloud.exe    # Mail.ru Cloud: имя процесса слишком общее, проверьте у себя
+# DiskO*.exe    # Яндекс.Диск: обычно работает и напрямую
+# YandexDis*.exe    # Яндекс.Диск: обычно работает и напрямую
+# avp.exe    # Kaspersky
+# kavfs.exe    # Kaspersky
+# mail.ru_cloud*.exe    # Облако Mail.ru

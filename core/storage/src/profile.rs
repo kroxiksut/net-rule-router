@@ -70,7 +70,9 @@ pub fn resolve_storage_topology(profile: &StorageProfile) -> StorageResult<Stora
                     "LOCALAPPDATA environment variable is not set".into(),
                 )
             })?;
-            PathBuf::from(base).join("NetRuleRouter").join("dev")
+            PathBuf::from(base)
+                .join(nrr_platform_api::paths::product_dir_leaf())
+                .join("dev")
         }
         StorageProfile::TestTemp(dir) => dir.clone(),
     };
@@ -90,46 +92,25 @@ pub fn resolve_storage_topology(profile: &StorageProfile) -> StorageResult<Stora
     })
 }
 
-/// Resolves the production-service root data directory, which is OS-specific:
-/// `%ProgramData%\NetRuleRouter\` on Windows, `/var/lib/netrulerouter` on Linux
-/// (the systemd `StateDirectory`). macOS (any other unix) follows the Linux
-/// FHS layout until its own port lands.
+/// Resolves the production-service root data directory. The OS shape and the
+/// product leaf are declared once in `nrr_platform_api::paths`; this crate is a
+/// consumer, not a second author.
 fn production_service_data_dir() -> StorageResult<PathBuf> {
-    #[cfg(windows)]
-    {
-        let base = std::env::var("PROGRAMDATA").map_err(|_| {
-            StorageError::StorageUnavailable("PROGRAMDATA environment variable is not set".into())
-        })?;
-        Ok(PathBuf::from(base).join("NetRuleRouter"))
-    }
-    #[cfg(unix)]
-    {
-        Ok(PathBuf::from("/var/lib/netrulerouter"))
-    }
-    #[cfg(not(any(windows, unix)))]
-    {
-        Err(StorageError::StorageUnavailable(
-            "no production storage layout defined for this platform".into(),
-        ))
-    }
+    nrr_platform_api::paths::production_data_root().ok_or_else(|| {
+        StorageError::StorageUnavailable(
+            "no production storage root for this platform (on Windows: PROGRAMDATA is not set)"
+                .into(),
+        )
+    })
 }
 
-/// Resolves the operational log directory. Everything except the Linux
-/// production service keeps logs under `data_dir/logs`; the Linux production
-/// service splits them to `/var/log/netrulerouter` (systemd `LogsDirectory`)
-/// so operational logs live under `/var/log` per FHS while state stays in
-/// `/var/lib`.
+/// Resolves the operational log directory. Only the production service can
+/// split logs away from the state directory (Linux does, per FHS); every other
+/// profile keeps them under its own `data_dir`.
 fn production_logs_dir(profile: &StorageProfile, data_dir: &std::path::Path) -> PathBuf {
     match profile {
         StorageProfile::ProductionService => {
-            #[cfg(unix)]
-            {
-                PathBuf::from("/var/log/netrulerouter")
-            }
-            #[cfg(not(unix))]
-            {
-                data_dir.join("logs")
-            }
+            nrr_platform_api::paths::production_logs_dir().unwrap_or_else(|| data_dir.join("logs"))
         }
         _ => data_dir.join("logs"),
     }
@@ -183,6 +164,16 @@ mod tests {
                 .expect("unix production topology resolves without env vars");
             assert_eq!(topology.data_dir, PathBuf::from("/var/lib/netrulerouter"));
             assert_eq!(topology.logs_dir, PathBuf::from("/var/log/netrulerouter"));
+            // Same roots the platform layer declares — the literals above are
+            // the expectation, not a second derivation.
+            assert_eq!(
+                Some(topology.data_dir.clone()),
+                nrr_platform_api::paths::production_data_root()
+            );
+            assert_eq!(
+                Some(topology.logs_dir.clone()),
+                nrr_platform_api::paths::production_logs_dir()
+            );
             // Audit stays under the state dir (never in /var/log), so a
             // logrotate config scoped to /var/log can never touch it.
             assert!(topology.state_db_path.starts_with("/var/lib/netrulerouter"));
@@ -195,6 +186,12 @@ mod tests {
             let topology = resolve_storage_topology(&StorageProfile::ProductionService)
                 .expect("windows production topology resolves via PROGRAMDATA");
             assert_eq!(topology.logs_dir, topology.data_dir.join("logs"));
+            // The root is the platform layer's, not a literal retyped here —
+            // a product rename must reach this path through one edit.
+            assert_eq!(
+                Some(topology.data_dir.clone()),
+                nrr_platform_api::paths::production_data_root()
+            );
         }
     }
 

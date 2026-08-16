@@ -1,22 +1,21 @@
 //! The `run` daemon body — the Linux analog of `windows-service`'s SCM/console
-//! runtime, minus the enforcement supervisor.
+//! runtime.
 //!
-//! ## Scope (honest skeleton)
+//! It bootstraps the OS-neutral storage topology and NDJSON tracing, honours the
+//! systemd `Type=notify` + `WatchdogSec` contract, and hands control to the same
+//! supervised runtime the Windows service uses: supervisor, health aggregation,
+//! IPC accept task, retention jobs.
 //!
-//! This is the make-before-break skeleton: it exercises the OS-neutral bootstrap
-//! (storage topology + NDJSON tracing, block 19.2.log parts A/B) and the systemd
-//! `Type=notify` + `WatchdogSec` contract (block 19.2 systemd mechanism) on a
-//! real systemd/root host, while enforcement stays a no-op — `LinuxApi` is a
-//! stub until the nftables/rtnetlink backend lands.
+//! ## What is not here yet
 //!
-//! TODO: replace the idle watchdog loop with the real
-//! `ServiceSupervisor` + `AF_UNIX` IPC accept loop (`peer_cred`) once a
-//! systemd/root host is available. `SupervisedRuntimeDeps` is Windows-only
-//! today; the Linux equivalent (a `runtime_deps` sibling wiring `LinuxApi`) is
-//! the next mechanism slice. Because it drives storage/DB creation under
-//! `/var/lib` + `/var/log` (root-owned) and talks to the systemd manager, this
-//! path is HW-gated: it is only meaningfully exercised under systemd, not in
-//! unit tests.
+//! Policy enforcement reconciles nothing. The nftables mechanism is ready and
+//! proven against a live kernel, but the `EnforcementPlan` it would apply comes
+//! from the per-principal policy store and route coordinator, which are Windows-
+//! only so far. The daemon says so in its log rather than implying it enforces.
+//!
+//! Storage and log directories live under `/var/lib` and `/var/log` and are
+//! root-owned, so this path is only meaningfully exercised on a real host — not
+//! in unit tests.
 
 #![cfg(target_os = "linux")]
 
@@ -25,13 +24,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nrr_platform_linux::systemd::{notify, notify_ready, watchdog_interval, NotifyState};
+use nrr_service_runtime::ipc_handlers::stub::DegradedPolicyManager;
+use nrr_service_runtime::managers::HealthReporter;
+use nrr_service_runtime::state::ServiceRuntimeState;
 use nrr_service_runtime::{
-    install_ndjson_tracing, run_bootstrap, AcceptOutcome, BootstrapConfig, IpcAcceptor,
-    IpcAuditEmitter, IpcHandlerRegistry, IpcRouter, IpcServer, NoopIpcAuditEmitter,
+    install_ndjson_tracing, run_bootstrap, run_supervised_runtime, BootstrapConfig,
+    ContractNegotiateHandler, HealthAggregator, IpcHandlerRegistry, ServiceController,
+    ServiceHealthHandler, StopToken,
 };
+use nrr_shared::ipc::IpcOperationName;
 use nrr_storage::StorageProfile;
-
-use crate::unix_socket_server::UnixDomainSocketServer;
 
 /// Fallback watchdog ping cadence when `$WATCHDOG_USEC` is absent (i.e. the unit
 /// declared no `WatchdogSec`, or we are not running under systemd).
@@ -57,18 +59,23 @@ pub fn run() -> ExitCode {
         );
     }
 
-    // Start the AF_UNIX IPC server. The router is EMPTY for now — real handlers
-    // are wired by the Linux `runtime_deps` (`SupervisedRuntimeDeps` is
-    // Windows-only today), so every operation currently gets an "unhandled"
-    // error. What this proves on a real host: the daemon binds
-    // `/run/netrulerouter/service-v1.sock`, classifies callers via SO_PEERCRED,
-    // and round-trips framed requests. Bind failure (e.g. no RuntimeDirectory
-    // outside systemd) degrades to watchdog-only rather than aborting the daemon.
-    let _ipc_acceptor = start_ipc_server();
+    // The IPC server is NOT bound here: the supervised runtime binds it as part
+    // of its accept-task bundle, so a bind failure lands in health rather than
+    // beside it. Binding once here and again there would put two servers on one
+    // socket path — and the first would carry its own health aggregator,
+    // reporting state nobody fills.
+
+    // Ask the enforcement mechanism whether it can work AT ALL, before anything
+    // depends on it. A missing `nftables` package is a fact the operator can act
+    // on; discovering it on the first rule the user expects to be applied is a
+    // support ticket that reads as "the product silently does nothing".
+    report_enforcement_readiness();
 
     tracing::info!(
         target: "nrr::lifecycle",
-        "linux-service bootstrap complete; enforcement pending, IPC serving with empty router (HW-gated, block 19.2)",
+        "linux-service bootstrap complete; supervised runtime starting. Policy enforcement \
+         reconciles nothing yet: the nftables mechanism is ready, but the per-principal policy \
+         store that would produce a plan is not ported",
     );
 
     // Signal readiness: Type=notify holds the unit "activating" until this,
@@ -83,63 +90,127 @@ pub fn run() -> ExitCode {
         }
     }
 
-    // Watchdog loop. Pings at half the systemd-declared timeout (the derivation
-    // systemd recommends). SIGTERM terminates the process by default, so systemd
-    // stop is clean without an explicit handler in this skeleton.
+    // Watchdog pings run beside the runtime, not instead of it: systemd must
+    // keep hearing from the process while the supervisor does the work.
     let interval = watchdog_interval(std::env::var("WATCHDOG_USEC").ok().as_deref())
         .unwrap_or(DEFAULT_WATCHDOG_PING);
-    loop {
-        std::thread::sleep(interval);
-        let _ = notify(&[NotifyState::Watchdog]);
-    }
+    let stop = StopToken::new();
+    spawn_watchdog(interval, stop.clone());
+
+    // The same supervised runtime the Windows service runs — supervisor, health
+    // aggregation, IPC accept task, retention jobs. Until this landed the daemon
+    // idled in a sleep loop, so none of those existed on Linux.
+    let health = Arc::new(HealthAggregator::new());
+    let ipc_server = crate::runtime_deps::build_ipc_server(Arc::clone(&health));
+    let deps = crate::runtime_deps::build_runtime_deps(&artifacts, Arc::clone(&health), ipc_server);
+    let controller = LogController;
+    let reason = run_supervised_runtime(&controller, &stop, artifacts, deps);
+
+    tracing::info!(
+        target: "nrr::lifecycle",
+        reason = ?reason,
+        "linux-service runtime stopped",
+    );
+    ExitCode::SUCCESS
 }
 
-/// Bind the AF_UNIX IPC server and spawn its accept loop on a background thread.
-/// Returns the acceptor so the caller keeps it alive for the process lifetime;
-/// `None` on bind/spawn failure (the daemon then runs watchdog-only).
-fn start_ipc_server() -> Option<Arc<dyn IpcAcceptor>> {
-    // Empty router: transport works end to end, but every operation is
-    // unhandled until the Linux runtime_deps wires the real handler registry.
-    let registry = IpcHandlerRegistry::new();
-    let audit: Arc<dyn IpcAuditEmitter> = Arc::new(NoopIpcAuditEmitter);
-    let router = Arc::new(IpcRouter::new(registry, audit, 1));
-
-    let acceptor: Arc<dyn IpcAcceptor> = match UnixDomainSocketServer::new(router).bind() {
-        Ok(a) => Arc::from(a),
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::lifecycle",
-                error = %e,
-                "IPC bind failed; running watchdog-only",
-            );
-            return None;
-        }
-    };
-
-    let accept = Arc::clone(&acceptor);
-    if let Err(e) = std::thread::Builder::new()
-        .name("nrr-ipc-accept".into())
-        .spawn(move || accept_loop(accept))
-    {
-        tracing::warn!(target: "nrr::lifecycle", error = %e, "IPC accept thread spawn failed");
-        return None;
-    }
-    tracing::info!(target: "nrr::lifecycle", "IPC server listening (empty router)");
-    Some(acceptor)
-}
-
-/// The background accept loop — the tick model the supervisor will own once the
-/// Linux `runtime_deps` lands. Until then this stands in as a plain loop.
-fn accept_loop(acceptor: Arc<dyn IpcAcceptor>) {
-    loop {
-        match acceptor.accept_one() {
-            AcceptOutcome::Connected | AcceptOutcome::Idle => continue,
-            AcceptOutcome::ShutdownRequested => break,
-            AcceptOutcome::Err(e) => {
-                tracing::warn!(target: "nrr::lifecycle", error = %e, "IPC accept error; retrying");
-                // Brief backoff so a persistent accept failure does not hot-spin.
-                std::thread::sleep(Duration::from_millis(200));
+/// Ping systemd on its own thread at half the declared timeout.
+///
+/// Separate from the runtime on purpose: a watchdog that shares a thread with
+/// the work it is supposed to vouch for stops pinging exactly when the work
+/// wedges — which is the one moment systemd needs to hear silence.
+fn spawn_watchdog(interval: Duration, stop: StopToken) {
+    let spawned = std::thread::Builder::new()
+        .name("nrr-sd-watchdog".to_owned())
+        .spawn(move || {
+            while !stop.is_stop_requested() {
+                std::thread::sleep(interval);
+                let _ = notify(&[NotifyState::Watchdog]);
             }
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            target: "nrr::lifecycle",
+            error = %e,
+            "watchdog thread could not start; systemd may restart the unit on WatchdogSec",
+        );
+    }
+}
+
+/// Reports runtime state to the log, since systemd has no per-state channel the
+/// way the Windows SCM does — `sd_notify` covers readiness and stopping only.
+struct LogController;
+
+impl ServiceController for LogController {
+    fn report(&self, state: ServiceRuntimeState) {
+        tracing::info!(target: "nrr::lifecycle", state = ?state, "runtime state");
+        if matches!(state, ServiceRuntimeState::Stopping) {
+            let _ = notify(&[NotifyState::Stopping]);
         }
     }
 }
+
+/// Probe the nftables mechanism once at start and say plainly what was found.
+///
+/// Not fatal: the daemon still serves IPC, health and diagnostics, and telling
+/// the operator that enforcement is unavailable is more useful than refusing to
+/// start at all. What it must never do is stay quiet — an enforcement backend
+/// that cannot run looks exactly like one with nothing to do.
+fn report_enforcement_readiness() {
+    use nrr_platform_linux::nft_backend::NftablesEnforcement;
+
+    match NftablesEnforcement::default().probe() {
+        Ok(()) => tracing::info!(
+            target: "nrr::enforcement",
+            backend = "nftables",
+            "enforcement mechanism is available",
+        ),
+        Err(e) => tracing::error!(
+            target: "nrr::enforcement",
+            backend = "nftables",
+            error = %e,
+            "enforcement mechanism is NOT available — routing rules cannot be applied \
+             until this is fixed",
+        ),
+    }
+}
+
+/// The operations this daemon can answer before its runtime deps exist.
+///
+/// Deliberately the two that need nothing from enforcement: the handshake, and
+/// "are you alive". Together they are what a client needs to connect at all —
+/// without them every connection ends in "unhandled", which is
+/// indistinguishable from a broken transport. Everything policy-shaped stays
+/// absent rather than stubbed: an empty answer that looks like a real one is
+/// worse than a refusal.
+/// Built around the aggregator the SUPERVISOR fills — passed in, never created
+/// here.
+///
+/// One instance, two readers: the supervisor records component health into it
+/// and the IPC handler reports from it. Building a second aggregator inside is a
+/// bug the Windows side already paid for — IPC answered `starting` with no
+/// components forever, because the instance being filled was not the one being
+/// read. Taking it as a parameter makes that mistake unspellable.
+pub(crate) fn serving_registry_with(health: Arc<HealthAggregator>) -> IpcHandlerRegistry {
+    let mut registry = IpcHandlerRegistry::new();
+    registry.register(
+        IpcOperationName::ContractNegotiate,
+        ContractNegotiateHandler::new(),
+    );
+    // Policy state stays "recovery required": no policy store is wired on this
+    // platform yet, and that is the truth the GUI needs in order to render
+    // something other than a spinner.
+    registry.register(
+        IpcOperationName::ServiceHealthGet,
+        ServiceHealthHandler::new(
+            health as Arc<dyn HealthReporter>,
+            Arc::new(DegradedPolicyManager),
+        ),
+    );
+    registry
+}
+
+// The hand-rolled `start_ipc_server` + `accept_loop` that stood in for the
+// supervisor are gone: `run_supervised_runtime` owns binding and the accept
+// tick now, with retries governed by the stability policy and failures recorded
+// in health. Keeping them beside it would have meant two servers on one socket.

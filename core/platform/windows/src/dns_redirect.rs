@@ -20,6 +20,8 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
+use nrr_platform_api::dns::UpstreamDnsCandidate;
+
 use crate::error::PlatformError;
 
 /// Comment stamped on OUR NRPT rule so `restore` / `verify` only ever touch the
@@ -76,51 +78,115 @@ fn flush_script() -> &'static str {
     "Clear-DnsClientCache"
 }
 
-/// PowerShell listing candidate upstream IPv4 DNS servers, one per line,
-/// excluding our own loopback listener. Emits the DNS server(s) of the interface
-/// that owns the DEFAULT ROUTE (the active egress, lowest route metric) FIRST,
-/// then every interface's servers as a fallback. The caller takes the first
-/// routable line, so the default-route server wins when present — avoiding a
-/// disconnected/virtual adapter pointing all forwarded DNS at a dead server —
-/// while never regressing to `None` when a server exists anywhere.
+/// PowerShell listing candidate upstream IPv4 DNS servers as `<ifIndex> <server>`
+/// lines, excluding our own loopback listener. Emits the DNS server(s) of the
+/// interface that owns the DEFAULT ROUTE (the active egress, lowest route
+/// metric) FIRST, then the servers of every CONNECTED interface as a fallback.
+/// The interface column lets the caller prefer the link its routing policy uses.
+///
+/// Both halves are gated on `ConnectionState -eq 'Connected'`: a disconnected
+/// adapter — an unplugged NIC, an idle Wi-Fi radio, a Bluetooth PAN — keeps its
+/// statically configured DNS server, and that entry is indistinguishable from a
+/// live one in the raw list. Taking it forwards every query into a black hole,
+/// which is exactly what happens at boot: the service arms before any default
+/// route exists, so only the fallback half runs.
+///
+/// The fallback is ordered by interface metric rather than by interface index,
+/// because index order is arbitrary with respect to which link the machine
+/// actually uses. Neither ordering is a liveness claim — the caller probes —
+/// but a better first guess saves a probe timeout on every boot.
+///
+/// If the interface query itself yields nothing (it is the newest of these
+/// cmdlets, and the DNS list is the older, more universally available one), the
+/// gate opens rather than starving the caller of candidates: an unprobed list
+/// beats no list, since the probe is what actually decides.
 fn upstream_dns_script() -> &'static str {
     "$ErrorActionPreference='SilentlyContinue'; \
+     $live = @(Get-NetIPInterface -AddressFamily IPv4 | \
+       Where-Object { $_.ConnectionState -eq 'Connected' } | \
+       Sort-Object -Property InterfaceMetric | \
+       Select-Object -ExpandProperty ifIndex); \
+     if ($live.Count -eq 0) { \
+       $live = @(Get-DnsClientServerAddress -AddressFamily IPv4 | \
+         Select-Object -ExpandProperty InterfaceIndex) \
+     }; \
      $idx = Get-NetRoute -DestinationPrefix '0.0.0.0/0' | \
        Sort-Object -Property RouteMetric | \
        Select-Object -First 1 -ExpandProperty ifIndex; \
-     if ($idx) { \
-       Get-DnsClientServerAddress -InterfaceIndex $idx -AddressFamily IPv4 | \
+     $order = @(); \
+     if ($idx -and ($live -contains $idx)) { $order += $idx }; \
+     $order += $live; \
+     foreach ($i in $order) { \
+       Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv4 | \
        Select-Object -ExpandProperty ServerAddresses | \
-       Where-Object { $_ -and $_ -ne '127.0.0.1' } \
-     }; \
-     Get-DnsClientServerAddress -AddressFamily IPv4 | \
-     Select-Object -ExpandProperty ServerAddresses | \
-     Where-Object { $_ -and $_ -ne '127.0.0.1' }"
+       Where-Object { $_ -and $_ -ne '127.0.0.1' } | \
+       ForEach-Object { \"$i $_\" } \
+     }"
 }
 
-/// Capture the system's current primary IPv4 DNS server (BEFORE any redirect) so
-/// the resolver can forward non-intercepted queries to a real upstream. Returns
-/// `None` when none can be determined — the caller MUST then NOT redirect, or
-/// general (non-rule) DNS would break. Prefers the DNS server of the
-/// default-route (active-egress) interface, falling back to any interface's
-/// server; takes the first non-loopback, routable IPv4 the script emits.
-/// Generic over [`CommandRunner`] so it is unit-testable.
+/// Every routable upstream candidate the script emits, best first, deduplicated
+/// by server address.
 ///
-/// NOTE (known limitation): this captures ONCE. The per-query forward path
-/// already fails open (a datagram to an unreachable upstream is dropped, never
-/// hung — see `dns_listener::serve_udp`), but a mid-session network change
-/// (new DHCP DNS / VPN up) can leave a stale upstream. Re-capturing on a
-/// network-change signal (or tearing the redirect down on persistent forward
-/// failure) is a possible future improvement.
-pub fn capture_upstream_dns_v4<R: CommandRunner>(runner: &R) -> Option<Ipv4Addr> {
-    let out = runner.run_powershell(upstream_dns_script()).ok()?;
+/// The caller probes these in order and rotates on failure, so the list matters
+/// more than its head: an adapter can be connected and still have an
+/// unreachable resolver (captive portal, VPN mid-handshake).
+pub fn capture_upstream_dns_candidates_v4<R: CommandRunner>(
+    runner: &R,
+) -> Vec<UpstreamDnsCandidate> {
+    let Ok(out) = runner.run_powershell(upstream_dns_script()) else {
+        return Vec::new();
+    };
     if !out.success {
-        return None;
+        return Vec::new();
     }
-    out.stdout
-        .lines()
-        .filter_map(|line| line.trim().parse::<Ipv4Addr>().ok())
-        .find(|ip| !ip.is_loopback() && !ip.is_unspecified() && !ip.is_broadcast())
+    let mut seen: Vec<UpstreamDnsCandidate> = Vec::new();
+    for line in out.stdout.lines() {
+        let Some(candidate) = parse_candidate_line(line) else {
+            continue;
+        };
+        if !seen.iter().any(|c| c.server == candidate.server) {
+            seen.push(candidate);
+        }
+    }
+    seen
+}
+
+/// `"17 192.168.0.1"` → candidate. A bare address (no interface column) still
+/// parses, so a future/degraded emitter never silently yields nothing.
+fn parse_candidate_line(line: &str) -> Option<UpstreamDnsCandidate> {
+    let line = line.trim();
+    let (index, addr) = match line.split_once(char::is_whitespace) {
+        Some((idx, rest)) => (idx.trim().parse::<u32>().ok(), rest.trim()),
+        None => (None, line),
+    };
+    let server = addr.parse::<Ipv4Addr>().ok()?;
+    (!server.is_loopback() && !server.is_unspecified() && !server.is_broadcast())
+        .then_some(UpstreamDnsCandidate::new(index, server))
+}
+
+/// The preferred upstream — the head of [`capture_upstream_dns_candidates_v4`].
+/// `None` when none can be determined; the caller MUST then NOT redirect, or
+/// general (non-rule) DNS would break. Generic over [`CommandRunner`] so it is
+/// unit-testable.
+pub fn capture_upstream_dns_v4<R: CommandRunner>(runner: &R) -> Option<Ipv4Addr> {
+    capture_upstream_dns_candidates_v4(runner)
+        .into_iter()
+        .next()
+        .map(|c| c.server)
+}
+
+/// Windows implementation of [`SystemDnsServersPort`] over the live PowerShell
+/// runner. Gated with the runner it drives — the enumeration logic above stays
+/// portable so it keeps its tests on any host.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowsSystemDnsServers;
+
+#[cfg(target_os = "windows")]
+impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+        capture_upstream_dns_candidates_v4(&PowerShellRunner)
+    }
 }
 
 /// Remove any orphaned NetRuleRouter Mode-B NRPT rule left by a prior crashed
@@ -296,6 +362,50 @@ mod tests {
     fn capture_upstream_dns_none_when_only_loopback_or_junk() {
         let runner = FakeRunner::new(ok("127.0.0.1\n\ngarbage\n0.0.0.0\n"));
         assert_eq!(capture_upstream_dns_v4(&runner), None);
+    }
+
+    #[test]
+    fn candidates_keep_order_and_drop_repeats() {
+        // The script lists the default-route interface first and then every
+        // connected one, so the preferred server legitimately appears twice.
+        let runner = FakeRunner::new(ok(
+            "17 192.168.0.1\n17 0.0.0.0\n17 192.168.0.1\n48 1.1.1.1\n",
+        ));
+        assert_eq!(
+            capture_upstream_dns_candidates_v4(&runner),
+            vec![
+                UpstreamDnsCandidate::new(Some(17), "192.168.0.1".parse().unwrap()),
+                UpstreamDnsCandidate::new(Some(48), "1.1.1.1".parse().unwrap()),
+            ],
+            "the caller probes down the list, so a repeat would cost a second probe"
+        );
+    }
+
+    #[test]
+    fn a_candidate_line_without_an_interface_column_still_parses() {
+        let runner = FakeRunner::new(ok("8.8.8.8\n"));
+        assert_eq!(
+            capture_upstream_dns_candidates_v4(&runner),
+            vec![UpstreamDnsCandidate::new(None, "8.8.8.8".parse().unwrap())],
+            "a degraded emitter must not silently yield nothing"
+        );
+    }
+
+    #[test]
+    fn the_candidate_script_excludes_disconnected_adapters_and_still_yields_a_list() {
+        let s = upstream_dns_script();
+        assert!(
+            s.contains("ConnectionState -eq 'Connected'"),
+            "a disconnected NIC or an idle Wi-Fi radio keeps stale static DNS"
+        );
+        assert!(
+            s.contains("Sort-Object -Property InterfaceMetric"),
+            "at boot there is no default route, so metric order is the only guess left"
+        );
+        assert!(
+            s.contains("$live.Count -eq 0"),
+            "no interface query result must not mean no candidates"
+        );
     }
 
     #[test]

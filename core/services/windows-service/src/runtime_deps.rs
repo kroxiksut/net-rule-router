@@ -1483,7 +1483,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 Arc::clone(c),
                 Arc::clone(conn),
             )),
-            None => Arc::new(DegradedPolicyManager),
+            None => Arc::new(nrr_service_runtime::ipc_handlers::stub::DegradedPolicyManager),
         };
 
         // Read the state DB schema
@@ -2250,6 +2250,12 @@ pub(crate) fn build_supervised_runtime_deps(
             // from a periodic tick).
             let pause = pause_coordinator.clone();
             Arc::new(move || {
+                // A recompute that lands after the stop teardown stripped the
+                // filters puts them back into a process that is about to exit —
+                // and a non-dynamic WFP filter outlives the process.
+                if nrr_service_runtime::teardown_in_progress() {
+                    return;
+                }
                 let tray_active = registry.active_sids();
                 // Enforce for the effective routing
                 // user even with NO tray connected (console-session user,
@@ -2363,6 +2369,10 @@ pub(crate) fn build_supervised_runtime_deps(
                 // Mode-B resolver watchdog (see above): re-arm the
                 // resolver if it is enabled but its serve thread has died.
                 dns_ctl.tick();
+                // A new link usually means a new resolver, and the old one can
+                // keep answering while pointing at the network we just left.
+                // Rate-limited inside the pool.
+                upstream_dns_pool().note_network_change();
             }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
         });
 
@@ -2777,7 +2787,9 @@ pub(crate) fn build_supervised_runtime_deps(
                 use nrr_platform_api::DnsCacheControlPort;
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(5));
-                    if controller.is_shut_down() {
+                    // `replan()` reinstalls filters, so a tick during teardown
+                    // would undo the strip.
+                    if controller.is_shut_down() || nrr_service_runtime::teardown_in_progress() {
                         break;
                     }
                     if controller.watchdog_tick() {
@@ -2806,6 +2818,16 @@ pub(crate) fn build_supervised_runtime_deps(
         (Some(coord), Some(sid)) => Some(build_dns_egress_policy(coord, Arc::clone(sid))),
         _ => None,
     };
+    // Forwarded queries should leave over the link the policy routes traffic
+    // over, not over whichever link happens to own the default route: only the
+    // bound primary's resolver knows that network's internal names.
+    if let (Some(coord), Some(sid)) = (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
+        let coord = Arc::clone(coord);
+        let sid = Arc::clone(sid);
+        upstream_dns_pool().set_preferred_interface(Arc::new(move || {
+            coord.resolve_primary_interface_index(&sid()?)
+        }));
+    }
     // The Mode-B direct-answer steering is not gated on the
     // secondary being usable: that is precisely when the fail-closed posture
     // BLOCKS the shared addresses, so standing steering down handed direct
@@ -3385,31 +3407,19 @@ fn spawn_fcrdns_learner_worker(
     consumer: Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>,
     companion: Option<CompanionFromReverseDeps<'_>>,
 ) {
-    use nrr_platform_windows::dns_redirect::{capture_upstream_dns_v4, PowerShellRunner};
     use nrr_service_runtime::dns_resolver_ports::{
         ConsumerConfirmedHostSink, FcrdnsUpstreamResolver,
     };
     use nrr_service_runtime::fcrdns_learner::{LearnOutcome, ReverseDnsLearner};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     // Cap distinct IPs named per service run — a backstop against a drop storm
     // turning into a PTR/A query flood (each IP is attempted at most once anyway).
     const MAX_ATTEMPTS_PER_SESSION: usize = 512;
 
-    type CapturedUpstream = Option<(Instant, Option<std::net::Ipv4Addr>)>;
-    let captured: Mutex<CapturedUpstream> = Mutex::new(None);
+    let pool = upstream_dns_pool();
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
-        Arc::new(move || {
-            let mut guard = captured.lock().unwrap_or_else(|p| p.into_inner());
-            let fresh = matches!(&*guard, Some((at, _)) if at.elapsed() < Duration::from_secs(300));
-            if !fresh {
-                *guard = Some((Instant::now(), capture_upstream_dns_v4(&PowerShellRunner)));
-            }
-            guard
-                .as_ref()
-                .and_then(|(_, ip)| *ip)
-                .map(|ip| std::net::SocketAddr::from((ip, 53)))
-        });
+        Arc::new(move || pool.current().or_else(|| pool.note_network_change()));
 
     let resolver = FcrdnsUpstreamResolver::new(upstream, Duration::from_millis(1500));
     // Two sinks over the same consumer: one for the exact-match fast path
@@ -3879,23 +3889,6 @@ fn conn_trace_backend() -> ConnTraceBackend {
         }
     }
     ConnTraceBackend::Both
-}
-
-// ── Degraded policy manager ──────────────────────────────────────────────────
-
-/// Fallback `PolicyManager` for the recovery-blocked path
-/// (state DB couldn't be opened). All methods return safe defaults so
-/// the snapshot/health handlers don't crash. Production startup with a
-/// healthy DB always uses [`CoordinatorPolicyManager`] instead.
-struct DegradedPolicyManager;
-
-impl PolicyManager for DegradedPolicyManager {
-    fn load_active(&self) -> nrr_service_runtime::state::ServicePolicyState {
-        nrr_service_runtime::state::ServicePolicyState::RecoveryRequired
-    }
-    fn current_revision(&self) -> Option<nrr_service_runtime::state::ActiveRevisionState> {
-        None
-    }
 }
 
 /// Opens the FQDN/IP cache database and wraps it in an
@@ -4811,16 +4804,16 @@ fn build_fake_ip_stack_factory(
 /// `resolve_hosts_bypass` posture is ON (the default), rule hosts resolve
 /// straight against the captured upstream server over a raw socket — so a
 /// hosts/adblock `127.0.0.1` pin can no
-/// longer starve a rule of its routable public IP. The upstream capture runs
-/// PowerShell, so it is memoized for 5 minutes per resolver instance. Missing
-/// settings DB / no active user read as the DEFAULT posture (bypass ON).
+/// longer starve a rule of its routable public IP. The upstream comes from the
+/// shared pool, so this path retires a dead resolver on the same evidence as
+/// the others. Missing settings DB / no active user read as the DEFAULT posture
+/// (bypass ON).
 fn build_hosts_bypass_resolver(
     settings_conn: Option<Arc<Mutex<Connection>>>,
     active_sid: Option<nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
     egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
 ) -> Arc<dyn nrr_platform_windows::dns::DnsResolverPort> {
-    use nrr_platform_windows::dns_redirect::{capture_upstream_dns_v4, PowerShellRunner};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     let bypass_enabled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
         let (Some(conn), Some(active_sid)) = (settings_conn.as_ref(), active_sid.as_ref()) else {
@@ -4837,20 +4830,9 @@ fn build_hosts_bypass_resolver(
             .map(|record| record.resolve_hosts_bypass)
             .unwrap_or(true)
     });
-    type CapturedUpstream = Option<(Instant, Option<std::net::Ipv4Addr>)>;
-    let captured: Arc<Mutex<CapturedUpstream>> = Arc::new(Mutex::new(None));
+    let pool = upstream_dns_pool();
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
-        Arc::new(move || {
-            let mut guard = captured.lock().unwrap_or_else(|p| p.into_inner());
-            let fresh = matches!(&*guard, Some((at, _)) if at.elapsed() < Duration::from_secs(300));
-            if !fresh {
-                *guard = Some((Instant::now(), capture_upstream_dns_v4(&PowerShellRunner)));
-            }
-            guard
-                .as_ref()
-                .and_then(|(_, ip)| *ip)
-                .map(|ip| std::net::SocketAddr::from((ip, 53)))
-        });
+        Arc::new(move || pool.current().or_else(|| pool.note_network_change()));
     let mut resolver = nrr_service_runtime::dns_resolver_ports::HostsBypassDnsResolver::new(
         Arc::new(WindowsDnsResolver::new()),
         bypass_enabled,
@@ -4910,18 +4892,20 @@ impl nrr_service_runtime::dns_resolver::CompanionRescueObserver for RescuedCompa
     }
 }
 
-/// Adapts the engine to `BlockedHostSinkFn` — a plain closure, since the
-/// learner has no observer trait of its own.
-fn isp_block_page_sink(
-    engine: Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>,
-    active_sid: nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn,
-) -> nrr_service_runtime::isp_block_page_learner::BlockedHostSinkFn {
-    Arc::new(move |blocked: &str, _notice_page: &str| {
-        let Some(sid) = active_sid() else {
-            return;
-        };
-        engine.note_isp_blocked_host(&sid, blocked, std::time::SystemTime::now());
-    })
+/// The process-wide upstream-DNS choice.
+///
+/// One pool, not one per resolver instance: it must outlive resolver restarts
+/// (a mode toggle rebuilds the resolver) and it is what the adapter hook pokes
+/// on a network change, long before any resolver exists.
+fn upstream_dns_pool() -> Arc<nrr_service_runtime::dns_upstream::UpstreamDnsPool> {
+    use nrr_service_runtime::dns_upstream::{UdpUpstreamProbe, UpstreamDnsPool};
+    static POOL: std::sync::OnceLock<Arc<UpstreamDnsPool>> = std::sync::OnceLock::new();
+    Arc::clone(POOL.get_or_init(|| {
+        Arc::new(UpstreamDnsPool::new(
+            Arc::new(nrr_platform_windows::dns_redirect::WindowsSystemDnsServers),
+            Arc::new(UdpUpstreamProbe::default()),
+        ))
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4938,29 +4922,32 @@ fn build_dns_resolver_instance(
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverService> {
     use nrr_platform_windows::dns_redirect::{
-        capture_upstream_dns_v4, NrptDnsRedirect, PowerShellRunner, SystemDnsRedirectPort,
+        NrptDnsRedirect, PowerShellRunner, SystemDnsRedirectPort,
     };
     use nrr_service_runtime::dns_listener::DnsInterceptListener;
     use nrr_service_runtime::dns_resolver_ports::{
         ActiveRuleHostOracle, CacheFactSink, DirectUdpUpstreamResolver, HookSyncReconciler,
     };
     use nrr_service_runtime::dns_resolver_service::DnsResolverService;
-    use std::net::SocketAddr;
     use std::time::Duration;
 
-    // Capture the real upstream DNS BEFORE redirecting. Without it the forward
-    // path for non-rule queries would break general DNS — so refuse to arm.
-    let upstream_ip = match capture_upstream_dns_v4(&PowerShellRunner) {
-        Some(ip) => ip,
+    // Settle the real upstream DNS BEFORE redirecting: once NRPT points the
+    // whole machine at our listener, an upstream that does not answer takes
+    // every name with it. The pool probes candidates and refuses to hand back
+    // one that is merely configured — a disconnected adapter keeps its static
+    // DNS, and at boot (no default route yet) that entry can be enumerated
+    // first.
+    let upstream_pool = upstream_dns_pool();
+    let upstream_dns = match upstream_pool.refresh() {
+        Some(addr) => addr,
         None => {
             tracing::warn!(
                 target: "nrr::dns-resolver",
-                "Mode B requested but no upstream IPv4 DNS could be captured; staying reactive",
+                "Mode B requested but no upstream IPv4 DNS answered a probe; staying reactive",
             );
             return None;
         }
     };
-    let upstream_dns = SocketAddr::from((upstream_ip, 53));
 
     let oracle = Arc::new(ActiveRuleHostOracle::new(
         Arc::new(ProductionRulesProvider::new(Arc::clone(settings_conn))),
@@ -4973,7 +4960,8 @@ fn build_dns_resolver_instance(
     // A raw socket is invisible to NRPT and skips the hosts file, matching
     // the `resolve_hosts_bypass` posture for rule hosts.
     let mut direct_upstream =
-        DirectUdpUpstreamResolver::new(upstream_dns, Duration::from_millis(1500), 2);
+        DirectUdpUpstreamResolver::new(upstream_dns, Duration::from_millis(1500), 2)
+            .with_upstream_pool(Arc::clone(&upstream_pool));
     // DNS-over-secondary — when the setting is on and the tunnel is up, these
     // queries leave source-bound over the secondary link to a public resolver
     // instead of asking the primary provider's.
@@ -5031,6 +5019,7 @@ fn build_dns_resolver_instance(
         Duration::from_millis(900),
         Duration::from_millis(2000), // forward timeout for non-intercepted queries
     )
+    .with_upstream_pool(Arc::clone(&upstream_pool))
     .with_direct_answer_steering(secondary_owned);
     // When the shared fake-IP assembly is present,
     // answer scope rule hosts with virtual addresses (gated on the relay
@@ -5076,21 +5065,10 @@ fn build_dns_resolver_instance(
             active_sid: Arc::clone(active_sid),
         }));
     }
-    // The learner always observes (diagnostics-only); with an engine wired,
-    // a blocked host also reaches it as an auto-rules candidate.
-    {
-        let mut observer =
-            nrr_service_runtime::isp_block_page_learner::LearningResolutionObserver::new(
-                nrr_service_runtime::isp_block_page_learner::global_isp_block_page_learner(),
-            );
-        if let Some(engine) = auto_rules.as_ref() {
-            observer = observer.with_blocked_host_sink(isp_block_page_sink(
-                Arc::clone(engine),
-                Arc::clone(active_sid),
-            ));
-        }
-        listener = listener.with_resolution_observer(Arc::new(observer));
-    }
+    // The notice-page learner is NOT wired: on a live machine its signal —
+    // "this name was queried right after an uncovered one" — fires on ordinary
+    // background traffic, which never lets the query stream go quiet. See the
+    // module docs for what a working signal has to key on.
     // While the fail-closed block-all is armed, a DIRECT host's
     // steered answer registers as known-direct and drives a bounded reconcile
     // BEFORE the answer is sent, so the client's first connect is not cut by
@@ -5115,12 +5093,12 @@ fn build_dns_resolver_instance(
         ));
     }
     let redirect: Arc<dyn SystemDnsRedirectPort> = Arc::new(NrptDnsRedirect::new(PowerShellRunner));
-    let listen_addr = SocketAddr::from(([127, 0, 0, 1], 53));
+    let listen_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 53));
     tracing::info!(
         target: "nrr::dns-resolver",
         upstream = %upstream_dns,
         "Mode B armed: local DNS resolver will bind 127.0.0.1:53 and forward non-rule \
-         queries to the captured upstream",
+         queries to an upstream that answered a probe",
     );
     Some(DnsResolverService::new(listener, redirect, listen_addr))
 }

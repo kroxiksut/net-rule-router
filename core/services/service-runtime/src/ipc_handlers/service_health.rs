@@ -1,6 +1,6 @@
-//! `ServiceHealthGet` handler — returns the top-level service state +
-//! worst severity + active revision id. Component breakdown and
-//! degraded-mode list are not wired yet.
+//! `ServiceHealthGet` handler — returns the top-level service state, worst
+//! severity, active revision id and the per-component breakdown the aggregator
+//! keeps, so "degraded" always names which component is degraded.
 
 use std::sync::Arc;
 
@@ -9,7 +9,7 @@ use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
 use crate::ipc_handlers::payloads::{
-    FakeIpDatapathDto, ServiceHealthRequest, ServiceHealthResponse,
+    FakeIpDatapathDto, HealthComponentResponse, ServiceHealthRequest, ServiceHealthResponse,
 };
 use crate::managers::{HealthReporter, PolicyManager};
 use crate::state::{ServiceHealthSeverity, ServiceRuntimeState};
@@ -57,11 +57,18 @@ pub fn build_service_health_response(
         service_state: service_state_slug(health.current_state()).into(),
         worst_severity: severity_slug(health.worst_severity()).into(),
         active_revision_id,
-        // TODO:: populate per-component statuses once the
-        // HealthReporter trait exposes them.
-        components: Vec::new(),
-        // TODO:: wire DegradedMode list from the runtime.
-        degraded_modes: Vec::new(),
+        components: health
+            .components()
+            .into_iter()
+            .map(|(component, severity, message)| HealthComponentResponse {
+                component: component.to_owned(),
+                severity: severity_slug(severity).to_owned(),
+                // An empty message says nothing; omit the field instead of
+                // sending a blank line for the GUI to render.
+                message: (!message.is_empty()).then_some(message),
+            })
+            .collect(),
+        degraded_modes: health.degraded_modes(),
         fake_ip_datapath: fake_ip_datapath.map(|probe| fake_ip_datapath_to_dto(probe())),
     }
 }
@@ -180,10 +187,50 @@ mod tests {
         assert_eq!(parsed.service_state, "degraded");
         assert_eq!(parsed.worst_severity, "warning");
         assert!(parsed.active_revision_id.is_none());
+        // This reporter tracks no components; the empty list is its answer, not
+        // a hard-coded one (see the aggregator test below).
         assert!(parsed.components.is_empty());
         assert!(parsed.degraded_modes.is_empty());
         // No probe wired -> the field is omitted, not fabricated.
         assert!(parsed.fake_ip_datapath.is_none());
+    }
+
+    /// A "degraded" answer that cannot say WHICH component is degraded leaves
+    /// the GUI (and whoever reads a bug report) with nowhere to go, so the real
+    /// aggregator's breakdown has to reach the wire.
+    #[test]
+    fn the_aggregators_component_breakdown_reaches_the_wire() {
+        use crate::health::{HealthAggregator, HealthComponent};
+
+        let aggregator = HealthAggregator::new();
+        aggregator.clear_lifecycle_override();
+        aggregator.record(
+            HealthComponent::Storage,
+            ServiceHealthSeverity::Ok,
+            "state db open",
+        );
+        aggregator.record(
+            HealthComponent::Ipc,
+            ServiceHealthSeverity::Blocking,
+            "pipe bind failed",
+        );
+
+        let handler = ServiceHealthHandler::new(
+            Arc::new(aggregator),
+            Arc::new(FakePolicy { revision: None }),
+        );
+        let resp = handler.handle(&req(serde_json::json!({})), &ctx()).unwrap();
+        let parsed: ServiceHealthResponse = serde_json::from_value(resp).unwrap();
+
+        assert_eq!(parsed.worst_severity, "blocking");
+        let ipc = parsed
+            .components
+            .iter()
+            .find(|c| c.component == "ipc")
+            .expect("the failing component must be named");
+        assert_eq!(ipc.severity, "blocking");
+        assert_eq!(ipc.message.as_deref(), Some("pipe bind failed"));
+        assert!(parsed.components.iter().any(|c| c.component == "storage"));
     }
 
     #[test]

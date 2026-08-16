@@ -164,6 +164,10 @@ impl ActiveSidRegistry {
             IpcClientProfile::TrayLightweight => {
                 entry.tray_connections = entry.tray_connections.saturating_add(1);
             }
+            // The console is counted as a connection but is neither a GUI
+            // session nor a routing signal: an operator running `status` must
+            // not make a user routing-active, nor keep them so.
+            IpcClientProfile::AdminConsole => {}
         }
         entry.last_event_at = now;
         let is_routing_active = entry.tray_connections > 0;
@@ -202,6 +206,8 @@ impl ActiveSidRegistry {
                 IpcClientProfile::TrayLightweight => {
                     entry.tray_connections = entry.tray_connections.saturating_sub(1);
                 }
+                // Mirrors `on_connect`: never counted, never decremented.
+                IpcClientProfile::AdminConsole => {}
             }
             entry.last_event_at = now;
             entry.connection_count == 0

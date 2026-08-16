@@ -826,6 +826,19 @@ impl RecoveryAuditSink for ProductionRecoveryAuditSink {
                 ),
                 None,
             ),
+            // Deliberately NOT `AuditEventKind::RollbackCompleted`: nothing was
+            // rolled back, and the reader of this trail must be able to tell
+            // the two apart during an incident.
+            RecoveryAuditRecord::RollbackDeferred { attempt_id, reason } => (
+                AuditEventKind::RecoveryActionRequested,
+                ReasonCode("integrity.rollback_deferred"),
+                format!(
+                    r#"{{"event":"recovery_rollback_deferred","attempt_id":"{}","reason":"{}"}}"#,
+                    attempt_id,
+                    reason.replace('"', "\\\""),
+                ),
+                None,
+            ),
             RecoveryAuditRecord::VerificationPassed { attempt_id } => (
                 AuditEventKind::RecoveryActionRequested,
                 ReasonCode("integrity.recovery_verified"),

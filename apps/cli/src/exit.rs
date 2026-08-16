@@ -20,9 +20,9 @@ pub const NOT_INSTALLED: u8 = 4;
 pub const NOT_RESPONDING: u8 = 5;
 /// The operation has no meaning on this platform.
 pub const UNSUPPORTED: u8 = 6;
-// 7 is reserved for "refused because it was not confirmed" and is declared
-// here, unused, only when a verb that demands confirmation exists. Do not
-// reuse it for anything else.
+/// The operation was refused because it was not confirmed. Distinct from
+/// USAGE: the command was spelled correctly and would have run.
+pub const NOT_CONFIRMED: u8 = 7;
 
 /// Map a control-port failure onto its exit code.
 pub fn for_error(err: &ServiceControlError) -> u8 {
@@ -49,6 +49,7 @@ mod tests {
             NOT_INSTALLED,
             NOT_RESPONDING,
             UNSUPPORTED,
+            NOT_CONFIRMED,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort_unstable();
@@ -73,6 +74,14 @@ mod tests {
             }),
             NOT_RESPONDING
         );
+    }
+
+    #[test]
+    fn refusing_an_unconfirmed_command_is_not_a_usage_error() {
+        // The command was spelled correctly; a script must be able to tell
+        // "you meant this but did not confirm" from "you typed it wrong".
+        assert_ne!(NOT_CONFIRMED, USAGE);
+        assert_ne!(NOT_CONFIRMED, FAILED);
     }
 
     #[test]

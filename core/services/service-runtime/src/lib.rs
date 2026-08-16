@@ -78,6 +78,7 @@ pub mod dns_refresh;
 pub mod dns_resolver;
 pub mod dns_resolver_ports;
 pub mod dns_resolver_service;
+pub mod dns_upstream;
 pub mod dns_wire;
 // Neutral enforcement planner (CodegenInput/rules → EnforcementPlan).
 // Built incrementally alongside the current `wfp_codegen` path; see the
@@ -289,9 +290,10 @@ pub use crash_recovery::{
     SafeDisableRequest, StartupRecoveryCoordinator, StartupRecoveryState,
 };
 pub use lifecycle::{
-    run_runtime, run_runtime_with_artifacts, run_runtime_with_bootstrap, LifecycleEvent,
-    ServiceController, StopToken, AUTOSTART_POLICY, EVENT_SOURCE_NAME, SERVICE_DESCRIPTION,
-    SERVICE_DISPLAY_NAME, SERVICE_NAME, START_TIMEOUT, STOP_TIMEOUT,
+    begin_teardown, clear_teardown, run_runtime, run_runtime_with_artifacts,
+    run_runtime_with_bootstrap, teardown_in_progress, LifecycleEvent, ServiceController, StopToken,
+    AUTOSTART_POLICY, EVENT_SOURCE_NAME, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME,
+    START_TIMEOUT, STOP_TIMEOUT,
 };
 pub use managers::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ApplyController, ApplyOutcome,
@@ -324,10 +326,14 @@ pub use windows_apply_adapter::{production_apply_layer, ApplyOrchestrator, Windo
 #[cfg(not(windows))]
 pub use windows_apply_adapter::{production_apply_layer, LinuxApplyLayer};
 
-/// One-line description of what stage a given runtime
-/// dimension is currently at. Used by the `nrr-windows-service` binary
-/// to print a status banner during scaffold development. Will be replaced
-/// with a real `HealthReporter` snapshot once that subsystem lands.
+/// What stage a given runtime dimension is at, as one short slug. Printed by
+/// the service binary's `status` verb.
+///
+/// Slugs: `ready` — the production implementation is what runs; `partial` — it
+/// runs, but a named piece of it is still missing. `scaffold` is deliberately
+/// absent from the current values: every dimension below has a real
+/// implementation, and a banner that says otherwise misreports the service to
+/// whoever is diagnosing it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServiceRuntimeOrchestrationSnapshot {
     pub scm_lifecycle: &'static str,
@@ -340,20 +346,22 @@ pub struct ServiceRuntimeOrchestrationSnapshot {
     pub install_update_hooks: &'static str,
 }
 
-/// Returns the current service-runtime scaffold status. Every field is a
-/// short slug ("scaffold" / "in-progress" / "ready") so the banner stays
-/// stable while individual subsystems graduate from scaffold to production
-/// one at a time.
+/// Maturity of each runtime dimension, as the `status` verb reports it.
+///
+/// The two `partial` entries name what is missing rather than rounding up:
+/// health does not publish per-component statuses or degraded modes yet, and
+/// the update hook stops after draining and backing up the state database —
+/// replacing the binary is the installer's half.
 pub const fn service_runtime_orchestration_snapshot() -> ServiceRuntimeOrchestrationSnapshot {
     ServiceRuntimeOrchestrationSnapshot {
-        scm_lifecycle: "scaffold",
-        bootstrap: "scaffold",
-        policy_load: "scaffold",
-        ipc_server: "scaffold",
-        health_readiness: "scaffold",
-        recovery: "scaffold",
-        privileged_operations: "scaffold",
-        install_update_hooks: "scaffold",
+        scm_lifecycle: "ready",
+        bootstrap: "ready",
+        policy_load: "ready",
+        ipc_server: "ready",
+        health_readiness: "partial",
+        recovery: "ready",
+        privileged_operations: "ready",
+        install_update_hooks: "partial",
     }
 }
 
@@ -361,16 +369,29 @@ pub const fn service_runtime_orchestration_snapshot() -> ServiceRuntimeOrchestra
 mod tests {
     use super::service_runtime_orchestration_snapshot;
 
+    /// The previous version of this test asserted `"scaffold"` on all eight
+    /// dimensions, so it pinned the banner to a claim that stopped being true
+    /// subsystem by subsystem. Assert the SHAPE instead: every dimension is one
+    /// of the known slugs, and none of them still says `scaffold` — a
+    /// dimension that regresses to a stub has to say so deliberately.
     #[test]
-    fn service_runtime_snapshot_exposes_required_dimensions() {
+    fn every_runtime_dimension_reports_a_known_non_scaffold_stage() {
         let snapshot = service_runtime_orchestration_snapshot();
-        assert_eq!(snapshot.scm_lifecycle, "scaffold");
-        assert_eq!(snapshot.bootstrap, "scaffold");
-        assert_eq!(snapshot.policy_load, "scaffold");
-        assert_eq!(snapshot.ipc_server, "scaffold");
-        assert_eq!(snapshot.health_readiness, "scaffold");
-        assert_eq!(snapshot.recovery, "scaffold");
-        assert_eq!(snapshot.privileged_operations, "scaffold");
-        assert_eq!(snapshot.install_update_hooks, "scaffold");
+        let dimensions = [
+            ("scm_lifecycle", snapshot.scm_lifecycle),
+            ("bootstrap", snapshot.bootstrap),
+            ("policy_load", snapshot.policy_load),
+            ("ipc_server", snapshot.ipc_server),
+            ("health_readiness", snapshot.health_readiness),
+            ("recovery", snapshot.recovery),
+            ("privileged_operations", snapshot.privileged_operations),
+            ("install_update_hooks", snapshot.install_update_hooks),
+        ];
+        for (name, stage) in dimensions {
+            assert!(
+                matches!(stage, "ready" | "partial"),
+                "{name} reports an unknown stage `{stage}`",
+            );
+        }
     }
 }

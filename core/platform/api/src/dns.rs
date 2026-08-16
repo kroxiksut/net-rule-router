@@ -291,6 +291,78 @@ impl DnsCacheReadPort for MockDnsCacheRead {
     }
 }
 
+// ── System upstream DNS servers ─────────────────────────────────────────────
+
+/// One configured upstream DNS server together with the interface that carries
+/// it. The interface matters because "reachable" is not the only question: a
+/// resolver reached over a link the routing policy does not use answers for the
+/// internet but not for that link's internal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UpstreamDnsCandidate {
+    /// OS interface index the server is configured on, when known.
+    pub interface_index: Option<u32>,
+    pub server: Ipv4Addr,
+}
+
+impl UpstreamDnsCandidate {
+    pub fn new(interface_index: Option<u32>, server: Ipv4Addr) -> Self {
+        Self {
+            interface_index,
+            server,
+        }
+    }
+}
+
+/// Enumerates the IPv4 DNS servers the OS is configured with, best first.
+///
+/// The loopback resolver forwards everything it does not intercept to one of
+/// these, so a dead pick breaks name resolution machine-wide. Implementations
+/// therefore return an ORDERED list of candidates rather than a single address:
+/// which one is actually reachable is a policy question, decided by
+/// `nrr-service-runtime` (it probes, prefers, and rotates), while enumeration is
+/// the per-OS mechanism that lives here.
+///
+/// Implementations MUST exclude loopback/unspecified/broadcast addresses and
+/// MUST NOT return servers belonging to interfaces that are down — a
+/// disconnected adapter's stale static DNS is the classic way to end up
+/// forwarding every query into a black hole.
+pub trait SystemDnsServersPort: Send + Sync {
+    /// Candidate upstream servers, most-preferred first. Empty when none can
+    /// be determined — the caller MUST then leave the system resolver alone.
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate>;
+}
+
+/// Fixed candidate list. Production-usable as a manual override and the
+/// standard stand-in in tests. Always compiled, same convention as the mocks
+/// above.
+#[derive(Debug, Default, Clone)]
+pub struct StaticDnsServers {
+    servers: Vec<UpstreamDnsCandidate>,
+}
+
+impl StaticDnsServers {
+    /// Servers with no interface attribution — the shape tests use when the
+    /// interface plays no part in what they exercise.
+    pub fn new(servers: Vec<Ipv4Addr>) -> Self {
+        Self {
+            servers: servers
+                .into_iter()
+                .map(|ip| UpstreamDnsCandidate::new(None, ip))
+                .collect(),
+        }
+    }
+
+    pub fn with_interfaces(servers: Vec<UpstreamDnsCandidate>) -> Self {
+        Self { servers }
+    }
+}
+
+impl SystemDnsServersPort for StaticDnsServers {
+    fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+        self.servers.clone()
+    }
+}
+
 // ── Trait ────────────────────────────────────────────────────────────────────
 
 /// Abstraction over a synchronous IPv4 DNS resolver.

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::ipc::IpcOperationName;
+
 /// Local IPC transport mechanism. The wire codec (4-byte BE u32 length +
 /// UTF-8 JSON, `IPC_MAX_MESSAGE_BYTES`) is identical across variants — only
 /// the OS mechanism that carries the framed bytes differs. The active
@@ -119,6 +121,299 @@ pub const SERVICE_ENDPOINT_ADDRESS: &str = "/run/netrulerouter/service-v1.sock";
 /// Re-exported as `nrr_service_runtime::IPC_MAX_MESSAGE_BYTES` to keep
 /// the import path stable for existing callers.
 pub const IPC_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+// ── Operation class ──────────────────────────────────────────────────────────
+
+/// Coarse operation class. Drives:
+/// - whether the request bypasses the mutation queue (`ReadSnapshot`,
+///   `DiagnosticQuery` are read-only);
+/// - whether elevation is required;
+/// - whether a confirmation token must be carried (`MutationRequest`,
+///   `RecoveryAction`, `SafeDisable`).
+///
+/// Declared here, alongside the wire format, because BOTH sides need the same
+/// answer and neither may derive its own: the class is what the service's
+/// admission checks are made of, so a second opinion is a way past them. See
+/// [`canonical_operation_class`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IpcOperationClass {
+    ReadSnapshot,
+    DiagnosticQuery,
+    DiagnosticAction,
+    MutationRequest,
+    ReviewConfirmation,
+    RecoveryAction,
+    SafeDisable,
+    /// per-SID user configuration write. Mutating (flows through the mutation
+    /// queue, audited before execution) but does **not** require client
+    /// elevation — the data is the user's own per-SID configuration, not
+    /// service-global policy. Single-step (no two-phase confirmation token).
+    UserScopedConfiguration,
+    /// per-principal rules/preset mutation. Like [`Self::MutationRequest`] it is
+    /// two-phase (a confirmation token from a prior dry-run is mandatory), flows
+    /// through the mutation queue, and is audited before execution — but it does
+    /// **not** require client elevation. The target principal is the caller's own
+    /// SID, never the service-global baseline, so a non-admin GUI session can
+    /// commit *its own* rules. Editing the admin baseline still goes through
+    /// [`Self::MutationRequest`] (elevation required).
+    UserScopedMutation,
+}
+
+impl IpcOperationClass {
+    /// Whether this class flows through the single-writer mutation queue.
+    /// `false` for read-only and lightweight diagnostic queries.
+    pub const fn is_mutating(self) -> bool {
+        match self {
+            Self::ReadSnapshot | Self::DiagnosticQuery => false,
+            Self::DiagnosticAction
+            | Self::MutationRequest
+            | Self::ReviewConfirmation
+            | Self::RecoveryAction
+            | Self::SafeDisable
+            | Self::UserScopedConfiguration
+            | Self::UserScopedMutation => true,
+        }
+    }
+
+    /// Whether the caller's process token must be elevated. Read-only
+    /// operations, diagnostic actions that persist nothing (e.g. an on-demand
+    /// adapter re-enumeration), and per-SID user configuration writes are safe
+    /// for non-admin GUI sessions; everything else requires an elevated client.
+    pub const fn requires_elevation(self) -> bool {
+        !matches!(
+            self,
+            Self::ReadSnapshot
+                | Self::DiagnosticQuery
+                | Self::DiagnosticAction
+                | Self::UserScopedConfiguration
+                | Self::UserScopedMutation
+        )
+    }
+
+    /// Whether the request envelope must carry a `confirmation_token` (issued by
+    /// an earlier dry-run response). Dangerous classes require explicit two-step
+    /// acknowledgement to prevent accidental network-policy mutation from a
+    /// stuck GUI.
+    pub const fn requires_confirmation_token(self) -> bool {
+        matches!(
+            self,
+            Self::MutationRequest
+                | Self::RecoveryAction
+                | Self::SafeDisable
+                | Self::UserScopedMutation
+        )
+    }
+
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::ReadSnapshot => "read-snapshot",
+            Self::DiagnosticQuery => "diagnostic-query",
+            Self::DiagnosticAction => "diagnostic-action",
+            Self::MutationRequest => "mutation-request",
+            Self::ReviewConfirmation => "review-confirmation",
+            Self::RecoveryAction => "recovery-action",
+            Self::SafeDisable => "safe-disable",
+            Self::UserScopedConfiguration => "user-scoped-configuration",
+            Self::UserScopedMutation => "user-scoped-mutation",
+        }
+    }
+}
+
+/// The class an operation ACTUALLY has, decided from the operation itself (and,
+/// for the two-phase operations, the payload that distinguishes their phases).
+///
+/// This is what the service admits requests by. The class must never be taken
+/// from the envelope the caller sent: the confirmation-token gate, the elevation
+/// gate, the pre-execution audit record and the single-writer queue are all
+/// selected by it, so a caller that names its own class names its own checks.
+/// The envelope still carries a class for readability on the wire, and the
+/// service compares the two — a mismatch is a bug in the caller, not a vote.
+pub fn canonical_operation_class(
+    op: IpcOperationName,
+    payload: &serde_json::Value,
+) -> IpcOperationClass {
+    // Two-phase operations: the dry-run pass is classified read-only so it can
+    // MINT the confirmation token the confirm pass is then required to carry.
+    if matches!(op, IpcOperationName::ProductImpactDisableTemporary) {
+        return if dry_run_flag(payload) {
+            IpcOperationClass::ReadSnapshot
+        } else {
+            IpcOperationClass::SafeDisable
+        };
+    }
+    if matches!(op, IpcOperationName::MutationSubmit) {
+        if dry_run_flag(payload) {
+            return IpcOperationClass::ReadSnapshot;
+        }
+        // An admin "set baseline" edit opts out of the per-principal path and
+        // confirms as an elevation-gated service-global mutation. The flag only
+        // steers the class here; the target principal is always resolved by the
+        // service, never carried in the payload.
+        let admin_baseline = payload
+            .get("payload")
+            .and_then(|p| p.get("admin-baseline"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if admin_baseline {
+            return IpcOperationClass::MutationRequest;
+        }
+        // Per-principal rules / preset edits: two-phase but NOT elevation-gated,
+        // so a non-admin session can commit its own rules. Everything else stays
+        // service-global.
+        let kind = payload.get("mutation-kind").and_then(|v| v.as_str());
+        if matches!(
+            kind,
+            Some("rules-update") | Some("preset-import") | Some("rules-reset-to-baseline")
+        ) {
+            return IpcOperationClass::UserScopedMutation;
+        }
+        return IpcOperationClass::MutationRequest;
+    }
+    fixed_operation_class(op)
+}
+
+/// `dry-run: true` in the envelope payload.
+fn dry_run_flag(payload: &serde_json::Value) -> bool {
+    payload
+        .get("dry-run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// The class of every operation whose class does not depend on its payload.
+/// Exhaustive on purpose: a new operation does not compile until it is
+/// classified, which is the only way this table stays complete.
+fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
+    match op {
+        // ContractNegotiate / ServiceHealthGet / snapshots / status polls /
+        // operation-status are all read-only — no mutation, no token.
+        IpcOperationName::ContractNegotiate
+        | IpcOperationName::ServiceHealthGet
+        | IpcOperationName::SnapshotInitialGet
+        | IpcOperationName::SnapshotInterfacesGet
+        | IpcOperationName::SnapshotDiagnosticsGet
+        | IpcOperationName::StatusUpdatesPoll
+        | IpcOperationName::OperationStatusGet
+        | IpcOperationName::LogsList
+        | IpcOperationName::AuditList
+        | IpcOperationName::SecurityAlertsList
+        | IpcOperationName::RulesList
+        | IpcOperationName::MigrationStatusGet
+        | IpcOperationName::RetentionSettingsGet
+        // Read log/audit retention config.
+        | IpcOperationName::LogRetentionConfigGet
+        | IpcOperationName::ApplyFailurePolicyGet
+        | IpcOperationName::StorageUsageGet
+        | IpcOperationName::RoutingPauseGet
+        | IpcOperationName::AutostartGet
+        // All read-only diagnostics ops + the export (which writes a derived
+        // artifact but does not mutate domain state).
+        | IpcOperationName::ExplainGet
+        | IpcOperationName::DiagnosticsExportArchive
+        | IpcOperationName::ServiceStabilityConfigGet
+        // Read-only preset export.
+        | IpcOperationName::PresetExportGet
+        // Read-only settings export.
+        | IpcOperationName::SettingsExportFull
+        // Read-only paginated cache-entries viewer.
+        | IpcOperationName::CacheEntriesList
+        // Read-only paginated connection-trace viewer.
+        | IpcOperationName::ConnTraceEntriesList
+        // Read-only attribution + integrity of shipped third-party binaries.
+        | IpcOperationName::ThirdPartyComponentsList
+        // Read-only two-way merge preview (no mutation queue).
+        | IpcOperationName::RulesMergePreview
+        // Read the shared DoH resolver baseline list.
+        | IpcOperationName::DohResolversGet
+        // Read-only traffic-stats query.
+        | IpcOperationName::TrafficStatsGet
+        // Read the caller's pending companion-domain suggestions.
+        | IpcOperationName::AutoRuleCandidatesList
+        // Read the caller's declined companion-domain suggestions.
+        | IpcOperationName::AutoRuleDismissedList => IpcOperationClass::ReadSnapshot,
+        // StatusUpdatesSubscribe sets up a long-lived push channel —
+        // classified as DiagnosticQuery (no mutation queue, no elevation).
+        IpcOperationName::StatusUpdatesSubscribe => IpcOperationClass::DiagnosticQuery,
+        // Privileged mutations: enter the mutation queue, require token.
+        IpcOperationName::MutationSubmit => IpcOperationClass::MutationRequest,
+        // Re-enumerating adapters (and, when the user asks for it, probing each
+        // adapter's external address) changes nothing persisted, so it must not
+        // enter the single-writer mutation queue: a heavy policy apply in the
+        // queue can hold the refresh past its own call deadline, and the user
+        // sees a timeout instead of addresses. DiagnosticQuery dispatches
+        // immediately and still requires no elevation.
+        IpcOperationName::InterfacesRefreshRequest => IpcOperationClass::DiagnosticQuery,
+        IpcOperationName::RollbackRequest => IpcOperationClass::RecoveryAction,
+        IpcOperationName::ProductImpactDisableTemporary => IpcOperationClass::SafeDisable,
+        // Per-SID user configuration writes go through the mutation queue
+        // (single-writer invariant) but do not require client elevation.
+        // Slug differs from `mutation-request` so handlers can distinguish.
+        IpcOperationName::RoutePolicyUpdate
+        // Link-provider app set: same per-SID user-scoped write pattern as
+        // RoutePolicyUpdate.
+        | IpcOperationName::RouteLinkProviderSet
+        | IpcOperationName::MigrationMarkComplete
+        | IpcOperationName::RoutingPauseToggle
+        | IpcOperationName::AutostartToggle => IpcOperationClass::UserScopedConfiguration,
+        // Service-global mutations admin-gated upstream. Service stability
+        // config shares the same envelope class as other service-global
+        // settings writes.
+        IpcOperationName::RetentionSettingsSet
+        | IpcOperationName::ApplyFailurePolicySet
+        // Log/audit retention write, service-global settings class.
+        | IpcOperationName::LogRetentionConfigSet
+        | IpcOperationName::ServiceStabilityConfigSet => IpcOperationClass::UserScopedConfiguration,
+        // LogsClear is a destructive maintenance op but does not mutate routing
+        // policy or rules — same class as the other settings writes.
+        IpcOperationName::LogsClear => IpcOperationClass::UserScopedConfiguration,
+        // CacheClear clears the rebuildable FQDN/IP cache — same class as the
+        // other GUI-only maintenance / settings writes.
+        IpcOperationName::CacheClear => IpcOperationClass::UserScopedConfiguration,
+        // DiagnosticModeSet toggles an in-memory diagnostic session; a
+        // GUI-only maintenance command, same envelope class.
+        IpcOperationName::DiagnosticModeSet => IpcOperationClass::UserScopedConfiguration,
+        // DoH resolver baseline replace. Machine-wide config write; the
+        // elevation gate lives in the catalog
+        // (`requires_service_mutation_privilege`), the envelope class matches the
+        // other settings writes.
+        IpcOperationName::DohResolversSet => IpcOperationClass::UserScopedConfiguration,
+        // Opt-in browser-history seed; a GUI-only maintenance command like
+        // CacheClear / DiagnosticModeSet.
+        IpcOperationName::SeedFromBrowserHistory => IpcOperationClass::UserScopedConfiguration,
+        // Service-global traffic-stats settings write / reset (admin-gated in
+        // the catalog); same envelope class as other settings writes.
+        IpcOperationName::TrafficStatsSet | IpcOperationName::TrafficStatsClear => {
+            IpcOperationClass::UserScopedConfiguration
+        }
+        // Accepting a companion-domain suggestion writes the caller's OWN
+        // rules and refusing one writes their own refusal record. Both are
+        // per-SID user configuration: they enter the single-writer mutation
+        // queue but require no elevation.
+        IpcOperationName::AutoRuleCandidatesAccept
+        | IpcOperationName::AutoRuleCandidatesDismiss => IpcOperationClass::UserScopedConfiguration,
+        // Restoring a declined suggestion writes the caller's own refusal
+        // record (a delete), and erasing one drops their own pending/refusal
+        // rows — same per-SID user-configuration class.
+        IpcOperationName::AutoRuleDismissedRestore
+        | IpcOperationName::AutoRuleCandidatesForget => IpcOperationClass::UserScopedConfiguration,
+        // Read the caller's own block-notice mutes.
+        IpcOperationName::BlockNoticeMutesList => IpcOperationClass::ReadSnapshot,
+        // Setting/removing/clearing a mute writes the caller's OWN durable
+        // mute row(s) — per-SID user configuration, no elevation, same shape
+        // as the companion-domain refusal writes above.
+        IpcOperationName::BlockNoticeMutesSet
+        | IpcOperationName::BlockNoticeMutesRemove
+        | IpcOperationName::BlockNoticeMutesClear => IpcOperationClass::UserScopedConfiguration,
+        // Turning a block notice into a rule writes the caller's OWN rules
+        // through the same authoring path AutoRuleCandidatesAccept uses —
+        // same per-SID user-configuration class.
+        IpcOperationName::BlockNoticeRouteToSecondary => IpcOperationClass::UserScopedConfiguration,
+        // Full reset purges the caller's OWN auxiliary state — per-SID user
+        // configuration, no elevation, same class as BlockNoticeMutesClear.
+        IpcOperationName::PrincipalDataPurge => IpcOperationClass::UserScopedConfiguration,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IpcEndpointAccessClass {

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nrr_application::backend_facade::{mock_scenario_from_env, tray_status_for_mock_scenario};
 use nrr_desktop_gui::app_shell::{parse_launch_request_arguments, LaunchRequest};
@@ -206,12 +206,35 @@ pub fn run(config: LauncherConfig) -> ExitCode {
 
     match SingleInstanceGuard::acquire(config.single_instance_key) {
         Ok(Some(guard)) => run_primary(&config, store, preferences, launch_request, guard),
-        Ok(None) => run_secondary(&config, &launch_request),
+        Ok(None) => match run_secondary(&config, &launch_request) {
+            SecondaryOutcome::Handled(code) => code,
+            // The lock owner never picked the activation up, so it cannot show a
+            // window. Take the lock over rather than leave the user with a tray
+            // click that does nothing.
+            SecondaryOutcome::TakeOver => {
+                match SingleInstanceGuard::reclaim(config.single_instance_key) {
+                    Ok(guard) => run_primary(&config, store, preferences, launch_request, guard),
+                    Err(error) => {
+                        eprintln!(
+                            "nrr-launcher: could not reclaim the single-instance lock: {error}"
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Err(error) => {
             eprintln!("nrr-launcher: single-instance guard error: {error}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// What the duplicate-launch path decided. `TakeOver` means the recorded
+/// primary proved unresponsive and this process should become the primary.
+enum SecondaryOutcome {
+    Handled(ExitCode),
+    TakeOver,
 }
 
 fn run_primary(
@@ -227,6 +250,11 @@ fn run_primary(
     // previous session's log out of the way before the first line lands.
     let log_path = diag_log_path(tag);
     rotate_session_log(&log_path);
+    // A request left behind by a duplicate launch nobody answered would
+    // otherwise fire against this fresh session.
+    if config.surface == LauncherSurface::MainGui {
+        let _ = fs::remove_file(default_activation_request_path());
+    }
     // Everything this process prints — including the crates it merely uses —
     // belongs in THIS surface's log, not in the log of whoever started it.
     // Done after the rotation so the redirected stream opens the fresh file.
@@ -336,6 +364,14 @@ fn run_primary(
     let mut host_arguments = vec![
         format!("--qml={}", qml_path.display()),
         format!("--nrr-context-file={}", path_to_file_url(&context_file)),
+        // The host derives every lock and flag path from this. Passed rather
+        // than recomputed there: the two sides agreed on Windows only because
+        // both spelled `%TEMP%\NetRuleRouter`, and on Unix they would not —
+        // this side uses the per-user runtime directory, not shared `/tmp`.
+        format!(
+            "--nrr-runtime-dir={}",
+            nrr_platform_api::paths::user_runtime_dir().display()
+        ),
     ];
     if let Some(icon_path) = resolve_native_icon_path() {
         host_arguments.push(format!("--nrr-app-icon={}", icon_path.display()));
@@ -490,12 +526,12 @@ fn run_primary(
             if let Some(stdin) = child_stdin.as_ref() {
                 let side = crate::rpc_dispatcher::request_uses_side_channel(&line);
                 if side && ipc_side_client.is_none() {
-                    let client = nrr_ipc_client::NamedPipeIpcClient::start();
+                    let client = nrr_ipc_client::ServiceIpcClient::start();
                     ipc_side_client = Some(std::sync::Arc::new(client)
                         as std::sync::Arc<dyn nrr_ipc_client::IpcClient>);
                 }
                 if !side && ipc_client.is_none() {
-                    let client = nrr_ipc_client::NamedPipeIpcClient::start();
+                    let client = nrr_ipc_client::ServiceIpcClient::start();
                     ipc_client = Some(std::sync::Arc::new(client)
                         as std::sync::Arc<dyn nrr_ipc_client::IpcClient>);
                 }
@@ -566,7 +602,12 @@ fn run_primary(
     ExitCode::from(truncated)
 }
 
-fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> ExitCode {
+/// How long a duplicate launch waits for the primary to consume the activation
+/// file. The host polls it at 350 ms, so this is many chances to be seen.
+const ACTIVATION_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+const ACTIVATION_ACK_POLL: Duration = Duration::from_millis(100);
+
+fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryOutcome {
     let tag = surface_tag(config.surface);
     // Same reasoning as the primary path, minus the rotation: this run appends
     // to the live log of the surface it belongs to instead of leaking its lines
@@ -587,7 +628,7 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> ExitCode {
             tag,
             "NRR_LAUNCHER[secondary] tray duplicate-launch: no-op (icon already owned by primary)",
         );
-        return ExitCode::SUCCESS;
+        return SecondaryOutcome::Handled(ExitCode::SUCCESS);
     }
 
     // For the main GUI, hand activation off to the running primary by writing
@@ -600,16 +641,46 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> ExitCode {
              {} instance: {error}",
             config.app_name
         );
-        return ExitCode::FAILURE;
+        return SecondaryOutcome::Handled(ExitCode::FAILURE);
     }
-    ExitCode::SUCCESS
+
+    // The write is only half the handshake. A lock holder with no window left
+    // (closed to tray, wedged, or a lock that merely looks held) never reads
+    // the file, and the click silently does nothing — so wait for the file to
+    // disappear and report which of the two happened.
+    let activation_path = default_activation_request_path();
+    let waited_from = Instant::now();
+    while waited_from.elapsed() < ACTIVATION_ACK_TIMEOUT {
+        if !activation_path.exists() {
+            diag_log(
+                tag,
+                &format!(
+                    "NRR_LAUNCHER[secondary] activation consumed by primary after {} ms",
+                    waited_from.elapsed().as_millis()
+                ),
+            );
+            return SecondaryOutcome::Handled(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(ACTIVATION_ACK_POLL);
+    }
+
+    diag_log(
+        tag,
+        &format!(
+            "NRR_LAUNCHER[secondary] activation NOT consumed within {} ms — \
+             the lock holder cannot show a window; taking the lock over",
+            ACTIVATION_ACK_TIMEOUT.as_millis()
+        ),
+    );
+    // Our own request would otherwise be replayed by the GUI we are about to
+    // start, on top of the request it already carries on its command line.
+    let _ = fs::remove_file(&activation_path);
+    SecondaryOutcome::TakeOver
 }
 
 /// Path the C++ Qt host polls via `takePendingGuiRequest`.
 pub fn default_activation_request_path() -> PathBuf {
-    env::temp_dir()
-        .join("NetRuleRouter")
-        .join("gui-activation.json")
+    nrr_platform_api::paths::user_runtime_dir().join("gui-activation.json")
 }
 
 pub fn write_activation_request_to_default_path(request: &LaunchRequest) -> io::Result<()> {
@@ -1005,17 +1076,74 @@ pub fn path_to_file_url(path: &Path) -> String {
 pub struct SingleInstanceGuard {
     lock_path: PathBuf,
     _lock_file: File,
+    /// The OS-held claim, when the platform offers one. It — not the lock file
+    /// — is what decides ownership: the kernel releases it when this process
+    /// dies, and no one can delete it out of the runtime directory.
+    _os_claim: Option<Box<dyn nrr_platform_api::single_instance::SingleInstanceClaim>>,
     /// PID a stale lock was reclaimed from on this `acquire`, if any — surfaced
     /// so the caller can log it once its own diagnostic log file is open.
     removed_stale_pid: Option<u32>,
 }
 
+/// The platform's single-instance mechanism, or `None` where there is none.
+fn os_single_instance_port(
+) -> Option<Box<dyn nrr_platform_api::single_instance::SingleInstancePort>> {
+    #[cfg(windows)]
+    {
+        Some(Box::new(
+            nrr_platform_windows::single_instance::WindowsSingleInstance,
+        ))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Some(Box::new(
+            nrr_platform_linux::single_instance::LinuxSingleInstance,
+        ))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
 impl SingleInstanceGuard {
     pub fn acquire(instance_key: &str) -> io::Result<Option<Self>> {
-        let lock_directory = env::temp_dir().join("NetRuleRouter");
+        let lock_directory = nrr_platform_api::paths::user_runtime_dir();
         fs::create_dir_all(&lock_directory)?;
 
         let lock_path = lock_directory.join(format!("{instance_key}.lock"));
+
+        // Ask the OS first. Its answer is authoritative in both directions: a
+        // refused claim means a live owner exists no matter what the runtime
+        // directory looks like, and a granted one means there is none — so a
+        // lock file left behind by a crash (or by a duplicate the old
+        // file-only scheme allowed) is just overwritten instead of probed.
+        if let Some(port) = os_single_instance_port() {
+            match port.claim(instance_key) {
+                Ok(None) => return Ok(None),
+                Ok(Some(claim)) => {
+                    let mut lock_file = OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&lock_path)?;
+                    writeln!(lock_file, "pid={}", std::process::id())?;
+                    return Ok(Some(Self {
+                        lock_path,
+                        _lock_file: lock_file,
+                        _os_claim: Some(claim),
+                        removed_stale_pid: None,
+                    }));
+                }
+                // Fall through to the lock-file scheme rather than guess.
+                Err(error) => eprintln!(
+                    "nrr-launcher: single-instance claim for {instance_key} failed ({error}); \
+                     falling back to the lock file"
+                ),
+            }
+        }
+
         let mut removed_stale_pid = None;
         for attempt in 0..2 {
             match OpenOptions::new()
@@ -1029,6 +1157,7 @@ impl SingleInstanceGuard {
                     return Ok(Some(Self {
                         lock_path,
                         _lock_file: lock_file,
+                        _os_claim: None,
                         removed_stale_pid,
                     }));
                 }
@@ -1047,10 +1176,53 @@ impl SingleInstanceGuard {
 
         Ok(None)
     }
+
+    /// Take the lock over from an owner that proved unresponsive: drop whatever
+    /// is on disk and claim it. Only the duplicate-launch path calls this, after
+    /// the recorded owner failed to answer an activation request.
+    pub fn reclaim(instance_key: &str) -> io::Result<Self> {
+        let lock_directory = nrr_platform_api::paths::user_runtime_dir();
+        fs::create_dir_all(&lock_directory)?;
+        let lock_path = lock_directory.join(format!("{instance_key}.lock"));
+        match fs::remove_file(&lock_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        // Take the OS claim if the previous owner has since exited. If it has
+        // not, proceed anyway: the point of a takeover is that the owner proved
+        // it cannot show a window, and a second window beats none.
+        let os_claim = os_single_instance_port()
+            .and_then(|port| port.claim(instance_key).ok())
+            .flatten();
+        let mut lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&lock_path)?;
+        writeln!(lock_file, "pid={}", std::process::id())?;
+        Ok(Self {
+            lock_path,
+            _lock_file: lock_file,
+            _os_claim: os_claim,
+            removed_stale_pid: None,
+        })
+    }
 }
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
+        // Delete only a lock that still records THIS process. Two primaries can
+        // coexist once the file is deleted out from under the first one, and
+        // removing by path alone would then strip the survivor's lock — leaving
+        // the runtime dir permanently able to host duplicates.
+        match fs::read_to_string(&self.lock_path) {
+            Ok(content) if parse_pid_from_lock_content(&content) == Some(std::process::id()) => {}
+            Ok(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(_) => return,
+        }
         if let Err(error) = fs::remove_file(&self.lock_path) {
             if error.kind() != io::ErrorKind::NotFound {
                 eprintln!(

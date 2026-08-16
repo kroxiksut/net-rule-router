@@ -22,10 +22,20 @@ pub enum Command {
     Stop,
     /// Stop then start the service.
     Restart,
+    /// Re-register the service from this directory, then start it.
+    Reinstall,
     /// Report registration and run state.
     Status,
     /// Check the installation and report what is wrong with it.
     DiagDoctor,
+    /// Print the tail of the service's operational log.
+    DiagLogs { tail: usize },
+    /// Ask the service for a diagnostic archive.
+    DiagExport,
+    /// Remove network state a crashed service left behind. `confirmed` carries
+    /// the mandatory flag rather than gating the parse, so "you meant this but
+    /// did not confirm" stays a distinct answer from a usage error.
+    ResetNetwork { confirmed: bool },
     /// Print the console version.
     Version,
     /// Print usage.
@@ -230,8 +240,32 @@ fn build(
         "start" => Ok(Command::Start),
         "stop" => Ok(Command::Stop),
         "restart" => Ok(Command::Restart),
+        "reinstall" => Ok(Command::Reinstall),
         "status" => Ok(Command::Status),
         "diag doctor" => Ok(Command::DiagDoctor),
+        "diag logs" => {
+            let tail = match flag(flags, "tail") {
+                Some(f) => {
+                    let raw = f.value.as_deref().unwrap_or_default();
+                    // Zero is a usage error, not "print nothing": asking for no
+                    // lines is never what someone means.
+                    raw.parse::<usize>()
+                        .ok()
+                        .filter(|n| (1..=crate::logs::MAX_TAIL).contains(n))
+                        .ok_or_else(|| ParseError::InvalidValue {
+                            verb: spec.name,
+                            flag: "tail",
+                            value: raw.to_string(),
+                        })?
+                }
+                None => crate::logs::DEFAULT_TAIL,
+            };
+            Ok(Command::DiagLogs { tail })
+        }
+        "diag export" => Ok(Command::DiagExport),
+        "reset-network" => Ok(Command::ResetNetwork {
+            confirmed: flag(flags, "confirm").is_some(),
+        }),
         "version" => Ok(Command::Version),
         "help" => Ok(Command::Help),
         // Unreachable while every declared verb is built above — and the test
@@ -254,6 +288,31 @@ mod tests {
     #[test]
     fn no_arguments_is_help_never_an_action() {
         assert_eq!(p(&[]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn reset_network_parses_and_carries_confirmation_rather_than_demanding_it() {
+        // Parsing must SUCCEED without --confirm: the refusal is a distinct
+        // answer with its own exit code, not a usage error.
+        assert_eq!(
+            p(&["reset-network"]),
+            Ok(Command::ResetNetwork { confirmed: false })
+        );
+        assert_eq!(
+            p(&["reset-network", "--confirm"]),
+            Ok(Command::ResetNetwork { confirmed: true })
+        );
+    }
+
+    #[test]
+    fn reset_network_rejects_a_value_on_the_confirmation_switch() {
+        assert_eq!(
+            p(&["reset-network", "--confirm=yes"]),
+            Err(ParseError::UnexpectedValue {
+                verb: "reset-network",
+                flag: "confirm"
+            })
+        );
     }
 
     #[test]

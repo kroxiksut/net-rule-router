@@ -37,8 +37,9 @@
 //! that can answer `service.health.get` but cannot apply policy.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_diagnostics::{AuditRetentionPolicy, LogRetentionPolicy, ManualCleanupScope};
 use nrr_platform_api::AdapterMonitor;
@@ -58,6 +59,68 @@ use crate::service_tasks::{
     TASK_ID_DIAGNOSTICS_CLEANUP, TASK_ID_IPC_ACCEPT_LOOP, TASK_ID_IPC_SHUTDOWN_WATCHER,
 };
 use crate::state::{ServiceHealthSeverity, ServiceRuntimeState, ServiceShutdownReason};
+
+// ── Teardown pacing ──────────────────────────────────────────────────────────
+
+/// How often the teardown re-reports `Stopping` to the controller. Well under
+/// SCM's 30 s wait hint, so a long strip never reads as "not responding".
+const STOP_PROGRESS_TICK: Duration = Duration::from_secs(2);
+
+/// Heartbeat wake-up granularity — also how long a fast teardown waits for the
+/// reporter thread to notice it is done.
+const STOP_PROGRESS_POLL: Duration = Duration::from_millis(100);
+
+/// Budget for stopping the DNS resolver. The serve loop polls at 500 ms and
+/// then restores the NRPT redirect, which shells out and takes seconds.
+const RESOLVER_STOP_BUDGET: Duration = Duration::from_secs(5);
+
+/// Budget for dropping a re-arm guard. Its worker can be mid-recompute; the
+/// teardown latch already stops it from applying anything.
+const REARM_STOP_BUDGET: Duration = Duration::from_secs(3);
+
+/// Run one teardown step off-thread and wait at most `budget` for it.
+///
+/// Every OS-facing step here can park indefinitely (an NRPT restore, a cancel
+/// that waits on an in-flight callback, a WFP transaction). Reaching the route
+/// and filter strip matters more than finishing any one of them, so a step that
+/// overruns is left to finish on its own and the teardown moves on.
+fn teardown_step<F>(name: &'static str, budget: Duration, work: F)
+where
+    F: FnOnce() + Send + 'static,
+{
+    tracing::info!(target: "nrr::lifecycle", step = name, "teardown step entered");
+    let began = Instant::now();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("nrr-stop-{name}"))
+        .spawn(move || {
+            work();
+            let _ = done_tx.send(());
+        });
+    if let Err(e) = spawned {
+        tracing::error!(
+            target: "nrr::lifecycle",
+            step = name,
+            error = %e,
+            "teardown step could not be spawned — skipped",
+        );
+        return;
+    }
+    match done_rx.recv_timeout(budget) {
+        Ok(()) => tracing::info!(
+            target: "nrr::lifecycle",
+            step = name,
+            elapsed_ms = began.elapsed().as_millis() as u64,
+            "teardown step finished",
+        ),
+        Err(_) => tracing::warn!(
+            target: "nrr::lifecycle",
+            step = name,
+            budget_ms = budget.as_millis() as u64,
+            "teardown step outran its budget — detached, continuing",
+        ),
+    }
+}
 
 // ── SupervisedRuntimeDeps ────────────────────────────────────────────────────
 
@@ -299,6 +362,9 @@ pub fn run_supervised_runtime(
     artifacts: BootstrapArtifacts,
     deps: SupervisedRuntimeDeps,
 ) -> ServiceShutdownReason {
+    // A second runtime in the same process (tests, console restart) must not be
+    // born already tearing down.
+    crate::lifecycle::clear_teardown();
     controller.report(ServiceRuntimeState::Starting);
 
     let blocked = !artifacts.is_ready_to_run();
@@ -450,51 +516,108 @@ pub fn run_supervised_runtime(
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    let teardown_began = Instant::now();
+    // Latch BEFORE anything is stripped: workers that never got a stop-token
+    // clone (fake-IP watchdog, network-change re-arm) would otherwise re-install
+    // routes and WFP filters behind the teardown, and those outlive the process.
+    crate::lifecycle::begin_teardown();
+    tracing::info!(target: "nrr::lifecycle", "stop requested — teardown begins");
     controller.report(ServiceRuntimeState::Stopping);
-    // Mode B (live re-arm): terminally shut the resolver down FIRST, so its serve
-    // loop exits, the NRPT redirect is restored, and `:53` is released before the
-    // rest of teardown. `shutdown()` flips the flag, JOINs, AND latches the
-    // controller `disarmed` — so an IPC `set(enforcement_mode=Resolver)` still
-    // in flight during teardown (the writer calls `apply` after dropping the DB
-    // lock, and IPC workers are not drained until `supervisor.shutdown()` below)
-    // can NEVER re-arm the resolver after this point. Without the latch that
-    // re-arm would spawn a fresh resolver whose NRPT redirect + `:53` bind
-    // outlive the process, leaving the OS DNS pointed at a dead listener until
-    // the next boot's `clear_orphan_redirect`. Idempotent for an already-stopped
-    // resolver (Reactive / never armed).
-    if let Some(controller) = resolver_controller.as_ref() {
-        controller.shutdown();
-    }
-    // stop the network-change observer next: its guard
-    // cancels the OS notifications (blocking until any in-flight callback
-    // returns) and stops the debounce thread, so no re-arm fires mid-teardown.
-    drop(network_rearm.take());
-    drop(power_rearm.take());
-    let report = supervisor.shutdown();
-    if report.timed_out() {
-        tracing::warn!(
-            target: "nrr::supervisor",
-            total = report.total as u32,
-            clean = report.clean as u32,
-            detached = %report.detached.join(", "),
-            "supervisor shutdown timed out — some tasks were detached",
-        );
-    } else {
-        tracing::info!(
-            target: "nrr::supervisor",
-            total = report.total as u32,
-            clean = report.clean as u32,
-            "supervisor drained cleanly",
-        );
-    }
-    // restore pristine networking on stop: now that the
-    // supervisor's tasks (which could re-add routes) have stopped, remove every
-    // NRR-owned route. Runs on every graceful stop path (SCM Stop / Shutdown /
-    // Ctrl+C). A crash skips this; startup orphan-adoption cleans up next run.
-    if let Some(teardown) = deps.route_teardown_hook.as_ref() {
-        teardown();
-    }
+
+    // SCM reads a rising checkpoint as progress; reporting `Stopping` once and
+    // then parking in a blocking OS call is what makes a slow stop read as a
+    // wedged one. Keep reporting for as long as teardown runs.
+    let teardown_done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut since_report = Duration::ZERO;
+            while !teardown_done.load(Ordering::Relaxed) {
+                std::thread::sleep(STOP_PROGRESS_POLL);
+                since_report += STOP_PROGRESS_POLL;
+                if since_report >= STOP_PROGRESS_TICK && !teardown_done.load(Ordering::Relaxed) {
+                    since_report = Duration::ZERO;
+                    controller.report(ServiceRuntimeState::Stopping);
+                }
+            }
+        });
+
+        // Mode B (live re-arm): terminally shut the resolver down FIRST, so its serve
+        // loop exits, the NRPT redirect is restored, and `:53` is released before the
+        // rest of teardown. `shutdown()` flips the flag, JOINs, AND latches the
+        // controller `disarmed` — so an IPC `set(enforcement_mode=Resolver)` still
+        // in flight during teardown (the writer calls `apply` after dropping the DB
+        // lock, and IPC workers are not drained until `supervisor.shutdown()` below)
+        // can NEVER re-arm the resolver after this point. Without the latch that
+        // re-arm would spawn a fresh resolver whose NRPT redirect + `:53` bind
+        // outlive the process, leaving the OS DNS pointed at a dead listener until
+        // the next boot's `clear_orphan_redirect`. Idempotent for an already-stopped
+        // resolver (Reactive / never armed).
+        if let Some(resolver) = resolver_controller.clone() {
+            teardown_step("dns-resolver-stop", RESOLVER_STOP_BUDGET, move || {
+                resolver.shutdown();
+            });
+        }
+        // stop the network-change observer next: its guard
+        // cancels the OS notifications (blocking until any in-flight callback
+        // returns) and stops the debounce thread, so no re-arm fires mid-teardown.
+        // The latch above already stopped it from enforcing, so a straggler that
+        // outlives the budget can only finish, never re-apply.
+        if let Some(rearm) = network_rearm.take() {
+            teardown_step("network-rearm-stop", REARM_STOP_BUDGET, move || drop(rearm));
+        }
+        if let Some(rearm) = power_rearm.take() {
+            teardown_step("power-rearm-stop", REARM_STOP_BUDGET, move || drop(rearm));
+        }
+
+        let drain_began = Instant::now();
+        tracing::info!(target: "nrr::lifecycle", step = "supervisor-drain", "teardown step entered");
+        let report = supervisor.shutdown();
+        let drain_ms = drain_began.elapsed().as_millis() as u64;
+        if report.timed_out() {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                total = report.total as u32,
+                clean = report.clean as u32,
+                detached = %report.detached.join(", "),
+                elapsed_ms = drain_ms,
+                "supervisor shutdown timed out — some tasks were detached",
+            );
+        } else {
+            tracing::info!(
+                target: "nrr::supervisor",
+                total = report.total as u32,
+                clean = report.clean as u32,
+                elapsed_ms = drain_ms,
+                "supervisor drained cleanly",
+            );
+        }
+        // restore pristine networking on stop: now that the
+        // supervisor's tasks (which could re-add routes) have stopped, remove every
+        // NRR-owned route. Runs on every graceful stop path (SCM Stop / Shutdown /
+        // Ctrl+C). A crash skips this; startup orphan-adoption cleans up next run.
+        // Deliberately NOT time-boxed: a filter left behind blocks traffic until
+        // the next start, so this one is worth waiting for however long it takes.
+        if let Some(teardown) = deps.route_teardown_hook.as_ref() {
+            let hook_began = Instant::now();
+            tracing::info!(target: "nrr::lifecycle", step = "route-and-filter-teardown", "teardown step entered");
+            teardown();
+            tracing::info!(
+                target: "nrr::lifecycle",
+                step = "route-and-filter-teardown",
+                elapsed_ms = hook_began.elapsed().as_millis() as u64,
+                "teardown step finished",
+            );
+        }
+
+        teardown_done.store(true, Ordering::Relaxed);
+    });
+
     controller.report(ServiceRuntimeState::Stopped);
+    tracing::info!(
+        target: "nrr::lifecycle",
+        elapsed_ms = teardown_began.elapsed().as_millis() as u64,
+        "teardown complete — service stopped",
+    );
 
     // Keep `artifacts` alive until the very end so any background ports
     // (e.g. `Arc<LogWriter>` shared with the global tracing subscriber

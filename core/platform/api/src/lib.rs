@@ -61,6 +61,10 @@ pub mod network_change;
 // the list become — is pure and lives here; the mechanism is per-OS (per-user
 // environment store on Windows, a shell start-up file on Unix).
 pub mod path_registration;
+// Where the production service keeps state and operational logs. The leaf comes
+// from the product identity, the OS shape (`%ProgramData%` / FHS split) is this
+// crate's business — declared once so a rename cannot land in one place only.
+pub mod paths;
 // Suspend/resume. The OS notifications that fire while the machine sleeps are
 // gone by the time we run again, so this is the only way to learn a wake
 // happened; the mechanism is per-OS, the reaction is neutral.
@@ -75,6 +79,10 @@ pub mod routing;
 // backends implement it over SCM (Windows) and systemd (Linux); the console and
 // the service binary's own verbs code against the trait.
 pub mod service_control;
+// Session-scoped single-instance claim for the desktop surfaces. A kernel
+// object on Windows, an abstract socket on Linux — anything the user cannot
+// delete and the OS releases when the owner dies.
+pub mod single_instance;
 pub mod snapshot;
 pub mod strategy;
 // Attribution + provenance of the third-party binaries we ship (today:

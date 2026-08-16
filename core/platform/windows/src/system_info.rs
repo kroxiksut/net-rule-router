@@ -12,15 +12,22 @@
 
 #![allow(unsafe_code)]
 
+#[cfg(target_os = "windows")]
 use std::ffi::c_void;
 
+#[cfg(target_os = "windows")]
 use nrr_shared::system_info::SystemInfo;
+#[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
+#[cfg(target_os = "windows")]
 use windows::Win32::Foundation::ERROR_SUCCESS;
+#[cfg(target_os = "windows")]
 use windows::Win32::System::Registry::{RegGetValueW, HKEY, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+#[cfg(target_os = "windows")]
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 /// Collect this Windows host's system information for the diagnostic archive.
+#[cfg(target_os = "windows")]
 pub fn collect() -> SystemInfo {
     let mut info = SystemInfo::from_std();
 
@@ -60,7 +67,9 @@ pub fn collect() -> SystemInfo {
 }
 
 /// Compose a human-readable OS version from the registry pieces, tolerating
-/// any subset being absent. Pure — unit-tested.
+/// any subset being absent. Pure — unit-tested; only `collect()` (Windows-only)
+/// calls it in production, so it is otherwise dead off-Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn format_os_version(
     product: Option<String>,
     display: Option<String>,
@@ -94,10 +103,12 @@ fn format_os_version(
 
 /// First build that is Windows 11; `ProductName` keeps saying "Windows 10"
 /// there, so the build number is the only honest source of the generation.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 const WINDOWS_11_FIRST_BUILD: u32 = 22000;
 
 /// Rewrite a stale "Windows 10 …" product name on a Windows 11 build, keeping
 /// the edition intact ("Windows 10 Enterprise LTSC 2024" → "Windows 11 …").
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn correct_windows_11_product(product: &str, build: u32) -> String {
     if build < WINDOWS_11_FIRST_BUILD {
         return product.to_string();
@@ -109,6 +120,7 @@ fn correct_windows_11_product(product: &str, build: u32) -> String {
 }
 
 /// Read a `REG_SZ` value. Two-pass (size, then read). `None` on any failure.
+#[cfg(target_os = "windows")]
 fn reg_sz(root: HKEY, subkey: &str, value: &str) -> Option<String> {
     let subkey_w = wide(subkey);
     let value_w = wide(value);
@@ -155,6 +167,7 @@ fn reg_sz(root: HKEY, subkey: &str, value: &str) -> Option<String> {
 }
 
 /// Total physical RAM in bytes via `GlobalMemoryStatusEx`. `None` on failure.
+#[cfg(target_os = "windows")]
 fn total_physical_ram_bytes() -> Option<u64> {
     let mut status = MEMORYSTATUSEX {
         dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -171,6 +184,7 @@ fn total_physical_ram_bytes() -> Option<u64> {
 }
 
 /// NUL-terminated UTF-16 for a `PCWSTR` argument.
+#[cfg(target_os = "windows")]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

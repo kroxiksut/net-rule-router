@@ -687,9 +687,17 @@ fn is_brand_related(anchor: &str, candidate: &str) -> bool {
 /// Anchored on purpose. A brand found anywhere INSIDE a label is a collision,
 /// not a relation: `istu` sits in the middle of `aistudio`, and reading that as
 /// kinship proposed a university's domain as a companion of Google's AI studio.
+///
+/// Only the REGISTRABLE domain is searched. A brand sitting in a subdomain of
+/// somebody else's apex names the customer, not the owner: `mozilla.map.fastly.net`
+/// is a Fastly machine, and treating it as kin proposed moving all of
+/// `mozilla.org` onto the additional link. Ownership shapes survive, because
+/// they put the brand in the registrable domain itself (`dzeninfra.ru`,
+/// `githubusercontent.com`).
 fn carries_brand(name: &str, brand: &str) -> bool {
     brand.len() >= MIN_BRAND_TOKEN_LEN
-        && name
+        && registrable_domain(name)
+            .unwrap_or(name)
             .split(['.', '-'])
             .any(|label| label.starts_with(brand) || label.ends_with(brand))
 }
@@ -1509,11 +1517,18 @@ impl CompanionAffinityLedger {
                 // Co-activity alone says nothing of the kind — a host that
                 // merely loaded at the same time must not drag its siblings
                 // onto the route.
-                let generalizes_alone = subdomains.iter().any(|m| {
-                    matches!(
-                        m.signal,
-                        CompanionSignal::BrandRelated | CompanionSignal::DeliveryName
-                    )
+                //
+                // The evidence has to hold for the APEX, though, not just for
+                // the one subdomain that was seen. `cdn.auth0.com` is a delivery
+                // name under a service's own domain: generalizing it moved all
+                // of `auth0.com` — sign-in included — onto the additional link
+                // on the strength of one asset host. A dedicated delivery apex
+                // (`cdninstagram.com`, `googlevideo.com`, `ytimg.com`) carries
+                // the mask itself, and that is the shape worth generalizing.
+                let generalizes_alone = subdomains.iter().any(|m| match m.signal {
+                    CompanionSignal::BrandRelated => is_brand_related(anchor_name, apex),
+                    CompanionSignal::DeliveryName => is_delivery_named(apex),
+                    CompanionSignal::CoActivity => false,
                 });
                 let suffix_proposed = !subdomains.is_empty()
                     && (generalizes_alone || subdomains.len() >= SUFFIX_MIN_DISTINCT_SUBDOMAINS)
@@ -2045,6 +2060,42 @@ mod tests {
         assert!(ledger.proposals(10_000, &NoExclusions).is_empty());
     }
 
+    #[test]
+    fn a_brand_sitting_in_someone_elses_subdomain_is_not_a_relation() {
+        // From a live run: a Fastly machine named after its customer offered to
+        // move all of mozilla.org onto the additional link.
+        let mut ledger = defaults();
+        page_load(
+            &mut ledger,
+            0,
+            "mozilla.map.fastly.net",
+            SECONDARY,
+            &["mozilla.org"],
+        );
+
+        assert!(
+            ledger.proposals(10_000, &NoExclusions).is_empty(),
+            "the brand names Fastly's customer, not Fastly's kin"
+        );
+    }
+
+    #[test]
+    fn a_brand_in_the_registrable_domain_is_still_a_relation() {
+        // The shape the rule must keep: the brand is in the apex itself.
+        let mut ledger = defaults();
+        page_load(
+            &mut ledger,
+            0,
+            "user-images.githubusercontent.com",
+            SECONDARY,
+            &["github.com"],
+        );
+
+        let proposals = ledger.proposals(10_000, &NoExclusions);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
+    }
+
     // ── Tier 2: delivery names ───────────────────────────────────────────────
 
     #[test]
@@ -2055,7 +2106,7 @@ mod tests {
             0,
             "site.test",
             SECONDARY,
-            &["img.delivery.net"],
+            &["img.edgefarm.net"],
         );
         assert!(ledger.proposals(10_000, &NoExclusions).is_empty());
 
@@ -2064,11 +2115,11 @@ mod tests {
             100_000,
             "site.test",
             SECONDARY,
-            &["img.delivery.net"],
+            &["img.edgefarm.net"],
         );
         let proposals = ledger.proposals(150_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
-        assert_eq!(proposals[0].proposed.value(), "delivery.net");
+        assert_eq!(proposals[0].proposed.value(), "edgefarm.net");
         assert_eq!(proposals[0].signal, CompanionSignal::DeliveryName);
     }
 
@@ -2080,11 +2131,11 @@ mod tests {
         let mut ledger = defaults();
         let anchor = CoActivityKind::Anchor { route: SECONDARY };
         ledger.observe(0, "site.test", anchor);
-        ledger.observe(1_000, "img.delivery.net", CoActivityKind::CandidateInUse);
+        ledger.observe(1_000, "img.edgefarm.net", CoActivityKind::CandidateInUse);
 
         let proposals = ledger.proposals(10_000, &NoExclusions);
         assert_eq!(proposals.len(), 1, "one visit was enough");
-        assert_eq!(proposals[0].proposed.value(), "delivery.net");
+        assert_eq!(proposals[0].proposed.value(), "edgefarm.net");
         assert_eq!(proposals[0].signal, CompanionSignal::DeliveryName);
     }
 
@@ -2097,9 +2148,9 @@ mod tests {
         let anchor = CoActivityKind::Anchor { route: SECONDARY };
         ledger.observe(0, "other.test", anchor);
         ledger.observe(1_000, "site.test", anchor);
-        ledger.observe(2_000, "img.delivery.net", CoActivityKind::CandidateInUse);
+        ledger.observe(2_000, "img.edgefarm.net", CoActivityKind::CandidateInUse);
         ledger.observe(3_000, "other.test", anchor);
-        ledger.observe(4_000, "img.delivery.net", CoActivityKind::Candidate);
+        ledger.observe(4_000, "img.edgefarm.net", CoActivityKind::Candidate);
 
         assert!(ledger.proposals(10_000, &NoExclusions).is_empty());
     }
@@ -2113,7 +2164,7 @@ mod tests {
         for start in [0_u64, 100_000] {
             ledger.observe(start, "far.test", anchor);
             ledger.observe(start + 1_000, "near.test", anchor);
-            ledger.observe(start + 2_000, "img.delivery.net", CoActivityKind::Candidate);
+            ledger.observe(start + 2_000, "img.edgefarm.net", CoActivityKind::Candidate);
         }
 
         let proposals = ledger.proposals(150_000, &NoExclusions);
@@ -2134,7 +2185,7 @@ mod tests {
         let anchor = CoActivityKind::Anchor { route: SECONDARY };
         contested.observe(0, "opened-by-the-user.test", anchor);
         contested.observe(800, "chatty-ttl.test", anchor);
-        contested.observe(1_000, "img.delivery.net", CoActivityKind::CandidateInUse);
+        contested.observe(1_000, "img.edgefarm.net", CoActivityKind::CandidateInUse);
         assert!(contested.proposals(10_000, &NoExclusions).is_empty());
 
         // The same sighting with the rival long quiet still publishes at once —
@@ -2142,7 +2193,7 @@ mod tests {
         let mut clear = defaults();
         clear.observe(0, "chatty-ttl.test", anchor);
         clear.observe(30_000, "opened-by-the-user.test", anchor);
-        clear.observe(31_000, "img.delivery.net", CoActivityKind::CandidateInUse);
+        clear.observe(31_000, "img.edgefarm.net", CoActivityKind::CandidateInUse);
         let proposals = clear.proposals(40_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].anchor_hostname, "opened-by-the-user.test");
@@ -2159,7 +2210,7 @@ mod tests {
             ledger.observe(start + 800, "chatty-ttl.test", anchor);
             ledger.observe(
                 start + 1_000,
-                "img.delivery.net",
+                "img.edgefarm.net",
                 CoActivityKind::CandidateInUse,
             );
         }
@@ -2328,6 +2379,24 @@ mod tests {
     }
 
     #[test]
+    fn a_delivery_name_under_a_services_own_domain_stays_exact() {
+        // From a live run: one asset host offered to move the whole service —
+        // sign-in included — onto the additional link.
+        let mut ledger = defaults();
+        for at in [0_u64, 100_000] {
+            page_load(&mut ledger, at, "site.test", SECONDARY, &["cdn.auth0.com"]);
+        }
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].proposed.value(),
+            "cdn.auth0.com",
+            "an asset host under a service's own apex is evidence about itself only"
+        );
+    }
+
+    #[test]
     fn a_shard_shaped_name_is_proposed_but_a_numbered_label_is_not() {
         let mut ledger = defaults();
         let anchor = CoActivityKind::Anchor { route: SECONDARY };
@@ -2336,9 +2405,12 @@ mod tests {
         for start in [0_u64, 100_000] {
             ledger.observe(start, "other.test", anchor);
             ledger.observe(start + 1_000, "site.test", anchor);
-            for (i, host) in ["rr5---sn-ajaig5-5a.shardhost.net", "s07.upd3.kaspersky.com"]
-                .iter()
-                .enumerate()
+            for (i, host) in [
+                "rr5---sn-ajaig5-5a.googlevideo.com",
+                "s07.upd3.kaspersky.com",
+            ]
+            .iter()
+            .enumerate()
             {
                 ledger.observe(start + 2_000 + i as u64, host, CoActivityKind::Candidate);
             }
@@ -2346,7 +2418,7 @@ mod tests {
 
         let proposals = ledger.proposals(150_000, &NoExclusions);
         let values: Vec<&str> = proposals.iter().map(|p| p.proposed.value()).collect();
-        assert_eq!(values, vec!["shardhost.net"]);
+        assert_eq!(values, vec!["googlevideo.com"]);
         assert_eq!(proposals[0].anchor_hostname, "site.test");
     }
 
@@ -2459,7 +2531,7 @@ mod tests {
             0,
             "site.test",
             SECONDARY,
-            &["img.delivery.net"],
+            &["img.edgefarm.net"],
         );
         assert!(
             ledger.proposals(10_000, &NoExclusions).is_empty(),
@@ -2467,7 +2539,7 @@ mod tests {
         );
         health(
             &mut ledger,
-            "img.delivery.net",
+            "img.edgefarm.net",
             PrimaryHealthEvent::Stalled,
             PRIMARY_STALL_CONFIRMATIONS,
         );
@@ -2484,17 +2556,17 @@ mod tests {
         // says nothing about which of them it belongs to, however badly it
         // behaves.
         let mut ledger = defaults();
-        page_load(&mut ledger, 0, "a.test", SECONDARY, &["img.delivery.net"]);
+        page_load(&mut ledger, 0, "a.test", SECONDARY, &["img.edgefarm.net"]);
         page_load(
             &mut ledger,
             1_000,
             "b.test",
             SECONDARY,
-            &["img.delivery.net"],
+            &["img.edgefarm.net"],
         );
         health(
             &mut ledger,
-            "img.delivery.net",
+            "img.edgefarm.net",
             PrimaryHealthEvent::Stalled,
             PRIMARY_STALL_CONFIRMATIONS,
         );
@@ -2510,7 +2582,7 @@ mod tests {
                 0,
                 "site.test",
                 SECONDARY,
-                &["cdn.delivery.net", "helper.other"],
+                &["assets.edgefarm.net", "helper.other"],
             );
         };
 
@@ -2530,7 +2602,7 @@ mod tests {
         // Only the delivery-shaped name is released; the plain one still has to
         // earn its proposal through the co-activity tier.
         let values: Vec<&str> = proposals.iter().map(|p| p.proposed.value()).collect();
-        assert_eq!(values, vec!["delivery.net"]);
+        assert_eq!(values, vec!["edgefarm.net"]);
         assert_eq!(proposals[0].signal, CompanionSignal::DeliveryName);
     }
 

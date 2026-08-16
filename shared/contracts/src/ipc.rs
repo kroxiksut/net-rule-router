@@ -36,19 +36,70 @@ impl fmt::Display for IpcInteractionClass {
     }
 }
 
+/// What kind of client is on the other end, and therefore what it is allowed to
+/// ask for.
+///
+/// A profile can only ever NARROW what an already-authorized caller may do — it
+/// is not an authorization mechanism of its own. The real gates are the channel
+/// ACL (Windows) or the socket directory's `0700` (Unix), the per-principal
+/// partition, and the elevation requirement on privileged classes. What the
+/// profile adds is that a client which has no business changing policy cannot do
+/// so by accident or by bug.
+///
+/// How the profile is established differs per OS, and honestly so: Windows
+/// PROVES it from the connecting executable, while `SO_PEERCRED` on Unix yields
+/// uid/pid/gid but not the executable, so there the caller declares its kind at
+/// handshake time and is held to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IpcClientProfile {
     GuiInteractive,
     TrayLightweight,
+    /// The administrative console: reads and diagnoses, never changes policy.
+    AdminConsole,
 }
 
 impl IpcClientProfile {
-    pub const ALL: [Self; 2] = [Self::GuiInteractive, Self::TrayLightweight];
+    pub const ALL: [Self; 3] = [
+        Self::GuiInteractive,
+        Self::TrayLightweight,
+        Self::AdminConsole,
+    ];
 
     pub const fn slug(self) -> &'static str {
         match self {
             Self::GuiInteractive => "gui-interactive",
             Self::TrayLightweight => "tray-lightweight",
+            Self::AdminConsole => "admin-console",
+        }
+    }
+
+    /// Whether a caller with this profile may invoke an operation of `class`.
+    ///
+    /// Only the console is restricted, and only to the classes that change
+    /// nothing: it exists to inspect and to collect diagnostics. Keeping the
+    /// rule here — rather than as a discipline inside the console's own code —
+    /// is what makes it hold when the console has a bug.
+    pub const fn permits(self, class: crate::ipc_transport::IpcOperationClass) -> bool {
+        use crate::ipc_transport::IpcOperationClass as C;
+        match self {
+            Self::GuiInteractive | Self::TrayLightweight => true,
+            Self::AdminConsole => matches!(
+                class,
+                C::ReadSnapshot | C::DiagnosticQuery | C::DiagnosticAction
+            ),
+        }
+    }
+
+    /// The narrower of two profiles: what the OS proved, and what the caller
+    /// declared. Declaration never widens.
+    pub fn narrowed_by(self, declared: Self) -> Self {
+        // Ordering is by capability, and only the console is narrower than the
+        // rest — a two-value comparison rather than a general lattice, because
+        // inventing an order over "gui vs tray" would be fiction.
+        if declared == Self::AdminConsole || self == Self::AdminConsole {
+            Self::AdminConsole
+        } else {
+            self
         }
     }
 }

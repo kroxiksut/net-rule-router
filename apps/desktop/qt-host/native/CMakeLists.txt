@@ -11,17 +11,27 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
 
 qt_standard_project_setup()
 
-set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets/icons/app/app.ico")
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.rc.in
-    ${CMAKE_CURRENT_BINARY_DIR}/generated_app.rc
-    @ONLY
-)
+set(NRR_HOST_SOURCES src/main.cpp)
 
+# The PE resource script carries the executable's icon. It is a Windows
+# concept — a `.rc` in the source list of a Linux build has no compiler to
+# handle it — so it is generated and added only there. On Linux the icon comes
+# from the desktop entry the packaging step installs.
+if(WIN32)
+    set(APP_ICON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets/icons/app/app.ico")
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/resources/app.rc.in
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_app.rc
+        @ONLY
+    )
+    list(APPEND NRR_HOST_SOURCES ${CMAKE_CURRENT_BINARY_DIR}/generated_app.rc)
+endif()
+
+# `WIN32` sets the subsystem so no console is allocated; on every other
+# platform CMake ignores the keyword.
 qt_add_executable(nrr_qt_native_host
     WIN32
-    src/main.cpp
-    ${CMAKE_CURRENT_BINARY_DIR}/generated_app.rc
+    ${NRR_HOST_SOURCES}
 )
 
 # Bake absolute QML paths so the host can locate them regardless of where

@@ -22,6 +22,12 @@ path = "src/main.rs"
 nrr-platform-api = { path = "../../core/platform/api" }
 # Product identity: the console prints and derives names, never types them.
 nrr-shared = { path = "../../shared/contracts" }
+# `diag export` asks the SERVICE to build the archive rather than assembling a
+# second one here — that is what keeps the console's archive byte-identical to
+# the application's. The console is held to reading by
+# `IpcClientProfile::AdminConsole`, which the service enforces.
+nrr-ipc-client = { path = "../../core/ipc-client" }
+serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 # The SCM implementation of the service-control port.

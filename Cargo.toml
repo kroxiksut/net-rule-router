@@ -6,6 +6,10 @@ members = [
   "core/platform/api",
   "core/platform/windows",
   "core/platform/linux",
+  # A standalone nf_tables netlink library, kept dependency-free of the product
+  # so it can leave this repository as its own published crate.
+  # `tests/independence.rs` enforces that.
+  "core/platform/nftlink",
   "core/storage",
   "core/storage-sidecar",
   "core/diagnostics",

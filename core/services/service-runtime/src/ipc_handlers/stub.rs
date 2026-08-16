@@ -13,6 +13,24 @@ use nrr_shared::ipc::IpcOperationName;
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
+use crate::managers::PolicyManager;
+
+/// `PolicyManager` for a runtime that has no policy store to read: the
+/// recovery-blocked Windows path (the state DB would not open) and the Linux
+/// daemon before its runtime deps exist. Every answer is the safe default, so
+/// the snapshot and health handlers report an honest "needs recovery" instead
+/// of failing the call.
+pub struct DegradedPolicyManager;
+
+impl PolicyManager for DegradedPolicyManager {
+    fn load_active(&self) -> crate::state::ServicePolicyState {
+        crate::state::ServicePolicyState::RecoveryRequired
+    }
+
+    fn current_revision(&self) -> Option<crate::state::ActiveRevisionState> {
+        None
+    }
+}
 
 pub struct UnimplementedHandler {
     op: IpcOperationName,

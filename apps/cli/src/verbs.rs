@@ -62,15 +62,43 @@ const PURGE_FLAG: FlagSpec = FlagSpec {
     summary: "also delete the service-owned data directory (user rule files are kept)",
 };
 
+const CONFIRM_FLAG: FlagSpec = FlagSpec {
+    name: "confirm",
+    value: None,
+    summary: "required: this drops leftover network state, so it is never implied",
+};
+
+const TAIL_FLAG: FlagSpec = FlagSpec {
+    name: "tail",
+    value: Some("N"),
+    summary: "how many of the newest lines to print (default 50)",
+};
+
 /// Subverbs of `diag`. The group exists because diagnostics is the part of
 /// this console that keeps growing; the lifecycle above does not.
-const DIAG_SUBVERBS: &[VerbSpec] = &[VerbSpec {
-    name: "doctor",
-    summary: "Check this installation and report what is wrong with it",
-    flags: &[],
-    privilege: Privilege::Any,
-    subverbs: &[],
-}];
+const DIAG_SUBVERBS: &[VerbSpec] = &[
+    VerbSpec {
+        name: "doctor",
+        summary: "Check this installation and report what is wrong with it",
+        flags: &[],
+        privilege: Privilege::Any,
+        subverbs: &[],
+    },
+    VerbSpec {
+        name: "logs",
+        summary: "Print the tail of the service's operational log",
+        flags: &[TAIL_FLAG],
+        privilege: Privilege::Any,
+        subverbs: &[],
+    },
+    VerbSpec {
+        name: "export",
+        summary: "Ask the service for a diagnostic archive and print its path",
+        flags: &[],
+        privilege: Privilege::Any,
+        subverbs: &[],
+    },
+];
 
 /// Every verb this console accepts.
 pub static VERBS: &[VerbSpec] = &[
@@ -109,6 +137,16 @@ pub static VERBS: &[VerbSpec] = &[
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
+    // What `doctor` tells the operator to do when the registered service is a
+    // different copy than the one next to this console — until now there was no
+    // single command for it.
+    VerbSpec {
+        name: "reinstall",
+        summary: "Re-register the service from this directory and start it",
+        flags: &[],
+        privilege: Privilege::Administrator,
+        subverbs: &[],
+    },
     VerbSpec {
         name: "status",
         summary: "Show whether the service is installed, running, and how it starts",
@@ -122,6 +160,13 @@ pub static VERBS: &[VerbSpec] = &[
         flags: &[],
         privilege: Privilege::Any,
         subverbs: DIAG_SUBVERBS,
+    },
+    VerbSpec {
+        name: "reset-network",
+        summary: "Remove network state a crashed service left behind",
+        flags: &[CONFIRM_FLAG],
+        privilege: Privilege::Administrator,
+        subverbs: &[],
     },
     VerbSpec {
         name: "version",
@@ -401,9 +446,12 @@ mod tests {
             .expect("the console reference must exist at docs/en/cli.md");
         let text = std::fs::read_to_string(&doc).expect("the console reference must be readable");
         for (spelling, _) in invocable() {
+            // The VERB TABLE row, not a mention: prose naming a verb as absent
+            // ("not in this build yet: …") satisfied a plain `contains` and let
+            // an undocumented verb ship as documented.
             assert!(
-                text.contains(&format!("`{spelling}`")),
-                "docs/en/cli.md does not document `{spelling}`"
+                text.contains(&format!("| `{spelling}` |")),
+                "docs/en/cli.md has no verb-table row for `{spelling}`"
             );
         }
     }

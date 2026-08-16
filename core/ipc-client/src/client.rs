@@ -398,29 +398,22 @@ enum HandshakeResult {
 }
 
 fn handshake(pipe: &SendableHandle) -> HandshakeResult {
+    // No progress printing here. This library runs inside binaries whose stdout
+    // and stderr ARE their interface — the console's output is what a script
+    // reads — so a stray line from the transport is output nobody asked for.
+    // Every failure below already travels back as a typed `TransportError`,
+    // which the caller renders where it belongs.
     let request = build_contract_negotiate(CLIENT_PROTOCOL_VERSION);
     let mut io = match PipeIo::new(pipe.0) {
         Ok(io) => io,
-        Err(e) => {
-            eprintln!("[cli-dbg] handshake: PipeIo::new failed: {e}");
-            return HandshakeResult::TransportError(e.to_string());
-        }
+        Err(e) => return HandshakeResult::TransportError(e.to_string()),
     };
-    eprintln!("[cli-dbg] handshake: writing contract.negotiate request");
     if let Err(e) = write_frame(&mut io, &request) {
-        eprintln!("[cli-dbg] handshake: write_frame FAILED: {e}");
         return HandshakeResult::TransportError(e.to_string());
     }
-    eprintln!("[cli-dbg] handshake: write OK, reading response");
     let response: Value = match read_frame(&mut io) {
-        Ok(r) => {
-            eprintln!("[cli-dbg] handshake: read_frame OK, response={r}");
-            r
-        }
-        Err(e) => {
-            eprintln!("[cli-dbg] handshake: read_frame FAILED: {e}");
-            return HandshakeResult::TransportError(e.to_string());
-        }
+        Ok(r) => r,
+        Err(e) => return HandshakeResult::TransportError(e.to_string()),
     };
 
     // Interpretation of the negotiate frame is transport-neutral — shared with

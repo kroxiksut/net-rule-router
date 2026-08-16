@@ -16,6 +16,8 @@ presets/
 │       ├── README*.txt
 │       ├── rules_primary.txt  # optional
 │       └── rules_secondary.txt# optional
+├── abroad/                    # category: you live outside the country whose
+│   └── access-to-<cc>/        # services you need (same pack layout)
 └── COUNTRY_BACKLOG.md
 ```
 
@@ -42,6 +44,24 @@ request with rules and interface translations for the software.
 - Country folder must use lowercase ISO-style code (for example `ru`, `by`, `kz`).
 - Pack folder must use lowercase letters, digits, and hyphens (for example
   `example-vpn`, `corp-vpn`, `streaming-split`).
+- Underscores and capital letters are not allowed in either name. The GUI
+  identifies a pack as `<folder>_<pack>` and stores that string in user
+  preferences, so an underscore inside a name makes the identifier ambiguous,
+  and capitals break the identifier on case-sensitive filesystems.
+
+## Categories
+
+A top-level folder whose name is not a country code is a **category**: it groups
+packs by scenario rather than by the country you are sitting in.
+
+| Category | Meaning |
+|---|---|
+| `abroad` | You live outside the country whose services you need. Packs are named `access-to-<cc>` (for example `access-to-ru`). |
+
+Category packs use exactly the same layout and file names as country packs and
+appear in the same GUI list. Only the first-run wizard treats them differently:
+it suggests packs by the OS locale's country code, so a category pack is chosen
+manually from the full list.
 
 ## Required files in each pack
 

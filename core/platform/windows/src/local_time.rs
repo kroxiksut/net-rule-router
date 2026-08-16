@@ -1,6 +1,8 @@
 //! Windows implementation of the neutral local-time port: the machine's civil
 //! offset from UTC, daylight-aware, straight from the OS time-zone settings.
 
+#![cfg(target_os = "windows")]
+
 use nrr_platform_api::local_time::LocalTimeZonePort;
 
 /// Reads the current offset via `GetTimeZoneInformation` on every call, so a

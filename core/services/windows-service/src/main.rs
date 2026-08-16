@@ -99,6 +99,14 @@ fn main() -> std::process::ExitCode {
                 }
             }
         }
+        // Re-point the registration at THIS binary and bring it back up. A
+        // SINGLE-TOKEN verb on purpose: the broker runs one whitelisted argv
+        // token and cannot pass `<path>`, and the path we want is the one this
+        // process was started from — which is exactly what an updated copy
+        // launching from its own folder needs. Data is kept (`keep_data`), so
+        // rules, per-SID state and the audit trail survive the swap.
+        #[cfg(windows)]
+        "reinstall" => reinstall_from_this_binary(),
         // Elevated start-mode switch. Two SINGLE-TOKEN verbs, because the
         // session broker runs exactly one
         // whitelisted argv token (never a `<mode>` argument). `set-start-auto`
@@ -259,6 +267,74 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Re-register the service against the binary this process runs from, then
+/// start it.
+///
+/// The case it exists for: the user unpacks a newer build somewhere else and
+/// runs it, while the registration still points at the previous folder. Nothing
+/// else can fix that — an install on an existing name fails, and the old binary
+/// keeps starting with Windows.
+///
+/// Uninstall keeps the data (`keep_data`), and the start mode is restored to
+/// whatever was registered before, so the swap is invisible apart from the
+/// restart. A failure after the uninstall leaves the service unregistered, so
+/// the error text says so plainly rather than pretending nothing happened.
+#[cfg(windows)]
+fn reinstall_from_this_binary() -> std::process::ExitCode {
+    use nrr_platform_api::service_control::ServiceControlPort;
+    use nrr_service_runtime::{InstallConfig, UninstallConfig};
+
+    let binary_path = match env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("reinstall failed: cannot resolve this binary's path: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    };
+
+    let control = nrr_platform_windows::service_control::WindowsServiceControl::new();
+    let previous = control.query().ok().flatten();
+    // Deliberately NOT short-circuited when the registered path already matches:
+    // a binary replaced in place keeps the same path while the process keeps
+    // running the previous code, and that is one of the two cases this verb is
+    // asked for. Re-registering an identical path is harmless; refusing it would
+    // leave the caller with no way to say "run what is on disk now".
+    if previous.is_some() {
+        if let Err(e) = scm::uninstall_service_with_config(&UninstallConfig::keep_data()) {
+            eprintln!("reinstall failed while removing the old registration: {e}");
+            return std::process::ExitCode::from(1);
+        }
+    }
+
+    let mut config = InstallConfig::production_defaults(binary_path.clone());
+    if let Some(mode) = previous.as_ref().and_then(|report| report.start_mode) {
+        config.start_mode = mode;
+    }
+    if let Err(e) = scm::install_service_with_config(&config) {
+        eprintln!(
+            "reinstall failed while registering '{}': {e}\n\
+             The service is now NOT registered — run `install` from the folder you want to run.",
+            binary_path.display()
+        );
+        return std::process::ExitCode::from(1);
+    }
+
+    if let Err(e) = scm::start_service(30) {
+        eprintln!(
+            "service '{}' was re-registered at '{}' but did not start: {e}",
+            nrr_service_runtime::SERVICE_NAME,
+            binary_path.display()
+        );
+        return std::process::ExitCode::from(1);
+    }
+    println!(
+        "Service '{}' now runs '{}'.",
+        nrr_service_runtime::SERVICE_NAME,
+        binary_path.display()
+    );
+    std::process::ExitCode::SUCCESS
+}
+
 /// Apply a service start mode (shared by the `set-start-auto` /
 /// `set-start-demand` verbs). For `OnAppLaunch` the targeted
 /// `SERVICE_START` grant is added BEFORE the start-type flip, so the service is
@@ -318,7 +394,7 @@ fn print_status_banner() {
     println!("{}", nrr_application::runtime_boot_guard_message());
     let s = service_runtime_orchestration_snapshot();
     println!(
-        "Service orchestration stub: lifecycle={} bootstrap={} policy={} ipc={} health={} \
+        "Service orchestration: lifecycle={} bootstrap={} policy={} ipc={} health={} \
          recovery={} privileged={} install_update={}",
         s.scm_lifecycle,
         s.bootstrap,

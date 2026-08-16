@@ -10,12 +10,8 @@ use nrr_shared::{
     ActivationSource, AppSection, AppShellModel, FirstRunScenarioId, SetupActionAvailability,
 };
 use nrr_ui_support::first_run::{first_run_flow_snapshot, resolve_entry_section_for_first_run};
-use std::env;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::Command;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HelperCommand {
@@ -370,139 +366,9 @@ pub fn parse_first_run_scenario(value: &str) -> Option<FirstRunScenarioId> {
     }
 }
 
-pub struct SingleInstanceGuard {
-    lock_path: PathBuf,
-    _lock_file: File,
-}
-
-impl SingleInstanceGuard {
-    pub fn acquire(instance_key: &str) -> io::Result<Option<Self>> {
-        let lock_directory = env::temp_dir().join("NetRuleRouter");
-        fs::create_dir_all(&lock_directory)?;
-
-        let lock_path = lock_directory.join(format!("{instance_key}.lock"));
-        for attempt in 0..2 {
-            match OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&lock_path)
-            {
-                Ok(mut lock_file) => {
-                    writeln!(lock_file, "pid={}", std::process::id())?;
-                    return Ok(Some(Self {
-                        lock_path,
-                        _lock_file: lock_file,
-                    }));
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    if attempt == 0 && cleanup_stale_lock_file(&lock_path)? {
-                        continue;
-                    }
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        Ok(None)
-    }
-}
-
-fn cleanup_stale_lock_file(lock_path: &Path) -> io::Result<bool> {
-    let content = match fs::read_to_string(lock_path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error),
-    };
-
-    let Some(pid) = parse_pid_from_lock_content(&content) else {
-        return Ok(false);
-    };
-    if pid == std::process::id() {
-        return Ok(false);
-    }
-    if is_process_alive(pid) {
-        return Ok(false);
-    }
-
-    match fs::remove_file(lock_path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
-fn parse_pid_from_lock_content(content: &str) -> Option<u32> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if let Some(raw_pid) = trimmed.strip_prefix("pid=") {
-            if let Ok(parsed) = raw_pid.trim().parse::<u32>() {
-                return Some(parsed);
-            }
-        }
-    }
-    None
-}
-
-#[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-
-    let filter = format!("PID eq {pid}");
-    let output = Command::new("tasklist")
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output();
-
-    match output {
-        Ok(output) => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(parse_tasklist_pid_from_csv_line)
-            .any(|active_pid| active_pid == pid),
-        Err(_) => false,
-    }
-}
-
-#[cfg(windows)]
-fn parse_tasklist_pid_from_csv_line(line: &str) -> Option<u32> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('"') {
-        return None;
-    }
-
-    // tasklist /FO CSV /NH -> "Image Name","PID","Session Name","Session#","Mem Usage"
-    let mut fields = trimmed.split(',');
-    let _image_name = fields.next()?;
-    let raw_pid = fields.next()?.trim().trim_matches('"');
-    raw_pid.parse::<u32>().ok()
-}
-
-#[cfg(not(windows))]
-fn is_process_alive(_pid: u32) -> bool {
-    true
-}
-
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
-        if let Err(error) = fs::remove_file(&self.lock_path) {
-            if error.kind() != io::ErrorKind::NotFound {
-                eprintln!(
-                    "Failed to remove GUI single-instance lock file '{}': {}",
-                    self.lock_path.display(),
-                    error
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_first_run_scenario, parse_launch_request_arguments, parse_pid_from_lock_content,
-    };
+    use super::{parse_first_run_scenario, parse_launch_request_arguments};
     use nrr_shared::{ActivationSource, AppSection, FirstRunScenarioId};
 
     #[test]
@@ -559,12 +425,5 @@ mod tests {
 
         assert_eq!(request.action, None);
         assert_eq!(request.reason, None);
-    }
-
-    #[test]
-    fn pid_parser_extracts_value_from_lock_content() {
-        assert_eq!(parse_pid_from_lock_content("pid=12345\n"), Some(12345));
-        assert_eq!(parse_pid_from_lock_content("pid=abc\n"), None);
-        assert_eq!(parse_pid_from_lock_content("key=value\n"), None);
     }
 }

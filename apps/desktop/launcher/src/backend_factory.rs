@@ -17,7 +17,7 @@
 //!
 //! The launcher is the only process that has both `nrr-application`
 //! (`MockBackendFacade`, `BackendFacade` trait) and `nrr-ipc-client`
-//! (`NamedPipeIpcClient`, `IpcBackendFacade`) in scope. The GUI lib
+//! (`ServiceIpcClient`, `IpcBackendFacade`) in scope. The GUI lib
 //! (`nrr-desktop-gui`) consumes the resulting `Arc<dyn BackendFacade>`
 //! through its public function signatures; it never instantiates a
 //! facade itself.
@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, MockBackendFacade, PreviewLocalBackendFacade,
 };
-use nrr_ipc_client::{ConnectionStatus, IpcBackendFacade, NamedPipeIpcClient};
+use nrr_ipc_client::{ConnectionStatus, IpcBackendFacade, ServiceIpcClient};
 
 /// How long the launcher waits for the named-pipe client to reach
 /// `Connected` before deciding the service is unreachable. The IPC
@@ -119,10 +119,10 @@ pub fn create_backend(choice: BackendChoice) -> BackendBundle {
 }
 
 fn build_ipc_bundle() -> BackendBundle {
-    let client = Arc::new(NamedPipeIpcClient::start());
+    let client = Arc::new(ServiceIpcClient::start());
     let connected = wait_for_connect(&client, IPC_PROBE_TIMEOUT);
     if connected {
-        match IpcBackendFacade::with_named_pipe(Arc::clone(&client)) {
+        match IpcBackendFacade::with_service_transport(Arc::clone(&client)) {
             Ok(facade) => BackendBundle {
                 facade: Arc::new(facade) as Arc<dyn BackendFacade>,
                 status: BackendConnectionStatus::Connected,
@@ -137,7 +137,7 @@ fn build_ipc_bundle() -> BackendBundle {
                 })
             }
         }
-    } else if let Some(bundle) = try_demand_start_then_reprobe(&client) {
+    } else if let Some(bundle) = try_demand_start_on_this_os(&client) {
         bundle
     } else {
         let status = ipc_status_to_backend_status(client.connection_status());
@@ -153,7 +153,8 @@ fn build_ipc_bundle() -> BackendBundle {
 /// the caller falls straight through to the mock backend. Returns
 /// `Some(bundle)` only when the service started AND the IPC re-probe
 /// connected.
-fn try_demand_start_then_reprobe(client: &Arc<NamedPipeIpcClient>) -> Option<BackendBundle> {
+#[cfg(target_os = "windows")]
+fn try_demand_start_on_this_os(client: &Arc<ServiceIpcClient>) -> Option<BackendBundle> {
     use nrr_broker::DemandStartOutcome;
     let outcome = nrr_broker::try_start_demand_service();
     if !matches!(
@@ -166,7 +167,7 @@ fn try_demand_start_then_reprobe(client: &Arc<NamedPipeIpcClient>) -> Option<Bac
     if !wait_for_connect(client, IPC_REPROBE_AFTER_START) {
         return None;
     }
-    match IpcBackendFacade::with_named_pipe(Arc::clone(client)) {
+    match IpcBackendFacade::with_service_transport(Arc::clone(client)) {
         Ok(facade) => Some(BackendBundle {
             facade: Arc::new(facade) as Arc<dyn BackendFacade>,
             status: BackendConnectionStatus::Connected,
@@ -177,6 +178,14 @@ fn try_demand_start_then_reprobe(client: &Arc<NamedPipeIpcClient>) -> Option<Bac
             None
         }
     }
+}
+
+/// Unix has no analog: the service is a systemd unit, started by systemd, and
+/// nothing the desktop session may start on demand without asking for a
+/// privilege. A failed connect is simply a failed connect here.
+#[cfg(not(target_os = "windows"))]
+fn try_demand_start_on_this_os(_client: &Arc<ServiceIpcClient>) -> Option<BackendBundle> {
+    None
 }
 
 fn fallback_with_status(status: BackendConnectionStatus) -> BackendBundle {
@@ -190,7 +199,7 @@ fn fallback_with_status(status: BackendConnectionStatus) -> BackendBundle {
 /// Polls the client status with a short sleep cadence until either
 /// `Connected` is reached or the deadline elapses. Returns `true` on
 /// connect, `false` on timeout / terminal failure.
-fn wait_for_connect(client: &NamedPipeIpcClient, deadline: Duration) -> bool {
+fn wait_for_connect(client: &ServiceIpcClient, deadline: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < deadline {
         match client.connection_status() {

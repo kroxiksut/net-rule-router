@@ -11,6 +11,9 @@ path = "src/lib.rs"
 
 [dependencies]
 nrr-domain = { path = "../domain" }
+# The production data/log roots are derived once, in the layer that owns OS
+# shape; storage consumes them instead of deriving a second copy.
+nrr-platform-api = { path = "../platform/api" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 bitflags = "2"
 sha2 = "0.10"

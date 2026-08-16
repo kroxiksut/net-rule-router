@@ -11,6 +11,25 @@
 //!
 //! Nothing here decides routing. It answers "is this host a notice page", and
 //! the suggestion layer decides what that is worth.
+//!
+//! # Not wired
+//!
+//! A live run disproved the premise. Adjacency in the query stream means
+//! something only if the stream goes quiet between page loads, and on a real
+//! desktop it never does: a torrent client's DHT, an antivirus, and OS
+//! telemetry keep a rule-less name in the pairing window at all times. Every
+//! candidate therefore collects its four distinct predecessors from unrelated
+//! background traffic, `seen_alone` never fires to disqualify anything, and the
+//! pairs come out mutual and arbitrary — a mail host "explaining" a torrent
+//! tracker and back. Tightening the window or the threshold does not help; the
+//! key itself is wrong.
+//!
+//! A working signal has to key on the ANSWER, not on the order of questions.
+//! The one available here without new machinery: the operator's resolver hands
+//! back an address that a public resolver does not (the comparison
+//! `PoisonFallbackUpstreamResolver` already performs for rule hosts), and that
+//! same address repeats across unrelated registrable domains. Until that is
+//! built, the production listener does not feed this learner at all.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;

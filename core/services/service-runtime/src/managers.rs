@@ -287,6 +287,21 @@ pub enum ApplyOutcome {
 pub trait HealthReporter: Send + Sync {
     fn current_state(&self) -> ServiceRuntimeState;
     fn worst_severity(&self) -> ServiceHealthSeverity;
+
+    /// Per-component breakdown as `(slug, severity, message)`, sorted by slug.
+    ///
+    /// Without this the GUI gets one aggregate severity and no way to say WHICH
+    /// part is unhealthy — "degraded" with nothing behind it is a dead end for
+    /// whoever is diagnosing. Defaulted to empty so a reporter that genuinely
+    /// tracks nothing (test doubles, the degraded-boot stub) stays valid.
+    fn components(&self) -> Vec<(&'static str, ServiceHealthSeverity, String)> {
+        Vec::new()
+    }
+
+    /// Slugs of the degraded modes currently in force, sorted.
+    fn degraded_modes(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Bundle that the runtime entry-point in `nrr-windows-service`

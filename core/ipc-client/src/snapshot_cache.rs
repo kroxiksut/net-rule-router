@@ -2,9 +2,10 @@
 //!
 //! ## Purpose
 //!
-//! When the IPC pipe to the service is up, every successful response is
-//! mirrored to a small per-operation JSON file under
-//! `%LOCALAPPDATA%\NetRuleRouter\snapshot_cache\`. When the pipe later
+//! When the IPC channel to the service is up, every successful response is
+//! mirrored to a small per-operation JSON file under the user's cache
+//! directory (`%LOCALAPPDATA%\<product>\` on Windows,
+//! `$XDG_CACHE_HOME/<product>/` on Unix). When the channel later
 //! goes down (service restart, killed by user, network glitch on a
 //! domain-joined box) the [`crate::IpcBackendFacade`] can hand the GUI a
 //! cached snapshot tagged `stale = true` so screens don't blank out.
@@ -373,17 +374,23 @@ fn default_cache_root() -> Result<PathBuf, CacheError> {
         CacheError::Io("environment variable LOCALAPPDATA is not set".to_string())
     })?;
     Ok(PathBuf::from(local_app_data)
-        .join("NetRuleRouter")
+        .join(nrr_shared::product_identity::PRODUCT_NAME)
         .join("snapshot_cache"))
 }
 
+/// `$XDG_CACHE_HOME/<product>/snapshot_cache`, or `~/.cache/…` when the
+/// variable is unset — the XDG default. Deliberately NOT the temp directory:
+/// this cache is what the GUI shows while the service is unreachable, and a
+/// world-writable location cleared on reboot is the wrong home for it.
 #[cfg(not(target_os = "windows"))]
 fn default_cache_root() -> Result<PathBuf, CacheError> {
-    // Production builds are Windows-only; this branch exists so
-    // workspace-wide `cargo check` on a Linux CI box (rare, but
-    // possible) keeps compiling.
-    Ok(std::env::temp_dir()
-        .join("NetRuleRouter")
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .ok_or_else(|| CacheError::Io("neither XDG_CACHE_HOME nor HOME is set".to_string()))?;
+    Ok(base
+        .join(nrr_shared::product_identity::PRODUCT_NAME_UNIX)
         .join("snapshot_cache"))
 }
 

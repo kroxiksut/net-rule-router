@@ -16,6 +16,7 @@
 use serde_json::Value;
 
 use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc_payloads::ContractNegotiateClientKind;
 
 use crate::connection::NegotiateInfo;
 
@@ -92,17 +93,40 @@ pub(crate) fn build_request_envelope(
     Value::Object(envelope)
 }
 
+/// What this PROCESS declares itself to be when it shakes hands.
+///
+/// A property of the binary, not of a connection: the launcher is a GUI, the
+/// console is a console, and neither changes its mind at runtime. Declared once
+/// at start-up via [`crate::declare_client_kind`]; unset means `Gui`, which is
+/// what the launcher (the original and still the common caller) is.
+///
+/// The declaration can only ever COST capability — the service narrows by it,
+/// never widens. On Windows the service proves the same fact from the connecting
+/// executable and does not need to be told; on Unix, where peer credentials name
+/// the user but not the program, this is the only thing that distinguishes a
+/// console from an application.
+static DECLARED_CLIENT_KIND: std::sync::OnceLock<ContractNegotiateClientKind> =
+    std::sync::OnceLock::new();
+
+/// Declare this process's client kind. First call wins; later calls are ignored,
+/// so a library cannot quietly re-label a binary that already introduced itself.
+pub fn declare_client_kind(kind: ContractNegotiateClientKind) {
+    let _ = DECLARED_CLIENT_KIND.set(kind);
+}
+
+fn declared_client_kind() -> ContractNegotiateClientKind {
+    *DECLARED_CLIENT_KIND
+        .get()
+        .unwrap_or(&ContractNegotiateClientKind::Gui)
+}
+
 /// Build the `ContractNegotiate` handshake request.
 pub(crate) fn build_contract_negotiate(client_version: u32) -> Value {
-    // `client-kind` is a required field of `ContractNegotiateRequest`
-    // (`nrr_shared::ipc_payloads`). The server uses it only for audit
-    // attribution; the actual profile is re-derived from the connecting
-    // process's exe basename by `classify_pipe_client`. We always send
-    // `"gui"` here because the launcher binary is `NetRuleRouter.exe`
-    // (the launcher used by BOTH the main GUI and the tray hosts a
-    // single shared client per process). Sending the exact value the
-    // handler accepts is what matters; the wire enum is kebab-case
-    // (`Gui`/`Tray` → `"gui"`/`"tray"`).
+    let kind = match declared_client_kind() {
+        ContractNegotiateClientKind::Gui => "gui",
+        ContractNegotiateClientKind::Tray => "tray",
+        ContractNegotiateClientKind::Console => "console",
+    };
     serde_json::json!({
         "protocol-version": client_version,
         "request-id": "handshake-1",
@@ -110,7 +134,7 @@ pub(crate) fn build_contract_negotiate(client_version: u32) -> Value {
         "operation-class": "read-snapshot",
         "payload": {
             "client-version": client_version,
-            "client-kind": "gui",
+            "client-kind": kind,
         },
     })
 }
@@ -215,204 +239,15 @@ pub(crate) fn new_request_serial() -> u64 {
     COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Payload-aware envelope-class resolver. Most operations have a fixed class
-/// regardless of payload; the exception is `ProductImpactDisableTemporary`
-/// whose dry-run vs confirm phases require DIFFERENT envelope classes
-/// (`read-snapshot` vs `safe-disable`). Routes through [`operation_class_slug`]
-/// for the non-discriminating cases.
+/// Envelope class for a call — the SAME derivation the service admits by
+/// (`nrr_shared::ipc_transport::canonical_operation_class`).
+///
+/// The client used to carry its own copy of this table, which made the label on
+/// the wire an independent opinion; the service now derives the class itself, so
+/// a divergent copy here could only ever produce a warning and a confusing
+/// envelope. One declaration, both sides.
 pub(crate) fn operation_class_slug_for_call(op: IpcOperationName, payload: &Value) -> &'static str {
-    if matches!(op, IpcOperationName::ProductImpactDisableTemporary) {
-        let dry_run = payload
-            .get("dry-run")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if dry_run {
-            return "read-snapshot";
-        }
-        return "safe-disable";
-    }
-    // `MutationSubmit` shares the two-phase pattern: dry-run is classified as
-    // `read-snapshot` (router skips the confirmation-token gate so the dry-run
-    // can MINT the token), and confirm is `mutation-request` (router enforces
-    // token presence before dispatch). The server-side handler cross-checks the
-    // pairing — see `mutation_submit.rs::handle_dry_run` / `handle_confirm`.
-    if matches!(op, IpcOperationName::MutationSubmit) {
-        let dry_run = payload
-            .get("dry-run")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if dry_run {
-            return "read-snapshot";
-        }
-        // An ADMIN "set baseline" edit opts out of the per-principal path by
-        // setting `admin-baseline: true` in the inner mutation payload. It
-        // confirms as `mutation-request` (elevation-gated): the router
-        // rejects a non-elevated client with `Forbidden`, which the launcher
-        // relays through the session elevation broker (one UAC). The server
-        // then resolves the target to `BASELINE_PRINCIPAL` from the class —
-        // the payload flag never travels as a principal; it only steers the
-        // client's class pick here.
-        let admin_baseline = payload
-            .get("payload")
-            .and_then(|p| p.get("admin-baseline"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if admin_baseline {
-            return "mutation-request";
-        }
-        // Per-principal rules / preset edits confirm as
-        // `user-scoped-mutation`: two-phase (token required) but NOT
-        // elevation-gated, so a non-admin GUI session commits its own rules.
-        // Every other mutation kind (alert ack/resolve, etc.) stays
-        // service-global `mutation-request` (elevation required). The server
-        // derives the target principal from the caller SID, so a
-        // `user-scoped-mutation` can only ever write the caller's own partition
-        // — never the admin baseline.
-        let kind = payload.get("mutation-kind").and_then(|v| v.as_str());
-        if matches!(
-            kind,
-            Some("rules-update") | Some("preset-import") | Some("rules-reset-to-baseline")
-        ) {
-            return "user-scoped-mutation";
-        }
-        return "mutation-request";
-    }
-    operation_class_slug(op)
-}
-
-/// Map operation → operation-class slug. Slugs match
-/// `nrr_service_runtime::ipc::IpcOperationClass` serde representation
-/// (kebab-case). Hardcoded here so the client doesn't take a runtime dep on
-/// service-runtime.
-fn operation_class_slug(op: IpcOperationName) -> &'static str {
-    match op {
-        // ContractNegotiate / ServiceHealthGet / snapshots / status polls /
-        // operation-status are all read-only — no mutation, no token.
-        IpcOperationName::ContractNegotiate
-        | IpcOperationName::ServiceHealthGet
-        | IpcOperationName::SnapshotInitialGet
-        | IpcOperationName::SnapshotInterfacesGet
-        | IpcOperationName::SnapshotDiagnosticsGet
-        | IpcOperationName::StatusUpdatesPoll
-        | IpcOperationName::OperationStatusGet
-        | IpcOperationName::LogsList
-        | IpcOperationName::AuditList
-        | IpcOperationName::SecurityAlertsList
-        | IpcOperationName::RulesList
-        | IpcOperationName::MigrationStatusGet
-        | IpcOperationName::RetentionSettingsGet
-        // Read log/audit retention config.
-        | IpcOperationName::LogRetentionConfigGet
-        | IpcOperationName::ApplyFailurePolicyGet
-        | IpcOperationName::StorageUsageGet
-        | IpcOperationName::RoutingPauseGet
-        | IpcOperationName::AutostartGet
-        // All read-only diagnostics ops + the export (which writes a derived
-        // artifact but does not mutate domain state).
-        | IpcOperationName::ExplainGet
-        | IpcOperationName::DiagnosticsExportArchive
-        | IpcOperationName::ServiceStabilityConfigGet
-        // Read-only preset export.
-        | IpcOperationName::PresetExportGet
-        // Read-only settings export.
-        | IpcOperationName::SettingsExportFull
-        // Read-only paginated cache-entries viewer.
-        | IpcOperationName::CacheEntriesList
-        // Read-only paginated connection-trace viewer.
-        | IpcOperationName::ConnTraceEntriesList
-        // Read-only attribution + integrity of shipped third-party binaries.
-        | IpcOperationName::ThirdPartyComponentsList
-        // Read-only two-way merge preview (no mutation queue).
-        | IpcOperationName::RulesMergePreview
-        // Read the shared DoH resolver baseline list.
-        | IpcOperationName::DohResolversGet
-        // Read-only traffic-stats query.
-        | IpcOperationName::TrafficStatsGet
-        // Read the caller's pending companion-domain suggestions.
-        | IpcOperationName::AutoRuleCandidatesList
-        // Read the caller's declined companion-domain suggestions.
-        | IpcOperationName::AutoRuleDismissedList => "read-snapshot",
-        // StatusUpdatesSubscribe sets up a long-lived push channel —
-        // classified as DiagnosticQuery (no mutation queue, no elevation).
-        IpcOperationName::StatusUpdatesSubscribe => "diagnostic-query",
-        // Privileged mutations: enter the mutation queue, require token.
-        IpcOperationName::MutationSubmit => "mutation-request",
-        // Re-enumerating adapters (and, when the user asks for it, probing each
-        // adapter's external address) changes nothing persisted, so it must not
-        // enter the single-writer mutation queue: a heavy policy apply in the
-        // queue can hold the refresh past its own call deadline, and the user
-        // sees a timeout instead of addresses. DiagnosticQuery dispatches
-        // immediately and still requires no elevation.
-        IpcOperationName::InterfacesRefreshRequest => "diagnostic-query",
-        IpcOperationName::RollbackRequest => "recovery-action",
-        IpcOperationName::ProductImpactDisableTemporary => "safe-disable",
-        // Per-SID user configuration writes go through the mutation queue
-        // (single-writer invariant) but do not require client elevation.
-        // Slug differs from `mutation-request` so handlers can distinguish.
-        IpcOperationName::RoutePolicyUpdate
-        // Link-provider app set: same per-SID user-scoped write pattern as
-        // RoutePolicyUpdate.
-        | IpcOperationName::RouteLinkProviderSet
-        | IpcOperationName::MigrationMarkComplete
-        | IpcOperationName::RoutingPauseToggle
-        | IpcOperationName::AutostartToggle => "user-scoped-configuration",
-        // Service-global mutations admin-gated upstream. Service stability
-        // config shares the same envelope class as other service-global
-        // settings writes.
-        IpcOperationName::RetentionSettingsSet
-        | IpcOperationName::ApplyFailurePolicySet
-        // Log/audit retention write, service-global settings class.
-        | IpcOperationName::LogRetentionConfigSet
-        | IpcOperationName::ServiceStabilityConfigSet => "user-scoped-configuration",
-        // LogsClear is a destructive maintenance op but does not mutate routing
-        // policy or rules — same class as the other settings writes.
-        IpcOperationName::LogsClear => "user-scoped-configuration",
-        // CacheClear clears the rebuildable FQDN/IP cache — same class as the
-        // other GUI-only maintenance / settings writes.
-        IpcOperationName::CacheClear => "user-scoped-configuration",
-        // DiagnosticModeSet toggles an in-memory diagnostic session; a
-        // GUI-only maintenance command, same envelope class.
-        IpcOperationName::DiagnosticModeSet => "user-scoped-configuration",
-        // DoH resolver baseline replace. Machine-wide config write; the
-        // elevation gate lives in the catalog
-        // (`requires_service_mutation_privilege`), the envelope class matches the
-        // other settings writes.
-        IpcOperationName::DohResolversSet => "user-scoped-configuration",
-        // Opt-in browser-history seed; a GUI-only maintenance command like
-        // CacheClear / DiagnosticModeSet.
-        IpcOperationName::SeedFromBrowserHistory => "user-scoped-configuration",
-        // Service-global traffic-stats settings write / reset (admin-gated in
-        // the catalog); same envelope class as other settings writes.
-        IpcOperationName::TrafficStatsSet | IpcOperationName::TrafficStatsClear => {
-            "user-scoped-configuration"
-        }
-        // Accepting a companion-domain suggestion writes the caller's OWN
-        // rules and refusing one writes their own refusal record. Both are
-        // per-SID user configuration: they enter the single-writer mutation
-        // queue but require no elevation.
-        IpcOperationName::AutoRuleCandidatesAccept
-        | IpcOperationName::AutoRuleCandidatesDismiss => "user-scoped-configuration",
-        // Restoring a declined suggestion writes the caller's own refusal
-        // record (a delete), and erasing one drops their own pending/refusal
-        // rows — same per-SID user-configuration class.
-        IpcOperationName::AutoRuleDismissedRestore
-        | IpcOperationName::AutoRuleCandidatesForget => "user-scoped-configuration",
-        // Read the caller's own block-notice mutes.
-        IpcOperationName::BlockNoticeMutesList => "read-snapshot",
-        // Setting/removing/clearing a mute writes the caller's OWN durable
-        // mute row(s) — per-SID user configuration, no elevation, same shape
-        // as the companion-domain refusal writes above.
-        IpcOperationName::BlockNoticeMutesSet
-        | IpcOperationName::BlockNoticeMutesRemove
-        | IpcOperationName::BlockNoticeMutesClear => "user-scoped-configuration",
-        // Turning a block notice into a rule writes the caller's OWN rules
-        // through the same authoring path AutoRuleCandidatesAccept uses —
-        // same per-SID user-configuration class.
-        IpcOperationName::BlockNoticeRouteToSecondary => "user-scoped-configuration",
-        // Full reset purges the caller's OWN auxiliary state — per-SID user
-        // configuration, no elevation, same class as BlockNoticeMutesClear.
-        IpcOperationName::PrincipalDataPurge => "user-scoped-configuration",
-    }
+    nrr_shared::ipc_transport::canonical_operation_class(op, payload).slug()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -601,7 +436,7 @@ mod tests {
     #[test]
     fn operation_class_slug_covers_every_operation() {
         for op in IpcOperationName::ALL {
-            let slug = operation_class_slug(op);
+            let slug = operation_class_slug_for_call(op, &serde_json::json!({}));
             assert!(
                 !slug.is_empty(),
                 "operation {} has empty class slug",
@@ -617,7 +452,10 @@ mod tests {
         // holding the queue would push the call past its deadline — and must
         // never route through a class that drags an elevation prompt.
         assert_eq!(
-            operation_class_slug(IpcOperationName::InterfacesRefreshRequest),
+            operation_class_slug_for_call(
+                IpcOperationName::InterfacesRefreshRequest,
+                &serde_json::json!({})
+            ),
             "diagnostic-query",
         );
     }

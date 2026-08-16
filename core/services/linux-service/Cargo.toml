@@ -45,11 +45,16 @@ nrr-storage = { path = "../../storage" }
 # Wire codec (length-prefixed JSON frames) — the single source of truth shared
 # with the client (`nrr-ipc-client`).
 nrr-ipc-client = { path = "../../ipc-client" }
-tracing = "0.1"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-# Test-only: build a sample request envelope payload (`serde_json::json!`).
+# Retention policies and the cleanup scope the supervised runtime's diagnostics
+# jobs take as inputs.
+nrr-diagnostics = { path = "../../diagnostics" }
+# The enforcement-mode enum the runtime deps carry (the daemon boots Reactive:
+# the local DNS resolver is a Windows mechanism today).
+nrr-domain = { path = "../../domain" }
+# The handshake payload is read to narrow the connection's client profile —
+# peer credentials name the user, not the program.
 serde_json = "1"
+tracing = "0.1"
 
 [lints]
 workspace = true

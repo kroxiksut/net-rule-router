@@ -160,13 +160,136 @@ fn handle_service_info(client: &dyn IpcClient) -> LocalHandlerResult {
         Some(i) => (i.server_protocol, i.service_version, i.session_id),
         None => (0u32, String::new(), String::new()),
     };
+    let registration = service_registration();
+    let registered = registration
+        .as_ref()
+        .and_then(|r| r.binary_path.clone())
+        .filter(|p| !p.as_os_str().is_empty());
+    let expected = sibling_service_binary();
+    // "Another copy is registered" and "the registered copy is older" are two
+    // different faults with one fix, so answer both and let QML offer it once.
+    let elsewhere = match (registered.as_ref(), expected.as_ref()) {
+        (Some(registered), Some(expected)) => !same_path(registered, expected),
+        _ => false,
+    };
+    let older = version_is_older(&service_version, GUI_SEMVER);
+    // An update written over the SAME folder leaves the registration untouched
+    // and the version string unchanged, so neither check above sees it — but
+    // the process still runs the code it loaded before the file was replaced.
+    let stale_process = registration
+        .as_ref()
+        .and_then(binary_is_newer_than_process)
+        .unwrap_or(false);
     Ok(json!({
         "gui-protocol":     GUI_PROTOCOL_VERSION,
         "gui-version":      GUI_SEMVER,
         "service-protocol": service_protocol,
         "service-version":  service_version,
         "session-id":       session_id,
+        "service-registered-path": registered
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "service-expected-path": expected
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        "service-registered-elsewhere": elsewhere,
+        "service-older-than-app": older,
+        "service-binary-replaced": stale_process,
+        "service-update-available": elsewhere || older,
+        "service-restart-needed": stale_process && !elsewhere,
     }))
+}
+
+/// What the service manager has registered, read straight from it.
+/// Unprivileged and answerable with the service stopped — the state in which
+/// the question matters most.
+fn service_registration() -> Option<nrr_platform_api::service_control::ServiceStatusReport> {
+    #[cfg(windows)]
+    {
+        use nrr_platform_api::service_control::ServiceControlPort;
+        nrr_platform_windows::service_control::WindowsServiceControl::new()
+            .query()
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Whether the registered binary on disk is newer than the process running from
+/// it — i.e. an update was written in place and the old code is still live.
+///
+/// `None` whenever the answer cannot be established (service stopped, no start
+/// time from the OS, unreadable file): the caller must not turn "unknown" into
+/// a prompt telling the user their service is stale.
+fn binary_is_newer_than_process(
+    report: &nrr_platform_api::service_control::ServiceStatusReport,
+) -> Option<bool> {
+    let started = report.running_since?;
+    let path = report.binary_path.as_ref()?;
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    // A second of slack: the file timestamp and the process clock come from
+    // different sources, and a start that races its own binary's write would
+    // otherwise report itself stale.
+    Some(modified > started + std::time::Duration::from_secs(1))
+}
+
+/// The service binary shipped alongside this application — the one an updated
+/// copy should be running.
+fn sibling_service_binary() -> Option<std::path::PathBuf> {
+    let exe_name = if cfg!(windows) {
+        "nrr-service.exe"
+    } else {
+        "nrr-serviced"
+    };
+    let candidate = std::env::current_exe().ok()?.parent()?.join(exe_name);
+    candidate.is_file().then_some(candidate)
+}
+
+/// Case- and spelling-insensitive path comparison. Canonicalisation resolves
+/// `\\?\` prefixes, 8.3 names and links; a path that cannot be canonicalised
+/// (removed since, permission) falls back to a plain case-insensitive compare.
+fn same_path(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (
+        std::fs::canonicalize(left).ok(),
+        std::fs::canonicalize(right).ok(),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => left
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy()),
+    }
+}
+
+/// Numeric-component semver comparison, `true` only when `service` is provably
+/// behind `app`. Unknown, unparseable or equal versions answer `false`: an
+/// update prompt on a guess is worse than no prompt.
+fn version_is_older(service: &str, app: &str) -> bool {
+    let parse = |raw: &str| -> Option<Vec<u64>> {
+        let core = raw.trim().trim_start_matches('v');
+        let core = core.split(['-', '+']).next()?;
+        let parts: Vec<u64> = core
+            .split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect::<Option<_>>()?;
+        (!parts.is_empty()).then_some(parts)
+    };
+    let (Some(service), Some(app)) = (parse(service), parse(app)) else {
+        return false;
+    };
+    let len = service.len().max(app.len());
+    for i in 0..len {
+        let s = service.get(i).copied().unwrap_or(0);
+        let a = app.get(i).copied().unwrap_or(0);
+        if s != a {
+            return s < a;
+        }
+    }
+    false
 }
 
 fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
@@ -342,5 +465,43 @@ mod tests {
         assert_eq!(resp["service-protocol"], 7);
         assert_eq!(resp["service-version"], "0.2.0");
         assert_eq!(resp["session-id"], "sess-deadbeef");
+    }
+
+    #[test]
+    fn an_older_service_version_is_recognised() {
+        assert!(version_is_older("0.1.0", "0.2.0"));
+        assert!(version_is_older("0.1.9", "0.2.0"));
+        assert!(version_is_older("1.2.3", "1.2.4"));
+        // Fewer components: the missing ones read as zero.
+        assert!(version_is_older("1.2", "1.2.1"));
+    }
+
+    #[test]
+    fn equal_newer_or_unreadable_versions_never_prompt_for_an_update() {
+        assert!(!version_is_older("0.2.0", "0.2.0"));
+        assert!(!version_is_older("0.3.0", "0.2.0"));
+        // Handshake has not happened yet — the field is empty.
+        assert!(!version_is_older("", "0.2.0"));
+        assert!(!version_is_older("nightly", "0.2.0"));
+        // Pre-release/build metadata is ignored, not guessed at.
+        assert!(!version_is_older("0.2.0-prealpha", "0.2.0"));
+    }
+
+    #[test]
+    fn service_info_answers_the_update_questions() {
+        let client = empty_client();
+        let resp = handle_local_request("local.service-info", &json!({}), &client).expect("ok");
+        // Present on every answer, so QML never has to test for existence.
+        for key in [
+            "service-registered-path",
+            "service-expected-path",
+            "service-registered-elsewhere",
+            "service-older-than-app",
+            "service-update-available",
+        ] {
+            assert!(resp.get(key).is_some(), "{key} must always be reported");
+        }
+        // With no handshake and no registration the answer is "nothing to do".
+        assert_eq!(resp["service-older-than-app"], false);
     }
 }

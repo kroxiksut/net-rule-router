@@ -112,7 +112,9 @@ pub struct DnsInterceptListener {
     /// the operator-notice-page detector needs. The default no-op observes
     /// nothing, so the feature is absent until wired.
     resolution_observer: Arc<dyn ResolutionObserver>,
-    upstream_dns: SocketAddr,
+    /// Live choice of forwarding upstream — rotates itself when the server it
+    /// points at stops answering.
+    upstream_dns: Arc<crate::dns_upstream::UpstreamDnsPool>,
     deadline: Duration,
     forward_timeout: Duration,
     response_ttl: u32,
@@ -154,11 +156,19 @@ impl DnsInterceptListener {
             companion_candidates: Arc::new(NoopCompanionCandidates),
             companion_rescue: Arc::new(NoopCompanionRescue),
             resolution_observer: Arc::new(NoopResolutionObserver),
-            upstream_dns,
+            upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
             deadline,
             forward_timeout,
             response_ttl: RESPONSE_TTL_SECS,
         }
+    }
+
+    /// Forward through a self-healing pool instead of the fixed address passed
+    /// to [`Self::new`]. Production always wires this; the fixed address stays
+    /// the shape tests use.
+    pub fn with_upstream_pool(mut self, pool: Arc<crate::dns_upstream::UpstreamDnsPool>) -> Self {
+        self.upstream_dns = pool;
+        self
     }
 
     /// Watch resolved names (operator-notice-page detection).
@@ -654,10 +664,28 @@ impl DnsInterceptListener {
     /// socket and return the raw reply. `None` on any I/O error / timeout (the
     /// caller drops the datagram — a lost forward is a client retry, never a
     /// listener stall).
+    ///
+    /// A failure is reported to the pool, and when that retires the server the
+    /// query is retried once against the replacement: every name on the machine
+    /// comes through here, so waiting for the client's own timeout to expose a
+    /// dead upstream would read as "the internet is down".
     fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
+        let upstream = self.upstream_dns.current()?;
+        if let Some(reply) = self.forward_to(query, upstream) {
+            self.upstream_dns.note_success();
+            return Some(reply);
+        }
+        let replacement = self.upstream_dns.note_failure()?;
+        let reply = self.forward_to(query, replacement)?;
+        self.upstream_dns.note_success();
+        Some(reply)
+    }
+
+    /// One send + receive against a named server.
+    fn forward_to(&self, query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
         sock.set_read_timeout(Some(self.forward_timeout)).ok()?;
-        sock.send_to(query, self.upstream_dns).ok()?;
+        sock.send_to(query, upstream).ok()?;
         let mut buf = [0u8; 1500];
         let n = sock.recv(&mut buf).ok()?;
         Some(buf[..n].to_vec())
