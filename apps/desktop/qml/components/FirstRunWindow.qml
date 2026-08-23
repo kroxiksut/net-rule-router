@@ -33,6 +33,11 @@ Window {
     // Both empty when no bundled pack is found for this locale.
     property string detectedCountry: ""
     property string detectedCountryPack: ""
+    // Language half of the same locale ("ru_RU" -> "ru"). The home/abroad
+    // question only makes sense to someone who reads that country's language:
+    // an English-language install that happens to sit in the region is not an
+    // emigrant deciding between two packs.
+    property string detectedLanguage: ""
 
     // Mirror pack for the same country under presets/abroad/ — for someone who
     // lives elsewhere but still needs that country's services. The OS locale
@@ -40,6 +45,9 @@ Window {
     // wizard asks instead of guessing. Empty when no such pack is bundled.
     property string detectedAbroadPack: ""
     property bool livingAbroad: false
+
+    readonly property bool locationQuestionRelevant:
+        detectedLanguage !== "" && detectedLanguage === detectedCountry
 
     readonly property bool hasHomePack: detectedCountryPack !== ""
     readonly property bool hasAbroadPack: detectedAbroadPack !== ""
@@ -61,6 +69,36 @@ Window {
     property bool wantDohLockdown: true
     property bool wantFakeIp: true
     property bool wantDiagnosticLogs: false
+    property bool wantBlockNoticesMuted: false
+
+    // Which adapter currently holds the primary role, read back from the same
+    // model the Interfaces screen edits — so assigning it here and assigning it
+    // there are the same act, not two code paths that can disagree.
+    readonly property int assignedPrimaryIndex: root.uiRevision >= 0
+            && root.interfacesRolesController
+            && typeof root.interfacesRolesController.adapterIndexHoldingRole === "function"
+        ? root.interfacesRolesController.adapterIndexHoldingRole("primary")
+        : -1
+    readonly property bool primaryAssigned: assignedPrimaryIndex >= 0
+    readonly property string assignedPrimaryName: primaryAssigned
+        ? String(root.interfacesModel.get(assignedPrimaryIndex).name || "")
+        : ""
+
+    // Same read-back for the additional adapter. Asking for it here is what
+    // keeps the service from sitting policy-less for a whole session: until
+    // some screen sends a binding, nothing is enforced and nothing is blocked.
+    readonly property int assignedSecondaryIndex: root.uiRevision >= 0
+            && root.interfacesRolesController
+            && typeof root.interfacesRolesController.adapterIndexHoldingRole === "function"
+        ? root.interfacesRolesController.adapterIndexHoldingRole("secondary")
+        : -1
+    readonly property bool secondaryAssigned: assignedSecondaryIndex >= 0
+    readonly property string assignedSecondaryName: secondaryAssigned
+        ? String(root.interfacesModel.get(assignedSecondaryIndex).name || "")
+        : ""
+    /// "I will choose it later" — the wizard stops asking, the Interfaces
+    /// screen and the banner keep the question alive.
+    property bool secondaryDeferred: false
 
     // Applied once, on whichever path closes the wizard. A stopped service
     // parks each intent and replays it on reconnect, so this is safe before the
@@ -78,6 +116,10 @@ Window {
                 rp.applyDohLockdownEnabled(wantDohLockdown)
             }
         }
+        if (wantBlockNoticesMuted) {
+            root.updatePrefs({ notifyBlockNotices: false })
+            root.emitPrefs()
+        }
         if (typeof root.applyServiceStabilityPatch !== "function") return
         var patch = { "fake-ip-enabled": wantFakeIp }
         if (wantDiagnosticLogs) {
@@ -90,6 +132,38 @@ Window {
                 console.log("FirstRun: stability patch deferred: " + String(code || ""))
             }
         }, "first-run")
+    }
+
+    /// What one connection reads as in the two pickers below. The Windows
+    /// connection name alone is not an answer to "which one is this": a laptop
+    /// shows "Wi-Fi", "Wi-Fi 2" and "Ethernet 3" with nothing to tell them
+    /// apart, while the adapter description names the hardware and the
+    /// availability says whether it is up right now.
+    function _adapterLabel(row) {
+        if (!row) return ""
+        var name = String(row.name || "")
+        var descr = String(row.description || "")
+        var out = name
+        if (descr !== "" && descr !== name) out += " — " + descr
+        var state = String(row.availability || "") === "available"
+            ? root.tr("interfaces.connectivity.available", "Connected")
+            : root.tr("interfaces.connectivity.unavailable", "No connection")
+        return out + " · " + state
+    }
+
+    /// The connection that looks like a tunnel, by the snapshot's own
+    /// classification. Names it in the hint rather than picking it: which link
+    /// carries which traffic is the user's decision, and a wrong automatic pick
+    /// is far more expensive than a wrong suggestion.
+    function _tunnelCandidateName() {
+        if (!root.interfacesModel) return ""
+        for (var i = 0; i < root.interfacesModel.count; i += 1) {
+            var row = root.interfacesModel.get(i)
+            if (!row) continue
+            var kind = String((row.derivedAssessment || {}).classification || "").toLowerCase()
+            if (kind.indexOf("vpn") >= 0) return String(row.name || "")
+        }
+        return ""
     }
 
     function _basename(p) {
@@ -108,6 +182,12 @@ Window {
             _detectCountryPreset()
             pickedPrimaryPath = ""
             pickedSecondaryPath = ""
+            // The adapter list is what the main-connection question offers; the
+            // wizard can open before the first snapshot arrived.
+            if (root.interfacesRolesController
+                    && typeof root.interfacesRolesController.refreshInterfacesFromService === "function") {
+                root.interfacesRolesController.refreshInterfacesFromService()
+            }
         }
     }
 
@@ -132,6 +212,11 @@ Window {
         if (root.licenseWindow.transientParent === firstRunWindow) {
             root.licenseWindow.transientParent = root
         }
+        // The choices above are parked when the service is not up yet, and the
+        // collect that delivers them refuses to run while this window is open.
+        if (typeof root.scheduleOfflineBacklogCollect === "function") {
+            root.scheduleOfflineBacklogCollect()
+        }
     }
 
     function _detectCountryPreset() {
@@ -141,6 +226,7 @@ Window {
             detectedCountry = ""
             detectedCountryPack = ""
             detectedAbroadPack = ""
+            detectedLanguage = ""
             return
         }
         var loc = String(nrrNativeBridge.detectOsLocale() || "")
@@ -150,6 +236,7 @@ Window {
         var cc = parts.length >= 2 ? parts[1] : (parts[0] || "")
         cc = cc.toLowerCase()
         detectedCountry = cc
+        detectedLanguage = String(parts[0] || "").toLowerCase()
         var packsJson = String(nrrNativeBridge.listCountryPresets(cc) || "[]")
         var packs = []
         try { packs = JSON.parse(packsJson) } catch (e) { packs = [] }
@@ -310,338 +397,543 @@ Window {
             firstRunWindow._localPathFromUrl(selectedFile)
     }
 
-    ColumnLayout {
+    // Scrollable: the wizard asks eight questions and the window is a fixed
+    // 640 px tall. Without this the lower options sat under the bottom edge —
+    // a user reaching for one clicked whatever the window did show.
+    ScrollView {
+        id: wizardScroller
         anchors.fill: parent
         anchors.margins: root.uiTheme.spacingLg
-        spacing: root.uiTheme.spacingMd
+        clip: true
+        contentWidth: availableWidth
 
-        Label {
-            text: root.tr("dialog.first-run-wizard.title",
-                "Welcome to NetRuleRouter")
-            color: root.textColor
-            font.bold: true
-            font.pixelSize: 18
-        }
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            text: root.tr("dialog.first-run-wizard.description",
-                "Choose how to populate your initial rule set. You can always change this later via the Rules toolbar or Settings → Presets.")
-        }
-
-        // Re-open the same read-only license agreement the user accepted
-        // via `eulaAgreementWindow` to get here — jumps to the "Licenses"
-        // window's EULA tab. No acceptance timestamp is persisted today
-        // (only `acceptedEulaVersion`, an integer), so the label carries
-        // no date.
-        RowLayout {
-            Layout.fillWidth: true
-            ThemedButton {
-                theme: root.uiTheme
-                text: root.tr("dialog.first-run-wizard.view-eula", "View EULA")
-                onClicked: root.licenseWindow.openOnEulaTab()
-            }
-            Item { Layout.fillWidth: true }
-        }
-
-        // Protection defaults, offered before the rule set so they are already
-        // in force when the first rules apply.
         ColumnLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXs
+            width: wizardScroller.availableWidth
+            spacing: root.uiTheme.spacingMd
 
             Label {
-                text: root.tr("dialog.first-run-wizard.protection-title",
-                    "Protection")
+                text: root.tr("dialog.first-run-wizard.title",
+                    "Welcome to NetRuleRouter")
                 color: root.textColor
                 font.bold: true
+                font.pixelSize: 18
             }
             Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
-                text: root.tr("dialog.first-run-wizard.protection-description",
-                    "Recommended for everyone. Each of these can be changed later in Settings.")
+                text: root.tr("dialog.first-run-wizard.description",
+                    "Choose how to populate your initial rule set. You can always change this later via the Rules toolbar or Settings → Presets.")
             }
-            CheckBox {
-                id: firstRunKillSwitchCheck
-                Layout.fillWidth: true
-                checked: firstRunWindow.wantKillSwitch
-                text: root.tr("dialog.first-run-wizard.protection-kill-switch",
-                    "Block routed traffic when the additional route is down")
-                contentItem: Label {
-                    text: firstRunKillSwitchCheck.text
-                    leftPadding: firstRunKillSwitchCheck.indicator.width + firstRunKillSwitchCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: firstRunWindow.wantKillSwitch = checked
-            }
-            CheckBox {
-                id: firstRunDohCheck
-                Layout.fillWidth: true
-                checked: firstRunWindow.wantDohLockdown
-                text: root.tr("dialog.first-run-wizard.protection-doh-lockdown",
-                    "Keep browsers from resolving routed sites past NetRuleRouter")
-                contentItem: Label {
-                    text: firstRunDohCheck.text
-                    leftPadding: firstRunDohCheck.indicator.width + firstRunDohCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: firstRunWindow.wantDohLockdown = checked
-            }
-            CheckBox {
-                id: firstRunFakeIpCheck
-                Layout.fillWidth: true
-                checked: firstRunWindow.wantFakeIp
-                text: root.tr("dialog.first-run-wizard.protection-fake-ip",
-                    "Route sites by name, so an address shared with another site is not dragged along")
-                contentItem: Label {
-                    text: firstRunFakeIpCheck.text
-                    leftPadding: firstRunFakeIpCheck.indicator.width + firstRunFakeIpCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: firstRunWindow.wantFakeIp = checked
-            }
-            CheckBox {
-                id: firstRunDiagLogsCheck
-                Layout.fillWidth: true
-                checked: firstRunWindow.wantDiagnosticLogs
-                text: root.tr("dialog.first-run-wizard.protection-diagnostic-logs",
-                    "Write detailed diagnostic logs (only needed to report a problem)")
-                contentItem: Label {
-                    text: firstRunDiagLogsCheck.text
-                    leftPadding: firstRunDiagLogsCheck.indicator.width + firstRunDiagLogsCheck.spacing
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: firstRunWindow.wantDiagnosticLogs = checked
-            }
-        }
 
-        // Option 1: Country preset (if a pack exists for the detected locale).
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXs
-            visible: firstRunWindow.hasAnyCountryPack
+            // Re-open the same read-only license agreement the user accepted
+            // via `eulaAgreementWindow` to get here — jumps to the "Licenses"
+            // window's EULA tab. No acceptance timestamp is persisted today
+            // (only `acceptedEulaVersion`, an integer), so the label carries
+            // no date.
+            RowLayout {
+                Layout.fillWidth: true
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("dialog.first-run-wizard.view-eula", "View EULA")
+                    onClicked: root.licenseWindow.openOnEulaTab()
+                }
+                Item { Layout.fillWidth: true }
+            }
 
-            // Asked only when both directions ship a pack; with one of them the
-            // answer would change nothing.
+            // Main connection, asked before anything else: rules describe what
+            // goes the OTHER way, so until this is named there is nothing for them
+            // to deviate from and none of them are applied. Skippable — the banner
+            // and the tray notice keep saying so until it is answered.
             ColumnLayout {
                 Layout.fillWidth: true
-                spacing: 0
-                visible: firstRunWindow.hasHomePack && firstRunWindow.hasAbroadPack
+                spacing: root.uiTheme.spacingXs
+
                 Label {
-                    text: root.tr("dialog.first-run-wizard.location-title",
-                        "Where are you?")
+                    text: root.tr("dialog.first-run-wizard.primary-adapter-title",
+                        "Main connection")
                     color: root.textColor
                     font.bold: true
                 }
-                ThemedRadioButton {
-                    theme: root.uiTheme
-                    Layout.fillWidth: true
-                    checked: !firstRunWindow.livingAbroad
-                    text: root.tr("dialog.first-run-wizard.location-home",
-                            "I am in {country}")
-                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
-                    onToggled: if (checked) firstRunWindow.livingAbroad = false
-                }
-                ThemedRadioButton {
-                    theme: root.uiTheme
-                    Layout.fillWidth: true
-                    checked: firstRunWindow.livingAbroad
-                    text: root.tr("dialog.first-run-wizard.location-abroad",
-                            "I am outside {country} and need access to its services")
-                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
-                    onToggled: if (checked) firstRunWindow.livingAbroad = true
-                }
-            }
-
-            ThemedButton {
-                theme: root.uiTheme
-                Layout.fillWidth: true
-                text: (firstRunWindow.useAbroadPack
-                        ? root.tr("dialog.first-run-wizard.option-country-preset-abroad",
-                            "Load access preset ({country})")
-                        : root.tr("dialog.first-run-wizard.option-country-preset",
-                            "Load country preset ({country})"))
-                    .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
-                icon.source: root.uiIconSource("load-list")
-                onClicked: firstRunWindow._applyCountryPreset()
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
-                wrapMode: Text.WordWrap
-                color: root.mutedTextColor
-                text: firstRunWindow.useAbroadPack
-                    ? root.tr("dialog.first-run-wizard.option-country-preset-abroad-description",
-                        "Everything stays on your local provider; only that country's services take the additional route.")
-                    : root.tr("dialog.first-run-wizard.option-country-preset-description",
-                        "Detected from your OS locale. Imports the bundled pack for your region.")
-            }
-        }
-        // Option 1 fallback note when no country pack found.
-        Label {
-            Layout.fillWidth: true
-            wrapMode: Text.WordWrap
-            color: root.mutedTextColor
-            visible: !firstRunWindow.hasAnyCountryPack
-            text: root.tr("dialog.first-run-wizard.option-country-not-available",
-                "No country preset is bundled for your region — pick a different option.")
-        }
-
-        // Option 2: Built-in demo.
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXs
-            ThemedButton {
-                theme: root.uiTheme
-                Layout.fillWidth: true
-                text: root.tr("dialog.first-run-wizard.option-builtin-demo",
-                        "Use built-in demo rules")
-                icon.source: root.uiIconSource("add")
-                onClicked: firstRunWindow._applyBuiltinDemo()
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
-                wrapMode: Text.WordWrap
-                color: root.mutedTextColor
-                text: root.tr("dialog.first-run-wizard.option-builtin-demo-description",
-                    "A tiny showcase set covering each rule kind. Replace with your own later.")
-            }
-        }
-
-        // Option 3: Open my rules… (two-file picker)
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXs
-            Label {
-                Layout.fillWidth: true
-                text: root.tr("dialog.first-run-wizard.option-open-file",
-                        "Open my rules...")
-                color: root.textColor
-                font.bold: true
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
-                wrapMode: Text.WordWrap
-                color: root.mutedTextColor
-                text: root.tr("dialog.first-run-wizard.option-open-file-description",
-                    "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.")
-            }
-            // Primary route slot.
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
-                spacing: root.uiTheme.spacingSm
                 Label {
-                    text: root.tr("dialog.first-run-wizard.primary-file-label",
-                        "Primary:")
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: firstRunWindow.primaryAssigned
+                        ? root.tr("dialog.first-run-wizard.primary-adapter-assigned",
+                            "Main connection: {name}. You can change it later in Interfaces and routes.")
+                            .replace("{name}", firstRunWindow.assignedPrimaryName)
+                        : root.tr("dialog.first-run-wizard.primary-adapter-description",
+                            "The connection everything travels by default. Until you name it, your rules are not applied.")
+                }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    visible: !firstRunWindow.primaryAssigned
+                    ThemedComboBox {
+                        id: firstRunPrimaryCombo
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        model: root.interfacesModel
+                        textRole: "name"
+                        currentIndex: -1
+                        labelResolver: function(item) {
+                            return firstRunWindow._adapterLabel(item)
+                        }
+                        displayText: root.uiRevision >= 0 && currentIndex >= 0
+                            ? firstRunWindow._adapterLabel(
+                                root.interfacesModel.get(currentIndex))
+                            : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
+                                "Choose a connection")
+                        Accessible.role: Accessible.ComboBox
+                        Accessible.name: root.tr("dialog.first-run-wizard.primary-adapter-title",
+                            "Main connection")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("dialog.first-run-wizard.primary-adapter-assign", "Set as main")
+                        enabled: firstRunPrimaryCombo.currentIndex >= 0
+                        onClicked: {
+                            if (root.interfacesRolesController
+                                    && typeof root.interfacesRolesController.assignRole === "function") {
+                                root.interfacesRolesController.assignRole(
+                                    firstRunPrimaryCombo.currentIndex, "primary")
+                            }
+                        }
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    visible: !firstRunWindow.primaryAssigned && root.interfacesModel.count === 0
+                    text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
+                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
+                }
+            }
+
+            // Additional connection, in the same breath as the main one: a rule
+            // says "send this the other way", and without an adapter to send it to
+            // the rule has nowhere to go.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXs
+
+                Label {
+                    text: root.tr("dialog.first-run-wizard.secondary-adapter-title",
+                        "Additional connection")
                     color: root.textColor
-                    Layout.preferredWidth: 96
+                    font.bold: true
                 }
                 Label {
                     Layout.fillWidth: true
-                    elide: Text.ElideMiddle
-                    color: firstRunWindow.pickedPrimaryPath
-                        ? root.textColor : root.mutedTextColor
-                    text: firstRunWindow.pickedPrimaryPath
-                        ? firstRunWindow._basename(firstRunWindow.pickedPrimaryPath)
-                        : root.tr("dialog.first-run-wizard.no-file-selected",
-                            "(no file selected)")
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: firstRunWindow.secondaryAssigned
+                        ? root.tr("dialog.first-run-wizard.secondary-adapter-assigned",
+                            "Additional connection: {name}. You can change it later in Interfaces and routes.")
+                            .replace("{name}", firstRunWindow.assignedSecondaryName)
+                        : (firstRunWindow.secondaryDeferred
+                            ? root.tr("dialog.first-run-wizard.secondary-adapter-deferred",
+                                "You can assign it any time in Interfaces and routes. Until then, with leak protection on, the traffic your rules send that way is blocked instead of leaking to the main connection.")
+                            : root.tr("dialog.first-run-wizard.secondary-adapter-description",
+                                "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned."))
                 }
-                ThemedButton {
-                    theme: root.uiTheme
-                    text: firstRunWindow.pickedPrimaryPath
-                        ? root.tr("dialog.first-run-wizard.change-button", "Change...")
-                        : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
-                    onClicked: root.openRulesDialog(firstRunOpenPrimaryDialog)
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    ThemedComboBox {
+                        id: firstRunSecondaryCombo
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        model: root.interfacesModel
+                        textRole: "name"
+                        currentIndex: -1
+                        labelResolver: function(item) {
+                            return firstRunWindow._adapterLabel(item)
+                        }
+                        displayText: root.uiRevision >= 0 && currentIndex >= 0
+                            ? firstRunWindow._adapterLabel(
+                                root.interfacesModel.get(currentIndex))
+                            : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
+                                "Choose a connection")
+                        Accessible.role: Accessible.ComboBox
+                        Accessible.name: root.tr("dialog.first-run-wizard.secondary-adapter-title",
+                            "Additional connection")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("dialog.first-run-wizard.secondary-adapter-assign",
+                            "Set as additional")
+                        enabled: firstRunSecondaryCombo.currentIndex >= 0
+                        onClicked: {
+                            if (root.interfacesRolesController
+                                    && typeof root.interfacesRolesController.assignRole === "function") {
+                                root.interfacesRolesController.assignRole(
+                                    firstRunSecondaryCombo.currentIndex, "secondary")
+                            }
+                        }
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("dialog.first-run-wizard.secondary-adapter-later",
+                            "I will choose it later")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: firstRunWindow.secondaryDeferred = true
+                    }
                 }
-                ThemedButton {
-                    theme: root.uiTheme
-                    visible: firstRunWindow.pickedPrimaryPath !== ""
-                    text: root.tr("dialog.first-run-wizard.clear-button", "Clear")
-                    onClicked: firstRunWindow.pickedPrimaryPath = ""
-                }
-            }
-            // Secondary route slot.
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
-                spacing: root.uiTheme.spacingSm
-                Label {
-                    text: root.tr("dialog.first-run-wizard.secondary-file-label",
-                        "Secondary:")
-                    color: root.textColor
-                    Layout.preferredWidth: 96
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                    Label {
+                        Layout.fillWidth: true
+                        Layout.preferredWidth: 0
+                        wrapMode: Text.WordWrap
+                        color: root.mutedTextColor
+                        text: firstRunWindow._tunnelCandidateName() !== ""
+                            ? root.tr("dialog.first-run-wizard.secondary-adapter-vpn-hint",
+                                "{name} looks like a VPN connection — choose it above to make it the additional route.")
+                                .replace("{name}", firstRunWindow._tunnelCandidateName())
+                            : root.tr("dialog.first-run-wizard.secondary-adapter-vpn-none",
+                                "No VPN connection found yet. Install your VPN and connect it, then come back here.")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("dialog.first-run-wizard.secondary-adapter-vpn-setup",
+                            "Set up my VPN")
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                        onClicked: root.openVpnOnboarding()
+                    }
                 }
                 Label {
                     Layout.fillWidth: true
-                    elide: Text.ElideMiddle
-                    color: firstRunWindow.pickedSecondaryPath
-                        ? root.textColor : root.mutedTextColor
-                    text: firstRunWindow.pickedSecondaryPath
-                        ? firstRunWindow._basename(firstRunWindow.pickedSecondaryPath)
-                        : root.tr("dialog.first-run-wizard.no-file-selected",
-                            "(no file selected)")
-                }
-                ThemedButton {
-                    theme: root.uiTheme
-                    text: firstRunWindow.pickedSecondaryPath
-                        ? root.tr("dialog.first-run-wizard.change-button", "Change...")
-                        : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
-                    onClicked: root.openRulesDialog(firstRunOpenSecondaryDialog)
-                }
-                ThemedButton {
-                    theme: root.uiTheme
-                    visible: firstRunWindow.pickedSecondaryPath !== ""
-                    text: root.tr("dialog.first-run-wizard.clear-button", "Clear")
-                    onClicked: firstRunWindow.pickedSecondaryPath = ""
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    visible: !firstRunWindow.secondaryAssigned && !firstRunWindow.secondaryDeferred
+                        && root.interfacesModel.count === 0
+                    text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
+                        "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
                 }
             }
-            ThemedButton {
-                theme: root.uiTheme
-                Layout.leftMargin: root.uiTheme.spacingMd
-                text: root.tr("dialog.first-run-wizard.import-button",
-                        "Import selected files")
-                icon.source: root.uiIconSource("load-list")
-                enabled: firstRunWindow.pickedPrimaryPath !== ""
-                    || firstRunWindow.pickedSecondaryPath !== ""
-                onClicked: firstRunWindow._applyOpenedFiles()
-            }
-        }
 
-        // Option 4: Start empty.
-        ColumnLayout {
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingXs
-            ThemedButton {
-                theme: root.uiTheme
+            // Protection defaults, offered before the rule set so they are already
+            // in force when the first rules apply.
+            ColumnLayout {
                 Layout.fillWidth: true
-                text: root.tr("dialog.first-run-wizard.option-start-empty",
-                        "Start empty")
-                onClicked: firstRunWindow._startEmpty()
+                spacing: root.uiTheme.spacingXs
+
+                Label {
+                    text: root.tr("dialog.first-run-wizard.protection-title",
+                        "Protection")
+                    color: root.textColor
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: root.tr("dialog.first-run-wizard.protection-description",
+                        "Recommended for everyone. Each of these can be changed later in Settings.")
+                }
+                CheckBox {
+                    id: firstRunKillSwitchCheck
+                    Layout.fillWidth: true
+                    checked: firstRunWindow.wantKillSwitch
+                    text: root.tr("dialog.first-run-wizard.protection-kill-switch",
+                        "Block routed traffic when the additional route is down")
+                    contentItem: Label {
+                        text: firstRunKillSwitchCheck.text
+                        leftPadding: firstRunKillSwitchCheck.indicator.width + firstRunKillSwitchCheck.spacing
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantKillSwitch = checked
+                }
+                CheckBox {
+                    id: firstRunDohCheck
+                    Layout.fillWidth: true
+                    checked: firstRunWindow.wantDohLockdown
+                    text: root.tr("dialog.first-run-wizard.protection-doh-lockdown",
+                        "Keep browsers from resolving routed sites past NetRuleRouter")
+                    contentItem: Label {
+                        text: firstRunDohCheck.text
+                        leftPadding: firstRunDohCheck.indicator.width + firstRunDohCheck.spacing
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantDohLockdown = checked
+                }
+                CheckBox {
+                    id: firstRunFakeIpCheck
+                    Layout.fillWidth: true
+                    checked: firstRunWindow.wantFakeIp
+                    text: root.tr("dialog.first-run-wizard.protection-fake-ip",
+                        "Route sites by name, so an address shared with another site is not dragged along")
+                    contentItem: Label {
+                        text: firstRunFakeIpCheck.text
+                        leftPadding: firstRunFakeIpCheck.indicator.width + firstRunFakeIpCheck.spacing
+                        color: root.textColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantFakeIp = checked
+                }
+                CheckBox {
+                    id: firstRunDiagLogsCheck
+                    Layout.fillWidth: true
+                    checked: firstRunWindow.wantDiagnosticLogs
+                    text: root.tr("dialog.first-run-wizard.protection-diagnostic-logs",
+                        "Write detailed diagnostic logs (only needed to report a problem)")
+                    contentItem: Label {
+                        text: firstRunDiagLogsCheck.text
+                        leftPadding: firstRunDiagLogsCheck.indicator.width + firstRunDiagLogsCheck.spacing
+                        color: root.mutedTextColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantDiagnosticLogs = checked
+                }
+                CheckBox {
+                    id: firstRunMuteBlockNoticesCheck
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    checked: firstRunWindow.wantBlockNoticesMuted
+                    text: root.tr("dialog.first-run-wizard.protection-mute-block-notices",
+                        "Do not show notifications about blocked traffic (rule suggestions still arrive)")
+                    contentItem: Label {
+                        text: firstRunMuteBlockNoticesCheck.text
+                        leftPadding: firstRunMuteBlockNoticesCheck.indicator.width + firstRunMuteBlockNoticesCheck.spacing
+                        color: root.mutedTextColor
+                        wrapMode: Text.WordWrap
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                    onToggled: firstRunWindow.wantBlockNoticesMuted = checked
+                }
             }
+
+            // Option 1: Country preset (if a pack exists for the detected locale).
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXs
+                visible: firstRunWindow.hasAnyCountryPack
+
+                // Asked only when both directions ship a pack (with one of them the
+                // answer would change nothing) and only in that country's own
+                // language — see `locationQuestionRelevant`.
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    visible: firstRunWindow.hasHomePack && firstRunWindow.hasAbroadPack
+                        && firstRunWindow.locationQuestionRelevant
+                    Label {
+                        text: root.tr("dialog.first-run-wizard.location-title",
+                            "Where are you?")
+                        color: root.textColor
+                        font.bold: true
+                    }
+                    ThemedRadioButton {
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        checked: !firstRunWindow.livingAbroad
+                        text: root.tr("dialog.first-run-wizard.location-home",
+                                "I am in {country}")
+                            .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                        onToggled: if (checked) firstRunWindow.livingAbroad = false
+                    }
+                    ThemedRadioButton {
+                        theme: root.uiTheme
+                        Layout.fillWidth: true
+                        checked: firstRunWindow.livingAbroad
+                        text: root.tr("dialog.first-run-wizard.location-abroad",
+                                "I am outside {country} and need access to its services")
+                            .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                        onToggled: if (checked) firstRunWindow.livingAbroad = true
+                    }
+                }
+
+                ThemedButton {
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: (firstRunWindow.useAbroadPack
+                            ? root.tr("dialog.first-run-wizard.option-country-preset-abroad",
+                                "Load access preset ({country})")
+                            : root.tr("dialog.first-run-wizard.option-country-preset",
+                                "Load country preset ({country})"))
+                        .replace("{country}", firstRunWindow.detectedCountry.toUpperCase())
+                    icon.source: root.uiIconSource("load-list")
+                    onClicked: firstRunWindow._applyCountryPreset()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: firstRunWindow.useAbroadPack
+                        ? root.tr("dialog.first-run-wizard.option-country-preset-abroad-description",
+                            "Everything stays on your local provider; only that country's services take the additional route.")
+                        : root.tr("dialog.first-run-wizard.option-country-preset-description",
+                            "Detected from your OS locale. Imports the bundled pack for your region.")
+                }
+            }
+            // Option 1 fallback note when no country pack found.
             Label {
                 Layout.fillWidth: true
-                Layout.leftMargin: root.uiTheme.spacingMd
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
-                text: root.tr("dialog.first-run-wizard.option-start-empty-description",
-                    "No rules. Add or import them whenever you want.")
+                visible: !firstRunWindow.hasAnyCountryPack
+                text: root.tr("dialog.first-run-wizard.option-country-not-available",
+                    "No country preset is bundled for your region — pick a different option.")
+            }
+
+            // Option 2: Built-in demo.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXs
+                ThemedButton {
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: root.tr("dialog.first-run-wizard.option-builtin-demo",
+                            "Use built-in demo rules")
+                    icon.source: root.uiIconSource("add")
+                    onClicked: firstRunWindow._applyBuiltinDemo()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: root.tr("dialog.first-run-wizard.option-builtin-demo-description",
+                        "A tiny showcase set covering each rule kind. Replace with your own later.")
+                }
+            }
+
+            // Option 3: Open my rules… (two-file picker)
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXs
+                Label {
+                    Layout.fillWidth: true
+                    text: root.tr("dialog.first-run-wizard.option-open-file",
+                            "Open my rules...")
+                    color: root.textColor
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: root.tr("dialog.first-run-wizard.option-open-file-description",
+                        "Choose one or two preset .txt files — one for each route. Leave a route empty to start it blank.")
+                }
+                // Primary route slot.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    spacing: root.uiTheme.spacingSm
+                    Label {
+                        text: root.tr("dialog.first-run-wizard.primary-file-label",
+                            "Primary:")
+                        color: root.textColor
+                        Layout.preferredWidth: 96
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideMiddle
+                        color: firstRunWindow.pickedPrimaryPath
+                            ? root.textColor : root.mutedTextColor
+                        text: firstRunWindow.pickedPrimaryPath
+                            ? firstRunWindow._basename(firstRunWindow.pickedPrimaryPath)
+                            : root.tr("dialog.first-run-wizard.no-file-selected",
+                                "(no file selected)")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: firstRunWindow.pickedPrimaryPath
+                            ? root.tr("dialog.first-run-wizard.change-button", "Change...")
+                            : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
+                        onClicked: root.openRulesDialog(firstRunOpenPrimaryDialog)
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: firstRunWindow.pickedPrimaryPath !== ""
+                        text: root.tr("dialog.first-run-wizard.clear-button", "Clear")
+                        onClicked: firstRunWindow.pickedPrimaryPath = ""
+                    }
+                }
+                // Secondary route slot.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    spacing: root.uiTheme.spacingSm
+                    Label {
+                        text: root.tr("dialog.first-run-wizard.secondary-file-label",
+                            "Secondary:")
+                        color: root.textColor
+                        Layout.preferredWidth: 96
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideMiddle
+                        color: firstRunWindow.pickedSecondaryPath
+                            ? root.textColor : root.mutedTextColor
+                        text: firstRunWindow.pickedSecondaryPath
+                            ? firstRunWindow._basename(firstRunWindow.pickedSecondaryPath)
+                            : root.tr("dialog.first-run-wizard.no-file-selected",
+                                "(no file selected)")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: firstRunWindow.pickedSecondaryPath
+                            ? root.tr("dialog.first-run-wizard.change-button", "Change...")
+                            : root.tr("dialog.first-run-wizard.browse-button", "Browse...")
+                        onClicked: root.openRulesDialog(firstRunOpenSecondaryDialog)
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: firstRunWindow.pickedSecondaryPath !== ""
+                        text: root.tr("dialog.first-run-wizard.clear-button", "Clear")
+                        onClicked: firstRunWindow.pickedSecondaryPath = ""
+                    }
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    text: root.tr("dialog.first-run-wizard.import-button",
+                            "Import selected files")
+                    icon.source: root.uiIconSource("load-list")
+                    enabled: firstRunWindow.pickedPrimaryPath !== ""
+                        || firstRunWindow.pickedSecondaryPath !== ""
+                    onClicked: firstRunWindow._applyOpenedFiles()
+                }
+            }
+
+            // Option 4: Start empty.
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingXs
+                ThemedButton {
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    text: root.tr("dialog.first-run-wizard.option-start-empty",
+                            "Start empty")
+                    onClicked: firstRunWindow._startEmpty()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: root.uiTheme.spacingMd
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: root.tr("dialog.first-run-wizard.option-start-empty-description",
+                        "No rules. Add or import them whenever you want.")
+                }
             }
         }
-
-        Item { Layout.fillHeight: true }
     }
 }

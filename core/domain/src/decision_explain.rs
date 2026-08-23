@@ -131,8 +131,8 @@ pub enum UncertaintyMarker {
     StaleAvailabilitySnapshot,
     /// Secondary adapter state was unknown at decision time.
     UnknownSecondaryState,
-    /// Destination IP was native IPv6 (Pro-only); ExactIp matching was skipped.
-    Ipv6DestinationProOnly,
+    /// Destination IP was native IPv6 (unsupported); ExactIp matching was skipped.
+    Ipv6DestinationUnsupported,
 }
 
 // ── ExplainConflictMarker ─────────────────────────────────────────────────────

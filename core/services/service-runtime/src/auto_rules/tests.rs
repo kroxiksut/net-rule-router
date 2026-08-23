@@ -1,4 +1,4 @@
-﻿//! Behaviour tests for the companion-domain discovery engine.
+//! Behaviour tests for the companion-domain discovery engine.
 //!
 //! The learning algorithm itself is proven in `nrr_domain::companion_affinity`;
 //! what is exercised here is the service-side contract around it — what each
@@ -33,6 +33,24 @@ impl FixedRules {
             }),
             behavior_mode: Mutex::new(RouteBehaviorMode::PreferPrimary),
         })
+    }
+
+    /// Add secondary rules for hostnames a test drives as anchors. The
+    /// proposal tick retires anchors the rule book does not recognise, so a
+    /// test that feeds the ledger an anchor has to say it is one.
+    fn also_route(&self, hosts: &[&str]) {
+        let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        let mut rules = book.secondary.rules().to_vec();
+        rules.extend(hosts.iter().map(|h| exact_rule(h)));
+        book.secondary = CanonicalRuleSet::from_rules(rules);
+    }
+
+    /// Same, for a hostname a test drives as a PRIMARY-route anchor.
+    fn also_route_primary(&self, hosts: &[&str]) {
+        let mut book = self.book.lock().unwrap_or_else(|p| p.into_inner());
+        let mut rules = book.primary.rules().to_vec();
+        rules.extend(hosts.iter().map(|h| exact_rule(h)));
+        book.primary = CanonicalRuleSet::from_rules(rules);
     }
 
     fn set_behavior_mode(&self, mode: RouteBehaviorMode) {
@@ -777,6 +795,7 @@ fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCan
         }],
         consumers_changed_unix_ms: last_seen_unix_ms,
         primary_behavior: String::new(),
+        anchor_refuses_main_link: false,
     }
 }
 
@@ -994,6 +1013,9 @@ fn candidate_ids_are_stable_across_recomputation_and_scoped_to_the_principal() {
 #[test]
 fn the_pending_set_is_capped_and_keeps_the_strongest() {
     let f = fixture(AutoRulesMode::Suggest);
+    let sites: Vec<String> = (0..5).map(|s| format!("site{s}.example")).collect();
+    f.rules
+        .also_route(&sites.iter().map(String::as_str).collect::<Vec<_>>());
     // Several sites, each pulling its own companions: one site alone cannot
     // exceed the learner's per-anchor cap.
     for site in 0..5 {
@@ -1071,6 +1093,7 @@ fn a_shared_host_carries_every_consumer_strongest_first() {
     // one hit already earns each anchor its own proposal for the same address
     // — the shape a real shared CDN produces.
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
+    f.rules.also_route(&["site-a.example", "site-b.example"]);
     // site-a pulls it on three separate visits, site-b on one: three visits
     // means three nearest-hits for site-a against a shared total, so its
     // evidence outranks site-b's and it signs the offer.
@@ -1123,6 +1146,7 @@ fn a_shared_host_carries_every_consumer_strongest_first() {
 #[test]
 fn a_repeated_tick_with_no_new_consumer_does_not_move_the_new_basis_clock() {
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
+    f.rules.also_route(&["site-a.example", "site-b.example"]);
     for (at, anchor) in [(0_u64, "site-a.example"), (100_000, "site-b.example")] {
         let Some(mut batch) = f.engine.begin_batch(SID) else {
             unreachable!("suggest mode collects")
@@ -1160,6 +1184,8 @@ fn a_repeated_tick_with_no_new_consumer_does_not_move_the_new_basis_clock() {
 #[test]
 fn a_third_consumer_arriving_later_moves_the_new_basis_clock_forward() {
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
+    f.rules
+        .also_route(&["site-a.example", "site-b.example", "site-c.example"]);
     for (at, anchor) in [(0_u64, "site-a.example"), (100_000, "site-b.example")] {
         let Some(mut batch) = f.engine.begin_batch(SID) else {
             unreachable!("suggest mode collects")
@@ -1208,6 +1234,8 @@ fn a_third_consumer_arriving_later_moves_the_new_basis_clock_forward() {
 #[test]
 fn a_consumer_on_the_default_route_still_appears_even_though_its_own_offer_is_inert() {
     let f = fixture_with_eager_delivery(Arc::new(AtomicBool::new(true)));
+    f.rules.also_route(&["site-a.example"]);
+    f.rules.also_route_primary(&["site-b.example"]);
     {
         let Some(mut batch) = f.engine.begin_batch(SID) else {
             unreachable!("suggest mode collects")
@@ -1463,6 +1491,108 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
 
     let after = bus.peek_pending_for(&sub.subscription_id, 10);
     assert_eq!(after.len(), 1, "no second event was published");
+}
+
+/// A site the user marked as refusing main-link addresses is the one case where
+/// "it answers on the main route" proves nothing — answering with a refusal is
+/// still answering. Its companions keep being offered.
+#[test]
+fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = Arc::new(EventBus::new());
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus))
+    .with_refusing_anchors(Arc::new(|_sid: &str| vec!["site.example".to_string()]));
+    let sub = bus.subscribe("client".into(), None);
+
+    // A third-party neighbour that answers on the main route: normally quietened.
+    two_visits(&engine, &["cdn.example"]);
+    engine.note_primary_health(SID, "cdn.example", PrimaryHealthEvent::Completed);
+
+    let summary = engine.tick(SID, later());
+    assert_eq!(summary.pending, 1);
+    assert!(
+        summary.published,
+        "the anchor refuses main-link addresses, so its companions are still worth asking about"
+    );
+    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+}
+
+/// While the additional route is down, everything already travels the main
+/// link and works — so an offer to move addresses onto a route that does not
+/// exist right now is noise. The findings are kept and offered once it is back.
+#[test]
+fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = Arc::new(EventBus::new());
+    let up = Arc::new(AtomicBool::new(false));
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus))
+    .with_secondary_ready({
+        let up = Arc::clone(&up);
+        Arc::new(move |_sid: &str| up.load(Ordering::Relaxed))
+    });
+    let sub = bus.subscribe("client".into(), None);
+
+    two_visits(&engine, &["assets.site.example"]);
+    let while_down = engine.tick(SID, later());
+    assert_eq!(while_down.pending, 1, "the finding is kept");
+    assert!(
+        !while_down.published,
+        "nothing pops while the route is down"
+    );
+    assert!(bus.peek_pending_for(&sub.subscription_id, 10).is_empty());
+
+    up.store(true, Ordering::Relaxed);
+    let when_back = engine.tick(SID, SystemTime::UNIX_EPOCH + Duration::from_millis(400_000));
+    assert!(
+        when_back.published,
+        "what was learned while the route was down is offered once it is up"
+    );
+    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+}
+
+/// "It answers on the main route" settles a third-party neighbour, never an
+/// address of the routed site itself: a site can complete the connection and
+/// still serve a refusal to a main-link address, which is the exact case the
+/// user routes it for.
+#[test]
+fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = Arc::new(EventBus::new());
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+    let sub = bus.subscribe("client".into(), None);
+
+    // Same registrable domain as the anchor `site.example` → brand-related.
+    two_visits(&engine, &["assets.site.example"]);
+    engine.note_primary_health(SID, "assets.site.example", PrimaryHealthEvent::Completed);
+
+    let summary = engine.tick(SID, later());
+    assert_eq!(summary.pending, 1);
+    assert!(
+        summary.published,
+        "an address belonging to the routed site is not settled by a completed connection"
+    );
+    assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
 }
 
 // ── Eager delivery-name suggestions (per-SID opt-in) ─────────────────────────

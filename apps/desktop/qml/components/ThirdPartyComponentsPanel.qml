@@ -113,6 +113,16 @@ Item {
         return root.tr("third-party.feature." + String(slug), String(slug))
     }
 
+    /// Not every component is versioned by a number: an icon set is identified
+    /// by which variant of it ships. Those read as words, so they translate;
+    /// a real version string is passed through untouched.
+    function _versionLabel(version) {
+        var v = String(version || "")
+        if (v === "outline set")
+            return root.tr("dialog.third-party.version.outline-set", "outline set")
+        return v
+    }
+
     function _copy(text) {
         if (typeof nrrNativeBridge !== "undefined"
                 && typeof nrrNativeBridge.copyToClipboard === "function") {
@@ -177,7 +187,7 @@ Item {
                         }
                         Label {
                             color: root.mutedTextColor
-                            text: String(componentCard.modelData.version || "")
+                            text: panel._versionLabel(componentCard.modelData.version)
                         }
                         Item { Layout.fillWidth: true }
 
@@ -208,7 +218,7 @@ Item {
                         Layout.fillWidth: true
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
-                        text: root.tr("dialog.third-party.publisher", "Author") + ": "
+                        text: root.tr("label.author", "Author") + ": "
                             + String(componentCard.modelData.publisher || "")
                             + "  ·  " + root.tr("label.license", "License") + ": "
                             + String(componentCard.modelData.licenseName || "")

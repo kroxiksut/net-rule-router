@@ -322,6 +322,9 @@ mod windows_impl {
 
 #[cfg(test)]
 mod tests {
+    // The only test here needs DPAPI, so off Windows the module has nothing to
+    // import — and an unconditional glob would be an unused import there.
+    #[cfg(windows)]
     use super::*;
 
     #[cfg(windows)]

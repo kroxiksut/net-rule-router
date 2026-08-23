@@ -70,6 +70,10 @@ const STOP_PROGRESS_TICK: Duration = Duration::from_secs(2);
 /// reporter thread to notice it is done.
 const STOP_PROGRESS_POLL: Duration = Duration::from_millis(100);
 
+/// How long a stop may run before it explains itself. Past every other step's
+/// budget combined, so reaching it means the unbounded one is still going.
+const STOP_SLOW_EXPLAIN: Duration = Duration::from_secs(20);
+
 /// Budget for stopping the DNS resolver. The serve loop polls at 500 ms and
 /// then restores the NRPT redirect, which shells out and takes seconds.
 const RESOLVER_STOP_BUDGET: Duration = Duration::from_secs(5);
@@ -170,6 +174,11 @@ pub struct SupervisedRuntimeDeps {
     /// (e.g. test profiles that don't need retention enforcement, or a
     /// recovery-blocked startup where the DB couldn't be opened).
     pub state_db_conn: Option<Arc<std::sync::Mutex<rusqlite::Connection>>>,
+    /// The enforcement cycle: who is present, what their policy is, and the
+    /// platform that applies it. `None` skips the task entirely, which is the
+    /// honest state for a host where no enforcement path is wired — the daemon
+    /// then serves IPC and diagnostics without pretending to enforce.
+    pub principal_enforcement: Option<Arc<crate::principal_enforcement::PrincipalEnforcementCycle>>,
     /// Traffic counter — sampler + role/settings resolvers driving the
     /// `traffic-sample-tick`. `None` skips the task (traffic DB unavailable /
     /// degraded boot).
@@ -285,6 +294,20 @@ pub struct SupervisedRuntimeDeps {
     /// re-resolving (the fail-closed posture heartbeat) sets a flag here instead
     /// of recomputing from inside its own compute. `None` in test profiles.
     pub rebind_requests: Option<Arc<crate::power_resume::RebindRequests>>,
+    /// Observation source and store behind application rules: what the program
+    /// connects to is what the rule routes. `None` where the platform has no
+    /// observation source — application rules then route nothing, which the
+    /// lowering already reports as unenforceable.
+    pub app_observation: Option<crate::service_tasks::AppObservationWiring>,
+    /// Observed resolutions feeding the rule-driven cache, applied for every
+    /// present principal. `None` where nothing observes DNS.
+    pub dns_observation: Option<crate::service_tasks::DnsObservationWiring>,
+    /// Everyone whose rules are in force right now, when the platform can name
+    /// more than one. Windows has a single console user and leaves this `None`,
+    /// falling back to `active_routing_sid`; Linux answers from logind, so a
+    /// per-user task covers every logged-in user rather than the first.
+    pub present_principals:
+        Option<Arc<dyn nrr_platform_api::active_principals::ActivePrincipalSource>>,
 }
 
 /// A cheap, idempotent "recompute the active user's routes now" callback.
@@ -531,12 +554,32 @@ pub fn run_supervised_runtime(
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let mut since_report = Duration::ZERO;
+            let mut elapsed = Duration::ZERO;
+            let mut explained = false;
             while !teardown_done.load(Ordering::Relaxed) {
                 std::thread::sleep(STOP_PROGRESS_POLL);
                 since_report += STOP_PROGRESS_POLL;
+                elapsed += STOP_PROGRESS_POLL;
                 if since_report >= STOP_PROGRESS_TICK && !teardown_done.load(Ordering::Relaxed) {
                     since_report = Duration::ZERO;
                     controller.report(ServiceRuntimeState::Stopping);
+                }
+                // Every step before the route/filter teardown is time-boxed, so
+                // past this point the wait is that one — and the only thing in
+                // it that can take minutes is a filtering engine that has
+                // stopped answering. Say so once: without this the stop is a
+                // silent hang, and the natural reaction (kill it) is the one
+                // that leaves the filters in place.
+                if !explained
+                    && elapsed >= STOP_SLOW_EXPLAIN
+                    && !teardown_done.load(Ordering::Relaxed)
+                {
+                    explained = true;
+                    tracing::warn!(
+                        target: "nrr::lifecycle",
+                        elapsed_secs = elapsed.as_secs(),
+                        "stop is taking unusually long — waiting on the packet-filter teardown, which is not time-boxed on purpose: filters left behind would block traffic until the next start. If the filtering engine has wedged this will not finish; killing the service leaves the filters, and a reboot clears them",
+                    );
                 }
             }
         });
@@ -627,6 +670,39 @@ pub fn run_supervised_runtime(
     ServiceShutdownReason::ScmStop
 }
 
+/// Everyone whose rules are in force, from whichever source this platform has.
+///
+/// Prefers the multi-user source: a machine that can name several logged-in
+/// users must not have their rules seeded for the first one only. Falls back to
+/// the single console user, and yields `None` when neither is wired — there is
+/// then nobody to act for, which is different from "nobody is logged in".
+fn present_principals_fn(
+    deps: &SupervisedRuntimeDeps,
+) -> Option<crate::service_tasks::PresentPrincipalsFn> {
+    if let Some(source) = deps.present_principals.as_ref() {
+        let source = Arc::clone(source);
+        return Some(Arc::new(move || match source.active_principals() {
+            Ok(principals) => principals
+                .iter()
+                .map(|p| p.as_stored().to_owned())
+                .collect(),
+            // "Could not ask" is not "nobody is here": acting on an empty list
+            // would silently skip a pass for everyone.
+            Err(e) => {
+                tracing::debug!(
+                    target: "nrr::supervisor",
+                    error = %e,
+                    "could not determine who is present; this pass acts for nobody",
+                );
+                Vec::new()
+            }
+        }));
+    }
+    let active = deps.active_routing_sid.as_ref()?;
+    let active = Arc::clone(active);
+    Some(Arc::new(move || active().into_iter().collect()))
+}
+
 /// Spawn the production task set in the documented startup order:
 /// adapter-monitor → health-aggregator → ipc-accept + watcher.
 /// Each `spawn` failure is logged via `tracing::error` and the matching
@@ -692,6 +768,31 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 "spawn resume-watchdog failed: {e}",
+            );
+        }
+    }
+
+    // 1e. app-observation-tick — the destinations application rules route, learnt
+    // from the connections the programs actually make.
+    if let Some(wiring) = deps.app_observation.clone() {
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_app_observation_task(
+            wiring,
+            deps.route_recompute_hook.clone(),
+        )) {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                "spawn app-observation failed: {e}",
+            );
+        }
+    }
+
+    // 1f. dns-observation-tick — the addresses behind the names domain rules
+    // are written in.
+    if let Some(wiring) = deps.dns_observation.clone() {
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_dns_observation_task(wiring)) {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                "spawn dns-observation failed: {e}",
             );
         }
     }
@@ -775,6 +876,20 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
+    // 3a-bis. principal-enforcement-tick. Asks the presence authority who is
+    // logged in, plans for each of them and applies the whole set in one pass.
+    if let Some(cycle) = deps.principal_enforcement.clone() {
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_principal_enforcement_task(
+            cycle,
+        )) {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                error = ?e,
+                "principal-enforcement task could not be spawned; policy will NOT be applied",
+            );
+        }
+    }
+
     // 3b. traffic-sample-tick (Block T). Skipped when the traffic DB / sampler
     // wasn't built (degraded boot). Reads interface octet counters, buckets by
     // role, folds deltas into the daily ledger + session totals.
@@ -807,13 +922,13 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
     // 5. rule-hostname-seed-tick (block 16.18 β). Resolves the active
     // user's ExactFqdn rule hostnames into the FQDN cache so domain rules
     // actually route. Skipped when the route path isn't available.
-    if let (Some(seeder), Some(active_sid)) = (
+    if let (Some(seeder), Some(present)) = (
         deps.rule_hostname_seeder.as_ref(),
-        deps.active_routing_sid.as_ref(),
+        present_principals_fn(deps),
     ) {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_rule_hostname_seed_task(
             Arc::clone(seeder),
-            Arc::clone(active_sid),
+            present,
             deps.route_recompute_hook.clone(),
         )) {
             tracing::warn!(
@@ -1000,6 +1115,7 @@ mod tests {
             audit_dir: std::env::temp_dir(),
             audit_retention: AuditRetentionPolicy::default(),
             state_db_conn: None,
+            principal_enforcement: None,
             traffic_tick: None,
             activation_coordinator: None,
             dns_refresh_orchestrator: None,
@@ -1018,6 +1134,9 @@ mod tests {
             secondary_liveness_hook: None,
             power_event_observer: None,
             rebind_requests: None,
+            app_observation: None,
+            dns_observation: None,
+            present_principals: None,
         }
     }
 

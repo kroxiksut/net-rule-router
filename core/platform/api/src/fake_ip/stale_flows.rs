@@ -50,6 +50,24 @@ pub trait StaleFlowReset: Send + Sync {
     /// table, but it must not block for long: a slow sweep delays the moment
     /// policy starts being enforced.
     fn reset_flows_to(&self, base: Ipv4Addr, prefix_len: u8) -> StaleFlowSweep;
+
+    /// Same teardown, for many exact addresses at once.
+    ///
+    /// A policy apply can newly pin hundreds of addresses in one pass, and each
+    /// of those hosts may be sitting on a connection that predates the pin.
+    /// Calling [`Self::reset_flows_to`] per address would re-read the entire
+    /// connection table per address; an implementation overrides this to sweep
+    /// once. The default keeps the naive shape so a platform without a batched
+    /// mechanism still works.
+    fn reset_flows_to_any(&self, targets: &[Ipv4Addr]) -> StaleFlowSweep {
+        let mut sweep = StaleFlowSweep::default();
+        for ip in targets {
+            let pass = self.reset_flows_to(*ip, 32);
+            sweep.found += pass.found;
+            sweep.torn_down += pass.torn_down;
+        }
+        sweep
+    }
 }
 
 /// The default: tears nothing down. Used on platforms with no connection-table

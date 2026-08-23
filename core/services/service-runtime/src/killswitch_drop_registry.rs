@@ -16,17 +16,20 @@
 //! published set — the caller is expected to pass the FULL current
 //! kill-switch/fail-closed Block id set on every call, not a delta.
 //!
-//! ## Two scopes, not one
+//! ## Scopes, not one set
 //!
-//! The published set is split by BLOCKING SCOPE, because the two
-//! halves fail in completely different ways and the drop detector must not
-//! conflate them:
+//! The published set is split by BLOCKING SCOPE, because the parts fail in
+//! completely different ways and the drop detector must not conflate them:
 //!
 //! - **destination-scoped** — the block carries a remote address (`/32`, a
 //!   subnet, or the catch-all). Its companion permit becomes satisfiable the
 //!   moment the destination's secondary route is installed, so a drop here
 //!   while the secondary is usable means the pin outran the route (or the
 //!   scope is genuinely too wide) — actionable.
+//! - **ipv6-cut** — the blanket close of the IPv6 family (see
+//!   `killswitch_codegen::catch_all_v6_filters`). Deliberately NOT part of the
+//!   role-verification set: a v6 drop proves nothing about the tunnel, it only
+//!   needs its own wording in the notice.
 //! - **app-scoped** — the block carries only an `ALE_APP_ID` condition and no
 //!   destination (`killswitch_codegen::app_kill_switch_filters`). It covers
 //!   EVERY destination the process talks to, including the ones the routing
@@ -45,6 +48,7 @@ use std::sync::RwLock;
 struct PublishedBlocks {
     all: HashSet<u64>,
     app_scoped: HashSet<u64>,
+    ipv6_cut: HashSet<u64>,
 }
 
 /// Shared, lock-protected set of WFP filter spec ids ([`WfpFilterId::raw`](nrr_platform_api::types::WfpFilterId))
@@ -65,7 +69,7 @@ impl KillswitchBlockFilterRegistry {
     /// callers that do not classify (tests, and any caller that only needs the
     /// role-verification gate).
     pub fn publish(&self, ids: HashSet<u64>) {
-        self.publish_scoped(ids, HashSet::new());
+        self.publish_scoped(ids, HashSet::new(), HashSet::new());
     }
 
     /// Replace the published set with `all`, of which `app_scoped` are the
@@ -73,9 +77,18 @@ impl KillswitchBlockFilterRegistry {
     /// kill-switch/fail-closed Block id set — never a partial delta.
     /// `app_scoped` is expected to be a subset of `all`; ids outside `all` are
     /// harmless (they can never match a role-verified drop).
-    pub fn publish_scoped(&self, all: HashSet<u64>, app_scoped: HashSet<u64>) {
+    pub fn publish_scoped(
+        &self,
+        all: HashSet<u64>,
+        app_scoped: HashSet<u64>,
+        ipv6_cut: HashSet<u64>,
+    ) {
         let mut guard = self.blocks.write().unwrap_or_else(|p| p.into_inner());
-        *guard = PublishedBlocks { all, app_scoped };
+        *guard = PublishedBlocks {
+            all,
+            app_scoped,
+            ipv6_cut,
+        };
     }
 
     /// Whether `id` is currently one of ours (kill-switch / fail-closed
@@ -85,6 +98,18 @@ impl KillswitchBlockFilterRegistry {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .all
+            .contains(&id)
+    }
+
+    /// Whether `id` is one of the blocks that close the IPv6 family while the
+    /// protection is on. A drop attributed to one of them has nothing to do
+    /// with the user's rules, and telling them a rule did it sends them
+    /// editing a file that cannot contain the cause.
+    pub fn is_ipv6_cut(&self, id: u64) -> bool {
+        self.blocks
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .ipv6_cut
             .contains(&id)
     }
 
@@ -141,7 +166,7 @@ mod tests {
     #[test]
     fn app_scoped_ids_are_role_verified_and_separately_identifiable() {
         let registry = KillswitchBlockFilterRegistry::new();
-        registry.publish_scoped(HashSet::from([1, 2]), HashSet::from([2]));
+        registry.publish_scoped(HashSet::from([1, 2]), HashSet::from([2]), HashSet::new());
         // Both halves still pass the role-verification gate…
         assert!(registry.contains(1));
         assert!(registry.contains(2));
@@ -153,17 +178,29 @@ mod tests {
     #[test]
     fn publish_scoped_replaces_both_sets_together() {
         let registry = KillswitchBlockFilterRegistry::new();
-        registry.publish_scoped(HashSet::from([1, 2]), HashSet::from([2]));
-        registry.publish_scoped(HashSet::from([3]), HashSet::new());
+        registry.publish_scoped(HashSet::from([1, 2]), HashSet::from([2]), HashSet::new());
+        registry.publish_scoped(HashSet::from([3]), HashSet::new(), HashSet::new());
         assert!(!registry.is_app_scoped(2));
         assert!(!registry.contains(2));
         assert!(registry.contains(3));
     }
 
     #[test]
+    fn ipv6_cut_ids_are_identifiable_without_being_role_verified() {
+        let registry = KillswitchBlockFilterRegistry::new();
+        registry.publish_scoped(HashSet::from([1]), HashSet::new(), HashSet::from([9]));
+        assert!(registry.is_ipv6_cut(9));
+        assert!(
+            !registry.contains(9),
+            "a v6 drop must not role-verify a tunnel"
+        );
+        assert!(!registry.is_ipv6_cut(1));
+    }
+
+    #[test]
     fn plain_publish_classifies_nothing_as_app_scoped() {
         let registry = KillswitchBlockFilterRegistry::new();
-        registry.publish_scoped(HashSet::from([1]), HashSet::from([1]));
+        registry.publish_scoped(HashSet::from([1]), HashSet::from([1]), HashSet::new());
         registry.publish(HashSet::from([1]));
         assert!(registry.contains(1));
         assert!(!registry.is_app_scoped(1));

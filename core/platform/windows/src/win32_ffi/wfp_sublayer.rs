@@ -33,7 +33,7 @@ use std::mem::MaybeUninit;
 
 use windows::core::{GUID, PWSTR};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmSubLayerAdd0, FWPM_DISPLAY_DATA0, FWPM_SUBLAYER0,
+    FwpmSubLayerAdd0, FwpmSubLayerDeleteByKey0, FWPM_DISPLAY_DATA0, FWPM_SUBLAYER0,
 };
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 
@@ -41,7 +41,7 @@ use crate::constants::{
     WFP_PROVIDER_GUID, WFP_SUBLAYER_DESCRIPTION, WFP_SUBLAYER_GUID, WFP_SUBLAYER_NAME,
     WFP_SUBLAYER_WEIGHT,
 };
-use crate::error::win32_codes::FWP_E_ALREADY_EXISTS;
+use crate::error::win32_codes::{FWP_E_ALREADY_EXISTS, FWP_E_SUBLAYER_NOT_FOUND};
 use crate::error::PlatformError;
 use crate::types::WfpEngineToken;
 
@@ -52,6 +52,9 @@ use super::wfp_engine::token_to_handle;
 /// string to keep sub-layer failures distinguishable from filter-add
 /// duplicates in the apply layer.
 const ADD_OP: &str = "FwpmSubLayerAdd0";
+
+/// Operation name for the removal half.
+const DELETE_OP: &str = "FwpmSubLayerDeleteByKey0";
 
 /// Provider GUID baked into the constants module, re-projected into
 /// the windows-rs [`GUID`] struct.
@@ -111,9 +114,10 @@ pub fn ensure_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
         name: PWSTR(name_w.as_mut_ptr()),
         description: PWSTR(desc_w.as_mut_ptr()),
     };
-    // Non-persistent sub-layer: bound to the engine session lifetime.
-    // Mirrors the per-apply WFP session strategy documented in
-    // `crate::constants`.
+    // Not `FWPM_SUBLAYER_FLAG_PERSISTENT`: the object does not survive a
+    // reboot or a Base Filtering Engine restart. It DOES outlive this process
+    // though — the session is non-dynamic — so removal is explicit, the same
+    // way filters are (`delete_sublayer`).
     sub.flags = 0;
     sub.providerKey = std::ptr::null_mut();
     sub.weight = (WFP_SUBLAYER_WEIGHT & 0xFFFF) as u16;
@@ -130,6 +134,30 @@ pub fn ensure_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
     }
     Err(PlatformError::Win32 {
         operation: ADD_OP,
+        code,
+        message: format!("Win32 error 0x{code:08X}"),
+    })
+}
+
+/// Remove our sub-layer.
+///
+/// The counterpart to [`ensure_sublayer`], for the one moment it is wanted:
+/// removing the product. The object is not persistent, so a reboot clears it
+/// anyway — but an uninstall should not leave the machine to tidy up after us
+/// at some unspecified later time.
+///
+/// Idempotent: `FWP_E_SUBLAYER_NOT_FOUND` is success. Fails while any filter
+/// still references the sub-layer, so the filter sweep has to run first.
+pub fn delete_sublayer(token: &WfpEngineToken) -> Result<(), PlatformError> {
+    let handle = token_to_handle(token);
+    // SAFETY: `handle` is valid for the lifetime of `token`; `NRR_SUBLAYER_GUID`
+    // is a `'static` constant, so the pointer outlives the call.
+    let code = unsafe { FwpmSubLayerDeleteByKey0(handle, &NRR_SUBLAYER_GUID) };
+    if code == 0 || code == FWP_E_SUBLAYER_NOT_FOUND {
+        return Ok(());
+    }
+    Err(PlatformError::Win32 {
+        operation: DELETE_OP,
         code,
         message: format!("Win32 error 0x{code:08X}"),
     })

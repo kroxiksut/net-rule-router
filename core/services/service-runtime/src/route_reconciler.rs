@@ -17,7 +17,7 @@
 //! installs the new user's. Per-SID WFP filters (the kill-switch) remain
 //! per-user and simultaneous; only the route table is single-owner.
 //! Simultaneous distinct routing for multiple concurrently-active sessions
-//! needs a kernel callout driver and is a Pro feature (`strategy.rs`).
+//! needs a kernel callout driver and is not supported (`strategy.rs`).
 //!
 //! ## Ownership tracking
 //!
@@ -32,8 +32,9 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 
+use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::routing::RoutingTransaction;
-use nrr_platform_api::{PlatformError, RouteEntry, RoutingAction, WindowsApiPort};
+use nrr_platform_api::{PlatformError, RouteEntry, RoutingAction};
 
 use crate::route_codegen::{OVERLAY_HIGH, OVERLAY_LOW};
 
@@ -151,6 +152,12 @@ pub fn bootstrap_server_ips(
 /// catch-all kill-switch permits these so DHCP renewal, the local
 /// router/DNS, and LAN devices keep working while everything else off-tunnel
 /// is blocked. Deduplicated, order preserved.
+///
+/// Windows carries an on-link `224.0.0.0/4` route on every interface, which
+/// looks exactly like a connected subnet here. Left in, it named a "local
+/// network" the user could see and untick in Settings, and it exempted all
+/// multicast from the kill-switch instead of the control block the codegen
+/// exempts deliberately. Only a unicast destination can be a subnet.
 pub fn primary_local_subnets(routes: &[RouteEntry], primary_ifindex: u32) -> Vec<(Ipv4Addr, u8)> {
     let mut seen = HashSet::new();
     routes
@@ -159,8 +166,48 @@ pub fn primary_local_subnets(routes: &[RouteEntry], primary_ifindex: u32) -> Vec
             r.interface_index == primary_ifindex
                 && r.next_hop.is_unspecified()
                 && (1..=31).contains(&r.prefix_length)
+                && is_unicast_destination(r.destination)
         })
         .map(|r| (r.destination, r.prefix_length))
+        .filter(|s| seen.insert(*s))
+        .collect()
+}
+
+/// `false` for the destinations that are routing artefacts rather than
+/// segments a host can live on.
+fn is_unicast_destination(net: Ipv4Addr) -> bool {
+    !net.is_multicast() && !net.is_broadcast() && !net.is_loopback() && !net.is_unspecified()
+}
+
+/// `true` for the RFC1918 ranges — the only ones a local virtual network may
+/// claim. A hypervisor adapter carrying a public range is not a local segment
+/// in any useful sense, and exempting it would be a hole, so it is left out.
+fn is_private_v4(net: Ipv4Addr) -> bool {
+    let o = net.octets();
+    o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1])) || (o[0] == 192 && o[1] == 168)
+}
+
+/// Directly-connected private subnets of the host's LOCAL virtual-machine
+/// adapters (hypervisor host-only / NAT / bridged), excluding `exclude_ifindex`
+/// — the additional route, whose own subnet must never be exempted.
+///
+/// These are segments that live inside this machine: traffic to them never
+/// reaches a provider, so a kill-switch blocking them protects nothing and only
+/// takes the user's virtual machines away. What it must NOT do is exempt a
+/// tunnel that happens to use the same address space — see
+/// [`nrr_platform_api::adapters::is_virtual_machine_adapter`].
+pub fn virtual_machine_local_subnets(
+    routes: &[RouteEntry],
+    adapters: &[nrr_platform_api::adapters::AdapterInfo],
+    exclude_ifindex: Option<u32>,
+) -> Vec<(Ipv4Addr, u8)> {
+    let mut seen = HashSet::new();
+    adapters
+        .iter()
+        .filter(|info| Some(info.index) != exclude_ifindex)
+        .filter(|info| nrr_platform_api::adapters::is_virtual_machine_adapter(info))
+        .flat_map(|info| primary_local_subnets(routes, info.index))
+        .filter(|(net, _)| is_private_v4(*net))
         .filter(|s| seen.insert(*s))
         .collect()
 }
@@ -180,7 +227,7 @@ impl RouteReconcileDelta {
 
 /// Reconciles the owned secondary-route set into the system route table.
 pub struct SecondaryRouteReconciler {
-    api: Arc<dyn WindowsApiPort>,
+    api: Arc<dyn RouteTablePort>,
     /// Routes this reconciler currently owns (last successfully applied
     /// desired set).
     owned: Mutex<Vec<RouteEntry>>,
@@ -189,7 +236,7 @@ pub struct SecondaryRouteReconciler {
 // `owned` is a `Mutex`; `lock().unwrap_or_else(into_inner)` recovers from a
 // poisoned lock instead of unwrapping (workspace denies `unwrap_used`).
 impl SecondaryRouteReconciler {
-    pub fn new(api: Arc<dyn WindowsApiPort>) -> Self {
+    pub fn new(api: Arc<dyn RouteTablePort>) -> Self {
         Self {
             api,
             owned: Mutex::new(Vec::new()),
@@ -383,7 +430,7 @@ mod tests {
     #[test]
     fn first_reconcile_adds_all_desired() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let desired = vec![
             route([1, 1, 1, 1], [10, 0, 0, 1], 7),
             route([2, 2, 2, 2], [10, 0, 0, 1], 7),
@@ -406,7 +453,7 @@ mod tests {
     #[test]
     fn reconcile_is_idempotent_when_desired_unchanged() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let desired = vec![route([1, 1, 1, 1], [10, 0, 0, 1], 7)];
         rec.reconcile(&desired).unwrap();
         let delta = rec.reconcile(&desired).unwrap();
@@ -417,7 +464,7 @@ mod tests {
     #[test]
     fn reconcile_adds_new_and_removes_dropped() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.reconcile(&[
             route([1, 1, 1, 1], [10, 0, 0, 1], 7),
             route([2, 2, 2, 2], [10, 0, 0, 1], 7),
@@ -447,7 +494,7 @@ mod tests {
     fn changing_secondary_gateway_replaces_the_route() {
         // Same destination, different gateway/ifindex → delete old + add new.
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.reconcile(&[route([1, 1, 1, 1], [10, 0, 0, 1], 7)])
             .unwrap();
         let delta = rec
@@ -472,7 +519,7 @@ mod tests {
     #[test]
     fn clear_removes_all_owned_routes() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.reconcile(&[
             route([1, 1, 1, 1], [10, 0, 0, 1], 7),
             route([2, 2, 2, 2], [10, 0, 0, 1], 7),
@@ -498,7 +545,7 @@ mod tests {
         let orphan_a = route([1, 1, 1, 1], [10, 0, 0, 1], 7);
         let orphan_b = route([2, 2, 2, 2], [10, 0, 0, 1], 7);
         api.set_route_table(vec![orphan_a.clone(), orphan_b.clone()]);
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         rec.adopt_owned(vec![orphan_a.clone(), orphan_b]);
         // New desired keeps only .1 → .2 must be purged.
         let delta = rec.reconcile(&[orphan_a]).unwrap();
@@ -559,6 +606,22 @@ mod tests {
         assert!(bootstrap_server_ips(&routes, 78, None).is_empty());
     }
 
+    /// Windows puts an on-link multicast route on every interface; it is not a
+    /// subnet, and exempting it would open all multicast rather than the
+    /// control block.
+    #[test]
+    fn multicast_and_broadcast_routes_are_not_local_subnets() {
+        let routes = vec![
+            raw_route([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, false),
+            raw_route([224, 0, 0, 0], 4, [0, 0, 0, 0], 12, false),
+            raw_route([127, 0, 0, 0], 8, [0, 0, 0, 0], 12, false),
+        ];
+        assert_eq!(
+            primary_local_subnets(&routes, 12),
+            vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]
+        );
+    }
+
     #[test]
     fn primary_local_subnets_collects_on_link_connected_routes_only() {
         let routes = vec![
@@ -575,6 +638,56 @@ mod tests {
                 (Ipv4Addr::new(192, 168, 1, 0), 24),
                 (Ipv4Addr::new(10, 0, 0, 0), 8)
             ]
+        );
+    }
+
+    /// Builds an adapter whose only interesting properties here are its index
+    /// and what its description says it is.
+    fn named_adapter(index: u32, description: &str) -> nrr_platform_api::adapters::AdapterInfo {
+        use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
+        nrr_platform_api::adapters::AdapterInfo {
+            index,
+            adapter_name: format!("{{{index}}}"),
+            description: description.to_string(),
+            friendly_name: description.to_string(),
+            mac: None,
+            interface_type: InterfaceType::Ethernet,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(10, 0, 0, 1)],
+            gateways: Vec::new(),
+        }
+    }
+
+    /// The exemption must cover a hypervisor's local segment and must NOT cover
+    /// a VPN adapter — both live in RFC1918 space, and mistaking one for the
+    /// other would punch a hole in the kill-switch instead of keeping a virtual
+    /// machine reachable.
+    #[test]
+    fn virtual_machine_subnets_take_the_hypervisor_and_leave_every_tunnel_alone() {
+        let routes = vec![
+            raw_route([192, 168, 56, 0], 24, [0, 0, 0, 0], 21, false), // VirtualBox host-only
+            raw_route([172, 20, 0, 0], 16, [0, 0, 0, 0], 22, false),   // Hyper-V / WSL
+            raw_route([10, 7, 0, 0], 24, [0, 0, 0, 0], 23, false),     // WireGuard
+            raw_route([10, 88, 0, 0], 10, [0, 0, 0, 0], 24, false),    // the additional route
+            raw_route([203, 0, 113, 0], 24, [0, 0, 0, 0], 25, false),  // public on a vSwitch
+        ];
+        let adapters = vec![
+            named_adapter(21, "VirtualBox Host-Only Ethernet Adapter"),
+            named_adapter(22, "Hyper-V Virtual Ethernet Adapter"),
+            named_adapter(23, "WireGuard Tunnel"),
+            named_adapter(24, "VMware Virtual Ethernet Adapter"),
+            named_adapter(25, "VMware Virtual Ethernet Adapter for VMnet0"),
+        ];
+
+        let got = virtual_machine_local_subnets(&routes, &adapters, Some(24));
+        assert_eq!(
+            got,
+            vec![
+                (Ipv4Addr::new(192, 168, 56, 0), 24),
+                (Ipv4Addr::new(172, 20, 0, 0), 16),
+            ],
+            "hypervisor segments only: the WireGuard link is a tunnel, ifindex 24 is the \
+             additional route, and a public range is not a local segment"
         );
     }
 
@@ -665,7 +778,7 @@ mod tests {
     #[test]
     fn strip_removes_vpn_redirect_pair_keeps_bootstrap_owned_and_default() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         // Mode A: we own a /32 secondary route (its key goes into `owned`).
         rec.reconcile(&[route([5, 5, 5, 5], [10, 91, 192, 1], 78)])
             .unwrap();
@@ -709,7 +822,7 @@ mod tests {
     #[test]
     fn strip_skips_redirect_overlay_we_own_in_mode_b() {
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         // Mode B: we own the /1 overlay (same key as the VPN's redirect pair —
         // our next-hop is the tunnel peer the VPN itself uses).
         let overlay_lo = RouteEntry {
@@ -745,7 +858,7 @@ mod tests {
         // hosts keep egressing the secondary adapter while general traffic returns to the OS
         // default.
         let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let host_a = route([8, 8, 8, 8], [10, 0, 0, 1], 14);
         let host_b = route([1, 1, 1, 1], [10, 0, 0, 1], 14);
         let counter_overlay = raw_route([64, 0, 0, 0], 2, [192, 168, 0, 1], 16, true);

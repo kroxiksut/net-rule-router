@@ -154,6 +154,12 @@ pub struct IpcRequestContext {
     /// Linux transport uses `UserPrincipal::from_linux_uid`. Storage stays
     /// string-keyed via [`UserPrincipal::as_stored`] (see [`Self::caller_stored`]).
     pub caller_principal: Option<UserPrincipal>,
+    /// The caller's process id, when the transport can name it. Needed only to
+    /// ask an external authority about the caller — polkit identifies a subject
+    /// by pid and start time, and a pid alone would let a recycled number answer
+    /// for somebody else, which is why the mechanism reads the start time itself
+    /// rather than taking it from here.
+    pub caller_pid: Option<u32>,
 }
 
 impl IpcRequestContext {
@@ -400,10 +406,21 @@ impl Drop for MutationGuard<'_> {
 /// The thing the transport calls per-request. Validates envelope,
 /// enforces authorization, claims a mutation slot when needed, runs
 /// the audit hook, dispatches to the registered handler.
+/// What the authority check concluded, with the refusal already worded for the
+/// person who has to act on it.
+enum AuthorizationOutcome {
+    Granted,
+    Refused(String),
+}
+
 pub struct IpcRouter {
     registry: IpcHandlerRegistry,
     audit: Arc<dyn IpcAuditEmitter>,
     queue: MutationQueue,
+    /// Consulted when an UNELEVATED caller asks for something that needs
+    /// elevation. Absent on a platform where the caller elevates itself before
+    /// connecting — there the answer is already in `caller_is_elevated`.
+    authority: Option<Arc<dyn nrr_platform_api::authorization::AuthorizationPort>>,
 }
 
 impl IpcRouter {
@@ -415,8 +432,72 @@ impl IpcRouter {
         Self {
             registry,
             audit,
+            authority: None,
             queue: MutationQueue::new(mutation_queue_capacity),
         }
+    }
+
+    /// Ask the platform's authority about this caller and this class.
+    ///
+    /// The message on a refusal is the whole user-facing value of the check: an
+    /// administrator who is simply not allowed, a user with no authentication
+    /// agent to prompt them, and a machine with no authority at all need three
+    /// different things done about it.
+    fn authorize(&self, class: IpcOperationClass, ctx: &IpcRequestContext) -> AuthorizationOutcome {
+        use nrr_platform_api::authorization::{AuthorizationDecision, AuthorizationSubject};
+
+        let Some(authority) = self.authority.as_ref() else {
+            return AuthorizationOutcome::Refused("operation requires an elevated client".into());
+        };
+        let (Some(action), Some(pid)) = (class.authorization_action(), ctx.caller_pid) else {
+            return AuthorizationOutcome::Refused(
+                "operation requires elevation and this caller cannot be identified".into(),
+            );
+        };
+        let uid = ctx
+            .caller_principal
+            .as_ref()
+            .and_then(|p| p.as_unix_uid())
+            .unwrap_or(0);
+        let subject = AuthorizationSubject {
+            pid,
+            uid,
+            // The mechanism reads the start time itself: it is the half of the
+            // identity that makes the pid unambiguous, and taking it from a
+            // caller-supplied context would defeat that.
+            start_time: None,
+        };
+        // An interactive client can be prompted; a background or console caller
+        // cannot, and popping a password dialog at one would be a prompt nobody
+        // is sitting in front of.
+        let interactive = matches!(ctx.client_profile, IpcClientProfile::GuiInteractive);
+        match authority.authorize(subject, action, interactive) {
+            AuthorizationDecision::Allowed => AuthorizationOutcome::Granted,
+            AuthorizationDecision::Denied => AuthorizationOutcome::Refused(format!(
+                "not authorized for {action}: an administrator may grant it"
+            )),
+            AuthorizationDecision::NeedsInteraction => AuthorizationOutcome::Refused(format!(
+                "{action} needs confirmation, and no authentication agent is available in this                  session"
+            )),
+            AuthorizationDecision::Unavailable => AuthorizationOutcome::Refused(format!(
+                "{action} could not be checked: no authorization service answered"
+            )),
+        }
+    }
+
+    /// Let an unelevated caller earn a privileged operation by being authorized
+    /// for it — the shape of a platform whose privileged process is the service
+    /// itself, and whose users have no way to elevate a client.
+    ///
+    /// Builder-style: without it the router behaves exactly as before, refusing
+    /// anything privileged from an unelevated client.
+    #[must_use]
+    pub fn with_authority(
+        mut self,
+        authority: Arc<dyn nrr_platform_api::authorization::AuthorizationPort>,
+    ) -> Self {
+        self.authority = Some(authority);
+        self
     }
 
     /// Synchronous request dispatch. Always returns a response — never
@@ -552,16 +633,25 @@ impl IpcRouter {
             );
         }
 
-        // 4. Elevation check.
+        // 4. Elevation check. An unelevated caller may still be authorized for
+        //    this particular action by the platform's authority, which can ask
+        //    them for a password through their own session. Only an outright
+        //    "yes" gets through: "could not ask" and "no agent available" are
+        //    refusals with different advice, never permission.
         if class.requires_elevation() && !ctx.caller_is_elevated {
-            return IpcResponseEnvelope::err(
-                &request,
-                IpcError {
-                    code: IpcErrorCode::Forbidden,
-                    message: "operation requires an elevated client".into(),
-                    diagnostics_id: None,
-                },
-            );
+            match self.authorize(class, &ctx) {
+                AuthorizationOutcome::Granted => {}
+                AuthorizationOutcome::Refused(message) => {
+                    return IpcResponseEnvelope::err(
+                        &request,
+                        IpcError {
+                            code: IpcErrorCode::Forbidden,
+                            message,
+                            diagnostics_id: None,
+                        },
+                    );
+                }
+            }
         }
 
         // 4. Audit privileged mutations *before* execution.
@@ -639,6 +729,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
             caller_principal: None,
+            caller_pid: None,
         }
     }
 
@@ -647,7 +738,19 @@ mod tests {
             client_profile: IpcClientProfile::TrayLightweight,
             caller_is_elevated: false,
             caller_principal: None,
+            caller_pid: None,
         }
+    }
+
+    /// A privileged request: rollback is a `RecoveryAction`, which needs
+    /// elevation and therefore reaches the authority.
+    fn recovery_request() -> IpcRequestEnvelope {
+        req(
+            IpcOperationName::RollbackRequest,
+            IpcOperationClass::RecoveryAction,
+            IPC_PROTOCOL_VERSION,
+            Some("token-from-dry-run"),
+        )
     }
 
     struct EchoHandler;
@@ -804,6 +907,7 @@ mod tests {
             client_profile: IpcClientProfile::AdminConsole,
             caller_is_elevated: true,
             caller_principal: None,
+            caller_pid: None,
         };
         let r = router.dispatch(
             req(
@@ -1022,5 +1126,68 @@ mod tests {
         // upper bound ensures we don't allow runaway-payload DoS.
         assert!(IPC_MAX_MESSAGE_BYTES >= 1024 * 1024);
         assert!(IPC_MAX_MESSAGE_BYTES <= 4 * 1024 * 1024);
+    }
+
+    /// On a platform where the caller cannot elevate itself, an unelevated
+    /// client earns a privileged operation by being authorized for it — and
+    /// only an outright yes counts.
+    #[test]
+    fn an_authorized_caller_passes_the_elevation_gate() {
+        use nrr_platform_api::authorization::{AuthorizationDecision, FixedAuthority};
+
+        let refusal_for = |decision: AuthorizationDecision| {
+            let router = make_router().with_authority(Arc::new(FixedAuthority(decision)));
+            let ctx = IpcRequestContext {
+                client_profile: IpcClientProfile::GuiInteractive,
+                caller_is_elevated: false,
+                caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
+                caller_pid: Some(4321),
+            };
+            router.dispatch(recovery_request(), ctx)
+        };
+
+        assert!(
+            refusal_for(AuthorizationDecision::Allowed).ok
+                || refusal_for(AuthorizationDecision::Allowed)
+                    .error
+                    .is_none_or(|e| e.code != IpcErrorCode::Forbidden),
+            "an authorized caller must get past the elevation gate",
+        );
+        for denied in [
+            AuthorizationDecision::Denied,
+            AuthorizationDecision::NeedsInteraction,
+            AuthorizationDecision::Unavailable,
+        ] {
+            let response = refusal_for(denied);
+            let error = response.error.expect("a refusal carries an error");
+            assert_eq!(error.code, IpcErrorCode::Forbidden, "{denied:?}");
+            // Each refusal must say something different: the remedies are not
+            // the same, and one generic message sends the user looking in the
+            // wrong place.
+            assert!(
+                error.message.contains("netrulerouter."),
+                "{denied:?}: the refusal must name the action: {}",
+                error.message,
+            );
+        }
+    }
+
+    /// Without an authority the router behaves exactly as it did before one
+    /// existed: privileged work needs an elevated client.
+    #[test]
+    fn without_an_authority_an_unelevated_caller_is_still_refused() {
+        let router = make_router();
+        let ctx = IpcRequestContext {
+            client_profile: IpcClientProfile::GuiInteractive,
+            caller_is_elevated: false,
+            caller_principal: Some(UserPrincipal::from_linux_uid(1000)),
+            caller_pid: Some(4321),
+        };
+
+        let response = router.dispatch(recovery_request(), ctx);
+
+        let error = response.error.expect("a refusal carries an error");
+        assert_eq!(error.code, IpcErrorCode::Forbidden);
+        assert!(error.message.contains("elevated client"));
     }
 }

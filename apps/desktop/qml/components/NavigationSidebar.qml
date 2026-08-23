@@ -29,10 +29,14 @@ Pane {
 
     // The comparison needs the service leg, so an unreachable service leaves
     // nothing to compare — disabled rather than hidden so the submenu does not
-    // reshuffle under the user. Agreement is NOT a reason to disable: "is it
-    // still in sync?" is exactly what the button answers.
+    // reshuffle under the user.
     readonly property bool rulesCheckAvailable: !!root.backendStatus
         && root.backendStatus.kind === "connected"
+    // …and with everything already in agreement the button is shown but does
+    // nothing when pressed, so it is not shown at all. A real divergence (rules
+    // not applied, or a linked file that no longer matches) brings it back.
+    readonly property bool rulesCheckDivergence: root.uiRevision >= 0
+        && (root.rulesNotAppliedToService || root.rulesNotSavedToFile)
 
     Layout.preferredWidth: root.sidebarCollapsed ? 64 : 280
     Layout.minimumWidth: root.sidebarCollapsed ? 64 : 260
@@ -323,6 +327,7 @@ Pane {
                         id: rulesCheckSyncButton
                         Layout.fillWidth: true
                         activeFocusOnTab: true
+                        visible: navigationSidebar.rulesCheckDivergence
                         enabled: navigationSidebar.rulesCheckAvailable
                         Accessible.name: root.tr("rules.nav.check-sync", "Check rules match")
                         onClicked: root.driftController._driftRecheckNow(true)

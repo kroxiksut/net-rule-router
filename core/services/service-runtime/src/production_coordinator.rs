@@ -633,15 +633,16 @@ impl RulesApplyDispatcher for NoopRulesApplyDispatcher {
 /// (`PerSidApplyOrchestrator`). Each method delegates to the
 /// orchestrator's existing API.
 ///
-/// Phase 2 wiring: `apply_for_sid` calls
-/// `PerSidApplyOrchestrator::recompile_for_sid` with the new rules.
-/// `revert_for_sid` is the same primitive with the previous rules.
-/// `dry_run_for_sid` returns a synthetic `SidActionPlanSummary` that
-/// surfaces filter add/remove counts; phase 3 may extend it to
-/// produce a full diff once the orchestrator exposes a dry-run path.
-/// `pre_flight_for_sid` returns an empty warning list today (the
-/// per-SID orchestrator's checks fire at apply time); phase 3 wires
-/// real pre-flight (FilterId collisions, batch overflow).
+/// `apply_for_sid` calls `PerSidApplyOrchestrator::recompile_for_sid` with the
+/// new rules; `revert_for_sid` is the same primitive with the previous rules.
+///
+/// `dry_run_for_sid` and `pre_flight_for_sid` both go through
+/// `PerSidApplyOrchestrator::preview_for_sid`, which derives what the apply
+/// would do without touching the engine or any live status. Two consequences
+/// worth knowing: the add/remove counts are an id-level DIFF (an unchanged
+/// policy previews as 0/0, which is what "already on baseline" reads), and
+/// `routing_actions` stays 0 because the route plan is owned by the route
+/// coordinator, not by the filter compute.
 pub struct ProductionRulesApplyDispatcher {
     orchestrator: Arc<crate::per_sid_orchestrator::PerSidApplyOrchestrator>,
     /// optional state-DB handle so the dispatched
@@ -688,22 +689,96 @@ impl ProductionRulesApplyDispatcher {
     }
 }
 
+/// Which facts about a computed plan the user deserves to be told BEFORE the
+/// apply, and under which category.
+///
+/// Pure on purpose: deciding what is worth a warning is policy, and it is
+/// testable without a WFP engine. Deriving the facts is the orchestrator's job
+/// ([`PerSidApplyOrchestrator::preview_for_sid`]).
+fn preview_to_warnings(
+    sid: &str,
+    preview: &crate::per_sid_orchestrator::SidApplyPreview,
+) -> Vec<PreFlightWarning> {
+    let mut warnings = Vec::new();
+    if !preview.colliding_filter_ids.is_empty() {
+        warnings.push(PreFlightWarning {
+            sid: sid.to_string(),
+            category: PreFlightCategory::FilterIdCollision,
+            message: format!(
+                "{} filter id(s) appear twice in the computed set; the engine keeps one of each \
+                 pair, so the applied policy would enforce less than it lists",
+                preview.colliding_filter_ids.len()
+            ),
+        });
+    }
+    // Past one transaction the apply commits in several batches, each atomic on
+    // its own — so a failure halfway leaves part of the policy live.
+    if preview.filters > nrr_platform_api::wfp::MAX_FILTERS_PER_TRANSACTION {
+        warnings.push(PreFlightWarning {
+            sid: sid.to_string(),
+            category: PreFlightCategory::BatchOverflow,
+            message: format!(
+                "{} filters exceed the {} per transaction, so the apply commits in several \
+                 batches and is no longer all-or-nothing",
+                preview.filters,
+                nrr_platform_api::wfp::MAX_FILTERS_PER_TRANSACTION
+            ),
+        });
+    }
+    if !preview.unresolved_apps.is_empty() {
+        warnings.push(PreFlightWarning {
+            sid: sid.to_string(),
+            category: PreFlightCategory::AppRuleUnenforceable,
+            message: format!(
+                "no executable matched: {} — these rules would be stored but enforce nothing",
+                preview.unresolved_apps.join(", ")
+            ),
+        });
+    }
+    if preview.secondary_binding_unresolved {
+        warnings.push(PreFlightWarning {
+            sid: sid.to_string(),
+            category: PreFlightCategory::BindingUnresolved,
+            message: "the additional route's adapter cannot be resolved right now; the rules \
+                      apply and their leak guard stays fail-closed until it returns"
+                .to_string(),
+        });
+    }
+    warnings
+}
+
 impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
     fn dry_run_for_sid(
         &self,
         sid: &str,
-        _rules_json: &str,
+        rules_json: &str,
     ) -> Result<SidActionPlanSummary, DispatchFailure> {
-        // Phase 2 placeholder: the orchestrator does not yet expose a
-        // dry-run path that returns counts without applying. We return a
-        // zeroed summary so the GUI sees "no changes detected"; phase 3
-        // wires a real diff against the per-SID filter set.
-        Ok(SidActionPlanSummary {
+        let zero = SidActionPlanSummary {
             sid: sid.to_string(),
             filter_additions: 0,
             filter_removals: 0,
             routing_actions: 0,
-        })
+        };
+        // Content that will not decode has no plan to report. Pre-flight names
+        // that as a blocker; a dry run stays quiet and lets it.
+        let Some(snapshot) = self.snapshot_for_dispatch(sid, rules_json, "dry-run") else {
+            return Ok(zero);
+        };
+        match self.orchestrator.preview_for_sid(sid, &snapshot) {
+            Ok(preview) => Ok(SidActionPlanSummary {
+                sid: sid.to_string(),
+                filter_additions: u32::try_from(preview.additions).unwrap_or(u32::MAX),
+                filter_removals: u32::try_from(preview.removals).unwrap_or(u32::MAX),
+                // Routing actions live in the route coordinator's plan, not in
+                // the filter compute. Reporting 0 says "not counted here"; a
+                // guess would be worse than a known gap.
+                routing_actions: 0,
+            }),
+            // A SID that cannot be previewed (baseline principal, empty SID) is
+            // not a verdict on the revision — the coordinator dispatches per
+            // active SID and one odd member must not sink the summary.
+            Err(_) => Ok(zero),
+        }
     }
 
     fn pre_flight_for_sid(
@@ -712,23 +787,18 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
         rules_json: &str,
     ) -> Result<Vec<PreFlightWarning>, DispatchFailure> {
         // Content that will not decode cannot be applied, and finding that out
-        // here costs one decode instead of a half-applied policy. The other
-        // categories (id collisions, batch overflow, routing conflicts) need a
-        // change plan computed WITHOUT applying, which the orchestrator does
-        // not expose yet — the same gap that keeps the change summary at zero.
-        // TODO: the orchestrator has no dry-run path; without it the remaining
-        // pre-flight categories cannot be answered.
-        if self
-            .snapshot_for_dispatch(sid, rules_json, "pre-flight")
-            .is_none()
-        {
+        // here costs one decode instead of a half-applied policy.
+        let Some(snapshot) = self.snapshot_for_dispatch(sid, rules_json, "pre-flight") else {
             return Ok(vec![PreFlightWarning {
                 sid: sid.to_string(),
                 category: PreFlightCategory::InvalidRulesContent,
                 message: "rules content failed to decode".to_string(),
             }]);
+        };
+        match self.orchestrator.preview_for_sid(sid, &snapshot) {
+            Ok(preview) => Ok(preview_to_warnings(sid, &preview)),
+            Err(_) => Ok(Vec::new()),
         }
-        Ok(Vec::new())
     }
 
     fn apply_for_sid(&self, sid: &str, rules_json: &str) -> Result<(), DispatchFailure> {
@@ -1030,6 +1100,112 @@ mod tests {
         assert!(token.starts_with("tok-"));
         assert!(attempt.starts_with("att-"));
         assert_ne!(token, attempt);
+    }
+
+    // ── Pre-flight warning mapping ───────────────────────────────────────────
+
+    fn clean_preview() -> crate::per_sid_orchestrator::SidApplyPreview {
+        crate::per_sid_orchestrator::SidApplyPreview {
+            sid: "S-1-5-21-A".into(),
+            enforceable: true,
+            filters: 12,
+            installed_now: 10,
+            additions: 3,
+            removals: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The default answer is silence. A pre-flight that warns about an ordinary
+    /// apply teaches the user to click past warnings.
+    #[test]
+    fn an_ordinary_plan_produces_no_warnings() {
+        assert!(preview_to_warnings("S-1-5-21-A", &clean_preview()).is_empty());
+    }
+
+    #[test]
+    fn colliding_filter_ids_are_reported_as_a_collision() {
+        let mut preview = clean_preview();
+        preview.colliding_filter_ids = vec![7, 9];
+        let warnings = preview_to_warnings("S-1-5-21-A", &preview);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].category, PreFlightCategory::FilterIdCollision);
+        assert_eq!(warnings[0].sid, "S-1-5-21-A");
+        assert!(
+            warnings[0].message.contains('2'),
+            "the message must say how many collided: {}",
+            warnings[0].message
+        );
+    }
+
+    /// One transaction is the atomicity boundary. A plan past it still applies,
+    /// but no longer all-or-nothing, and that is exactly what the policy option
+    /// `pre-flight-then-all-or-nothing` promises the user.
+    #[test]
+    fn a_plan_past_one_transaction_warns_about_lost_atomicity() {
+        let mut preview = clean_preview();
+        preview.filters = nrr_platform_api::wfp::MAX_FILTERS_PER_TRANSACTION;
+        assert!(
+            preview_to_warnings("S-1-5-21-A", &preview).is_empty(),
+            "exactly one full transaction is still atomic"
+        );
+        preview.filters = nrr_platform_api::wfp::MAX_FILTERS_PER_TRANSACTION + 1;
+        let warnings = preview_to_warnings("S-1-5-21-A", &preview);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].category, PreFlightCategory::BatchOverflow);
+    }
+
+    #[test]
+    fn an_app_rule_that_matched_no_executable_is_named() {
+        let mut preview = clean_preview();
+        preview.unresolved_apps = vec!["nowhere.exe".into(), "gone.exe".into()];
+        let warnings = preview_to_warnings("S-1-5-21-A", &preview);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            warnings[0].category,
+            PreFlightCategory::AppRuleUnenforceable
+        );
+        assert!(warnings[0].message.contains("nowhere.exe"));
+        assert!(warnings[0].message.contains("gone.exe"));
+    }
+
+    #[test]
+    fn an_unresolvable_binding_is_reported_without_blocking_the_apply() {
+        let mut preview = clean_preview();
+        preview.secondary_binding_unresolved = true;
+        let warnings = preview_to_warnings("S-1-5-21-A", &preview);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].category, PreFlightCategory::BindingUnresolved);
+        assert!(
+            warnings[0].message.contains("fail-closed"),
+            "the user needs to know what applying means here: {}",
+            warnings[0].message
+        );
+    }
+
+    /// Several findings at once are all reported — the first one is not the whole
+    /// story, and a user who fixes it should not discover the next on the next
+    /// attempt.
+    #[test]
+    fn every_finding_is_reported_not_just_the_first() {
+        let mut preview = clean_preview();
+        preview.colliding_filter_ids = vec![1];
+        preview.filters = nrr_platform_api::wfp::MAX_FILTERS_PER_TRANSACTION * 2;
+        preview.unresolved_apps = vec!["nowhere.exe".into()];
+        preview.secondary_binding_unresolved = true;
+        let categories: Vec<PreFlightCategory> = preview_to_warnings("S-1-5-21-A", &preview)
+            .into_iter()
+            .map(|w| w.category)
+            .collect();
+        assert_eq!(
+            categories,
+            vec![
+                PreFlightCategory::FilterIdCollision,
+                PreFlightCategory::BatchOverflow,
+                PreFlightCategory::AppRuleUnenforceable,
+                PreFlightCategory::BindingUnresolved,
+            ]
+        );
     }
 
     // ── ProductionApplyMarkerStore ───────────────────────────────────────────

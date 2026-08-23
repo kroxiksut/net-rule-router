@@ -56,11 +56,18 @@ The software requires the installation of a background Windows service
 (administrator rights are needed). The software modifies the routing
 table and creates network traffic filters. All such changes are
 **temporary**: they are removed when the service is stopped and do not
-survive a computer restart. If anything is left behind, the package ships
-a reset script — `scripts\reset-network.ps1` (`scripts/reset-network.sh`
-on Linux), run from an elevated console — which removes the routes and
-filters the software created. Instructions for a full reset are in the
-documentation (section "Internet gone? How to reset everything").
+survive a computer restart.
+
+If anything is left behind, undo it from the application itself:
+**Settings → Service management → Restore network**. That button removes
+the routes, traffic filters and DNS redirect the software created, and
+it asks for administrator confirmation.
+
+Should the application not start at all, the same teardown ships as a
+script for an elevated console. Its exact location on this computer, and
+a ready-to-run command, are shown in **About → Licenses → License
+agreement**; instructions for a full reset are in the documentation
+(section "Internet gone? How to reset everything").
 
 ## 5. User responsibilities
 

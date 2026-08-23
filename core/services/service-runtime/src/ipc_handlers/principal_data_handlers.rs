@@ -1,7 +1,9 @@
-//! `principal-data.purge` handler — full reset's auxiliary-state cleanup.
-//! Caller-scoped, never elevated; see `nrr_storage::principal_purge` for scope.
+//! `principal-data.purge` / `principal-data.count` handlers — full reset's
+//! auxiliary-state cleanup and the question it has to ask first.
+//! Caller-scoped unless the request asks for every principal, which needs
+//! elevation; see `nrr_storage::principal_purge` for scope.
 
-use nrr_shared::ipc_payloads::PrincipalDataPurgeRequest;
+use nrr_shared::ipc_payloads::{PrincipalDataCountResponse, PrincipalDataPurgeRequest};
 
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
@@ -50,13 +52,63 @@ impl PrincipalDataPurgeHandler {
 impl IpcHandler for PrincipalDataPurgeHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let _: PrincipalDataPurgeRequest =
+        let req: PrincipalDataPurgeRequest =
             serde_json::from_value(request.payload.clone()).unwrap_or_default();
-        let response = self.purger.purge_for_sid(sid).map_err(map_write_error)?;
+        let response = if req.all_principals {
+            // Erasing other users' routing is an administrative act. The
+            // elevation check is here rather than in the catalog because the
+            // SAME operation is the ordinary, non-elevated self-reset.
+            if !ctx.caller_is_elevated {
+                return Err(IpcError {
+                    code: IpcErrorCode::Forbidden,
+                    message: "clearing every user's data needs administrator approval".to_string(),
+                    diagnostics_id: None,
+                });
+            }
+            self.purger
+                .purge_all_principals(req.include_rules_history)
+                .map_err(map_write_error)?
+        } else {
+            let mut response = self
+                .purger
+                .purge_for_sid(sid, req.include_rules_history)
+                .map_err(map_write_error)?;
+            response.principals_purged = 1;
+            response
+        };
         serde_json::to_value(response).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
             message: format!("principal-data.purge serialisation failed: {e}"),
             diagnostics_id: None,
+        })
+    }
+}
+
+/// "Is anyone else's routing stored here?" — the question full reset has to
+/// answer before it can offer a choice of scope.
+pub struct PrincipalDataCountHandler {
+    purger: std::sync::Arc<dyn PrincipalDataPurger>,
+}
+
+impl PrincipalDataCountHandler {
+    pub fn new(purger: std::sync::Arc<dyn PrincipalDataPurger>) -> Self {
+        Self { purger }
+    }
+}
+
+impl IpcHandler for PrincipalDataCountHandler {
+    fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let other_principals = self
+            .purger
+            .other_principal_count(sid)
+            .map_err(map_write_error)?;
+        serde_json::to_value(PrincipalDataCountResponse { other_principals }).map_err(|e| {
+            IpcError {
+                code: IpcErrorCode::Internal,
+                message: format!("principal-data.count serialisation failed: {e}"),
+                diagnostics_id: None,
+            }
         })
     }
 }
@@ -76,6 +128,7 @@ mod tests {
             caller_is_elevated: false,
             caller_principal: sid
                 .and_then(|s| nrr_domain::user_principal::UserPrincipal::from_windows_sid(s).ok()),
+            caller_pid: None,
         }
     }
 
@@ -93,31 +146,65 @@ mod tests {
 
     struct RecordingPurger {
         calls: Mutex<Vec<String>>,
+        rules_asked: Mutex<Vec<bool>>,
         result: Result<PrincipalDataPurgeResponse, RoutePolicyWriteError>,
     }
 
+    impl RecordingPurger {
+        fn new(result: Result<PrincipalDataPurgeResponse, RoutePolicyWriteError>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                rules_asked: Mutex::new(Vec::new()),
+                result,
+            }
+        }
+    }
+
     impl PrincipalDataPurger for RecordingPurger {
+        fn purge_all_principals(
+            &self,
+            include_rules_history: bool,
+        ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push("*".to_string());
+            self.rules_asked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(include_rules_history);
+            self.result.clone()
+        }
+
+        fn other_principal_count(&self, _sid: &str) -> Result<u32, RoutePolicyWriteError> {
+            Ok(0)
+        }
+
         fn purge_for_sid(
             &self,
             sid: &str,
+            include_rules_history: bool,
         ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError> {
             self.calls
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push(sid.to_string());
+            self.rules_asked
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(include_rules_history);
             self.result.clone()
         }
     }
 
     #[test]
     fn purges_the_callers_own_sid_and_returns_the_summary() {
-        let purger = Arc::new(RecordingPurger {
-            calls: Mutex::new(Vec::new()),
-            result: Ok(PrincipalDataPurgeResponse {
-                rows_deleted: 9,
-                tables_touched: 9,
-            }),
-        });
+        let purger = Arc::new(RecordingPurger::new(Ok(PrincipalDataPurgeResponse {
+            rows_deleted: 9,
+            tables_touched: 9,
+            rules_rows_deleted: 0,
+            principals_purged: 0,
+        })));
         let handler =
             PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
         let value = handler.handle(&req(), &ctx(Some("S-A"))).expect("purge");
@@ -134,12 +221,35 @@ mod tests {
         );
     }
 
+    /// The flag is what separates routine cleanup from a full reset, so it has
+    /// to survive the wire rather than default quietly to "delete the rules".
+    #[test]
+    fn the_rules_history_flag_reaches_the_purger_only_when_asked_for() {
+        for asked in [false, true] {
+            let purger = Arc::new(RecordingPurger::new(Ok(
+                PrincipalDataPurgeResponse::default(),
+            )));
+            let handler =
+                PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
+            let mut envelope = req();
+            envelope.payload = serde_json::json!({ "include-rules-history": asked });
+            handler.handle(&envelope, &ctx(Some("S-A"))).expect("purge");
+            assert_eq!(
+                purger
+                    .rules_asked
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_slice(),
+                &[asked]
+            );
+        }
+    }
+
     #[test]
     fn an_unattributed_caller_is_refused_before_reaching_the_purger() {
-        let purger = Arc::new(RecordingPurger {
-            calls: Mutex::new(Vec::new()),
-            result: Ok(PrincipalDataPurgeResponse::default()),
-        });
+        let purger = Arc::new(RecordingPurger::new(Ok(
+            PrincipalDataPurgeResponse::default(),
+        )));
         let handler =
             PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
         let err = handler.handle(&req(), &ctx(None)).expect_err("no identity");
@@ -153,10 +263,9 @@ mod tests {
 
     #[test]
     fn a_storage_failure_maps_to_internal() {
-        let purger = Arc::new(RecordingPurger {
-            calls: Mutex::new(Vec::new()),
-            result: Err(RoutePolicyWriteError::Storage("disk full".into())),
-        });
+        let purger = Arc::new(RecordingPurger::new(Err(RoutePolicyWriteError::Storage(
+            "disk full".into(),
+        ))));
         let handler =
             PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
         let err = handler

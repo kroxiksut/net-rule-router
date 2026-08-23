@@ -1,18 +1,17 @@
-//! Preset format and Free/Pro compatibility.
+//! Preset format and forward compatibility.
 //!
 //! These tests verify the design decisions documented in docs/en/rules-file-format.md
-//! Forward compatibility and Preset Files sections, and in CLAUDE.md under "Free vs Pro Configuration Model":
+//! Forward compatibility and Preset Files sections:
 //!
 //! - A preset is two independent txt files (one per route), same syntax as
 //!   working rules files.
 //! - Metadata header comments (`name`, `description`, `author`,
 //!   `preset_version`) are optional and captured in `PresetMetadata`.
-//! - Pro-only sections (`CIDR`, `Ports`, …) are parsed and preserved but
+//! - unsupported sections (`CIDR`, `Ports`, …) are parsed and preserved but
 //!   **not** applied. They are reported via `ParseWarning::UnknownSection`.
-//! - Round-trip guarantee: Free → Pro → Free without data loss. Pro-only
+//! - Round-trip guarantee: parse and write-back lose nothing. Unsupported
 //!   entries survive unmodified in `unknown_sections`.
-//! - A file with only Free-edition sections is always valid for Pro without
-//!   transformation.
+//! - A file with only supported sections needs no transformation.
 //! - An absent route file (the optional second file) is represented by an
 //!   empty string — always valid.
 
@@ -110,11 +109,11 @@ fn preset_file_without_any_metadata_keys_but_with_preset_header() {
     assert!(meta.is_empty());
 }
 
-// ── forward-compatibility: Pro-only sections ──────────────────────────────────
+// ── forward-compatibility: unsupported sections ──────────────────────────────────
 
 #[test]
-fn pro_only_sections_produce_unknown_section_warnings() {
-    // CIDR and Ports are Pro-edition sections. The Free parser must flag them
+fn unsupported_sections_produce_unknown_section_warnings() {
+    // CIDR and Ports are unsupported sections. The Free parser must flag them
     // via `ParseWarning::UnknownSection` — they are not errors.
     let input = "--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n--- Ports\n443\n";
     let outcome = parse_rules_file(input);
@@ -149,8 +148,8 @@ fn pro_only_sections_produce_unknown_section_warnings() {
 }
 
 #[test]
-fn pro_only_sections_not_in_parsed_active_sections() {
-    // Pro sections must NOT appear in `parsed.sections` — they are never
+fn unsupported_sections_not_in_parsed_active_sections() {
+    // unsupported sections must NOT appear in `parsed.sections` — they are never
     // applied to routing policy in the Free edition.
     let input = "--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
@@ -168,7 +167,7 @@ fn pro_only_sections_not_in_parsed_active_sections() {
 }
 
 #[test]
-fn pro_only_section_entries_preserved_with_correct_count() {
+fn unsupported_section_entries_preserved_with_correct_count() {
     let input = "--- CIDR\n10.0.0.0/8\n192.168.0.0/16\n--- Ports\n443\n";
     let outcome = parse_rules_file(input);
 
@@ -199,13 +198,13 @@ fn pro_only_section_entries_preserved_with_correct_count() {
     ));
 }
 
-// ── round-trip guarantee (Free → Pro → Free) ──────────────────────────────────
+// ── round-trip guarantee (parse → write-back) ─────────────────────────────────
 
 #[test]
 fn round_trip_free_to_pro_no_data_loss() {
     // After a Free-edition parse, all data must be accessible:
     //   - Free sections in `parsed`
-    //   - Pro-only sections in `unknown_sections`
+    //   - unsupported sections in `unknown_sections`
     // Both together represent the full file content — no entry is silently dropped.
     let input = "\
 --- Zones\ncorp-internal\n\
@@ -222,7 +221,7 @@ fn round_trip_free_to_pro_no_data_loss() {
         1
     );
 
-    // Pro sections preserved.
+    // unsupported sections preserved.
     assert_eq!(outcome.unknown_sections.len(), 2);
     let cidr = outcome
         .unknown_sections
@@ -239,7 +238,7 @@ fn round_trip_free_to_pro_no_data_loss() {
 }
 
 #[test]
-fn pro_sections_inline_comments_preserved_in_round_trip() {
+fn extended_sections_inline_comments_preserved_in_round_trip() {
     let input = "--- CIDR\n10.0.0.0/8  # internal range\n";
     let outcome = parse_rules_file(input);
     let cidr = outcome
@@ -254,7 +253,7 @@ fn pro_sections_inline_comments_preserved_in_round_trip() {
 }
 
 #[test]
-fn pro_sections_disabled_entries_preserved_in_round_trip() {
+fn extended_sections_disabled_entries_preserved_in_round_trip() {
     let input = "--- CIDR\n# 10.0.0.0/8\n";
     let outcome = parse_rules_file(input);
     let cidr = outcome
@@ -267,7 +266,7 @@ fn pro_sections_disabled_entries_preserved_in_round_trip() {
     assert_eq!(cidr.entries[0].match_value, "10.0.0.0/8");
 }
 
-// ── free-only file is always valid for Pro ────────────────────────────────────
+// ── a file with only supported sections ───────────────────────────────────────
 
 #[test]
 fn free_only_file_has_no_unknown_sections_and_no_warnings() {
@@ -296,8 +295,8 @@ fn free_only_file_has_no_unknown_sections_and_no_warnings() {
 // ── fixture round-trip ────────────────────────────────────────────────────────
 
 #[test]
-fn fixture_preset_with_pro_sections_parses_correctly() {
-    let content = include_str!("fixtures/preset_with_pro_sections.txt");
+fn fixture_preset_with_extended_sections_parses_correctly() {
+    let content = include_str!("fixtures/preset_with_extended_sections.txt");
     let outcome = parse_rules_file(content);
 
     // Preset header present.
@@ -317,12 +316,12 @@ fn fixture_preset_with_pro_sections_parses_correctly() {
         .entries_for(RulesFileSection::Domains)
         .is_empty());
 
-    // Pro sections preserved but not applied.
+    // unsupported sections preserved but not applied.
     assert!(!outcome.unknown_sections.is_empty());
     assert!(outcome.unknown_sections.iter().any(|s| s.name == "CIDR"));
     assert!(outcome.unknown_sections.iter().any(|s| s.name == "Ports"));
 
-    // Warnings for Pro sections (no format-version warning — version is current).
+    // Warnings for unsupported sections (no format-version warning — version is current).
     assert!(outcome
         .warnings
         .iter()
@@ -335,16 +334,16 @@ fn fixture_preset_with_pro_sections_parses_correctly() {
 }
 
 #[test]
-fn fixture_preset_pro_sections_not_routed_on_windows() {
+fn fixture_preset_extended_sections_not_routed_on_windows() {
     use nrr_domain::rules_file::rules_file_to_route_rule_set;
 
-    let content = include_str!("fixtures/preset_with_pro_sections.txt");
+    let content = include_str!("fixtures/preset_with_extended_sections.txt");
     let outcome = parse_rules_file(content);
 
     // Only Free sections contribute to routing.
     let rule_set = rules_file_to_route_rule_set(&outcome.parsed, HostPlatform::Windows, false);
 
-    // Pro CIDR/Ports entries must not appear in the rule set.
+    // CIDR/Ports entries must not appear in the rule set.
     for rule in &rule_set.rules {
         let v = rule
             .address_match
@@ -353,7 +352,7 @@ fn fixture_preset_pro_sections_not_routed_on_windows() {
             .unwrap_or_default();
         assert!(
             !v.contains("10.0.0.0/8") && !v.contains("443"),
-            "Pro-only entry must not appear in routing rule set, found: {v}"
+            "an unsupported entry must not appear in the routing rule set, found: {v}"
         );
     }
 }

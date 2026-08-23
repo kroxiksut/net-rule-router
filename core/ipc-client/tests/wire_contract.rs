@@ -44,6 +44,7 @@ fn elevated_gui() -> IpcRequestContext {
         // replacement for the old `caller_sid: String`. `None` = unattributed,
         // matching the old empty SID.
         caller_principal: None,
+        caller_pid: None,
     }
 }
 

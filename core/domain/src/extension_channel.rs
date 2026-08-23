@@ -104,7 +104,7 @@ pub enum ExtensionChannelKind {
     NamedPipe,
     /// A local loopback REST API endpoint. Reserved for future use.
     RestApi,
-    /// A dynamically loaded plugin (DLL/shared library). Reserved for Pro edition.
+    /// A dynamically loaded plugin (DLL/shared library). Reserved; no loader ships.
     Plugin,
 }
 

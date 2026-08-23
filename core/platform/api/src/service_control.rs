@@ -146,6 +146,10 @@ pub struct ServiceInstallReport {
     /// baseline. `None` when the install was asked not to create data dirs, so
     /// it never touched their permissions either.
     pub acl_applied: Option<bool>,
+    /// Whether the service's records will render under their own source name in
+    /// the host's operator log. `None` on platforms where the log needs no
+    /// registration (the systemd journal takes stdout as it is).
+    pub event_source_registered: Option<bool>,
 }
 
 // ── Uninstall ────────────────────────────────────────────────────────────────
@@ -184,6 +188,14 @@ impl ServiceUninstallSpec {
 pub struct ServiceUninstallReport {
     /// Whether the service-owned data directory was deleted.
     pub data_removed: bool,
+    /// Whether the enforcement state the service leaves on the MACHINE —
+    /// packet filters, DNS redirection — was swept before the registration
+    /// went away. `None` where the platform does not sweep here.
+    ///
+    /// It matters because removal is exactly when a wedged install is being
+    /// removed: those objects outlive the process, and the boot sweep that
+    /// would have healed them dies with the registration.
+    pub machine_state_cleared: Option<bool>,
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────

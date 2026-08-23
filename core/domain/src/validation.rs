@@ -66,18 +66,18 @@ pub enum ValidationError {
     DomainInvalidIdn { rule_id: RuleId, value: String },
 
     /// An `ExactIp` rule contains an IPv6 address. IPv6 is not supported in the
-    /// Free edition. CIDR subnets and ranges are also Pro edition features —
-    /// see [`ValidationError::CidrNotSupportedInFree`] and
-    /// [`ValidationError::IpRangeNotSupportedInFree`].
-    Ipv6NotSupportedInFree { rule_id: RuleId, value: String },
+    /// Free edition. CIDR subnets and ranges are also unsupported —
+    /// see [`ValidationError::CidrNotSupported`] and
+    /// [`ValidationError::IpRangeNotSupported`].
+    Ipv6NotSupported { rule_id: RuleId, value: String },
 
     /// An `ExactIp` rule contains a CIDR notation address (`192.168.1.0/24`).
-    /// CIDR subnet matching is a Pro edition feature.
-    CidrNotSupportedInFree { rule_id: RuleId, value: String },
+    /// CIDR subnet matching is not supported.
+    CidrNotSupported { rule_id: RuleId, value: String },
 
     /// An `ExactIp` rule contains an IP range (`10.0.0.1-10.0.0.100`).
-    /// Range matching is a Pro edition feature.
-    IpRangeNotSupportedInFree { rule_id: RuleId, value: String },
+    /// Range matching is not supported.
+    IpRangeNotSupported { rule_id: RuleId, value: String },
 
     /// An `ExactIp` rule contains a string that cannot be parsed as any IP
     /// address. The rule cannot be applied and must be corrected.
@@ -99,9 +99,9 @@ impl ValidationError {
             Self::RuleEmptyMatch { rule_id }
             | Self::DomainEmptyValue { rule_id }
             | Self::DomainInvalidIdn { rule_id, .. }
-            | Self::Ipv6NotSupportedInFree { rule_id, .. }
-            | Self::CidrNotSupportedInFree { rule_id, .. }
-            | Self::IpRangeNotSupportedInFree { rule_id, .. }
+            | Self::Ipv6NotSupported { rule_id, .. }
+            | Self::CidrNotSupported { rule_id, .. }
+            | Self::IpRangeNotSupported { rule_id, .. }
             | Self::InvalidIpAddress { rule_id, .. }
             | Self::ZoneEmptyName { rule_id }
             | Self::AppGlobTooWide { rule_id } => Some(rule_id),
@@ -136,23 +136,17 @@ impl fmt::Display for ValidationError {
                     "rule {rule_id}: '{value}' is not a valid internationalized domain name"
                 )
             }
-            Self::Ipv6NotSupportedInFree { rule_id, value } => {
+            Self::Ipv6NotSupported { rule_id, value } => {
+                write!(f, "rule {rule_id}: IPv6 address '{value}' is not supported")
+            }
+            Self::CidrNotSupported { rule_id, value } => {
                 write!(
                     f,
-                    "rule {rule_id}: IPv6 address '{value}' is not supported in the Free edition"
+                    "rule {rule_id}: CIDR notation '{value}' is not supported"
                 )
             }
-            Self::CidrNotSupportedInFree { rule_id, value } => {
-                write!(
-                    f,
-                    "rule {rule_id}: CIDR notation '{value}' is a Pro edition feature"
-                )
-            }
-            Self::IpRangeNotSupportedInFree { rule_id, value } => {
-                write!(
-                    f,
-                    "rule {rule_id}: IP range '{value}' is a Pro edition feature"
-                )
+            Self::IpRangeNotSupported { rule_id, value } => {
+                write!(f, "rule {rule_id}: IP range '{value}' is not supported")
             }
             Self::InvalidIpAddress { rule_id, value } => {
                 write!(f, "rule {rule_id}: '{value}' is not a valid IP address")
@@ -754,7 +748,7 @@ fn canonicalize_ip_addr(
                 });
                 Ok(v4)
             } else {
-                Err(ValidationError::Ipv6NotSupportedInFree {
+                Err(ValidationError::Ipv6NotSupported {
                     rule_id: rule_id.clone(),
                     value: addr.to_string(),
                 })
@@ -775,47 +769,25 @@ fn normalize_app_match(
 ) -> Result<CanonicalAppMatch, ValidationError> {
     let canonical_pattern = match &app.pattern {
         AppMatchPattern::Exact(raw) => {
-            let raw = raw.trim().to_string();
-
-            // Strip path if present (handles `C:\Foo\bar.exe`, `C:/Foo/bar.exe`,
-            // `//C//Foo//bar.exe` and other mixed-separator Windows path forms).
-            let contains_sep = raw.contains('/') || raw.contains('\\');
-            let filename: String = if contains_sep {
-                let extracted = raw
-                    .split(['/', '\\'])
-                    .rfind(|s| !s.is_empty())
-                    .unwrap_or(raw.as_str())
-                    .to_string();
+            let (process_name, changes) = crate::app_identity::canonical_exact_process_name(raw);
+            if let Some(original) = changes.stripped_path_from {
                 warnings.push(ValidationWarning::ProcessNameContainedPath {
                     rule_id: rule_id.clone(),
-                    original: raw.clone(),
-                    normalized: extracted.clone(),
+                    original,
+                    normalized: process_name.clone(),
                 });
-                extracted
-            } else {
-                raw.clone()
-            };
-
-            // Lowercase (Windows process names are case-insensitive).
-            let lowercased = filename.to_lowercase();
-
-            // Append `.exe` if absent.
-            let process_name = if lowercased.ends_with(".exe") {
-                lowercased
-            } else {
-                let with_exe = format!("{lowercased}.exe");
+            }
+            if let Some(original) = changes.appended_exe_to {
                 warnings.push(ValidationWarning::ProcessNameMissingExeSuffix {
                     rule_id: rule_id.clone(),
-                    original: filename,
-                    normalized: with_exe.clone(),
+                    original,
+                    normalized: process_name.clone(),
                 });
-                with_exe
-            };
-
+            }
             CanonicalAppPattern::Exact(process_name)
         }
         AppMatchPattern::Glob(raw) => {
-            let lowercased = raw.trim().to_lowercase();
+            let lowercased = crate::app_identity::canonical_glob_process_pattern(raw);
             if lowercased == "*" {
                 return Err(ValidationError::AppGlobTooWide {
                     rule_id: rule_id.clone(),
@@ -1266,7 +1238,7 @@ mod tests {
         let result = canonicalize_ip_addr(addr, &RuleId("r-1".to_string()), &mut warnings);
         assert!(matches!(
             result,
-            Err(ValidationError::Ipv6NotSupportedInFree { .. })
+            Err(ValidationError::Ipv6NotSupported { .. })
         ));
     }
 
@@ -1449,7 +1421,7 @@ mod tests {
         assert!(outcome
             .errors()
             .iter()
-            .any(|e| matches!(e, ValidationError::Ipv6NotSupportedInFree { .. })));
+            .any(|e| matches!(e, ValidationError::Ipv6NotSupported { .. })));
     }
 
     // ── Deduplication ─────────────────────────────────────────────────────────

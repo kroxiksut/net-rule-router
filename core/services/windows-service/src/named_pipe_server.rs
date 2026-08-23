@@ -87,12 +87,14 @@ use windows::Win32::System::Pipes::{
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
 
+use nrr_service_runtime::ipc_push::{
+    extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+};
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ActiveSidRegistry, EventBus, IpcAcceptor,
     IpcAuditEmitter, IpcBindError, IpcError, IpcErrorCode, IpcRequestContext, IpcRequestEnvelope,
     IpcResponseEnvelope, IpcRouter, IpcServer,
 };
-use nrr_shared::ipc_payloads::StatusUpdatePushFrame;
 
 use crate::named_pipe_acl::PipeSecurityAttributes;
 use crate::named_pipe_identity::{classify_pipe_client, ClientRejectReason};
@@ -576,8 +578,6 @@ fn handle_connection(
         }
     };
     let mut subscription_id: Option<String> = None;
-    const PUSH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(150);
-    const PUSH_BATCH_SIZE: usize = 32;
 
     // Step 2: serve frames until error or shutdown.
     while !shutdown.load(Ordering::SeqCst) {
@@ -596,6 +596,9 @@ fn handle_connection(
                         &identity.caller_sid,
                     )
                     .ok(),
+                    // The caller elevates itself here (the broker), so the
+                    // service never has to ask an authority about it.
+                    caller_pid: None,
                 };
 
                 let response = router.dispatch(request, ctx);
@@ -653,7 +656,10 @@ fn handle_connection(
                 // Push pump tick. Only flushes when this connection
                 // has subscribed AND the bus is wired.
                 if let (Some(sub_id), Some(bus)) = (subscription_id.as_ref(), event_bus.as_ref()) {
-                    if flush_push_frames(&mut writer, bus, sub_id, PUSH_BATCH_SIZE) {
+                    let failed = flush_push_frames(bus, sub_id, PUSH_BATCH_SIZE, |env| {
+                        write_frame(&mut writer, env).map_err(|e| e.to_string())
+                    });
+                    if failed {
                         break;
                     }
                 }
@@ -716,97 +722,6 @@ fn run_reader_loop(pipe: SendableHandle, reader_tx: std::sync::mpsc::SyncSender<
             }
         }
     }
-}
-
-/// One push pump tick. Returns `true` if a pipe write failed, signalling
-/// the caller to break the dispatch loop.
-///
-/// Writes pending events for `subscription_id` in order and advances the
-/// cursor to the last one written. On write failure the frame is counted
-/// as dropped for that subscriber.
-fn flush_push_frames<W: Write>(
-    writer: &mut W,
-    event_bus: &EventBus,
-    subscription_id: &str,
-    batch_size: usize,
-) -> bool {
-    let pending = event_bus.peek_pending_for(subscription_id, batch_size);
-    let mut last_id: Option<u64> = None;
-    for entry in pending {
-        let push_payload = StatusUpdatePushFrame {
-            event_id: entry.event_id,
-            event: entry.event.clone(),
-        };
-        let json_payload = match serde_json::to_value(&push_payload) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    target: "nrr::ipc-push",
-                    subscription_id,
-                    event_id = entry.event_id,
-                    error = %e,
-                    "push event could not be encoded, skipped"
-                );
-                continue;
-            }
-        };
-        // The wire tag is the only stable name for the variant here;
-        // reading it back beats duplicating a slug table.
-        let event_type = json_payload
-            .get("event")
-            .and_then(|e| e.get("type"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        let env = IpcResponseEnvelope {
-            request_id: String::new(),
-            correlation_id: subscription_id.to_string(),
-            operation_id: None,
-            ok: true,
-            stale: false,
-            diagnostics_id: None,
-            user_action_required: false,
-            payload: Some(json_payload),
-            error: None,
-        };
-        if let Err(e) = write_frame(writer, &env) {
-            event_bus.record_drop(subscription_id, 1);
-            tracing::warn!(
-                target: "nrr::ipc-push",
-                subscription_id,
-                event_id = entry.event_id,
-                event_type,
-                error = %e,
-                "push frame write failed, subscriber dropped it"
-            );
-            return true;
-        }
-        tracing::debug!(
-            target: "nrr::ipc-push",
-            subscription_id,
-            event_id = entry.event_id,
-            event_type,
-            "push frame written"
-        );
-        last_id = Some(entry.event_id);
-    }
-    if let Some(id) = last_id {
-        event_bus.advance_cursor(subscription_id, id);
-    }
-    false
-}
-
-/// Parses `StatusUpdatesSubscribeResponse.subscription_id` out of a
-/// router response. Returns `None` for non-subscribe ops or
-/// shape mismatches (the dispatcher already validated wire shape, so
-/// this is defence in depth).
-fn extract_subscription_id(env: &IpcResponseEnvelope) -> Option<String> {
-    let payload = env.payload.as_ref()?;
-    payload
-        .get("subscription-id")
-        .or_else(|| payload.get("subscription_id"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
 }
 
 /// RAII guard that calls `ActiveSidRegistry::on_connect` on construction
@@ -996,7 +911,6 @@ impl Write for PipeIo {
 mod tests {
     use super::*;
     use nrr_service_runtime::{IpcHandlerRegistry, NoopIpcAuditEmitter};
-    use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
     #[test]
     fn pipe_name_is_versioned() {
@@ -1055,173 +969,6 @@ mod tests {
         acceptor.join_workers();
     }
 
-    // ── Push pump unit tests ─────────────────────────────
-    //
-    // These exercise `flush_push_frames` directly without spinning a
-    // real Win32 pipe. The writer is `Vec<u8>` (or a controlled
-    // `FailingWriter`); the bus is a real `EventBus`. We read frames
-    // back via `Cursor` + `read_frame` to assert wire shape.
-
-    fn adapters_event() -> StatusUpdateEvent {
-        StatusUpdateEvent::AdaptersChanged {
-            data_source: "wmi".into(),
-        }
-    }
-
-    /// Two events queued: pump writes both as push frames in order,
-    /// each carrying `request_id=""`, `correlation_id=<sub>`,
-    /// `payload=StatusUpdatePushFrame{event_id, event}`. Cursor
-    /// advances past the last delivered id so a re-poll is empty.
-    #[test]
-    fn flush_push_frames_writes_pending_events_in_order() {
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-        let id1 = bus.publish(StatusUpdateEvent::HealthChanged {
-            service_state: "running".into(),
-            worst_severity: "ok".into(),
-        });
-        let id2 = bus.publish(adapters_event());
-
-        let mut buf: Vec<u8> = Vec::new();
-        let break_out = flush_push_frames(&mut buf, &bus, &s.subscription_id, 32);
-        assert!(!break_out, "no write failure expected");
-
-        let mut cursor = std::io::Cursor::new(buf);
-        let frame1: IpcResponseEnvelope = read_frame(&mut cursor).expect("frame 1");
-        let frame2: IpcResponseEnvelope = read_frame(&mut cursor).expect("frame 2");
-
-        assert_eq!(frame1.request_id, "");
-        assert_eq!(frame1.correlation_id, s.subscription_id);
-        assert!(frame1.ok);
-        assert!(frame1.error.is_none());
-
-        let payload1: StatusUpdatePushFrame =
-            serde_json::from_value(frame1.payload.expect("payload 1")).expect("decode 1");
-        assert_eq!(payload1.event_id, id1);
-        let payload2: StatusUpdatePushFrame =
-            serde_json::from_value(frame2.payload.expect("payload 2")).expect("decode 2");
-        assert_eq!(payload2.event_id, id2);
-
-        assert!(
-            bus.peek_pending_for(&s.subscription_id, 32).is_empty(),
-            "cursor should have advanced past last delivered id"
-        );
-    }
-
-    /// No pending events ⇒ pump writes nothing and returns `false`.
-    #[test]
-    fn flush_push_frames_with_no_pending_writes_nothing() {
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-        let mut buf: Vec<u8> = Vec::new();
-        let break_out = flush_push_frames(&mut buf, &bus, &s.subscription_id, 32);
-        assert!(!break_out);
-        assert!(buf.is_empty());
-    }
-
-    /// Batch limit honoured: only the first N events are written and
-    /// the cursor advances to the Nth — the remainder stays pending
-    /// for the next tick.
-    #[test]
-    fn flush_push_frames_batch_caps_at_size_and_leaves_remainder() {
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-        let mut ids = Vec::new();
-        for _ in 0..5 {
-            ids.push(bus.publish(adapters_event()));
-        }
-        let mut buf: Vec<u8> = Vec::new();
-        let break_out = flush_push_frames(&mut buf, &bus, &s.subscription_id, 2);
-        assert!(!break_out);
-
-        let pending = bus.peek_pending_for(&s.subscription_id, 32);
-        assert_eq!(pending.len(), 3, "remainder should still be pending");
-        assert_eq!(pending[0].event_id, ids[2]);
-    }
-
-    /// Pipe write fails: pump increments the per-subscriber drop
-    /// counter by 1, returns `true` (caller should break the dispatch
-    /// loop), and does NOT advance the cursor — the failed event is
-    /// still pending so a re-subscribe could replay it (within the
-    /// buffer window).
-    #[test]
-    fn flush_push_frames_records_drop_and_returns_break_on_write_failure() {
-        use std::io::{Error, ErrorKind};
-
-        struct FailingWriter;
-        impl Write for FailingWriter {
-            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-                Err(Error::new(ErrorKind::BrokenPipe, "test pipe broken"))
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-        let id1 = bus.publish(adapters_event());
-        let id2 = bus.publish(adapters_event());
-
-        let mut writer = FailingWriter;
-        let break_out = flush_push_frames(&mut writer, &bus, &s.subscription_id, 32);
-        assert!(break_out, "write failure must signal break");
-
-        let pending = bus.peek_pending_for(&s.subscription_id, 32);
-        assert_eq!(pending.len(), 2, "no events delivered yet");
-        assert_eq!(pending[0].event_id, id1);
-        assert_eq!(pending[1].event_id, id2);
-        assert_eq!(
-            bus.take_dropped_count(&s.subscription_id),
-            1,
-            "exactly one drop recorded for the failed frame"
-        );
-    }
-
-    /// Unknown subscription id: `peek_pending_for` returns empty, pump
-    /// is a no-op (does not touch the writer, does not panic).
-    #[test]
-    fn flush_push_frames_no_op_for_unknown_subscription() {
-        let bus = EventBus::new();
-        let _ = bus.publish(adapters_event());
-        let mut buf: Vec<u8> = Vec::new();
-        let break_out = flush_push_frames(&mut buf, &bus, "no-such-sub", 32);
-        assert!(!break_out);
-        assert!(buf.is_empty());
-    }
-
-    /// Multiple successive ticks: between calls, new events arrive on
-    /// the bus and the second tick picks them up cleanly. Validates
-    /// that cursor advancement is sticky across pump calls.
-    #[test]
-    fn flush_push_frames_ticks_pick_up_new_events() {
-        let bus = EventBus::new();
-        let s = bus.subscribe("client-1".into(), None);
-
-        let _id1 = bus.publish(adapters_event());
-        let mut buf1: Vec<u8> = Vec::new();
-        assert!(!flush_push_frames(&mut buf1, &bus, &s.subscription_id, 32));
-        assert!(!buf1.is_empty(), "first tick wrote one frame");
-
-        // Second tick with no new events: empty.
-        let mut buf2: Vec<u8> = Vec::new();
-        assert!(!flush_push_frames(&mut buf2, &bus, &s.subscription_id, 32));
-        assert!(buf2.is_empty(), "no new events, no writes");
-
-        // Publish, then tick again: second event delivered.
-        let id2 = bus.publish(adapters_event());
-        let mut buf3: Vec<u8> = Vec::new();
-        assert!(!flush_push_frames(&mut buf3, &bus, &s.subscription_id, 32));
-        let mut cursor = std::io::Cursor::new(buf3);
-        let frame: IpcResponseEnvelope = read_frame(&mut cursor).expect("frame");
-        let payload: StatusUpdatePushFrame =
-            serde_json::from_value(frame.payload.expect("payload")).expect("decode");
-        assert_eq!(payload.event_id, id2);
-    }
-
-    /// Multiple `bind()` calls on the same server succeed (Recoverable
-    /// supervisor policy depends on this — after a failed acceptor it
-    /// can rebind immediately).
     #[test]
     fn bind_can_be_called_multiple_times() {
         let server = WindowsNamedPipeServer::new(empty_router(), empty_audit());

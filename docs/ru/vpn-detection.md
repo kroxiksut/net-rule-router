@@ -61,13 +61,14 @@ ViPNet (ИнфоТеКС), С-Терра (S-Terra), Amnezia, hidemy.name.
 
 Список ключевых слов находится в одном месте:
 [`core/platform/api/src/vpn_discovery.rs`](../../core/platform/api/src/vpn_discovery.rs),
-в константе `VPN_NAME_KEYWORDS`. Добавление клиента — правка в одну строку.
+в константах `VPN_CONSUMER_KEYWORDS` / `VPN_CORPORATE_KEYWORDS`. Добавление
+клиента — правка в одну строку.
 
 Добавить клиента можно тремя способами.
 
 ### 1. Пул-реквест
 
-Добавьте отличительное ключевое слово в `VPN_NAME_KEYWORDS` и откройте PR в
+Добавьте отличительное ключевое слово в подходящий список и откройте PR в
 репозитории
 [github.com/kroxiksut/net-rule-router](https://github.com/kroxiksut/net-rule-router).
 

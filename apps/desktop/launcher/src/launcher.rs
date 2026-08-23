@@ -23,7 +23,7 @@ use nrr_desktop_gui::ui_surface::{
     apply_qt_preferences_payload as apply_qt_payload, write_qt_context_file_at,
 };
 use nrr_desktop_tray::write_qt_tray_context_file;
-use nrr_shared::{gui_shell_v1, ActivationSource, AppSection};
+use nrr_shared::{gui_shell_v1, AppSection};
 use nrr_ui_support::first_run::first_run_flow_snapshot;
 use nrr_ui_support::theme::resolve_theme;
 use nrr_ui_support::tray::{tray_runtime_snapshot, TrayServiceLink};
@@ -276,7 +276,6 @@ fn run_primary(
             config.surface, request.source, request.section
         ),
     );
-    let _ = &request;
     // Seed the archive raw-log cap from the stored preference so an export
     // issued before the first preferences round-trip already honours it.
     crate::archive_localize::set_service_log_budget_mib(preferences.archive_log_budget_mib);
@@ -302,7 +301,7 @@ fn run_primary(
         ),
     );
 
-    let context_file = match emit_context(config.surface, &preferences, &backend_bundle) {
+    let context_file = match emit_context(config.surface, &preferences, &backend_bundle, &request) {
         Ok(path) => path,
         Err(error) => {
             diag_log(
@@ -739,9 +738,10 @@ fn emit_context(
     surface: LauncherSurface,
     preferences: &UiPreferences,
     backend_bundle: &crate::backend_factory::BackendBundle,
+    request: &LaunchRequest,
 ) -> Result<PathBuf, String> {
     match surface {
-        LauncherSurface::MainGui => emit_main_gui_context(preferences, backend_bundle),
+        LauncherSurface::MainGui => emit_main_gui_context(preferences, backend_bundle, request),
         LauncherSurface::Tray => emit_tray_context(preferences, backend_bundle),
     }
 }
@@ -749,15 +749,11 @@ fn emit_context(
 fn emit_main_gui_context(
     preferences: &UiPreferences,
     backend_bundle: &crate::backend_factory::BackendBundle,
+    request: &LaunchRequest,
 ) -> Result<PathBuf, String> {
     let shell = gui_shell_v1();
-    let request = default_launch_request();
 
-    let section_to_open = if preferences.reopen_last_section_on_startup {
-        preferences.last_opened_section
-    } else {
-        AppSection::InterfacesAndRoutes
-    };
+    let section_to_open = cold_start_section(request, preferences);
 
     let first_run = first_run_flow_snapshot(&shell, preferences.first_run_completed, None);
 
@@ -766,10 +762,10 @@ fn emit_main_gui_context(
         &context_path,
         &shell,
         section_to_open,
-        ActivationSource::Menu,
+        request.source,
         preferences.clone(),
         &first_run,
-        &request,
+        request,
         backend_bundle.facade.as_ref(),
         &backend_bundle.status,
     )?;
@@ -804,16 +800,16 @@ fn emit_tray_context(
     write_qt_tray_context_file(&runtime, &preferences.language, preferences, icon_file_url)
 }
 
-fn default_launch_request() -> LaunchRequest {
-    LaunchRequest {
-        source: ActivationSource::Menu,
-        section: None,
-        open_about: false,
-        open_license: false,
-        first_run_completed_override: None,
-        first_run_scenario_override: None,
-        action: None,
-        reason: None,
+/// Which section a cold start opens.
+///
+/// A launch that carries a section is the tray handing work over, so it wins:
+/// dropping it opened whatever the preferences remembered, and "Open and
+/// compare" on the tray's rules notice landed on an unrelated section.
+pub fn cold_start_section(request: &LaunchRequest, preferences: &UiPreferences) -> AppSection {
+    match request.section {
+        Some(section) => section,
+        None if preferences.reopen_last_section_on_startup => preferences.last_opened_section,
+        None => AppSection::InterfacesAndRoutes,
     }
 }
 

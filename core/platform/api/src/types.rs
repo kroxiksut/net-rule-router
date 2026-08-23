@@ -8,7 +8,7 @@
 //! `nrr-platform-api`; each OS backend consumes them and implements the ports.
 //!
 //! IPv6 routing is out-of-scope for the Free tier: per-destination V6 needs
-//! AAAA resolution (a Pro feature), so an IPv6 destination in an ordinary rule
+//! AAAA resolution (not supported), so an IPv6 destination in an ordinary rule
 //! is silently skipped by the apply layer with an audit note "skipped: IPv6
 //! destination not supported". The one exception is the **catch-all
 //! kill-switch**, which blocks ALL outbound IPv6 (except loopback + link-local)
@@ -264,7 +264,7 @@ pub struct WfpFilterSpec {
     /// The catch-all kill-switch uses this to carve the IPv6 system exemptions
     /// its block-everything must never cover: loopback `::1/128` and link-local
     /// `fe80::/10`. The per-IP fail-closed path stays IPv4-only — selective V6
-    /// destinations need AAAA resolution, a Pro feature.
+    /// destinations need AAAA resolution, not supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_subnet_v6: Option<(Ipv6Addr, u8)>,
     /// Match condition (multi-protocol kill-switch): IP protocol
@@ -371,6 +371,19 @@ impl ApplyActionPlan {
     pub fn is_empty(&self) -> bool {
         self.routing_actions.is_empty() && self.wfp_actions.is_empty()
     }
+}
+
+/// One IPv6 route as the OS reports it. Read-only, diagnostics-only: the
+/// product does not install v6 routes, but "what does the v6 table look like"
+/// is the first question any IPv6 report raises, and answering it from a log
+/// beats asking the user to run `route print -6`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv6RouteRow {
+    pub destination: std::net::Ipv6Addr,
+    pub prefix_length: u8,
+    pub next_hop: std::net::Ipv6Addr,
+    pub interface_index: u32,
+    pub metric: u32,
 }
 
 /// A single routing table mutation.

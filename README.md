@@ -191,7 +191,8 @@ The package lands in `C:\temp\NetRuleRouter\dist\NetRuleRouter`; `-Zip` puts
 `NetRuleRouter-windows-x64-<version>+<commit>.zip` beside it. It carries the
 GUI, tray, service, console, the Qt runtime, and the QML / locale / preset /
 config tree, plus a `build-info.json` stamp (version, revision, build time)
-and a short `READ-ME.txt` for whoever unpacks it. Parameters and layout:
+and short `README.txt` / `README.ru.txt` notes for whoever unpacks it.
+Parameters and layout:
 [`docs/en/packaging-windows.md`](docs/en/packaging-windows.md).
 
 ## Configuration & data

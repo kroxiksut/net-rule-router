@@ -105,6 +105,99 @@ pub fn behaviorally_equivalent(a: &[WfpFilterSpec], b: &[WfpFilterSpec]) -> bool
     behavioral_multiset(a) == behavioral_multiset(b)
 }
 
+/// What one filter set has that the other does not, as multiset differences.
+///
+/// [`behaviorally_equivalent`] answers whether two sets differ; this answers
+/// HOW. A boolean is enough to know the neutral path is not ready, and useless
+/// for finding out why — a two-filter gap in a set of two thousand cannot be
+/// found by reading either set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BehavioralDifference {
+    /// Present in `a` (with multiplicity) and missing from `b`.
+    pub only_in_a: Vec<(BehavioralKey, usize)>,
+    /// Present in `b` and missing from `a`.
+    pub only_in_b: Vec<(BehavioralKey, usize)>,
+}
+
+impl BehavioralDifference {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.only_in_a.is_empty() && self.only_in_b.is_empty()
+    }
+}
+
+/// Multiset difference of two filter sets, both directions.
+#[must_use]
+pub fn behavioral_difference(a: &[WfpFilterSpec], b: &[WfpFilterSpec]) -> BehavioralDifference {
+    let ma = behavioral_multiset(a);
+    let mb = behavioral_multiset(b);
+    let surplus = |left: &BTreeMap<BehavioralKey, usize>,
+                   right: &BTreeMap<BehavioralKey, usize>| {
+        left.iter()
+            .filter_map(|(k, n)| {
+                let other = right.get(k).copied().unwrap_or(0);
+                (*n > other).then(|| (k.clone(), n - other))
+            })
+            .collect()
+    };
+    BehavioralDifference {
+        only_in_a: surplus(&ma, &mb),
+        only_in_b: surplus(&mb, &ma),
+    }
+}
+
+/// Short label for a layer ordinal, for one-line diagnostics.
+fn layer_label(ord: u8) -> &'static str {
+    match ord {
+        0 => "ale4",
+        1 => "pkt4",
+        2 => "ale6",
+        3 => "pkt6",
+        4 => "transport4",
+        _ => "layer?",
+    }
+}
+
+/// One line per key, carrying only the fields that are set — the whole point is
+/// to be readable in a log next to two thousand siblings.
+impl core::fmt::Display for BehavioralKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{}/{}",
+            layer_label(self.layer),
+            // Ordinals come from `action_ord`; keep the two in step.
+            match self.action {
+                a if a == action_ord(WfpAction::Block) => "block",
+                a if a == action_ord(WfpAction::Permit) => "permit",
+                _ => "action?",
+            }
+        )?;
+        if let Some(ip) = self.remote_ip {
+            write!(f, " ip={ip}")?;
+        }
+        if let Some((net, len)) = self.remote_subnet {
+            write!(f, " net={net}/{len}")?;
+        }
+        if let Some((net, len)) = self.remote_subnet_v6 {
+            write!(f, " net6={net}/{len}")?;
+        }
+        if let Some(port) = self.remote_port {
+            write!(f, " port={port}")?;
+        }
+        if let Some(proto) = self.ip_protocol {
+            write!(f, " proto={proto}")?;
+        }
+        if let Some(luid) = self.local_interface_luid {
+            write!(f, " if={luid}")?;
+        }
+        if let Some(app) = self.app_pattern.as_deref() {
+            write!(f, " app={app}")?;
+        }
+        Ok(())
+    }
+}
+
 /// The behavioural keys of a filter set in weight order (weight ascending; the
 /// key itself breaks ties so the sequence is deterministic). This is the
 /// relative arbitration order — WFP evaluates higher weights first, so a stable
@@ -161,6 +254,67 @@ mod tests {
             remote_subnet_v6: None,
             ip_protocol: None,
         }
+    }
+
+    #[test]
+    fn identical_sets_have_no_difference() {
+        let a = vec![permit(ip(203, 0, 113, 5), 10, 1)];
+        let b = vec![permit(ip(203, 0, 113, 5), 99, 2)];
+        assert!(behavioral_difference(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn a_surplus_filter_is_named_on_the_side_that_has_it() {
+        let a = vec![
+            permit(ip(203, 0, 113, 5), 10, 1),
+            permit(ip(198, 51, 100, 7), 10, 2),
+        ];
+        let b = vec![permit(ip(203, 0, 113, 5), 10, 3)];
+
+        let d = behavioral_difference(&a, &b);
+        assert_eq!(d.only_in_a.len(), 1);
+        assert_eq!(d.only_in_a[0].0.remote_ip, Some(ip(198, 51, 100, 7)));
+        assert_eq!(d.only_in_a[0].1, 1);
+        assert!(d.only_in_b.is_empty());
+    }
+
+    #[test]
+    fn multiplicity_is_part_of_the_difference() {
+        // The same behavioural key twice on one side and once on the other is
+        // a difference of one, not of nothing: `behaviorally_equivalent`
+        // compares multisets, so the explanation has to as well.
+        let a = vec![
+            permit(ip(203, 0, 113, 5), 10, 1),
+            permit(ip(203, 0, 113, 5), 20, 2),
+        ];
+        let b = vec![permit(ip(203, 0, 113, 5), 10, 3)];
+
+        let d = behavioral_difference(&a, &b);
+        assert_eq!(d.only_in_a.len(), 1);
+        assert_eq!(d.only_in_a[0].1, 1);
+        assert!(d.only_in_b.is_empty());
+        assert!(!behaviorally_equivalent(&a, &b));
+    }
+
+    #[test]
+    fn both_directions_are_reported() {
+        let a = vec![permit(ip(203, 0, 113, 5), 10, 1)];
+        let b = vec![permit(ip(198, 51, 100, 7), 10, 2)];
+
+        let d = behavioral_difference(&a, &b);
+        assert_eq!(d.only_in_a[0].0.remote_ip, Some(ip(203, 0, 113, 5)));
+        assert_eq!(d.only_in_b[0].0.remote_ip, Some(ip(198, 51, 100, 7)));
+    }
+
+    #[test]
+    fn a_key_renders_only_the_fields_it_carries() {
+        let key = behavioral_key(&permit(ip(203, 0, 113, 5), 10, 1));
+        let line = key.to_string();
+        assert!(line.starts_with("ale4/permit"), "{line}");
+        assert!(line.contains("ip=203.0.113.5"), "{line}");
+        // Nothing was set for these, so nothing should be printed for them.
+        assert!(!line.contains("port="), "{line}");
+        assert!(!line.contains("app="), "{line}");
     }
 
     #[test]

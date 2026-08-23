@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nrr_domain::block_notice::{BlockAttempt, BlockNoticeLedger, Mute};
 use nrr_shared::ipc_payloads::StatusUpdateEvent;
 
+use crate::block_notice_journal_store::BlockNoticeJournalStore;
 use crate::ipc_handlers::event_bus::EventBus;
 
 /// Loads the persisted mutes of one principal. Consulted when a principal's
@@ -39,6 +40,7 @@ pub struct BlockNoticeCenter {
     ledgers: Mutex<HashMap<String, BlockNoticeLedger>>,
     mute_loader: Option<MuteLoaderFn>,
     events: Option<Arc<EventBus>>,
+    journal: Option<Arc<dyn BlockNoticeJournalStore>>,
 }
 
 impl Default for BlockNoticeCenter {
@@ -54,6 +56,7 @@ impl BlockNoticeCenter {
             ledgers: Mutex::new(HashMap::new()),
             mute_loader: None,
             events: None,
+            journal: None,
         }
     }
 
@@ -72,6 +75,15 @@ impl BlockNoticeCenter {
     #[must_use]
     pub fn with_event_bus(mut self, events: Arc<EventBus>) -> Self {
         self.events = Some(events);
+        self
+    }
+
+    /// Attach the backlog so a notice raised while no surface is subscribed
+    /// still reaches its user later. Push delivery is live-only: without this
+    /// the tray being closed means the notice was never told to anyone.
+    #[must_use]
+    pub fn with_journal(mut self, journal: Arc<dyn BlockNoticeJournalStore>) -> Self {
+        self.journal = Some(journal);
         self
     }
 
@@ -105,6 +117,14 @@ impl BlockNoticeCenter {
                 attempts = notice.attempts,
                 "blocked connection — new episode",
             );
+            // Journalled before publishing, and unconditionally: whether a
+            // subscriber exists is not knowable here, and a duplicate the user
+            // sees twice beats a block they are never told about. The surface
+            // that shows a backlog entry acknowledges it, which is what stops
+            // the repeat.
+            if let Some(journal) = self.journal.as_ref() {
+                journal.append(sid, &notice, now_ms as i64);
+            }
             if let Some(bus) = self.events.as_ref() {
                 bus.publish(StatusUpdateEvent::BlockNoticeRaised {
                     sid: sid.to_owned(),
@@ -292,6 +312,33 @@ mod tests {
         center.record(ALICE, &attempt());
 
         assert_eq!(bus.peek_pending_for(&sub.subscription_id, 10).len(), 1);
+    }
+
+    #[test]
+    fn a_raised_notice_is_journalled_for_a_surface_that_is_not_up_yet() {
+        let journal =
+            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
+        let center = BlockNoticeCenter::new().with_journal(journal.clone());
+
+        center.record(ALICE, &attempt());
+
+        let pending = journal.list_pending(ALICE, i64::MAX);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].notice.destination, attempt().destination_label());
+        assert!(journal.list_pending(BOB, i64::MAX).is_empty());
+    }
+
+    #[test]
+    fn a_muted_episode_journals_nothing_either() {
+        let journal =
+            Arc::new(crate::block_notice_journal_store::InMemoryBlockNoticeJournalStore::new());
+        let center = BlockNoticeCenter::new()
+            .with_journal(journal.clone())
+            .with_mute_loader(Arc::new(|_sid: &str| vec![Mute::forever(MuteScope::All)]));
+
+        center.record(ALICE, &attempt());
+
+        assert!(journal.list_pending(ALICE, i64::MAX).is_empty());
     }
 
     #[test]

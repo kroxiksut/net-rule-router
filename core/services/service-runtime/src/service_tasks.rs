@@ -214,6 +214,183 @@ pub fn build_health_aggregator_task(health: Arc<HealthAggregator>) -> ServiceTas
     )
 }
 
+// ── Principal enforcement ────────────────────────────────────────────────────
+
+/// How often the service asks who is present and re-applies their policy.
+///
+/// Two facts set the cadence: a login or logout should take effect in seconds,
+/// and the pass is cheap — one query to the presence authority, plans read from
+/// an open database, one atomic apply. It is nowhere near the data path, so it
+/// costs the user nothing per packet.
+pub const PRINCIPAL_ENFORCEMENT_INTERVAL: Duration = Duration::from_secs(10);
+pub const TASK_ID_PRINCIPAL_ENFORCEMENT: &str = "principal-enforcement-tick";
+
+/// Apply the policy of everyone currently present, every tick.
+///
+/// Recoverable: a failed pass must be retried, never retire the task. The one
+/// outcome that must stay loud is an unreadable presence authority — the
+/// platform is then left exactly as it was, and silence would read as "all is
+/// well" while the answer is actually unknown.
+pub fn build_principal_enforcement_task(
+    cycle: Arc<crate::principal_enforcement::PrincipalEnforcementCycle>,
+) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_PRINCIPAL_ENFORCEMENT,
+        TaskClass::Recoverable,
+        PRINCIPAL_ENFORCEMENT_INTERVAL,
+        RECOVERABLE_DEFAULT_MAX_RESTARTS,
+        move |_stop| {
+            cycle.tick_logged("timer");
+            TaskOutcome::Continue
+        },
+    )
+}
+
+// ── DNS observation ──────────────────────────────────────────────────────────
+
+/// How often observed resolutions are folded into the rule-driven cache.
+///
+/// Two seconds: a name is looked up immediately before it is connected to, so
+/// the window between learning the address and needing it is what decides
+/// whether the first connection goes the right way.
+pub const DNS_OBSERVATION_INTERVAL: Duration = Duration::from_secs(2);
+pub const TASK_ID_DNS_OBSERVATION: &str = "dns-observation-tick";
+
+/// Applies a batch of observations on behalf of ONE principal. A resolution is
+/// not owned by a user — the machine looked the name up — so the caller applies
+/// it to every present user's rules rather than to a chosen one's.
+pub type ConsumeObservationsFor =
+    Arc<dyn Fn(&str, &[nrr_platform_api::dns_observe::DnsObservation]) + Send + Sync>;
+
+/// What the DNS-observation tick needs.
+#[derive(Clone)]
+pub struct DnsObservationWiring {
+    pub source: Arc<dyn nrr_platform_api::dns_observe::DnsObservationSource>,
+    pub consume_for: ConsumeObservationsFor,
+    /// Who is present right now.
+    pub principals: Arc<dyn nrr_platform_api::active_principals::ActivePrincipalSource>,
+}
+
+/// Fold observed resolutions into the addresses domain rules enforce.
+///
+/// A rule naming a domain can only be enforced for addresses that are known, so
+/// this is what makes `suffix` and zone rules follow a site that moves. The
+/// batch is applied for each present principal: two users may have different
+/// rules about the same name, and the machine resolved it once for both.
+///
+/// `Optional`: losing it costs domain rules their freshness, never the policy.
+pub fn build_dns_observation_task(wiring: DnsObservationWiring) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_DNS_OBSERVATION,
+        TaskClass::Optional,
+        DNS_OBSERVATION_INTERVAL,
+        RECOVERABLE_DEFAULT_MAX_RESTARTS,
+        move |_stop| {
+            let observations = wiring.source.drain();
+            if observations.is_empty() {
+                return TaskOutcome::Continue;
+            }
+            match wiring.principals.active_principals() {
+                Ok(principals) => {
+                    for principal in principals {
+                        (wiring.consume_for)(principal.as_stored(), &observations);
+                    }
+                }
+                // "Could not ask" is not "nobody is here": dropping the batch is
+                // the honest outcome, and the next resolution comes soon.
+                Err(e) => tracing::debug!(
+                    target: "nrr::dns-observe",
+                    error = %e,
+                    observations = observations.len(),
+                    "could not determine who is present; this batch was not applied",
+                ),
+            }
+            TaskOutcome::Continue
+        },
+    )
+}
+
+// ── App-destination observation ──────────────────────────────────────────────
+
+/// How often observed connections are folded into the app-destination store.
+///
+/// Short, because a socket that opens and closes between two polls is invisible:
+/// the poll interval IS the resolution of what an application rule can learn.
+/// Cheap enough for that — the platform source reads a socket table, never
+/// traffic.
+pub const APP_OBSERVATION_INTERVAL: Duration = Duration::from_secs(2);
+pub const TASK_ID_APP_OBSERVATION: &str = "app-observation-tick";
+
+/// What the app-destination tick needs.
+#[derive(Clone)]
+pub struct AppObservationWiring {
+    pub source: Arc<dyn nrr_platform_api::conn_observe::ConnectionObservationSource>,
+    pub store: Arc<crate::app_observation_lookup::AppObservationStore>,
+}
+
+/// Fold observed connections into the destinations application rules route.
+///
+/// An application rule cannot be expressed as a packet-filter condition on every
+/// OS, so the destinations the program actually uses ARE the rule's expression:
+/// the planner turns each remembered address into an ordinary host flow. That
+/// makes this tick the whole mechanism behind app rules where the filter engine
+/// has no app context, and a supporting one where it has.
+///
+/// A newly-learnt address re-drives policy at once rather than waiting for the
+/// next pass: the point of learning it is that traffic to it is going the wrong
+/// way right now.
+///
+/// `Optional`: losing it costs an app rule its freshness, never the rest of the
+/// policy.
+pub fn build_app_observation_task(
+    wiring: AppObservationWiring,
+    on_new_destination: Option<crate::supervised_runtime::RouteRecomputeHook>,
+) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_APP_OBSERVATION,
+        TaskClass::Optional,
+        APP_OBSERVATION_INTERVAL,
+        RECOVERABLE_DEFAULT_MAX_RESTARTS,
+        move |_stop| {
+            let learnt = fold_observations(&wiring);
+            if learnt > 0 {
+                tracing::debug!(
+                    target: "nrr::app-routing",
+                    learnt,
+                    "new application destinations observed; re-driving policy",
+                );
+                if let Some(hook) = on_new_destination.as_ref() {
+                    hook();
+                }
+            }
+            TaskOutcome::Continue
+        },
+    )
+}
+
+/// Drain the source into the store; returns how many destinations were NEW.
+///
+/// Separate from the task so the decision is testable without a supervisor: the
+/// count is what decides whether policy is re-driven, and a count that can only
+/// be read from a log is a decision nothing checks.
+pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
+    let mut learnt = 0usize;
+    for observation in wiring.source.drain() {
+        // Without a process there is nothing to attribute the address to, and an
+        // address attributed to nobody would widen every app rule that happens
+        // to be enabled.
+        let Some(path) = observation.process_path.as_deref() else {
+            continue;
+        };
+        if let std::net::IpAddr::V4(ip) = observation.remote.ip() {
+            if wiring.store.record(path, ip) {
+                learnt += 1;
+            }
+        }
+    }
+    learnt
+}
+
 // ── Traffic sampler ──────────────────────────────────────────────────────────
 
 /// Cadence the traffic sampler reads interface octet counters at. Reading a
@@ -619,12 +796,13 @@ pub fn build_dns_refresh_task(
 /// IPs become routes. Without this nothing ever populates the cache from
 /// the rule book, so domain rules would never route.
 ///
-/// `active_sid` returns the routing-active SID (Free single-active-user);
-/// `None`/empty → nothing to seed. Off the mutation path: DNS resolution
-/// runs on the supervisor's background tick, never blocking an apply.
+/// `present` returns everyone whose rules are in force right now — one console
+/// user on Windows, however many are logged in on Linux. Empty → nothing to
+/// seed. Off the mutation path: DNS resolution runs on the supervisor's
+/// background tick, never blocking an apply.
 pub fn build_rule_hostname_seed_task(
     seeder: Arc<crate::rule_hostname_seeder::RuleHostnameSeeder>,
-    active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    present: PresentPrincipalsFn,
     on_progress: Option<crate::supervised_runtime::RouteRecomputeHook>,
 ) -> ServiceTask {
     ServiceTask::periodic(
@@ -633,9 +811,11 @@ pub fn build_rule_hostname_seed_task(
         RULE_HOSTNAME_SEED_INTERVAL,
         0,
         move |_stop| {
-            if let Some(sid) = active_sid() {
+            let mut progressed = false;
+            for sid in present() {
                 let summary = seeder.seed_for_principal(&sid, SystemTime::now());
                 if summary.made_progress() {
+                    progressed = true;
                     tracing::info!(
                         target: "nrr::rule-seed",
                         sid = %sid,
@@ -645,15 +825,27 @@ pub fn build_rule_hostname_seed_task(
                         apex_absent = summary.apex_absent,
                         "rule-hostname seed tick",
                     );
-                    if let Some(hook) = on_progress.as_ref() {
-                        hook();
-                    }
+                }
+            }
+            // One recompute for the pass, not one per user: the pass installs
+            // policy for everyone present anyway.
+            if progressed {
+                if let Some(hook) = on_progress.as_ref() {
+                    hook();
                 }
             }
             TaskOutcome::Continue
         },
     )
 }
+
+/// Everyone whose rules are in force at this moment.
+///
+/// A list rather than an Option because "the active user" is a Windows-shaped
+/// idea: there is one console session there, and any number of logged-in users
+/// on Linux. A task that seeds only the first of them leaves the others' domain
+/// rules resolving to nothing.
+pub type PresentPrincipalsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
 /// Application-destination write-back.
 ///
@@ -845,6 +1037,7 @@ pub fn build_conn_observe_task(
                         other = summary.other,
                         unknown = summary.unknown,
                         app_ips_added = summary.app_ips_added,
+                        app_ips_retracted = summary.app_ips_retracted,
                         vpn_endpoints_learned = summary.vpn_endpoints_learned,
                         vpn_client_apps_learned = summary.vpn_client_apps_learned,
                         blocked_nrr = summary.blocked_nrr,
@@ -870,6 +1063,10 @@ pub fn build_conn_observe_task(
                 // arming its app-scoped exemption before the client's next
                 // check.
                 if summary.app_ips_added > 0
+                    // A withdrawal has to reach the route table as promptly as
+                    // an addition: until the recompute runs, the `/32` is still
+                    // moving the process the withdrawal was for.
+                    || summary.app_ips_retracted > 0
                     || summary.vpn_endpoints_learned > 0
                     || summary.vpn_client_apps_learned > 0
                 {
@@ -1060,10 +1257,27 @@ pub fn build_ipc_accept_task_bundle(
         max_restarts,
         backoff: accept_backoff,
         tick: Box::new(accept_tick),
+        // Draining on the way out, not inside a tick: whichever way the loop
+        // ended, the workers get their signal and are joined once.
+        on_stop: Some(Box::new({
+            let cell = Arc::clone(&cell);
+            move || {
+                let acc = cell.current();
+                acc.request_shutdown();
+                acc.join_workers();
+            }
+        })),
     };
 
     // ── Shutdown watcher ────────────────────────────────────────────────
+    // Why a second task exists at all: the accept task cannot wake itself. It is
+    // parked in the transport's blocking accept, and nothing in its own thread
+    // runs until a client connects. This one sleeps, so a stop reaches it
+    // immediately — and it does the waking from `on_stop`, which is the only
+    // place guaranteed to run (the loop exits without a further tick when the
+    // stop arrives during the sleep, which is the usual case).
     let watcher_cell = Arc::clone(&cell);
+    let watcher_stop_cell = Arc::clone(&cell);
     let watcher = ServiceTask::periodic(
         TASK_ID_IPC_SHUTDOWN_WATCHER,
         TaskClass::Optional,
@@ -1078,7 +1292,8 @@ pub fn build_ipc_accept_task_bundle(
                 TaskOutcome::Continue
             }
         },
-    );
+    )
+    .with_on_stop(move || watcher_stop_cell.current().request_shutdown());
 
     Ok(IpcAcceptTaskBundle {
         accept,
@@ -1194,6 +1409,10 @@ mod tests {
         // when empty, returns ShutdownRequested.
         scripted: Mutex<Vec<AcceptOutcome>>,
         bind_should_fail: AtomicUsize, // remaining bind failures
+        // Shared with every acceptor this server hands out, so a test can see
+        // what the tasks did to an acceptor it never holds itself.
+        shutdown_calls: Arc<AtomicUsize>,
+        join_calls: Arc<AtomicUsize>,
     }
 
     impl MockServer {
@@ -1202,6 +1421,8 @@ mod tests {
                 binds: AtomicUsize::new(0),
                 scripted: Mutex::new(outs),
                 bind_should_fail: AtomicUsize::new(0),
+                shutdown_calls: Arc::new(AtomicUsize::new(0)),
+                join_calls: Arc::new(AtomicUsize::new(0)),
             })
         }
         fn fail_first_bind(self: &Arc<Self>, count: usize) {
@@ -1221,16 +1442,16 @@ mod tests {
                 std::mem::take(&mut *self.scripted.lock().unwrap_or_else(|p| p.into_inner()));
             Ok(Box::new(MockAcceptor {
                 outcomes: Mutex::new(drained.into_iter().collect()),
-                join_calls: AtomicUsize::new(0),
-                shutdown_calls: AtomicUsize::new(0),
+                join_calls: Arc::clone(&self.join_calls),
+                shutdown_calls: Arc::clone(&self.shutdown_calls),
             }))
         }
     }
 
     struct MockAcceptor {
         outcomes: Mutex<std::collections::VecDeque<AcceptOutcome>>,
-        join_calls: AtomicUsize,
-        shutdown_calls: AtomicUsize,
+        join_calls: Arc<AtomicUsize>,
+        shutdown_calls: Arc<AtomicUsize>,
     }
     impl IpcAcceptor for MockAcceptor {
         fn accept_one(&self) -> AcceptOutcome {
@@ -1243,6 +1464,48 @@ mod tests {
         fn join_workers(&self) {
             self.join_calls.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// The accept loop cannot wake itself: it is parked in the transport's
+    /// blocking accept. The watcher is the thread that CAN notice a stop, and it
+    /// has to do the waking from `on_stop` — the runner exits the loop without a
+    /// further tick when the stop lands during its sleep, which is the usual
+    /// case. Before this, a stop left the accept loop parked for the whole
+    /// budget and the supervisor detached it.
+    #[test]
+    fn the_watchers_teardown_wakes_the_accept_loop_and_the_accept_task_drains() {
+        let server = MockServer::with_outcomes(vec![]);
+        let server_dyn: Arc<dyn IpcServer> = server.clone();
+        let mut bundle = build_ipc_accept_task_bundle(
+            server_dyn,
+            fresh_health(),
+            &ServiceStabilityConfig::default(),
+        )
+        .expect("bind succeeds");
+
+        let watcher_teardown = bundle
+            .shutdown_watcher
+            .on_stop
+            .take()
+            .expect("the watcher must carry a teardown hook");
+        watcher_teardown();
+        assert_eq!(
+            server.shutdown_calls.load(Ordering::SeqCst),
+            1,
+            "the watcher's teardown must ask the acceptor to unblock"
+        );
+
+        let accept_teardown = bundle
+            .accept
+            .on_stop
+            .take()
+            .expect("the accept task must carry a teardown hook");
+        accept_teardown();
+        assert_eq!(
+            server.join_calls.load(Ordering::SeqCst),
+            1,
+            "the accept task's teardown joins the connection workers once"
+        );
     }
 
     #[test]
@@ -1444,5 +1707,111 @@ mod tests {
         stop.request_stop();
         // Post-stop: watcher returns Done.
         assert_eq!((bundle.shutdown_watcher.tick)(&stop), TaskOutcome::Done);
+    }
+
+    /// The join that makes application rules work at all: what the program
+    /// connected to becomes what the rule routes.
+    #[test]
+    fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
+        use crate::app_observation_lookup::AppObservationLookup;
+        use nrr_platform_api::conn_observe::{
+            ConnectionObservation, ConnectionProgress, ConnectionVerdict,
+            MockConnectionObservationSource, TransportProtocol,
+        };
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let source = Arc::new(MockConnectionObservationSource::new());
+        let observed = |path: Option<&str>, ip: Ipv4Addr| ConnectionObservation {
+            pid: 42,
+            process_path: path.map(str::to_owned),
+            user_sid: Some("unix:uid:1000".to_owned()),
+            protocol: TransportProtocol::Tcp,
+            local: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 40000),
+            remote: SocketAddr::new(IpAddr::V4(ip), 443),
+            verdict: ConnectionVerdict::Unknown,
+            drop_filter_id: None,
+            blocked_by_nrr: None,
+            nrr_drop_spec_id: None,
+            observed_unix_ms: None,
+            progress: ConnectionProgress::Attempt,
+        };
+        source.push(observed(
+            Some("/usr/bin/telegram"),
+            Ipv4Addr::new(149, 154, 167, 51),
+        ));
+        // Nothing to attribute this one to: counted for nobody, or it would widen
+        // every enabled app rule.
+        source.push(observed(None, Ipv4Addr::new(203, 0, 113, 9)));
+
+        let store = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+        let wiring = AppObservationWiring {
+            source: source.clone(),
+            store: Arc::clone(&store),
+        };
+
+        assert_eq!(fold_observations(&wiring), 1);
+        assert_eq!(
+            store.ips_for_app("telegram"),
+            vec![Ipv4Addr::new(149, 154, 167, 51)],
+        );
+
+        // A destination already known is not news: re-driving policy for it
+        // would make every poll of a busy program a policy pass.
+        source.push(observed(
+            Some("/usr/bin/telegram"),
+            Ipv4Addr::new(149, 154, 167, 51),
+        ));
+        assert_eq!(fold_observations(&wiring), 0);
+    }
+
+    /// A resolution belongs to the machine, not to a user: every present
+    /// principal's rules must get a look at it, or one user's domain rule would
+    /// learn addresses and another's would not.
+    #[test]
+    fn an_observed_resolution_is_applied_for_every_present_principal() {
+        use nrr_platform_api::active_principals::{ActivePrincipalError, ActivePrincipalSource};
+        use nrr_platform_api::dns_observe::MockDnsObservationSource;
+        use nrr_platform_api::enforcement::UserPrincipal;
+        use std::net::Ipv4Addr;
+        use std::sync::Mutex;
+
+        struct TwoUsers;
+        impl ActivePrincipalSource for TwoUsers {
+            fn active_principals(&self) -> Result<Vec<UserPrincipal>, ActivePrincipalError> {
+                Ok(vec![
+                    UserPrincipal::from_linux_uid(1000),
+                    UserPrincipal::from_linux_uid(1001),
+                ])
+            }
+            fn authority(&self) -> &'static str {
+                "scripted"
+            }
+        }
+
+        let source = Arc::new(MockDnsObservationSource::new());
+        source.push("example.com", vec![Ipv4Addr::new(93, 184, 216, 34)]);
+
+        let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&applied);
+        let wiring = DnsObservationWiring {
+            source,
+            consume_for: Arc::new(move |principal, observations| {
+                assert_eq!(observations.len(), 1);
+                recorder
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(principal.to_owned());
+            }),
+            principals: Arc::new(TwoUsers),
+        };
+
+        let mut task = build_dns_observation_task(wiring);
+        let stop = crate::lifecycle::StopToken::new();
+        (task.tick)(&stop);
+
+        assert_eq!(
+            *applied.lock().unwrap_or_else(|p| p.into_inner()),
+            vec!["unix:uid:1000".to_owned(), "unix:uid:1001".to_owned()],
+        );
     }
 }

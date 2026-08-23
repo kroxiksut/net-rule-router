@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+pub mod app_identity;
 pub mod auto_rule;
 pub mod diagnostics_dto;
 pub mod eula;
@@ -619,6 +620,11 @@ pub struct AboutContract {
     pub license: &'static str,
     pub project_url: &'static str,
     pub build_channel: &'static str,
+    /// Rights holder named by the licence agreement, spelled as the English
+    /// text spells it; the UI renders it through `label.author-name`, so each
+    /// locale can carry its own spelling of the same person.
+    pub author: &'static str,
+    pub author_email: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1049,8 +1055,7 @@ pub struct AdaptersSnapshot {
 /// This is the canonical shared type for route roles used across domain,
 /// IPC contracts, and DTO layers.
 ///
-/// The Pro edition will introduce additional named routes beyond `Primary`
-/// and `Secondary`.
+/// Named routes beyond `Primary` and `Secondary` may be added later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum RouteRole {
@@ -1323,7 +1328,7 @@ pub enum FreeRuleType {
     Domain,
     /// Matches a TLD or internal domain suffix (e.g. `".ru"`,
     /// `".intra"`). Free tier supports domain-suffix zones only;
-    /// IP-subnet zones remain Pro-only. The rule engine evaluates
+    /// IP-subnet zones remain unsupported. The rule engine evaluates
     /// zone matches at tier 3 (after Exact FQDN and Subdomain/Suffix).
     Zone,
     /// Matches one exact IP address. No CIDR prefix or range matching.
@@ -2640,6 +2645,8 @@ const ABOUT_CONTRACT: AboutContract = AboutContract {
     license: "MPL-2.0",
     project_url: "https://github.com/kroxiksut/net-rule-router",
     build_channel: "development",
+    author: "Fyodor Malkov (kroxiksut)",
+    author_email: "fmalkov91@gmail.com",
 };
 
 const SECURITY_VISIBILITY_RULES: [SecurityVisibilityRule; 6] = [

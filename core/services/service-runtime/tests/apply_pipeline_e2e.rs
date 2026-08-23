@@ -234,6 +234,11 @@ fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
         kill_switch_strict_shared_ips: false,
         auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
         auto_rules_eager_delivery_names: false,
+        primary_probe_auto: false,
+        primary_probe_timeout_ms: 1500,
+        primary_probe_max_targets: 8,
+        primary_probe_repeat_secs: 300,
+        block_ipv6_when_protected: true,
         binding_source: BindingSource::UserAssigned,
     };
     repo.update_for_sid(sid, &record, 1_700_000_000)

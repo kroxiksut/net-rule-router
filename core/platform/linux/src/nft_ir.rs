@@ -31,7 +31,7 @@ impl fmt::Display for NftFamily {
 /// What a matched packet is done with. `Accept` and `Drop` are terminal —
 /// evaluation of the chain stops — which is exactly how the first-match
 /// ordering realises the arbitration WFP expresses with weights.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NftVerdict {
     Accept,
     Drop,
@@ -48,7 +48,7 @@ impl fmt::Display for NftVerdict {
 
 /// One match condition. A rule's conditions are ANDed, mirroring how a WFP
 /// filter ANDs its conditions.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NftMatch {
     /// `ip daddr <addr>/<prefix>` — a v4 destination host or subnet.
     DstV4 { net: Ipv4Addr, prefix: u8 },

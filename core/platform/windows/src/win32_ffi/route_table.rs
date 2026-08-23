@@ -43,11 +43,11 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{
-    AF_INET, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
 };
 
 use crate::error::PlatformError;
-use crate::types::RouteEntry;
+use crate::types::{Ipv6RouteRow, RouteEntry};
 
 const GET_OP: &str = "GetIpForwardTable2";
 const CREATE_OP: &str = "CreateIpForwardEntry2";
@@ -125,6 +125,81 @@ pub fn enumerate_routes() -> Result<Vec<RouteEntry>, PlatformError> {
     unsafe { FreeMibTable(table_ptr.cast()) };
 
     Ok(result)
+}
+
+/// Enumerate the IPv6 forwarding table. Read-only: nothing installs v6 routes,
+/// this exists so "what does the v6 table look like" is answerable from a log
+/// instead of from a screenshot of `route print -6`.
+pub fn enumerate_routes_v6() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
+    let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+    // SAFETY: same contract as the v4 enumeration above, with the AF_INET6
+    // family; on error the pointer stays null and is not freed.
+    let code = unsafe { GetIpForwardTable2(AF_INET6, &mut table_ptr).0 };
+    if code != NO_ERROR.0 {
+        return Err(PlatformError::Win32 {
+            operation: GET_OP,
+            code,
+            message: format!("Win32 error {code}"),
+        });
+    }
+    if table_ptr.is_null() {
+        return Ok(Vec::new());
+    }
+    // SAFETY: filled by Win32 and non-null; released by `FreeMibTable` below.
+    let result = unsafe { read_table_v6(table_ptr) };
+    // SAFETY: allocated by the matching `GetIpForwardTable2`.
+    unsafe { FreeMibTable(table_ptr.cast()) };
+    Ok(result)
+}
+
+/// Walk a Win32-allocated table, keeping only the IPv6 rows.
+///
+/// # Safety
+/// `table` must be a live `MIB_IPFORWARD_TABLE2` from `GetIpForwardTable2`.
+unsafe fn read_table_v6(table: *const MIB_IPFORWARD_TABLE2) -> Vec<Ipv6RouteRow> {
+    // SAFETY: valid Win32 allocation per caller invariant.
+    let header = unsafe { &*table };
+    let count = header.NumEntries as usize;
+    if count == 0 {
+        return Vec::new();
+    }
+    let first = header.Table.as_ptr();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        // SAFETY: Win32 guarantees `count` consecutive valid rows.
+        let row = unsafe { &*first.add(i) };
+        let (Some(dest), Some(next_hop)) = (
+            read_ipv6_from_inet(&row.DestinationPrefix.Prefix),
+            read_ipv6_from_inet(&row.NextHop),
+        ) else {
+            continue;
+        };
+        out.push(Ipv6RouteRow {
+            destination: dest,
+            prefix_length: row.DestinationPrefix.PrefixLength,
+            next_hop,
+            interface_index: row.InterfaceIndex,
+            metric: row.Metric,
+        });
+    }
+    out
+}
+
+/// Read the IPv6 address out of a `SOCKADDR_INET` union; `None` when the entry
+/// is not IPv6.
+fn read_ipv6_from_inet(addr: &SOCKADDR_INET) -> Option<std::net::Ipv6Addr> {
+    // SAFETY: `si_family` is the union discriminator and is readable whichever
+    // arm is set — both address arms start with the family field.
+    let family = unsafe { addr.si_family };
+    if family != AF_INET6 {
+        return None;
+    }
+    // SAFETY: the family selects the `Ipv6: SOCKADDR_IN6` arm.
+    let sa_in6 = unsafe { addr.Ipv6 };
+    // SAFETY: `Byte` is a valid arm of the IN6_ADDR union; 16 network-order
+    // bytes per the Win32 contract.
+    let bytes = unsafe { sa_in6.sin6_addr.u.Byte };
+    Some(std::net::Ipv6Addr::from(bytes))
 }
 
 /// Read every `MIB_IPFORWARD_ROW2` from a Win32-allocated table.

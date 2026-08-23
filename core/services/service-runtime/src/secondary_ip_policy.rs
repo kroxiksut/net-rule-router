@@ -47,9 +47,11 @@ pub fn secondary_ip_denylist(
     let mut ip_rule_hosts: HashMap<Ipv4Addr, HashSet<String>> = HashMap::new();
     let mut rule_hosts: HashSet<String> = HashSet::new();
     for rule in secondary.rules().iter().filter(|r| r.enabled) {
-        // App rules and block rules do not put a destination IP on the secondary
-        // link (block = dropped; app routing is Pro), so they never contribute a
-        // committable shared IP.
+        // Block rules drop their destination, and an app rule names no host,
+        // so neither contributes a hostname the census can weigh. App rules DO
+        // put destinations on the additional link (learned from observation),
+        // but those are guarded where they are emitted, against the main link's
+        // own rules — see `route_codegen::address_rule_ips`.
         if rule.app_match.is_some() || matches!(rule.action, RuleAction::Block) {
             continue;
         }

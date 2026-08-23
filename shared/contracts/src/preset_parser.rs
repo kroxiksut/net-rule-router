@@ -235,8 +235,8 @@ fn parse_section_header(line: &str) -> Option<&str> {
 
 /// Map a section name (case-sensitive) to the rule type the GUI
 /// represents in `rulesModel`. Returns `None` for sections that go
-/// into passthrough (foreign-OS sections on Windows hosts, future Pro
-/// sections, custom user-named sections).
+/// into passthrough (foreign-OS sections on Windows hosts, extended sections,
+/// custom user-named sections).
 ///
 /// We deliberately match by exact case rather than lowercasing — the
 /// canonical format declares section names case-sensitive in §1.2, and
@@ -914,10 +914,10 @@ mod tests {
     }
 
     #[test]
-    fn pro_section_cidr_goes_to_passthrough() {
-        // Pro-tier sections (CIDR, Ports) are not yet supported by
-        // the Free engine — they survive as passthrough so a Pro→Free
-        // round-trip doesn't lose them.
+    fn extended_section_cidr_goes_to_passthrough() {
+        // unsupported sections (CIDR, Ports) are not yet supported by
+        // this engine — they survive as passthrough so a round-trip does
+        // not lose them.
         let result = parse_canonical_rules("--- Cidr\n10.0.0.0/8\n");
         assert!(result.rules.is_empty());
         assert_eq!(result.passthrough[0].section_name, "Cidr");

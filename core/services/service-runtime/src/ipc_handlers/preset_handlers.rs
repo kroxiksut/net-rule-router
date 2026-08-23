@@ -221,6 +221,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid("S-1-5-21-test").ok(),
+            caller_pid: None,
         }
     }
 

@@ -549,7 +549,8 @@ mod tests {
         ActiveRulesSnapshot, PerSidPolicySnapshot, RoutePolicySource, RulesProvider,
     };
     use crate::route_coordinator::{RuleScopeProvider, SecondaryRouteCoordinator};
-    use nrr_platform_api::{MockWindowsApi, RouteEntry, WindowsApiPort};
+    use nrr_platform_api::route_table::RouteTablePort;
+    use nrr_platform_api::{MockWindowsApi, RouteEntry};
     use nrr_shared::ipc::IpcClientProfile;
     use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
     use nrr_storage::repository::MigrationRunner;
@@ -771,7 +772,7 @@ mod tests {
     /// `api` (so `effective_routing_sid([])` resolves the console user).
     fn route_coord_service_driven(api: Arc<MockWindowsApi>) -> Arc<SecondaryRouteCoordinator> {
         Arc::new(SecondaryRouteCoordinator::new(
-            api as Arc<dyn WindowsApiPort>,
+            api as Arc<dyn RouteTablePort>,
             Arc::new(NoRules) as Arc<dyn RulesProvider>,
             Arc::new(NoPolicy) as Arc<dyn RoutePolicySource>,
             Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,

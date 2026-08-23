@@ -153,6 +153,20 @@ pub struct RoutePolicyRecord {
     /// too). When `true`, a port-scoped DNS permit lets zones keep resolving while
     /// everything else is blocked. Only meaningful in the block-all path.
     pub allow_dns_over_primary: bool,
+    /// May the service check "does this answer on the main link?" on its own,
+    /// or only when the user presses Check? Default `false` — a probe is an
+    /// outgoing connection, so doing it unasked is the user's decision.
+    pub primary_probe_auto: bool,
+    /// What one probing pass may cost. Kept as plain numbers here; the service
+    /// clamps them into its allowed ranges on the way out, so a value from
+    /// another build (or a hand-edited row) can never widen a pass.
+    pub primary_probe_timeout_ms: u32,
+    pub primary_probe_max_targets: u32,
+    pub primary_probe_repeat_secs: u32,
+    /// Cut IPv6 while leak protection is on. Default `true`: Free pins IPv4
+    /// only, so a host with an AAAA record would otherwise keep a second,
+    /// unpinned way out.
+    pub block_ipv6_when_protected: bool,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -240,6 +254,11 @@ impl RoutePolicyRecord {
             // stays 0 (checksummed DDL, inert — upserts always bind every
             // column).
             allow_dns_over_primary: true,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             // Default ON: adding `mysite.com` and silently losing
             // `cdn.mysite.com` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -329,6 +348,62 @@ impl std::error::Error for RoutePolicyValidationError {}
 /// (`SqliteMigrationRunner` does so during bootstrap).
 pub struct RouteBindingsRepository<'c> {
     conn: &'c Connection,
+}
+
+/// One decoded `secondary_block_policy` row (see
+/// `RouteBindingsRepository::load_block_policy`). `Default` is the
+/// never-configured answer, which is why the loader can hand a missing row
+/// straight to it.
+struct BlockPolicyRow {
+    block_secondary_when_unavailable: bool,
+    kill_switch_fail_closed: bool,
+    kill_switch_protocols: u16,
+    kill_switch_block_all: bool,
+    kill_switch_enabled: bool,
+    allow_dns_over_primary: bool,
+    include_subdomains: bool,
+    shared_ip_policy: SharedIpPolicy,
+    mode_a_coverage_strategy: ModeACoverageStrategy,
+    resolve_hosts_bypass: bool,
+    doh_lockdown_enabled: bool,
+    doh_lockdown_scope: DohLockdownScope,
+    browser_history_auto_seed: bool,
+    kill_switch_strict_shared_ips: bool,
+    auto_rules_mode: AutoRulesMode,
+    auto_rules_eager_delivery_names: bool,
+    primary_probe_auto: bool,
+    primary_probe_timeout_ms: u32,
+    primary_probe_max_targets: u32,
+    primary_probe_repeat_secs: u32,
+    block_ipv6_when_protected: bool,
+}
+
+impl Default for BlockPolicyRow {
+    fn default() -> Self {
+        Self {
+            block_secondary_when_unavailable: true,
+            kill_switch_fail_closed: true,
+            kill_switch_protocols: KILL_SWITCH_PROTOCOLS_ALL,
+            kill_switch_block_all: false,
+            kill_switch_enabled: false,
+            allow_dns_over_primary: true,
+            include_subdomains: true,
+            shared_ip_policy: SharedIpPolicy::default(),
+            mode_a_coverage_strategy: ModeACoverageStrategy::default(),
+            resolve_hosts_bypass: true,
+            doh_lockdown_enabled: false,
+            doh_lockdown_scope: DohLockdownScope::default(),
+            browser_history_auto_seed: false,
+            kill_switch_strict_shared_ips: false,
+            auto_rules_mode: AutoRulesMode::default(),
+            auto_rules_eager_delivery_names: AUTO_RULES_EAGER_DELIVERY_NAMES_DEFAULT,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
+        }
+    }
 }
 
 impl<'c> RouteBindingsRepository<'c> {
@@ -433,9 +508,11 @@ impl<'c> RouteBindingsRepository<'c> {
                  mode_a_coverage_strategy, resolve_hosts_bypass, \
                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed, \
                  kill_switch_strict_shared_ips, auto_rules_mode, \
-                 auto_rules_eager_delivery_names, updated_at)
+                 auto_rules_eager_delivery_names, primary_probe_auto, \
+                 primary_probe_timeout_ms, primary_probe_max_targets, \
+                 primary_probe_repeat_secs, block_ipv6_when_protected, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18)
+             ?18, ?19, ?20, ?21, ?22, ?23)
              ON CONFLICT(sid) DO UPDATE SET
                 block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
                 kill_switch_fail_closed = excluded.kill_switch_fail_closed,
@@ -453,6 +530,11 @@ impl<'c> RouteBindingsRepository<'c> {
                 kill_switch_strict_shared_ips = excluded.kill_switch_strict_shared_ips,
                 auto_rules_mode = excluded.auto_rules_mode,
                 auto_rules_eager_delivery_names = excluded.auto_rules_eager_delivery_names,
+                primary_probe_auto = excluded.primary_probe_auto,
+                primary_probe_timeout_ms = excluded.primary_probe_timeout_ms,
+                primary_probe_max_targets = excluded.primary_probe_max_targets,
+                primary_probe_repeat_secs = excluded.primary_probe_repeat_secs,
+                block_ipv6_when_protected = excluded.block_ipv6_when_protected,
                 updated_at = excluded.updated_at",
             params![
                 sid,
@@ -472,6 +554,11 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.kill_switch_strict_shared_ips as i64,
                 record.auto_rules_mode.as_slug(),
                 record.auto_rules_eager_delivery_names as i64,
+                record.primary_probe_auto as i64,
+                record.primary_probe_timeout_ms as i64,
+                record.primary_probe_max_targets as i64,
+                record.primary_probe_repeat_secs as i64,
+                record.block_ipv6_when_protected as i64,
                 now_epoch_secs
             ],
         )
@@ -536,6 +623,52 @@ impl<'c> RouteBindingsRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("heal update binding: {e}")))
     }
 
+    /// Remember one more identity for an existing `(sid, role)` binding without
+    /// touching which adapter it currently points at.
+    ///
+    /// The heal path rewrites `stable_id` because the stored one went stale;
+    /// this one is for an identity the binding gains while still resolving
+    /// correctly — the MAC anchor of a physical adapter, learned the first time
+    /// the binding resolves. Returns whether the set actually grew, so the
+    /// caller can log once instead of every reconcile. No-op when the row is
+    /// absent or the id is already known.
+    pub fn remember_stable_id(
+        &self,
+        sid: &str,
+        role: &str,
+        extra_stable_id: &str,
+        now_epoch_secs: i64,
+    ) -> StorageResult<bool> {
+        if extra_stable_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let existing: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT known_stable_ids FROM route_bindings WHERE sid = ?1 AND role = ?2",
+                params![sid, role],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| StorageError::Internal(format!("anchor read binding: {e}")))?;
+        let Some(known_raw) = existing else {
+            return Ok(false);
+        };
+        let known = parse_known_ids(&known_raw);
+        let grown = union_known_ids(&known, &[extra_stable_id]);
+        if grown.len() == known.len() {
+            return Ok(false);
+        }
+        self.conn
+            .execute(
+                "UPDATE route_bindings SET known_stable_ids = ?1, updated_at = ?2
+                 WHERE sid = ?3 AND role = ?4",
+                params![serialize_known_ids(&grown), now_epoch_secs, sid, role],
+            )
+            .map(|_| true)
+            .map_err(|e| StorageError::Internal(format!("anchor update binding: {e}")))
+    }
+
     /// Read the current policy snapshot for `sid`. Returns
     /// `RoutePolicyRecord::empty(...)` if the SID has no rows in any of
     /// the three tables (i.e. the user has never sent a `RoutePolicyUpdate`).
@@ -544,44 +677,32 @@ impl<'c> RouteBindingsRepository<'c> {
         let primary = self.load_binding_for_sid(sid, "primary")?;
         let secondary = self.load_binding_for_sid(sid, "secondary")?;
         let (mode, binding_source) = self.load_mode_and_source(sid)?;
-        let (
-            block,
-            kill_switch_fail_closed,
-            kill_switch_protocols,
-            kill_switch_block_all,
-            kill_switch_enabled,
-            allow_dns_over_primary,
-            include_subdomains,
-            shared_ip_policy,
-            mode_a_coverage_strategy,
-            resolve_hosts_bypass,
-            doh_lockdown_enabled,
-            doh_lockdown_scope,
-            browser_history_auto_seed,
-            kill_switch_strict_shared_ips,
-            auto_rules_mode,
-            auto_rules_eager_delivery_names,
-        ) = self.load_block_policy(sid)?;
+        let policy = self.load_block_policy(sid)?;
         Ok(RoutePolicyRecord {
             primary: primary.map(|(b, _)| b),
             secondary: secondary.map(|(b, _)| b),
             mode,
-            block_secondary_when_unavailable: block,
-            kill_switch_fail_closed,
-            kill_switch_protocols,
-            kill_switch_block_all,
-            kill_switch_enabled,
-            allow_dns_over_primary,
-            include_subdomains,
-            shared_ip_policy,
-            mode_a_coverage_strategy,
-            resolve_hosts_bypass,
-            doh_lockdown_enabled,
-            doh_lockdown_scope,
-            browser_history_auto_seed,
-            kill_switch_strict_shared_ips,
-            auto_rules_mode,
-            auto_rules_eager_delivery_names,
+            block_secondary_when_unavailable: policy.block_secondary_when_unavailable,
+            kill_switch_fail_closed: policy.kill_switch_fail_closed,
+            kill_switch_protocols: policy.kill_switch_protocols,
+            kill_switch_block_all: policy.kill_switch_block_all,
+            kill_switch_enabled: policy.kill_switch_enabled,
+            allow_dns_over_primary: policy.allow_dns_over_primary,
+            include_subdomains: policy.include_subdomains,
+            shared_ip_policy: policy.shared_ip_policy,
+            mode_a_coverage_strategy: policy.mode_a_coverage_strategy,
+            resolve_hosts_bypass: policy.resolve_hosts_bypass,
+            doh_lockdown_enabled: policy.doh_lockdown_enabled,
+            doh_lockdown_scope: policy.doh_lockdown_scope,
+            browser_history_auto_seed: policy.browser_history_auto_seed,
+            kill_switch_strict_shared_ips: policy.kill_switch_strict_shared_ips,
+            auto_rules_mode: policy.auto_rules_mode,
+            auto_rules_eager_delivery_names: policy.auto_rules_eager_delivery_names,
+            primary_probe_auto: policy.primary_probe_auto,
+            primary_probe_timeout_ms: policy.primary_probe_timeout_ms,
+            primary_probe_max_targets: policy.primary_probe_max_targets,
+            primary_probe_repeat_secs: policy.primary_probe_repeat_secs,
+            block_ipv6_when_protected: policy.block_ipv6_when_protected,
             binding_source,
         })
     }
@@ -674,156 +795,62 @@ impl<'c> RouteBindingsRepository<'c> {
     /// leaks secondary-bound traffic to the primary link. An explicit
     /// stored `0` (the user unchecked it) still wins.
     #[allow(clippy::type_complexity)]
-    fn load_block_policy(
-        &self,
-        sid: &str,
-    ) -> StorageResult<(
-        bool,
-        bool,
-        u16,
-        bool,
-        bool,
-        bool,
-        bool,
-        SharedIpPolicy,
-        ModeACoverageStrategy,
-        bool,
-        bool,
-        DohLockdownScope,
-        bool,
-        bool,
-        AutoRulesMode,
-        bool,
-    )> {
-        #[allow(clippy::type_complexity)]
-        let row: Option<(
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            String,
-            i64,
-        )> = self
+    /// One `secondary_block_policy` row, decoded. A struct rather than a tuple:
+    /// with twenty fields a positional return is a bug waiting for the next
+    /// column to be added in the wrong place.
+    fn load_block_policy(&self, sid: &str) -> StorageResult<BlockPolicyRow> {
+        let row: Option<BlockPolicyRow> = self
             .conn
             .query_row(
-                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed, \
-                 kill_switch_protocols, kill_switch_block_all, kill_switch_enabled, \
-                 allow_dns_over_primary, include_subdomains, shared_ip_policy, \
-                 mode_a_coverage_strategy, resolve_hosts_bypass, \
-                 doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed, \
-                 kill_switch_strict_shared_ips, auto_rules_mode, \
-                 auto_rules_eager_delivery_names
+                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs, block_ipv6_when_protected
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                        row.get(11)?,
-                        row.get(12)?,
-                        row.get(13)?,
-                        row.get(14)?,
-                        row.get(15)?,
-                    ))
+                    let auto_rules_mode: String = row.get(14)?;
+                    Ok(BlockPolicyRow {
+                        block_secondary_when_unavailable: row.get::<_, i64>(0)? != 0,
+                        kill_switch_fail_closed: row.get::<_, i64>(1)? != 0,
+                        kill_switch_protocols: row.get::<_, i64>(2)? as u16,
+                        kill_switch_block_all: row.get::<_, i64>(3)? != 0,
+                        kill_switch_enabled: row.get::<_, i64>(4)? != 0,
+                        allow_dns_over_primary: row.get::<_, i64>(5)? != 0,
+                        include_subdomains: row.get::<_, i64>(6)? != 0,
+                        // Unknown code (shouldn't happen — CHECK-constrained) → default.
+                        shared_ip_policy: SharedIpPolicy::from_code(row.get::<_, i64>(7)?)
+                            .unwrap_or_default(),
+                        mode_a_coverage_strategy: ModeACoverageStrategy::from_code(
+                            row.get::<_, i64>(8)?,
+                        )
+                        .unwrap_or_default(),
+                        resolve_hosts_bypass: row.get::<_, i64>(9)? != 0,
+                        doh_lockdown_enabled: row.get::<_, i64>(10)? != 0,
+                        doh_lockdown_scope: DohLockdownScope::from_code(row.get::<_, i64>(11)?)
+                            .unwrap_or_default(),
+                        browser_history_auto_seed: row.get::<_, i64>(12)? != 0,
+                        kill_switch_strict_shared_ips: row.get::<_, i64>(13)? != 0,
+                        // Unknown slug → the default; never silently promote to
+                        // applying rules unattended.
+                        auto_rules_mode: AutoRulesMode::from_slug(&auto_rules_mode)
+                            .unwrap_or_default(),
+                        auto_rules_eager_delivery_names: row.get::<_, i64>(15)? != 0,
+                        primary_probe_auto: row.get::<_, i64>(16)? != 0,
+                        primary_probe_timeout_ms: row.get::<_, i64>(17)? as u32,
+                        primary_probe_max_targets: row.get::<_, i64>(18)? as u32,
+                        primary_probe_repeat_secs: row.get::<_, i64>(19)? as u32,
+                        block_ipv6_when_protected: row.get::<_, i64>(20)? != 0,
+                    })
                 },
             )
             .optional()
             .map_err(|e| StorageError::Internal(format!("load block policy: {e}")))?;
-        match row {
-            // A missing row means the user never sent a policy: leak-guard ON,
-            // fail-closed, all protocols, block-all OFF (per-IP), DNS-over-
-            // primary ON (a DNS-cut block-all would otherwise be a total
-            // blackout), subdomain-coverage ON (a rule for a site covers that
-            // site's subdomains; widening only ever adds coverage towards the
-            // route the rule already names), the default shared-IP policy
-            // (balanced majority-of-ip), Mode-A default coverage, and
-            // hosts-bypass ON.
-            None => Ok((
-                true,
-                true,
-                KILL_SWITCH_PROTOCOLS_ALL,
-                false,
-                false,
-                true,
-                true,
-                SharedIpPolicy::default(),
-                ModeACoverageStrategy::default(),
-                true,
-                // DoH lockdown OFF by default (explicit opt-in), scope
-                // leak-protection-only.
-                false,
-                DohLockdownScope::default(),
-                // Automatic browser-history seed OFF by default (explicit
-                // per-SID opt-in — privacy-sensitive read).
-                false,
-                // Kill-switch shared-IP strictness OFF by default ("smart":
-                // census-shared IPs are not pinned/blocked).
-                false,
-                // Companion-domain findings are collected and offered, never
-                // applied unattended by default.
-                AutoRulesMode::default(),
-                // A delivery-shaped host still earns its suggestion by
-                // evidence unless the user asks for it sooner.
-                AUTO_RULES_EAGER_DELIVERY_NAMES_DEFAULT,
-            )),
-            Some((
-                block,
-                fail_closed,
-                protocols,
-                block_all,
-                kill_switch_enabled,
-                allow_dns_over_primary,
-                include_subdomains,
-                shared_ip,
-                mode_a,
-                resolve_hosts_bypass,
-                doh_enabled,
-                doh_scope,
-                browser_history_auto_seed,
-                kill_switch_strict_shared_ips,
-                auto_rules_mode,
-                auto_rules_eager_delivery_names,
-            )) => Ok((
-                block != 0,
-                fail_closed != 0,
-                protocols as u16,
-                block_all != 0,
-                kill_switch_enabled != 0,
-                allow_dns_over_primary != 0,
-                include_subdomains != 0,
-                // Unknown code (shouldn't happen — CHECK-constrained) → default.
-                SharedIpPolicy::from_code(shared_ip).unwrap_or_default(),
-                ModeACoverageStrategy::from_code(mode_a).unwrap_or_default(),
-                resolve_hosts_bypass != 0,
-                doh_enabled != 0,
-                DohLockdownScope::from_code(doh_scope).unwrap_or_default(),
-                browser_history_auto_seed != 0,
-                kill_switch_strict_shared_ips != 0,
-                // Unknown slug (shouldn't happen — CHECK-constrained) → the
-                // default; never silently promote to applying rules unattended.
-                AutoRulesMode::from_slug(&auto_rules_mode).unwrap_or_default(),
-                auto_rules_eager_delivery_names != 0,
-            )),
-        }
+        // A missing row means the user never sent a policy: leak-guard ON,
+        // fail-closed, all protocols, block-all OFF (per-IP), DNS-over-primary
+        // ON (a DNS-cut block-all would otherwise be a total blackout),
+        // subdomain coverage ON, balanced shared-IP policy, Mode-A default
+        // coverage, hosts-bypass ON, DoH lockdown OFF, history seed OFF,
+        // findings offered but never applied unattended, and probing only when
+        // asked for.
+        Ok(row.unwrap_or_default())
     }
 
     // ── Link-provider apps ───────────────────────────────────────────────
@@ -1251,6 +1278,11 @@ mod tests {
             // Non-default (default is `false`) — proves the v46 eager
             // delivery-name column round-trips rather than reading the default.
             auto_rules_eager_delivery_names: true,
+            primary_probe_auto: true,
+            primary_probe_timeout_ms: 900,
+            primary_probe_max_targets: 4,
+            primary_probe_repeat_secs: 120,
+            block_ipv6_when_protected: true,
             binding_source: source,
         }
     }
@@ -1463,6 +1495,40 @@ mod tests {
         assert!(s
             .known_stable_ids
             .contains(&"win-adapter:{guid-b}".to_string()));
+    }
+
+    #[test]
+    fn remember_stable_id_adds_once_and_keeps_the_binding_pointing_where_it_did() {
+        let (_dir, conn) = fresh_db();
+        let repo = RouteBindingsRepository::new(&conn);
+        let mut rec = sample_record(BindingSource::UserAssigned);
+        rec.secondary = Some(secondary_binding("win-adapter:{guid-a}", "Wi-Fi"));
+        repo.update_for_sid("S", &rec, 1).unwrap();
+
+        assert!(repo
+            .remember_stable_id("S", "secondary", "win-mac:D8-C4-97-14-BA-2E", 2)
+            .unwrap());
+        assert!(
+            !repo
+                .remember_stable_id("S", "secondary", "win-mac:d8-c4-97-14-ba-2e", 3)
+                .unwrap(),
+            "a known id, however it is spelled, must not grow the set again"
+        );
+
+        let s = repo.load_for_sid("S").unwrap().secondary.unwrap();
+        assert_eq!(s.stable_id, "win-adapter:{guid-a}");
+        assert!(s
+            .known_stable_ids
+            .contains(&"win-mac:D8-C4-97-14-BA-2E".to_string()));
+    }
+
+    #[test]
+    fn remember_stable_id_is_a_noop_without_a_binding() {
+        let (_dir, conn) = fresh_db();
+        let repo = RouteBindingsRepository::new(&conn);
+        assert!(!repo
+            .remember_stable_id("S", "secondary", "win-mac:00-11-22-33-44-55", 1)
+            .unwrap());
     }
 
     #[test]

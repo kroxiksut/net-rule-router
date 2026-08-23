@@ -22,7 +22,65 @@ const PURGED_TABLES: &[&str] = &[
     "auto_rule_pending_candidates",
     "auto_rule_evidence",
     "block_notice_mutes",
+    "local_network_rules",
+    "refusing_anchors",
+    "block_notice_journal",
 ];
+
+/// Principals this database holds rules for, excluding the shared baseline.
+/// Full reset reads it to ask whose data it is about to erase; the count is
+/// all it needs, so nothing here is resolved to a user name.
+pub fn principals_with_rules(conn: &Connection) -> StorageResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT principal FROM revisions ORDER BY principal ASC")
+        .map_err(|e| StorageError::Internal(format!("principals_with_rules prepare: {e}")))?;
+    let principals = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| StorageError::Internal(format!("principals_with_rules query: {e}")))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|e| StorageError::Internal(format!("principals_with_rules collect: {e}")))?;
+    Ok(principals
+        .into_iter()
+        .filter(|p| p != BASELINE_PRINCIPAL && !p.is_empty())
+        .collect())
+}
+
+/// The rules the SERVICE holds for one principal: its revision history, the
+/// pointer at the active one, and any unconsumed mutation tokens. Deliberately
+/// outside [`PURGED_TABLES`] — the ordinary auxiliary purge must never drop a
+/// user's rules, and only a full reset asks for this.
+///
+/// Deletion order follows the foreign key: the pointer references the
+/// revision, so it goes first. Returns rows deleted.
+pub fn purge_principal_rules(conn: &mut Connection, principal: &str) -> StorageResult<u64> {
+    if principal.is_empty() {
+        return Err(StorageError::Internal(
+            "purge_principal_rules: empty principal".into(),
+        ));
+    }
+    if principal == BASELINE_PRINCIPAL {
+        return Err(StorageError::Internal(
+            "purge_principal_rules: refusing to purge the shared baseline".into(),
+        ));
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| StorageError::Internal(format!("principal rules purge begin: {e}")))?;
+    let mut rows: u64 = 0;
+    for sql in [
+        "DELETE FROM active_revision_pointer WHERE principal = ?1",
+        "DELETE FROM revisions WHERE principal = ?1",
+        "DELETE FROM mutation_tokens WHERE principal = ?1",
+    ] {
+        let deleted = tx
+            .execute(sql, [principal])
+            .map_err(|e| StorageError::Internal(format!("principal rules purge: {e}")))?;
+        rows = rows.saturating_add(deleted as u64);
+    }
+    tx.commit()
+        .map_err(|e| StorageError::Internal(format!("principal rules purge commit: {e}")))?;
+    Ok(rows)
+}
 
 /// Outcome of [`purge_principal_data`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -155,6 +213,24 @@ mod tests {
             params![sid],
         )
         .expect("block_notice_mutes");
+        conn.execute(
+            "INSERT INTO local_network_rules (sid, cidr, allow, origin, updated_at)
+             VALUES (?1, '10.0.2.0/24', 1, 'manual', 1)",
+            params![sid],
+        )
+        .expect("local_network_rules");
+        conn.execute(
+            "INSERT INTO refusing_anchors (sid, hostname, marked_at) VALUES (?1, 'chatgpt.com', 1)",
+            params![sid],
+        )
+        .expect("refusing_anchors");
+        conn.execute(
+            "INSERT INTO block_notice_journal
+                 (sid, raised_at, destination, app, reason, attempts)
+             VALUES (?1, 1, 'blocked.example', 'app.exe', 'blocked-by-rule', 2)",
+            params![sid],
+        )
+        .expect("block_notice_journal");
     }
 
     fn row_count(conn: &Connection, table: &str, sid: &str) -> i64 {
@@ -176,6 +252,51 @@ mod tests {
         for table in PURGED_TABLES {
             assert_eq!(row_count(&conn, table, "S-A"), 0, "{table} not cleared");
         }
+    }
+
+    /// One principal's rules go, the other's stay — a full reset is per user,
+    /// and the auxiliary purge alone must leave both sets standing.
+    #[test]
+    fn the_rules_purge_takes_one_principals_revisions_and_nobody_elses() {
+        let mut conn = migrated_conn();
+        for principal in ["S-A", "S-B"] {
+            conn.execute(
+                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status,                  source, correlation_id, created_at)                  VALUES (?1, ?2, 'hash', '{}', 'active', 'gui-rules-edit', 'corr', 1)",
+                params![principal, format!("rev-{principal}")],
+            )
+            .expect("revision");
+            conn.execute(
+                "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)                  VALUES (?1, ?2, 1)",
+                params![principal, format!("rev-{principal}")],
+            )
+            .expect("pointer");
+        }
+
+        // The auxiliary purge leaves the rules alone…
+        purge_principal_data(&mut conn, "S-A").expect("aux purge");
+        assert_eq!(revision_count(&conn, "S-A"), 1);
+
+        // …the full reset takes them.
+        let rows = purge_principal_rules(&mut conn, "S-A").expect("rules purge");
+        assert_eq!(rows, 2, "one revision + one pointer");
+        assert_eq!(revision_count(&conn, "S-A"), 0);
+        assert_eq!(revision_count(&conn, "S-B"), 1);
+    }
+
+    #[test]
+    fn the_rules_purge_refuses_the_shared_baseline() {
+        let mut conn = migrated_conn();
+        assert!(purge_principal_rules(&mut conn, BASELINE_PRINCIPAL).is_err());
+        assert!(purge_principal_rules(&mut conn, "").is_err());
+    }
+
+    fn revision_count(conn: &Connection, principal: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM revisions WHERE principal = ?1",
+            params![principal],
+            |r| r.get(0),
+        )
+        .expect("count")
     }
 
     #[test]
@@ -252,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn revision_history_is_never_in_scope() {
+    fn revision_history_is_never_in_the_auxiliary_scope() {
         for table in PURGED_TABLES {
             assert!(!matches!(
                 *table,

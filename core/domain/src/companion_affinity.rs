@@ -93,6 +93,15 @@
 //!    threshold this tier is close to inert by design; it is the conservative
 //!    fallback, not the workhorse.
 //!
+//! Tiers 2 and 3 are additionally held to **sub-resource, not neighbour in
+//! time**: both rest on the assumption that the anchor is the page doing the
+//! fetching, and the ledger checks it. The most recent page-shaped hostname is
+//! remembered, and an attributed observation made while a DIFFERENT site's page
+//! was loading counts against the pair; once most of them do, the pair is not
+//! proposed. Without this, a rule host left open in one tab collects the CDN of
+//! whatever the user visited next. Brand relation is exempt — a shared name
+//! states ownership whatever was on screen.
+//!
 //! Qualifying subdomains of one registrable domain generalize into a single
 //! suffix proposal (see [`registrable_domain`]): immediately for a brand or
 //! delivery name, and from two distinct subdomains for co-activity alone.
@@ -104,7 +113,7 @@
 //! engine never normalizes, so `Foo.example` and `foo.example` would be
 //! distinct keys, and the name-shape tests above are ASCII-literal.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use nrr_shared::RouteRole;
 
@@ -116,6 +125,23 @@ use nrr_shared::RouteRole;
 /// within a few seconds of the anchor's own DNS activity. 15 s absorbs slow
 /// pages and lazy media without merging unrelated browsing into the window.
 pub const DEFAULT_WINDOW_MS: u64 = 15_000;
+
+/// How far BACK an opening window reaches for companions already seen, in
+/// milliseconds.
+///
+/// Rationale: a browser routinely opens the CDN connection before the one to
+/// the page itself — `static.cdninstagram.com` a second ahead of
+/// `www.instagram.com` is the ordinary case, not a rarity. A window that only
+/// looks forward throws that sighting away at the door and the CDN is never
+/// proposed, while the same site visited in the other order proposes fine. Ten
+/// seconds covers the spread of one page load without reaching into whatever
+/// the user was doing before it.
+pub const DEFAULT_RETRO_WINDOW_MS: u64 = 10_000;
+
+/// Cap on companions parked while no window is open. A page load fires dozens
+/// of requests, and only the newest handful can still be inside a look-back by
+/// the time a window opens.
+const MAX_UNATTRIBUTED: usize = 64;
 
 /// Default hard cap on a single anchor window's duration, in milliseconds.
 ///
@@ -135,6 +161,20 @@ pub const DEFAULT_MAX_WINDOW_MS: u64 = 60_000;
 /// (two anchors at equal rates gives 0.5). 0.8 admits a little noise from
 /// overlapping windows while still rejecting anything genuinely shared.
 pub const DEFAULT_MIN_AFFINITY: f64 = 0.8;
+
+/// Default minimum affinity for a BRAND-related proposal.
+///
+/// Rationale: a shared name states ownership, not need — an operator's
+/// advertising, telemetry and platform-asset domains carry the brand exactly as
+/// plainly as the host a page cannot render without. What separates them is
+/// company: a site's own hosts ride along with that site, the operator's
+/// everything-hosts ride along with every site and dilute to affinities in the
+/// thousandths. Measured on the trace study, genuine brand companions sit at
+/// 0.11-0.5; the floor is set below that band and two orders of magnitude above
+/// the ubiquitous ones. Much lower than [`DEFAULT_MIN_AFFINITY`] on purpose:
+/// the shared name is real evidence, so this tier asks for less of the temporal
+/// kind than the purely co-activity one.
+pub const DEFAULT_BRAND_MIN_AFFINITY: f64 = 0.1;
 
 /// Default minimum number of distinct co-occurrence windows for a proposal.
 ///
@@ -241,8 +281,14 @@ pub struct CompanionAffinityConfig {
     pub window_ms: u64,
     /// Hard cap on a single window's duration (see [`DEFAULT_MAX_WINDOW_MS`]).
     pub max_window_ms: u64,
+    /// How far back an opening window reaches for already-seen companions
+    /// (see [`DEFAULT_RETRO_WINDOW_MS`]). Zero disables the look-back.
+    pub retro_window_ms: u64,
     /// Minimum affinity for a proposal (see [`DEFAULT_MIN_AFFINITY`]).
     pub min_affinity: f64,
+    /// Minimum affinity for a brand-related proposal
+    /// (see [`DEFAULT_BRAND_MIN_AFFINITY`]).
+    pub brand_min_affinity: f64,
     /// Minimum distinct co-occurrence windows (see [`DEFAULT_MIN_DISTINCT_WINDOWS`]).
     pub min_distinct_windows: u32,
     /// Minimum `nearest_share` for a delivery-named candidate
@@ -284,7 +330,9 @@ impl Default for CompanionAffinityConfig {
         Self {
             window_ms: DEFAULT_WINDOW_MS,
             max_window_ms: DEFAULT_MAX_WINDOW_MS,
+            retro_window_ms: DEFAULT_RETRO_WINDOW_MS,
             min_affinity: DEFAULT_MIN_AFFINITY,
+            brand_min_affinity: DEFAULT_BRAND_MIN_AFFINITY,
             min_distinct_windows: DEFAULT_MIN_DISTINCT_WINDOWS,
             delivery_min_nearest_share: DEFAULT_DELIVERY_MIN_NEAREST_SHARE,
             delivery_min_distinct_windows: DEFAULT_DELIVERY_MIN_DISTINCT_WINDOWS,
@@ -766,6 +814,30 @@ fn is_delivery_named(hostname: &str) -> bool {
     DELIVERY_NAME_MASKS.iter().any(|m| hostname.contains(m)) || is_sharded_delivery_label(hostname)
 }
 
+/// The hostname looks like a PAGE rather than an endpoint a page fetches from:
+/// the registrable apex itself or its `www.` form, and not delivery-named.
+///
+/// Used to answer "under whose page did this load?" — see
+/// [`CompanionAffinityLedger::foreign_document_owner`].
+fn is_document_shaped(hostname: &str) -> bool {
+    if is_delivery_named(hostname) || names_one_machine(hostname) {
+        return false;
+    }
+    match registrable_domain(hostname) {
+        Some(apex) => hostname == apex || hostname.strip_prefix("www.") == Some(apex),
+        None => false,
+    }
+}
+
+/// Whether two hostnames belong to the same site — same registrable domain, or
+/// related by brand (one operator, several domains).
+fn same_site(a: &str, b: &str) -> bool {
+    if registrable_domain(a).is_some() && registrable_domain(a) == registrable_domain(b) {
+        return true;
+    }
+    is_brand_related(a, b)
+}
+
 // ── Internal state ────────────────────────────────────────────────────────────
 
 /// Live state of one tracked anchor (rule host).
@@ -803,6 +875,10 @@ struct PairStats {
     /// The subset of `nearest_hits` won with no rival anchor active in the same
     /// breath — the only ones that say anything about ownership on their own.
     uncontested_hits: u32,
+    /// The subset of `nearest_hits` that happened while a DIFFERENT site's page
+    /// was the one loading. Each is evidence that this anchor was a neighbour in
+    /// time, not the parent of the fetch.
+    foreign_parent_hits: u32,
 }
 
 // ── Persistable snapshot ─────────────────────────────────────────────────────
@@ -834,6 +910,7 @@ pub struct PairSnapshot {
     pub last_window_id: u64,
     pub nearest_hits: u32,
     pub uncontested_hits: u32,
+    pub foreign_parent_hits: u32,
 }
 
 /// One tracked candidate, as data.
@@ -925,6 +1002,15 @@ pub struct CompanionAffinityLedger {
     candidates: HashMap<String, CandidateState>,
     next_anchor_id: u32,
     next_window_id: u64,
+    /// The page-shaped hostname seen most recently, and when. Answers "whose
+    /// page is loading right now" — deliberately not persisted, because a
+    /// restart genuinely does not know what page the user is on.
+    last_document: Option<(String, u64)>,
+    /// Companions seen while no window was open, newest last: `(hostname,
+    /// at_ms, in_use)`. An opening window replays the ones that fall inside its
+    /// look-back and the rest age out. Not persisted — a restart has no page
+    /// load in flight to attribute them to.
+    unattributed: VecDeque<(String, u64, bool)>,
 }
 
 impl CompanionAffinityLedger {
@@ -936,6 +1022,8 @@ impl CompanionAffinityLedger {
             candidates: HashMap::new(),
             next_anchor_id: 0,
             next_window_id: 0,
+            last_document: None,
+            unattributed: VecDeque::new(),
         }
     }
 
@@ -985,6 +1073,7 @@ impl CompanionAffinityLedger {
                         last_window_id: p.last_window_id,
                         nearest_hits: p.nearest_hits,
                         uncontested_hits: p.uncontested_hits,
+                        foreign_parent_hits: p.foreign_parent_hits,
                     })
                     .collect(),
             })
@@ -1054,6 +1143,7 @@ impl CompanionAffinityLedger {
                             last_window_id: p.last_window_id,
                             nearest_hits: p.nearest_hits,
                             uncontested_hits: p.uncontested_hits,
+                            foreign_parent_hits: p.foreign_parent_hits,
                         })
                         .collect(),
                 },
@@ -1102,6 +1192,49 @@ impl CompanionAffinityLedger {
             CoActivityKind::CandidateInUse => self.observe_candidate(at_ms, hostname, true),
             CoActivityKind::PrimaryHealth(event) => self.note_primary_health(hostname, event),
         }
+        // After attribution, never before: a page-shaped host is the parent of
+        // what follows it, not of itself.
+        if matches!(
+            kind,
+            CoActivityKind::Anchor { .. }
+                | CoActivityKind::Candidate
+                | CoActivityKind::CandidateInUse
+        ) && is_document_shaped(hostname)
+        {
+            let newer = self
+                .last_document
+                .as_ref()
+                .is_none_or(|(_, seen_at)| at_ms >= *seen_at);
+            if newer {
+                self.last_document = Some((hostname.to_string(), at_ms));
+            }
+        }
+    }
+
+    /// Whether the page loading right now says this fetch belonged to somebody
+    /// other than `anchor_hostname`.
+    ///
+    /// Two guards keep this from suppressing honest evidence:
+    ///
+    /// - **Stale context does not count.** A page seen longer than one window
+    ///   ago has no claim on what is being fetched now.
+    /// - **A page of the candidate's OWN site only speaks when the candidate is
+    ///   a delivery endpoint.** Our data cannot tell a navigation from an XHR to
+    ///   an apex, so an anchor's page calling `partner.test` and then
+    ///   `one.partner.test` must keep its attribution. A delivery name is
+    ///   different: `cdninstagram.com` seen while `instagram.com` is loading is
+    ///   serving Instagram, whichever rule host happens to be open.
+    fn document_disowns(&self, at_ms: u64, anchor_hostname: &str, candidate: &str) -> bool {
+        let Some((document, seen_at)) = self.last_document.as_ref() else {
+            return false;
+        };
+        if at_ms.saturating_sub(*seen_at) > self.config.window_ms {
+            return false;
+        }
+        if same_site(document, anchor_hostname) {
+            return false;
+        }
+        !same_site(document, candidate) || is_delivery_named(candidate)
     }
 
     /// Counts one primary-route outcome against an already-tracked candidate.
@@ -1153,6 +1286,7 @@ impl CompanionAffinityLedger {
                 self.next_window_id += 1;
                 anchor.window_start_ms = at_ms;
                 anchor.window_end_ms = at_ms.saturating_add(window_ms);
+                self.replay_unattributed(at_ms);
             }
             return;
         }
@@ -1175,6 +1309,76 @@ impl CompanionAffinityLedger {
                 last_seen_ms: at_ms,
             },
         );
+        self.replay_unattributed(at_ms);
+    }
+
+    /// Remember a companion sighting that had no window to belong to. Bounded
+    /// by the look-back itself: anything older than one look-back can never be
+    /// claimed, so it is dropped as new sightings arrive.
+    fn park_unattributed(&mut self, at_ms: u64, hostname: &str, in_use: bool) {
+        if self.config.retro_window_ms == 0 {
+            return;
+        }
+        let cutoff = at_ms.saturating_sub(self.config.retro_window_ms);
+        while self
+            .unattributed
+            .front()
+            .is_some_and(|(_, seen_at, _)| *seen_at < cutoff)
+        {
+            self.unattributed.pop_front();
+        }
+        // One sighting per host in the buffer: a page firing fifty requests
+        // must not push everything else out before a window opens.
+        if let Some(slot) = self
+            .unattributed
+            .iter_mut()
+            .find(|(name, _, _)| name == hostname)
+        {
+            slot.1 = at_ms;
+            slot.2 |= in_use;
+            return;
+        }
+        if self.unattributed.len() >= MAX_UNATTRIBUTED {
+            self.unattributed.pop_front();
+        }
+        self.unattributed
+            .push_back((hostname.to_string(), at_ms, in_use));
+    }
+
+    /// A window just opened at `at_ms`: replay the companions seen in the
+    /// look-back before it. Each replayed sighting leaves the buffer — from
+    /// here on it is a tracked candidate and its later sightings arrive
+    /// through the ordinary path.
+    fn replay_unattributed(&mut self, at_ms: u64) {
+        if self.config.retro_window_ms == 0 || self.unattributed.is_empty() {
+            return;
+        }
+        let cutoff = at_ms.saturating_sub(self.config.retro_window_ms);
+        let mut claimed: Vec<(String, u64, bool)> = Vec::new();
+        let mut kept: VecDeque<(String, u64, bool)> = VecDeque::new();
+        for entry in std::mem::take(&mut self.unattributed) {
+            if entry.1 >= cutoff && entry.1 <= at_ms {
+                claimed.push(entry);
+            } else if entry.1 > at_ms {
+                kept.push_back(entry);
+            }
+        }
+        self.unattributed = kept;
+        // Only companions the ledger does not know yet. The look-back exists to
+        // let a first sighting count, not to top up statistics that already
+        // exist: replaying into a tracked candidate moves its attribution and
+        // shifts which anchor owns it (measured on the formula-study trace — a
+        // real CDN lost its offer that way).
+        //
+        // Attributed AT the window's start, not at the sighting's own earlier
+        // timestamp: it belongs to this window, and dating it before the
+        // window would put it straight back outside.
+        for (hostname, _, in_use) in claimed {
+            if self.candidates.contains_key(&hostname) {
+                continue;
+            }
+            self.observe_candidate(at_ms, &hostname, in_use);
+        }
     }
 
     fn observe_candidate(&mut self, at_ms: u64, hostname: &str, in_use: bool) {
@@ -1182,7 +1386,9 @@ impl CompanionAffinityLedger {
             return;
         }
         // An anchor is never its own companion; the caller normally marks
-        // rule hosts as anchors, this is a cheap defensive backstop.
+        // rule hosts as anchors, this is a cheap defensive backstop. An anchor
+        // whose RULE is gone is retired by `retain_anchors`, not from here: a
+        // single observation is too weak a basis for retiring one.
         if self.anchors.contains_key(hostname) {
             return;
         }
@@ -1194,11 +1400,17 @@ impl CompanionAffinityLedger {
         }
         // A candidate seen outside every anchor window carries no signal;
         // not tracking it keeps memory tied to co-activity, not to traffic.
+        //
+        // "Outside" is not the same as "worthless", though: the browser opens
+        // the CDN connection before the one to the page as often as after it.
+        // Park the sighting so the window about to open can claim it, and let
+        // the look-back decide.
         if !self
             .anchors
             .values()
             .any(|a| at_ms <= a.window_end_ms && at_ms >= a.window_start_ms)
         {
+            self.park_unattributed(at_ms, hostname, in_use);
             return;
         }
 
@@ -1248,6 +1460,24 @@ impl CompanionAffinityLedger {
             })
         });
 
+        // Whose page each attributed hit really belonged to. Computed before the
+        // split borrow (it reads `last_document`), and only for endpoint-shaped
+        // names — a page is nobody's sub-resource.
+        let foreign_parent: Vec<(u32, bool)> = if is_document_shaped(hostname) {
+            Vec::new()
+        } else {
+            self.anchors
+                .iter()
+                .filter(|(_, a)| at_ms <= a.window_end_ms && at_ms >= a.window_start_ms)
+                .map(|(anchor_hostname, a)| {
+                    (
+                        a.id,
+                        self.document_disowns(at_ms, anchor_hostname, hostname),
+                    )
+                })
+                .collect()
+        };
+
         // Split borrow: anchors read-only, one candidate mutated.
         let anchors = &self.anchors;
         let Some(candidate) = self.candidates.get_mut(hostname) else {
@@ -1272,6 +1502,12 @@ impl CompanionAffinityLedger {
                         if uncontested {
                             pair.uncontested_hits = pair.uncontested_hits.saturating_add(1);
                         }
+                        if foreign_parent
+                            .iter()
+                            .any(|(id, foreign)| *id == anchor.id && *foreign)
+                        {
+                            pair.foreign_parent_hits = pair.foreign_parent_hits.saturating_add(1);
+                        }
                     }
                     // Count each window at most once regardless of hit volume.
                     if pair.last_window_id != anchor.window_id {
@@ -1281,12 +1517,16 @@ impl CompanionAffinityLedger {
                     }
                 }
                 None => {
+                    let foreign = foreign_parent
+                        .iter()
+                        .any(|(id, foreign)| *id == anchor.id && *foreign);
                     candidate.pairs.push(PairStats {
                         anchor_id: anchor.id,
                         distinct_windows: 1,
                         last_window_id: anchor.window_id,
                         nearest_hits: u32::from(is_nearest),
                         uncontested_hits: u32::from(is_nearest && uncontested),
+                        foreign_parent_hits: u32::from(is_nearest && foreign),
                     });
                     candidate.total_windows = candidate.total_windows.saturating_add(1);
                 }
@@ -1300,6 +1540,42 @@ impl CompanionAffinityLedger {
     /// candidate `total_windows` deliberately keeps the historical
     /// contribution (see [`CandidateState::total_windows`]). Never panics —
     /// on an empty map it is a no-op.
+    /// Retire every anchor the predicate no longer recognises as a rule host,
+    /// and with it the evidence gathered underneath — that evidence said
+    /// "companion of a ROUTED site", and the site is not routed any more.
+    ///
+    /// Why this exists: an anchor used to be immortal. A user who DELETED a
+    /// rule left its hostname registered as an anchor for the rest of the
+    /// session, and `observe_candidate` refuses to track a host that is an
+    /// anchor — so the very hosts someone removes in order to be offered them
+    /// again were the ones that could never be proposed. Called from the
+    /// proposal tick, which already holds the live rule book.
+    ///
+    /// Returns how many anchors were retired.
+    pub fn retain_anchors<F>(&mut self, is_still_a_rule_host: F) -> usize
+    where
+        F: Fn(&str) -> bool,
+    {
+        let retired: Vec<(String, u32)> = self
+            .anchors
+            .iter()
+            .filter(|(name, _)| !is_still_a_rule_host(name))
+            .map(|(name, state)| (name.clone(), state.id))
+            .collect();
+        for (name, id) in &retired {
+            self.anchors.remove(name);
+            for candidate in self.candidates.values_mut() {
+                candidate.pairs.retain(|p| p.anchor_id != *id);
+            }
+        }
+        if !retired.is_empty() {
+            // A candidate left with no pairs describes nothing; new sightings
+            // rebuild it from scratch if it turns up again.
+            self.candidates.retain(|_, c| !c.pairs.is_empty());
+        }
+        retired.len()
+    }
+
     fn evict_least_recent_anchor(&mut self) {
         let victim = self
             .anchors
@@ -1348,7 +1624,42 @@ impl CompanionAffinityLedger {
         affinity: f64,
     ) -> Option<CompanionSignal> {
         if is_brand_related(anchor_hostname, candidate_hostname) {
-            return Some(CompanionSignal::BrandRelated);
+            // Brand relation states ownership, not need. An operator's
+            // advertising and telemetry domains carry the brand exactly as
+            // plainly as the asset host a page cannot render without
+            // (`googlesyndication.com` beside `googleusercontent.com` under
+            // `notebooklm.google.com`), so the shared name opens the tier and
+            // evidence decides it — one sighting is not a relationship.
+            //
+            // Ownership is measured with `nearest_share`, not `affinity`:
+            // affinity divides by how many OTHER anchors pulled the same
+            // candidate, and a brand's shared asset host is pulled by all of
+            // them by design — the threshold would drop precisely the companion
+            // worth proposing.
+            // Exclusivity is the evidence that separates them, and `affinity`
+            // measures exactly that: the share of all the windows this candidate
+            // was ever seen in that belong to THIS anchor. A site's own hosts
+            // ride along with that site; an operator's advertising, telemetry
+            // and shared asset domains ride along with everything, which is what
+            // drops them to affinities in the thousandths.
+            if affinity >= self.config.brand_min_affinity {
+                return Some(CompanionSignal::BrandRelated);
+            }
+            // Not proven as kin — fall through to the tiers below, which judge
+            // it on temporal evidence like any other name.
+        }
+        // Sub-resource, not neighbour in time. Both tiers below rest on temporal
+        // attribution, and that attribution is only as good as the assumption
+        // that the anchor is the page doing the fetching. When most of the hits
+        // this anchor claims happened while somebody else's page was loading,
+        // the assumption is false — this is how a rule host in one tab collects
+        // another site's CDN (`ypncdn.com` under `www.google.ru`,
+        // `cdninstagram.com` under `cdn.openai.com`). Brand relation above is
+        // exempt: a shared name states ownership regardless of timing.
+        let mostly_someone_elses =
+            pair.foreign_parent_hits > 0 && pair.foreign_parent_hits * 2 > pair.nearest_hits.max(1);
+        if mostly_someone_elses {
+            return None;
         }
         if is_delivery_named(candidate_hostname) {
             let nearest_share =
@@ -1963,7 +2274,7 @@ mod tests {
     // ── Tier 1: brand relation ───────────────────────────────────────────────
 
     #[test]
-    fn a_brand_related_companion_is_proposed_from_the_very_first_window() {
+    fn a_brand_related_companion_is_proposed_once_the_relation_repeats() {
         // A brand-related subdomain generalizes to its domain; a candidate that
         // IS the domain has no subdomain to generalize from and stays exact.
         for (anchor, candidate, expected) in [
@@ -1972,15 +2283,34 @@ mod tests {
             ("tiktok.com", "tiktokv.com", "tiktokv.com"),
         ] {
             let mut ledger = defaults();
-            page_load(&mut ledger, 0, anchor, SECONDARY, &[candidate]);
+            two_visits(&mut ledger, anchor, &[candidate]);
 
-            let proposals = ledger.proposals(10_000, &NoExclusions);
+            let proposals = ledger.proposals(150_000, &NoExclusions);
             assert_eq!(proposals.len(), 1, "{candidate} should be proposed");
             assert_eq!(proposals[0].proposed.value(), expected);
             assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
-            // Shared branding needs no temporal support at all.
-            assert_eq!(proposals[0].distinct_windows, 1);
+            assert_eq!(proposals[0].distinct_windows, 2);
         }
+    }
+
+    #[test]
+    fn a_brand_related_name_that_rides_along_with_everything_is_not_proposed() {
+        // The operator's advertising and asset domains carry the brand as
+        // plainly as the host a page cannot render without. What separates them
+        // is that they accompany every site, not this one.
+        let mut ledger = defaults();
+        // Every site of the same operator pulls it once; none of them owns it.
+        for i in 0..20_u64 {
+            page_load(
+                &mut ledger,
+                i * 100_000,
+                &format!("site-{i}.google.com"),
+                SECONDARY,
+                &["googlesyndication.com"],
+            );
+        }
+
+        assert!(ledger.proposals(2_000_000, &NoExclusions).is_empty());
     }
 
     #[test]
@@ -2008,9 +2338,9 @@ mod tests {
             ("example.com", "assets.example-cdn.net"),
         ] {
             let mut ledger = defaults();
-            page_load(&mut ledger, 0, anchor, SECONDARY, &[candidate]);
+            two_visits(&mut ledger, anchor, &[candidate]);
 
-            let proposals = ledger.proposals(10_000, &NoExclusions);
+            let proposals = ledger.proposals(150_000, &NoExclusions);
             assert_eq!(proposals.len(), 1, "{candidate} should be proposed");
             assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
         }
@@ -2083,15 +2413,13 @@ mod tests {
     fn a_brand_in_the_registrable_domain_is_still_a_relation() {
         // The shape the rule must keep: the brand is in the apex itself.
         let mut ledger = defaults();
-        page_load(
+        two_visits(
             &mut ledger,
-            0,
             "user-images.githubusercontent.com",
-            SECONDARY,
             &["github.com"],
         );
 
-        let proposals = ledger.proposals(10_000, &NoExclusions);
+        let proposals = ledger.proposals(150_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
     }
@@ -2153,6 +2481,96 @@ mod tests {
         ledger.observe(4_000, "img.edgefarm.net", CoActivityKind::Candidate);
 
         assert!(ledger.proposals(10_000, &NoExclusions).is_empty());
+    }
+
+    /// The defect this criterion exists for, four times reported: the user
+    /// searches on a rule host, follows a link to an unrelated site, and that
+    /// site's CDN is offered under the rule host — `ypncdn.com` under
+    /// `www.google.ru`, `cdninstagram.com` under `cdn.openai.com`.
+    #[test]
+    fn a_cdn_fetched_by_another_sites_page_is_not_offered_under_the_open_anchor() {
+        let mut ledger = defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        for start in [0_u64, 100_000] {
+            // The rule host is the page the user came from, and stays open.
+            ledger.observe(start, "search.test", anchor);
+            // Then they navigate to a site of their own, which fetches its CDN.
+            ledger.observe(start + 1_000, "elsewhere.test", CoActivityKind::Candidate);
+            ledger.observe(
+                start + 2_000,
+                "img.cdn-elsewhere.test",
+                CoActivityKind::CandidateInUse,
+            );
+        }
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        let offered: Vec<&str> = proposals.iter().map(|p| p.proposed.value()).collect();
+        assert!(
+            !offered.iter().any(|v| v.contains("cdn-elsewhere")),
+            "the CDN belongs to the page that fetched it, not to the open anchor: {offered:?}"
+        );
+    }
+
+    /// The other half of the same criterion: an anchor's OWN delivery endpoint
+    /// must still be offered, including when the user has been elsewhere in the
+    /// same window — otherwise the fix would silence the suggestions the product
+    /// exists to make.
+    #[test]
+    fn a_cdn_fetched_by_the_anchors_own_page_is_still_offered() {
+        let mut ledger = defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        for start in [0_u64, 100_000] {
+            ledger.observe(start, "elsewhere.test", CoActivityKind::Candidate);
+            // Back on the anchor's page; what follows is its own fetch.
+            ledger.observe(start + 1_000, "site.test", anchor);
+            ledger.observe(
+                start + 2_000,
+                "img.cdn-site.test",
+                CoActivityKind::CandidateInUse,
+            );
+        }
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            proposals.iter().any(
+                |p| p.anchor_hostname == "site.test" && p.proposed.value().contains("cdn-site")
+            ),
+            "the anchor's own delivery endpoint must survive the criterion: {:?}",
+            proposals
+                .iter()
+                .map(|p| (p.anchor_hostname.as_str(), p.proposed.value()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Shared branding outranks the page context: `static.whatsapp.net` is
+    /// WhatsApp's whoever's page happened to be loading.
+    #[test]
+    fn brand_relation_is_not_overruled_by_the_page_context() {
+        let mut ledger = defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        for start in [0_u64, 100_000] {
+            ledger.observe(start, "web.whatsapp.com", anchor);
+            ledger.observe(start + 1_000, "elsewhere.test", CoActivityKind::Candidate);
+            ledger.observe(
+                start + 2_000,
+                "static.whatsapp.net",
+                CoActivityKind::Candidate,
+            );
+        }
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            proposals
+                .iter()
+                .any(|p| p.signal == CompanionSignal::BrandRelated
+                    && p.proposed.value().contains("whatsapp.net")),
+            "a brand match states ownership and needs no page context: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.value())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2856,9 +3274,9 @@ mod tests {
         // `*.site.com`, on one window's evidence — this is the shape behind
         // any two same-domain subdomains reached via trivial brand equality
         // in the companion-affinity trace study.
-        page_load(&mut ledger, 0, "www.site.com", SECONDARY, &["rt.site.com"]);
+        two_visits(&mut ledger, "www.site.com", &["rt.site.com"]);
 
-        let proposals = ledger.proposals(10_000, &NoExclusions);
+        let proposals = ledger.proposals(150_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
         assert_eq!(
@@ -2932,6 +3350,140 @@ mod tests {
         assert_eq!(registrable_domain("localhost"), None);
         // Case-insensitive suffix table match.
         assert_eq!(registrable_domain("www.foo.CO.UK"), Some("foo.CO.UK"));
+    }
+
+    // ── A rule the user deleted ──────────────────────────────────────────────
+
+    #[test]
+    fn a_host_that_stopped_being_a_rule_can_become_a_companion() {
+        // The exact gesture a user makes to test the feature: delete the CDN
+        // rules, reload the site, expect them offered back.
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        ledger.observe(
+            0,
+            "cdn.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+        ledger.observe(
+            10,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+        assert!(!ledger.is_tracking_candidate("cdn.example"));
+
+        // The user deletes the CDN rule; the next tick tells the ledger which
+        // hostnames the rule book still calls rule hosts.
+        assert_eq!(ledger.retain_anchors(|host| host == "site.example"), 1);
+
+        ledger.observe(
+            100_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+        ledger.observe(100_100, "cdn.example", CoActivityKind::Candidate);
+
+        assert!(
+            ledger.is_tracking_candidate("cdn.example"),
+            "a deleted rule must stop being an anchor, or it can never be proposed again"
+        );
+    }
+
+    #[test]
+    fn retiring_an_anchor_drops_the_evidence_gathered_under_it() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        page_load(&mut ledger, 0, "site.example", SECONDARY, &["cdn.example"]);
+        assert!(ledger.is_tracking_candidate("cdn.example"));
+
+        ledger.retain_anchors(|_| false);
+
+        assert_eq!(ledger.anchor_count(), 0);
+        assert!(
+            !ledger.is_tracking_candidate("cdn.example"),
+            "evidence about a companion of a site that is no longer routed says nothing"
+        );
+    }
+
+    #[test]
+    fn retaining_every_anchor_changes_nothing() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        page_load(&mut ledger, 0, "site.example", SECONDARY, &["cdn.example"]);
+
+        assert_eq!(ledger.retain_anchors(|_| true), 0);
+        assert_eq!(ledger.anchor_count(), 1);
+        assert!(ledger.is_tracking_candidate("cdn.example"));
+    }
+
+    // ── Look-back on an opening window ───────────────────────────────────────
+
+    #[test]
+    fn a_companion_seen_just_before_the_page_is_still_attributed_to_it() {
+        // The order a browser actually uses often enough: the CDN connection
+        // opens a second ahead of the one to the page.
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        ledger.observe(1_000, "static.cdn.example", CoActivityKind::Candidate);
+        ledger.observe(
+            2_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+
+        assert!(
+            ledger.is_tracking_candidate("static.cdn.example"),
+            "a sighting one second before the anchor must not be thrown away"
+        );
+    }
+
+    #[test]
+    fn a_companion_seen_long_before_the_page_is_not_claimed_by_it() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        ledger.observe(0, "unrelated.cdn.example", CoActivityKind::Candidate);
+        ledger.observe(
+            DEFAULT_RETRO_WINDOW_MS + 5_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+
+        assert!(
+            !ledger.is_tracking_candidate("unrelated.cdn.example"),
+            "the look-back must not reach into earlier browsing"
+        );
+    }
+
+    #[test]
+    fn the_look_back_can_be_switched_off() {
+        let mut ledger = CompanionAffinityLedger::new(CompanionAffinityConfig {
+            retro_window_ms: 0,
+            ..CompanionAffinityConfig::default()
+        });
+        ledger.observe(1_000, "static.cdn.example", CoActivityKind::Candidate);
+        ledger.observe(
+            2_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+
+        assert!(!ledger.is_tracking_candidate("static.cdn.example"));
+    }
+
+    #[test]
+    fn a_replayed_companion_counts_once_however_many_times_it_was_seen() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        for at in [500_u64, 700, 900, 1_100] {
+            ledger.observe(at, "static.cdn.example", CoActivityKind::Candidate);
+        }
+        ledger.observe(
+            2_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+        // A second window must not re-claim what the first one already took.
+        ledger.observe(
+            120_000,
+            "site.example",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+
+        assert_eq!(ledger.candidate_count(), 1);
     }
 
     // ── Bounds and eviction ──────────────────────────────────────────────────
@@ -3075,30 +3627,26 @@ mod tests {
     #[test]
     fn a_stronger_signal_outranks_a_higher_affinity() {
         let mut ledger = defaults();
+        for start in [0_u64, 100_000, 200_000, 300_000] {
+            page_load(
+                &mut ledger,
+                start,
+                "web.whatsapp.com",
+                SECONDARY,
+                &["helper.other", "crashlogs.whatsapp.net"],
+            );
+        }
+        // A second site pulls the brand-related host too, diluting its affinity
+        // below the plain co-activity companion's.
         page_load(
             &mut ledger,
-            0,
-            "web.whatsapp.com",
-            SECONDARY,
-            &["helper.other", "crashlogs.whatsapp.net"],
-        );
-        page_load(
-            &mut ledger,
-            100_000,
-            "web.whatsapp.com",
-            SECONDARY,
-            &["helper.other"],
-        );
-        // Dilutes the brand-related host down to affinity 0.5.
-        page_load(
-            &mut ledger,
-            200_000,
+            400_000,
             "b.test",
             SECONDARY,
             &["crashlogs.whatsapp.net"],
         );
 
-        let proposals = ledger.proposals(250_000, &NoExclusions);
+        let proposals = ledger.proposals(450_000, &NoExclusions);
         let shape: Vec<(&str, CompanionSignal)> = proposals
             .iter()
             .map(|p| (p.proposed.value(), p.signal))

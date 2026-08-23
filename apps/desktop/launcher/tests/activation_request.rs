@@ -120,3 +120,37 @@ fn action_and_reason_are_omitted_when_unset() {
     assert!(object.get("action").is_none());
     assert!(object.get("reason").is_none());
 }
+
+/// The cold-start counterpart: with no window running there is no activation
+/// file to hand the intent to, so it has to reach QML through the context.
+#[test]
+fn cold_start_context_carries_the_launch_action() {
+    let mut request = make_request(Some(AppSection::Rules), false, false);
+    request.action = Some("rules-drift-compare".to_string());
+
+    let shell = nrr_shared::gui_shell_v1();
+    let preferences = nrr_ui_support::ui_preferences::UiPreferences::default();
+    let first_run = nrr_ui_support::first_run::first_run_flow_snapshot(&shell, true, None);
+    let backend = nrr_application::backend_facade::MockBackendFacade;
+    let status = nrr_application::backend_facade::BackendConnectionStatus::Connected;
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("context.json");
+    nrr_desktop_gui::ui_surface::write_qt_context_file_at(
+        &path,
+        &shell,
+        AppSection::Rules,
+        ActivationSource::Tray,
+        preferences,
+        &first_run,
+        &request,
+        &backend,
+        &status,
+    )
+    .expect("write context");
+
+    let raw = fs::read_to_string(&path).expect("read context");
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("parse context");
+    assert_eq!(json["launchAction"], "rules-drift-compare");
+    assert_eq!(json["entrySection"], "rules");
+}

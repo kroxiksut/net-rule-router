@@ -43,11 +43,10 @@ existing connections traffic leaves through. Tracker blocking, ad filtering,
 traffic obfuscation and anonymity are out of scope — not because they are bad
 ideas, but because they are a different product.
 
-**Some things are Pro-only by design.** Multiple saved profiles, three or more
-routes at once, automated switching and richer rule types are planned for a
-paid tier. The free tier stays one active configuration per user. A patch that
-moves a Pro capability into the free tier cannot be merged, so please ask before
-writing one.
+**The scope is deliberately narrow.** Multiple saved profiles, three or more
+routes at once, automated switching and richer rule types are out of scope: the
+product keeps one active configuration per user. A patch that widens that scope
+cannot be merged, so please ask before writing one.
 
 ## Building
 

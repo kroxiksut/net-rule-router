@@ -91,15 +91,32 @@ impl VpnDiscoveryPort for NoopVpnDiscovery {
     }
 }
 
-/// Distinctive case-insensitive keywords that identify a VPN client by its
-/// executable name OR its installed-program display name. Deliberately
-/// curated to be distinctive (a bare `"warp"`/`"hola"` would false-positive
-/// on unrelated apps) — the user confirms anyway, so a near miss just means
-/// they add it manually, while a false positive is one extra row to ignore.
+/// Which market a matched VPN client belongs to. A corporate client
+/// installed by an employer is normally not the user's personal tunnel, so
+/// callers that react to a personal VPN coming up (e.g. the tray's
+/// unassigned-route reminder) must not fire for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VpnClientClass {
+    Consumer,
+    Corporate,
+}
+
+/// Distinctive case-insensitive keywords for personal/retail VPN clients —
+/// matched by [`vpn_client_class`] against an exe basename or an
+/// installed-program display name. Deliberately curated to be distinctive (a
+/// bare `"warp"`/`"hola"` would false-positive on unrelated apps) — the user
+/// confirms anyway, so a near miss just means they add it manually, while a
+/// false positive is one extra row to ignore.
 ///
-/// Neutral POLICY DATA (matched by [`looks_like_vpn`]); the OS mechanism only
-/// supplies the strings to test.
-pub const VPN_NAME_KEYWORDS: &[&str] = &[
+/// Protocol-named clients (`wireguard`, `openvpn`, `softether`,
+/// `shadowsocks`, `sing-box`, bare `vpn`, `warp`) are classed consumer even
+/// though corporate deployments exist: the name states the protocol, not the
+/// vendor, and the two misclassifications are not symmetric — a wrong
+/// reminder is one notice dismissed, a missing one leaves the user testing
+/// against an unassigned route for an hour.
+///
+/// Neutral POLICY DATA; the OS mechanism only supplies the strings to test.
+pub const VPN_CONSUMER_KEYWORDS: &[&str] = &[
     "vpn",
     "openvpn",
     "wireguard",
@@ -117,11 +134,7 @@ pub const VPN_NAME_KEYWORDS: &[&str] = &[
     "outline",
     "cloudflare warp",
     "warp-svc",
-    "tailscale",
-    "zerotier",
     "softether",
-    "openconnect",
-    "anyconnect",
     "psiphon",
     "shadowsocks",
     "sing-box",
@@ -136,17 +149,21 @@ pub const VPN_NAME_KEYWORDS: &[&str] = &[
     "ivacy",
     "torguard",
     "secureline", // Avast/AVG SecureLine
-    "netbird",
     "perfect privacy",
     "betternet",
     "speedify",
     "browsec",
     "zenmate",
-    // Corporate / enterprise clients. Tokens chosen to match the
-    // real DisplayName / exe basename without colliding with non-VPN software:
-    // "check point" (spaced, unlike the ML "checkpoint"); "pulse secure" (not
-    // bare "pulse"); "bigip" (F5 BIG-IP Edge). "citrix" is intentionally NOT
-    // added — Citrix Workspace is overwhelmingly VDI, not VPN.
+];
+
+/// Distinctive case-insensitive keywords for corporate/enterprise VPN and
+/// zero-trust clients — see [`VPN_CONSUMER_KEYWORDS`] for the matching rules
+/// this list shares. Tokens chosen to match the real DisplayName / exe
+/// basename without colliding with non-VPN software: "check point" (spaced,
+/// unlike the ML "checkpoint"); "pulse secure" (not bare "pulse"); "bigip"
+/// (F5 BIG-IP Edge). Neither `"array"` nor `"citrix"` is added — both are too
+/// collision-prone (Citrix Workspace is overwhelmingly VDI, not VPN).
+pub const VPN_CORPORATE_KEYWORDS: &[&str] = &[
     "globalprotect", // Palo Alto
     "forticlient",   // Fortinet
     "zscaler",
@@ -158,6 +175,28 @@ pub const VPN_NAME_KEYWORDS: &[&str] = &[
     "twingate",
     "barracuda",
     "bigip", // F5 BIG-IP Edge Client
+    "anyconnect",
+    "openconnect",
+    "netbird",
+    "tailscale",
+    "zerotier",
+    "cisco secure client",
+    "mobile connect",
+    "netskope",
+    "cato",
+    "prisma access",
+    "perimeter 81",
+    "secoclient",
+    "easyconnect",
+    "inode",
+    "rutoken",
+    "рутокен",
+    "ngate",
+    "застава",
+    "zastava",
+    "dionis",
+    "usergate",
+    "ideco",
     // Russian/CIS enterprise clients (the project's primary
     // audience). "vipnet" (InfoTeCS ViPNet Client/Coordinator) and "s-terra"
     // (S-Terra Gate/Client) are distinctive Latin product names; "континент"
@@ -167,14 +206,31 @@ pub const VPN_NAME_KEYWORDS: &[&str] = &[
     "s-terra",
 ];
 
-/// True when `text` (an exe basename or a program display name) contains any
-/// [`VPN_NAME_KEYWORDS`] entry, case-insensitively. Empty/whitespace → false.
-pub fn looks_like_vpn(text: &str) -> bool {
-    let lower = text.trim().to_ascii_lowercase();
+/// Classify `text` (an exe basename or a program display name) as a VPN
+/// client, or `None` if nothing matches. Corporate wins when both a
+/// corporate and a consumer token match (e.g. "FortiClient VPN.exe" contains
+/// both `forticlient` and `vpn`) — the corporate classification is the more
+/// consequential one to get right. `to_lowercase()`, not
+/// `to_ascii_lowercase()`, because several corporate tokens are Cyrillic and
+/// ASCII-lowering leaves Cyrillic letters untouched. Empty/whitespace → None.
+pub fn vpn_client_class(text: &str) -> Option<VpnClientClass> {
+    let lower = text.trim().to_lowercase();
     if lower.is_empty() {
-        return false;
+        return None;
     }
-    VPN_NAME_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    if VPN_CORPORATE_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return Some(VpnClientClass::Corporate);
+    }
+    if VPN_CONSUMER_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return Some(VpnClientClass::Consumer);
+    }
+    None
+}
+
+/// True when `text` looks like any VPN client, personal or corporate. See
+/// [`vpn_client_class`] for the market breakdown.
+pub fn looks_like_vpn(text: &str) -> bool {
+    vpn_client_class(text).is_some()
 }
 
 /// Merge candidates from several sources into a stable, deduplicated list.
@@ -268,6 +324,53 @@ mod tests {
         assert!(!looks_like_vpn("svchost.exe"));
         assert!(!looks_like_vpn(""));
         assert!(!looks_like_vpn("   "));
+    }
+
+    #[test]
+    fn corporate_wins_over_consumer_token() {
+        assert_eq!(
+            vpn_client_class("FortiClient VPN.exe"),
+            Some(VpnClientClass::Corporate)
+        );
+    }
+
+    #[test]
+    fn consumer_clients_classify_as_consumer() {
+        assert_eq!(
+            vpn_client_class("hidemy.name VPN 3.0.exe"),
+            Some(VpnClientClass::Consumer)
+        );
+        assert_eq!(
+            vpn_client_class("WireGuard.exe"),
+            Some(VpnClientClass::Consumer)
+        );
+    }
+
+    #[test]
+    fn cyrillic_corporate_token_matches_with_full_lowercasing() {
+        assert_eq!(
+            vpn_client_class("Рутокен VPN.exe"),
+            Some(VpnClientClass::Corporate)
+        );
+    }
+
+    #[test]
+    fn unrelated_app_has_no_class() {
+        assert_eq!(vpn_client_class("notepad.exe"), None);
+    }
+
+    #[test]
+    fn keyword_lists_are_lowercase_nonempty_and_disjoint() {
+        for kw in VPN_CONSUMER_KEYWORDS.iter().chain(VPN_CORPORATE_KEYWORDS) {
+            assert!(!kw.is_empty(), "keyword must not be empty");
+            assert_eq!(*kw, kw.to_lowercase(), "keyword must be lowercase: {kw}");
+        }
+        for kw in VPN_CONSUMER_KEYWORDS {
+            assert!(
+                !VPN_CORPORATE_KEYWORDS.contains(kw),
+                "keyword in both lists makes classification order-dependent: {kw}"
+            );
+        }
     }
 
     #[test]

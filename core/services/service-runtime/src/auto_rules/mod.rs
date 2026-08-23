@@ -66,7 +66,7 @@ use nrr_storage::auto_rule_pending::AutoRulePendingRecord;
 use nrr_storage::auto_rules::AutoRulesMode;
 use sha2::{Digest, Sha256};
 
-use crate::dns_observation_consumer::rule_set_matches;
+use crate::dns_observation_consumer::{rule_set_match_origin, rule_set_matches};
 use crate::ipc_handlers::event_bus::EventBus;
 use crate::per_sid_orchestrator::RulesProvider;
 
@@ -147,6 +147,17 @@ pub type AutoRulesModeFn = Arc<dyn Fn(&str) -> AutoRulesMode + Send + Sync>;
 /// source and same reason for being a closure as [`AutoRulesModeFn`]. Unwired
 /// means "not opted in", which is also the stored default.
 pub type AutoRulesEagerDeliveryFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Reads the sites a principal marked as answering the MAIN link with a
+/// refusal. Their companions must never be quietened by "it answers on the main
+/// route" — answering is exactly what a refusal does. A closure over the state
+/// DB at the composition root.
+pub type RefusingAnchorsFn = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
+/// Reads whether a principal's additional route resolves to a usable adapter
+/// right now. A closure over the route coordinator at the composition root, so
+/// this module never learns what an adapter binding is.
+pub type SecondaryReadyFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// What one principal configured for companion discovery, read together and
 /// memoised together because they are one row and are consulted on the same
@@ -350,6 +361,15 @@ impl LedgerBatch<'_> {
 
 /// Owns the per-principal ledgers, the pending suggestions, and the decision of
 /// what to do with a finding.
+/// Companions the last tick decided not to offer, because the site pulling
+/// them already travels the route they would be sent to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuietNote {
+    pub inert: u64,
+    /// A few of the dropped names, capped where they are collected.
+    pub sample: Vec<String>,
+}
+
 pub struct AutoRulesEngine {
     ledgers: Mutex<HashMap<String, SidLedger>>,
     pending: Mutex<HashMap<String, Vec<PendingCandidate>>>,
@@ -361,6 +381,11 @@ pub struct AutoRulesEngine {
     /// deletes stops silencing its own host.
     authored: Mutex<HashMap<String, HashMap<String, Instant>>>,
     publish_state: Mutex<HashMap<String, PublishState>>,
+    /// Why the last tick had nothing to offer: how many companions were
+    /// dropped as inert and a few of their names. Read by the suggestions
+    /// screen, which otherwise shows an empty list and no reason for it —
+    /// "why does it say nothing about this site" was asked of every quiet run.
+    quiet_note: Mutex<HashMap<String, QuietNote>>,
     settings_memo: Mutex<HashMap<String, (PrincipalSettings, Instant)>>,
     mode_for: AutoRulesModeFn,
     /// `None` means the composition root wired no source, so nobody is opted in.
@@ -379,6 +404,13 @@ pub struct AutoRulesEngine {
     /// Gate for [`Self::note_isp_blocked_host`]. Off by default. `Arc` so
     /// production can share it live with the settings writer; tests get a private one.
     isp_block_candidates_enabled: Arc<AtomicBool>,
+    /// Is this principal's additional route usable right now? `None` (tests,
+    /// degraded boot) means "assume yes", which is the behaviour that existed
+    /// before the gate. See the check in [`Self::announce_pending`].
+    secondary_ready: Option<SecondaryReadyFn>,
+    /// Sites the user says refuse main-link addresses (see
+    /// [`RefusingAnchorsFn`]). `None` behaves as "none marked".
+    refusing_anchors: Option<RefusingAnchorsFn>,
     /// Durable mirror of the ledgers. A proposal needs two windows, and a
     /// restart used to reset the count to zero — a machine that restarts a few
     /// times a day therefore never reached the second one. `None` (no state DB)
@@ -407,6 +439,7 @@ impl AutoRulesEngine {
             dismissed: Mutex::new(HashMap::new()),
             authored: Mutex::new(HashMap::new()),
             publish_state: Mutex::new(HashMap::new()),
+            quiet_note: Mutex::new(HashMap::new()),
             settings_memo: Mutex::new(HashMap::new()),
             mode_for,
             eager_delivery_for: None,
@@ -416,6 +449,8 @@ impl AutoRulesEngine {
             author: OnceLock::new(),
             events: None,
             isp_block_candidates_enabled: Arc::new(AtomicBool::new(false)),
+            secondary_ready: None,
+            refusing_anchors: None,
             evidence_store: None,
             evidence_saved_at: Mutex::new(HashMap::new()),
         }
@@ -518,6 +553,23 @@ impl AutoRulesEngine {
         self
     }
 
+    /// Wire the "which sites refuse main-link addresses" question, so their
+    /// companions keep being offered even when the address answers.
+    #[must_use]
+    pub fn with_refusing_anchors(mut self, refusing: RefusingAnchorsFn) -> Self {
+        self.refusing_anchors = Some(refusing);
+        self
+    }
+
+    /// Wire the "is the additional route usable" question, so suggestions are
+    /// held back while it is down instead of being offered against a problem
+    /// the user does not currently have.
+    #[must_use]
+    pub fn with_secondary_ready(mut self, ready: SecondaryReadyFn) -> Self {
+        self.secondary_ready = Some(ready);
+        self
+    }
+
     // ── Observation feed ─────────────────────────────────────────────────────
 
     /// Opens an observation batch for `sid`, or returns `None` when this
@@ -596,8 +648,8 @@ impl AutoRulesEngine {
             return;
         };
         let kind = Self::classify(
-            rule_set_matches(hostname, &snapshot.rule_book.primary),
-            rule_set_matches(hostname, &snapshot.rule_book.secondary),
+            rule_set_match_origin(hostname, &snapshot.rule_book.primary).user_authored,
+            rule_set_match_origin(hostname, &snapshot.rule_book.secondary).user_authored,
         );
         let Some(mut batch) = self.begin_batch(sid) else {
             return;
@@ -688,6 +740,7 @@ impl AutoRulesEngine {
                 consumers: Vec::new(),
                 consumers_changed_unix_ms: 0,
                 primary_behavior: String::new(),
+                anchor_refuses_main_link: false,
             },
             route: RouteRole::Secondary,
             match_kind: AuthoredMatchKind::SuffixDomain,
@@ -699,12 +752,13 @@ impl AutoRulesEngine {
         true
     }
 
-    /// Classifies one observed hostname for the ledger: a hostname covered by an
-    /// active rule anchors its own route, everything else is a candidate.
+    /// Classifies one observed hostname for the ledger: a hostname covered by a
+    /// rule the USER wrote anchors its own route, everything else is a candidate.
     ///
     /// Takes the match results the caller already computed — the DNS consumer
     /// tests both rule sets to decide whether to cache the resolution, so
-    /// learning rides along at zero additional matching cost.
+    /// learning rides along at zero additional matching cost. Auto-added rules
+    /// are deliberately not anchors: see `rule_set_match_origin`.
     pub fn classify(in_primary: bool, in_secondary: bool) -> CoActivityKind {
         if in_secondary {
             CoActivityKind::Anchor {
@@ -750,11 +804,31 @@ impl AutoRulesEngine {
             book: &snapshot.rule_book,
         };
         let proposals: Vec<CompanionProposal> = {
-            let ledgers = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
-            ledgers
-                .get(sid)
-                .map(|l| l.ledger.proposals(now_ms.max(0) as u64, &exclusions))
-                .unwrap_or_default()
+            let mut ledgers = self.ledgers.lock().unwrap_or_else(|p| p.into_inner());
+            match ledgers.get_mut(sid) {
+                Some(l) => {
+                    // Retire anchors whose rule is gone before reading the
+                    // ledger. An anchor was immortal until now, so a rule the
+                    // user DELETED went on blocking its own hostname from ever
+                    // being suggested back — the exact thing someone does when
+                    // they want to see the suggestion.
+                    let retired = l.ledger.retain_anchors(|host| {
+                        rule_set_match_origin(host, &snapshot.rule_book.primary).user_authored
+                            || rule_set_match_origin(host, &snapshot.rule_book.secondary)
+                                .user_authored
+                    });
+                    if retired > 0 {
+                        tracing::debug!(
+                            target: "nrr::auto-rules",
+                            sid = %sid,
+                            retired,
+                            "hosts that are no longer rules stopped counting as sites to learn around",
+                        );
+                    }
+                    l.ledger.proposals(now_ms.max(0) as u64, &exclusions)
+                }
+                None => Vec::new(),
+            }
         };
         if proposals.is_empty() {
             summary.pending = self.pending_count(sid);
@@ -830,6 +904,20 @@ impl AutoRulesEngine {
             })
             .collect();
         fresh.sort_by(|a, b| a.dto.id.cmp(&b.dto.id));
+        {
+            let mut notes = self.quiet_note.lock().unwrap_or_else(|p| p.into_inner());
+            if inert > 0 {
+                notes.insert(
+                    sid.to_string(),
+                    QuietNote {
+                        inert: inert as u64,
+                        sample: inert_names.clone(),
+                    },
+                );
+            } else {
+                notes.remove(sid);
+            }
+        }
         if inert > 0 {
             tracing::debug!(
                 target: "nrr::auto-rules",
@@ -894,22 +982,59 @@ impl AutoRulesEngine {
         if offered.is_empty() {
             return false;
         }
+        // With the additional link down there is no half-loaded page to fix:
+        // everything, routed or not, is already going out the main link and
+        // working. Offering to "add these to the additional route" then states
+        // a problem the user does not have. Learning continues — what is found
+        // while the tunnel is off is offered once it comes back.
+        if self
+            .secondary_ready
+            .as_ref()
+            .is_some_and(|ready| !ready(sid))
+        {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                sid = %sid,
+                pending = offered.len(),
+                "suggestions held until the additional route is up",
+            );
+            return false;
+        }
         // The count stays whole — the list the user opens holds every offer.
         let pending = offered.len() as u64;
-        // A host that already answers over the main route earns no popup: the
-        // offer reads "move this into the tunnel", and it plainly works without
-        // one. It keeps its place in the list, and a later stall re-opens the
-        // question on its own, because the verdict is recomputed every tick.
-        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) = offered
-            .into_iter()
-            .partition(|c| c.dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS);
+        // "Answers on the main route" silences the WEAKEST tier only.
+        //
+        // It is not proof the address is unwanted: a site can complete the
+        // connection and serve a refusal — ChatGPT answers the main link with
+        // "this address is not served" — so an address belonging to the routed
+        // site itself (brand-related, or its own delivery name) still opens the
+        // question. What it does settle is the co-activity tier, whose members
+        // are third-party names that merely load nearby: an advertising or
+        // telemetry endpoint that works fine without the tunnel is exactly the
+        // noise this gate exists for. Held-back rows keep their place in the
+        // list, and a later stall re-opens the question — the verdict is
+        // recomputed every tick.
+        // A site the user marked as refusing main-link addresses is the one case
+        // where "it answers" says nothing: answering with a refusal is still
+        // answering. Its companions keep their popup.
+        let refusing: Vec<String> = self
+            .refusing_anchors
+            .as_ref()
+            .map(|read| read(sid))
+            .unwrap_or_default();
+        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
+            offered.into_iter().partition(|c| {
+                let quietable = c.dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
+                    && c.dto.signal == AUTO_RULE_SIGNAL_CO_ACTIVITY;
+                !quietable || refusing.contains(&c.dto.anchor)
+            });
         if !settled.is_empty() {
             tracing::debug!(
                 target: "nrr::auto-rules",
                 sid = %sid,
                 held_back = settled.len(),
                 sample = %preview(&settled),
-                "suggestions kept out of the tray — the host already answers on the main route",
+                "suggestions kept out of the tray — a nearby third-party host that already answers on the main route",
             );
         }
         if worth_a_popup.is_empty() {
@@ -930,12 +1055,36 @@ impl AutoRulesEngine {
     // ── IPC surface ──────────────────────────────────────────────────────────
 
     /// `autorules.candidates.list` — the suggestions waiting for `sid`.
+    /// What the last tick dropped for this principal, for a screen that has to
+    /// explain an empty list. Empty when the last tick had nothing to drop.
+    pub fn quiet_note_for(&self, sid: &str) -> QuietNote {
+        self.quiet_note
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub fn candidates(&self, sid: &str) -> Vec<AutoRuleCandidateDto> {
+        let refusing: Vec<String> = self
+            .refusing_anchors
+            .as_ref()
+            .map(|read| read(sid))
+            .unwrap_or_default();
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(sid)
-            .map(|v| v.iter().map(|c| c.dto.clone()).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|c| {
+                        let mut dto = c.dto.clone();
+                        dto.anchor_refuses_main_link = refusing.contains(&dto.anchor);
+                        dto
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -1634,6 +1783,9 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
             consumers: Vec::new(),
             consumers_changed_unix_ms: 0,
             primary_behavior: primary_behavior_slug(proposal.primary_behavior).to_string(),
+            // Stamped when the list is served: the mark is the user's, lives in
+            // the state DB, and can change without the evidence changing.
+            anchor_refuses_main_link: false,
         },
         route: proposal.route,
         match_kind: AuthoredMatchKind::SuffixDomain,

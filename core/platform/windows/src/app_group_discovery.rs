@@ -119,7 +119,7 @@ fn discover_from_processes() -> Vec<DiscoveredApp> {
     out
 }
 
-fn enum_process_ids() -> Vec<u32> {
+pub(crate) fn enum_process_ids() -> Vec<u32> {
     let mut pids = vec![0u32; 1024];
     loop {
         let cap_bytes = (pids.len() * std::mem::size_of::<u32>()) as u32;
@@ -143,7 +143,7 @@ fn enum_process_ids() -> Vec<u32> {
     }
 }
 
-fn process_image_path(pid: u32) -> Option<PathBuf> {
+pub(crate) fn process_image_path(pid: u32) -> Option<PathBuf> {
     if pid == 0 {
         return None;
     }

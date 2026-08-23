@@ -188,8 +188,24 @@ pub trait LinkProviderWriter: Send + Sync {
 /// Full-reset auxiliary-state purge for the CALLER's own principal — see
 /// `nrr_storage::principal_purge` for the exact table scope/boundary.
 pub trait PrincipalDataPurger: Send + Sync {
-    fn purge_for_sid(&self, sid: &str)
-        -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError>;
+    /// `include_rules_history` additionally drops the service's own copy of
+    /// this caller's rules — a full reset, not routine cleanup.
+    fn purge_for_sid(
+        &self,
+        sid: &str,
+        include_rules_history: bool,
+    ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError>;
+
+    /// Same purge, applied to EVERY principal the service holds state for.
+    /// Machine-wide, so the handler admits it only from an elevated caller.
+    fn purge_all_principals(
+        &self,
+        include_rules_history: bool,
+    ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError>;
+
+    /// How many principals OTHER than `sid` the service holds rules for. Full
+    /// reset asks before it decides whose data it is erasing.
+    fn other_principal_count(&self, sid: &str) -> Result<u32, RoutePolicyWriteError>;
 }
 
 /// Post-write hook fired AFTER a successful `route.policy.update`, so a
@@ -384,6 +400,49 @@ pub trait TrafficStatsWriter: Send + Sync {
     fn clear(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError>;
 }
 
+/// The local networks a principal may keep reachable while the kill-switch
+/// blocks everything else: what the service discovered plus what the user
+/// decided. One trait for both directions — reading the list and writing a
+/// decision are the same subject, and a writer that could not read back what it
+/// produced would leave the GUI guessing.
+pub trait LocalNetworksProvider: Send + Sync {
+    fn list(&self, sid: &str) -> nrr_shared::ipc_payloads::LocalNetworksGetResponse;
+
+    /// Record decisions and forget others. Malformed or non-private entries are
+    /// reported in the response instead of failing the whole write: one bad row
+    /// typed into a list must not discard the good ones.
+    fn set(
+        &self,
+        sid: &str,
+        request: &nrr_shared::ipc_payloads::LocalNetworksSetRequest,
+    ) -> nrr_shared::ipc_payloads::LocalNetworksSetResponse;
+}
+
+/// Runs a bounded "does it answer on the main link?" pass — over the caller's
+/// pending suggestions, or over hosts their rules already name. Accepts the
+/// request and reports what it will examine; the verdicts reach the GUI later
+/// (a suggestion-changed push, or the next rules read), because a pass takes
+/// seconds and an IPC reply must not wait for it.
+pub trait AutoRuleProbeRunner: Send + Sync {
+    fn probe(
+        &self,
+        sid: &str,
+        ids: &[String],
+        rule_hostnames: &[String],
+    ) -> nrr_shared::ipc_payloads::AutoRuleCandidatesProbeResponse;
+}
+
+/// Records which routed sites the caller says answer the MAIN link with a
+/// refusal — the one thing about a site no measurement here can settle.
+pub trait RefusingAnchorsWriter: Send + Sync {
+    fn set(
+        &self,
+        sid: &str,
+        hostname: &str,
+        refusing: bool,
+    ) -> nrr_shared::ipc_payloads::RefusingAnchorSetResponse;
+}
+
 /// Source of the caller's per-SID `routing_pause_state` row.
 pub trait RoutingPauseProvider: Send + Sync {
     fn get(&self, sid: &str) -> RoutingPauseDto;
@@ -402,10 +461,10 @@ pub trait RoutingPauseWriter: Send + Sync {
     ) -> Result<RoutingPauseDto, SettingsWriteError>;
 }
 
-/// Source of the singleton `autostart_state` row combined with the most
-/// recent registry observation. Production impl probes
-/// `HKCU\…\Run` lazily and updates the row via
-/// `AutostartStateRepository::record_observation`.
+/// Source of the singleton `autostart_state` row combined with a live probe of
+/// the OS mechanism. Shadowed in production: autostart is per-user, so the
+/// launcher answers `autostart.*` in the user's own context before the request
+/// reaches the service.
 pub trait AutostartProvider: Send + Sync {
     fn get(&self) -> AutostartDto;
 }

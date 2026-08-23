@@ -203,6 +203,27 @@ pub fn text_indicates_vpn_tunnel(haystack: &str) -> bool {
     VPN_TUNNEL_ADAPTER_MARKERS.iter().any(|m| text.contains(m))
 }
 
+/// Is this the host side of a LOCAL virtual-machine network — a hypervisor's
+/// host-only / NAT / bridged adapter — as opposed to a tunnel?
+///
+/// The distinction matters because both live in RFC1918 space: a WireGuard link
+/// is as much a `10.x` as a VirtualBox host-only network, and treating "private
+/// address" as "local and safe" would hand a VPN's address range the exemption
+/// meant for a virtual machine. So the two name sets decide, and the VPN one
+/// wins ties: a TAP adapter is a tunnel even though a hypervisor may have
+/// installed it.
+pub fn is_virtual_machine_adapter(info: &AdapterInfo) -> bool {
+    if matches!(info.interface_type, InterfaceType::Loopback) {
+        return false;
+    }
+    let names = format!("{} {}", info.description, info.friendly_name);
+    if text_indicates_vpn_tunnel(&names) {
+        return false;
+    }
+    description_matches_virtual_software(&info.description)
+        || description_matches_virtual_software(&info.friendly_name)
+}
+
 // ── AdapterAvailability ───────────────────────────────────────────────────────
 
 /// Availability classification of one network adapter.

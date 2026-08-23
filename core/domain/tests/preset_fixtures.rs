@@ -4,7 +4,7 @@
 //!   1. Canonical example files in `presets/examples/` parse and validate correctly.
 //!   2. Community example-pack files pass validation.
 //!   3. Negative fixture files produce the expected outcomes.
-//!   4. Pro-only sections round-trip without data loss.
+//!   4. unsupported sections round-trip without data loss.
 //!
 //! All fixture content is embedded at compile time via `include_bytes!` / `include_str!`
 //! so the tests require no file-system access at runtime.
@@ -161,8 +161,8 @@ fn ipv6_address_in_ip_section_is_rejected_at_canonicalize() {
         assert!(
             errors
                 .iter()
-                .any(|e| matches!(e, ValidationError::Ipv6NotSupportedInFree { .. })),
-            "expected Ipv6NotSupportedInFree error, got: {errors:?}"
+                .any(|e| matches!(e, ValidationError::Ipv6NotSupported { .. })),
+            "expected Ipv6NotSupported error, got: {errors:?}"
         );
     }
 }
@@ -197,15 +197,15 @@ fn duplicate_domains_accepted_with_warnings_and_second_copy_dropped() {
     assert_eq!(rule_set.len(), 2, "duplicates deduped to 2 unique rules");
 }
 
-// ── Pro sections round-trip ───────────────────────────────────────────────────
+// ── unsupported sections round-trip ───────────────────────────────────────────────────
 
-static PRO_SECTIONS: &[u8] = include_bytes!("fixtures/preset_with_pro_sections.txt");
+static EXTENDED_SECTIONS: &[u8] = include_bytes!("fixtures/preset_with_extended_sections.txt");
 
-/// Pro-only sections (CIDR, Ports) are not included in the canonical rule set
+/// unsupported sections (CIDR, Ports) are not included in the canonical rule set
 /// but their entries are preserved in `ParseOutcome::unknown_sections`.
 #[test]
-fn pro_sections_not_in_canonical_rule_set() {
-    let outcome = validate_preset_bytes(PRO_SECTIONS);
+fn extended_sections_not_in_canonical_rule_set() {
+    let outcome = validate_preset_bytes(EXTENDED_SECTIONS);
     let (parse_outcome, warnings) = match outcome {
         PresetFileValidationOutcome::Accepted { parse_outcome } => (parse_outcome, vec![]),
         PresetFileValidationOutcome::AcceptedWithWarnings {
@@ -213,17 +213,17 @@ fn pro_sections_not_in_canonical_rule_set() {
             warnings,
         } => (parse_outcome, warnings),
         PresetFileValidationOutcome::Rejected(reason) => {
-            panic!("Pro sections fixture must pass validation: {reason:?}")
+            panic!("unsupported-section fixture must pass validation: {reason:?}")
         }
         _ => unreachable!("non-exhaustive: unknown PresetFileValidationOutcome variant"),
     };
 
-    // Pro sections produce an UnknownProSection warning.
+    // unsupported sections produce an UnknownSection warning.
     assert!(
         warnings
             .iter()
-            .any(|w| matches!(w, PresetImportWarning::UnknownProSection { .. })),
-        "expected UnknownProSection warning for CIDR/Ports sections"
+            .any(|w| matches!(w, PresetImportWarning::UnknownSection { .. })),
+        "expected UnknownSection warning for CIDR/Ports sections"
     );
 
     // The canonical rule set contains only Free-edition rules.
@@ -233,7 +233,9 @@ fn pro_sections_not_in_canonical_rule_set() {
         HostPlatform::Windows,
         false,
     );
-    let rule_set = canon.rule_set().expect("Pro fixture must canonicalize");
+    let rule_set = canon
+        .rule_set()
+        .expect("unsupported-section fixture must canonicalize");
 
     // Free-edition rules from the fixture: Zones(1) + Domains(2) + IP(1) + Windows(1) = 5
     assert_eq!(
@@ -243,10 +245,10 @@ fn pro_sections_not_in_canonical_rule_set() {
         rule_set.len()
     );
 
-    // Pro-only entries are preserved in unknown_sections (round-trip guarantee).
+    // unsupported entries are preserved in unknown_sections (round-trip guarantee).
     assert!(
         !parse_outcome.unknown_sections.is_empty(),
-        "Pro sections must be preserved in unknown_sections"
+        "unsupported sections must be preserved in unknown_sections"
     );
     let cidr = parse_outcome
         .unknown_sections
@@ -271,7 +273,7 @@ fn pro_sections_not_in_canonical_rule_set() {
     );
 }
 
-/// A file with only Free-edition sections is valid for Pro without transformation.
+/// A file with only supported sections needs no transformation.
 #[test]
 fn free_edition_file_is_valid_for_pro_without_change() {
     let free_only = b"\

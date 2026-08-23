@@ -1,0 +1,50 @@
+name: linux-quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+
+    # Same reason as the Windows job: no Qt on the runner, and every cargo step
+    # would otherwise run the Qt host's build script. `check.sh` also sets this
+    # itself when cmake is missing, but setting it here keeps the job honest
+    # about what it does NOT cover rather than relying on a fallback.
+    env:
+      NRR_SKIP_QT_HOST: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run quality baseline
+        # Same gates in the same order as the Windows job: fmt, clippy with
+        # warnings denied, the full test suite, then cargo-deny.
+        #
+        # What this job exists to catch: code that compiles on Windows but not
+        # on Linux. Twice already a module landed with direct Win32 calls and no
+        # `cfg` guard, and a test asserted the host OS outright — both broke the
+        # Linux build and both were found only by someone running WSL by hand.
+        # Enforcement tests that need root (nftables, live routes) skip loudly
+        # on their own; they are not this job's business.
+        #
+        # Invoked through `bash` on purpose: the script is recorded in git
+        # without an executable bit, so `./scripts/check.sh` would fail on a
+        # fresh checkout with "Permission denied".
+        run: bash scripts/check.sh --require-cargo-deny

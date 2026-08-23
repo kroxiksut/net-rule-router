@@ -207,7 +207,7 @@ pub static PRIVILEGE_MATRIX: &[PrivilegeMatrixEntry] = &[
             "on Windows Vista+. Persistent WFP objects also require admin. ",
             "We use volatile filters (non-persistent) so filters auto-remove on session close — ",
             "this provides automatic orphan cleanup on service crash. ",
-            "No kernel-mode WFP callout driver is used in MVP (Pro feature)."
+            "No kernel-mode WFP callout driver is used."
         ),
         fallback: concat!(
             "Fail-Closed enforcement and application-rule blocking become unavailable. ",
@@ -354,6 +354,10 @@ pub struct UninstallOutcome {
     pub data_removed: bool,
     /// Whether user rule files were explicitly preserved (not touched).
     pub rule_files_preserved: bool,
+    /// Whether the enforcement state left on the machine (packet filters, DNS
+    /// redirection) was swept before the registration went away. `None` where
+    /// the platform does not sweep during removal.
+    pub machine_state_cleared: Option<bool>,
 }
 
 // ── Security checklist ────────────────────────────────────────────────────────

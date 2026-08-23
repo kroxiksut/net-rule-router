@@ -93,6 +93,8 @@ Window {
     /// (0 = never). A notice nobody answered must not hold the surface
     /// forever: while it is up, everything behind it is silenced.
     property int autoRetireMs: 0
+    /// Whole-window opacity in percent (100 = opaque).
+    property int opacityPercent: 100
 
     /// Emitted exactly once per showing, with the id of the chosen action and
     /// the indexes of the checked rows (all rows when not selectable).
@@ -373,11 +375,17 @@ Window {
     // frameless drops a title bar the corner close box already replaces, and
     // staying on top is what makes a notification a notification.
     flags: Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
-    // Opaque. A translucent window needs a platform flag Qt does not set for a
-    // plain Window on Windows, and without it the surface came up invisible —
-    // which is worse than ugly, because an invisible window still counts as
-    // "on screen" and silences every notification behind it.
+    // Opaque SURFACE. A translucent window `color` needs a platform flag Qt
+    // does not set for a plain Window on Windows, and without it the surface
+    // came up invisible — which is worse than ugly, because an invisible window
+    // still counts as "on screen" and silences every notification behind it.
+    // Window-level `opacity` below is a different mechanism (a layered window)
+    // and is safe.
     color: _panelColor
+    // User preference, 40..100: some people want the notice to sit lighter over
+    // whatever is under it. Clamped here rather than trusted, because it
+    // arrives from a preferences file.
+    opacity: Math.max(0.4, Math.min(1, promptWindow.opacityPercent / 100))
     title: titleText
 
     onClosing: promptWindow._dismiss()

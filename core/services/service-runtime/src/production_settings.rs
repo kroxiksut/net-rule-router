@@ -693,57 +693,6 @@ where
     }
 }
 
-// ── Once-per-startup autostart probe ─────────────────────────────────────────
-
-/// Reads the current `HKCU\…\Run` value via `helper.get_state` and
-/// persists the observation through `record_observation`. Called at
-/// service startup so the GUI sees an up-to-date `last_known_state`
-/// (incl. external overrides) without waiting for the user to open
-/// settings. Errors are logged via `tracing` and swallowed — the probe
-/// is best-effort.
-pub fn run_autostart_startup_probe<P>(
-    conn: &Mutex<Connection>,
-    helper: &nrr_platform_api::autostart::AutostartHelper<P>,
-    tray_binary_path: &std::path::Path,
-) where
-    P: nrr_platform_api::autostart::AutostartRegistryPort + Send + Sync,
-{
-    use nrr_platform_api::autostart::AutostartCurrentState;
-    let observed = match helper.get_state(tray_binary_path) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(target: "nrr::autostart", error = ?e, "autostart startup probe failed");
-            return;
-        }
-    };
-    let last_known = match observed {
-        AutostartCurrentState::Enabled { matches_ours, .. } => {
-            if matches_ours {
-                AutostartLastKnownState::Enabled
-            } else {
-                AutostartLastKnownState::OverriddenExternally
-            }
-        }
-        AutostartCurrentState::Disabled => AutostartLastKnownState::Disabled,
-        AutostartCurrentState::OverriddenExternally { .. } => {
-            AutostartLastKnownState::OverriddenExternally
-        }
-    };
-    let conn = match conn.lock() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let repo = AutostartStateRepository::new(&conn);
-    let now = now_secs();
-    if let Err(e) = repo.record_observation(last_known, now) {
-        tracing::warn!(
-            target: "nrr::autostart",
-            error = %e,
-            "autostart observation persist failed",
-        );
-    }
-}
-
 // ── Service stability config ──────────────────────────────────────────────────
 
 use crate::ipc_handlers::providers::{

@@ -81,8 +81,9 @@ pub use auto_rules_handlers::{
     AutoRuleDismissedRestoreHandler,
 };
 pub use block_notice_handlers::{
-    BlockNoticeMutesClearHandler, BlockNoticeMutesListHandler, BlockNoticeMutesRemoveHandler,
-    BlockNoticeMutesSetHandler, BlockNoticeRouteToSecondaryHandler,
+    BlockNoticeJournalAckHandler, BlockNoticeJournalListHandler, BlockNoticeMutesClearHandler,
+    BlockNoticeMutesListHandler, BlockNoticeMutesRemoveHandler, BlockNoticeMutesSetHandler,
+    BlockNoticeRouteToSecondaryHandler,
 };
 pub use contract_negotiate::{
     service_binary_version, set_service_binary_version, ContractNegotiateHandler,
@@ -110,7 +111,7 @@ pub use operation_status_store::{
     OperationError, OperationRecord, OperationState, OperationStatusStore,
     DEFAULT_OPERATION_RETENTION,
 };
-pub use principal_data_handlers::PrincipalDataPurgeHandler;
+pub use principal_data_handlers::{PrincipalDataCountHandler, PrincipalDataPurgeHandler};
 pub use product_impact_disable::ProductImpactDisableTemporaryHandler;
 pub use providers::{
     review_risk_level, AdaptersSnapshotProvider, ApplyFailurePolicyProvider,
@@ -136,8 +137,9 @@ pub use service_stability_handlers::{
     ServiceStabilityConfigGetHandler, ServiceStabilityConfigSetHandler,
 };
 pub use settings_handlers::{
-    ApplyFailurePolicyGetHandler, ApplyFailurePolicySetHandler, AutostartGetHandler,
-    AutostartToggleHandler, LogRetentionConfigGetHandler, LogRetentionConfigSetHandler,
+    ApplyFailurePolicyGetHandler, ApplyFailurePolicySetHandler, AutoRuleCandidatesProbeHandler,
+    AutostartGetHandler, AutostartToggleHandler, LocalNetworksGetHandler, LocalNetworksSetHandler,
+    LogRetentionConfigGetHandler, LogRetentionConfigSetHandler, RefusingAnchorSetHandler,
     RetentionSettingsGetHandler, RetentionSettingsSetHandler, RoutingPauseGetHandler,
     RoutingPauseToggleHandler, StorageUsageGetHandler, TrafficStatsClearHandler,
     TrafficStatsGetHandler, TrafficStatsSetHandler,
@@ -201,6 +203,12 @@ pub struct IpcHandlerDeps {
     /// through IPC would only take effect after a service restart. Wired
     /// alongside `block_notice_mutes` via `with_block_notice_mutes(...)`.
     pub block_notice_center: Option<Arc<crate::block_notice_center::BlockNoticeCenter>>,
+    /// Durable backlog of notices raised while no surface was subscribed.
+    /// `None` keeps the two `block-notices.journal.*` ops unimplemented — a
+    /// degraded boot answers "nothing pending" rather than refusing. Wired via
+    /// `with_block_notice_journal(...)`.
+    pub block_notice_journal:
+        Option<Arc<dyn crate::block_notice_journal_store::BlockNoticeJournalStore>>,
     /// Rule author behind `block-notices.route-to-secondary` — the SAME
     /// authoring path companion-domain suggestions use, so a notice-driven
     /// rule passes the same Free rule cap, tamper gate and revision audit a
@@ -289,6 +297,17 @@ pub struct IpcHandlerDeps {
     /// "clear OS DNS cache" button. `None` keeps that branch reporting
     /// `os_cache_flushed = Some(false)`. Wired via `with_dns_cache_control(...)`.
     pub dns_cache_control: Option<Arc<dyn nrr_platform_api::dns::DnsCacheControlPort>>,
+    /// The caller's local-network exemptions (discovered + decided). `None`
+    /// keeps both `settings.local-networks.*` operations unimplemented, which
+    /// is the degraded-boot behaviour for every other stateful setting here.
+    pub local_networks: Option<Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>>,
+    /// Runs the "does it answer on the main link?" pass for the caller's
+    /// pending suggestions. `None` keeps `autorules.candidates.probe`
+    /// unimplemented, exactly like every other unwired capability here.
+    pub auto_rule_probe: Option<Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>>,
+    /// Records the sites the caller says refuse main-link addresses. `None`
+    /// keeps `autorules.refusing-anchor.set` unimplemented.
+    pub refusing_anchors: Option<Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>>,
     /// Merge-preview source. `None` keeps `RulesMergePreview`
     /// registered as `UnimplementedHandler` (degraded boot / no state DB).
     /// Wired via `with_merge_preview_source(...)`.
@@ -411,12 +430,16 @@ impl IpcHandlerDeps {
             browser_history_seeder: None,
             cache_repository: None,
             dns_cache_control: None,
+            local_networks: None,
+            auto_rule_probe: None,
+            refusing_anchors: None,
             merge_preview_source: None,
             traffic_stats: None,
             traffic_stats_writer: None,
             auto_rules: None,
             block_notice_mutes: None,
             block_notice_center: None,
+            block_notice_journal: None,
             block_notice_author: None,
             conn_trace_ring: None,
             third_party_integrity: None,
@@ -492,6 +515,18 @@ impl IpcHandlerDeps {
     ) -> Self {
         self.block_notice_mutes = Some(store);
         self.block_notice_center = Some(center);
+        self
+    }
+
+    /// Attach the backlog the `block-notices.journal.*` ops serve. The same
+    /// `Arc` the [`BlockNoticeCenter`] writes to, so what a surface reads is
+    /// what the drop path recorded.
+    #[must_use]
+    pub fn with_block_notice_journal(
+        mut self,
+        store: Arc<dyn crate::block_notice_journal_store::BlockNoticeJournalStore>,
+    ) -> Self {
+        self.block_notice_journal = Some(store);
         self
     }
 
@@ -653,6 +688,34 @@ impl IpcHandlerDeps {
         port: Arc<dyn nrr_platform_api::dns::DnsCacheControlPort>,
     ) -> Self {
         self.dns_cache_control = Some(port);
+        self
+    }
+
+    /// Attach the caller's local-network exemptions so the settings screen can
+    /// list what the service discovered and record what the user decided.
+    /// Attach the main-link probe runner (see [`Self::auto_rule_probe`]).
+    /// Attach the refusing-site writer (see [`Self::refusing_anchors`]).
+    pub fn with_refusing_anchors(
+        mut self,
+        writer: Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>,
+    ) -> Self {
+        self.refusing_anchors = Some(writer);
+        self
+    }
+
+    pub fn with_auto_rule_probe(
+        mut self,
+        runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>,
+    ) -> Self {
+        self.auto_rule_probe = Some(runner);
+        self
+    }
+
+    pub fn with_local_networks(
+        mut self,
+        provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>,
+    ) -> Self {
+        self.local_networks = Some(provider);
         self
     }
 
@@ -1230,6 +1293,38 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     registry.register(op, UnimplementedHandler::new(op));
                 }
             },
+            IpcOperationName::AutoRuleCandidatesProbe => match deps.auto_rule_probe.clone() {
+                Some(runner) => {
+                    registry.register(op, AutoRuleCandidatesProbeHandler::new(runner));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::RefusingAnchorSet => match deps.refusing_anchors.clone() {
+                Some(writer) => {
+                    registry.register(op, RefusingAnchorSetHandler::new(writer));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::LocalNetworksGet => match deps.local_networks.clone() {
+                Some(provider) => {
+                    registry.register(op, LocalNetworksGetHandler::new(provider));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::LocalNetworksSet => match deps.local_networks.clone() {
+                Some(provider) => {
+                    registry.register(op, LocalNetworksSetHandler::new(provider));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
             // Companion-domain suggestions — gated on the engine,
             // which is only wired when the DNS-observation path exists.
             IpcOperationName::AutoRuleCandidatesList => match deps.auto_rules.clone() {
@@ -1275,6 +1370,24 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::AutoRuleDismissedRestore => match deps.auto_rules.clone() {
                 Some(engine) => {
                     registry.register(op, AutoRuleDismissedRestoreHandler::new(engine));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            // The backlog a surface drains when it comes up. Gated on its own
+            // store: mutes can work without it and it without them.
+            IpcOperationName::BlockNoticeJournalList => match deps.block_notice_journal.clone() {
+                Some(store) => {
+                    registry.register(op, BlockNoticeJournalListHandler::new(store));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::BlockNoticeJournalAck => match deps.block_notice_journal.clone() {
+                Some(store) => {
+                    registry.register(op, BlockNoticeJournalAckHandler::new(store));
                 }
                 None => {
                     registry.register(op, UnimplementedHandler::new(op));
@@ -1351,6 +1464,14 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::PrincipalDataPurge => match deps.principal_data_purger.clone() {
                 Some(purger) => {
                     registry.register(op, PrincipalDataPurgeHandler::new(purger));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::PrincipalDataCount => match deps.principal_data_purger.clone() {
+                Some(purger) => {
+                    registry.register(op, PrincipalDataCountHandler::new(purger));
                 }
                 None => {
                     registry.register(op, UnimplementedHandler::new(op));

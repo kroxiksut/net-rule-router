@@ -61,13 +61,14 @@ always works, and the list is easy to extend.
 
 The keyword list lives in one place:
 [`core/platform/api/src/vpn_discovery.rs`](../../core/platform/api/src/vpn_discovery.rs),
-in the `VPN_NAME_KEYWORDS` constant. Adding a client is a one-line change.
+in the `VPN_CONSUMER_KEYWORDS` / `VPN_CORPORATE_KEYWORDS` constants. Adding a
+client is a one-line change.
 
 There are three ways to get a client added.
 
 ### 1. Open a pull request
 
-Add a distinctive keyword to `VPN_NAME_KEYWORDS` and open a PR against
+Add a distinctive keyword to the matching list and open a PR against
 [github.com/kroxiksut/net-rule-router](https://github.com/kroxiksut/net-rule-router).
 
 Please keep two rules in mind:

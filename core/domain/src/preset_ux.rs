@@ -8,7 +8,7 @@
 //! - Providing locale key constants for all user-facing strings so the GUI
 //!   can resolve them from the active locale catalog without embedding raw text
 //!   in the domain layer.
-//! - Defining display data for Pro-only section badges in the rules list.
+//! - Defining display data for unsupported section badges in the rules list.
 //! - Enumerating the GUI actions available after a failed import.
 //! - Specifying where the "Import both files together" preference lives in the
 //!   settings screen.
@@ -141,9 +141,9 @@ impl PresetImportGuiAction {
     }
 }
 
-// ── Pro section badge ─────────────────────────────────────────────────────────
+// ── unsupported section badge ─────────────────────────────────────────────────────────
 
-/// Display data for a Pro-only section shown as a badge row in the rules list.
+/// Display data for a unsupported section shown as a badge row in the rules list.
 ///
 /// When a preset file contains sections not recognised by the Free edition
 /// (e.g. `--- CIDR`, `--- Ports`), the rules list renders a read-only badge
@@ -152,13 +152,14 @@ impl PresetImportGuiAction {
 ///
 /// # GUI rendering contract
 ///
-/// - Badge icon: `assets/icons/ui/pro.svg` (normal), `assets/icons/ui-hc/pro.svg`
+/// - Badge icon: `assets/icons/ui/extended-section.svg` (normal),
+///   `assets/icons/ui-hc/extended-section.svg`
 ///   (high-contrast theme).
 /// - Badge label: resolved from [`LOCALE_KEY_BADGE_LABEL`].
 /// - Row tooltip: resolved from [`LOCALE_KEY_BADGE_TOOLTIP`].
 /// - Rules in this section: greyed-out, non-interactive.
-/// - User cannot add, edit, or delete rules in a Pro section.
-/// - Presence of a Pro section is **not** an import error; import proceeds normally.
+/// - User cannot add, edit, or delete rules in a unsupported section.
+/// - Presence of a unsupported section is **not** an import error; import proceeds normally.
 /// - The section is shown only in read-only preview mode; not in the editing surface.
 ///
 /// # Construction
@@ -166,48 +167,48 @@ impl PresetImportGuiAction {
 /// Build from a parsed [`UnknownSection`] via the [`From`] impl:
 ///
 /// ```no_run
-/// use nrr_domain::preset_ux::ProSectionDisplayItem;
+/// use nrr_domain::preset_ux::ExtendedSectionDisplayItem;
 /// use nrr_domain::rules_file::UnknownSection;
 /// # let section = UnknownSection { name: "CIDR".to_string(), entries: vec![] };
-/// let item = ProSectionDisplayItem::from(&section);
+/// let item = ExtendedSectionDisplayItem::from(&section);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProSectionDisplayItem {
+pub struct ExtendedSectionDisplayItem {
     /// Raw section name as declared in the file (e.g. `"CIDR"`, `"Ports"`).
     pub section_name: String,
     /// Number of entries in this section.
     pub entry_count: usize,
 }
 
-impl ProSectionDisplayItem {
-    /// Locale key for the "Pro" badge label on the section header row.
-    pub const LOCALE_KEY_BADGE_LABEL: &'static str = "rules.pro-section.badge-label";
+impl ExtendedSectionDisplayItem {
+    /// Locale key for the badge label on the section header row.
+    pub const LOCALE_KEY_BADGE_LABEL: &'static str = "rules.extended-section.badge-label";
 
-    /// Locale key for the badge tooltip explaining that Pro is required.
-    pub const LOCALE_KEY_BADGE_TOOLTIP: &'static str = "rules.pro-section.badge-tooltip";
+    /// Locale key for the badge tooltip explaining why the rules are inert.
+    pub const LOCALE_KEY_BADGE_TOOLTIP: &'static str = "rules.extended-section.badge-tooltip";
 
     /// Locale key for the per-rule "inactive" hint shown on each rule row.
-    pub const LOCALE_KEY_INACTIVE_HINT: &'static str = "rules.pro-section.inactive-hint";
+    pub const LOCALE_KEY_INACTIVE_HINT: &'static str = "rules.extended-section.inactive-hint";
 
-    /// Locale key for the import-time warning that a Pro section was skipped.
+    /// Locale key for the import-time warning that a unsupported section was skipped.
     ///
     /// Shown in the import result summary when `AcceptedWithWarnings` includes
-    /// an `UnknownProSection` warning.
+    /// an `UnknownSection` warning.
     pub const LOCALE_KEY_IMPORT_WARNING: &'static str =
-        "dialog.preset-import.warning.pro-section-skipped";
+        "dialog.preset-import.warning.extended-section-skipped";
 
-    /// Pro section rules are always non-editable in the Free edition.
+    /// unsupported section rules are always non-editable in the Free edition.
     pub const fn is_editable() -> bool {
         false
     }
 
-    /// Pro section rules are always rendered as inactive.
+    /// unsupported section rules are always rendered as inactive.
     pub const fn is_active() -> bool {
         false
     }
 }
 
-impl From<&UnknownSection> for ProSectionDisplayItem {
+impl From<&UnknownSection> for ExtendedSectionDisplayItem {
     fn from(section: &UnknownSection) -> Self {
         Self {
             section_name: section.name.clone(),
@@ -372,10 +373,10 @@ mod tests {
         }
     }
 
-    // ── ProSectionDisplayItem ─────────────────────────────────────────────────
+    // ── ExtendedSectionDisplayItem ─────────────────────────────────────────────────
 
     #[test]
-    fn pro_section_display_item_from_unknown_section() {
+    fn extended_section_display_item_from_unknown_section() {
         let section = UnknownSection {
             name: "CIDR".to_string(),
             entries: vec![
@@ -396,24 +397,24 @@ mod tests {
             ],
         };
 
-        let item = ProSectionDisplayItem::from(&section);
+        let item = ExtendedSectionDisplayItem::from(&section);
         assert_eq!(item.section_name, "CIDR");
         assert_eq!(item.entry_count, 2);
     }
 
     #[test]
-    fn pro_section_is_not_editable_and_not_active() {
-        assert!(!ProSectionDisplayItem::is_editable());
-        assert!(!ProSectionDisplayItem::is_active());
+    fn extended_section_is_not_editable_and_not_active() {
+        assert!(!ExtendedSectionDisplayItem::is_editable());
+        assert!(!ExtendedSectionDisplayItem::is_active());
     }
 
     #[test]
-    fn pro_section_locale_keys_are_nonempty_and_dot_separated() {
+    fn extended_section_locale_keys_are_nonempty_and_dot_separated() {
         let keys = [
-            ProSectionDisplayItem::LOCALE_KEY_BADGE_LABEL,
-            ProSectionDisplayItem::LOCALE_KEY_BADGE_TOOLTIP,
-            ProSectionDisplayItem::LOCALE_KEY_INACTIVE_HINT,
-            ProSectionDisplayItem::LOCALE_KEY_IMPORT_WARNING,
+            ExtendedSectionDisplayItem::LOCALE_KEY_BADGE_LABEL,
+            ExtendedSectionDisplayItem::LOCALE_KEY_BADGE_TOOLTIP,
+            ExtendedSectionDisplayItem::LOCALE_KEY_INACTIVE_HINT,
+            ExtendedSectionDisplayItem::LOCALE_KEY_IMPORT_WARNING,
         ];
         for key in keys {
             assert!(!key.is_empty());
@@ -422,12 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn pro_section_empty_section_has_zero_entry_count() {
+    fn extended_section_empty_section_has_zero_entry_count() {
         let section = UnknownSection {
             name: "Ports".to_string(),
             entries: vec![],
         };
-        let item = ProSectionDisplayItem::from(&section);
+        let item = ExtendedSectionDisplayItem::from(&section);
         assert_eq!(item.entry_count, 0);
     }
 

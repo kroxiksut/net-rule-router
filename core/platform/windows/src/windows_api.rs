@@ -19,11 +19,16 @@
 //! `nrr-platform-api` and are re-exported below so
 //! `nrr_platform_windows::windows_api::*` paths keep resolving unchanged.
 
-pub use nrr_platform_api::windows_api::{mock_luid_for_index, MockWindowsApi, WindowsApiPort};
+pub use nrr_platform_api::route_table::RouteTablePort;
+pub use nrr_platform_api::windows_api::{
+    mock_luid_for_index, MockWindowsApi, WfpEnginePort, WindowsApiPort,
+};
 
 use crate::{
     error::PlatformError,
-    types::{RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec},
+    types::{
+        Ipv6RouteRow, RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec,
+    },
 };
 
 // ── Production implementation ─────────────────────────────────────────────────
@@ -35,11 +40,15 @@ use crate::{
 /// succeeds on Linux/macOS CI runners.
 pub struct ProductionWindowsApi;
 
-impl WindowsApiPort for ProductionWindowsApi {
+impl RouteTablePort for ProductionWindowsApi {
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
         // Real GetIpForwardTable2 on Windows; stubbed elsewhere via
         // `production_get_ip_forward_table`.
         production_get_ip_forward_table()
+    }
+
+    fn get_ipv6_forward_table(&self) -> Result<Vec<Ipv6RouteRow>, PlatformError> {
+        production_get_ipv6_forward_table()
     }
 
     fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
@@ -81,7 +90,9 @@ impl WindowsApiPort for ProductionWindowsApi {
         // Real ConvertInterfaceIndexToLuid on Windows.
         production_interface_luid_for_index(ifindex)
     }
+}
 
+impl WfpEnginePort for ProductionWindowsApi {
     fn wfp_engine_open(&self) -> Result<WfpEngineToken, PlatformError> {
         production_wfp_engine_open()
     }
@@ -183,6 +194,18 @@ fn production_get_ip_forward_table() -> Result<Vec<RouteEntry>, PlatformError> {
 
 #[cfg(not(target_os = "windows"))]
 fn production_get_ip_forward_table() -> Result<Vec<RouteEntry>, PlatformError> {
+    Err(PlatformError::NotSupported {
+        reason: "GetIpForwardTable2 requires target_os = \"windows\"",
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn production_get_ipv6_forward_table() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
+    crate::win32_ffi::route_table::enumerate_routes_v6()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn production_get_ipv6_forward_table() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
     Err(PlatformError::NotSupported {
         reason: "GetIpForwardTable2 requires target_os = \"windows\"",
     })

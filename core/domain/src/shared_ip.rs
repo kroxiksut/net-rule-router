@@ -12,7 +12,7 @@
 //! service-runtime derives `rule_on_ip` / `total_rule` from the secondary rules
 //! × FQDN cache, and `direct_on_ip` from the observed shared-IP census. A
 //! separating solution (per-hostname routing on a shared IP) needs SNI/L7
-//! inspection and is a Pro feature.
+//! inspection and is not supported.
 
 use std::fmt;
 

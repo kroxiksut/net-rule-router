@@ -82,6 +82,10 @@ pub struct UiPreferences {
     /// Redacts the destination host/IP from the "connection blocked" notice
     /// body while still showing that a block happened. Default `false`.
     pub hide_block_notice_addresses: bool,
+    /// Opacity of the tray notice window, in percent. Clamped to 40..=100 on
+    /// the way in; 100 is the opaque default. The notice is our own window,
+    /// not a system balloon, so this is ours to honour.
+    pub tray_notice_opacity_percent: u16,
     pub reopen_last_section_on_startup: bool,
     pub first_run_completed: bool,
     /// The highest EULA revision the user has accepted on this device, or
@@ -131,13 +135,6 @@ pub struct UiPreferences {
     /// non-maintained historical fallback; mode B is the supported mechanism.
     /// Pure device-local UI display preference.
     pub allow_mode_a_killswitch: bool,
-    /// Experimental opt-in: reveal the "pre-flight, then all-or-nothing"
-    /// apply-failure policy option in the routing settings. `false` (default)
-    /// hides it from the picker unless it is already the selected policy —
-    /// a previously-saved choice is always shown regardless of this flag.
-    /// Its pre-flight checks are still in development. Pure device-local UI
-    /// display preference.
-    pub pre_flight_apply_policy_opt_in: bool,
     /// Reveals the individual DNS-via-secondary / fast-DNS-answers / fake-IP /
     /// fake-IP-UDP-relay / fake-IP-instant-reset toggles in the routing
     /// settings screen. `false` (default) hides them and the built-in defaults
@@ -657,6 +654,7 @@ impl Default for UiPreferences {
             notify_suggestion_changes: true,
             notify_block_notices: true,
             hide_block_notice_addresses: false,
+            tray_notice_opacity_percent: 100,
             reopen_last_section_on_startup: true,
             first_run_completed: false,
             accepted_eula_version: nrr_shared::eula::EULA_NOT_ACCEPTED,
@@ -676,7 +674,6 @@ impl Default for UiPreferences {
             admin_auto_revoke_disabled: false,
             admin_auto_revoke_minutes: ADMIN_AUTO_REVOKE_DEFAULT_MINUTES,
             allow_mode_a_killswitch: false,
-            pre_flight_apply_policy_opt_in: false,
             routing_detailed_mode: false,
             show_remembered_adapters: true,
             auto_confirm_adapter_id_change: true,
@@ -1145,6 +1142,11 @@ fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.hide_block_notice_addresses = parsed;
                 }
             }
+            "tray_notice_opacity_percent" => {
+                if let Some(parsed) = parse_tray_notice_opacity_percent(value) {
+                    preferences.tray_notice_opacity_percent = parsed;
+                }
+            }
             "reopen_last_section_on_startup" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.reopen_last_section_on_startup = parsed;
@@ -1251,11 +1253,6 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "allow_mode_a_killswitch" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.allow_mode_a_killswitch = parsed;
-                }
-            }
-            "pre_flight_apply_policy_opt_in" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.pre_flight_apply_policy_opt_in = parsed;
                 }
             }
             "routing_detailed_mode" => {
@@ -1750,7 +1747,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "last_loaded_path_secondary={}\n",
             "notify_block_notices={}\n",
             "hide_block_notice_addresses={}\n",
-            "pre_flight_apply_policy_opt_in={}\n"
+            "tray_notice_opacity_percent={}\n"
         ),
         CURRENT_UI_PREFS_SCHEMA_VERSION,
         preferences.launch_window_on_startup,
@@ -1848,7 +1845,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         optional_string_field(&preferences.last_loaded_path_secondary),
         preferences.notify_block_notices,
         preferences.hide_block_notice_addresses,
-        preferences.pre_flight_apply_policy_opt_in
+        preferences.tray_notice_opacity_percent
     )
 }
 
@@ -1900,6 +1897,11 @@ fn parse_bool(value: &str) -> Option<bool> {
         "false" => Some(false),
         _ => None,
     }
+}
+
+fn parse_tray_notice_opacity_percent(value: &str) -> Option<u16> {
+    let parsed = value.parse::<u16>().ok()?;
+    (40..=100).contains(&parsed).then_some(parsed)
 }
 
 fn parse_font_scale_percent(value: &str) -> Option<u16> {
@@ -2064,20 +2066,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_flight_apply_policy_opt_in_defaults_when_key_absent() {
-        // A file saved before this key existed must still load cleanly,
-        // with the field falling back to its type default (opted out).
-        let parsed = parse_preferences("theme_mode=system\n");
-        assert!(!parsed.pre_flight_apply_policy_opt_in);
-    }
-
-    #[test]
-    fn pre_flight_apply_policy_opt_in_parses_explicit_value() {
-        let parsed = parse_preferences("pre_flight_apply_policy_opt_in=true\n");
-        assert!(parsed.pre_flight_apply_policy_opt_in);
-    }
-
-    #[test]
     fn parser_reads_confirmed_role_fields() {
         let parsed = parse_preferences(concat!(
             "show_bluetooth_adapters=true\n",
@@ -2110,6 +2098,8 @@ mod tests {
             notify_block_notices: false,
             // Non-default (default is false) — proves the field persists.
             hide_block_notice_addresses: true,
+            // Non-default (default is 100) — proves the field persists.
+            tray_notice_opacity_percent: 80,
             reopen_last_section_on_startup: true,
             first_run_completed: true,
             accepted_eula_version: 1,
@@ -2132,8 +2122,6 @@ mod tests {
             admin_auto_revoke_minutes: 45,
             // Non-default (default is false) — proves the field persists.
             allow_mode_a_killswitch: true,
-            // Non-default (default is false) — proves the field persists.
-            pre_flight_apply_policy_opt_in: true,
             // Non-default (default is false) — proves the field persists.
             routing_detailed_mode: true,
             // Non-default (default is true) so the round-trip test proves the

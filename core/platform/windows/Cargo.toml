@@ -69,6 +69,8 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
     "Win32_Networking_WinSock",
+    # Operator-facing records in the Application event log.
+    "Win32_System_EventLog",
     # Block 16.9.4: HKCU\...\Run autostart helper.
     "Win32_System_Registry",
     # Block 16.12.A.0: FwpmEngineOpen0 takes a SEC_WINNT_AUTH_IDENTITY_W

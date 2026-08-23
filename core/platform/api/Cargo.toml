@@ -39,6 +39,13 @@ nrr-shared = { path = "../../../shared/contracts" }
 # this keeps `platform → domain` — an allowed direction — with no cycle.
 nrr-domain = { path = "../../domain" }
 
+# `PlatformError::Errno` classifies POSIX error codes, whose numeric values
+# differ between Unix targets — naming them through `libc` is what keeps the
+# table right on Linux and macOS alike. Scoped to `cfg(unix)` so the crate's
+# "compiles on every target" rule stays literal: Windows builds never see it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # `hosts_file` tests write a temp hosts file + exercise the mtime cache.
 tempfile = "3"

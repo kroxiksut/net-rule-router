@@ -3,7 +3,7 @@
 //! Test matrix:
 //!   - malformed file (binary noise, truncated UTF-8)
 //!   - oversized file
-//!   - unknown Pro sections (CIDR, Ports)
+//!   - unknown unsupported sections (CIDR, Ports)
 //!   - invalid match values (semantic errors deferred, length errors here)
 //!   - duplicate rules (parse-level: accepted, semantic layer deduplicates)
 //!   - empty file
@@ -103,7 +103,7 @@ fn size_check_happens_before_encoding_check() {
     ));
 }
 
-// ── Unknown Pro sections ──────────────────────────────────────────────────────
+// ── Unknown unsupported sections ──────────────────────────────────────────────────────
 
 #[test]
 fn cidr_section_is_accepted_with_warning_not_rejected() {
@@ -124,7 +124,7 @@ fn ports_section_is_accepted_with_warning() {
     let w = outcome.warnings();
     assert_eq!(w.len(), 1);
     assert!(
-        matches!(&w[0], PresetImportWarning::UnknownProSection { name, entry_count: 2 } if name == "Ports")
+        matches!(&w[0], PresetImportWarning::UnknownSection { name, entry_count: 2 } if name == "Ports")
     );
 }
 
@@ -138,7 +138,7 @@ fn unknown_section_entries_included_in_parse_outcome() {
 }
 
 #[test]
-fn file_with_only_pro_sections_is_accepted_with_warning() {
+fn file_with_only_extended_sections_is_accepted_with_warning() {
     let input = b"--- CIDR\n10.0.0.0/8\n";
     let outcome = validate_preset_bytes(input);
     assert!(outcome.is_accepted());
@@ -170,7 +170,7 @@ fn match_value_one_byte_over_limit_is_rejected() {
 }
 
 #[test]
-fn too_long_value_in_pro_section_is_rejected() {
+fn too_long_value_in_extended_section_is_rejected() {
     let v = "x".repeat(MAX_MATCH_VALUE_LEN + 1);
     let input = format!("--- CIDR\n{v}\n");
     let outcome = validate_preset_bytes(input.as_bytes());
@@ -236,8 +236,8 @@ fn one_over_rule_count_limit_is_rejected() {
 }
 
 #[test]
-fn rule_count_spans_both_free_and_pro_sections() {
-    // Split rules between a Free section and a Pro section.
+fn rule_count_spans_both_free_and_extended_sections() {
+    // Split rules between a Free section and a unsupported section.
     // Combined they exceed the limit.
     let half = MAX_RULES_PER_FILE as usize / 2;
     let mut content = String::from("--- Domains\n");
@@ -311,15 +311,18 @@ fn example_preset_secondary_passes_validation() {
 }
 
 #[test]
-fn fixture_preset_with_pro_sections_accepted_with_warnings() {
-    let bytes = include_bytes!("fixtures/preset_with_pro_sections.txt");
+fn fixture_preset_with_extended_sections_accepted_with_warnings() {
+    let bytes = include_bytes!("fixtures/preset_with_extended_sections.txt");
     let outcome = validate_preset_bytes(bytes);
     assert!(outcome.is_accepted(), "file must be accepted");
-    assert!(outcome.has_warnings(), "Pro sections must produce warnings");
+    assert!(
+        outcome.has_warnings(),
+        "unsupported sections must produce warnings"
+    );
     let pro_warnings: Vec<_> = outcome
         .warnings()
         .iter()
-        .filter(|w| matches!(w, PresetImportWarning::UnknownProSection { .. }))
+        .filter(|w| matches!(w, PresetImportWarning::UnknownSection { .. }))
         .collect();
     assert!(!pro_warnings.is_empty());
 }

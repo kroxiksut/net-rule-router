@@ -37,7 +37,7 @@
 //! - Application rules in Free tier support **block mode only** (WFP ALE
 //!   `FWP_ACTION_BLOCK` when secondary is unavailable). Traffic routing
 //!   via secondary must use an explicit IP-based rule alongside the app rule.
-//! - Full per-process routing (routing mode) is a Pro-tier feature via callout.
+//! - Full per-process routing (routing mode) is a unsupported feature via callout.
 //!
 //! ## Risk matrix
 //!

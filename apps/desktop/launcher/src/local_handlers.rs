@@ -301,7 +301,12 @@ fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
     // DTO. `serde_json::from_str` is forgiving of field order, which
     // is exactly the point — the GUI emits insertion-order JSON and
     // we re-emit in declaration order via `to_canonical_string`.
-    let dto: CanonicalRulesJsonV1 = serde_json::from_str(rules_json)?;
+    let mut dto: CanonicalRulesJsonV1 = serde_json::from_str(rules_json)?;
+    // Hash what the rules MEAN, not how they were typed: the window and the
+    // bound `.txt` keep the user's spelling while the service stores the
+    // validated one, so an unfolded hash reported a permanent app-vs-service
+    // difference over nothing but letter case.
+    nrr_shared::rules_json::fold_for_comparison(&mut dto);
     let canonical = to_canonical_string(&dto)?;
     // SHA-256 of the canonical bytes. Matches the service's
     // `content_hash` exactly when both sides receive equal rules,
@@ -405,6 +410,42 @@ mod tests {
             "rules-json": r#"{"schema-version":1,"primary":[{"id":"r1","enabled":true,"address-match":{"kind":"zone","name":"ru"}}],"secondary":[]}"#,
         });
         assert_eq!(hash_of(&with_empty), hash_of(&without));
+    }
+
+    /// The seven rules that kept the amber banner up through a whole session:
+    /// same routing, different letter case on each side.
+    #[test]
+    fn the_reported_divergence_folds_away() {
+        let typed = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r1\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"Cloud.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r2\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"DiskO*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r3\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"YandexDis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r4\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"hidemy.name VPN 3.0.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        let service = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r93\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"hidemy.name vpn 3.0.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r92\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"yandexdis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r91\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"disko*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r90\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"cloud.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        assert_eq!(hash_of(&typed), hash_of(&service));
+    }
+
+    /// The window and the bound `.txt` keep the user's spelling; the service
+    /// stores the validated one. Both must hash alike or the app-vs-service
+    /// alarm fires forever over letter case alone.
+    #[test]
+    fn app_name_spelling_does_not_change_the_hash() {
+        let typed = json!({
+            "rules-json": r#"{"schema-version":1,"primary":[{"id":"r1","enabled":true,"app-match":{"pattern":{"kind":"exact","value":"Cloud.exe"},"include-child-processes":false}}],"secondary":[]}"#,
+        });
+        let validated = json!({
+            "rules-json": r#"{"schema-version":1,"primary":[{"id":"r9","enabled":true,"app-match":{"pattern":{"kind":"exact","value":"cloud.exe"},"include-child-processes":false}}],"secondary":[]}"#,
+        });
+        assert_eq!(hash_of(&typed), hash_of(&validated));
+    }
+
+    /// Two sides may list the same rules in different orders — the service
+    /// returns them in its canonical order, a file in the user's.
+    #[test]
+    fn rule_order_does_not_change_the_hash() {
+        let one = json!({
+            "rules-json": r#"{"schema-version":1,"primary":[{"id":"r1","enabled":true,"address-match":{"kind":"zone","name":"ru"}},{"id":"r2","enabled":true,"address-match":{"kind":"zone","name":"su"}}],"secondary":[]}"#,
+        });
+        let other = json!({
+            "rules-json": r#"{"schema-version":1,"primary":[{"id":"r2","enabled":true,"address-match":{"kind":"zone","name":"su"}},{"id":"r1","enabled":true,"address-match":{"kind":"zone","name":"ru"}}],"secondary":[]}"#,
+        });
+        assert_eq!(hash_of(&one), hash_of(&other));
     }
 
     #[test]

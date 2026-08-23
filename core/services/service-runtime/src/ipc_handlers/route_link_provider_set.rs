@@ -22,9 +22,9 @@ use crate::ipc_handlers::providers::{
     LinkProviderWriter, RoutePolicyApplyTrigger, RoutePolicyWriteError,
 };
 
-/// Binding roles a link-provider set may target today. Free has exactly one
-/// secondary; `primary` is accepted for symmetry (Pro grows real multi-binding
-/// roles with the binding model).
+/// Binding roles a link-provider set may target today: exactly one secondary.
+/// `primary` is accepted for symmetry; further roles would come with a real
+/// multi-binding model.
 const ALLOWED_ROLES: [&str; 2] = ["secondary", "primary"];
 
 pub struct RouteLinkProviderSetHandler {
@@ -156,6 +156,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
+            caller_pid: None,
         }
     }
 

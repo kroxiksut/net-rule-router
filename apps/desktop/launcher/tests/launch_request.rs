@@ -65,3 +65,33 @@ fn unknown_argument_is_ignored() {
     assert_eq!(request.source, ActivationSource::Tray);
     assert_eq!(request.section, Some(AppSection::Settings));
 }
+
+#[test]
+fn a_cold_start_opens_the_section_the_tray_asked_for() {
+    // The tray hands work over by launching the exe with a section (and an
+    // intent slug). With no window running that launch IS the primary one, and
+    // preferring the remembered section there dropped the hand-off silently.
+    let request = parse_launch_request_arguments([
+        "--source=tray".to_string(),
+        "--section=rules".to_string(),
+        "--action=rules-drift-compare".to_string(),
+    ]);
+    let preferences = nrr_ui_support::ui_preferences::UiPreferences {
+        reopen_last_section_on_startup: true,
+        last_opened_section: AppSection::Diagnostics,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        nrr_launcher::launcher::cold_start_section(&request, &preferences),
+        AppSection::Rules
+    );
+    assert_eq!(request.action.as_deref(), Some("rules-drift-compare"));
+
+    // A plain launch still resumes where the user left off.
+    let plain = parse_launch_request_arguments(std::iter::empty::<String>());
+    assert_eq!(
+        nrr_launcher::launcher::cold_start_section(&plain, &preferences),
+        AppSection::Diagnostics
+    );
+}

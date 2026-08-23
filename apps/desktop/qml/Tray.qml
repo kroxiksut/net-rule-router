@@ -31,6 +31,12 @@ SystemTrayIcon {
     /// Same launch-time snapshot rule; absent in an older context file means
     /// "on", which is the shipped default.
     property bool notifySuggestionChanges: true
+    /// Per-kind mute for the "connection blocked" notice, and whether that
+    /// notice may name the destination at all. Same launch-time snapshot rule.
+    property bool notifyBlockNotices: true
+    property bool hideBlockNoticeAddresses: false
+    /// Whole-window opacity of the notice, in percent (Settings → General).
+    property int noticeOpacityPercent: 100
     property int autoCloseMs: 0
     property var autoCloseTimer: null
 
@@ -77,6 +83,7 @@ SystemTrayIcon {
         // to the window, not to whichever notification is occupying it.
         closeAccessibleText: tray.tr("action.close", "Close")
         copyLabel: tray.tr("action.copy", "Copy")
+        opacityPercent: tray.noticeOpacityPercent
         copiedLabel: tray.tr("action.copied", "Copied")
         onActionTriggered: function(actionId, selectedIndexes) {
             tray._onPromptAction(actionId, selectedIndexes)
@@ -150,6 +157,7 @@ SystemTrayIcon {
     function _onPromptRetired() {
         _activeNoticeId = ""
         _autoRuleActiveIds = []
+        _enforcementNoticeKind = ""
         _scheduleDrain()
     }
 
@@ -264,6 +272,12 @@ SystemTrayIcon {
             case "block-notice-raised":
                 _onBlockNoticeRaised(event)
                 break
+            case "enforcement-status-changed":
+                _onEnforcementStatusChanged(event)
+                break
+            case "unassigned-tunnel-detected":
+                _onUnassignedTunnel(event)
+                break
             case "revision-status-changed":
             case "health-changed":
                 // Both change the answer to "are rules being applied", which the
@@ -374,9 +388,6 @@ SystemTrayIcon {
     /// from `_autoRuleActiveIds` so a cancel can leave the original notice's
     /// candidates untouched instead of discarding them.
     property var _autoRulesModePendingIds: []
-    /// Anchor (the routed site the candidates were seen alongside) from the
-    /// most recent push; used as the `{name}` in the prompt body.
-    property string _autoRuleAnchor: ""
     property bool _autoRuleFetchInFlight: false
     /// How many suggestions the service is holding — the menu row's count.
     property int _autoRulePendingCount: 0
@@ -408,8 +419,9 @@ SystemTrayIcon {
             console.log("tray auto-rules: suppressed — the user asked for quiet")
             return
         }
-        var anchor = String(event["top-anchor"] || "")
-        if (anchor !== "") _autoRuleAnchor = anchor
+        // `top-anchor` is deliberately ignored: the prompt fetches the whole
+        // pending list, so the site named by one push does not describe what the
+        // user ends up seeing. The heading is derived from the shown rows.
         _fetchAutoRuleCandidates()
     }
 
@@ -505,21 +517,36 @@ SystemTrayIcon {
     function _presentAutoRulePrompt(candidates) {
         var ids = []
         var items = []
-        var anchor = _autoRuleAnchor
         // Which route the answer would put them on. The user asked to see it
         // before deciding; it is the anchor's own route, so it is the same for
         // every row of one site and only differs when sites are mixed.
         var routes = []
-        for (var i = 0; i < candidates.length; i += 1) {
+        // Anchors of the rows actually SHOWN. The push event's `top-anchor` is
+        // not usable for the heading: the list is fetched whole, so it routinely
+        // contains companions of other sites — a notice headed
+        // "notebooklm.google.com" listed rows belonging to chatgpt.com and
+        // reddit.com. The heading is derived from what the user can see.
+        var anchorCounts = ({})
+        // Group by site so rows of one site sit together; ties break on the
+        // name, so the same set always lists in the same order.
+        var ordered = (candidates || []).slice().sort(function(a, b) {
+            var aa = String((a || {}).anchor || "")
+            var bb = String((b || {}).anchor || "")
+            if (aa === bb) return 0
+            return aa < bb ? -1 : 1
+        })
+        for (var i = 0; i < ordered.length; i += 1) {
             if (ids.length >= _autoRuleMaxPerNotice) break
-            var c = candidates[i] || {}
+            var c = ordered[i] || {}
             var id = String(c.id || c["id"] || "")
             if (id === "") continue
             if (_autoRuleShowAll
                     ? noticeLedger.isDecided(_autoRuleRefusedId(id))
                     : _autoRuleAnswered(id)) continue
             var candidateAnchor = String(c.anchor || c["anchor"] || "")
-            if (anchor === "" && candidateAnchor !== "") anchor = candidateAnchor
+            if (candidateAnchor !== "") {
+                anchorCounts[candidateAnchor] = Number(anchorCounts[candidateAnchor] || 0) + 1
+            }
             var candidateRoute = String(c.route || c["route"] || "")
             if (candidateRoute !== "" && routes.indexOf(candidateRoute) < 0) {
                 routes.push(candidateRoute)
@@ -532,6 +559,12 @@ SystemTrayIcon {
                 detailText: _candidateDetailLine(c)
             })
         }
+        var anchorNames = Object.keys(anchorCounts)
+        anchorNames.sort(function(a, b) {
+            var d = anchorCounts[b] - anchorCounts[a]
+            return d !== 0 ? d : (a < b ? -1 : (a > b ? 1 : 0))
+        })
+        var anchor = anchorNames.length > 0 ? anchorNames[0] : ""
         if (ids.length === 0) {
             console.log("tray auto-rules: every candidate was already answered — nothing to show")
             // A click that produces no window reads as a broken menu item, so
@@ -563,9 +596,15 @@ SystemTrayIcon {
         var siteName = anchor !== ""
             ? anchor
             : tr("tray.auto-rules.site-fallback", "a site you use")
-        var bodyText = tr("tray.auto-rules.body",
-                "Found addresses without which {name} will not work fully.")
-            .replace("{name}", siteName)
+        // One heading cannot honestly name one site when the rows belong to
+        // several; each row still says which site it came from.
+        var bodyText = anchorNames.length > 1
+            ? tr("tray.auto-rules.body-multi",
+                    "Found addresses that {count} of the sites you routed need.")
+                .replace("{count}", String(anchorNames.length))
+            : tr("tray.auto-rules.body",
+                    "Found addresses without which {name} will not work fully.")
+                .replace("{name}", siteName)
         // Mixed routes are named per row instead; one shared route reads
         // better as a sentence than as a repeated tag.
         if (routes.length === 1) {
@@ -696,7 +735,8 @@ SystemTrayIcon {
                 "External address of the additional route: {address}")
             .replace("{address}", "<b>" + address + "</b>")
         if (adapter !== "") {
-            body = body + "\n" + tr("tray.external-address.adapter", "Adapter: {name}")
+            // `<br>`, not `\n`: StyledText collapses a bare newline.
+            body = body + "<br>" + tr("tray.external-address.adapter", "Adapter: {name}")
                 .replace("{name}", adapter)
         }
         _activeNoticeId = noticeId
@@ -785,14 +825,18 @@ SystemTrayIcon {
             items: items,
             listAccessibleName: tr("tray.rules-drift.list-accessible-name",
                 "Rule files that differ"),
+            // Looking first, acting second: "Apply" here takes the FILE side
+            // and would silently drop an edit the user has open in the window.
+            // The accented answer is therefore the one that shows the
+            // difference; applying stays available, one button over.
             primaryAction: {
-                label: tr("action.apply", "Apply"),
-                actionId: "rules-drift-apply",
+                label: tr("tray.rules-drift.action.compare", "Open and compare"),
+                actionId: "rules-drift-open",
                 accent: true
             },
             secondaryAction: {
-                label: tr("action.open-main-window", "Open NetRuleRouter"),
-                actionId: "rules-drift-open"
+                label: tr("tray.rules-drift.action.apply-files", "Apply the files"),
+                actionId: "rules-drift-apply"
             },
             dismissAction: {
                 label: tr("notifications.dismiss", "Dismiss"),
@@ -832,7 +876,7 @@ SystemTrayIcon {
     property string _blockNoticeReason: ""
 
     function _onBlockNoticeRaised(event) {
-        if (!showNotifications) {
+        if (!showNotifications || !notifyBlockNotices) {
             console.log("tray block-notice: suppressed — notifications are off")
             return
         }
@@ -869,6 +913,10 @@ SystemTrayIcon {
             case "blocked-by-rule":
                 return tr("tray.block-notice.reason.blocked-by-rule",
                     "A rule blocks this address directly.")
+            case "ipv6-blocked":
+                return tr("tray.block-notice.reason.ipv6-blocked",
+                    "IPv6 is switched off while leak protection is on, and this address is IPv6. "
+                    + "No rule blocked it — the switch is in Settings.")
             case "unattributed":
                 return tr("tray.block-notice.reason.unattributed",
                     "NetRuleRouter blocked this address, but could not identify which filter did it.")
@@ -878,21 +926,49 @@ SystemTrayIcon {
         }
     }
 
+    /// What the user is told the notice is about. The destination is the one
+    /// field the "hide addresses" preference covers — a screen being shared
+    /// must not leak it, here or in the mute chooser's buttons.
+    function _blockNoticeDestinationText() {
+        return hideBlockNoticeAddresses
+            ? tr("notifications.block-notice.destination-hidden", "a hidden destination")
+            : _blockNoticeDestination
+    }
+
+    /// `&` is legal in a Windows path and in a host label; StyledText would
+    /// eat it as an entity. `<` cannot occur in either, so one rule is enough.
+    function _escapeMarkup(text) {
+        return String(text).replace(/&/g, "&amp;")
+    }
+
     function _showBlockNotice(destination, app, reason, attempts) {
         _blockNoticeDestination = destination
         _blockNoticeApp = app
         _blockNoticeReason = reason
         _activeNoticeId = ""
-        var summaryParts = [destination]
-        if (app !== "") summaryParts.push(app)
+        // Bold only the identifiers, never the sentence around them: the
+        // markup lives here so the locale strings stay plain prose.
+        var summaryParts = ["<b>" + _escapeMarkup(_blockNoticeDestinationText()) + "</b>"]
+        if (app !== "") summaryParts.push("<b>" + _escapeMarkup(app) + "</b>")
         summaryParts.push(tr("tray.block-notice.attempts", "{count} attempts")
             .replace("{count}", String(attempts)))
-        var body = summaryParts.join(" · ") + "\n" + _blockNoticeReasonLine(reason)
+        // `<br>`, not `\n`: StyledText collapses a bare newline.
+        var body = summaryParts.join(" · ") + "<br>"
+            + _escapeMarkup(_blockNoticeReasonLine(reason))
         // "Route unavailable" already means the address HAS a rule pointing at
         // a route — offering to add it there again would write nothing. What
         // the user can actually do is look at the route.
         var routeIsDown = (reason === "route-unavailable")
-        var primary = routeIsDown
+        // A closed IPv6 family is governed by a switch, not by a rule: routing
+        // an IPv6 address would write a rule the engine cannot enforce.
+        var ipv6Closed = (reason === "ipv6-blocked")
+        var primary = ipv6Closed
+            ? {
+                label: tr("notifications.strict-killswitch.action", "Open settings"),
+                actionId: "block-notice-open-settings",
+                accent: true
+            }
+            : routeIsDown
             ? {
                 label: tr("tray.block-notice.action.open-routes",
                     "Open routes"),
@@ -913,6 +989,7 @@ SystemTrayIcon {
                 ? tr("tray.block-notice.title-route-down", "Additional route is unavailable")
                 : tr("tray.block-notice.title", "Connection blocked"),
             bodyText: body,
+            bodyRichText: true,
             primaryAction: primary,
             secondaryAction: {
                 label: tr("tray.block-notice.action.snooze", "Snooze"),
@@ -928,6 +1005,247 @@ SystemTrayIcon {
             // just answer nothing — closing this toast is not a decision.
             dismissActionId: "block-notice-dismiss",
             autoRetireMs: _promptAutoRetireMs
+        })
+    }
+
+    /// Queue kind of the enforcement notice on screen; "" when none. Keyed by
+    /// role because the service reports each role independently — an `ok` for
+    /// one must not take down the other's question — and carried as the whole
+    /// kind so "nothing on screen" stays distinguishable from a roleless one.
+    property string _enforcementNoticeKind: ""
+
+    /// Roles the service last reported as not enforced. Kept apart from what is
+    /// on screen: the question may have been suppressed (window in front,
+    /// notifications off) and coming back out of this set is still news.
+    property var _enforcementDownRoles: []
+
+    /// How long the "routing is back" line stays up. It asks nothing.
+    readonly property int _enforcementRestoredNoticeMs: 15000
+
+    /// How long the "a link is down" notice stays up. It used to wait for the
+    /// user or for the service to report the role enforced again, which meant a
+    /// user who turned their own VPN off had a window sitting there until they
+    /// closed it. The state itself is not lost — the tray icon and its tooltip
+    /// keep saying so, and the notice does not re-raise for the same role.
+    readonly property int _enforcementNoticeMs: 45000
+
+    /// Take the standing enforcement notice for `role` down — on screen and in
+    /// the queue. The state it described is over; the question no longer has an
+    /// answer worth giving.
+    function _clearEnforcementNotice(role) {
+        var kind = "enforcement-status:" + String(role || "")
+        var kept = []
+        for (var i = 0; i < _noticeQueue.length; i += 1) {
+            if (_noticeQueue[i].kind !== kind) kept.push(_noticeQueue[i])
+        }
+        if (kept.length !== _noticeQueue.length) _noticeQueue = kept
+        if (_enforcementNoticeKind === kind) {
+            _enforcementNoticeKind = ""
+            // `retire()` closes through a timer, so the window is still visible
+            // here and the notice below queues behind it — which is exactly the
+            // settling the drain timer exists to give.
+            if (promptWindow && promptWindow.visible) promptWindow.retire()
+        }
+    }
+
+    /// The channel carries the rules again. The browser will not say so: a page
+    /// refused while the channel was down keeps its error until it is reloaded.
+    function _noteEnforcementRestored() {
+        if (!showNotifications) return
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        _presentOrQueue("enforcement-restored", function() {
+            promptWindow.present({
+                titleText: tray.tr("notifications.enforcement.restored.title",
+                    "Routing is working again"),
+                bodyText: tray.tr("notifications.enforcement.restored.body",
+                    "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
+                dismissActionId: "enforcement-restored-dismiss",
+                autoRetireMs: tray._enforcementRestoredNoticeMs
+            })
+        })
+    }
+
+    /// The last state announced per role, so a service that keeps reporting the
+    /// same outage does not re-raise the same window every time the notice
+    /// retires. Mutated in place: nothing binds to it.
+    property var _enforcementShownByRole: ({})
+
+    /// Policy stopped being enforced for this user. The notice retires on a
+    /// timer — a user who switched their own tunnel off should not have to
+    /// close a window about it — but it is announced ONCE per state: the tray
+    /// icon and its tooltip go on saying so, which is what keeps "your rules
+    /// are not applied" from going invisible for a whole session.
+    // ── Local networks waiting for an answer ─────────────────────────────────
+    //
+    // A hypervisor installed months into using the app creates its network
+    // quietly, and the service exempts it from the kill-switch on its own. That
+    // is nearly always the right answer, but the user still gets to confirm it,
+    // and the window may not be open for weeks. Asked once a day at most.
+
+    property real _localNetworkAskedAtMs: 0
+    readonly property real _localNetworkAskIntervalMs: 24 * 60 * 60 * 1000
+
+    function _checkPendingLocalNetworks() {
+        if (!showNotifications) return
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcLocalNetworksGet !== "function") return
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        var corr = rpc.rpcLocalNetworksGet()
+        if (!corr || corr === "") return
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok || !payload) return
+            var pending = (payload.networks || []).filter(function(n) {
+                return n && n["decided-by-user"] !== true
+            })
+            if (pending.length === 0) return
+            tray._localNetworkAskedAtMs = Date.now()
+            var first = pending[0] || {}
+            var body = tray.tr("notifications.local-networks.body",
+                    "{cidr} on {adapter} stays reachable while routed traffic is blocked. Keep it that way?")
+                .replace("{cidr}", String(first.cidr || ""))
+                .replace("{adapter}", String(first.adapter || ""))
+            tray._presentOrQueue("local-networks", function() {
+                promptWindow.present({
+                    titleText: tray.tr("notifications.local-networks.title",
+                        "A local network was found"),
+                    bodyText: body,
+                    primaryAction: {
+                        label: tray.tr("notifications.local-networks.action", "Open settings"),
+                        actionId: "block-notice-open-settings",
+                        accent: true
+                    },
+                    dismissActionId: "enforcement-dismiss"
+                })
+            })
+        })
+    }
+
+    property Timer _localNetworkAskTimer: Timer {
+        interval: tray._localNetworkAskIntervalMs
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: tray._checkPendingLocalNetworks()
+    }
+
+    /// A tunnel is up and nothing is bound to the additional route, so every
+    /// rule naming it does nothing. The service decides WHEN to say this (once
+    /// a day per connection, personal clients only); the tray only shows it.
+    function _onUnassignedTunnel(event) {
+        var adapter = String(event["adapter-name"] || "")
+        if (adapter === "") return
+        if (!showNotifications) {
+            console.log("tray unassigned-tunnel notice: suppressed — notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) return
+        _presentOrQueue("unassigned-tunnel", function() {
+            promptWindow.present({
+                titleText: tr("notifications.unassigned-tunnel.title",
+                    "The additional route is not assigned"),
+                bodyText: tr("notifications.unassigned-tunnel.body",
+                        "{adapter} is up, but no connection is assigned to the additional route — so the sites your rules send there will not open.")
+                    .replace("{adapter}", adapter),
+                primaryAction: {
+                    label: tr("notifications.unassigned-tunnel.action", "Assign it now"),
+                    actionId: "enforcement-open-interfaces",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
+        })
+    }
+
+    function _onEnforcementStatusChanged(event) {
+        var status = String(event.status || "")
+        var role = String(event.role || "")
+        var wasDown = _enforcementDownRoles.indexOf(role) >= 0
+        if (status === "" || status === "ok") {
+            _clearEnforcementNotice(role)
+            delete _enforcementShownByRole[role]
+            if (wasDown) {
+                _enforcementDownRoles = _enforcementDownRoles.filter(
+                    function(r) { return r !== role })
+                _noteEnforcementRestored()
+            }
+            return
+        }
+        if (!wasDown) _enforcementDownRoles = _enforcementDownRoles.concat([role])
+        if (_enforcementShownByRole[role] === status) return
+        _enforcementShownByRole[role] = status
+        if (!showNotifications) {
+            console.log("tray enforcement notice: suppressed — notifications are off")
+            return
+        }
+        var presence = guiPresence ? guiPresence.read() : { windowActive: false }
+        if (presence.windowActive) {
+            console.log("tray enforcement notice: suppressed — main window is active")
+            return
+        }
+        var candidates = event.candidates || []
+        var title = ""
+        var body = ""
+        if (status === "adapter-choice-needed") {
+            title = tr("notifications.enforcement.adapter-choice.title",
+                "Choose which adapter to use")
+            body = tr("notifications.enforcement.adapter-choice.body",
+                    "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
+                .replace("{list}", candidates.join(", "))
+        } else if (status === "no-primary-route") {
+            title = tr("notifications.enforcement.no-primary.title",
+                "Main connection is not set")
+            body = tr("notifications.enforcement.no-primary.body",
+                "Without a main connection there is nowhere to send traffic your rules do not route, so the rules are not being applied.")
+        } else if (status === "no-policy") {
+            title = tr("notifications.enforcement.no-policy.title",
+                "Connections are not chosen yet")
+            body = tr("notifications.enforcement.no-policy.body",
+                "The service has no routing settings for you yet, so nothing is being routed. Choose the main and additional connections.")
+        } else if (status === "secondary-down") {
+            // The service reports which role went down; before this the primary
+            // going down was announced as "the additional connection is not up".
+            if (role === "primary") {
+                title = tr("notifications.enforcement.primary-down.title",
+                    "The main connection is not up")
+                body = tr("notifications.enforcement.primary-down.body",
+                    "Traffic that is not routed to the additional connection has nowhere to go until it comes back. Check the cable, the Wi-Fi, or pick another main connection.")
+            } else {
+                title = tr("notifications.enforcement.secondary-down.title",
+                    "The additional connection is not up")
+                body = tr("notifications.enforcement.secondary-down.body",
+                    "Everything your rules send there is being held until it comes back — that is the protection doing its job, not a fault. Start the connection, or move those rules to the main one.")
+            }
+        } else if (status === "adapters-unreadable") {
+            title = tr("notifications.enforcement.adapters-unreadable.title",
+                "Cannot read the list of connections")
+            body = tr("notifications.enforcement.adapters-unreadable.body",
+                "The service cannot enumerate network adapters right now, so your rules are not being applied. This usually clears itself; if it does not, restart the service.")
+        } else {
+            title = tr("notifications.enforcement.unknown.title",
+                "Your rules are not being applied")
+            body = tr("notifications.enforcement.unknown.body",
+                "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
+        }
+        // Keyed by role, not by "enforcement-status" alone: a missing primary
+        // and a downed secondary are two questions, and the newer one must not
+        // silently replace the older in the queue.
+        _presentOrQueue("enforcement-status:" + role, function() {
+            tray._enforcementNoticeKind = "enforcement-status:" + role
+            promptWindow.present({
+                titleText: title,
+                bodyText: body,
+                primaryAction: {
+                    label: tr("notifications.enforcement.action", "Open interfaces"),
+                    actionId: "enforcement-open-interfaces",
+                    accent: true
+                },
+                dismissActionId: "enforcement-dismiss",
+                autoRetireMs: tray._enforcementNoticeMs
+            })
         })
     }
 
@@ -975,7 +1293,7 @@ SystemTrayIcon {
             titleText: tr("tray.block-notice.snooze.title", "Snooze this notice"),
             bodyText: tr("tray.block-notice.snooze.body",
                 "Stop asking about {name} for a while.")
-                .replace("{name}", _blockNoticeDestination),
+                .replace("{name}", _blockNoticeDestinationText()),
             primaryAction: {
                 label: tr("tray.block-notice.snooze.for-15-minutes", "15 minutes"),
                 actionId: "block-notice-snooze-15m"
@@ -1012,9 +1330,18 @@ SystemTrayIcon {
             { "kind": "host", "host": _blockNoticeDestination }, Date.now() + ms)
     }
 
+    /// A button label carries the real name so "this app" is never a question
+    /// the user has to answer from memory — but a full FQDN or a long
+    /// executable name would push the footer into extra rows, so it is cut.
+    function _blockNoticeMuteName(text) {
+        var name = String(text)
+        return name.length > 28 ? name.slice(0, 27) + "…" : name
+    }
+
     function _showBlockNoticeMuteChoice() {
         var slots = [{
-            label: tr("tray.block-notice.mute.this-host", "This host"),
+            label: tr("tray.block-notice.mute.this-host", "Only {name}")
+                .replace("{name}", _blockNoticeMuteName(_blockNoticeDestinationText())),
             actionId: "block-notice-mute-host",
             accent: true
         }]
@@ -1022,7 +1349,8 @@ SystemTrayIcon {
         // unattributed connection has nothing for that scope to cover.
         if (_blockNoticeApp !== "") {
             slots.push({
-                label: tr("tray.block-notice.mute.this-app", "This app"),
+                label: tr("tray.block-notice.mute.this-app", "Only {name}")
+                    .replace("{name}", _blockNoticeMuteName(_blockNoticeApp)),
                 actionId: "block-notice-mute-app"
             })
         }
@@ -1030,19 +1358,19 @@ SystemTrayIcon {
         // "tell me when a rule blocks something, but not every tunnel outage".
         if (_blockNoticeReason !== "") {
             slots.push({
-                label: _blockNoticeMuteReasonLabel(_blockNoticeReason),
+                label: tr("tray.block-notice.mute.this-reason", "All \"{name}\"")
+                    .replace("{name}", _blockNoticeMuteReasonLabel(_blockNoticeReason)),
                 actionId: "block-notice-mute-reason"
             })
         }
         slots.push({
-            label: tr("tray.block-notice.mute.all", "All block notifications"),
+            label: tr("tray.block-notice.mute.all", "Every block notification"),
             actionId: "block-notice-mute-all"
         })
         promptWindow.present({
-            titleText: tr("tray.block-notice.mute.title", "Don't show this notice again"),
+            titleText: tr("tray.block-notice.mute.title", "What should stop appearing?"),
             bodyText: tr("tray.block-notice.mute.body",
-                "Choose what to stop hearing about {name}.")
-                .replace("{name}", _blockNoticeDestination),
+                "Mutes can be lifted later in Settings, General, under active mutes."),
             primaryAction: slots[0] || null,
             secondaryAction: slots[1] || null,
             tertiaryAction: slots[2] || null,
@@ -1063,6 +1391,8 @@ SystemTrayIcon {
                 return tr("block-reason.not-covered-by-rules", "Addresses no rule covers")
             case "blocked-by-rule":
                 return tr("block-reason.blocked-by-rule", "Blocks by rule")
+            case "ipv6-blocked":
+                return tr("block-reason.ipv6-blocked", "IPv6 blocks")
             case "unattributed":
                 return tr("block-reason.unattributed", "Blocks without an identified filter")
             default:
@@ -1145,8 +1475,24 @@ SystemTrayIcon {
             _confirmBlockNoticeRoute()
             return
         }
-        if (action === "block-notice-open-routes") {
+        if (action === "block-notice-open-routes"
+                || action === "enforcement-open-interfaces") {
+            _enforcementNoticeKind = ""
             triggerAction("interfaces-routes")
+            _scheduleDrain()
+            return
+        }
+        if (action === "block-notice-open-settings") {
+            triggerAction("settings")
+            _scheduleDrain()
+            return
+        }
+        if (action === "enforcement-dismiss") {
+            _enforcementNoticeKind = ""
+            _scheduleDrain()
+            return
+        }
+        if (action === "enforcement-restored-dismiss") {
             _scheduleDrain()
             return
         }
@@ -1287,8 +1633,11 @@ SystemTrayIcon {
                 triggerAction("rules-drift-apply")
                 break
             case "rules-drift-open":
+                // Not a plain "go to Rules": the window has to re-measure and
+                // SHOW the divergence this notice is about, so the intent
+                // travels with the hand-off.
                 _rulesDriftNoticeId = ""
-                triggerAction("rules")
+                triggerAction("rules-drift-compare")
                 break
             case "rules-drift-dismiss":
                 _rulesDriftNoticeId = ""
@@ -1751,6 +2100,11 @@ SystemTrayIcon {
         quickActions = context.quickActions || []
         showNotifications = context.showNotifications !== false
         notifySuggestionChanges = context.notifySuggestionChanges !== false
+        notifyBlockNotices = context.notifyBlockNotices !== false
+        hideBlockNoticeAddresses = context.hideBlockNoticeAddresses === true
+        if (context.trayNoticeOpacityPercent !== undefined) {
+            noticeOpacityPercent = parseInt(context.trayNoticeOpacityPercent) || 100
+        }
     }
 
     // ── What the tray says about itself ──────────────────────────────────────
@@ -1960,6 +2314,77 @@ SystemTrayIcon {
     // The tooltip states whether the event stream is live, so a change in either
     // of these has to be reflected there.
     on_LastSubscribeFailureCodeChanged: refreshTooltip()
+    /// Notices the service raised while nothing was subscribed. One summary
+    /// notice, not one window per entry.
+    property Timer _blockNoticeBacklogTimer: Timer {
+        interval: 10000
+        repeat: false
+        onTriggered: tray._drainBlockNoticeJournal()
+    }
+
+    function _drainBlockNoticeJournal() {
+        if (!showNotifications || !notifyBlockNotices) return
+        if (!bridgeAvailable || !rpc
+                || typeof rpc.rpcBlockNoticeJournalList !== "function") return
+        var corr = rpc.rpcBlockNoticeJournalList()
+        if (!corr || corr === "") return
+        rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            var entries = (p && p.entries) || []
+            if (entries.length === 0) return
+            var throughId = 0
+            var shown = []
+            for (var i = 0; i < entries.length; i += 1) {
+                var id = Number(entries[i].id || 0)
+                if (id > throughId) throughId = id
+                var dest = String(entries[i].destination || "")
+                if (dest !== "" && shown.indexOf(dest) < 0) shown.push(dest)
+            }
+            tray._showBlockNoticeBacklog(entries.length, shown)
+            if (throughId > 0) {
+                var ackCorr = rpc.rpcBlockNoticeJournalAck({ "through-id": throughId })
+                rpc.registerRpcCallback(ackCorr, function(ackOk, ackPayload, code, msg) {
+                    if (!ackOk) console.warn("tray journal ack failed:", code, msg)
+                })
+            }
+        })
+    }
+
+    function _showBlockNoticeBacklog(count, destinations) {
+        var names = hideBlockNoticeAddresses ? [] : destinations.slice(0, 5)
+        var rest = hideBlockNoticeAddresses
+            ? 0 : Math.max(0, destinations.length - names.length)
+        var body = tr("notifications.block-notice.backlog.body",
+                "The service blocked {count} connection(s) while neither this window nor "
+                + "the tray icon was running.")
+            .replace("{count}", "<b>" + String(count) + "</b>")
+        if (names.length > 0) {
+            var list = names.map(function(n) { return _escapeMarkup(n) }).join(", ")
+            if (rest > 0) {
+                list = list + ", "
+                    + tr("notifications.block-notice.backlog.more", "and {count} more")
+                        .replace("{count}", String(rest))
+            }
+            body = body + "<br>" + tr("notifications.block-notice.backlog.destinations",
+                "Destinations: {list}.").replace("{list}", list)
+        }
+        _presentOrQueue("block-notice-backlog", function() {
+            promptWindow.present({
+                titleText: tr("notifications.block-notice.backlog.title",
+                    "Blocked while the app was closed"),
+                bodyText: body,
+                bodyRichText: true,
+                primaryAction: {
+                    label: tr("action.close", "Close"),
+                    actionId: "block-notice-backlog-dismiss",
+                    accent: true
+                },
+                dismissActionId: "block-notice-backlog-dismiss",
+                autoRetireMs: _promptAutoRetireMs
+            })
+        })
+    }
+
     function _subscribeStatusUpdatesTray() {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
@@ -1984,6 +2409,10 @@ SystemTrayIcon {
                 // The event stream is live, so the tray can now say what is
                 // actually being enforced instead of guessing.
                 tray._refreshEnforcementState()
+                // Both surfaces drain the same backlog, and the main window
+                // does it immediately. Waiting lets its acknowledgement land
+                // first, so a user who has both up is told once, not twice.
+                tray._blockNoticeBacklogTimer.restart()
             }
         })
     }

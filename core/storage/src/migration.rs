@@ -44,7 +44,8 @@ use crate::schema::{
     STATE_DB_V39_DDL, STATE_DB_V3_DDL, STATE_DB_V40_DDL, STATE_DB_V41_DDL, STATE_DB_V42_DDL,
     STATE_DB_V43_DDL, STATE_DB_V44_DDL, STATE_DB_V45_DDL, STATE_DB_V46_DDL, STATE_DB_V47_DDL,
     STATE_DB_V48_DDL, STATE_DB_V49_DDL, STATE_DB_V4_DDL, STATE_DB_V50_DDL, STATE_DB_V51_DDL,
-    STATE_DB_V52_DDL, STATE_DB_V5_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
+    STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
+    STATE_DB_V57_DDL, STATE_DB_V5_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
     STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
 };
 
@@ -323,7 +324,7 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
     // `route_link_provider_apps`: per-(sid, role) executables
     // the user confirmed as establishing the link (VPN client et al.). Service-
     // side SSOT for the kill-switch link-provider exemption; per-binding by
-    // construction for Pro. Purely additive CREATE TABLE. DEV schema; wiped
+    // construction. Purely additive CREATE TABLE. DEV schema; wiped
     // freely.
     MigrationDef {
         version: 30,
@@ -531,6 +532,43 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_auto_rule_evidence",
         stmts: STATE_DB_V52_DDL,
     },
+    // Per-principal exceptions for LOCAL networks under the kill-switch: the
+    // hypervisor segments a user does not want exempted, plus networks we
+    // cannot discover (a NAT-mode hypervisor creates no host interface).
+    MigrationDef {
+        version: 53,
+        name: "add_local_network_rules",
+        stmts: STATE_DB_V53_DDL,
+    },
+    // Main-link probing: the per-principal opt-in plus the bounds one pass may
+    // cost. Asked for explicitly by the owner: the limits belong to the user,
+    // not to a constant in the binary.
+    MigrationDef {
+        version: 54,
+        name: "add_primary_probe_preferences",
+        stmts: STATE_DB_V54_DDL,
+    },
+    // Sites the user says refuse main-link addresses. The only thing no
+    // measurement here can establish, so it is recorded rather than inferred.
+    MigrationDef {
+        version: 55,
+        name: "add_refusing_anchors",
+        stmts: STATE_DB_V55_DDL,
+    },
+    // IPv6 under leak protection. Default ON: a rule that closes a host over
+    // one address family only has not closed it.
+    MigrationDef {
+        version: 56,
+        name: "add_block_ipv6_when_protected",
+        stmts: STATE_DB_V56_DDL,
+    },
+    // Notices raised with no surface listening. Without this the push channel
+    // silently dropped them and a service-only user heard nothing.
+    MigrationDef {
+        version: 57,
+        name: "add_block_notice_journal",
+        stmts: STATE_DB_V57_DDL,
+    },
 ];
 
 // ── Required schema elements — used by verify_schema ─────────────────────────
@@ -617,6 +655,12 @@ const STATE_REQUIRED_TABLES: &[&str] = &[
     // State DB v49 — durable block-notice mutes.
     "block_notice_mutes",
     "auto_rule_evidence",
+    // State DB v53 — per-principal local-network exceptions.
+    "local_network_rules",
+    // State DB v55 — sites the user says refuse main-link addresses.
+    "refusing_anchors",
+    // State DB v57 — notices raised with nobody listening.
+    "block_notice_journal",
 ];
 
 const STATE_REQUIRED_INDEXES: &[&str] = &[
@@ -639,6 +683,8 @@ const STATE_REQUIRED_INDEXES: &[&str] = &[
     "idx_app_observed_destinations_learned",
     // State DB v49 — durable block-notice mutes.
     "idx_block_notice_mutes_sid",
+    // State DB v57 — notices raised with nobody listening.
+    "idx_block_notice_journal_sid",
 ];
 
 // ── Connection factory ────────────────────────────────────────────────────────
@@ -1220,7 +1266,7 @@ mod tests {
         // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
         // + v49 (block_notice_mutes table — durable "do not show" choices)
         // + v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(s.to_version, 52);
+        assert_eq!(s.to_version, 57);
         assert_eq!(
             s.migrations_applied,
             [
@@ -1276,6 +1322,11 @@ mod tests {
                 "add_isp_block_candidates_enabled",
                 "widen_block_notice_mute_scopes",
                 "add_auto_rule_evidence",
+                "add_local_network_rules",
+                "add_primary_probe_preferences",
+                "add_refusing_anchors",
+                "add_block_ipv6_when_protected",
+                "add_block_notice_journal",
             ]
         );
     }
@@ -1287,8 +1338,8 @@ mod tests {
 
         runner.run_pending_migrations().expect("first run");
         let s = runner.run_pending_migrations().expect("second run");
-        assert_eq!(s.from_version, 52);
-        assert_eq!(s.to_version, 52);
+        assert_eq!(s.from_version, 57);
+        assert_eq!(s.to_version, 57);
         assert!(s.migrations_applied.is_empty());
     }
 
@@ -1314,7 +1365,7 @@ mod tests {
         let v = runner.verify_schema().expect("verify");
         assert!(v.is_ok(), "state schema verification failed: {v:?}");
         // through v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(v.version, 52);
+        assert_eq!(v.version, 57);
     }
 
     #[test]
@@ -1614,7 +1665,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
         assert_eq!(summary.from_version, 1);
-        assert_eq!(summary.to_version, 52);
+        assert_eq!(summary.to_version, 57);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1669,6 +1720,11 @@ mod tests {
                 "add_isp_block_candidates_enabled",
                 "widen_block_notice_mute_scopes",
                 "add_auto_rule_evidence",
+                "add_local_network_rules",
+                "add_primary_probe_preferences",
+                "add_refusing_anchors",
+                "add_block_ipv6_when_protected",
+                "add_block_notice_journal",
             ]
         );
 
@@ -1704,7 +1760,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
         assert_eq!(summary.from_version, 2);
-        assert_eq!(summary.to_version, 52);
+        assert_eq!(summary.to_version, 57);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1758,6 +1814,11 @@ mod tests {
                 "add_isp_block_candidates_enabled",
                 "widen_block_notice_mute_scopes",
                 "add_auto_rule_evidence",
+                "add_local_network_rules",
+                "add_primary_probe_preferences",
+                "add_refusing_anchors",
+                "add_block_ipv6_when_protected",
+                "add_block_notice_journal",
             ]
         );
 

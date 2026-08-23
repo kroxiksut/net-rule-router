@@ -188,6 +188,129 @@ impl IpcHandler for ApplyFailurePolicySetHandler {
     }
 }
 
+// ── Probing a suggestion against the main link ────────────────────────────────
+
+pub struct AutoRuleCandidatesProbeHandler {
+    runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>,
+}
+
+impl AutoRuleCandidatesProbeHandler {
+    pub fn new(runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>) -> Self {
+        Self { runner }
+    }
+}
+
+impl IpcHandler for AutoRuleCandidatesProbeHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let req: nrr_shared::ipc_payloads::AutoRuleCandidatesProbeRequest =
+            serde_json::from_value(request.payload.clone())
+                .map_err(|e| malformed("autorules.candidates.probe", e))?;
+        let sid = ctx.caller_stored();
+        if sid.is_empty() {
+            return Err(IpcError {
+                code: IpcErrorCode::Internal,
+                message: "autorules.candidates.probe: caller SID unavailable".into(),
+                diagnostics_id: None,
+            });
+        }
+        serialise(
+            "autorules.candidates.probe",
+            self.runner
+                .probe(sid.as_ref(), &req.ids, &req.rule_hostnames),
+        )
+    }
+}
+
+// ── Sites that refuse main-link addresses ────────────────────────────────────
+
+pub struct RefusingAnchorSetHandler {
+    writer: Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>,
+}
+
+impl RefusingAnchorSetHandler {
+    pub fn new(writer: Arc<dyn crate::ipc_handlers::providers::RefusingAnchorsWriter>) -> Self {
+        Self { writer }
+    }
+}
+
+impl IpcHandler for RefusingAnchorSetHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let req: nrr_shared::ipc_payloads::RefusingAnchorSetRequest =
+            serde_json::from_value(request.payload.clone())
+                .map_err(|e| malformed("autorules.refusing-anchor.set", e))?;
+        let sid = ctx.caller_stored();
+        if sid.is_empty() {
+            return Err(IpcError {
+                code: IpcErrorCode::Internal,
+                message: "autorules.refusing-anchor.set: caller SID unavailable".into(),
+                diagnostics_id: None,
+            });
+        }
+        serialise(
+            "autorules.refusing-anchor.set",
+            self.writer.set(sid.as_ref(), &req.hostname, req.refusing),
+        )
+    }
+}
+
+// ── Local networks under the kill-switch ─────────────────────────────────────
+
+pub struct LocalNetworksGetHandler {
+    provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>,
+}
+
+impl LocalNetworksGetHandler {
+    pub fn new(provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+impl IpcHandler for LocalNetworksGetHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let _: nrr_shared::ipc_payloads::LocalNetworksGetRequest =
+            serde_json::from_value(request.payload.clone())
+                .map_err(|e| malformed("settings.local-networks.get", e))?;
+        let sid = ctx.caller_stored();
+        serialise(
+            "settings.local-networks.get",
+            self.provider.list(sid.as_ref()),
+        )
+    }
+}
+
+pub struct LocalNetworksSetHandler {
+    provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>,
+}
+
+impl LocalNetworksSetHandler {
+    pub fn new(provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>) -> Self {
+        Self { provider }
+    }
+}
+
+impl IpcHandler for LocalNetworksSetHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let req: nrr_shared::ipc_payloads::LocalNetworksSetRequest =
+            serde_json::from_value(request.payload.clone())
+                .map_err(|e| malformed("settings.local-networks.set", e))?;
+        // These exemptions are per-principal; an unattributable caller must not
+        // be able to write into someone else's set (or into an empty-SID row
+        // nothing would ever read).
+        let sid = ctx.caller_stored();
+        if sid.is_empty() {
+            return Err(IpcError {
+                code: IpcErrorCode::Internal,
+                message: "settings.local-networks.set: caller SID unavailable".into(),
+                diagnostics_id: None,
+            });
+        }
+        serialise(
+            "settings.local-networks.set",
+            self.provider.set(sid.as_ref(), &req),
+        )
+    }
+}
+
 // ── Storage usage ────────────────────────────────────────────────────────────
 
 pub struct StorageUsageGetHandler {
@@ -389,6 +512,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
             caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
+            caller_pid: None,
         }
     }
 

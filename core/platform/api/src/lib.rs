@@ -18,9 +18,13 @@
 //! Ports are re-exported from the backend for source compatibility, so the
 //! Windows build never changes behaviour while the seam is carved.
 
+pub mod active_principals;
 pub mod adapters;
 pub mod app_group_discovery;
 pub mod app_path_resolver;
+/// Asking whether a caller may perform a privileged operation — the neutral
+/// question; polkit and its peers are the per-OS answer.
+pub mod authorization;
 pub mod autostart;
 // Opt-in browser-history read (visited hostnames → seed rule-matching hosts
 // into the FQDN cache, closing the pre-service-start blind spot). Neutral
@@ -74,6 +78,10 @@ pub mod power;
 // per-OS.
 pub mod process_error_stream;
 pub mod reachability;
+// The route table + adapters half of the old `WindowsApiPort` — the part
+// every OS can implement.
+pub mod route_lowering;
+pub mod route_table;
 pub mod routing;
 // Register / remove / start / stop / inspect the background service. The OS
 // backends implement it over SCM (Windows) and systemd (Linux); the console and
@@ -85,6 +93,9 @@ pub mod service_control;
 pub mod single_instance;
 pub mod snapshot;
 pub mod strategy;
+// The host's operator log (Windows event log; the journal on Linux, which needs
+// no implementation because stdout already lands there).
+pub mod system_event_log;
 // Attribution + provenance of the third-party binaries we ship (today:
 // WireGuard LLC's signed `wintun.dll` on Windows). Neutral descriptors +
 // verdict derivation; the hashing/signature MECHANISM is per-OS.
@@ -189,8 +200,9 @@ pub use types::{
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
 };
 pub use vpn_discovery::{
-    looks_like_vpn, merge_candidates, MockVpnDiscovery, NoopVpnDiscovery, VpnCandidate,
-    VpnCandidateSource, VpnDiscoveryPort, VPN_NAME_KEYWORDS,
+    looks_like_vpn, merge_candidates, vpn_client_class, MockVpnDiscovery, NoopVpnDiscovery,
+    VpnCandidate, VpnCandidateSource, VpnClientClass, VpnDiscoveryPort, VPN_CONSUMER_KEYWORDS,
+    VPN_CORPORATE_KEYWORDS,
 };
 // `RouteEntry` carries a `RouteTableRef`, so re-export it at the crate root
 // next to `RouteEntry` (consumers construct `RouteEntry` with

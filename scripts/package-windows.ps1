@@ -11,7 +11,7 @@
 
         NetRuleRouter\
           NetRuleRouter.exe     start here
-          READ-ME.txt
+          README.txt  README.ru.txt
           <tray, service, console, Qt host, the Qt runtime, wintun.dll>
           qml\                  Qt's own modules, written by windeployqt
           apps\desktop\qml\     the app's own QML
@@ -317,6 +317,21 @@ if (-not $Full) {
             Remove-Item -Path $styleDir -Recurse -Force
         }
     }
+    # Image formats we never decode. The app's own art is SVG (icons), PNG
+    # (logo lock-ups) and ICO (window/tray icon): PNG is built into Qt6Gui, ICO
+    # and SVG are the two plugins below. Nothing in the QML tree references a
+    # JPEG, GIF, TIFF, WebP, TGA, WBMP, ICNS or PDF, so their decoders are dead
+    # weight in the payload.
+    $keptImageFormats = @('qsvg.dll', 'qico.dll')
+    $imageFormatsDir = Join-Path $binDir 'imageformats'
+    if (Test-Path $imageFormatsDir) {
+        Get-ChildItem $imageFormatsDir -File -Filter '*.dll' | ForEach-Object {
+            if ($keptImageFormats -notcontains $_.Name) {
+                $freedBytes += $_.Length
+                Remove-Item -Path $_.FullName -Force
+            }
+        }
+    }
     # Debug/profiling plugins for QML tooling: only a connected debugger loads
     # them, and a shipped build has none.
     $qmlTooling = Join-Path $binDir 'qmltooling'
@@ -324,7 +339,7 @@ if (-not $Full) {
         $freedBytes += (Get-ChildItem $qmlTooling -Recurse -File | Measure-Object -Property Length -Sum).Sum
         Remove-Item -Path $qmlTooling -Recurse -Force
     }
-    Write-Step ("trimmed unused Qt styles and QML tooling: {0:N1} MB" -f ($freedBytes / 1MB))
+    Write-Step ("trimmed unused Qt styles, image formats and QML tooling: {0:N1} MB" -f ($freedBytes / 1MB))
 }
 
 # ── Payload ──────────────────────────────────────────────────────────────────
@@ -338,8 +353,13 @@ Copy-Payload 'locales' (Join-Path $packageRoot 'locales')
 Copy-Payload 'presets' (Join-Path $packageRoot 'presets')
 Copy-Payload 'configs' (Join-Path $packageRoot 'configs')
 Copy-Payload 'assets\icons' (Join-Path $packageRoot 'assets\icons')
+# The startup splash paints the logo lockup before the QML engine loads, and it
+# looks for the file by walking up from the binary. Left out of the package, the
+# splash silently does not appear — which is how a packaged build came to start
+# with several seconds of nothing.
+Copy-Payload 'assets\images' (Join-Path $packageRoot 'assets\images')
 Copy-Payload 'scripts' (Join-Path $packageRoot 'scripts')
-Write-Step 'copied the QML, locales, presets, configs, icons and scripts'
+Write-Step 'copied the QML, locales, presets, configs, icons, images and scripts'
 
 # ── Build identity ───────────────────────────────────────────────────────────
 
@@ -369,13 +389,71 @@ Write-Step "stamped build-info.json ($buildStamp)"
 
 # ── Entry point and notes ────────────────────────────────────────────────────
 
-$readMe = @"
+$readMeEn = @"
+NetRuleRouter - portable build for Windows
+=========================================
+
+Version $productVersion, revision $($revision.commit)$(if ($revision.dirty) { ' (built with uncommitted changes)' })
+Built $($buildInfo.built_at_utc) UTC. Details are in build-info.json; attach that
+file if you report a problem.
+
+Russian: see README.ru.txt.
+
+How to start it
+---------------
+Copy this whole folder to the other machine and run NetRuleRouter.exe. Nothing
+has to be installed first: Qt, the Microsoft Visual C++ libraries and everything
+else sit inside the folder.
+
+Where to put the folder
+-----------------------
+IMPORTANT. The background service runs with system rights. Anyone who can change
+files in its directory can replace its executable and gain those rights. So
+before installing the service, put the folder somewhere an ordinary user cannot
+write, for example:
+
+    C:\Program Files\NetRuleRouter
+
+Running the app from a flash drive or from Downloads is fine for looking at the
+interface, but do not install the service from a folder like that.
+
+The service
+-----------
+The service is installed from the app; Windows asks for administrator
+confirmation. This build carries no separate installer.
+
+What is inside
+--------------
+    NetRuleRouter.exe   the app; the tray, service, console and libraries sit beside it
+    qml\        Qt's own modules
+    apps\       the interface (QML). The nesting is deliberate: the interface
+                addresses its icons relative to itself
+    locales\    translations (Russian and English)
+    presets\    ready-made rule sets
+    configs\    schemas and configuration
+    assets\     icons and the logo
+    scripts\    maintenance scripts
+
+Some scripts under scripts\ expect a source tree and will not work on another
+machine. The useful ones here are reset-network.ps1 (emergency network
+recovery), service-status.ps1 and service-smoke.ps1.
+
+If nothing happens when you start it
+------------------------------------
+The app opens no console, so it writes its errors to a file. Look at
+launcher-main.log in %TEMP%\NetRuleRouter.
+"@
+Set-Content -Path (Join-Path $packageRoot 'README.txt') -Value $readMeEn -Encoding UTF8
+
+$readMeRu = @"
 NetRuleRouter - переносимая сборка для Windows
 ==============================================
 
 Версия $productVersion, ревизия $($revision.commit)$(if ($revision.dirty) { ' (собрано с незакоммиченными правками)' })
 Собрано $($buildInfo.built_at_utc) UTC. Подробности - в файле build-info.json;
 приложите его, если будете сообщать о проблеме.
+
+English: см. README.txt.
 
 Как запустить
 -------------
@@ -409,7 +487,7 @@ NetRuleRouter - переносимая сборка для Windows
     locales\    переводы (русский и английский)
     presets\    готовые наборы правил
     configs\    схемы и конфигурация
-    assets\     значки
+    assets\     значки и логотип
     scripts\    вспомогательные сценарии
 
 Часть сценариев в scripts\ рассчитана на дерево исходного кода и на другом
@@ -421,7 +499,7 @@ NetRuleRouter - переносимая сборка для Windows
 Программа не открывает консоль, поэтому ошибки пишет в файл. Смотрите
 launcher-main.log в папке %TEMP%\NetRuleRouter.
 "@
-Set-Content -Path (Join-Path $packageRoot 'READ-ME.txt') -Value $readMe -Encoding UTF8
+Set-Content -Path (Join-Path $packageRoot 'README.ru.txt') -Value $readMeRu -Encoding UTF8
 
 # ── Verification ─────────────────────────────────────────────────────────────
 
@@ -434,6 +512,10 @@ $required = @(
     'wintun.dll',
     'Qt6Core.dll',
     'Qt6Quick.dll',
+    # The two image decoders the app actually needs; the trim above removes the
+    # rest, and removing one of these would blank every icon or the window icon.
+    'imageformats\qsvg.dll',
+    'imageformats\qico.dll',
     'qml\QtQuick',
     'apps\desktop\qml\Main.qml',
     'apps\desktop\qml\Tray.qml',
@@ -442,7 +524,9 @@ $required = @(
     'locales\en.json',
     'locales\ru.json',
     'assets\icons\app\app.ico',
-    'nrr_qt_native_host.exe',
+    'assets\images\logo\logo-lockup-stacked.png',
+    'README.txt',
+    'README.ru.txt',
     'build-info.json'
 )
 $missing = $required | Where-Object { -not (Test-Path (Join-Path $packageRoot $_)) }

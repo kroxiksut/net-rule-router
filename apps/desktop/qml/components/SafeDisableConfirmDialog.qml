@@ -38,7 +38,7 @@ Dialog {
     property var ownerRoot: null
 
     /// Reason text bound to the input. Pre-populated when the tray
-    /// passes `--reason=...` (not used today; future Pro UX could
+    /// passes `--reason=...` (not used today; a future UX could
     /// supply context-aware defaults).
     property string reasonText: ""
 

@@ -132,6 +132,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
+            caller_pid: None,
         }
     }
 
@@ -173,6 +174,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -204,6 +210,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -259,6 +270,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -294,6 +310,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -328,6 +349,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -365,6 +391,11 @@ mod tests {
             kill_switch_strict_shared_ips: dto.kill_switch_strict_shared_ips,
             auto_rules_mode: dto.auto_rules_mode.clone(),
             auto_rules_eager_delivery_names: dto.auto_rules_eager_delivery_names,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -422,6 +453,11 @@ mod tests {
             kill_switch_strict_shared_ips: dto.kill_switch_strict_shared_ips,
             auto_rules_mode: dto.auto_rules_mode.clone(),
             auto_rules_eager_delivery_names: dto.auto_rules_eager_delivery_names,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -466,6 +502,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();

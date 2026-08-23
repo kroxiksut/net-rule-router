@@ -70,6 +70,14 @@ pub struct ProductionRulesSnapshotProvider {
     /// The service runs as LocalSystem and reads the world-readable file —
     /// no new privileged path.
     hosts: Arc<dyn nrr_platform_api::hosts_file::HostsFileReader>,
+    /// What the user's last main-link check found for their rule addresses.
+    /// `None` leaves every row unannotated, which is how the table read before
+    /// the check existed.
+    verdicts: Option<Arc<crate::main_route_verdicts::MainRouteVerdicts>>,
+    /// Destinations each application rule currently holds. `None` leaves the
+    /// rows unannotated — the table simply does not say what an application
+    /// rule is holding, which is how it read before.
+    app_observations: Option<Arc<crate::app_observation_lookup::AppObservationStore>>,
 }
 
 impl ProductionRulesSnapshotProvider {
@@ -77,7 +85,30 @@ impl ProductionRulesSnapshotProvider {
         Self {
             conn,
             hosts: Arc::new(nrr_platform_api::hosts_file::OsHostsFileReader::new()),
+            verdicts: None,
+            app_observations: None,
         }
+    }
+
+    /// Wire the store the main-link check writes into.
+    #[must_use]
+    pub fn with_main_route_verdicts(
+        mut self,
+        verdicts: Arc<crate::main_route_verdicts::MainRouteVerdicts>,
+    ) -> Self {
+        self.verdicts = Some(verdicts);
+        self
+    }
+
+    /// Wire the observed destination store so an application rule can show
+    /// what it is holding.
+    #[must_use]
+    pub fn with_app_observations(
+        mut self,
+        store: Arc<crate::app_observation_lookup::AppObservationStore>,
+    ) -> Self {
+        self.app_observations = Some(store);
+        self
     }
 
     /// Construct with an explicit `hosts` reader (tests inject a fixture).
@@ -85,16 +116,55 @@ impl ProductionRulesSnapshotProvider {
         conn: Arc<Mutex<Connection>>,
         hosts: Arc<dyn nrr_platform_api::hosts_file::HostsFileReader>,
     ) -> Self {
-        Self { conn, hosts }
+        Self {
+            conn,
+            hosts,
+            verdicts: None,
+            app_observations: None,
+        }
     }
 
     /// Read the `hosts` map once and annotate every eligible row in `resp`.
-    fn annotate(&self, resp: &mut RulesListResponse) {
+    /// `principal` is empty for the baseline read, which has no owner and
+    /// therefore no main-link verdicts of its own.
+    fn annotate(&self, resp: &mut RulesListResponse, principal: &str) {
         if resp.rows.is_empty() {
             return;
         }
         let map = self.hosts.snapshot();
         annotate_hosts_overrides(resp, &map);
+        if let Some(store) = self.verdicts.as_ref() {
+            if !principal.is_empty() {
+                let now = std::time::Instant::now();
+                for row in &mut resp.rows {
+                    if row.rule_type != "domain" && row.rule_type != "zone" {
+                        continue;
+                    }
+                    row.main_route = store
+                        .get(principal, &row.match_value, now)
+                        .map(|v| v.slug().to_string());
+                }
+            }
+        }
+        if let Some(store) = self.app_observations.as_ref() {
+            for row in &mut resp.rows {
+                // Only a rule that actually produces host routes: an
+                // application rule bound to the additional link, showing what
+                // it took. A blocked or main-link row holds nothing.
+                if row.rule_type != "application" || row.target_route != "secondary" {
+                    continue;
+                }
+                let held: Vec<String> =
+                    crate::app_observation_lookup::AppObservationLookup::ips_for_app(
+                        store.as_ref(),
+                        &row.match_value,
+                    )
+                    .into_iter()
+                    .map(|ip| ip.to_string())
+                    .collect();
+                row.pinned_destinations = (!held.is_empty()).then_some(held);
+            }
+        }
     }
 }
 
@@ -163,7 +233,7 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
             }
         };
         // Annotate AFTER releasing the DB lock — the `hosts` read is file I/O.
-        self.annotate(&mut resp);
+        self.annotate(&mut resp, "");
         resp
     }
 
@@ -198,7 +268,7 @@ impl RulesSnapshotProvider for ProductionRulesSnapshotProvider {
             }
         };
         // Annotate AFTER releasing the DB lock — the `hosts` read is file I/O.
-        self.annotate(&mut resp);
+        self.annotate(&mut resp, principal);
         resp
     }
 }
@@ -256,13 +326,16 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
         } else {
             Some(message_key.to_string())
         },
-        // Filled later by `annotate_hosts_overrides` once the whole row set
-        // is projected — the hosts map is read once per snapshot, not per row.
+        // Both filled after the whole row set is projected — the hosts map
+        // and the probe verdicts are each read once per snapshot, not per row.
+        main_route: None,
         hosts_override: None,
         // Provenance travels verbatim: the GUI marks an app-authored row and
         // names the site it was added for, and nothing else in the pipeline
         // branches on it.
         origin: dto.origin.clone(),
+        // Filled with the other annotations, once per snapshot.
+        pinned_destinations: None,
     }
 }
 
@@ -416,6 +489,11 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             doh_lockdown_scope: record.doh_lockdown_scope,
             doh_resolver_ips,
             auto_rules_mode: record.auto_rules_mode,
+            primary_probe_auto: record.primary_probe_auto,
+            primary_probe_timeout_ms: record.primary_probe_timeout_ms,
+            primary_probe_max_targets: record.primary_probe_max_targets,
+            primary_probe_repeat_secs: record.primary_probe_repeat_secs,
+            block_ipv6_when_protected: record.block_ipv6_when_protected,
         })
     }
 }
@@ -602,6 +680,11 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             )
             .unwrap_or_default(),
             auto_rules_eager_delivery_names: request.auto_rules_eager_delivery_names,
+            primary_probe_auto: request.primary_probe_auto,
+            primary_probe_timeout_ms: request.primary_probe_timeout_ms,
+            primary_probe_max_targets: request.primary_probe_max_targets,
+            primary_probe_repeat_secs: request.primary_probe_repeat_secs,
+            block_ipv6_when_protected: request.block_ipv6_when_protected,
             binding_source: dto_source_to_storage(request.binding_source),
         };
         let conn = self
@@ -670,6 +753,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
     fn purge_for_sid(
         &self,
         sid: &str,
+        include_rules_history: bool,
     ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError> {
         if sid.is_empty() {
             return Err(RoutePolicyWriteError::EmptySid);
@@ -680,10 +764,54 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
         let summary = nrr_storage::purge_principal_data(&mut conn, sid)
             .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+        let rules_rows_deleted = if include_rules_history {
+            nrr_storage::purge_principal_rules(&mut conn, sid)
+                .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?
+        } else {
+            0
+        };
         Ok(PrincipalDataPurgeResponse {
             rows_deleted: summary.rows_deleted,
             tables_touched: summary.tables_touched as u32,
+            rules_rows_deleted,
+            principals_purged: 1,
         })
+    }
+
+    fn purge_all_principals(
+        &self,
+        include_rules_history: bool,
+    ) -> Result<PrincipalDataPurgeResponse, RoutePolicyWriteError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
+        let principals = nrr_storage::principals_with_rules(&conn)
+            .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+        let mut total = PrincipalDataPurgeResponse::default();
+        for principal in &principals {
+            let summary = nrr_storage::purge_principal_data(&mut conn, principal)
+                .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+            total.rows_deleted += summary.rows_deleted;
+            total.tables_touched = total.tables_touched.max(summary.tables_touched as u32);
+            if include_rules_history {
+                total.rules_rows_deleted +=
+                    nrr_storage::purge_principal_rules(&mut conn, principal)
+                        .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+            }
+        }
+        total.principals_purged = principals.len() as u32;
+        Ok(total)
+    }
+
+    fn other_principal_count(&self, sid: &str) -> Result<u32, RoutePolicyWriteError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
+        let principals = nrr_storage::principals_with_rules(&conn)
+            .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
+        Ok(principals.iter().filter(|p| p.as_str() != sid).count() as u32)
     }
 }
 
@@ -722,6 +850,11 @@ fn record_to_dto(
         kill_switch_strict_shared_ips: rec.kill_switch_strict_shared_ips,
         auto_rules_mode: rec.auto_rules_mode.as_slug().to_string(),
         auto_rules_eager_delivery_names: rec.auto_rules_eager_delivery_names,
+        primary_probe_auto: rec.primary_probe_auto,
+        primary_probe_timeout_ms: rec.primary_probe_timeout_ms,
+        primary_probe_max_targets: rec.primary_probe_max_targets,
+        primary_probe_repeat_secs: rec.primary_probe_repeat_secs,
+        block_ipv6_when_protected: rec.block_ipv6_when_protected,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }
@@ -891,7 +1024,7 @@ impl MutationExecutor for NoopMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         }
     }
 
@@ -943,7 +1076,7 @@ impl AdaptersSnapshotProvider for NoopAdaptersSnapshotProvider {
 // ── MonitoredAdaptersSnapshotProvider ─────────────────────────────────────────
 
 /// Production [`AdaptersSnapshotProvider`] backed by
-/// [`WindowsApiPort::get_adapter_infos`]. Each call enumerates the
+/// [`RouteTablePort::get_adapter_infos`]. Each call enumerates the
 /// adapter list synchronously and projects every
 /// [`AdapterInfo`](nrr_platform_api::adapters::AdapterInfo) into
 /// the wire-shape [`AdapterEntry`](nrr_shared::ipc_payloads::AdapterEntry).
@@ -981,7 +1114,7 @@ fn now_ms() -> i64 {
 }
 
 pub struct MonitoredAdaptersSnapshotProvider {
-    api: Arc<dyn nrr_platform_api::windows_api::WindowsApiPort>,
+    api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     /// Last externally-observed address per adapter, keyed by the adapter's
     /// persistent id (adapter name when the id is empty). Snapshots are
     /// whole-table replacements, and a snapshot that did not probe carries no
@@ -1005,7 +1138,7 @@ struct CachedExternalAddress {
 }
 
 impl MonitoredAdaptersSnapshotProvider {
-    pub fn new(api: Arc<dyn nrr_platform_api::windows_api::WindowsApiPort>) -> Self {
+    pub fn new(api: Arc<dyn nrr_platform_api::route_table::RouteTablePort>) -> Self {
         Self {
             api,
             last_external: Mutex::new(std::collections::HashMap::new()),
@@ -1282,13 +1415,14 @@ fn adapter_to_entry(
 mod adapters_snapshot_tests {
     use super::*;
     use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
-    use nrr_platform_api::windows_api::{MockWindowsApi, WindowsApiPort};
+    use nrr_platform_api::route_table::RouteTablePort;
+    use nrr_platform_api::windows_api::MockWindowsApi;
     use std::net::Ipv4Addr;
 
     #[test]
     fn empty_adapter_list_yields_empty_wire_response() {
         let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn WindowsApiPort>);
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
         let resp = provider.adapters_snapshot(false);
         assert_eq!(resp.data_source, "windows-live");
         assert!(resp.adapters.is_empty());
@@ -1309,7 +1443,7 @@ mod adapters_snapshot_tests {
             ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 5)],
             gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
         }]);
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn WindowsApiPort>);
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
         let resp = provider.adapters_snapshot(false);
         assert_eq!(resp.adapters.len(), 1);
         let entry = &resp.adapters[0];
@@ -1352,7 +1486,7 @@ mod adapters_snapshot_tests {
         // `Alias`-derived key, not the low-level identity GUID.
         let api = Arc::new(MockWindowsApi::new());
         let recorder = Arc::new(FakeAddressRecorder::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn WindowsApiPort>)
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
             .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
         let mut rows = nrr_platform_api::interface_rows::fallback_rows();
@@ -1383,7 +1517,7 @@ mod adapters_snapshot_tests {
         // recorder — only a genuinely fresh resolution does.
         let api = Arc::new(MockWindowsApi::new());
         let recorder = Arc::new(FakeAddressRecorder::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn WindowsApiPort>)
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
             .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
         let mut first = nrr_platform_api::interface_rows::fallback_rows();
@@ -1405,7 +1539,7 @@ mod adapters_snapshot_tests {
     #[test]
     fn without_a_recorder_fold_cached_external_is_a_noop_for_persistence() {
         let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn WindowsApiPort>);
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
         let mut rows = nrr_platform_api::interface_rows::fallback_rows();
         // Must not panic without a recorder wired.
         provider.fold_cached_external(&mut rows);
@@ -1431,8 +1565,10 @@ mod hosts_override_tests {
             enabled: true,
             validation_status: "ok".into(),
             validation_message_key: None,
+            main_route: None,
             hosts_override: None,
             origin: None,
+            pinned_destinations: None,
         }
     }
 
@@ -1528,7 +1664,7 @@ mod hosts_override_tests {
         ));
         let provider = ProductionRulesSnapshotProvider::with_hosts_reader(conn, reader);
         let mut r = resp(vec![row("domain", "ads.example.com")]);
-        provider.annotate(&mut r);
+        provider.annotate(&mut r, "");
         assert!(
             r.rows[0]
                 .hosts_override
@@ -1617,6 +1753,11 @@ mod fail_closed_probe_tests {
                 kill_switch_strict_shared_ips: false,
                 auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
                 auto_rules_eager_delivery_names: false,
+                primary_probe_auto: false,
+                primary_probe_timeout_ms: 1500,
+                primary_probe_max_targets: 8,
+                primary_probe_repeat_secs: 300,
+                block_ipv6_when_protected: true,
                 binding_source: BindingSource::UserAssigned,
             },
             100,
@@ -1771,6 +1912,11 @@ mod fail_closed_probe_tests {
                 kill_switch_strict_shared_ips: false,
                 auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
                 auto_rules_eager_delivery_names: false,
+                primary_probe_auto: false,
+                primary_probe_timeout_ms: 1500,
+                primary_probe_max_targets: 8,
+                primary_probe_repeat_secs: 300,
+                block_ipv6_when_protected: true,
                 binding_source: BindingSource::UserAssigned,
             },
             100,

@@ -124,7 +124,7 @@ pub enum CanonicalAddressMatch {
     /// when a hostname is available; IP-only traffic bypasses Zone in Free.
     ///
     /// Runtime priority vs [`CanonicalAddressMatch::ExactIp`] is user-configurable
-    /// (default: ExactIp wins). IP subnet zones are a Pro edition feature; Free
+    /// (default: ExactIp wins). IP subnet zones are not supported; Free
     /// supports domain-suffix zones only.
     Zone(String),
     /// Matches exactly one IPv4 address (runtime priority tier 3 by default;

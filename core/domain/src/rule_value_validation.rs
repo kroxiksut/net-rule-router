@@ -130,6 +130,11 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
 // ── exact-ip ──────────────────────────────────────────────────────────────────
 
 fn validate_exact_ip(value: &str) -> RuleValueValidation {
+    // An IPv6 literal is a deliberate answer, not a typo: say why the rule is
+    // unnecessary rather than making the user check their four octets.
+    if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip-v6");
+    }
     // Reject anything that is not exactly four dot-separated decimal octets.
     let parts: Vec<&str> = value.split('.').collect();
     if parts.len() != 4 {
@@ -393,6 +398,20 @@ mod tests {
     fn ipv4_loopback_warns() {
         warn("exact-ip", "127.0.0.1", "loopback");
         warn("exact-ip", "127.255.255.254", "loopback");
+    }
+
+    #[test]
+    fn an_ipv6_literal_says_ipv6_not_bad_octets() {
+        assert!(matches!(
+            validate_rule_value("exact-ip", "2606:4700::1111"),
+            RuleValueValidation::Error { ref message_key, .. }
+                if message_key == "rules.validation.match-value-invalid.exact-ip-v6"
+        ));
+        assert!(matches!(
+            validate_rule_value("exact-ip", "::1"),
+            RuleValueValidation::Error { ref message_key, .. }
+                if message_key == "rules.validation.match-value-invalid.exact-ip-v6"
+        ));
     }
 
     #[test]

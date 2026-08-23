@@ -16,7 +16,7 @@
 //! - `nrr-service-runtime` testable without admin rights or live DNS,
 //! - `cargo check --workspace` working on Linux/macOS CI,
 //! - alternative resolver backends (DoH, system stub) plug-compatible
-//!   for any future Pro-tier extension.
+//!   for any future unsupported extension.
 //!
 //! ## Scope
 //!

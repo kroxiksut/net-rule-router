@@ -25,7 +25,7 @@
 //! (`chrome.exe`) is matched the same way. Glob patterns (`*vpn*.exe`) match
 //! against every observed process name and union their IPs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -33,6 +33,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 /// [`crate::wfp_codegen::PER_HOSTNAME_IP_CAP`] in spirit). A busy browser can
 /// touch thousands of IPs; we keep the most-recently-observed up to this cap.
 pub const APP_IP_CAP: usize = 256;
+
+/// Destinations the census remembers, with the processes seen using them.
+///
+/// Deliberately NOT [`APP_IP_CAP`]: that one bounds how many host routes a rule
+/// may fan out to, this one bounds *evidence*. A browser passes the route cap
+/// long before it stops being worth knowing that it, too, uses an address — and
+/// the whole point of the census is to answer for exactly such a process.
+pub const CENSUS_IP_CAP: usize = 8192;
+
+/// Distinct process names kept per destination. The census only ever answers
+/// "is anybody here who is not one of these rules?", so a handful is enough and
+/// an unbounded list would be a leak with no reader.
+pub const CENSUS_KEYS_PER_IP: usize = 4;
 
 /// Narrow read-only port the WFP codegen consumes for `Application` rules.
 ///
@@ -44,6 +57,32 @@ pub trait AppObservationLookup: Send + Sync {
     /// observed process image's **file name**. Returns empty when nothing
     /// has been observed yet (cold start / observer off).
     fn ips_for_app(&self, app: &str) -> Vec<Ipv4Addr>;
+
+    /// Has a process none of `friendly` names been seen using `ip`?
+    ///
+    /// A host route moves every process that talks to the address, so an
+    /// application rule may only claim a destination nobody else is using.
+    /// The default answers "nobody else" — an implementation without a census
+    /// behaves exactly as before one existed.
+    fn destination_used_outside(&self, _friendly: &[String], _ip: Ipv4Addr) -> bool {
+        false
+    }
+}
+
+/// File name of the running executable, lower-cased.
+///
+/// The relay dials an application's destinations over the tunnel on the
+/// application's behalf, so this process appearing on an address is the
+/// mechanism working, never somebody else using it. Both the census and the
+/// collateral check read the same value from here.
+pub fn own_process_key() -> &'static str {
+    static OWN: OnceLock<String> = OnceLock::new();
+    OWN.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .map(|p| app_key(&p.to_string_lossy()))
+            .unwrap_or_default()
+    })
 }
 
 /// Reduce a process path or rule pattern to its lowercased file name, so
@@ -59,6 +98,15 @@ pub fn app_key(raw: &str) -> String {
 /// through the [`AppObservationLookup`] impl.
 pub struct AppObservationStore {
     inner: Mutex<HashMap<String, HashSet<Ipv4Addr>>>,
+    /// Who has been seen using each destination — the evidence a pin is
+    /// weighed against before it is emitted.
+    census: Mutex<CensusIndex>,
+    /// `(app, ip)` pairs withdrawn because the host route they produced was
+    /// carrying somebody else's traffic. Sticky for the life of the process:
+    /// the app will touch the address again within seconds, and without this
+    /// the pair would be relearned immediately and the two processes would take
+    /// the address from each other in a loop.
+    retracted: Mutex<HashSet<(String, Ipv4Addr)>>,
     cap_per_app: usize,
 }
 
@@ -76,6 +124,8 @@ impl AppObservationStore {
     pub fn with_cap(cap_per_app: usize) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            census: Mutex::new(CensusIndex::default()),
+            retracted: Mutex::new(HashSet::new()),
             cap_per_app,
         }
     }
@@ -94,6 +144,14 @@ impl AppObservationStore {
         }
         let key = app_key(process_path);
         if key.is_empty() {
+            return false;
+        }
+        if self
+            .retracted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&(key.clone(), ip))
+        {
             return false;
         }
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -128,10 +186,119 @@ impl AppObservationStore {
             .count()
     }
 
+    /// Which applications have `ip` in their observed set.
+    ///
+    /// The reverse of [`ips_for_app`](AppObservationLookup::ips_for_app), and
+    /// the question the collateral check asks: a host route derived from this
+    /// address moves EVERY process, so when a different process is seen using
+    /// it, the owner has to be named before the pin can be withdrawn. Cheap —
+    /// the map holds one entry per application a rule names.
+    #[must_use]
+    pub fn apps_for_ip(&self, ip: Ipv4Addr) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, ips)| ips.contains(&ip))
+            .map(|(app, _)| app.clone())
+            .collect()
+    }
+
+    /// Withdraw `ip` from `app`'s observed set and refuse to learn it again
+    /// this session. Returns `true` when the pair was actually present.
+    ///
+    /// The route this address produced is machine-wide; the moment it is seen
+    /// moving a process the rule never named, it is doing more harm than the
+    /// rule is worth. The application loses the destination — its own traffic
+    /// there falls back to the main link — which is the lesser cost: an
+    /// application rule may not quietly overrule where everything else goes.
+    pub fn retract(&self, app: &str, ip: Ipv4Addr) -> bool {
+        let key = app_key(app);
+        if key.is_empty() {
+            return false;
+        }
+        let removed = self
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&key)
+            .is_some_and(|set| set.remove(&ip));
+        self.retracted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert((key, ip));
+        removed
+    }
+
+    /// Note that `process_path` was seen talking to `ip`.
+    ///
+    /// Separate from [`record`](Self::record) on purpose, and fed only from
+    /// live observation: `record` is also called by the cross-session warm load
+    /// with RULE PATTERNS as keys, and a pattern is not a process — letting one
+    /// into the census would have a rule vouching for itself.
+    pub fn note_process_destination(&self, process_path: &str, ip: Ipv4Addr) {
+        if is_unroutable(ip) {
+            return;
+        }
+        let key = app_key(process_path);
+        if key.is_empty() || key == own_process_key() {
+            return;
+        }
+        let mut g = self.census.lock().unwrap_or_else(|p| p.into_inner());
+        match g.seen.get_mut(&ip) {
+            Some(keys) => {
+                if keys.len() < CENSUS_KEYS_PER_IP && !keys.iter().any(|k| k == &key) {
+                    keys.push(key);
+                }
+            }
+            None => {
+                g.seen.insert(ip, vec![key]);
+                g.order.push_back(ip);
+                while g.order.len() > CENSUS_IP_CAP {
+                    if let Some(evicted) = g.order.pop_front() {
+                        g.seen.remove(&evicted);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Has a process that none of `friendly` names been seen using `ip`?
+    ///
+    /// `friendly` is every application pattern the rule set routes over the
+    /// additional link, not just the rule being compiled: two applications may
+    /// legitimately share a destination, and a route serves them both the same
+    /// way, so that is not collateral.
+    ///
+    /// `false` when nothing is known about the address. An unobserved address
+    /// is not evidence of exclusivity — it is the absence of evidence, and the
+    /// withdrawal path covers the case where the other process shows up later.
+    #[must_use]
+    pub fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
+        let g = self.census.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(keys) = g.seen.get(&ip) else {
+            return false;
+        };
+        keys.iter().any(|seen| {
+            !friendly
+                .iter()
+                .any(|pattern| pattern_matches(pattern, seen))
+        })
+    }
+
     /// Number of apps with at least one observation (diagnostics / tests).
     pub fn app_count(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
+}
+
+/// Destinations mapped to the processes seen using them, FIFO-bounded.
+#[derive(Default)]
+struct CensusIndex {
+    seen: HashMap<Ipv4Addr, Vec<String>>,
+    /// Insertion order, so the bound evicts the oldest destination in O(1)
+    /// instead of scanning for a victim.
+    order: VecDeque<Ipv4Addr>,
 }
 
 impl AppObservationLookup for AppObservationStore {
@@ -161,6 +328,24 @@ impl AppObservationLookup for AppObservationStore {
         // applies for the same observed set.
         v.sort();
         v
+    }
+
+    fn destination_used_outside(&self, friendly: &[String], ip: Ipv4Addr) -> bool {
+        AppObservationStore::destination_used_outside(self, friendly, ip)
+    }
+}
+
+/// Does the rule pattern `pattern` name the observed process `key`?
+///
+/// The one place this question is answered, so the census, the collateral check
+/// and the codegen cannot drift into disagreeing about what a rule covers.
+#[must_use]
+pub fn pattern_matches(pattern: &str, key: &str) -> bool {
+    let p = app_key(pattern);
+    if p.contains('*') {
+        glob_match(&p, key)
+    } else {
+        p == key
     }
 }
 
@@ -236,6 +421,9 @@ fn is_unroutable(ip: Ipv4Addr) -> bool {
 #[derive(Default)]
 pub struct MockAppObservationLookup {
     inner: Mutex<HashMap<String, Vec<Ipv4Addr>>>,
+    /// Destinations the test declares to be in use by somebody the rule set
+    /// does not name.
+    used_outside: Mutex<HashSet<Ipv4Addr>>,
 }
 
 #[allow(clippy::unwrap_used)]
@@ -247,6 +435,11 @@ impl MockAppObservationLookup {
     /// Register `ips` as the observed set for `app`. Last write wins.
     pub fn set_ips(&self, app: &str, ips: Vec<Ipv4Addr>) {
         self.inner.lock().unwrap().insert(app_key(app), ips);
+    }
+
+    /// Declare `ip` to be in use by a process no application rule names.
+    pub fn set_used_outside(&self, ip: Ipv4Addr) {
+        self.used_outside.lock().unwrap().insert(ip);
     }
 }
 
@@ -260,10 +453,160 @@ impl AppObservationLookup for MockAppObservationLookup {
             .cloned()
             .unwrap_or_default()
     }
+
+    fn destination_used_outside(&self, _friendly: &[String], ip: Ipv4Addr) -> bool {
+        self.used_outside.lock().unwrap().contains(&ip)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::net::Ipv4Addr;
+
+    fn addr(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(203, 0, 113, last)
+    }
+
+    fn friendly(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn an_address_nobody_has_been_seen_using_is_not_shared() {
+        // Absence of evidence is not evidence of company: an unobserved
+        // address still gets its route, and the withdrawal path covers the
+        // case where somebody turns up later.
+        let store = AppObservationStore::new();
+        assert!(!store.destination_used_outside(&friendly(&["assistant.exe"]), addr(10)));
+    }
+
+    #[test]
+    fn a_process_no_rule_names_makes_a_destination_shared() {
+        let store = AppObservationStore::new();
+        store.note_process_destination(r"C:\Program Files\Chrome\chrome.exe", addr(10));
+        assert!(store.destination_used_outside(&friendly(&["assistant.exe"]), addr(10)));
+    }
+
+    #[test]
+    fn two_routed_applications_may_share_a_destination() {
+        // A route serves both the same way, so this is not collateral.
+        let store = AppObservationStore::new();
+        store.note_process_destination("assistant.exe", addr(10));
+        store.note_process_destination("claude.exe", addr(10));
+        assert!(
+            !store.destination_used_outside(&friendly(&["assistant.exe", "claude.exe"]), addr(10))
+        );
+        // …but a third, unnamed one does make it shared.
+        store.note_process_destination("chrome.exe", addr(10));
+        assert!(
+            store.destination_used_outside(&friendly(&["assistant.exe", "claude.exe"]), addr(10))
+        );
+    }
+
+    #[test]
+    fn a_glob_rule_vouches_for_every_process_it_matches() {
+        let store = AppObservationStore::new();
+        store.note_process_destination("codex.exe", addr(10));
+        store.note_process_destination("codex-helper.exe", addr(10));
+        assert!(!store.destination_used_outside(&friendly(&["codex*.exe"]), addr(10)));
+    }
+
+    #[test]
+    fn our_own_process_is_never_somebody_else() {
+        // The relay dials an application's destinations over the tunnel on its
+        // behalf; counting that would withdraw every pin the moment it worked.
+        let store = AppObservationStore::new();
+        store.note_process_destination(own_process_key(), addr(10));
+        assert!(!store.destination_used_outside(&friendly(&["assistant.exe"]), addr(10)));
+    }
+
+    #[test]
+    fn the_census_is_bounded_and_drops_the_oldest_destination() {
+        let store = AppObservationStore::new();
+        let ip_of = |n: u32| Ipv4Addr::from(0x0b00_0000u32 + n);
+        for n in 0..(CENSUS_IP_CAP as u32 + 1) {
+            store.note_process_destination("chrome.exe", ip_of(n));
+        }
+        // The first one was evicted; the newest survived.
+        assert!(!store.destination_used_outside(&friendly(&["assistant.exe"]), ip_of(0)));
+        assert!(store
+            .destination_used_outside(&friendly(&["assistant.exe"]), ip_of(CENSUS_IP_CAP as u32)));
+    }
+
+    #[test]
+    fn names_kept_per_destination_are_bounded() {
+        let store = AppObservationStore::new();
+        for n in 0..(CENSUS_KEYS_PER_IP + 3) {
+            store.note_process_destination(&format!("proc{n}.exe"), addr(10));
+        }
+        // Still answers, and the answer is still "somebody else".
+        assert!(store.destination_used_outside(&friendly(&["assistant.exe"]), addr(10)));
+    }
+
+    #[test]
+    fn unroutable_destinations_never_enter_the_census() {
+        let store = AppObservationStore::new();
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        store.note_process_destination("chrome.exe", loopback);
+        assert!(!store.destination_used_outside(&friendly(&["assistant.exe"]), loopback));
+    }
+
+    #[test]
+    fn apps_for_ip_names_every_owner_of_a_destination() {
+        let store = AppObservationStore::new();
+        store.record(r"C:\apps\alpha.exe", addr(10));
+        store.record("beta.exe", addr(10));
+        store.record("beta.exe", addr(11));
+
+        let mut owners = store.apps_for_ip(addr(10));
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec!["alpha.exe".to_string(), "beta.exe".to_string()]
+        );
+        assert_eq!(store.apps_for_ip(addr(11)), vec!["beta.exe".to_string()]);
+        assert!(store.apps_for_ip(addr(12)).is_empty());
+    }
+
+    #[test]
+    fn a_retracted_destination_is_dropped_and_never_relearned() {
+        let store = AppObservationStore::new();
+        store.record("alpha.exe", addr(10));
+        store.record("alpha.exe", addr(11));
+
+        assert!(store.retract("alpha.exe", addr(10)));
+        assert_eq!(store.ips_for_app("alpha.exe"), vec![addr(11)]);
+
+        // The application keeps using the address; the pin must not come back.
+        assert!(!store.record("alpha.exe", addr(10)));
+        assert_eq!(store.ips_for_app("alpha.exe"), vec![addr(11)]);
+        // Nor may the cross-session warm load reintroduce it.
+        assert_eq!(store.seed_many(&[("alpha.exe".to_string(), addr(10))]), 0);
+    }
+
+    #[test]
+    fn retraction_binds_to_one_app_not_to_the_address() {
+        let store = AppObservationStore::new();
+        store.record("alpha.exe", addr(10));
+        store.record("beta.exe", addr(10));
+
+        store.retract("alpha.exe", addr(10));
+
+        assert!(store.ips_for_app("alpha.exe").is_empty());
+        assert_eq!(store.ips_for_app("beta.exe"), vec![addr(10)]);
+        // Beta is still free to re-confirm it.
+        assert!(!store.record("beta.exe", addr(10)));
+        assert_eq!(store.ips_for_app("beta.exe"), vec![addr(10)]);
+    }
+
+    #[test]
+    fn retracting_something_absent_is_harmless_and_still_sticks() {
+        let store = AppObservationStore::new();
+        assert!(!store.retract("alpha.exe", addr(10)));
+        assert!(!store.record("alpha.exe", addr(10)));
+        assert!(store.ips_for_app("alpha.exe").is_empty());
+    }
+
     use super::*;
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

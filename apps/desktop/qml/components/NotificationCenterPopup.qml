@@ -183,7 +183,8 @@ Popup {
                                 text: card.modelData.actionText || ""
                                 onClicked: {
                                     if (root.ownerRoot) {
-                                        root.ownerRoot.runNotificationAction(card.modelData.actionKey)
+                                        root.ownerRoot.runNotificationAction(card.modelData.actionKey,
+                                                            card.modelData.actionArg)
                                     }
                                     root.close()
                                 }

@@ -1,5 +1,5 @@
 // Interactive review for preset imports
-// that have duplicate sections or unknown (foreign-OS / Pro-tier)
+// that have duplicate sections or unknown (foreign-OS / unsupported)
 // sections requiring user input. Opens BEFORE the parser's output
 // reaches rulesModel / sidecar, so the user's choices can adjust
 // what actually lands.

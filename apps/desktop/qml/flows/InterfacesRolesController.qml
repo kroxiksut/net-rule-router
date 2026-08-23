@@ -433,14 +433,6 @@ QtObject {
         return -1
     }
     function unassignRole(index, role) {
-        // Adapter bindings are
-        // NOT parked offline: they drive route enforcement directly, so changing
-        // them only makes sense against a running service. Block + explain.
-        if (!root._routingBackendConnected()) {
-            root.statusLine = root.tr("status.bindings-require-service",
-                "Adapter bindings can only be changed while the background service is running.")
-            return
-        }
         var selected = root.interfacesModel.get(index)
         var selectedId = String(selected.persistentId || "")
         var selectedName = String(selected.name || "")
@@ -471,8 +463,7 @@ QtObject {
         // Mirror the binding into the service policy so enforcement sees the
         // cleared slot. Unbinding must be explicit: a blank pref alone means
         // "leave as is" on the service side, never "unbind".
-        root.routePolicyController.pushRouteBindingToService(
-            role === "primary" ? { unbindPrimary: true } : { unbindSecondary: true })
+        _deliverBinding(role === "primary" ? { unbindPrimary: true } : { unbindSecondary: true })
     }
     /// The live mapped row behind a model entry. `interfacesModel` is a
     /// ListModel, so its nested `derivedAssessment` is not the plain JS object
@@ -503,12 +494,6 @@ QtObject {
     /// `unroutableConfirmed` is set by the confirm dialog's proceed callback so
     /// the second pass skips the guardrail. Every other caller omits it.
     function assignRole(index, role, unroutableConfirmed) {
-        // See unassignRole.
-        if (!root._routingBackendConnected()) {
-            root.statusLine = root.tr("status.bindings-require-service",
-                "Adapter bindings can only be changed while the background service is running.")
-            return
-        }
         var selected = root.interfacesModel.get(index)
         var selectedId = String(selected.persistentId || "")
         var selectedName = String(selected.name || "")
@@ -575,7 +560,21 @@ QtObject {
         // Push the new binding to the service per-SID
         // policy (route.policy.update). Without this the selection lived only in
         // UiPreferences and enforcement had no secondary target.
-        root.routePolicyController.pushRouteBindingToService(pushOpts)
+        _deliverBinding(pushOpts)
+    }
+
+    /// Hand the binding just written to prefs over to the service — or park it
+    /// when the service is not up. A choice made before the service exists is
+    /// still a choice: refusing it left a first-run user unable to name their
+    /// connections at the one moment the wizard asks for them.
+    function _deliverBinding(pushOpts) {
+        if (root._routingBackendConnected()) {
+            root.routePolicyController.pushRouteBindingToService(pushOpts)
+            return
+        }
+        root.recordOfflineBindingIntent(pushOpts)
+        root.statusLine = root.tr("status.binding-parked-offline",
+            "Saved. The connection assignment will be applied as soon as the background service is running.")
     }
 
     /// Rename-tolerant ack for the VPN-split

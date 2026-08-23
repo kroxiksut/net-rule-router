@@ -1,85 +1,42 @@
-//! `WindowsApiPort` trait + neutral `MockWindowsApi`.
+//! `WfpEnginePort` — the WFP filter engine — plus the neutral `MockWindowsApi`.
 //!
-//! Per the policy/mechanism seam, the port DEFINITION (`WindowsApiPort`)
-//! and its always-compiled test double (`MockWindowsApi`, plus the deterministic
-//! `mock_luid_for_index` helper) are neutral — they reference only `std` and the
-//! neutral `error`/`types`/`adapters` value types — so they live in the neutral
+//! The route table and adapter half of what used to be one `WindowsApiPort`
+//! now lives in [`crate::route_table::RouteTablePort`]: every OS can answer it,
+//! and keeping it here forced a Linux backend to stub the filter engine in
+//! order to reach it. What remains below is genuinely Windows-shaped — a WFP
+//! engine handle, its transactions, and filters keyed by GUID — and no other
+//! platform implements it.
+//!
+//! Per the policy/mechanism seam, the port DEFINITION and its always-compiled
+//! test double (`MockWindowsApi`, plus the deterministic `mock_luid_for_index`
+//! helper) are neutral — they reference only `std` and the neutral
+//! `error`/`types`/`adapters` value types — so they live in the neutral
 //! `nrr-platform-api`. The Windows MECHANISM (`ProductionWindowsApi` + the
 //! `production_*` Win32 FFI helpers) stays in `nrr-platform-windows` and
 //! re-exports these definitions for source compatibility.
 //!
-//! All Win32 networking calls are accessed only through `WindowsApiPort`.
-//! Business logic in the apply layer never calls Win32 directly. This single
-//! seam makes the entire apply layer unit-testable without admin rights or a
-//! live Windows installation.
+//! All Win32 networking calls are accessed only through these ports. Business
+//! logic in the apply layer never calls Win32 directly. This single seam makes
+//! the entire apply layer unit-testable without admin rights or a live Windows
+//! installation.
 
 use std::sync::Mutex;
 
+use crate::route_table::RouteTablePort;
 use crate::{
     error::PlatformError,
     types::{RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec},
 };
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
+// ── Traits ────────────────────────────────────────────────────────────────────
 
-/// Abstraction over all Win32 networking calls used by the apply layer.
+/// The WFP filter engine: a session handle, its transactions, and the filters
+/// installed under our provider GUID.
 ///
 /// Every method maps to one (or a small group of) Win32 API calls. The
 /// signature uses Rust-idiomatic types; the production impl translates
 /// them to Win32 structures internally with localized `unsafe { }` blocks.
-pub trait WindowsApiPort: Send + Sync {
-    // ── IPv4 route table ─────────────────────────────────────────────────────
-
-    /// Enumerate all IPv4 routes that our apply layer is interested in.
-    /// Wraps `GetIpForwardTable2(AF_INET, ...)`.
-    fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError>;
-
-    /// Add a single IPv4 route entry.
-    /// Wraps `CreateIpForwardEntry2(...)`.
-    fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError>;
-
-    /// Delete a single IPv4 route entry.
-    /// Wraps `DeleteIpForwardEntry2(...)`.
-    fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError>;
-
-    // ── Adapter enumeration ───────────────────────────────────────────────────
-
-    /// Enumerate all network adapters with their current availability state.
-    /// Wraps `GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS, ...)`.
-    ///
-    /// Returns info for all adapters including virtual and loopback.
-    /// Callers filter via `is_virtual_adapter()` and `classify_availability()`.
-    fn get_adapter_infos(&self) -> Result<Vec<crate::adapters::AdapterInfo>, PlatformError>;
-
-    /// All local unicast addresses (IPv4 **and**
-    /// IPv6) paired with the interface index that owns each, via
-    /// `GetUnicastIpAddressTable`. The connection-egress trace maps a
-    /// connection's local (source) address to its egress interface; unlike
-    /// [`Self::get_adapter_infos`] (IPv4-only) this also covers IPv6. The
-    /// default returns empty (no egress labelling) so non-production doubles
-    /// need not implement it; the production impl overrides.
-    fn unicast_ip_addresses(&self) -> Result<Vec<(std::net::IpAddr, u32)>, PlatformError> {
-        Ok(Vec::new())
-    }
-
-    /// String SID of the user owning the active console
-    /// session (`WTSGetActiveConsoleSessionId` → `WTSQueryUserToken` →
-    /// `GetTokenInformation(TokenUser)`). The service-driven routing scope uses
-    /// it to pick the routing user when no GUI/tray is connected (enforce a
-    /// managed policy from boot). `None` when there is no interactive console
-    /// user or the SID can't be resolved. The default returns `None` so test
-    /// doubles need not implement it; the production impl overrides.
-    fn active_console_user_sid(&self) -> Option<String> {
-        None
-    }
-
-    /// Resolve a Windows `IfIndex` to its 64-bit interface LUID
-    /// (`NET_LUID.Value`). The kill-switch needs the
-    /// LUID — not the `IfIndex` — to pin a
-    /// `FWPM_CONDITION_IP_LOCAL_INTERFACE` egress condition on a filter.
-    /// Wraps `ConvertInterfaceIndexToLuid`.
-    fn interface_luid_for_index(&self, ifindex: u32) -> Result<u64, PlatformError>;
-
+pub trait WfpEnginePort: Send + Sync {
     // ── WFP engine ───────────────────────────────────────────────────────────
 
     /// Open a dynamic (volatile, non-persistent) WFP engine session.
@@ -131,6 +88,17 @@ pub trait WindowsApiPort: Send + Sync {
         token: &WfpEngineToken,
     ) -> Result<Vec<WfpFilterRecord>, PlatformError>;
 }
+
+/// Everything the Windows apply layer needs from the OS: the neutral route
+/// table plus the WFP engine.
+///
+/// A convenience composition, not a third set of methods — Windows code takes
+/// one handle instead of two, while neutral routing code names only
+/// [`RouteTablePort`] and works off-Windows. The blanket impl means any type
+/// implementing both halves is automatically a `WindowsApiPort`.
+pub trait WindowsApiPort: RouteTablePort + WfpEnginePort {}
+
+impl<T: RouteTablePort + WfpEnginePort> WindowsApiPort for T {}
 
 // ── Mock implementation ───────────────────────────────────────────────────────
 
@@ -251,6 +219,15 @@ impl MockWindowsApi {
                     detail: detail.clone(),
                 },
                 PlatformError::NotSupported { reason } => PlatformError::NotSupported { reason },
+                PlatformError::Errno {
+                    operation,
+                    code,
+                    message,
+                } => PlatformError::Errno {
+                    operation,
+                    code: *code,
+                    message: message.clone(),
+                },
             });
         }
         Ok(())
@@ -265,7 +242,7 @@ impl Default for MockWindowsApi {
 
 // Test-only mock: lock-poisoning `unwrap()` is acceptable scaffolding.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
-impl WindowsApiPort for MockWindowsApi {
+impl RouteTablePort for MockWindowsApi {
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
         Ok(self.route_table.lock().unwrap().clone())
     }
@@ -301,7 +278,12 @@ impl WindowsApiPort for MockWindowsApi {
         });
         Ok(())
     }
+}
 
+// Test double: lock-poisoning `unwrap()` is acceptable scaffolding, same as
+// the route-table half above.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+impl WfpEnginePort for MockWindowsApi {
     fn wfp_engine_open(&self) -> Result<WfpEngineToken, PlatformError> {
         self.check_error()?;
         let mut n = self.next_engine_token.lock().unwrap();

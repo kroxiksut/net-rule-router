@@ -188,6 +188,46 @@ GroupBox {
             checked: root.prefs.notifyBlockNotices !== false
             onToggled: root.updatePrefs({ notifyBlockNotices: checked })
         }
+        // Tray notices are our own window, not system balloons, so their
+        // opacity is ours to offer. Indented with the mutes above: it is the
+        // same "how notifications behave" group.
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            spacing: root.uiTheme.spacingSm
+            enabled: root.prefs.showNotifications !== false
+            Label {
+                text: root.tr("settings.field.tray-notice-opacity",
+                    "Tray notification opacity, %")
+                color: root.textColor
+            }
+            ThemedSpinBox {
+                theme: root.uiTheme
+                Layout.preferredWidth: 140
+                Layout.minimumWidth: 140
+                from: 40
+                to: 100
+                stepSize: 5
+                editable: true
+                value: root.prefs.trayNoticeOpacityPercent || 100
+                ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+                ToolTip.text: "40–100 %"
+                onValueModified: {
+                    root.updatePrefs({ trayNoticeOpacityPercent: value })
+                    root.emitPrefs()
+                }
+            }
+            Item { Layout.fillWidth: true }
+        }
+        Label {
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            wrapMode: Text.WordWrap
+            color: root.mutedTextColor
+            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            text: root.tr("settings.field.tray-notice-opacity-note",
+                "Applies to notifications shown from the tray. Restart the tray for it to take effect.")
+        }
         CheckBox {
             Layout.fillWidth: true
             text: root.tr("settings.field.reopen-last-section", "Open last section on startup")

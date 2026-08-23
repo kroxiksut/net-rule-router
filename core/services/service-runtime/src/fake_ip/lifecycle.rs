@@ -48,6 +48,9 @@ pub struct FakeIpAssembly {
     /// Datapath-health pulse (answers vs. ingress) shared between the answerers,
     /// the stack and the controller watchdog.
     health: Arc<super::health::FakeIpHealth>,
+    /// The additional route's own subnets, read live — the answerer must never
+    /// hand a virtual address for the tunnel's interior.
+    secondary_subnets: Option<crate::dns_resolver::SecondarySubnetsFn>,
     /// Confirmed-VPN-client bypass handed to every stack this assembly builds —
     /// a relayed flow owned by the client that establishes the secondary link
     /// leaves over the primary instead. Inert until the boot wiring supplies an
@@ -70,6 +73,7 @@ impl FakeIpAssembly {
             direct_map: Arc::new(super::direct::DirectRealIpMap::new()),
             runtime_exclusions: Arc::new(super::self_heal::RuntimeHostExclusions::new()),
             health: Arc::new(super::health::FakeIpHealth::new()),
+            secondary_subnets: None,
             vpn_bypass: Arc::new(super::vpn_client_bypass::NoVpnClientBypass),
             stale_flow_reset: Arc::new(NoopStaleFlowReset),
         }
@@ -135,9 +139,23 @@ impl FakeIpAssembly {
     /// runtime exclusion set (so a VPN-self-healed host keeps its real address).
     #[must_use]
     pub fn answerer(&self) -> ScopedFakeIpAnswerer {
-        ScopedFakeIpAnswerer::new(self.scope.clone(), Arc::clone(&self.allocator))
-            .with_runtime_exclusions(Arc::clone(&self.runtime_exclusions))
-            .with_health(Arc::clone(&self.health))
+        let mut answerer =
+            ScopedFakeIpAnswerer::new(self.scope.clone(), Arc::clone(&self.allocator))
+                .with_runtime_exclusions(Arc::clone(&self.runtime_exclusions))
+                .with_health(Arc::clone(&self.health));
+        if let Some(read) = self.secondary_subnets.as_ref() {
+            answerer = answerer.with_secondary_subnets(Arc::clone(read));
+        }
+        answerer
+    }
+
+    /// Teach this assembly which subnets belong to the additional route, so the
+    /// answerer never substitutes an address inside the tunnel's own interior.
+    /// Unwired keeps the previous behaviour.
+    #[must_use]
+    pub fn with_secondary_subnets(mut self, read: crate::dns_resolver::SecondarySubnetsFn) -> Self {
+        self.secondary_subnets = Some(read);
+        self
     }
 
     /// The DIRECT-host answerer for the armed block-all,

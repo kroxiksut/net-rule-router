@@ -259,11 +259,26 @@ fn decode_address_match(
     })
 }
 
+/// The stored spelling is canonicalized on the way in, not trusted.
+///
+/// A revision can arrive from a client that never ran validation, and one
+/// un-canonicalized name is enough to make the same rule set compare unequal to
+/// itself — the diff then adds and removes the same rule on every pass.
 fn decode_app_match(m: AppMatchDto) -> CanonicalAppMatch {
     CanonicalAppMatch {
         pattern: match m.pattern {
-            AppPatternDto::Exact { value } => CanonicalAppPattern::Exact(value),
-            AppPatternDto::Glob { value } => CanonicalAppPattern::Glob(value),
+            // A `*` in an "exact" filename is a client that mislabelled a
+            // pattern: no process can ever carry that name, so read it as the
+            // glob it plainly is instead of storing a rule that matches nothing.
+            AppPatternDto::Exact { value } if value.contains('*') => CanonicalAppPattern::Glob(
+                crate::app_identity::canonical_glob_process_pattern(&value),
+            ),
+            AppPatternDto::Exact { value } => CanonicalAppPattern::Exact(
+                crate::app_identity::canonical_exact_process_name(&value).0,
+            ),
+            AppPatternDto::Glob { value } => CanonicalAppPattern::Glob(
+                crate::app_identity::canonical_glob_process_pattern(&value),
+            ),
         },
         include_child_processes: m.include_child_processes,
     }
@@ -359,6 +374,39 @@ mod tests {
             primary: CanonicalRuleSet::from_rules(primary),
             secondary: CanonicalRuleSet::from_rules(secondary),
         }
+    }
+
+    #[test]
+    fn an_exact_pattern_carrying_a_star_decodes_as_a_glob() {
+        // What the GUI used to send for `disko*.exe`: no process can be named
+        // that, so keeping it exact stored a rule that matched nothing.
+        let dto = CanonicalRulesJsonV1 {
+            schema_version: 1,
+            primary: vec![RuleDto {
+                id: "r-app".into(),
+                enabled: true,
+                address_match: None,
+                app_match: Some(AppMatchDto {
+                    pattern: AppPatternDto::Exact {
+                        value: "DiskO*.exe".into(),
+                    },
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: WireRuleAction::default(),
+                origin: None,
+            }],
+            secondary: vec![],
+        };
+        let decoded = decode(dto).expect("decode");
+        assert_eq!(
+            decoded.rule_book.primary.rules()[0]
+                .app_match
+                .as_ref()
+                .expect("app match")
+                .pattern,
+            CanonicalAppPattern::Glob("disko*.exe".into())
+        );
     }
 
     #[test]

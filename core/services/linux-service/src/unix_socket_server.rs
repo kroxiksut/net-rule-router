@@ -21,8 +21,9 @@
 //! - **Client profile defaults to `GuiInteractive`.** The Windows server derives
 //!   `IpcClientProfile` from the exe basename; peer-cred cannot, so every caller
 //!   is treated as the full-capability profile. Authorization that matters flows
-//!   through `caller_principal` (`unix:uid:<n>`) + `caller_is_elevated`
-//!   (`uid == 0`), not the profile hint.
+//!   through `caller_principal` (`unix:uid:<n>`), `caller_is_elevated`
+//!   (`uid == 0`) and — for privileged operations from an ordinary user — polkit,
+//!   which the router consults using the pid captured here.
 //!
 //! ## Shutdown
 //!
@@ -31,10 +32,15 @@
 //! technique the Windows server uses via `CreateFileW`). The tick then re-checks
 //! the flag and returns `ShutdownRequested`.
 //!
-//! TODO: push-event delivery — the `EventBus` pump the Windows server runs
-//! after a `StatusUpdatesSubscribe`. This cut serves request/response only, so
-//! a subscribed client degrades to poll-only. Lands with the Linux
-//! `runtime_deps`, since `SupervisedRuntimeDeps` is Windows-only today.
+//! ## Push delivery
+//!
+//! A subscribed client is owed events it never asked for again, so the worker
+//! cannot sit in a blocking read. `try_clone` gives the reader its own fd: a
+//! sub-thread does blocking reads and forwards frames over an mpsc, and the main
+//! loop alternates between dispatching what arrives and draining the `EventBus`
+//! (`nrr_service_runtime::ipc_push`). Read timeouts would be simpler and wrong —
+//! one expiring mid-frame loses the bytes already consumed and desynchronises
+//! the stream.
 
 #![cfg(target_os = "linux")]
 
@@ -46,8 +52,11 @@ use std::thread::{self, JoinHandle};
 
 use nrr_ipc_client::wire::{read_frame, write_frame};
 use nrr_platform_linux::peer_cred::classify_unix_client;
+use nrr_service_runtime::ipc_push::{
+    extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+};
 use nrr_service_runtime::{
-    AcceptError, AcceptErrorCategory, AcceptOutcome, IpcAcceptor, IpcBindError, IpcError,
+    AcceptError, AcceptErrorCategory, AcceptOutcome, EventBus, IpcAcceptor, IpcBindError, IpcError,
     IpcErrorCode, IpcRequestContext, IpcRequestEnvelope, IpcResponseEnvelope, IpcRouter, IpcServer,
     UserPrincipal,
 };
@@ -72,6 +81,9 @@ const DEFAULT_CLIENT_PROFILE: IpcClientProfile = IpcClientProfile::GuiInteractiv
 pub struct UnixDomainSocketServer {
     router: Arc<IpcRouter>,
     socket_path: PathBuf,
+    /// Shared bus the per-connection workers drain for their subscription.
+    /// `None` leaves a subscribed client on request/response only.
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl UnixDomainSocketServer {
@@ -80,7 +92,15 @@ impl UnixDomainSocketServer {
         Self {
             router,
             socket_path: PathBuf::from(SOCKET_PATH),
+            event_bus: None,
         }
+    }
+
+    /// Attach the shared `EventBus` so workers can flush push frames after a
+    /// `StatusUpdatesSubscribe`.
+    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Construct a server bound to an explicit path — used by tests to bind a
@@ -90,6 +110,7 @@ impl UnixDomainSocketServer {
         Self {
             router,
             socket_path: socket_path.into(),
+            event_bus: None,
         }
     }
 }
@@ -120,6 +141,7 @@ impl IpcServer for UnixDomainSocketServer {
         Ok(Box::new(UnixDomainSocketAcceptor {
             listener,
             router: Arc::clone(&self.router),
+            event_bus: self.event_bus.clone(),
             socket_path: self.socket_path.clone(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             active_count: Arc::new(AtomicUsize::new(0)),
@@ -133,6 +155,7 @@ impl IpcServer for UnixDomainSocketServer {
 pub struct UnixDomainSocketAcceptor {
     listener: UnixListener,
     router: Arc<IpcRouter>,
+    event_bus: Option<Arc<EventBus>>,
     /// The bound path, kept so `request_shutdown` can self-connect to wake a
     /// blocked `accept`, and `Drop` can unlink the socket file.
     socket_path: PathBuf,
@@ -172,12 +195,13 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
         }
 
         let router = Arc::clone(&self.router);
+        let bus = self.event_bus.clone();
         let active = Arc::clone(&self.active_count);
         self.active_count.fetch_add(1, Ordering::SeqCst);
         let spawn = thread::Builder::new()
             .name("nrr-ipc-worker".into())
             .spawn(move || {
-                handle_connection(stream, router);
+                handle_connection(stream, router, bus);
                 active.fetch_sub(1, Ordering::SeqCst);
             });
 
@@ -226,9 +250,21 @@ impl Drop for UnixDomainSocketAcceptor {
     }
 }
 
+/// Frames the reader sub-thread hands to the dispatch loop.
+enum ReaderMsg {
+    Request(IpcRequestEnvelope),
+    Malformed,
+    Closed,
+}
+
 /// Per-connection worker: classify the caller once, then serve framed
-/// request→response pairs until the client disconnects or a frame is malformed.
-fn handle_connection(mut stream: UnixStream, router: Arc<IpcRouter>) {
+/// request→response pairs — interleaved with push flushes once the client
+/// subscribes — until it disconnects or a frame is malformed.
+fn handle_connection(
+    mut stream: UnixStream,
+    router: Arc<IpcRouter>,
+    event_bus: Option<Arc<EventBus>>,
+) {
     let identity = match classify_unix_client(&stream) {
         Ok(id) => id,
         Err(_) => return, // getsockopt failure — nothing we can attribute; drop.
@@ -241,29 +277,101 @@ fn handle_connection(mut stream: UnixStream, router: Arc<IpcRouter>) {
     // to a console's limits for the rest of the connection.
     let mut profile = DEFAULT_CLIENT_PROFILE;
 
+    let mut reader = match stream.try_clone() {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "nrr::ipc", error = %e, "socket clone failed, dropping connection");
+            return;
+        }
+    };
+    let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel::<ReaderMsg>(8);
+    let reader_thread = thread::Builder::new()
+        .name("nrr-ipc-reader".into())
+        .spawn(move || loop {
+            let msg = match read_frame::<_, IpcRequestEnvelope>(&mut reader) {
+                Ok(req) => ReaderMsg::Request(req),
+                Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
+                Err(_) => ReaderMsg::Malformed,
+            };
+            let terminal = !matches!(msg, ReaderMsg::Request(_));
+            if reader_tx.send(msg).is_err() || terminal {
+                break;
+            }
+        })
+        .ok();
+
+    let mut subscription_id: Option<String> = None;
     loop {
-        match read_frame::<_, IpcRequestEnvelope>(&mut stream) {
-            Ok(request) => {
+        match reader_rx.recv_timeout(PUSH_POLL_INTERVAL) {
+            Ok(ReaderMsg::Request(request)) => {
                 profile = narrow_profile_from_handshake(profile, &request);
                 let ctx = IpcRequestContext {
                     client_profile: profile,
                     caller_is_elevated: identity.caller_is_elevated,
                     caller_principal: principal.clone(),
+                    // Named so the router can ask polkit about this caller: on
+                    // this platform an ordinary user cannot elevate a client,
+                    // and being authorized for the one action is how they get
+                    // to do privileged work at all.
+                    caller_pid: u32::try_from(identity.pid).ok(),
                 };
                 let response = router.dispatch(request, ctx);
+                if subscription_id.is_none() && response.ok {
+                    subscription_id = extract_subscription_id(&response);
+                    if let Some(sub_id) = subscription_id.as_deref() {
+                        tracing::info!(
+                            target: "nrr::ipc-push",
+                            subscription_id = sub_id,
+                            bus_wired = event_bus.is_some(),
+                            "push subscription opened"
+                        );
+                    }
+                }
                 if write_frame(&mut stream, &response).is_err() {
                     break;
                 }
             }
-            Err(e) if e.is_transport_dead() => break, // EOF / client closed.
-            Err(_) => {
+            Ok(ReaderMsg::Malformed) => {
                 let _ = write_frame(
                     &mut stream,
                     &error_response(IpcErrorCode::MalformedRequest, "frame decode failed"),
                 );
                 break;
             }
+            Ok(ReaderMsg::Closed) => break, // EOF / client closed.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if let (Some(sub_id), Some(bus)) = (subscription_id.as_ref(), event_bus.as_ref()) {
+                    let failed = flush_push_frames(bus, sub_id, PUSH_BATCH_SIZE, |env| {
+                        write_frame(&mut stream, env).map_err(|e| e.to_string())
+                    });
+                    if failed {
+                        break;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
+    }
+
+    // Stop the bus accumulating for a subscription nobody will read.
+    if let (Some(sub_id), Some(bus)) = (subscription_id.as_ref(), event_bus.as_ref()) {
+        bus.unsubscribe(sub_id);
+        tracing::info!(
+            target: "nrr::ipc-push",
+            subscription_id = %sub_id,
+            subscribers = bus.subscriber_count(),
+            "push subscription closed"
+        );
+    }
+    // The reader holds its own dup of the fd, so dropping ours would leave it
+    // blocked until the client happened to disconnect. Shut the socket down
+    // instead: the pending read returns EOF and the thread joins at once.
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+    // Release the queue too: a reader parked in `send` (bounded channel, nobody
+    // receiving any more) unblocks with an error and falls out of its loop.
+    drop(reader_rx);
+    if let Some(handle) = reader_thread {
+        let _ = handle.join();
     }
 }
 
@@ -354,6 +462,31 @@ mod tests {
         Arc::new(IpcRouter::new(reg, audit, 1))
     }
 
+    /// The daemon's own registry, over a caller-supplied bus so a test can
+    /// publish into the same one the workers drain.
+    fn serving_router(event_bus: Arc<EventBus>) -> Arc<IpcRouter> {
+        let audit: Arc<dyn IpcAuditEmitter> = Arc::new(NoopIpcAuditEmitter);
+        let health = Arc::new(nrr_service_runtime::HealthAggregator::new());
+        Arc::new(IpcRouter::new(
+            crate::run::serving_registry_with(health, event_bus),
+            audit,
+            1,
+        ))
+    }
+
+    /// Connect with a retry window — the acceptor may not have reached
+    /// `accept` yet when the test's client dials.
+    fn connect(sock: &std::path::Path) -> UnixStream {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match UnixStream::connect(sock) {
+                Ok(s) => return s,
+                Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("client connect failed: {e}"),
+            }
+        }
+    }
+
     fn sample_request() -> IpcRequestEnvelope {
         use nrr_service_runtime::IpcOperationClass;
         use nrr_shared::ipc::IpcOperationName;
@@ -414,16 +547,7 @@ mod tests {
         let ticker = thread::spawn(move || acc.accept_one());
 
         // Connect a real client and exchange one framed request/response.
-        let mut client = {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match UnixStream::connect(&sock) {
-                    Ok(s) => break s,
-                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                    Err(e) => panic!("client connect failed: {e}"),
-                }
-            }
-        };
+        let mut client = connect(&sock);
         write_frame(&mut client, &sample_request()).expect("client writes request");
         let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
         // Empty registry → the op is unhandled → a well-formed error envelope.
@@ -452,31 +576,14 @@ mod tests {
     fn the_serving_registry_answers_the_handshake() {
         let dir = temp_dir();
         let sock = dir.0.join("service.sock");
-        let router = {
-            let audit: Arc<dyn IpcAuditEmitter> = Arc::new(NoopIpcAuditEmitter);
-            let health = Arc::new(nrr_service_runtime::HealthAggregator::new());
-            Arc::new(IpcRouter::new(
-                crate::run::serving_registry_with(health),
-                audit,
-                1,
-            ))
-        };
+        let router = serving_router(Arc::new(EventBus::new()));
         let server = UnixDomainSocketServer::new_at(router, &sock);
         let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
 
         let acc = Arc::clone(&acceptor);
         let ticker = thread::spawn(move || acc.accept_one());
 
-        let mut client = {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                match UnixStream::connect(&sock) {
-                    Ok(s) => break s,
-                    Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-                    Err(e) => panic!("client connect failed: {e}"),
-                }
-            }
-        };
+        let mut client = connect(&sock);
         // A real handshake payload — the empty one the transport test uses is
         // rejected by the handler, which would prove nothing about routing.
         let mut request = sample_request();
@@ -492,6 +599,62 @@ mod tests {
             "contract.negotiate must be answered, got {:?}",
             response.error
         );
+
+        drop(client);
+        let _ = ticker.join().expect("ticker thread");
+        acceptor.request_shutdown();
+        acceptor.join_workers();
+    }
+
+    /// A subscribed client is handed events it never asked for again.
+    ///
+    /// The distinction that matters: without the pump the connection still
+    /// answers `status.updates.subscribe` with a subscription id, so a client
+    /// sees a healthy subscription and silently never receives anything.
+    #[test]
+    fn a_subscribed_client_receives_a_published_event_as_a_push_frame() {
+        use nrr_shared::ipc::IpcOperationName;
+        use nrr_shared::ipc_payloads::{StatusUpdateEvent, StatusUpdatePushFrame};
+
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let bus = Arc::new(EventBus::new());
+        let server = UnixDomainSocketServer::new_at(serving_router(Arc::clone(&bus)), &sock)
+            .with_event_bus(Arc::clone(&bus));
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+
+        let mut client = connect(&sock);
+        let mut request = sample_request();
+        request.operation = IpcOperationName::StatusUpdatesSubscribe;
+        request.payload = serde_json::json!({ "client-id": "test-client" });
+        write_frame(&mut client, &request).expect("client writes subscribe");
+        let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");
+        assert!(
+            response.ok,
+            "subscribe must succeed, got {:?}",
+            response.error
+        );
+
+        // Publish AFTER the subscription exists, so the frame can only arrive
+        // via the pump rather than as part of the response.
+        let event_id = bus.publish(StatusUpdateEvent::AdaptersChanged {
+            data_source: "netlink".into(),
+        });
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let push: IpcResponseEnvelope = read_frame(&mut client).expect("client reads push frame");
+        assert!(push.request_id.is_empty(), "a push answers no request");
+        assert_eq!(
+            push.correlation_id,
+            extract_subscription_id(&response).expect("sub id")
+        );
+        let frame: StatusUpdatePushFrame =
+            serde_json::from_value(push.payload.expect("push payload")).expect("decode push");
+        assert_eq!(frame.event_id, event_id);
 
         drop(client);
         let _ = ticker.join().expect("ticker thread");

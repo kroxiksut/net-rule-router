@@ -5,7 +5,7 @@ import QtQuick.Layouts 1.15
 // Top banner stack (extracted from Main.qml). The status banners
 // (backend / combined-amber / drift / merge / compat / secondary-adapter /
 // empty-rules / policy-inactive / block-all / rules-folder-suggestion /
-// revision-integrity), stacked top-to-bottom
+// revision-integrity / local-network-offer), stacked top-to-bottom
 // and anchored to each other. The combined-amber bar merges the drift and
 // secondary-adapter warnings into one container while both apply; those two
 // stand down for its duration. Kept as ONE
@@ -25,6 +25,7 @@ Item {
         + emptyRulesBanner.height + policyInactiveBanner.height
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
+        + localNetworkOfferBanner.height
     height: totalHeight
 
     // Expansion state of the combined amber banner. Local to the stack — the
@@ -380,7 +381,7 @@ Item {
                 Layout.fillWidth: true
                 color: "white"
                 text: root.tr("status.merge-banner",
-                    "Your rules file and the app's rules have diverged — you can merge them.")
+                    "The rules in your files are not the ones being applied — you can compare and merge them.")
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideRight
                 Accessible.role: Accessible.StaticText
@@ -724,14 +725,18 @@ Item {
             Label {
                 Layout.fillWidth: true
                 color: "white"
-                // Two halves of one story: the app holds an adapter the service
-                // never received (fixable here), or no adapter is assigned at
-                // all (nothing to send — say where to assign one instead).
+                // Three readings of one silence: the app holds an adapter the
+                // service never received (fixable here); no adapter and leak
+                // protection on (that traffic is being blocked); no adapter and
+                // protection off (nothing to send — say where to assign one).
                 text: root.policyInactiveActionable
                     ? root.tr("status.policy-inactive-not-delivered",
                         "The service is running, but your rules are not being applied: it never received which adapter to send them through. Send it now.")
-                    : root.tr("status.policy-inactive-no-adapter",
-                        "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes.")
+                    : (root.policyInactiveKillSwitchBlocking
+                        ? root.tr("status.policy-inactive-kill-switch-blocking",
+                            "Leak protection is on and no additional adapter is assigned, so everything your rules send that way is being blocked. Assign an adapter in Interfaces and routes, or turn leak protection off.")
+                        : root.tr("status.policy-inactive-no-adapter",
+                            "The service is running, but your rules are not being applied: no additional adapter is assigned to them yet, so there is nowhere to route them. Assign one in Interfaces and routes."))
                 verticalAlignment: Text.AlignVCenter
                 wrapMode: Text.WordWrap
                 Accessible.role: Accessible.StaticText
@@ -952,6 +957,58 @@ Item {
                     "status.revision-integrity-banner-button-description",
                     "Open Diagnostics to see which rule set was rejected and confirm the alert.")
                 onClicked: root.requestSectionChange("diagnostics")
+            }
+        }
+    }
+    // A local segment nobody has answered for yet — a hypervisor's virtual
+    // network, or the subnet of the main connection. It stays reachable while
+    // the kill-switch blocks everything else, which is almost always right, but
+    // "almost always" is the user's call to confirm. No close button on
+    // purpose: an unanswered offer that can be waved away is an offer that
+    // never gets answered, and the answer decides whether their virtual
+    // machines survive the next outage.
+    Rectangle {
+        id: localNetworkOfferBanner
+        anchors.top: revisionIntegrityBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.localNetworkOfferVisible
+            ? Math.max(36, localNetworkOfferRow.implicitHeight + 2 * root.uiTheme.spacingSm)
+            : 0
+        visible: root.localNetworkOfferVisible
+        color: "#2f7d5b"
+        z: 91
+        RowLayout {
+            id: localNetworkOfferRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: root.uiTheme.spacingMd
+            anchors.rightMargin: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: "white"
+                text: root.localNetworkOfferText
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("status.local-network-offer-keep", "Keep them reachable")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.acceptPendingLocalNetworks()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("status.local-network-offer-decide", "Decide for each…")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: root.openSettingsCategory("routing")
             }
         }
     }

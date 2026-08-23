@@ -737,13 +737,21 @@ fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
         })
         .collect();
 
-    // Seven qualifying (anchor, candidate) pairs surface as six review rows:
-    // brand and delivery names generalize to a *different* domain from the
-    // anchor's own, so the two cross-TLD companions of `anchor-f` collapse into
-    // one row. `rt.anchor-k.example` stays exact: its apex IS the anchor's own
-    // domain (`anchor-k.example`), and generalizing there would swallow
+    // Eight review rows, every one confirmed by the hand-labelled ground
+    // truth. Brand and delivery names generalize to a *different* domain from
+    // the anchor's own, so the two cross-TLD companions of `anchor-f` collapse
+    // into one row. `rt.anchor-k.example` stays exact: its apex IS the anchor's
+    // own domain (`anchor-k.example`), and generalizing there would swallow
     // `www.anchor-k.example` itself on one window's evidence — the same guard
-    // that keeps a subdomain from speaking for the umbrella domain it lives under.
+    // that keeps a subdomain from speaking for the umbrella domain it lives
+    // under.
+    //
+    // The last two rows (`anchorb`'s own suffix and `bot.anchor-i.example`)
+    // arrived with the opening window's look-back: their first sighting landed
+    // a moment BEFORE the page that pulls them, and a forward-only window threw
+    // exactly those away. Both are `Good` against the same ground truth, and no
+    // row was lost — the look-back only adds companions the ledger would
+    // otherwise never have tracked at all.
     assert_eq!(
         emitted,
         vec![
@@ -760,6 +768,12 @@ fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
                 Verdict::Good
             ),
             (
+                "anchorb.example",
+                "anchorb.example",
+                CompanionSignal::BrandRelated,
+                Verdict::Good
+            ),
+            (
                 "anchord.example",
                 "anchordx.example",
                 CompanionSignal::BrandRelated,
@@ -768,6 +782,12 @@ fn the_shipped_engine_reproduces_the_recommended_rule_on_the_trace() {
             (
                 "web.anchor-f.example",
                 "anchor-f.test",
+                CompanionSignal::BrandRelated,
+                Verdict::Good
+            ),
+            (
+                "www.anchor-i.example",
+                "bot.anchor-i.example",
                 CompanionSignal::BrandRelated,
                 Verdict::Good
             ),

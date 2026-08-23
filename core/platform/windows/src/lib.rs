@@ -51,6 +51,9 @@ pub mod dns;
 pub mod dns_observe;
 pub mod dns_redirect;
 pub mod error;
+// Operator-facing Windows event log (install-time source registration + the
+// runtime sink behind `SystemEventLogPort`).
+pub mod event_log;
 pub mod fail_closed;
 // Windows TUN mechanism on WireGuard LLC's signed Wintun driver, plus the
 // third-party integrity report the GUI shows.
@@ -69,6 +72,8 @@ pub mod key_store;
 pub mod lower_windows;
 pub mod network_change;
 pub mod notify;
+/// The Windows `EnforcementBackend` — the neutral plan reconciled onto WFP.
+pub mod wfp_backend;
 // Per-user environment mechanism behind
 // `nrr_platform_api::path_registration::PathRegistrationPort` — appends the
 // administrative console's directory to `HKCU\Environment`'s `Path` value and
@@ -197,4 +202,8 @@ pub use vpn_discovery::WindowsVpnDiscovery;
 // `ALE_APP_ID` builder needs the drive-letter form.
 #[cfg(target_os = "windows")]
 pub use win32_ffi::app_id::win32_path_from_nt_path;
-pub use windows_api::{MockWindowsApi, ProductionWindowsApi, WindowsApiPort};
+// `RouteTablePort` is the neutral half of the old single port; re-exported
+// here so Windows code names one crate, exactly as before the split.
+pub use windows_api::{
+    MockWindowsApi, ProductionWindowsApi, RouteTablePort, WfpEnginePort, WindowsApiPort,
+};

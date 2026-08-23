@@ -48,6 +48,9 @@ mod named_pipe_server;
 // (`scm.rs::run_scm_inner`) and console mode (`run_console`).
 #[cfg(windows)]
 mod runtime_deps;
+// Redirecting the process stderr handle is a Win32 mechanism; the Linux
+// daemon gets the same evidence from journald.
+#[cfg(windows)]
 mod stderr_capture;
 
 fn main() -> std::process::ExitCode {
@@ -157,6 +160,12 @@ fn main() -> std::process::ExitCode {
                     );
                     println!("  data_removed: {}", outcome.data_removed);
                     println!("  rule_files_preserved: {}", outcome.rule_files_preserved);
+                    if outcome.machine_state_cleared == Some(false) {
+                        eprintln!(
+                            "  warning: filters or the DNS redirect could not be swept. \
+                             Run `nrr-service cleanup` elevated, or reboot."
+                        );
+                    }
                     std::process::ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -413,9 +422,12 @@ fn print_status_banner() {
 /// shutdown.
 fn run_console() -> std::process::ExitCode {
     use nrr_service_runtime::{
-        install_ndjson_tracing_with_console_and_verbose, run_bootstrap, run_supervised_runtime,
-        BootstrapConfig, ServiceController, ServiceRuntimeState, StopToken,
+        install_ndjson_tracing_with_console_and_verbose, run_bootstrap, BootstrapConfig,
+        ServiceController, ServiceRuntimeState, StopToken,
     };
+    // Only the Windows branch below runs the supervised runtime.
+    #[cfg(windows)]
+    use nrr_service_runtime::run_supervised_runtime;
     use nrr_storage::StorageProfile;
     use std::sync::Arc;
 
@@ -547,12 +559,19 @@ fn run_console() -> std::process::ExitCode {
     // operation-results GC, diagnostics cleanup) before waiting on the
     // stop token.
     #[cfg(windows)]
-    let deps = runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
+    {
+        let deps = runtime_deps::build_supervised_runtime_deps(&artifacts, verbosity_handle);
+        let _reason = run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
+        std::process::ExitCode::SUCCESS
+    }
+    // Console mode drives the same supervised runtime the SCM path does, and
+    // its dependency bundle is built from Win32 handles. Off Windows there is
+    // nothing to construct — say so and return, rather than reaching an
+    // `unreachable!` that makes every statement after it dead code.
     #[cfg(not(windows))]
-    let deps: nrr_service_runtime::SupervisedRuntimeDeps = {
-        let _ = verbosity_handle;
-        unreachable!("console mode requires Windows for SupervisedRuntimeDeps construction")
-    };
-    let _reason = run_supervised_runtime(&ConsoleController, &stop, artifacts, deps);
-    std::process::ExitCode::SUCCESS
+    {
+        let _ = (verbosity_handle, artifacts, stop, ConsoleController);
+        eprintln!("nrr-service: console mode needs Windows; on this host use nrr-serviced");
+        std::process::ExitCode::FAILURE
+    }
 }

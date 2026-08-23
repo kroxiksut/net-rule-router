@@ -13,11 +13,21 @@ Dialog {
     /// ApplicationWindow injected by the caller (`ownerRoot: window`).
     property var ownerRoot: null
     /// Fired when the user acknowledges + confirms; caller runs fullReset().
-    signal confirmed()
+    /// `allPrincipals` is true when the user chose to clear every OS user's
+    /// routing, not just their own.
+    signal confirmed(bool allPrincipals)
 
     /// Acknowledgement state; reset on every open so the destructive button
     /// always starts disabled.
     property bool _ack: false
+
+    /// How many OTHER users the service holds rules for, answered by
+    /// `principal-data.count` on open. Zero (or unknown) keeps the dialog the
+    /// single-user question it has always been.
+    property int otherPrincipals: 0
+    /// The chosen scope. Defaults to "mine": erasing another account's routing
+    /// is never the safe reading of "reset".
+    property bool _allPrincipals: false
 
     function tr(key, fallback) {
         if (ownerRoot && typeof ownerRoot.tr === "function") {
@@ -38,7 +48,14 @@ Dialog {
         theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
         titleText: root.title
     }
-    onOpened: _ack = false
+    onOpened: {
+        _ack = false
+        _allPrincipals = false
+        otherPrincipals = 0
+        if (ownerRoot && typeof ownerRoot.countOtherPrincipals === "function") {
+            ownerRoot.countOtherPrincipals(function(count) { root.otherPrincipals = count })
+        }
+    }
     contentItem: ColumnLayout {
         spacing: 12
         Label {
@@ -50,6 +67,33 @@ Dialog {
                 + "applied by the service (back to an empty post-install state), and "
                 + "wipes saved comments and logs. The Windows service is NOT "
                 + "uninstalled. This cannot be undone.")
+        }
+        // Only asked when someone else's routing is actually stored here.
+        ColumnLayout {
+            Layout.fillWidth: true
+            spacing: 4
+            visible: root.otherPrincipals > 0
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                text: root.tr("dialog.full-reset.other-users",
+                    "Other users of this computer have rules here too ({count}). What should be cleared?")
+                    .replace("{count}", String(root.otherPrincipals))
+            }
+            ThemedRadioButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                checked: !root._allPrincipals
+                text: root.tr("dialog.full-reset.scope-mine", "Only my data")
+                onToggled: if (checked) root._allPrincipals = false
+            }
+            ThemedRadioButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                checked: root._allPrincipals
+                text: root.tr("dialog.full-reset.scope-everyone",
+                    "Every user on this computer (asks for administrator approval)")
+                onToggled: if (checked) root._allPrincipals = true
+            }
         }
         CheckBox {
             id: fullResetAck
@@ -76,7 +120,11 @@ Dialog {
                 text: root.tr("dialog.full-reset.confirm", "Reset everything")
                 highlighted: true
                 enabled: root._ack
-                onClicked: { root.close(); root.confirmed() }
+                onClicked: {
+                    var scope = root._allPrincipals
+                    root.close()
+                    root.confirmed(scope)
+                }
             }
         }
     }

@@ -974,7 +974,7 @@ GroupBox {
                     ThemedButton {
                         theme: root.uiTheme
                         enabled: exportState.lastArchiveDir !== ""
-                        text: root.tr("diag.archive.open-folder", "Open folder")
+                        text: root.tr("action.open-folder", "Open folder")
                         icon.source: root.uiIconSource("open-file")
                         onClicked: {
                             if (exportState.lastArchiveDir === "") return

@@ -59,7 +59,7 @@ use crate::{
     },
     types::{ApplyActionPlan, RouteEntry, RoutingAction, WfpFilterAction, WfpFilterSpec},
     wfp::WfpSession,
-    windows_api::WindowsApiPort,
+    windows_api::{RouteTablePort, WindowsApiPort},
 };
 use nrr_storage::StoredSnapshot;
 
@@ -272,7 +272,8 @@ impl RollbackEngine {
         let deadline = Instant::now() + std::time::Duration::from_secs(self.rollback_timeout_secs);
 
         // Route batch with compensating journal.
-        let mut routing_tx = RoutingTransaction::new(Arc::clone(&self.api));
+        let mut routing_tx =
+            RoutingTransaction::new(Arc::clone(&self.api) as Arc<dyn RouteTablePort>);
         if let Err(e) = routing_tx.execute(&plan.routing_actions) {
             return RollbackResult::Failed {
                 reason: format!("routing rollback failed: {e}"),

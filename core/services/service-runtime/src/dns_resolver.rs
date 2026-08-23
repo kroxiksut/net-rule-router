@@ -73,6 +73,12 @@ pub trait RuleHostOracle: Send + Sync {
 ///
 /// [`FakeIpAllocator`]: nrr_platform_api::fake_ip::FakeIpAllocator
 pub trait FakeIpAnswerer: Send + Sync {
+    /// May a virtual address stand in for these real ones? `true` by default;
+    /// see the production implementation for the one case that says no.
+    fn may_substitute(&self, _real: &[Ipv4Addr]) -> bool {
+        true
+    }
+
     fn fake_answer(&self, hostname: &str) -> Option<Vec<Ipv4Addr>>;
 }
 
@@ -138,7 +144,16 @@ pub struct ScopedFakeIpAnswerer {
     allocator: Arc<Mutex<FakeIpAllocator>>,
     runtime_exclusions: Arc<crate::fake_ip::RuntimeHostExclusions>,
     health: Arc<crate::fake_ip::FakeIpHealth>,
+    /// The additional route's own subnets, read live. See
+    /// [`FakeIpAnswerer::may_substitute`].
+    secondary_subnets: Option<SecondarySubnetsFn>,
 }
+
+/// Reads the subnets that belong to the additional route itself. A closure over
+/// the route coordinator at the composition root, so this module never learns
+/// what an adapter is.
+pub type SecondarySubnetsFn =
+    Arc<dyn Fn() -> Vec<nrr_domain::ipv4_network::Ipv4Network> + Send + Sync>;
 
 impl ScopedFakeIpAnswerer {
     #[must_use]
@@ -148,6 +163,7 @@ impl ScopedFakeIpAnswerer {
             allocator,
             runtime_exclusions: Arc::new(crate::fake_ip::RuntimeHostExclusions::new()),
             health: Arc::new(crate::fake_ip::FakeIpHealth::new()),
+            secondary_subnets: None,
         }
     }
 
@@ -163,6 +179,16 @@ impl ScopedFakeIpAnswerer {
         self
     }
 
+    /// Teach the answerer which subnets belong to the additional route itself,
+    /// so it never substitutes an address inside them (see
+    /// [`FakeIpAnswerer::may_substitute`]). Unwired means "substitute freely",
+    /// which is the behaviour that existed before.
+    #[must_use]
+    pub fn with_secondary_subnets(mut self, read: SecondarySubnetsFn) -> Self {
+        self.secondary_subnets = Some(read);
+        self
+    }
+
     /// Share the datapath-health counters so every handed-out virtual address
     /// feeds the relay watchdog. Builder-style; the default is a private
     /// counter nobody reads.
@@ -174,6 +200,26 @@ impl ScopedFakeIpAnswerer {
 }
 
 impl FakeIpAnswerer for ScopedFakeIpAnswerer {
+    /// Never substitute a virtual address for one that lives INSIDE the
+    /// additional route's own subnet.
+    ///
+    /// Those addresses are the tunnel's own interior — the VPN client's
+    /// authorization endpoint is a live example (`10.117.0.1` on a
+    /// `10.88.0.0/10` tunnel). Handing out a virtual address for them points
+    /// the caller at our TUN, where nothing serves the tunnel's own protocol,
+    /// and the client concludes the connection failed. The relay cannot rescue
+    /// it either: reaching the interior requires being inside the tunnel, which
+    /// is what the caller was already doing.
+    fn may_substitute(&self, real: &[Ipv4Addr]) -> bool {
+        let Some(read) = self.secondary_subnets.as_ref() else {
+            return true;
+        };
+        let subnets = read();
+        !real
+            .iter()
+            .any(|ip| subnets.iter().any(|net| net.contains(*ip)))
+    }
+
     fn fake_answer(&self, hostname: &str) -> Option<Vec<Ipv4Addr>> {
         if !self.scope.decide(hostname, None).is_fake_ip() {
             return None;
@@ -610,7 +656,14 @@ pub fn handle_a_query(
     // steers it per-hostname. No WFP reconcile here: fake-IP replaces per-IP
     // routing for scope hosts, and the kill-switch blocks the real addresses
     // separately so a cached / in-app-DoH real IP cannot leak past the fake.
-    if let Some(fake) = fake_ip.fake_answer(hostname) {
+    if !fake_ip.may_substitute(&answered) {
+        tracing::info!(
+            target: "nrr::dns-resolver",
+            host = %hostname,
+            addresses = ?answered,
+            "answering with the real address: this host lives inside the additional route's own subnet, and a virtual address there would point the caller at our TUN instead of into the tunnel",
+        );
+    } else if let Some(fake) = fake_ip.fake_answer(hostname) {
         tracing::debug!(
             target: "nrr::dns-resolver",
             host = %hostname,
@@ -762,6 +815,14 @@ mod tests {
     struct FakeFakeIp {
         scope: Vec<String>,
         fake: Ipv4Addr,
+        /// Subnets this double treats as the tunnel's own interior.
+        refuse: Vec<nrr_domain::ipv4_network::Ipv4Network>,
+    }
+    impl FakeFakeIp {
+        fn refusing_subnets(mut self, subnets: Vec<nrr_domain::ipv4_network::Ipv4Network>) -> Self {
+            self.refuse = subnets;
+            self
+        }
     }
     impl FakeIpAnswerer for FakeFakeIp {
         fn fake_answer(&self, hostname: &str) -> Option<Vec<Ipv4Addr>> {
@@ -769,6 +830,12 @@ mod tests {
                 .iter()
                 .any(|h| h == hostname)
                 .then(|| vec![self.fake])
+        }
+
+        fn may_substitute(&self, real: &[Ipv4Addr]) -> bool {
+            !real
+                .iter()
+                .any(|addr| self.refuse.iter().any(|net| net.contains(*addr)))
         }
     }
 
@@ -821,6 +888,54 @@ mod tests {
         // Fail-open path must NOT record facts or reconcile: general DNS never
         // depends on enforcement health.
         assert!(log.snapshot().is_empty());
+    }
+
+    /// An address inside the tunnel's OWN subnet must keep its real value.
+    ///
+    /// The live case: a VPN client authorizes against `10.117.0.1` on a
+    /// `10.88.0.0/10` link. A virtual address there sends it to our TUN, where
+    /// nothing speaks the tunnel's protocol — the client concludes the
+    /// connection failed and reconnects forever.
+    #[test]
+    fn a_host_inside_the_tunnels_own_subnet_is_never_given_a_virtual_address() {
+        let log = CallLog::default();
+        let interior = ip(10, 117, 0, 1);
+        let answerer = FakeFakeIp {
+            scope: vec!["auth.tunnel.internal".to_string()],
+            refuse: Vec::new(),
+            fake: ip(198, 18, 0, 7),
+        }
+        .refusing_subnets(vec![nrr_domain::ipv4_network::Ipv4Network::parse(
+            "10.88.0.0/10",
+        )
+        .expect("parse")]);
+
+        let out = handle_a_query(
+            "auth.tunnel.internal",
+            AnswerHold {
+                deadline: Duration::from_millis(150),
+                fast_answers: false,
+            },
+            &oracle(&["auth.tunnel.internal"]),
+            &FakeUpstream {
+                answer: Ok(resolved(&[interior])),
+            },
+            &FakeSink(&log),
+            &FakeReconciler {
+                log: &log,
+                outcome: ReconcileOutcome::Installed,
+            },
+            &answerer,
+        );
+
+        match out {
+            QueryOutcome::Answer { ips, .. } => assert_eq!(
+                ips,
+                vec![interior],
+                "the caller must be sent into the tunnel, not to our TUN"
+            ),
+            other => panic!("unexpected outcome: {other:?}"),
+        }
     }
 
     /// The observed provider placeholder: one address pair, every octet ending
@@ -1181,6 +1296,7 @@ mod tests {
             },
             &FakeFakeIp {
                 scope: vec!["chatgpt.com".to_string()],
+                refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
         );
@@ -1220,6 +1336,7 @@ mod tests {
             // exclusion) → real address + normal reconcile.
             &FakeFakeIp {
                 scope: vec!["chatgpt.com".to_string()],
+                refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
         );
@@ -1286,6 +1403,7 @@ mod tests {
         let gate_flag = Arc::clone(&up);
         let inner: Arc<dyn FakeIpAnswerer> = Arc::new(FakeFakeIp {
             scope: vec!["chatgpt.com".to_string()],
+            refuse: Vec::new(),
             fake: ip(198, 18, 0, 9),
         });
         let gated =

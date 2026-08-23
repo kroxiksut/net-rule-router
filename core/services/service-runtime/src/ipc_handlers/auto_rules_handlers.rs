@@ -93,8 +93,11 @@ impl AutoRuleCandidatesListHandler {
 impl IpcHandler for AutoRuleCandidatesListHandler {
     fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let sid = principal(ctx)?;
+        let quiet = self.engine.quiet_note_for(sid);
         serde_json::to_value(AutoRuleCandidatesListResponse {
             candidates: self.engine.candidates(sid),
+            inert_dropped: quiet.inert,
+            inert_sample: quiet.sample,
         })
         .map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -270,6 +273,7 @@ mod tests {
             caller_is_elevated: false,
             caller_principal: sid
                 .and_then(|s| nrr_domain::user_principal::UserPrincipal::from_windows_sid(s).ok()),
+            caller_pid: None,
         }
     }
 

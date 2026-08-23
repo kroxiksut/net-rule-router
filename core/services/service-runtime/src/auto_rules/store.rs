@@ -478,6 +478,10 @@ struct PairJson {
     lw: u64,
     nh: u32,
     uh: u32,
+    /// Additive: evidence written before this counter existed reads as zero,
+    /// which is the same as "no reason to doubt the anchor".
+    #[serde(default)]
+    fp: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -536,6 +540,7 @@ impl EvidenceSnapshotJson {
                             lw: p.last_window_id,
                             nh: p.nearest_hits,
                             uh: p.uncontested_hits,
+                            fp: p.foreign_parent_hits,
                         })
                         .collect(),
                 })
@@ -587,6 +592,7 @@ impl EvidenceSnapshotJson {
                             last_window_id: p.lw,
                             nearest_hits: p.nh,
                             uncontested_hits: p.uh,
+                            foreign_parent_hits: p.fp,
                         })
                         .collect(),
                 })

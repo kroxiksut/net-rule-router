@@ -35,7 +35,7 @@ use crate::decision_pipeline::{ProcessContext, RuntimeInput};
 /// - **hostname**: lowercase, trailing-dot removal, IDNA2008 (Unicode → ASCII).
 /// - **IP**: IPv4 passes through; IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is
 ///   converted to IPv4 with a warning; native IPv6 becomes
-///   [`NormalizedIp::ProOnlyNativeIpv6`] and blocks `ExactIp` matching.
+///   [`NormalizedIp::UnsupportedNativeIpv6`] and blocks `ExactIp` matching.
 /// - **process identity**: lowercase, path stripped to basename, `.exe`
 ///   suffix ensured.
 ///
@@ -209,7 +209,7 @@ fn normalize_ip_value(raw: Option<IpAddr>) -> (NormalizedIp, Vec<NormalizationWa
                     }],
                 )
             } else {
-                (NormalizedIp::ProOnlyNativeIpv6 { addr: v6 }, vec![])
+                (NormalizedIp::UnsupportedNativeIpv6 { addr: v6 }, vec![])
             }
         }
     }
@@ -291,8 +291,8 @@ fn derive_match_class_availability(
     };
     let ip_block = match ip {
         NormalizedIp::ValidIpv4(_) | NormalizedIp::Unavailable => None,
-        NormalizedIp::ProOnlyNativeIpv6 { addr } => {
-            Some(NormalizationError::IpNativeIpv6ProOnly { addr: *addr })
+        NormalizedIp::UnsupportedNativeIpv6 { addr } => {
+            Some(NormalizationError::IpNativeIpv6Unsupported { addr: *addr })
         }
     };
     let app_block = if app_identity.is_none() {
@@ -1057,12 +1057,12 @@ mod tests {
     }
 
     #[test]
-    fn ip_native_ipv6_becomes_pro_only() {
+    fn ip_native_ipv6_becomes_unsupported() {
         let v6: Ipv6Addr = "2001:db8::1"
             .parse()
             .unwrap_or_else(|e| panic!("fixture addr: {e}"));
         let (ip, w) = normalize_ip_value(Some(IpAddr::V6(v6)));
-        assert!(matches!(ip, NormalizedIp::ProOnlyNativeIpv6 { .. }));
+        assert!(matches!(ip, NormalizedIp::UnsupportedNativeIpv6 { .. }));
         assert!(w.is_empty());
     }
 

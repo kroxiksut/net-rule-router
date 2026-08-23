@@ -44,6 +44,10 @@ pub enum BlockReason {
     NotCoveredByRules,
     /// A rule says block outright.
     BlockedByRule,
+    /// IPv6 is closed for the duration of the protection. The user has a
+    /// switch for it and no rule to edit, so this must never be reported as a
+    /// rule blocking the site.
+    Ipv6Blocked,
     /// Ours, but the filter behind it could not be identified. Naming a cause
     /// here would send the user editing rules that may have nothing to do with
     /// it — say only what is known.
@@ -58,6 +62,7 @@ impl BlockReason {
             Self::RouteUnavailable => "route-unavailable",
             Self::NotCoveredByRules => "not-covered-by-rules",
             Self::BlockedByRule => "blocked-by-rule",
+            Self::Ipv6Blocked => "ipv6-blocked",
             Self::Unattributed => "unattributed",
         }
     }
@@ -69,6 +74,7 @@ impl BlockReason {
             "route-unavailable" => Some(Self::RouteUnavailable),
             "not-covered-by-rules" => Some(Self::NotCoveredByRules),
             "blocked-by-rule" => Some(Self::BlockedByRule),
+            "ipv6-blocked" => Some(Self::Ipv6Blocked),
             "unattributed" => Some(Self::Unattributed),
             _ => None,
         }

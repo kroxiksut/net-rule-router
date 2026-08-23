@@ -189,7 +189,12 @@ function pendingOfflineCount(obj) {
     if (!obj) return 0
     var rp = obj["route-policy"] || {}
     var st = obj["stability"] || {}
+    var bd = obj["binding"] || {}
+    // The binding namespace holds one undelivered fact, not a key per field,
+    // so it counts as one — but it MUST count, or the store that carries it is
+    // written out as empty and the parked assignment is lost.
     return Object.keys(rp).length + Object.keys(st).length
+        + (bd.pending === true ? 1 : 0)
 }
 
 // ---- service-stability config -- the ONE wire-field declaration ----
@@ -663,6 +668,9 @@ function parsePendingSummaryCounts(summaryJsonText) {
 // Wire key -> value used when the live snapshot does not carry the key.
 // `binding-source` is deliberately absent: it is not preserved from the
 // snapshot but always stamped by the writer (see `buildFullRoutePolicyReq`).
+// Main-link probing keys are listed here for the same reason as every other
+// field: a request that omits a key sends its default, so a panel writing ANY
+// key would otherwise reset the ones it does not mention.
 var ROUTE_POLICY_FIELD_DEFAULTS = {
     "mode": "prefer-primary",
     "block-secondary-when-unavailable": false,
@@ -680,7 +688,12 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "browser-history-auto-seed": false,
     "kill-switch-strict-shared-ips": false,
     "auto-rules-mode": "suggest",
-    "auto-rules-eager-delivery-names": false
+    "auto-rules-eager-delivery-names": false,
+    "primary-probe-auto": false,
+    "primary-probe-timeout-ms": 1500,
+    "primary-probe-max-targets": 8,
+    "primary-probe-repeat-secs": 300,
+    "block-ipv6-when-protected": true
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
@@ -858,6 +871,8 @@ function groupAutoRuleRows(candidates, dismissed) {
             observations: Number(row.observations || 0),
             signal: String(row.signal || ""),
             primaryBehavior: String(row["primary-behavior"] || row.primaryBehavior || ""),
+            anchorRefusesMainLink: (row["anchor-refuses-main-link"] === true)
+                || (row.anchorRefusesMainLink === true),
             timestampMs: ts
         })
         if (status === "pending") group.pendingIds.push(id)
@@ -928,9 +943,32 @@ function searchAutoRuleGroups(groups, query) {
 
 // `newest` | `consumers` | `name`, mirroring the sort modes the old
 // suggestions inbox offered.
+/// Where a group belongs when sorting by what the main route does with it:
+/// 0 = at least one address does not open there, 1 = nothing checked yet,
+/// 2 = the main route reaches every address in the group.
+///
+/// "Reaches" is deliberately not read as "you don't need this": a site can
+/// complete the connection and answer with a refusal. It only decides ORDER.
+function autoRuleGroupMainRouteRank(group) {
+    var hosts = (group || {}).hosts || []
+    var rank = 2
+    for (var i = 0; i < hosts.length; i += 1) {
+        var behavior = String(hosts[i].primaryBehavior || "")
+        if (behavior === "stalls" || behavior === "cut") return 0
+        if (behavior !== "responds") rank = Math.min(rank, 1)
+    }
+    return rank
+}
+
 function sortAutoRuleGroups(groups, mode) {
     var out = groups.slice()
     out.sort(function(a, b) {
+        if (mode === "main-route") {
+            var r = autoRuleGroupMainRouteRank(a) - autoRuleGroupMainRouteRank(b)
+            if (r !== 0) return r
+            var dn = b.latestMs - a.latestMs
+            return dn !== 0 ? dn : a.domain.localeCompare(b.domain)
+        }
         if (mode === "name") return a.domain.localeCompare(b.domain)
         if (mode === "consumers") {
             var d = b.consumers.length - a.consumers.length

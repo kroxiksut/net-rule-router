@@ -332,7 +332,7 @@ impl MutationExecutor for FakeMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         }
     }
 
@@ -388,6 +388,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // are registered as the unimplemented-operation stub.
         block_notice_mutes: None,
         block_notice_center: None,
+        block_notice_journal: None,
         block_notice_author: None,
         audit_emitter: Arc::new(NoopAuditEmitter),
         health: Arc::new(FakeHealth {
@@ -469,6 +470,9 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         cache_repository: None,
         // No OS-DNS-flush port in test deps.
         dns_cache_control: None,
+        local_networks: None,
+        auto_rule_probe: None,
+        refusing_anchors: None,
         // No merge source in test deps; RulesMergePreview
         // resolves to the Unimplemented stub here (catalog-coverage sees it
         // as an unwired op).
@@ -547,6 +551,11 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             kill_switch_strict_shared_ips: request.kill_switch_strict_shared_ips,
             auto_rules_mode: request.auto_rules_mode.clone(),
             auto_rules_eager_delivery_names: request.auto_rules_eager_delivery_names,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());

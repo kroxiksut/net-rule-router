@@ -100,6 +100,10 @@ fn live_link_named(
 pub struct UnsupportedRule {
     /// Index into `plan.flows`.
     pub index: usize,
+    /// Stored principal of the plan the rule came from. With several users'
+    /// plans lowered into one ruleset, an index alone no longer says whose rule
+    /// went unenforced — and that is the first thing an operator asks.
+    pub principal: String,
     pub reason: UnsupportedReason,
 }
 
@@ -111,6 +115,10 @@ pub enum UnsupportedReason {
     /// The rule pins egress to an interface the caller could not resolve to a
     /// name (adapter absent right now).
     UnresolvedEgress,
+    /// The rule is scoped to a principal with no Unix uid (a Windows SID read
+    /// from a migrated store). Emitting it anyway would drop the user condition
+    /// and apply one person's policy to everyone on the machine.
+    UnresolvablePrincipal { stored: String },
 }
 
 /// The result of lowering: the ruleset to apply, plus what could not be
@@ -128,28 +136,79 @@ pub struct LoweredPlan {
 /// terminal `accept`/`drop` at the first match then reproduces the arbitration
 /// Windows gets from weight bands.
 pub fn lower_plan(plan: &EnforcementPlan, egress: &EgressNames) -> LoweredPlan {
-    let mut indexed: Vec<(usize, &FlowRule)> = plan.flows.iter().enumerate().collect();
+    lower_plans(std::slice::from_ref(plan), egress)
+}
+
+/// Lower the plans of EVERY active principal into ONE ruleset.
+///
+/// Applying a table is a whole-table replacement, so a per-plan apply would let
+/// the second user's policy erase the first user's. Their rules are safe to
+/// interleave because each carries `meta skuid`: a rule scoped to one uid cannot
+/// match another user's packet, whatever order it sits in.
+///
+/// Arbitration within each plan is preserved exactly — the sort is stable on
+/// (rank, ordinal) and falls back to the plan's own position, so a user's rules
+/// keep the relative order their policy assigned them.
+pub fn lower_plans(plans: &[EnforcementPlan], egress: &EgressNames) -> LoweredPlan {
+    let scoped: Vec<ScopedPlan<'_>> = plans
+        .iter()
+        .map(|plan| ScopedPlan { plan, egress })
+        .collect();
+    lower_scoped(&scoped)
+}
+
+/// One principal's plan together with the interface names ITS bindings resolve
+/// to.
+///
+/// Two users can route through different secondaries, so a single pair of names
+/// for the whole ruleset would pin one of them to the other's link. The egress
+/// travels with the plan for that reason.
+pub struct ScopedPlan<'a> {
+    pub plan: &'a EnforcementPlan,
+    pub egress: &'a EgressNames,
+}
+
+/// Lower plans that each carry their own egress resolution.
+pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
+    let mut indexed: Vec<(usize, usize, &FlowRule)> = plans
+        .iter()
+        .enumerate()
+        .flat_map(|(plan_idx, scoped)| {
+            scoped
+                .plan
+                .flows
+                .iter()
+                .enumerate()
+                .map(move |(flow_idx, flow)| (plan_idx, flow_idx, flow))
+        })
+        .collect();
     // Higher rank first; ties broken by the planner's ordinal, then by original
     // position so the output is stable for identical input (re-apply must be a
     // no-op, and a churning ruleset would defeat that).
-    indexed.sort_by(|(ai, a), (bi, b)| {
+    indexed.sort_by(|(ap, ai, a), (bp, bi, b)| {
         b.precedence
             .class
             .rank()
             .cmp(&a.precedence.class.rank())
             .then(a.precedence.ordinal.cmp(&b.precedence.ordinal))
+            .then(ap.cmp(bp))
             .then(ai.cmp(bi))
     });
 
-    let mut rules = Vec::new();
+    let mut rules: Vec<NftRule> = Vec::new();
     let mut unsupported = Vec::new();
 
-    for (index, flow) in indexed {
-        match lower_flow(flow, egress) {
+    for (plan_idx, index, flow) in indexed {
+        match lower_flow(flow, plans[plan_idx].egress) {
             Ok(lowered) => rules.extend(lowered),
-            Err(reason) => unsupported.push(UnsupportedRule { index, reason }),
+            Err(reason) => unsupported.push(UnsupportedRule {
+                index,
+                principal: plans[plan_idx].plan.principal.as_stored().to_owned(),
+                reason,
+            }),
         }
     }
+    let rules = prune_unreachable(rules);
 
     LoweredPlan {
         ruleset: NftRuleset {
@@ -165,6 +224,28 @@ pub fn lower_plan(plan: &EnforcementPlan, egress: &EgressNames) -> LoweredPlan {
 /// Lower one rule. An `OnlyVia` pin becomes TWO rules — accept when leaving the
 /// pinned interface, drop otherwise — which is the leak-proof shape: the drop
 /// is scoped to the same destination, so nothing else is affected.
+/// Drop the rules no packet can ever reach.
+///
+/// Every verdict here is terminal, so an earlier rule whose conditions are a
+/// SUBSET of a later one's already decided every packet the later one describes.
+/// Two sources produce such rules and neither is a mistake: the plan states a
+/// rule twice — once for the connect decision, once per packet — because Windows
+/// judges those at two layers, and a blanket block makes the protocol-specific
+/// blocks beneath it redundant. Keeping them would grow the ruleset a reader has
+/// to reason about, with not one verdict changed.
+fn prune_unreachable(rules: Vec<NftRule>) -> Vec<NftRule> {
+    let mut kept: Vec<NftRule> = Vec::new();
+    for rule in rules {
+        let unreachable = kept
+            .iter()
+            .any(|earlier| earlier.matches.iter().all(|m| rule.matches.contains(m)));
+        if !unreachable {
+            kept.push(rule);
+        }
+    }
+    kept
+}
+
 fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, UnsupportedReason> {
     if let AppScope::Program { key, .. } = &flow.app {
         return Err(UnsupportedReason::AppScoped { key: key.clone() });
@@ -173,10 +254,16 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, Uns
     let mut base = Vec::new();
     if let PrincipalScope(Some(principal)) = &flow.principal {
         // Per-user matching is a plain condition here — the capability Windows
-        // has to emulate with per-SID filter sets.
-        if let Some(uid) = principal.as_unix_uid() {
-            base.push(NftMatch::SkUid(uid));
-        }
+        // has to emulate with per-SID filter sets. A principal we cannot express
+        // as a uid must FAIL the rule, never widen it: dropping the condition
+        // turns one user's rule into a machine-wide one.
+        let uid =
+            principal
+                .as_unix_uid()
+                .ok_or_else(|| UnsupportedReason::UnresolvablePrincipal {
+                    stored: principal.as_stored().to_owned(),
+                })?;
+        base.push(NftMatch::SkUid(uid));
     }
     base.extend(lower_flow_match(&flow.flow));
 
@@ -194,12 +281,22 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, Uns
                 .ok_or(UnsupportedReason::UnresolvedEgress)?;
             let mut pinned = base.clone();
             pinned.push(NftMatch::OutInterface(device));
+            let accept = NftRule {
+                matches: pinned,
+                verdict: NftVerdict::Accept,
+                comment: format!("{comment} via"),
+            };
+            // A pin on ANY destination is the blanket "everything goes through
+            // the tunnel" permit, and its guard would be a block on everything —
+            // which the plan states separately, and lower down, so the machine's
+            // own escapes (loopback, the LAN, the tunnel's server) are matched
+            // first. Emitting it here would put that block in the exemption
+            // band, above the very rules it must not cut.
+            if flow.flow.dst == DstMatch::Any {
+                return Ok(vec![accept]);
+            }
             Ok(vec![
-                NftRule {
-                    matches: pinned,
-                    verdict: NftVerdict::Accept,
-                    comment: format!("{comment} via"),
-                },
+                accept,
                 // Same destination, any other interface: dropped. Without this
                 // the pin would be advice — traffic would simply follow the
                 // default route when the pinned link is down, which is the leak
@@ -469,11 +566,82 @@ mod tests {
             lowered.unsupported,
             vec![UnsupportedRule {
                 index: 0,
+                principal: "unix:uid:1000".into(),
                 reason: UnsupportedReason::AppScoped {
                     key: "telegram".into()
                 },
             }],
         );
+    }
+
+    /// Two logged-in users must both end up in the ruleset. Applying a table
+    /// replaces it wholesale, so lowering one plan at a time and applying each
+    /// would leave only whoever was applied last actually enforced.
+    #[test]
+    fn two_principals_are_lowered_into_one_ruleset() {
+        let mut alice = plan_of(vec![rule(
+            PrecedenceClass::RouteRule(RouteRole::Secondary),
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 1)),
+            Verdict::Permit,
+        )]);
+        alice.flows[0].principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1000)));
+
+        let mut bob = plan_of(vec![rule(
+            PrecedenceClass::RouteRule(RouteRole::Secondary),
+            0,
+            DstMatch::HostV4(v4(198, 51, 100, 2)),
+            Verdict::Permit,
+        )]);
+        bob.principal = UserPrincipal::from_linux_uid(1001);
+        bob.flows[0].principal = PrincipalScope(Some(UserPrincipal::from_linux_uid(1001)));
+
+        let lowered = lower_plans(&[alice, bob], &names());
+
+        assert!(lowered.unsupported.is_empty());
+        let uids: Vec<u32> = lowered
+            .ruleset
+            .rules
+            .iter()
+            .filter_map(|r| {
+                r.matches.iter().find_map(|m| match m {
+                    NftMatch::SkUid(uid) => Some(*uid),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(uids.contains(&1000) && uids.contains(&1001), "got {uids:?}");
+    }
+
+    /// A principal with no uid — a Windows SID surviving in a migrated store —
+    /// must fail its rule, not lose the user condition. Without the condition
+    /// the rule matches every packet on the host, which turns one person's
+    /// routing policy into everyone's.
+    #[test]
+    fn a_principal_without_a_uid_fails_the_rule_instead_of_widening_it() {
+        let mut foreign = plan_of(vec![rule(
+            PrecedenceClass::RouteRule(RouteRole::Secondary),
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 1)),
+            Verdict::Permit,
+        )]);
+        let sid = UserPrincipal::from_windows_sid("S-1-5-21-1-2-3-1001").expect("valid sid");
+        foreign.principal = sid.clone();
+        foreign.flows[0].principal = PrincipalScope(Some(sid));
+
+        let lowered = lower_plan(&foreign, &names());
+
+        assert!(
+            lowered.ruleset.rules.is_empty(),
+            "a rule that cannot be scoped to its user must not be applied at all",
+        );
+        assert!(matches!(
+            lowered.unsupported.as_slice(),
+            [UnsupportedRule {
+                reason: UnsupportedReason::UnresolvablePrincipal { .. },
+                ..
+            }]
+        ));
     }
 
     /// An unresolvable pin must not silently become an unpinned accept — that
@@ -499,6 +667,7 @@ mod tests {
             lowered.unsupported,
             vec![UnsupportedRule {
                 index: 0,
+                principal: "unix:uid:1000".into(),
                 reason: UnsupportedReason::UnresolvedEgress,
             }],
         );
@@ -618,5 +787,149 @@ mod tests {
             first.ruleset.to_nft_script(),
             second.ruleset.to_nft_script()
         );
+    }
+
+    /// The blanket "everything through the tunnel" permit must NOT bring a
+    /// leak-guard with it: that guard blocks every destination, and sitting in
+    /// the exemption band it would cut loopback, the LAN and the tunnel's own
+    /// server before their exemptions are ever reached.
+    #[test]
+    fn a_pin_on_any_destination_emits_no_leak_guard() {
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(1000),
+            flows: vec![FlowRule {
+                verdict: Verdict::Permit,
+                precedence: Precedence {
+                    class: PrecedenceClass::CatchAllExempt,
+                    ordinal: 0,
+                },
+                flow: FlowMatch {
+                    dst: DstMatch::Any,
+                    dst_port: None,
+                    protocol: None,
+                },
+                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(1000))),
+                app: AppScope::Any,
+                egress: EgressConstraint::OnlyVia(EgressRef::Secondary),
+                coverage: Coverage::ConnectOnly,
+            }],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        let egress = EgressNames {
+            primary: Some("eth0".to_owned()),
+            secondary: Some("tun0".to_owned()),
+        };
+
+        let lowered = lower_plan(&plan, &egress);
+
+        assert_eq!(
+            lowered.ruleset.rules.len(),
+            1,
+            "the guard would block everything"
+        );
+        assert_eq!(lowered.ruleset.rules[0].verdict, NftVerdict::Accept);
+    }
+
+    /// The plan states a rule twice — once for the connect decision, once per
+    /// packet — because Windows judges those at two layers. nftables judges once,
+    /// so the pair must collapse or every re-apply looks like a change.
+    #[test]
+    fn the_two_layer_mirror_collapses_into_one_rule() {
+        let flow = |coverage| FlowRule {
+            verdict: Verdict::Block,
+            precedence: Precedence {
+                class: PrecedenceClass::CatchAllBlock,
+                ordinal: 0,
+            },
+            flow: FlowMatch {
+                dst: DstMatch::Any,
+                dst_port: None,
+                protocol: None,
+            },
+            principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(1000))),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage,
+        };
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(1000),
+            flows: vec![flow(Coverage::ConnectOnly), flow(Coverage::AllPackets)],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+
+        let lowered = lower_plan(&plan, &EgressNames::default());
+
+        assert_eq!(lowered.ruleset.rules.len(), 1);
+    }
+
+    /// A blanket drop settles every packet of that user, so the protocol-specific
+    /// blocks beneath it decide nothing. Keeping them would grow a ruleset a
+    /// reader has to reason about without changing a verdict.
+    #[test]
+    fn a_blanket_drop_makes_the_narrower_blocks_beneath_it_redundant() {
+        let uid = 1000;
+        let block = |protocol, ordinal| FlowRule {
+            verdict: Verdict::Block,
+            precedence: Precedence {
+                class: PrecedenceClass::CatchAllBlock,
+                ordinal,
+            },
+            flow: FlowMatch {
+                dst: DstMatch::Any,
+                dst_port: None,
+                protocol,
+            },
+            principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        };
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(uid),
+            flows: vec![block(None, 0), block(Some(L4Proto::Icmp), 1)],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+
+        let lowered = lower_plan(&plan, &EgressNames::default());
+
+        assert_eq!(lowered.ruleset.rules.len(), 1);
+        assert!(lowered.ruleset.rules[0]
+            .matches
+            .contains(&NftMatch::SkUid(uid)));
+    }
+
+    /// The pruning is per user, and it has to be: one user's blanket drop says
+    /// nothing about another's packets, and treating it as if it did would erase
+    /// a second user's whole policy.
+    #[test]
+    fn one_users_blanket_drop_does_not_erase_anothers_rules() {
+        let blanket = |uid| EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(uid),
+            flows: vec![FlowRule {
+                verdict: Verdict::Block,
+                precedence: Precedence {
+                    class: PrecedenceClass::CatchAllBlock,
+                    ordinal: 0,
+                },
+                flow: FlowMatch {
+                    dst: DstMatch::Any,
+                    dst_port: None,
+                    protocol: None,
+                },
+                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+                app: AppScope::Any,
+                egress: EgressConstraint::Any,
+                coverage: Coverage::ConnectOnly,
+            }],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+
+        let lowered = lower_plans(&[blanket(1000), blanket(1001)], &EgressNames::default());
+
+        assert_eq!(lowered.ruleset.rules.len(), 2);
     }
 }

@@ -15,6 +15,7 @@
 pub mod accessibility;
 pub mod app_shell;
 pub mod interfaces_routes;
+pub mod provisioning;
 pub mod rules;
 pub mod security;
 pub mod settings;

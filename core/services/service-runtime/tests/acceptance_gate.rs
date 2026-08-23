@@ -180,6 +180,7 @@ fn elevated_gui() -> IpcRequestContext {
         client_profile: IpcClientProfile::GuiInteractive,
         caller_is_elevated: true,
         caller_principal: None,
+        caller_pid: None,
     }
 }
 fn unprivileged_tray() -> IpcRequestContext {
@@ -187,6 +188,7 @@ fn unprivileged_tray() -> IpcRequestContext {
         client_profile: IpcClientProfile::TrayLightweight,
         caller_is_elevated: false,
         caller_principal: None,
+        caller_pid: None,
     }
 }
 

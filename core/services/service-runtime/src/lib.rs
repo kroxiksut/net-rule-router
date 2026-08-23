@@ -64,6 +64,7 @@ pub mod app_observation_lookup;
 /// needs and, depending on the user's `auto_rules_mode`, offers or applies them.
 pub mod auto_rules;
 pub mod block_notice_center;
+pub mod block_notice_journal_store;
 pub mod block_notice_mute_store;
 pub mod bootstrap;
 pub mod browser_history_seeder;
@@ -96,11 +97,16 @@ pub mod health;
 pub mod integration_ports;
 pub mod ipc;
 pub mod ipc_handlers;
+pub mod ipc_push;
+pub mod ipv6_route_log;
 pub mod isp_block_page_learner;
 pub mod killswitch_codegen;
 pub mod killswitch_drop_registry;
 pub mod known_direct;
+// What the last main-link check found for a rule's address.
 pub mod lifecycle;
+pub mod lifecycle_journal;
+pub mod main_route_verdicts;
 pub mod managers;
 mod net_filter;
 pub mod network_rearm;
@@ -108,14 +114,19 @@ pub mod per_sid_orchestrator;
 pub mod persistent_app_resolver;
 pub mod policy_loader;
 pub mod power_resume;
+pub mod primary_path_probe;
+pub mod principal_enforcement;
+pub mod production_auto_rule_probe;
 pub mod production_coordinator;
 pub mod production_diagnostics;
 pub mod production_handlers_misc;
+pub mod production_local_networks;
 pub mod production_merge_preview;
 pub mod production_mutation_executor;
 pub mod production_per_sid_audit;
 pub mod production_policy_manager;
 pub mod production_preset_exporter;
+pub mod production_principal_plan;
 pub mod production_rules_provider;
 pub mod production_security_alerts;
 pub mod production_settings;
@@ -127,6 +138,14 @@ pub mod recent_rule_addresses;
 pub mod recovery_audit;
 pub mod route_codegen;
 pub mod route_coordinator;
+// Cold-boot warm-up window before the kill-switch arms fail-closed.
+/// What a blanket block must never cut — tunnel-server addresses and the
+/// machine's own attached subnets, read off the route table.
+/// Who owns an address — one answer for the route, filter and kill-switch
+/// mechanisms, so they cannot disagree about it.
+pub mod address_ownership;
+pub mod catch_all_exemptions;
+pub mod route_apply;
 pub mod route_reconciler;
 pub mod routed_host_flow_refresh;
 pub mod routing_pause;
@@ -135,6 +154,7 @@ pub mod runtime_loop;
 pub mod secondary_external_address;
 pub mod secondary_ip_policy;
 pub mod secondary_liveness;
+pub mod secondary_subnets;
 pub mod service_lifecycle;
 pub mod service_stability;
 pub mod service_tasks;
@@ -147,7 +167,6 @@ pub mod vpn_client_registry;
 pub mod vpn_endpoint_learning;
 pub mod wfp_codegen;
 pub mod wfp_filter_ledger;
-pub mod windows_apply_adapter;
 // `source_watcher.rs` was removed as part of a backdoor-audit cleanup: the
 // file-watcher was a scaffold that never got wired into the production
 // runtime and would have constituted a second mutation channel had it
@@ -179,8 +198,9 @@ pub use supervised_runtime::{run_supervised_runtime, SupervisedRuntimeDeps};
 pub use activation_coordinator::{
     ActivationAuditEmitter, ActivationAuditEvent, ActivationCoordinator, ActivationOutcome,
     ApplyFailurePolicy, CandidateSubmission, Clock, ConfirmationToken, DispatchFailure,
-    DryRunSummary, IdGenerator, NoopActivationAudit, PolicyError, PreFlightCategory,
-    PreFlightWarning, RollbackTarget, RulesApplyDispatcher, SidActionPlanSummary,
+    DryRunSummary, IdGenerator, InMemoryMarkerStore, NoopActivationAudit, PolicyError,
+    PreFlightCategory, PreFlightWarning, RollbackTarget, RulesApplyDispatcher,
+    SidActionPlanSummary,
 };
 pub use active_sid_registry::{ActiveSidEntry, ActiveSidRegistry};
 pub use per_sid_orchestrator::{
@@ -251,10 +271,10 @@ pub use nrr_diagnostics::{
 
 // Production settings impls.
 pub use production_settings::{
-    run_autostart_startup_probe, FakeIpApplyRequest, NoopPauseDispatcher,
-    OrchestratorPauseDispatcher, ProductionApplyFailurePolicy, ProductionAutostart,
-    ProductionLogRetentionConfig, ProductionRetentionSettings, ProductionRoutingPause,
-    ProductionServiceStability, ProductionStorageUsage, SystemClock,
+    FakeIpApplyRequest, NoopPauseDispatcher, OrchestratorPauseDispatcher,
+    ProductionApplyFailurePolicy, ProductionAutostart, ProductionLogRetentionConfig,
+    ProductionRetentionSettings, ProductionRoutingPause, ProductionServiceStability,
+    ProductionStorageUsage, SystemClock,
 };
 
 // Live tracing-verbosity control seam (policy side).
@@ -315,16 +335,6 @@ pub use state::{
     ActiveRevisionState, ServiceHealthSeverity, ServicePolicyState, ServiceRuntimeState,
     ServiceShutdownReason,
 };
-pub use windows_apply_adapter::{
-    CollectingAuditSink, InMemoryMarkerStore, InMemorySnapshotStore, NoopCachePort,
-    NoopDiagnosticsPort, NoopSnapshotStore, SnapshotStore,
-};
-// The Windows apply engine (mechanism) is cfg(windows)-only.
-#[cfg(windows)]
-pub use windows_apply_adapter::{production_apply_layer, ApplyOrchestrator, WindowsApplyAdapter};
-// The Linux mechanism is the cfg(not(windows)) skeleton mirror.
-#[cfg(not(windows))]
-pub use windows_apply_adapter::{production_apply_layer, LinuxApplyLayer};
 
 /// What stage a given runtime dimension is at, as one short slug. Printed by
 /// the service binary's `status` verb.

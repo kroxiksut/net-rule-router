@@ -452,7 +452,7 @@ mod tests {
     use super::*;
     use crate::{
         types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey},
-        windows_api::MockWindowsApi,
+        windows_api::{MockWindowsApi, RouteTablePort},
     };
     use std::net::Ipv4Addr;
 

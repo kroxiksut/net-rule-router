@@ -222,10 +222,7 @@ GroupBox {
                 // The bytes come from the rules table on screen, so a stopped
                 // service is no reason to withhold the button.
                 enabled: root.userPresetsDir !== ""
-                onClicked: {
-                    saveAsSetNameField.text = ""
-                    saveAsSetDialog.open()
-                }
+                onClicked: saveAsSetDialog.openFor("", root.userPresetsDir)
             }
         }
         Label {
@@ -252,64 +249,14 @@ GroupBox {
 
     // ── Dialogs (private to this subsection) ──────────────────────
 
-    // "Save current rules as a set": asks for a folder name, then writes both
-    // route files into `<my rule sets>/<name>/`. Kept inline (not a shared
-    // component) because it is a one-field prompt owned by this subsection.
-    Dialog {
+    // "Save current rules as a set": asks for a name, then writes both route
+    // files into `<my rule sets>/<name>/`. The folder is a setting here, so the
+    // dialog's own folder picker stays hidden.
+    SaveRuleSetDialog {
         id: saveAsSetDialog
-        modal: true
-        popupType: Popup.Item
-        anchors.centerIn: Overlay.overlay
-        width: 460
-        title: root.tr("settings.presets.save-as-set.title", "Save rules as a set")
-        standardButtons: Dialog.NoButton
-        closePolicy: Popup.NoAutoClose
-
-        contentItem: ColumnLayout {
-            spacing: root.uiTheme.spacingSm
-            Label {
-                Layout.fillWidth: true
-                wrapMode: Text.WordWrap
-                color: root.textColor
-                text: root.tr("settings.presets.save-as-set.prompt",
-                    "The current rules of both routes are saved as a new set in your folder. Name it so you can tell it apart later, for example \"work\" or \"home\".")
-            }
-            ThemedTextField {
-                id: saveAsSetNameField
-                theme: root.uiTheme
-                Layout.fillWidth: true
-                placeholderText: root.tr("settings.presets.save-as-set.name-placeholder",
-                    "Set name")
-                onAccepted: if (group._saveAsSetNameIsUsable(text)) group._saveCurrentRulesAsSet(text)
-            }
-            Label {
-                Layout.fillWidth: true
-                visible: saveAsSetNameField.text.trim() !== ""
-                            && !group._saveAsSetNameIsUsable(saveAsSetNameField.text)
-                wrapMode: Text.WordWrap
-                color: root.uiTheme.colorDanger
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.presets.save-as-set.name-invalid",
-                    "A name cannot contain \\ / : or \"..\" — it is a folder name, not a path.")
-            }
-            RowLayout {
-                Layout.fillWidth: true
-                Layout.topMargin: root.uiTheme.spacingSm
-                spacing: root.uiTheme.spacingSm
-                Item { Layout.fillWidth: true }
-                ThemedButton {
-                    theme: root.uiTheme
-                    text: root.tr("action.cancel", "Cancel")
-                    onClicked: saveAsSetDialog.close()
-                }
-                ThemedButton {
-                    theme: root.uiTheme
-                    text: root.tr("settings.presets.save-as-set.confirm", "Save set")
-                    enabled: group._saveAsSetNameIsUsable(saveAsSetNameField.text)
-                    onClicked: group._saveCurrentRulesAsSet(saveAsSetNameField.text)
-                }
-            }
-        }
+        root: group.root
+        folderSelectable: false
+        onSetAccepted: function(name, folder) { group._saveCurrentRulesAsSet(name) }
     }
 
     // Shown once when a set would be written into the folder the app ships its
@@ -457,16 +404,6 @@ GroupBox {
             "The quick-load dropdown now lists the rule sets in your folder.")
     }
 
-    // A set name is a folder name, never a path — mirrors the same refusal in
-    // the bridge so the user sees why the button stays disabled.
-    function _saveAsSetNameIsUsable(name) {
-        var n = String(name || "").trim()
-        if (n === "" || n === ".") return false
-        if (n.indexOf("/") >= 0 || n.indexOf("\\") >= 0) return false
-        if (n.indexOf(":") >= 0 || n.indexOf("..") >= 0) return false
-        return true
-    }
-
     // True when the configured folder IS the one the app ships its sets in.
     // Compared case-insensitively with separators normalised, because the path
     // reaches us both from the bridge and from a folder picker.
@@ -485,7 +422,7 @@ GroupBox {
 
     function _saveCurrentRulesAsSet(name) {
         var setName = String(name || "").trim()
-        if (!group._saveAsSetNameIsUsable(setName)) return
+        if (!root.boundFilesController.isUsableSetName(setName)) return
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.createPresetSetDir !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable",
@@ -517,7 +454,7 @@ GroupBox {
     // as a set" flow uses) confirms before either route file is written.
     function _saveCurrentRulesAsSetConfirmed(name) {
         var setName = String(name || "").trim()
-        if (!group._saveAsSetNameIsUsable(setName)) return
+        if (!root.boundFilesController.isUsableSetName(setName)) return
         var dir = String(nrrNativeBridge.createPresetSetDir(root.userPresetsDir, setName) || "")
         if (dir === "") {
             root.statusLine = root.tr("status.save-as-set-folder-failed",

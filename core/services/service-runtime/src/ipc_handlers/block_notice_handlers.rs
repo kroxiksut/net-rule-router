@@ -16,15 +16,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nrr_domain::block_notice::{Mute, MuteScope};
 use nrr_shared::ipc_payloads::{
-    BlockNoticeMuteDto, BlockNoticeMuteScopeDto, BlockNoticeMutesClearResponse,
-    BlockNoticeMutesListResponse, BlockNoticeMutesRemoveRequest, BlockNoticeMutesRemoveResponse,
-    BlockNoticeMutesSetRequest, BlockNoticeMutesSetResponse, BlockNoticeRouteToSecondaryRequest,
-    BlockNoticeRouteToSecondaryResponse,
+    BlockNoticeJournalAckRequest, BlockNoticeJournalAckResponse, BlockNoticeJournalEntryDto,
+    BlockNoticeJournalListResponse, BlockNoticeMuteDto, BlockNoticeMuteScopeDto,
+    BlockNoticeMutesClearResponse, BlockNoticeMutesListResponse, BlockNoticeMutesRemoveRequest,
+    BlockNoticeMutesRemoveResponse, BlockNoticeMutesSetRequest, BlockNoticeMutesSetResponse,
+    BlockNoticeRouteToSecondaryRequest, BlockNoticeRouteToSecondaryResponse,
 };
 use nrr_shared::{AutoRuleReason, RouteRole};
 
 use crate::auto_rules::{AuthoredMatchKind, AuthoredRule, AutoRuleAuthor};
 use crate::block_notice_center::BlockNoticeCenter;
+use crate::block_notice_journal_store::BlockNoticeJournalStore;
 use crate::block_notice_mute_store::BlockNoticeMuteStore;
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
@@ -242,6 +244,64 @@ impl IpcHandler for BlockNoticeMutesClearHandler {
     }
 }
 
+// ── journal (notices raised with nobody listening) ───────────────────────────
+
+pub struct BlockNoticeJournalListHandler {
+    store: Arc<dyn BlockNoticeJournalStore>,
+}
+
+impl BlockNoticeJournalListHandler {
+    pub fn new(store: Arc<dyn BlockNoticeJournalStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl IpcHandler for BlockNoticeJournalListHandler {
+    fn handle(&self, _request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let entries = self
+            .store
+            .list_pending(sid, now_ms())
+            .into_iter()
+            .map(|e| BlockNoticeJournalEntryDto {
+                id: e.id,
+                raised_at_unix_ms: e.raised_at_ms,
+                destination: e.notice.destination,
+                app: e.notice.app,
+                reason: e.notice.reason.slug().to_string(),
+                attempts: u64::from(e.notice.attempts),
+            })
+            .collect();
+        serialize(
+            "block-notices.journal.list",
+            BlockNoticeJournalListResponse { entries },
+        )
+    }
+}
+
+pub struct BlockNoticeJournalAckHandler {
+    store: Arc<dyn BlockNoticeJournalStore>,
+}
+
+impl BlockNoticeJournalAckHandler {
+    pub fn new(store: Arc<dyn BlockNoticeJournalStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl IpcHandler for BlockNoticeJournalAckHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
+        let sid = principal(ctx)?;
+        let parsed: BlockNoticeJournalAckRequest = serde_json::from_value(request.payload.clone())
+            .map_err(|e| malformed("block-notices.journal.ack payload", e))?;
+        let acknowledged = self.store.ack_through(sid, parsed.through_id) as u64;
+        serialize(
+            "block-notices.journal.ack",
+            BlockNoticeJournalAckResponse { acknowledged },
+        )
+    }
+}
+
 // ── route-to-secondary ──────────────────────────────────────────────────────
 
 pub struct BlockNoticeRouteToSecondaryHandler {
@@ -346,6 +406,7 @@ mod tests {
             caller_is_elevated: false,
             caller_principal: sid
                 .and_then(|s| nrr_domain::user_principal::UserPrincipal::from_windows_sid(s).ok()),
+            caller_pid: None,
         }
     }
 
@@ -459,6 +520,77 @@ mod tests {
             bus.peek_pending_for(&sub.subscription_id, 10).is_empty(),
             "the mute set through the handler must silence this episode immediately"
         );
+    }
+
+    #[test]
+    fn the_backlog_is_listed_then_drained_for_the_caller_only() {
+        use crate::block_notice_journal_store::{
+            BlockNoticeJournalStore, InMemoryBlockNoticeJournalStore,
+        };
+        let journal = Arc::new(InMemoryBlockNoticeJournalStore::new());
+        let notice = nrr_domain::block_notice::BlockNotice {
+            destination: "cdn.example".to_string(),
+            app: "chrome.exe".to_string(),
+            reason: nrr_domain::block_notice::BlockReason::NotCoveredByRules,
+            first_attempt_ms: 10,
+            attempts: 4,
+        };
+        journal.append("S-A", &notice, 10);
+        journal.append("S-B", &notice, 10);
+        let store: Arc<dyn BlockNoticeJournalStore> = journal;
+
+        let list = BlockNoticeJournalListHandler::new(Arc::clone(&store));
+        let value = list
+            .handle(
+                &req(
+                    IpcOperationName::BlockNoticeJournalList,
+                    serde_json::json!({}),
+                ),
+                &ctx(Some("S-A")),
+            )
+            .expect("list");
+        let parsed: nrr_shared::ipc_payloads::BlockNoticeJournalListResponse =
+            serde_json::from_value(value).expect("decode");
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].destination, "cdn.example");
+        assert_eq!(parsed.entries[0].attempts, 4);
+
+        let ack = BlockNoticeJournalAckHandler::new(Arc::clone(&store));
+        ack.handle(
+            &req(
+                IpcOperationName::BlockNoticeJournalAck,
+                serde_json::json!({ "through-id": parsed.entries[0].id }),
+            ),
+            &ctx(Some("S-A")),
+        )
+        .expect("ack");
+
+        assert!(store.list_pending("S-A", i64::MAX).is_empty());
+        assert_eq!(
+            store.list_pending("S-B", i64::MAX).len(),
+            1,
+            "one user's acknowledgement must not drain another user's backlog"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_caller_cannot_read_the_backlog() {
+        use crate::block_notice_journal_store::{
+            BlockNoticeJournalStore, InMemoryBlockNoticeJournalStore,
+        };
+        let store: Arc<dyn BlockNoticeJournalStore> =
+            Arc::new(InMemoryBlockNoticeJournalStore::new());
+        let list = BlockNoticeJournalListHandler::new(store);
+        let err = list
+            .handle(
+                &req(
+                    IpcOperationName::BlockNoticeJournalList,
+                    serde_json::json!({}),
+                ),
+                &ctx(None),
+            )
+            .expect_err("no identity");
+        assert_eq!(err.code, IpcErrorCode::Unauthorized);
     }
 
     #[test]
