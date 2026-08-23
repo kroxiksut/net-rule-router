@@ -106,6 +106,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
+            caller_pid: None,
         }
     }
 

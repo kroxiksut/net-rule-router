@@ -10,7 +10,7 @@
 //!   table) — the resolver set is a machine-wide fact, edited once (with
 //!   elevation), pre-filled with public resolvers by country.
 //!
-//! Subnets/CIDR are a Pro feature; a Free entry is a single IPv4 or a hostname
+//! Subnets/CIDR are not supported; a Free entry is a single IPv4 or a hostname
 //! (resolved to `/32`s by the enforcement layer).
 
 use std::net::Ipv4Addr;
@@ -74,7 +74,7 @@ impl DohLockdownScope {
 }
 
 /// A resolver-list entry target. Free: a literal IPv4 (blocked directly) or a
-/// hostname (the enforcement layer resolves it to `/32`s). CIDR/subnets = Pro.
+/// hostname (the enforcement layer resolves it to `/32`s). No CIDR/subnets.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DohTarget {
     /// A single IPv4 resolver address.

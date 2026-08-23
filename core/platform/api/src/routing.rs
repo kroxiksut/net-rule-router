@@ -1,5 +1,8 @@
 //! Routing table transaction with compensating-action journal.
 //!
+//! Neutral: it drives [`RouteTablePort`], so the same journal works on any OS
+//! whose backend can add and delete a route.
+//!
 //! Windows route table has no true atomic batch API. We simulate atomicity
 //! with a **compensating-action journal**: every successful mutation is
 //! immediately pushed onto a rollback stack. On failure, `rollback()` walks
@@ -30,8 +33,8 @@ use std::sync::Arc;
 
 use crate::{
     error::{ErrorClass, PlatformError},
+    route_table::RouteTablePort,
     types::{RouteEntry, RoutingAction},
-    windows_api::WindowsApiPort,
 };
 
 // ── CompensatingAction ────────────────────────────────────────────────────────
@@ -61,13 +64,13 @@ enum CompensatingAction {
 /// `finalize()` to clear the journal. On failure (or before finalize) call
 /// `rollback()` to undo every applied mutation in reverse order.
 pub struct RoutingTransaction {
-    api: Arc<dyn WindowsApiPort>,
+    api: Arc<dyn RouteTablePort>,
     /// Undo steps in *forward* order; `rollback()` iterates in reverse.
     compensating: Vec<CompensatingAction>,
 }
 
 impl RoutingTransaction {
-    pub fn new(api: Arc<dyn WindowsApiPort>) -> Self {
+    pub fn new(api: Arc<dyn RouteTablePort>) -> Self {
         Self {
             api,
             compensating: Vec::new(),
@@ -212,6 +215,7 @@ impl RoutingTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route_table::RouteTablePort;
     use crate::{error::PlatformError, types::RoutingAction, windows_api::MockWindowsApi};
     use std::net::Ipv4Addr;
 
@@ -234,7 +238,7 @@ mod tests {
     #[test]
     fn add_route_inserts_into_table() {
         let api = api();
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let r = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
         tx.execute(&[RoutingAction::AddRoute(r.clone())]).unwrap();
         let table = api.get_ip_forward_table().unwrap();
@@ -256,7 +260,7 @@ mod tests {
             code: 0x1392,
             message: "route already exists".to_string(),
         }));
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let r = route([0, 0, 0, 0], [10, 91, 192, 1], 78, true);
         tx.execute(&[RoutingAction::AddRoute(r)])
             .expect("conflict on add is treated as success");
@@ -273,7 +277,7 @@ mod tests {
         let r = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
         api.create_ip_forward_entry(&r).unwrap();
 
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::DeleteRoute(r.clone())])
             .unwrap();
         assert!(api.get_ip_forward_table().unwrap().is_empty());
@@ -290,7 +294,7 @@ mod tests {
             ..old.clone()
         };
 
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::UpdateRoute {
             old: old.clone(),
             new: new.clone(),
@@ -307,7 +311,7 @@ mod tests {
     fn rollback_undoes_add_route() {
         let api = api();
         let r = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::AddRoute(r.clone())]).unwrap();
         assert_eq!(api.get_ip_forward_table().unwrap().len(), 1);
 
@@ -326,7 +330,7 @@ mod tests {
         let r = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
         api.create_ip_forward_entry(&r).unwrap();
 
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::DeleteRoute(r.clone())])
             .unwrap();
         assert!(api.get_ip_forward_table().unwrap().is_empty());
@@ -352,7 +356,7 @@ mod tests {
         // Pre-add r2 to the mock to simulate duplicate conflict for r2 only.
         // We'll instead use force_error after r1.
         // Trick: add r1 first ourselves, then make subsequent calls fail.
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::AddRoute(r1.clone())]).unwrap();
 
         api.set_force_error(Some(PlatformError::Win32 {
@@ -382,7 +386,7 @@ mod tests {
             message: "not found".into(),
         }));
 
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         let result = tx.execute(&[RoutingAction::DeleteRoute(r)]);
         // Idempotent → treated as success
         assert!(
@@ -397,7 +401,7 @@ mod tests {
     fn finalize_clears_compensating_log() {
         let api = api();
         let r = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[RoutingAction::AddRoute(r)]).unwrap();
         assert_eq!(tx.pending_undo_count(), 1);
         tx.finalize();
@@ -416,7 +420,7 @@ mod tests {
         let r2 = route([10, 0, 1, 0], [192, 168, 1, 2], 5, true);
         api.create_ip_forward_entry(&r1).unwrap();
 
-        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
         tx.execute(&[
             RoutingAction::DeleteRoute(r1.clone()),
             RoutingAction::AddRoute(r2.clone()),

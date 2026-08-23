@@ -1,0 +1,280 @@
+//! The two mechanisms must agree about who owns an address.
+//!
+//! Routing and filtering are separate code paths that read the same rule book:
+//! one decides where a packet leaves, the other decides whether it may leave at
+//! all. When they disagree, the result is not "one of the two behaviours" — it
+//! is a destination that is routed one way and dropped on the other, dead for
+//! every process on the machine.
+//!
+//! That is not hypothetical. A live machine lost `habr.com` for hours: an
+//! application rule on the additional link had once been observed connecting to
+//! its address, so the filter side pinned and then blocked it, while the route
+//! side — which already had the guard — left it on the main link. The site was
+//! named by the user's own main-link rule the whole time.
+//!
+//! These tests state the invariant rather than the incident: whatever the rule
+//! book says, an address the main link claims never appears among the
+//! destinations the filter side hands the kill-switch. Written as a sweep over
+//! rule-book shapes, so the next way to reach the same contradiction fails here
+//! instead of on someone's machine.
+
+use std::collections::HashSet;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
+
+use nrr_domain::canonical::{
+    CanonicalAddressMatch, CanonicalAppMatch, CanonicalAppPattern, CanonicalRule,
+    CanonicalRuleBook, CanonicalRuleSet,
+};
+use nrr_domain::{RouteBehaviorMode, RuleAction, RuleId};
+use nrr_platform_api::MockAppPathResolver;
+use nrr_service_runtime::app_observation_lookup::MockAppObservationLookup;
+use nrr_service_runtime::fqdn_cache_lookup::MockFqdnCacheLookup;
+use nrr_service_runtime::route_codegen::{address_rule_ips, generate_routes, SecondaryRouteTarget};
+use nrr_service_runtime::wfp_codegen::{generate_filters, CodegenInput};
+
+/// The address two rules end up fighting over.
+const CONTESTED: Ipv4Addr = Ipv4Addr::new(178, 248, 237, 68);
+/// An address only the application ever touches.
+const APP_ONLY: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+const HOST: &str = "habr.com";
+const APP: &str = "claude.exe";
+
+fn address_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+    CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: Some(m),
+        app_match: None,
+        comment: String::new(),
+        action: RuleAction::Route,
+        origin: None,
+    }
+}
+
+fn app_rule(id: &str, process: &str) -> CanonicalRule {
+    CanonicalRule {
+        id: RuleId(id.into()),
+        enabled: true,
+        address_match: None,
+        app_match: Some(CanonicalAppMatch {
+            pattern: CanonicalAppPattern::Exact(process.into()),
+            include_child_processes: false,
+        }),
+        comment: String::new(),
+        action: RuleAction::Route,
+        origin: None,
+    }
+}
+
+/// Every way a main-link rule can name the contested address.
+fn main_link_claims() -> Vec<(&'static str, CanonicalRule)> {
+    vec![
+        (
+            "by literal address",
+            address_rule("r-ip", CanonicalAddressMatch::ExactIp(CONTESTED)),
+        ),
+        (
+            "by exact name",
+            address_rule("r-fqdn", CanonicalAddressMatch::ExactFqdn(HOST.into())),
+        ),
+        (
+            "by domain suffix",
+            address_rule("r-suffix", CanonicalAddressMatch::SuffixDomain(HOST.into())),
+        ),
+    ]
+}
+
+fn cache() -> MockFqdnCacheLookup {
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips(HOST, vec![CONTESTED]);
+    cache
+}
+
+fn observations() -> MockAppObservationLookup {
+    let obs = MockAppObservationLookup::new();
+    obs.set_ips(APP, vec![CONTESTED, APP_ONLY]);
+    obs
+}
+
+fn resolver() -> MockAppPathResolver {
+    MockAppPathResolver::new().with(APP, vec![PathBuf::from(r"C:\Apps\claude.exe")])
+}
+
+fn target() -> SecondaryRouteTarget {
+    SecondaryRouteTarget {
+        gateway: Ipv4Addr::new(10, 88, 0, 1),
+        interface_index: 42,
+    }
+}
+
+/// The invariant, over every shape of main-link claim: an address the main link
+/// names is never handed to the kill-switch as a protected secondary
+/// destination, and never routed to the additional link either.
+#[test]
+fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
+    for (how, main_rule) in main_link_claims() {
+        let cache = cache();
+        let observations = observations();
+        let resolver = resolver();
+        let rule_book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![main_rule]),
+            secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+        };
+
+        let filters = generate_filters(CodegenInput {
+            sid: "S-1-5-21-TEST",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &observations,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &HashSet::new(),
+        });
+        let routes = generate_routes(
+            RouteBehaviorMode::PreferPrimary,
+            &rule_book,
+            None,
+            &target(),
+            &cache,
+            &observations,
+            &HashSet::new(),
+        );
+
+        assert!(
+            !filters.secondary_dest_ips.contains(&CONTESTED),
+            "{how}: the filter side took over an address the main link names — the kill-switch \
+             would block it for every process",
+        );
+        assert!(
+            !routes.routes.iter().any(|r| r.destination == CONTESTED),
+            "{how}: the route side steered an address the main link names onto the other link",
+        );
+        // The app rule is not disarmed by the guard: what nobody else named is
+        // still its own.
+        assert!(
+            filters.secondary_dest_ips.contains(&APP_ONLY),
+            "{how}: the guard swallowed a destination no other rule claims",
+        );
+    }
+}
+
+/// The two sides must agree on the whole set, not merely on the contested
+/// address: any destination the filter side protects on the additional link is
+/// one the route side actually steers there. A protected address with no route
+/// is a block with nowhere to go.
+#[test]
+fn every_protected_destination_is_one_the_routes_actually_steer() {
+    let cache = cache();
+    let observations = observations();
+    let resolver = resolver();
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![address_rule(
+            "r-main",
+            CanonicalAddressMatch::ExactFqdn(HOST.into()),
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![
+            app_rule("r-app", APP),
+            address_rule(
+                "r-sec",
+                CanonicalAddressMatch::ExactIp(Ipv4Addr::new(198, 51, 100, 4)),
+            ),
+        ]),
+    };
+
+    let filters = generate_filters(CodegenInput {
+        sid: "S-1-5-21-TEST",
+        rule_book: &rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &observations,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &HashSet::new(),
+    });
+    let routes = generate_routes(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        None,
+        &target(),
+        &cache,
+        &observations,
+        &HashSet::new(),
+    );
+
+    let steered: HashSet<Ipv4Addr> = routes.routes.iter().map(|r| r.destination).collect();
+    let orphaned: Vec<Ipv4Addr> = filters
+        .secondary_dest_ips
+        .iter()
+        .copied()
+        .filter(|ip| !steered.contains(ip))
+        .collect();
+
+    assert!(
+        orphaned.is_empty(),
+        "protected on the additional link but not routed there: {orphaned:?} — traffic to these \
+         is blocked when the link drops and has no path to it when the link is up",
+    );
+}
+
+/// The definition itself: what the main link claims is read the same way on both
+/// sides. Two definitions of "claimed" is how the halves drift apart again.
+#[test]
+fn both_sides_read_the_main_links_claim_from_one_definition() {
+    let cache = cache();
+    let rules = CanonicalRuleSet::from_rules(vec![address_rule(
+        "r-main",
+        CanonicalAddressMatch::ExactFqdn(HOST.into()),
+    )]);
+
+    let claimed = address_rule_ips(&rules, &cache);
+
+    assert!(claimed.contains(&CONTESTED));
+    assert!(!claimed.contains(&APP_ONLY));
+}
+
+/// The mirror of the incident, and the rule stated plainly: an address rule
+/// wins over an application rule REGARDLESS of which link each is on.
+///
+/// Here the tunnel's own zone rule names the address and the application rule
+/// sits on the main link. If the program's observation won, a host the user
+/// deliberately routes through the tunnel would leave over the open link
+/// whenever that particular program touched it — the leak version of the same
+/// mistake that produced the dead site.
+#[test]
+fn an_address_rule_wins_over_an_app_rule_on_either_link() {
+    let cache = MockFqdnCacheLookup::new();
+    cache.set_ips("api.example.com", vec![CONTESTED]);
+    let observations = MockAppObservationLookup::new();
+    observations.set_ips(APP, vec![CONTESTED, APP_ONLY]);
+    let resolver = resolver();
+
+    // Zone rule on the ADDITIONAL link; application rule on the MAIN link.
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+        secondary: CanonicalRuleSet::from_rules(vec![address_rule(
+            "r-zone",
+            CanonicalAddressMatch::SuffixDomain("example.com".into()),
+        )]),
+    };
+
+    let filters = generate_filters(CodegenInput {
+        sid: "S-1-5-21-TEST",
+        rule_book: &rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &observations,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &HashSet::new(),
+    });
+
+    assert!(
+        filters.secondary_dest_ips.contains(&CONTESTED),
+        "the address rule that names it must keep the address on its own link",
+    );
+    assert!(
+        !filters.primary_dest_ips.contains(&CONTESTED),
+        "the app rule on the main link took an address the tunnel's own rule names — that host          would leave over the open link whenever this program touched it",
+    );
+    // And what only the program knows about is still the program's.
+    assert!(filters.primary_dest_ips.contains(&APP_ONLY));
+}

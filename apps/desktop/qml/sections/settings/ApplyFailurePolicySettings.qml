@@ -15,16 +15,6 @@ GroupBox {
         ? (root.routingState.applyFailurePolicy || "best-effort")
         : "best-effort"
 
-    // Pre-flight is gated behind the Experimental opt-in (its checks are not
-    // implemented yet, see ExperimentalSettings.qml). A user who already has
-    // it selected keeps seeing it even with the opt-in off — we never swap a
-    // saved choice out from under them — but it does not appear as a pickable
-    // option for anyone else until they opt in.
-    readonly property bool preFlightOptedIn:
-        root.uiRevision >= 0 && root.prefs.preFlightApplyPolicyOptIn === true
-    readonly property bool preFlightAlreadySelected:
-        currentSlug === "pre-flight-then-all-or-nothing"
-
     readonly property var optionDefs: {
         var defs = [
             {
@@ -42,19 +32,13 @@ GroupBox {
                 descFallback: "If any single rule can't be enforced, the whole apply rolls back. Exact-or-nothing."
             }
         ]
-        if (group.preFlightOptedIn || group.preFlightAlreadySelected) {
-            defs.push({
-                slug: "pre-flight-then-all-or-nothing",
-                labelKey: "settings.routing.failure-policy.option.pre-flight.label",
-                labelFallback: "Pre-flight, then all-or-nothing (experimental)",
-                descKey: group.preFlightAlreadySelected && !group.preFlightOptedIn
-                    ? "settings.routing.failure-policy.option.pre-flight.description-stale"
-                    : "settings.routing.failure-policy.option.pre-flight.description",
-                descFallback: group.preFlightAlreadySelected && !group.preFlightOptedIn
-                    ? "Selected, but the Experimental opt-in for this option is off. The checks are still in development — this behaves the same as All or nothing today."
-                    : "Run predictable-failure checks before applying. Apply still rolls back on real errors. The checks themselves are still in development — this behaves the same as All or nothing today."
-            })
-        }
+        defs.push({
+            slug: "pre-flight-then-all-or-nothing",
+            labelKey: "settings.routing.failure-policy.option.pre-flight.label",
+            labelFallback: "Check first, then all or nothing",
+            descKey: "settings.routing.failure-policy.option.pre-flight.description",
+            descFallback: "Checks the change before touching anything and refuses to start when it cannot be applied as one piece — a very large rule set is applied in several parts, and this option would rather stop than leave half of it live. Rules that would be stored without enforcing anything (a program that is not installed) are reported, not blocked."
+        })
         return defs
     }
 

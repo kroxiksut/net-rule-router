@@ -60,7 +60,7 @@
 //!   [`CanonicalAddressMatch::SuffixDomain`]; display layer restores it.
 //! - **Platform-inactive sections** — on Windows, `--- Linux` and `--- MacOS`
 //!   entries are excluded from the canonical rule set (never applied to routing).
-//! - **Pro-only section entries** — entries in unknown sections (e.g. `--- CIDR`,
+//! - **unsupported section entries** — entries in unknown sections (e.g. `--- CIDR`,
 //!   `--- Ports`) are not converted; they live in `ParseOutcome::unknown_sections`
 //!   and are round-tripped through the file, but they are outside the canonical
 //!   policy boundary for the Free edition.
@@ -478,10 +478,10 @@ mod tests {
             .is_some_and(|a| a.pattern.as_str() == "browser.exe"));
     }
 
-    // ── Discarded: Pro-only section entries ───────────────────────────────────
+    // ── Discarded: unsupported section entries ───────────────────────────────────
 
     #[test]
-    fn pro_only_sections_not_in_canonical_rule_set() {
+    fn unsupported_sections_not_in_canonical_rule_set() {
         // CIDR entries live in unknown_sections and must not enter the canonical set.
         let set = rule_set("--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n");
         assert_eq!(set.len(), 1);

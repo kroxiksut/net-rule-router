@@ -50,7 +50,7 @@
 //! blocking requires the FQDN cache to supply resolved IPs. If the
 //! cache has no entry for an FQDN, no filter is added — traffic may route via
 //! primary until the cache is populated. This is a known Free-tier limitation
-//! (Pro: callout driver intercepts at DNS/SNI level).
+//! (interception at the DNS/SNI level is out of scope).
 //!
 //! ## Audit and rate-limiting
 //!

@@ -9,6 +9,9 @@
 
 pub use nrr_platform_api::interface_rows::*;
 
+// Only the live Windows enumeration builds rows; off Windows this module is
+// the neutral re-export plus the fallback dataset.
+#[cfg(windows)]
 use nrr_shared::RouteSelectionState;
 
 /// Enumerate adapters live and enrich each into an [`InterfaceRouteRow`].
@@ -40,9 +43,10 @@ pub fn collect_interfaces_rows(
     }
 
     // The fallback dataset is deterministic and offline by contract: there is
-    // no real adapter behind those rows to probe.
+    // no real adapter behind those rows to probe, and nothing off Windows reads
+    // the snapshot the live path merges.
     #[cfg(not(windows))]
-    let _ = probe_external_ip;
+    let _ = (probe_external_ip, snapshot);
 
     (InterfacesDataSource::FallbackMock, fallback_rows())
 }
@@ -217,7 +221,7 @@ fn apply_external_ip_probes(rows: &mut [InterfaceRouteRow]) {
 #[cfg(windows)]
 fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String>> {
     use nrr_platform_api::interface_rows::derive_forwarding_next_hop;
-    use nrr_platform_api::windows_api::WindowsApiPort;
+    use nrr_platform_api::route_table::RouteTablePort;
 
     let api = crate::windows_api::ProductionWindowsApi;
     let (Ok(routes), Ok(infos)) = (api.get_ip_forward_table(), api.get_adapter_infos()) else {

@@ -65,6 +65,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: None,
+            caller_pid: None,
         }
     }
 
@@ -90,8 +91,10 @@ mod tests {
             enabled: true,
             validation_status: "ok".into(),
             validation_message_key: None,
+            main_route: None,
             hosts_override: None,
             origin: None,
+            pinned_destinations: None,
         }
     }
 

@@ -228,7 +228,23 @@ ScrollView {
         return 0
     }
 
-    Component.onCompleted: { _loadCacheColWidths(); _refreshServiceHealth() }
+    Component.onCompleted: {
+        _loadCacheColWidths()
+        _refreshServiceHealth()
+        _consumePendingExplainHost()
+    }
+    // Arriving from a block notice: the host travelled with the action, so the
+    // question is answered here instead of retyped. Consumed once — coming back
+    // to this page later must not re-probe a problem the user already looked at.
+    onVisibleChanged: if (visible) section._consumePendingExplainHost()
+
+    function _consumePendingExplainHost() {
+        var host = String(root.pendingExplainHost || "").trim()
+        if (host === "") return
+        root.pendingExplainHost = ""
+        section._probeInputText = host
+        section._runExplainProbe()
+    }
     Connections {
         target: root.refreshAction
         function onTriggered() { section._refreshServiceHealth() }
@@ -979,7 +995,10 @@ ScrollView {
             }
             if (route !== "all") {
                 var r = String((e && e.expected_route) || "")
-                if (route === "none") { if (r !== "") continue }
+                // "ipv6" is not a route the user can pick — it means no rule
+                // CAN cover the row, so it belongs with the no-rule bucket
+                // rather than vanishing from every filter.
+                if (route === "none") { if (r !== "" && r !== "ipv6") continue }
                 else if (r !== route) continue
             }
             if (q !== "" && section._cacheRowBlob(e).indexOf(q) === -1) continue
@@ -1830,7 +1849,7 @@ ScrollView {
                     ThemedButton {
                         theme: root.uiTheme
                         enabled: section._exportArchiveDir !== ""
-                        text: root.tr("diag.archive.open-folder", "Open folder")
+                        text: root.tr("action.open-folder", "Open folder")
                         onClicked: {
                             if (section._exportArchiveDir === "") return
                             Qt.openUrlExternally(

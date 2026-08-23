@@ -102,6 +102,13 @@ fn run(command: Command, exe: &str) -> u8 {
                         ),
                         None => println!("  data directory:    left as it was"),
                     }
+                    // Only worth a line when it went wrong: a registered source
+                    // is invisible to the operator precisely because it works.
+                    if report.event_source_registered == Some(false) {
+                        println!(
+                            "  system event log:  source not registered; lifecycle records will                              show without their description"
+                        );
+                    }
                     exit::SUCCESS
                 }
                 Err(err) => report_failure("install", &err, exe, "install"),
@@ -125,6 +132,18 @@ fn run(command: Command, exe: &str) -> u8 {
                         }
                     );
                     println!("  your rule files:   kept");
+                    // Removal is when a wedged install gets removed, so say out
+                    // loud whether the machine was handed back clean: a leftover
+                    // filter set or DNS redirect means no traffic and no product
+                    // left to fix it.
+                    match report.machine_state_cleared {
+                        Some(true) => println!("  network state:     restored"),
+                        Some(false) => println!(
+                            "  network state:     NOT fully restored — run `{exe} \
+reset-network` elevated, or reboot"
+                        ),
+                        None => {}
+                    }
                     exit::SUCCESS
                 }
                 Err(err) => report_failure(

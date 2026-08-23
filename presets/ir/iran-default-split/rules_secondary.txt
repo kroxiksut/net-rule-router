@@ -39,6 +39,15 @@ api.mistral.ai
 *.jetbrains.com
 plugins.jetbrains.com
 
+# Developer and IT services measured as unreachable from this country
+*.coursera.org
+*.gitlab.com
+*.intel.com
+*.mongodb.com
+*.notion.so
+*.releases.hashicorp.com
+*.sentry.io
+
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 

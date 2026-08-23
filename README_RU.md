@@ -196,8 +196,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\package-windows.ps1 -Zip
 кладёт рядом `NetRuleRouter-windows-x64-<версия>+<коммит>.zip`. Внутри — GUI,
 трей, служба, консоль, runtime Qt и дерево QML / локалей / пресетов /
 конфигураций, плюс отметка сборки `build-info.json` (версия, ревизия, время
-сборки) и короткий `READ-ME.txt` для того, кто распакует архив. Параметры и
-состав пакета — в [`docs/ru/packaging-windows.md`](docs/ru/packaging-windows.md).
+сборки) и короткие `README.txt` / `README.ru.txt` для того, кто распакует
+архив. Параметры и состав пакета — в
+[`docs/ru/packaging-windows.md`](docs/ru/packaging-windows.md).
 
 ## Конфигурация и данные
 

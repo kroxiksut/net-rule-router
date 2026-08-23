@@ -23,6 +23,14 @@ QtObject {
     /// 3 s health poll from opening the dialog twice concurrently.
     property bool _offlinePendingDialogActive: false
 
+    /// Drop the latch — but never while the shared post-connect dialog is on
+    /// screen: the settings half settles on its own and must not clear the
+    /// guard the rules half is still standing behind.
+    function _releasePendingDialogFlag() {
+        if (root.offlineBacklogDialog && root.offlineBacklogDialog.visible) return
+        _offlinePendingDialogActive = false
+    }
+
     function _offlineOnOffLabel(v) {
         return v === true
             ? root.tr("dialog.offline-pending.value-on", "On")
@@ -270,6 +278,27 @@ QtObject {
     ///   - Omitted by the dialog's own "Apply all" button: a user-initiated
     ///     retry, so it reports through the plain applied/failed status lines
     ///     and never re-opens itself.
+    /// Hand the service a connection assignment the user made while it was
+    /// stopped. Runs ahead of `_resyncRouteBindingIfMissing`, which only fires
+    /// when the service holds NO binding — a user who re-pointed their
+    /// additional connection offline has one to overwrite.
+    function deliverParkedBinding() {
+        var b = root._readPendingOffline()["binding"] || {}
+        if (b.pending !== true) return
+        if (!root._routingBackendConnected()) return
+        var opts = {}
+        if (b.unbindPrimary === true) opts.unbindPrimary = true
+        if (b.unbindSecondary === true) opts.unbindSecondary = true
+        root.routePolicyController.pushRouteBindingToService(opts, function(ok) {
+            if (!ok) return // stays parked; the next connect re-offers it
+            var obj = root._readPendingOffline()
+            obj["binding"] = {}
+            root._writePendingOffline(obj)
+            root.statusLine = root.tr("status.binding-delivered-after-offline",
+                "The connections you chose are now applied by the background service.")
+        })
+    }
+
     function _applyOfflinePending(fallbackRows) {
         var obj = root._readPendingOffline()
         var rp = obj["route-policy"] || {}
@@ -278,7 +307,7 @@ QtObject {
         var haveSt = Object.keys(st).length > 0
         if (!haveRp && !haveSt) {
             root._writePendingOffline({})
-            _offlinePendingDialogActive = false
+            _releasePendingDialogFlag()
             return
         }
         if (!root._routingBackendConnected()
@@ -287,7 +316,7 @@ QtObject {
             // Lost the service between offer and apply — keep the store intact.
             root.statusLine = root.tr("status.offline-pending-apply-failed",
                 "Could not apply the saved changes; they are still pending.")
-            _offlinePendingDialogActive = false
+            _releasePendingDialogFlag()
             return
         }
         var state = { rpDone: !haveRp, rpOk: true, stDone: !haveSt, stOk: true }
@@ -301,7 +330,7 @@ QtObject {
                     : root.tr("status.offline-pending-applied",
                         "Your saved changes were applied.")
                 root.offlinePendingApplied()
-                _offlinePendingDialogActive = false
+                _releasePendingDialogFlag()
                 return
             }
             if (fallbackRows) {
@@ -316,7 +345,7 @@ QtObject {
             }
             root.statusLine = root.tr("status.offline-pending-apply-failed",
                 "Could not apply the saved changes; they are still pending.")
-            _offlinePendingDialogActive = false
+            _releasePendingDialogFlag()
         }
         if (haveRp) {
             var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
@@ -351,6 +380,6 @@ QtObject {
         root.statusLine = root.tr("status.offline-pending-discarded",
             "Your saved changes were discarded.")
         root.offlinePendingApplied()
-        _offlinePendingDialogActive = false
+        _releasePendingDialogFlag()
     }
 }

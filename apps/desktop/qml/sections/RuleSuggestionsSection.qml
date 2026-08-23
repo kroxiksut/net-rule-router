@@ -21,8 +21,10 @@ ColumnLayout {
     property var root
     spacing: root.uiTheme.spacingMd
 
-    /// `newest` | `consumers` | `name`.
-    property string sortMode: "newest"
+    /// `main-route` | `newest` | `consumers` | `name`. Defaults to the main-route
+    /// order: what does not open without the additional route is what the user
+    /// is here to fix, so it belongs at the top.
+    property string sortMode: "main-route"
     /// Hostname whose dependents are being shown alone; empty shows all.
     property string consumerFilter: ""
     /// Free-text search across domain, observed hosts, and consumer names.
@@ -42,6 +44,97 @@ ColumnLayout {
     /// the scroll position back to zero on every delete/accept/dismiss.
     property real _pendingScrollY: -1
 
+    /// Sites the user marked as answering the main route with a refusal. Kept
+    /// as the service last reported it — the mark is service state, and the
+    /// panel must not invent a local truth about it.
+    property var refusingAnchors: []
+
+    function _isRefusingAnchor(host) {
+        var h = String(host || "").toLowerCase()
+        for (var i = 0; i < section.refusingAnchors.length; i += 1) {
+            if (String(section.refusingAnchors[i]).toLowerCase() === h) return true
+        }
+        return false
+    }
+
+    /// Tell the service this site answers the main route with a refusal (or take
+    /// it back). The only consequence is that this site's addresses stop being
+    /// quietened by "the main route reaches it" — we still never claim to know
+    /// what the far end served.
+    function _toggleRefusingAnchor(host) {
+        var hostname = String(host || "")
+        if (hostname === "") return
+        if (!root.bridgeAvailable || typeof root.rpc.rpcRefusingAnchorSet !== "function") {
+            root.statusLine = root.tr("status.bindings-require-service",
+                "Adapter bindings can only be changed while the background service is running.")
+            return
+        }
+        var want = !section._isRefusingAnchor(hostname)
+        var corr = root.rpc.rpcRefusingAnchorSet({ "hostname": hostname, "refusing": want })
+        if (!corr || corr === "") return
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            if (!ok) {
+                root.statusLine = String(msg || code || "")
+                return
+            }
+            section.refusingAnchors = (payload || {}).refusing || []
+            root.statusLine = want
+                ? root.tr("status.refusing-anchor-on",
+                        "{name} is marked as refusing addresses on the main connection.")
+                    .replace("{name}", hostname)
+                : root.tr("status.refusing-anchor-off",
+                        "The mark on {name} was removed.").replace("{name}", hostname)
+            section._refresh()
+        })
+    }
+
+    /// True while a probe pass is running. It is a request, not a stream: the
+    /// service accepts the pass and the verdicts arrive with the next refresh,
+    /// so this only guards against a second press mid-flight.
+    property bool probeBusy: false
+
+    function _probeMainRoute() {
+        if (section.probeBusy) return
+        if (!root.bridgeAvailable || typeof root.rpc.rpcAutoRuleCandidatesProbe !== "function") {
+            root.statusLine = root.tr("status.bindings-require-service",
+                "Adapter bindings can only be changed while the background service is running.")
+            return
+        }
+        var corr = root.rpc.rpcAutoRuleCandidatesProbe({ "ids": [] })
+        if (!corr || corr === "") return
+        section.probeBusy = true
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            section.probeBusy = false
+            if (!ok) {
+                root.statusLine = String(msg || code || "")
+                return
+            }
+            var accepted = Number((payload || {}).accepted || 0)
+            root.statusLine = accepted > 0
+                ? root.tr("status.main-route-check-started",
+                        "Checking {count} addresses over the main connection...")
+                    .replace("{count}", String(accepted))
+                : root.tr("status.main-route-check-nothing",
+                    "Everything here was checked recently.")
+            // The verdicts land in the service's own ledger; the list re-reads
+            // them on the next refresh rather than being patched here.
+            _refreshLater.restart()
+        })
+    }
+
+    Timer {
+        id: _refreshLater
+        interval: 4000
+        onTriggered: section._refresh()
+    }
+
+    /// A few of the names the service dropped — three is enough to recognise
+    /// one's own site, and the rest would only make the line longer.
+    function _inertSampleText() {
+        var names = root.autoRuleInertSample || []
+        return names.slice(0, 3).join(", ")
+    }
+
     function _refresh() {
         if (typeof root.refreshAutoRuleCandidates === "function") root.refreshAutoRuleCandidates()
         if (typeof root.refreshAutoRuleDismissed === "function") root.refreshAutoRuleDismissed()
@@ -51,6 +144,40 @@ ColumnLayout {
     // pending set can change while the user was elsewhere in the app.
     Component.onCompleted: section._refresh()
     onVisibleChanged: if (visible) section._refresh()
+
+    /// The list is fetched, never pushed on its own, so a page already on
+    /// screen when the service starts would sit empty until the user navigated
+    /// away and back. Reading `_routingBackendConnected()` inside a binding is
+    /// what makes this track the live service rather than the window's default
+    /// "connected" optimism.
+    readonly property bool _serviceOnline: root._routingBackendConnected()
+    /// Reads still owed to the catch-up below.
+    property int _catchUpLeft: 0
+    on_ServiceOnlineChanged: {
+        if (!section._serviceOnline) return
+        // The service answers health well before its first candidate pass
+        // finishes, so the read at connect time can land on a store that is
+        // still empty. A few spaced retries cover that window without turning
+        // the page into a poller.
+        section._catchUpLeft = 6
+        section._refresh()
+        _catchUpTimer.restart()
+    }
+
+    Timer {
+        id: _catchUpTimer
+        interval: 5000
+        repeat: true
+        onTriggered: {
+            if (!section._serviceOnline || section._catchUpLeft <= 0
+                    || (root.autoRuleCandidates || []).length > 0) {
+                stop()
+                return
+            }
+            section._catchUpLeft -= 1
+            section._refresh()
+        }
+    }
 
     // Grouped ONCE per data change (candidates/dismissed arrays), filtered +
     // sorted ONCE per UI change (sort/filter). Delegates below only ever read
@@ -256,15 +383,29 @@ ColumnLayout {
         }
         return parts.join(" · ")
     }
-    /// How the host behaves on the main route — empty unless the service
-    /// reached a verdict (a guess here would be worse than silence).
+    /// What the main route does with this address — a FACT, never advice.
+    ///
+    /// "The main route reaches it" is not "you don't need this": a site can
+    /// answer a main-link address with a refusal (ChatGPT does), which is the
+    /// very case the address is being offered for. Only the negative verdict is
+    /// a recommendation, and it says so.
     function _behaviorText(host) {
         var slug = String(host.primaryBehavior || "")
-        if (slug === "responds")
-            return root.tr("rules.suggestions.inbox.behavior-responds", "already works without the tunnel")
+        if (slug === "responds") {
+            // Reachable AND the site is known to refuse main-link addresses: the
+            // bare "reaches it" would read as "you don't need this", which is
+            // exactly wrong here.
+            if (host.anchorRefusesMainLink === true) {
+                return root.tr("rules.suggestions.inbox.behavior-responds-refusing",
+                    "the main route reaches it, but the site refuses addresses there")
+            }
+            return root.tr("rules.suggestions.inbox.behavior-responds", "the main route reaches it")
+        }
         if (slug === "stalls")
             return root.tr("rules.suggestions.inbox.behavior-stalls", "connections to it stall on the main route")
-        return ""
+        if (slug === "cut")
+            return root.tr("rules.suggestions.inbox.behavior-cut", "the main route drops connections to it")
+        return root.tr("rules.suggestions.inbox.behavior-unknown", "not checked on the main route")
     }
     function _isPrimaryConsumer(consumer) {
         return String((consumer || {}).route || "") === "primary"
@@ -278,6 +419,9 @@ ColumnLayout {
         root.statusLine = root.tr("status.copied-to-clipboard", "Copied to clipboard.")
     }
     function _sortLabel(mode) {
+        if (mode === "main-route")
+            return root.tr("rules.suggestions.inbox.sort-main-route",
+                "What the main route can't reach first")
         if (mode === "consumers") return root.tr("rules.suggestions.inbox.sort-consumers", "By number of sites")
         if (mode === "name") return root.tr("rules.suggestions.inbox.sort-name", "By name")
         return root.tr("rules.suggestions.inbox.sort-newest", "Newest first")
@@ -285,6 +429,11 @@ ColumnLayout {
 
     Label {
         Layout.fillWidth: true
+        // A wrapping Text still reports its UNWRAPPED width as implicitWidth,
+        // and a StackLayout sizes to the widest child's preferred width — so
+        // without this the intro sentence alone decided how wide the whole
+        // page wanted to be, and the columns beside it got squeezed.
+        Layout.preferredWidth: 0
         wrapMode: Text.Wrap
         textFormat: Text.StyledText
         color: root.textColor
@@ -305,99 +454,178 @@ ColumnLayout {
         Accessible.name: text.replace(/<\/?[a-z]+>/gi, "")
     }
 
-    RowLayout {
+    /// Why the list is empty, when the service knows: companions it saw but
+    /// did not offer because they already travel the route a rule would send
+    /// them to. Its own Label, so an empty screen with nothing to explain
+    /// looks exactly as it did before.
+    Label {
         Layout.fillWidth: true
+        // A wrapping Text reports its UNWRAPPED width as implicitWidth, and
+        // this line carries hostnames — without a preferred width it would
+        // drive the whole page wider than the window.
+        Layout.preferredWidth: 0
+        visible: section.mergedGroups.length === 0
+            && root.uiRevision >= 0 && root.autoRuleInertDropped > 0
+        wrapMode: Text.Wrap
+        color: root.mutedTextColor
+        text: root.tr("rules.suggestions.inbox.empty-all-inert",
+                "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.")
+            .replace("{count}", String(root.autoRuleInertDropped))
+            .replace("{sample}", section._inertSampleText())
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+
+    // Toolbar. A single RowLayout demanded the SUM of every control's width as
+    // the page's minimum, so the filter chip and its long checkbox pushed the
+    // whole section past the window edge. A Flow wraps to the next line
+    // instead; recipe 32 is why it sits inside an Item. Controls that belong
+    // together share a Row, the rest wrap on their own.
+    Item {
+        Layout.fillWidth: true
+        Layout.preferredHeight: toolbarFlow.height
         // Data may exist even when the current search/filter shows nothing --
         // the row (and its search box) must stay reachable so it can be cleared.
         visible: section.mergedGroups.length > 0
-        spacing: root.uiTheme.spacingSm
 
-        Label {
-            text: root.tr("rules.suggestions.inbox.sort", "Sort")
-            color: root.mutedTextColor
-        }
-        ThemedComboBox {
-            id: sortCombo
-            theme: root.uiTheme
-            Layout.preferredWidth: 220
-            model: ["newest", "consumers", "name"]
-            labelResolver: function(item) { return section._sortLabel(String(item)) }
-            displayText: root.uiRevision >= 0 ? section._sortLabel(section.sortMode) : ""
-            currentIndex: model.indexOf(section.sortMode)
-            onActivated: section.sortMode = String(model[currentIndex])
-            Accessible.role: Accessible.ComboBox
-            Accessible.name: root.tr("rules.suggestions.inbox.sort", "Sort")
-        }
-        Label {
-            text: root.tr("action.search", "Search")
-            color: root.mutedTextColor
-        }
-        ThemedTextField {
-            id: suggestionsSearchField
-            theme: root.uiTheme
-            Layout.preferredWidth: 220
-            placeholderText: root.uiRevision >= 0
-                ? root.tr("rules.suggestions.inbox.search-placeholder",
-                    "Search by domain, host, or site")
-                : ""
-            text: section.searchQuery
-            onTextChanged: section.searchQuery = text
-            Accessible.role: Accessible.EditableText
-            Accessible.name: root.tr("action.search", "Search")
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            visible: section.searchQuery !== ""
-            text: root.tr("action.clear", "Clear")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: { section.searchQuery = ""; suggestionsSearchField.text = "" }
-        }
-        CheckBox {
-            id: selectAllVisibleCheckBox
-            tristate: true
-            checkState: section.visibleCheckedState === 1
-                ? Qt.Checked
-                : (section.visibleCheckedState === 2 ? Qt.PartiallyChecked : Qt.Unchecked)
-            onClicked: section._toggleSelectAllVisible()
-            Accessible.role: Accessible.CheckBox
-            Accessible.name: root.tr("rules.suggestions.inbox.select-all", "Select all")
-            ToolTip.visible: hovered
-            ToolTip.delay: 400
-            ToolTip.text: root.tr("rules.suggestions.inbox.select-all-tooltip",
-                "Select or clear every address currently shown.")
-        }
-        Label {
-            text: root.tr("rules.suggestions.inbox.select-all", "Select all")
-            color: root.textColor
-        }
-        Item { Layout.fillWidth: true }
-        Label {
-            visible: section.consumerFilter !== ""
-            Layout.maximumWidth: 320
-            elide: Text.ElideRight
-            color: root.textColor
-            text: root.tr("rules.suggestions.inbox.filter-active", "Showing only what {name} needs")
-                .replace("{name}", section.consumerFilter)
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            visible: section.consumerFilter !== ""
-            text: root.tr("rules.suggestions.inbox.filter-clear", "Show everything")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: section.consumerFilter = ""
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.tr("rules.suggestions.inbox.action-forget-all", "Clear all")
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr("rules.suggestions.inbox.action-forget-all-tooltip",
-                "Removes every accumulated suggestion, answer and all, so addresses are offered again if they turn up next to your sites.")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            Accessible.description: ToolTip.text
-            onClicked: clearAllSuggestionsConfirm.open()
+        Flow {
+            id: toolbarFlow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Row {
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.tr("rules.suggestions.inbox.sort", "Sort")
+                    color: root.mutedTextColor
+                }
+                ThemedComboBox {
+                    id: sortCombo
+                    theme: root.uiTheme
+                    width: 220
+                    model: ["main-route", "newest", "consumers", "name"]
+                    labelResolver: function(item) { return section._sortLabel(String(item)) }
+                    displayText: root.uiRevision >= 0 ? section._sortLabel(section.sortMode) : ""
+                    currentIndex: model.indexOf(section.sortMode)
+                    onActivated: section.sortMode = String(model[currentIndex])
+                    Accessible.role: Accessible.ComboBox
+                    Accessible.name: root.tr("rules.suggestions.inbox.sort", "Sort")
+                }
+            }
+
+            Row {
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.tr("action.search", "Search")
+                    color: root.mutedTextColor
+                }
+                ThemedTextField {
+                    id: suggestionsSearchField
+                    theme: root.uiTheme
+                    width: 220
+                    placeholderText: root.uiRevision >= 0
+                        ? root.tr("rules.suggestions.inbox.search-placeholder",
+                            "Search by domain, host, or site")
+                        : ""
+                    text: section.searchQuery
+                    onTextChanged: section.searchQuery = text
+                    Accessible.role: Accessible.EditableText
+                    Accessible.name: root.tr("action.search", "Search")
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    visible: section.searchQuery !== ""
+                    text: root.tr("action.clear", "Clear")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: { section.searchQuery = ""; suggestionsSearchField.text = "" }
+                }
+            }
+
+            Row {
+                spacing: root.uiTheme.spacingSm
+                CheckBox {
+                    id: selectAllVisibleCheckBox
+                    anchors.verticalCenter: parent.verticalCenter
+                    tristate: true
+                    checkState: section.visibleCheckedState === 1
+                        ? Qt.Checked
+                        : (section.visibleCheckedState === 2 ? Qt.PartiallyChecked : Qt.Unchecked)
+                    onClicked: section._toggleSelectAllVisible()
+                    Accessible.role: Accessible.CheckBox
+                    Accessible.name: root.tr("rules.suggestions.inbox.select-all", "Select all")
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 400
+                    ToolTip.text: root.tr("rules.suggestions.inbox.select-all-tooltip",
+                        "Select or clear every address currently shown.")
+                }
+                Label {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.tr("rules.suggestions.inbox.select-all", "Select all")
+                    color: root.textColor
+                }
+            }
+
+            Label {
+                visible: section.consumerFilter !== ""
+                height: sortCombo.height
+                verticalAlignment: Text.AlignVCenter
+                // elide needs a width, and the site name is arbitrary length.
+                width: Math.min(implicitWidth, 320)
+                elide: Text.ElideRight
+                color: root.textColor
+                text: root.tr("rules.suggestions.inbox.filter-active", "Showing only what {name} needs")
+                    .replace("{name}", section.consumerFilter)
+            }
+            CheckBox {
+                visible: section.consumerFilter !== ""
+                checked: section._isRefusingAnchor(section.consumerFilter)
+                text: root.tr("rules.suggestions.inbox.mark-refusing",
+                    "This site refuses addresses on the main connection")
+                onClicked: section._toggleRefusingAnchor(section.consumerFilter)
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.mark-refusing-tooltip",
+                    "Use this when the site opens over the main connection but answers that your address is not served. Its addresses then keep being offered even though they are reachable.")
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: ToolTip.text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                visible: section.consumerFilter !== ""
+                text: root.tr("rules.suggestions.inbox.filter-clear", "Show everything")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: section.consumerFilter = ""
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: section.probeBusy
+                    ? root.tr("rules.suggestions.inbox.action-check-main-route-busy", "Checking...")
+                    : root.tr("rules.suggestions.inbox.action-check-main-route", "Check the main route")
+                enabled: !section.probeBusy && section.mergedGroups.length > 0
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.action-check-main-route-tooltip",
+                    "Tries to reach these addresses over the main connection and marks what it finds. Answering there does not mean the site works there — it only means the address is reachable.")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: ToolTip.text
+                onClicked: section._probeMainRoute()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("rules.suggestions.inbox.action-forget-all", "Clear all")
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.action-forget-all-tooltip",
+                    "Removes every accumulated suggestion, answer and all, so addresses are offered again if they turn up next to your sites.")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: ToolTip.text
+                onClicked: clearAllSuggestionsConfirm.open()
+            }
         }
     }
 
@@ -731,59 +959,70 @@ ColumnLayout {
         }
     }
 
-    RowLayout {
+    // Bulk actions. Same reason as the toolbar above: five buttons in one row
+    // demanded more width than the window had.
+    Item {
         Layout.fillWidth: true
+        Layout.preferredHeight: bulkActionsFlow.height
         visible: section.checkedDomains.length > 0
-        spacing: root.uiTheme.spacingSm
 
-        Label {
-            color: root.mutedTextColor
-            text: root.tr("rules.suggestions.inbox.selected", "{count} selected")
-                .replace("{count}", String(section.checkedDomains.length))
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.tr("rules.suggestions.inbox.action-never", "Don't suggest again")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: section._dismissIds(section._checkedPendingIds())
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            highlighted: true
-            text: root.tr("rules.suggestions.inbox.action-add", "Add to the additional route")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: section._acceptIds(section._checkedPendingIds())
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.tr("rules.suggestions.rejected.restore", "Allow again")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: section._restoreIds(section._checkedDismissedIds())
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.tr("rules.suggestions.inbox.action-forget", "Delete")
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr("rules.suggestions.inbox.action-forget-tooltip",
-                "Removes the record entirely, answer and all, so the address is offered again if it turns up next to your sites.")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            Accessible.description: ToolTip.text
-            onClicked: {
-                section._forgetIds(section._checkedAllIds())
-                section._clearCheckedSelection()
+        Flow {
+            id: bulkActionsFlow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Label {
+                height: addSelectedButton.height
+                verticalAlignment: Text.AlignVCenter
+                color: root.mutedTextColor
+                text: root.tr("rules.suggestions.inbox.selected", "{count} selected")
+                    .replace("{count}", String(section.checkedDomains.length))
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("rules.suggestions.inbox.action-never", "Don't suggest again")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: section._dismissIds(section._checkedPendingIds())
+            }
+            ThemedButton {
+                id: addSelectedButton
+                theme: root.uiTheme
+                highlighted: true
+                text: root.tr("rules.suggestions.inbox.action-add", "Add to the additional route")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: section._acceptIds(section._checkedPendingIds())
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("rules.suggestions.rejected.restore", "Allow again")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: section._restoreIds(section._checkedDismissedIds())
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("rules.suggestions.inbox.action-forget", "Delete")
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.action-forget-tooltip",
+                    "Removes the record entirely, answer and all, so the address is offered again if it turns up next to your sites.")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: ToolTip.text
+                onClicked: {
+                    section._forgetIds(section._checkedAllIds())
+                    section._clearCheckedSelection()
+                }
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("rules.bulk.clear-selection", "Clear (Esc)")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: section._clearCheckedSelection()
             }
         }
-        ThemedButton {
-            theme: root.uiTheme
-            text: root.tr("rules.bulk.clear-selection", "Clear (Esc)")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            onClicked: section._clearCheckedSelection()
-        }
-        Item { Layout.fillWidth: true }
     }
 }

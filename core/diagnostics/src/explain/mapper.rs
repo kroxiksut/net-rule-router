@@ -271,7 +271,7 @@ fn uncertainty_to_key(marker: &UncertaintyMarker) -> &'static str {
         UncertaintyMarker::AmbiguousLookup => UNCERTAINTY_AMBIGUOUS_LOOKUP,
         UncertaintyMarker::StaleAvailabilitySnapshot => UNCERTAINTY_STALE_AVAILABILITY,
         UncertaintyMarker::UnknownSecondaryState => UNCERTAINTY_UNKNOWN_SECONDARY,
-        UncertaintyMarker::Ipv6DestinationProOnly => UNCERTAINTY_IPV6_PRO_ONLY,
+        UncertaintyMarker::Ipv6DestinationUnsupported => UNCERTAINTY_IPV6_UNSUPPORTED,
     }
 }
 

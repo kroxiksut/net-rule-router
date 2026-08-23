@@ -1,5 +1,5 @@
 //! Connection-egress observation port (Free diagnostic; the foundation for
-//! per-process routing, whose strict *enforcement* is the Pro experiment).
+//! per-process routing, whose strict *enforcement* is out of scope).
 //!
 //! Where [`crate::dns_observe`] watches DNS *resolutions* (hostname → IP), this
 //! port watches actual outbound *connections*: which process connected to which

@@ -109,6 +109,18 @@ if ! command -v cargo-fmt >/dev/null 2>&1; then
   echo "cargo-fmt is not installed. Install it with \`rustup component add rustfmt\`." >&2
   exit 1
 fi
+# The Qt host is built by `nrr-qt-host`'s build script through CMake. On a
+# machine without Qt — a CI runner, or the WSL environment the Linux port is
+# developed in — that script aborts and takes the whole gate with it, including
+# the crates that have nothing to do with the GUI. Skipping it there is what
+# makes this script runnable on Linux at all; the switch is the one the build
+# script already honours. Announced, never silent: a gate that quietly covers
+# less than it claims is worse than one that refuses to run.
+if [ -z "${NRR_SKIP_QT_HOST:-}" ] && ! command -v cmake >/dev/null 2>&1; then
+  yellow "[check] cmake not found — setting NRR_SKIP_QT_HOST=1; the Qt host is NOT built or checked by this run."
+  export NRR_SKIP_QT_HOST=1
+fi
+
 cyan "[check] format: cargo-fmt --all -- --check"
 cargo-fmt --all -- --check
 

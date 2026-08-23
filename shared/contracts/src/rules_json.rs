@@ -348,6 +348,105 @@ pub fn exceeds_free_rule_cap(rules_json: &str) -> bool {
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
+// ── Comparison folding ──────────────────────────────────────────────────────
+
+/// Fold a rules-json DTO into the form a COMPARISON should see, then hash or
+/// diff that instead of the raw payload.
+///
+/// [`to_canonical_string`] answers "were these two payloads written the same
+/// way"; comparing rule sets needs "do they describe the same routing". The two
+/// differ because the service normalises on validation — application names are
+/// lower-cased, hostnames lose their trailing dot, a suffix loses its `*.` —
+/// while a set typed in the window or read back from a `.txt` keeps whatever
+/// the user wrote. A rule spelled `Cloud.exe` therefore hashed differently from
+/// the identical `cloud.exe` the service had applied, and the amber
+/// "the app and the service disagree" banner could never be cleared: the diff
+/// the service computed alongside it was empty, because by then both sides were
+/// folded.
+///
+/// Identity that carries no routing (`id`, `comment`) is dropped, and both
+/// buckets are ordered, so the result depends on the rules alone and not on the
+/// order they arrived in.
+pub fn fold_for_comparison(dto: &mut CanonicalRulesJsonV1) {
+    for rule in dto.primary.iter_mut().chain(dto.secondary.iter_mut()) {
+        fold_rule(rule);
+    }
+    dto.primary.sort_by_key(comparison_key);
+    dto.secondary.sort_by_key(comparison_key);
+}
+
+fn fold_rule(rule: &mut RuleDto) {
+    rule.id.clear();
+    rule.comment.clear();
+    if let Some(address) = rule.address_match.as_mut() {
+        match address {
+            AddressMatchDto::ExactFqdn { value } => *value = fold_host(value),
+            AddressMatchDto::SuffixDomain { suffix } => *suffix = fold_suffix(suffix),
+            AddressMatchDto::Zone { name } => *name = fold_suffix(name),
+            // An address has one spelling already: the validator rejects
+            // leading zeros rather than folding them, so trimming is all a
+            // comparison may do without inventing a difference of its own.
+            AddressMatchDto::ExactIpv4 { address } => *address = address.trim().to_string(),
+        }
+    }
+    if let Some(app) = rule.app_match.as_mut() {
+        match &mut app.pattern {
+            AppPatternDto::Exact { value } => {
+                *value = crate::app_identity::canonical_exact_process_name(value).0
+            }
+            AppPatternDto::Glob { value } => {
+                *value = crate::app_identity::canonical_glob_process_pattern(value)
+            }
+        }
+    }
+}
+
+/// Case and trailing-dot folding for a hostname. IDN encoding is NOT done here
+/// — the producers punycode before they get this far, and pulling an IDNA
+/// implementation into the contracts crate to re-do it would be a second
+/// spelling of a decision made upstream.
+fn fold_host(raw: &str) -> String {
+    raw.trim().trim_end_matches('.').to_lowercase()
+}
+
+/// [`fold_host`] plus the `*.` / leading-dot spellings of a suffix or zone.
+fn fold_suffix(raw: &str) -> String {
+    let host = fold_host(raw);
+    let stripped = host.strip_prefix("*.").unwrap_or(&host);
+    stripped.strip_prefix('.').unwrap_or(stripped).to_string()
+}
+
+/// Order key for a folded rule: the routing it describes, nothing else. NUL
+/// separates the parts because an application pattern may contain spaces.
+fn comparison_key(rule: &RuleDto) -> String {
+    let (kind, value) = match (&rule.address_match, &rule.app_match) {
+        (Some(AddressMatchDto::ExactFqdn { value }), _) => ("exact-fqdn", value.as_str()),
+        (Some(AddressMatchDto::SuffixDomain { suffix }), _) => ("suffix-domain", suffix.as_str()),
+        (Some(AddressMatchDto::Zone { name }), _) => ("zone", name.as_str()),
+        (Some(AddressMatchDto::ExactIpv4 { address }), _) => ("exact-ipv4", address.as_str()),
+        (None, Some(app)) => match &app.pattern {
+            AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
+            AppPatternDto::Glob { value } => ("app:glob", value.as_str()),
+        },
+        (None, None) => ("", ""),
+    };
+    let app_suffix = match (&rule.address_match, &rule.app_match) {
+        (Some(_), Some(app)) => match &app.pattern {
+            AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => value.as_str(),
+        },
+        _ => "",
+    };
+    format!(
+        "{kind}\0{value}\0{app_suffix}\0{}\0{}",
+        u8::from(rule.enabled),
+        if rule.action.is_route() {
+            "route"
+        } else {
+            "block"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +480,89 @@ mod tests {
             action: crate::rules_json::RuleAction::Route,
             origin: None,
         }
+    }
+
+    /// A rule set typed by the user and the same set after the service
+    /// validated it must fold to the same bytes — this is what the drift
+    /// comparison hashes.
+    #[test]
+    fn spelling_does_not_survive_folding() {
+        let mut typed = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                sample_app_rule("r-001", r"C:\Program Files\Cloud\Cloud.exe", false),
+                sample_exact_fqdn("r-002", "API.Example.COM."),
+            ],
+            secondary: vec![],
+        };
+        let mut validated = CanonicalRulesJsonV1 {
+            schema_version: RULES_JSON_SCHEMA_VERSION,
+            primary: vec![
+                sample_exact_fqdn("r-777", "api.example.com"),
+                sample_app_rule("r-999", "cloud.exe", false),
+            ],
+            secondary: vec![],
+        };
+        fold_for_comparison(&mut typed);
+        fold_for_comparison(&mut validated);
+        assert_eq!(
+            to_canonical_string(&typed).expect("typed"),
+            to_canonical_string(&validated).expect("validated")
+        );
+    }
+
+    #[test]
+    fn glob_case_and_suffix_spellings_fold_together() {
+        let fold_one = |rule: RuleDto| {
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: vec![rule],
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        let glob = |value: &str| RuleDto {
+            id: "r-001".into(),
+            enabled: true,
+            address_match: None,
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Glob {
+                    value: value.into(),
+                },
+                include_child_processes: false,
+            }),
+            comment: String::new(),
+            action: crate::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        assert_eq!(fold_one(glob("DiskO*.exe")), fold_one(glob("disko*.exe")));
+
+        let zone = |name: &str| RuleDto {
+            id: "r-002".into(),
+            enabled: true,
+            address_match: Some(AddressMatchDto::Zone { name: name.into() }),
+            app_match: None,
+            comment: String::new(),
+            action: crate::rules_json::RuleAction::Route,
+            origin: None,
+        };
+        assert_eq!(fold_one(zone("*.RU")), fold_one(zone("ru")));
+    }
+
+    /// Folding must not make two different rules look alike.
+    #[test]
+    fn folding_keeps_genuinely_different_rules_apart() {
+        let fold_one = |value: &str| {
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: vec![sample_exact_fqdn("r-001", value)],
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        assert_ne!(fold_one("api.example.com"), fold_one("api.example.org"));
     }
 
     #[test]

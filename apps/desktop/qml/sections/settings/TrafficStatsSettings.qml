@@ -31,11 +31,32 @@ GroupBox {
     readonly property bool panelVisible: categoryActive && root.section === "settings"
     // Selected period, derived from the persisted UI preference so it survives
     // restarts. Writing goes through `_setPeriod` (updatePrefs + emitPrefs).
-    readonly property string period:
-        (root.uiRevision >= 0 && root.prefs.trafficStatsPeriod === "session") ? "session" : "today"
+    readonly property string period: root.uiRevision >= 0
+        ? ((root.prefs.trafficStatsPeriod === "session"
+            || root.prefs.trafficStatsPeriod === "all-time")
+            ? String(root.prefs.trafficStatsPeriod) : "today")
+        : "today"
 
-    readonly property var rows: (ctrl && period === "session") ? ctrl.sessionRows
-                              : (ctrl ? ctrl.todayRows : [])
+    /// The rows every figure on this panel is derived from. All three periods
+    /// carry the same per-adapter shape with a `role`, so one rendering serves
+    /// whichever is selected.
+    readonly property var rows: !ctrl ? []
+                              : (period === "session") ? ctrl.sessionRows
+                              : (period === "all-time") ? ctrl.allTimeRows
+                              : ctrl.todayRows
+
+    /// `rows` folded into one block per role — see `_buildGroups`.
+    readonly property var groups: root.uiRevision >= 0 ? group._buildGroups(rows) : []
+
+    /// The grand total earns its line only when more than one role carried
+    /// traffic; otherwise it just repeats the single headline above it.
+    readonly property bool showPeriodTotal: {
+        var withData = 0
+        for (var i = 0; i < groups.length; ++i) {
+            if (Number(groups[i].inBytes) + Number(groups[i].outBytes) > 0) withData += 1
+        }
+        return withData >= 2
+    }
 
     // Fast-poll gate: mirror `panelVisible` onto the controller so it raises
     // its cadence from 60 s to 3 s only while this panel is on screen, and
@@ -51,17 +72,7 @@ GroupBox {
     onPanelVisibleChanged: if (panelVisible && ctrl) ctrl.refresh()
     Component.onCompleted: if (ctrl) ctrl.refresh()
 
-    function sumRole(role, field) {
-        var total = 0
-        for (var i = 0; i < group.rows.length; ++i) {
-            var r = group.rows[i]
-            if (r && r["role"] === role) total += Number(r[field] || 0)
-        }
-        return total
-    }
-
-    // Sum a byte field across ALL roles of an arbitrary row array (used for
-    // the all-time grand-total line under the per-session view).
+    // Sum a byte field across every role of a row array.
     function sumAll(rowsArr, field) {
         var total = 0
         var a = rowsArr || []
@@ -79,12 +90,98 @@ GroupBox {
         return unit
     }
 
-    function roleLabel(role) {
-        if (role === "primary") return root.tr("settings.traffic.role-primary", "Primary")
-        if (role === "secondary") return root.tr("settings.traffic.role-secondary", "Additional")
+    // Folds the selected period's rows into one block per role, in a fixed
+    // order. Routed roles keep a zero line — "nothing went through the
+    // additional adapter" is itself an answer; the opt-in buckets are noise
+    // when empty. Adapters inside a role are ordered by volume.
+    function _buildGroups(src) {
+        var order = [ "secondary", "primary", "loopback", "virtual" ]
+        var byRole = {}
+        var a = src || []
+        // Nothing counted at all for the period: the "no data" line says it
+        // better than a card of zeroes.
+        if (a.length === 0) return []
+        for (var i = 0; i < a.length; ++i) {
+            var r = a[i]
+            if (!r) continue
+            var slug = String(r["role"] || "")
+            if (!byRole[slug]) byRole[slug] = []
+            byRole[slug].push(r)
+        }
+        var out = []
+        for (var k = 0; k < order.length; ++k) {
+            var role = order[k]
+            var list = (byRole[role] || []).slice()
+            if (list.length === 0 && role !== "primary" && role !== "secondary") continue
+            list.sort(function(x, y) {
+                return (Number(y["in-bytes"] || 0) + Number(y["out-bytes"] || 0))
+                     - (Number(x["in-bytes"] || 0) + Number(x["out-bytes"] || 0))
+            })
+            var inB = 0
+            var outB = 0
+            for (var j = 0; j < list.length; ++j) {
+                inB += Number(list[j]["in-bytes"] || 0)
+                outB += Number(list[j]["out-bytes"] || 0)
+            }
+            out.push({
+                role: role,
+                title: group._roleTitle(role, list),
+                adapters: list,
+                collapsed: list.length === 1,
+                inBytes: inB,
+                outBytes: outB
+            })
+        }
+        return out
+    }
+
+    // Role headline. The user's own route label is appended only when it adds
+    // something: a default label, or one identical to the single adapter named
+    // right below it, would repeat what is already on screen.
+    function _roleTitle(role, list) {
         if (role === "loopback") return root.tr("settings.traffic.role-loopback", "Local (localhost)")
         if (role === "virtual") return root.tr("settings.traffic.role-virtual", "Virtual (VM)")
-        return role
+        var base = role === "secondary"
+            ? root.tr("settings.traffic.through-secondary", "Through additional adapter")
+            : root.tr("settings.traffic.through-primary", "Through primary adapter")
+        var lbl = String((role === "secondary"
+            ? root.prefs.routeSecondaryLabel
+            : root.prefs.routePrimaryLabel) || "")
+        if (lbl === "" || lbl === root.defaultRouteLabel(role)) return base
+        if (list.length === 1 && group._sameName(lbl, group._adapterName(list[0]))) return base
+        return base + " (" + lbl + ")"
+    }
+
+    function _adapterName(row) {
+        if (!row) return ""
+        return String(row["display-name"] || row["adapter-key"] || "")
+    }
+
+    function _sameName(a, b) {
+        return String(a || "").trim().toLowerCase() === String(b || "").trim().toLowerCase()
+    }
+
+    // Whether the adapter of this row still holds the role it was counted
+    // under. Roles are reassignable, so a history period can list an adapter
+    // that has since been swapped out — showing it unmarked would read as a
+    // claim about the current setup.
+    function _holdsRoleNow(row) {
+        var role = String((row || {})["role"] || "")
+        if (role !== "primary" && role !== "secondary") return true
+        var assigned = String((role === "secondary"
+            ? root.prefs.selectedSecondaryInterfaceName
+            : root.prefs.selectedPrimaryInterfaceName) || "")
+        // Nothing assigned right now: no ground to call anything stale.
+        if (assigned === "") return true
+        return group._sameName(assigned, group._adapterName(row))
+            || group._sameName(assigned, String((row || {})["adapter-key"] || ""))
+    }
+
+    function _adapterCaption(row) {
+        if (!row) return ""
+        var name = group._adapterName(row)
+        if (group._holdsRoleNow(row)) return name
+        return name + "  ·  " + root.tr("settings.traffic.role-not-current", "not in this role now")
     }
 
     ColumnLayout {
@@ -183,6 +280,24 @@ GroupBox {
                     ? root.tr("settings.traffic.period-today-note",
                         "All traffic accounted by the service today, with or without the additional adapter") : ""
             }
+
+            ThemedRadioButton {
+                theme: root.uiTheme
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.traffic.period-all-time", "All time") : ""
+                checked: group.period === "all-time"
+                onToggled: if (checked) group._setPeriod("all-time")
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.leftMargin: root.uiTheme.spacingLg + root.uiTheme.spacingXs
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.uiRevision >= 0
+                    ? root.tr("settings.traffic.period-all-time-note",
+                        "Everything counted since the service was installed, split the same way") : ""
+            }
         }
 
         // Session status hint: shown only for the "session" period. When no
@@ -204,9 +319,22 @@ GroupBox {
                 : ""
         }
 
-        // Headline: through additional vs through primary.
+        // No data at all for the selected period.
+        Label {
+            visible: group.groups.length === 0
+            Layout.fillWidth: true
+            color: root.mutedTextColor
+            text: root.tr("settings.traffic.no-data", "No data yet — counting starts once traffic flows.")
+        }
+
+        // One block per role: the headline carries the role's sum, and the
+        // adapters that produced it sit under it. Roles are reassignable, so
+        // "today" / "all time" legitimately hold several adapters per role — a
+        // role with exactly one collapses to a caption instead of repeating the
+        // same figures twice.
         Frame {
             Layout.fillWidth: true
+            visible: group.groups.length > 0
             padding: root.uiTheme.spacingSm
             background: CardSurface {
                 theme: root.uiTheme
@@ -214,64 +342,150 @@ GroupBox {
             }
             ColumnLayout {
                 anchors.fill: parent
-                spacing: root.uiTheme.spacingXs
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingMd
-                    Label {
+                spacing: root.uiTheme.spacingSm
+
+                Repeater {
+                    model: group.groups
+                    delegate: ColumnLayout {
+                        id: roleBlock
+                        property var g: modelData
                         Layout.fillWidth: true
-                        color: root.textColor
-                        font.bold: true
-                        elide: Text.ElideRight
-                        text: (root.uiRevision >= 0 ? group._secondaryTitle() : "") + ":"
+                        spacing: 2
+
+                        RowLayout {
+                            Layout.fillWidth: true
+                            spacing: root.uiTheme.spacingMd
+                            Label {
+                                Layout.fillWidth: true
+                                color: root.textColor
+                                font.bold: true
+                                elide: Text.ElideRight
+                                text: (root.uiRevision >= 0 ? roleBlock.g.title : "") + ":"
+                            }
+                            TrafficFigure {
+                                theme: root.uiTheme
+                                textColor: root.textColor
+                                iconSource: root.uiIconSource("traffic-in")
+                                label: root.tr("settings.traffic.received", "Received")
+                                value: Pure.formatStorageBytes(roleBlock.g.inBytes)
+                            }
+                            TrafficFigure {
+                                theme: root.uiTheme
+                                textColor: root.textColor
+                                iconSource: root.uiIconSource("traffic-out")
+                                label: root.tr("settings.traffic.sent", "Sent")
+                                value: Pure.formatStorageBytes(roleBlock.g.outBytes)
+                            }
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.leftMargin: root.uiTheme.spacingSm
+                            visible: roleBlock.g.collapsed
+                            color: root.mutedTextColor
+                            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                            elide: Text.ElideRight
+                            text: (root.uiRevision >= 0 && roleBlock.g.collapsed)
+                                ? group._adapterCaption(roleBlock.g.adapters[0]) : ""
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            Layout.leftMargin: root.uiTheme.spacingSm
+                            visible: roleBlock.g.collapsed
+                                && group._addressLine(roleBlock.g.adapters[0]) !== ""
+                            color: root.mutedTextColor
+                            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                            elide: Text.ElideRight
+                            text: roleBlock.g.collapsed
+                                ? group._addressLine(roleBlock.g.adapters[0]) : ""
+                        }
+
+                        Repeater {
+                            model: roleBlock.g.collapsed ? [] : roleBlock.g.adapters
+                            delegate: ColumnLayout {
+                                id: adapterRow
+                                property var a: modelData
+                                Layout.fillWidth: true
+                                Layout.leftMargin: root.uiTheme.spacingSm
+                                spacing: 0
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: root.uiTheme.spacingSm
+                                    Label {
+                                        Layout.fillWidth: true
+                                        color: root.textColor
+                                        elide: Text.ElideRight
+                                        text: root.uiRevision >= 0
+                                            ? group._adapterCaption(adapterRow.a) : ""
+                                    }
+                                    TrafficFigure {
+                                        theme: root.uiTheme
+                                        textColor: root.mutedTextColor
+                                        iconSource: root.uiIconSource("traffic-in")
+                                        label: root.tr("settings.traffic.received", "Received")
+                                        value: Pure.formatStorageBytes(Number(adapterRow.a["in-bytes"] || 0))
+                                    }
+                                    TrafficFigure {
+                                        theme: root.uiTheme
+                                        textColor: root.mutedTextColor
+                                        iconSource: root.uiIconSource("traffic-out")
+                                        label: root.tr("settings.traffic.sent", "Sent")
+                                        value: Pure.formatStorageBytes(Number(adapterRow.a["out-bytes"] || 0))
+                                    }
+                                }
+                                // Last observed local/external address for this
+                                // adapter, from a user-requested probe. Absent
+                                // until the user has probed at least once.
+                                Label {
+                                    Layout.fillWidth: true
+                                    visible: group._addressLine(adapterRow.a) !== ""
+                                    color: root.mutedTextColor
+                                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                                    elide: Text.ElideRight
+                                    text: group._addressLine(adapterRow.a)
+                                }
+                            }
+                        }
                     }
-                    TrafficFigure {
-                        theme: root.uiTheme
-                        textColor: root.textColor
-                        iconSource: root.uiIconSource("traffic-in")
-                        label: root.tr("settings.traffic.received", "Received")
-                        value: Pure.formatStorageBytes(group.sumRole("secondary", "in-bytes"))
-                    }
-                    TrafficFigure {
-                        theme: root.uiTheme
-                        textColor: root.textColor
-                        iconSource: root.uiIconSource("traffic-out")
-                        label: root.tr("settings.traffic.sent", "Sent")
-                        value: Pure.formatStorageBytes(group.sumRole("secondary", "out-bytes"))
-                    }
+                }
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 1
+                    visible: group.showPeriodTotal
+                    color: root.uiTheme.colorBorder
                 }
                 RowLayout {
                     Layout.fillWidth: true
+                    visible: group.showPeriodTotal
                     spacing: root.uiTheme.spacingMd
                     Label {
                         Layout.fillWidth: true
                         color: root.textColor
-                        font.bold: true
                         elide: Text.ElideRight
-                        text: root.tr("settings.traffic.through-primary", "Through primary adapter") + ":"
+                        text: root.tr("settings.traffic.total-period", "Total for the period")
                     }
                     TrafficFigure {
                         theme: root.uiTheme
                         textColor: root.textColor
                         iconSource: root.uiIconSource("traffic-in")
                         label: root.tr("settings.traffic.received", "Received")
-                        value: Pure.formatStorageBytes(group.sumRole("primary", "in-bytes"))
+                        value: Pure.formatStorageBytes(group.sumAll(group.rows, "in-bytes"))
                     }
                     TrafficFigure {
                         theme: root.uiTheme
                         textColor: root.textColor
                         iconSource: root.uiIconSource("traffic-out")
                         label: root.tr("settings.traffic.sent", "Sent")
-                        value: Pure.formatStorageBytes(group.sumRole("primary", "out-bytes"))
+                        value: Pure.formatStorageBytes(group.sumAll(group.rows, "out-bytes"))
                     }
                 }
             }
         }
 
         // Tunnel-overlap honesty note: while a VPN session is active, the
-        // primary row above already excludes traffic that transited into the
-        // tunnel (block T Feature 1) — say so, so the numbers are not
-        // mistaken for double-counted.
+        // primary figures already exclude traffic that transited into the
+        // tunnel — say so, so they are not mistaken for double-counted.
         Label {
             Layout.fillWidth: true
             visible: group.ctrl && group.ctrl.sessionActive
@@ -280,112 +494,6 @@ GroupBox {
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.traffic.tunnel-overlap-note",
                 "While a VPN session is active, the primary row excludes traffic that transited into the tunnel.")
-        }
-
-        // Per-adapter rows.
-        Label {
-            visible: group.rows.length === 0
-            Layout.fillWidth: true
-            color: root.mutedTextColor
-            text: root.tr("settings.traffic.no-data", "No data yet — counting starts once traffic flows.")
-        }
-        Repeater {
-            model: group.rows
-            delegate: ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 2
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingSm
-                    Label {
-                        Layout.fillWidth: true
-                        color: root.textColor
-                        elide: Text.ElideRight
-                        text: (modelData["display-name"] || modelData["adapter-key"] || "")
-                            + "  ·  " + group.roleLabel(modelData["role"])
-                    }
-                    TrafficFigure {
-                        theme: root.uiTheme
-                        textColor: root.mutedTextColor
-                        iconSource: root.uiIconSource("traffic-in")
-                        label: root.tr("settings.traffic.received", "Received")
-                        value: Pure.formatStorageBytes(Number(modelData["in-bytes"] || 0))
-                    }
-                    TrafficFigure {
-                        theme: root.uiTheme
-                        textColor: root.mutedTextColor
-                        iconSource: root.uiIconSource("traffic-out")
-                        label: root.tr("settings.traffic.sent", "Sent")
-                        value: Pure.formatStorageBytes(Number(modelData["out-bytes"] || 0))
-                    }
-                }
-                // Last observed local/external address for this adapter (from
-                // a user-requested "Refresh interfaces" probe — block T
-                // Feature 2). Absent until the user has probed at least once.
-                Label {
-                    Layout.fillWidth: true
-                    visible: !!(modelData["local-ip"] || modelData["external-ip"])
-                    color: root.mutedTextColor
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                    elide: Text.ElideRight
-                    text: group._addressLine(modelData)
-                }
-            }
-        }
-
-        // Session total: the current additional-adapter session summed across
-        // every role. Session figures reset when a new session begins.
-        RowLayout {
-            visible: group.period === "session"
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingSm
-            Label {
-                Layout.fillWidth: true
-                color: root.textColor
-                text: root.tr("settings.traffic.total-session", "Session total")
-            }
-            TrafficFigure {
-                theme: root.uiTheme
-                textColor: root.mutedTextColor
-                iconSource: root.uiIconSource("traffic-in")
-                label: root.tr("settings.traffic.received", "Received")
-                value: Pure.formatStorageBytes(group.sumAll(group.ctrl ? group.ctrl.sessionRows : [], "in-bytes"))
-            }
-            TrafficFigure {
-                theme: root.uiTheme
-                textColor: root.mutedTextColor
-                iconSource: root.uiIconSource("traffic-out")
-                label: root.tr("settings.traffic.sent", "Sent")
-                value: Pure.formatStorageBytes(group.sumAll(group.ctrl ? group.ctrl.sessionRows : [], "out-bytes"))
-            }
-        }
-
-        // All-time grand total: session numbers reset with every
-        // additional-adapter session, so the persisted cumulative sum gives
-        // them context. Bounded by the retention window configured below.
-        RowLayout {
-            visible: group.period === "session"
-            Layout.fillWidth: true
-            spacing: root.uiTheme.spacingSm
-            Label {
-                Layout.fillWidth: true
-                color: root.textColor
-                text: root.tr("settings.traffic.total-all-time", "Total (all time)")
-            }
-            TrafficFigure {
-                theme: root.uiTheme
-                textColor: root.mutedTextColor
-                iconSource: root.uiIconSource("traffic-in")
-                label: root.tr("settings.traffic.received", "Received")
-                value: Pure.formatStorageBytes(group.sumAll(group.ctrl ? group.ctrl.allTimeRows : [], "in-bytes"))
-            }
-            TrafficFigure {
-                theme: root.uiTheme
-                textColor: root.mutedTextColor
-                iconSource: root.uiIconSource("traffic-out")
-                label: root.tr("settings.traffic.sent", "Sent")
-                value: Pure.formatStorageBytes(group.sumAll(group.ctrl ? group.ctrl.allTimeRows : [], "out-bytes"))
-            }
         }
 
         Rectangle {
@@ -542,22 +650,11 @@ GroupBox {
         root.emitPrefs()
     }
 
-    // Headline title for the "through additional adapter" total, suffixed with
-    // the user's own secondary route name when they gave it a custom one
-    // (e.g. "Through additional adapter (VPN)"). Default/empty names are
-    // omitted to avoid a redundant "(Additional)".
-    function _secondaryTitle() {
-        var base = root.tr("settings.traffic.through-secondary", "Through additional adapter")
-        var lbl = String(root.prefs.routeSecondaryLabel || "")
-        if (lbl !== "" && lbl !== root.defaultRouteLabel("secondary"))
-            return base + " (" + lbl + ")"
-        return base
-    }
-
     // Compact "IP: ... · external: ... (observed at)" line for one adapter
-    // row (block T Feature 2). Either half is omitted when absent so a
-    // local-only or never-probed row never shows a stray separator.
+    // row. Either half is omitted when absent so a local-only or never-probed
+    // row never shows a stray separator.
     function _addressLine(row) {
+        if (!row) return ""
         var parts = []
         if (row["local-ip"]) {
             parts.push(root.tr("settings.traffic.address-local", "IP") + ": " + row["local-ip"])

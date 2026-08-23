@@ -1,6 +1,6 @@
 # NetRuleRouter preset — version 1
-# name: Corporate VPN — Full Pack (Pro)
-# description: Routes corporate traffic via VPN with Pro-only CIDR and port rules
+# name: Corporate VPN — Full Pack (extended)
+# description: Routes corporate traffic via VPN with extended CIDR and port rules
 # author: NetRuleRouter
 # preset_version: 1
 
@@ -24,9 +24,9 @@ outlook.exe                # corporate mail client
 # (reserved — not applied on Windows)
 
 --- CIDR
-10.0.0.0/8                 # internal network range (Pro only)
-192.168.0.0/16             # local RFC-1918 range (Pro only)
+10.0.0.0/8                 # internal network range (not applied)
+192.168.0.0/16             # local RFC-1918 range (not applied)
 
 --- Ports
-443                        # HTTPS (Pro only)
-80                         # HTTP (Pro only)
+443                        # HTTPS (not applied)
+80                         # HTTP (not applied)

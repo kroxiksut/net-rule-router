@@ -121,6 +121,7 @@ pub fn run_server_loop_for_test(
             client_profile,
             caller_is_elevated,
             caller_principal: None,
+            caller_pid: None,
         };
         let response = router.dispatch(request, ctx);
         if write_frame(&mut server_end, &response).is_err() {

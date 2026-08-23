@@ -66,7 +66,6 @@ use nrr_domain::RuleAction;
 use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
 use crate::per_sid_orchestrator::RulesProvider;
-use crate::supervised_runtime::ActiveRoutingSidFn;
 use crate::wfp_codegen::PER_HOSTNAME_IP_CAP;
 
 /// Persist one application's currently-known destinations, stamped with the
@@ -99,7 +98,10 @@ impl FlushSummary {
 pub struct AppDestinationMemory {
     observations: Arc<AppObservationStore>,
     rules: Arc<dyn RulesProvider>,
-    active_sid: ActiveRoutingSidFn,
+    /// Everyone whose rules are in force. A list, not one user: on a machine
+    /// with several logged in, persisting only the first one's destinations
+    /// means the others' application rules start every session cold.
+    present: crate::service_tasks::PresentPrincipalsFn,
     persist: AppDestinationPersistFn,
     load: AppDestinationLoadFn,
     /// How recently a destination must have been confirmed to be re-seeded.
@@ -112,14 +114,14 @@ impl AppDestinationMemory {
     pub fn new(
         observations: Arc<AppObservationStore>,
         rules: Arc<dyn RulesProvider>,
-        active_sid: ActiveRoutingSidFn,
+        present: crate::service_tasks::PresentPrincipalsFn,
         persist: AppDestinationPersistFn,
         load: AppDestinationLoadFn,
     ) -> Self {
         Self {
             observations,
             rules,
-            active_sid,
+            present,
             persist,
             load,
             window: ENFORCEMENT_CONFIRMATION_WINDOW,
@@ -165,13 +167,30 @@ impl AppDestinationMemory {
     /// one snapshot read and returns.
     pub fn flush(&self, now: SystemTime) -> FlushSummary {
         let mut summary = FlushSummary::default();
-        let Some(sid) = (self.active_sid)() else {
-            return summary;
-        };
-        let Some(snapshot) = self.rules.active_rules_for(&sid) else {
-            return summary;
-        };
+        let mut written: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sid in (self.present)() {
+            let Some(snapshot) = self.rules.active_rules_for(&sid) else {
+                continue;
+            };
+            self.flush_for(&snapshot, now, &mut written, &mut summary);
+        }
+        summary
+    }
+
+    /// Write back one principal's routed applications. `written` spans the whole
+    /// pass: two users routing the same application share its destinations, and
+    /// persisting them twice would double the reported counts.
+    fn flush_for(
+        &self,
+        snapshot: &crate::per_sid_orchestrator::ActiveRulesSnapshot,
+        now: SystemTime,
+        written: &mut std::collections::HashSet<String>,
+        summary: &mut FlushSummary,
+    ) {
         for pattern in routed_app_patterns(&snapshot.rule_book.secondary) {
+            if !written.insert(pattern.clone()) {
+                continue;
+            }
             // The same slice the codegen enforces: sorted, capped identically,
             // so nothing is persisted that could not become a route anyway.
             let ips = self.observations.ips_for_app(&pattern);
@@ -183,7 +202,6 @@ impl AppDestinationMemory {
             summary.apps = summary.apps.saturating_add(1);
             summary.destinations = summary.destinations.saturating_add(ips.len() as u32);
         }
-        summary
     }
 }
 
@@ -194,7 +212,7 @@ impl AppDestinationMemory {
 /// table can scope a route to a process, so `generate_secondary_routes` emits
 /// nothing for it — remembering its destinations would be dead weight. Deduped
 /// and ordered so a flush pass is deterministic.
-fn routed_app_patterns(set: &CanonicalRuleSet) -> BTreeSet<String> {
+pub fn routed_app_patterns(set: &CanonicalRuleSet) -> BTreeSet<String> {
     set.rules()
         .iter()
         .filter(|r| r.enabled && matches!(r.action, RuleAction::Route))
@@ -303,7 +321,7 @@ mod tests {
         AppDestinationMemory::new(
             Arc::clone(store),
             Arc::new(FixedRules { book: rules }) as Arc<dyn RulesProvider>,
-            Arc::new(|| Some("S-A".to_string())),
+            Arc::new(|| vec!["S-A".to_string()]),
             FakeTable::persist_fn(table),
             FakeTable::load_fn(table),
         )
@@ -326,6 +344,8 @@ mod tests {
             &MockFqdnCacheLookup::new(),
             store,
             &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
         );
         out.routes.into_iter().map(|r| r.destination).collect()
     }
@@ -371,6 +391,8 @@ mod tests {
             &MockFqdnCacheLookup::new(),
             &store,
             &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
         );
         assert!(out.routes.is_empty());
         assert_eq!(
@@ -505,7 +527,7 @@ mod tests {
             Arc::new(FixedRules {
                 book: book(vec![app_rule("r1", "telegram.exe")]),
             }) as Arc<dyn RulesProvider>,
-            Arc::new(|| None),
+            Arc::new(Vec::new),
             FakeTable::persist_fn(&table),
             FakeTable::load_fn(&table),
         );

@@ -211,6 +211,10 @@ struct ControllerInner {
     /// failing start backs off instead of busy-spinning (see
     /// [`RESOLVER_RESTART_BACKOFF_TICKS`]).
     restart_cooldown: u32,
+    /// Whether an upstream was reachable the last time the caller reported it.
+    /// Only the false→true edge clears the backoff — see
+    /// [`DnsResolverController::note_upstream_present`].
+    upstream_present: bool,
 }
 
 impl DnsResolverController {
@@ -296,6 +300,25 @@ impl DnsResolverController {
         inner.desired = true;
         inner.restart_cooldown = 0;
         Self::start_locked(&mut inner);
+    }
+
+    /// Report whether an upstream DNS server is reachable right now.
+    ///
+    /// A cold boot arms Mode B before the router has finished coming up, so the
+    /// first attempts fail with "no upstream" and the watchdog then waits out
+    /// its full backoff — on a power-cut restart that left name resolution down
+    /// for over two minutes after the link was already back. The upstream
+    /// appearing is the event that arm was waiting for, so clear the backoff on
+    /// that edge and let the next tick retry at once. Only the edge counts: a
+    /// steady "yes" must not defeat the backoff that protects against a
+    /// genuinely failing start (`:53` already taken).
+    pub fn note_upstream_present(&self, present: bool) {
+        let mut inner = self.lock();
+        let appeared = present && !inner.upstream_present;
+        inner.upstream_present = present;
+        if appeared {
+            inner.restart_cooldown = 0;
+        }
     }
 
     /// Watchdog tick — call periodically (e.g. from the reconcile safety tick).

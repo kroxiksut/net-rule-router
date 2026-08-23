@@ -179,7 +179,7 @@ impl FreshnessStateDb {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressFamily {
     Ipv4,
-    /// Pro-only extension point.  Present in schema but excluded from matching.
+    /// unsupported extension point.  Present in schema but excluded from matching.
     Ipv6,
 }
 
@@ -1293,7 +1293,7 @@ pub const STATE_DB_V29_DDL: &[&str] = &[
 /// - the connection-observation endpoint learner — configured basenames
 ///   extend the built-in `DEFAULT_VPN_EXEMPT_PATTERNS` name globs.
 ///
-/// Keyed `(sid, role, exe_path)`: per-binding by construction, so the Pro
+/// Keyed `(sid, role, exe_path)`: per-binding by construction, so a
 /// multi-adapter model extends it without a reshape (`role` grows beyond
 /// 'primary'/'secondary' with the binding model). `source` distinguishes a
 /// user-confirmed pick from an auto-discovery suggestion (reserved).
@@ -1701,6 +1701,84 @@ pub const STATE_DB_V52_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS auto_rule_ev
     snapshot_json TEXT    NOT NULL,
     updated_at    INTEGER NOT NULL
 )"];
+
+/// Per-principal decisions about LOCAL networks under the kill-switch —
+/// `local_network_rules`.
+///
+/// Holds only what DIFFERS from the automatic answer: a hypervisor segment the
+/// user does not want exempted (`allow = 0`), or a network we cannot discover
+/// at all and the user named themselves (`allow = 1`, `origin = 'manual'`). The
+/// discovered-and-accepted case stores nothing, so a machine whose virtual
+/// networks come and go does not accumulate rows.
+/// Purely additive CREATE. DEV schema; wiped freely.
+pub const STATE_DB_V53_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS local_network_rules (
+    sid        TEXT    NOT NULL,
+    cidr       TEXT    NOT NULL,
+    allow      INTEGER NOT NULL CHECK(allow IN (0, 1)),
+    origin     TEXT    NOT NULL CHECK(origin IN ('manual', 'discovered')),
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (sid, cidr)
+)"];
+
+/// Main-link probing preferences on `secondary_block_policy` — v54.
+///
+/// `primary_probe_auto` is the opt-in that lets the service check on its own
+/// instead of only when the user presses Check; the three bounds are what one
+/// pass may cost. Stored per principal because both the permission and the
+/// appetite for waiting are personal. Defaults match
+/// `nrr_service_runtime::primary_path_probe::ProbeLimits::default`.
+pub const STATE_DB_V54_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_auto INTEGER NOT NULL DEFAULT 0 CHECK(primary_probe_auto IN (0, 1))",
+    "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_timeout_ms INTEGER NOT NULL DEFAULT 1500",
+    "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_max_targets INTEGER NOT NULL DEFAULT 8",
+    "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_repeat_secs INTEGER NOT NULL DEFAULT 300",
+];
+
+/// Sites the user says answer the MAIN link with a refusal — v55.
+///
+/// A connection that completes proves the packet arrives, not that the service
+/// serves us: ChatGPT answers a main-link address with "this address is not
+/// served". Nothing on this machine can tell those apart without reading the
+/// traffic, which we will not do — so the user says it, once, per site. The
+/// consequence is narrow: that site's companion addresses stop being quietened
+/// by "it answers on the main route".
+/// Purely additive CREATE. DEV schema; wiped freely.
+pub const STATE_DB_V55_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS refusing_anchors (
+    sid       TEXT    NOT NULL,
+    hostname  TEXT    NOT NULL,
+    marked_at INTEGER NOT NULL,
+    PRIMARY KEY (sid, hostname)
+)"];
+
+/// "Cut IPv6 while leak protection is on" — v56.
+///
+/// A rule names a HOST, and a host with an AAAA record has a second way out
+/// that the per-destination pins never covered: Free resolves and pins IPv4
+/// only, so the same site could travel the tunnel over v4 and the main link
+/// over v6. "Blocked by half" is worse than an honest "not supported", so the
+/// default is ON — and it is a per-principal switch because someone whose
+/// network genuinely needs v6 must be able to say so.
+pub const STATE_DB_V56_DDL: &[&str] = &["ALTER TABLE secondary_block_policy ADD COLUMN block_ipv6_when_protected INTEGER NOT NULL DEFAULT 1 CHECK(block_ipv6_when_protected IN (0, 1))"];
+
+/// Backlog of block notices raised with nobody listening — v57.
+///
+/// The push channel is live-only. A user who runs the service without a tray
+/// or a window was told nothing at all; these rows are what a surface shows
+/// when one finally comes up, and they leave as soon as it has.
+/// Purely additive CREATE. DEV schema; wiped freely.
+pub const STATE_DB_V57_DDL: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS block_notice_journal (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    sid         TEXT    NOT NULL,
+    raised_at   INTEGER NOT NULL,
+    destination TEXT    NOT NULL,
+    app         TEXT    NOT NULL,
+    reason      TEXT    NOT NULL,
+    attempts    INTEGER NOT NULL
+)",
+    "CREATE INDEX IF NOT EXISTS idx_block_notice_journal_sid
+     ON block_notice_journal(sid, id)",
+];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

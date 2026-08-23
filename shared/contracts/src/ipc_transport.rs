@@ -160,6 +160,16 @@ pub enum IpcOperationClass {
     UserScopedMutation,
 }
 
+/// Editing the policy every user falls back to. The one operation where a
+/// mistake reaches somebody who never asked for it.
+pub const ACTION_EDIT_BASELINE: &str = "netrulerouter.edit-baseline";
+/// Taking the machine's networking apart to get it back: dropping owned routes
+/// and filters wholesale.
+pub const ACTION_RECOVER_NETWORK: &str = "netrulerouter.recover-network";
+/// Turning protection off on purpose. Named apart from recovery because an
+/// administrator may well allow one and not the other.
+pub const ACTION_DISABLE_PROTECTION: &str = "netrulerouter.disable-protection";
+
 impl IpcOperationClass {
     /// Whether this class flows through the single-writer mutation queue.
     /// `false` for read-only and lightweight diagnostic queries.
@@ -180,6 +190,28 @@ impl IpcOperationClass {
     /// operations, diagnostic actions that persist nothing (e.g. an on-demand
     /// adapter re-enumeration), and per-SID user configuration writes are safe
     /// for non-admin GUI sessions; everything else requires an elevated client.
+    /// The authorization action an unelevated caller must be granted before
+    /// this class is allowed, or `None` when no elevation is needed at all.
+    ///
+    /// Windows answers the elevation question before the request arrives — the
+    /// broker holds the rights. Where the privileged process is the service
+    /// itself, the question is asked here instead, and this is the name it is
+    /// asked under. Three names rather than one, because an administrator
+    /// writing a rule wants to distinguish "may edit the shared baseline" from
+    /// "may take the network apart to recover it".
+    pub const fn authorization_action(self) -> Option<&'static str> {
+        match self {
+            Self::MutationRequest | Self::ReviewConfirmation => Some(ACTION_EDIT_BASELINE),
+            Self::RecoveryAction => Some(ACTION_RECOVER_NETWORK),
+            Self::SafeDisable => Some(ACTION_DISABLE_PROTECTION),
+            Self::ReadSnapshot
+            | Self::DiagnosticQuery
+            | Self::DiagnosticAction
+            | Self::UserScopedConfiguration
+            | Self::UserScopedMutation => None,
+        }
+    }
+
     pub const fn requires_elevation(self) -> bool {
         !matches!(
             self,
@@ -328,6 +360,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         | IpcOperationName::DohResolversGet
         // Read-only traffic-stats query.
         | IpcOperationName::TrafficStatsGet
+        // Read the caller's local-network exemptions and what we discovered.
+        | IpcOperationName::LocalNetworksGet
         // Read the caller's pending companion-domain suggestions.
         | IpcOperationName::AutoRuleCandidatesList
         // Read the caller's declined companion-domain suggestions.
@@ -386,6 +420,17 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         IpcOperationName::TrafficStatsSet | IpcOperationName::TrafficStatsClear => {
             IpcOperationClass::UserScopedConfiguration
         }
+        // Probing the caller's own suggestions writes evidence about them, not
+        // policy — but it is still a per-SID action the service performs on the
+        // caller's behalf, so it travels the same envelope as their other
+        // configuration commands.
+        IpcOperationName::AutoRuleCandidatesProbe => IpcOperationClass::UserScopedConfiguration,
+        // Marking a site as refusing main-link addresses records the caller's
+        // own observation about their own site: per-SID configuration.
+        IpcOperationName::RefusingAnchorSet => IpcOperationClass::UserScopedConfiguration,
+        // The caller's own local-network exemptions: per-SID configuration,
+        // same envelope class as the other route-policy writes.
+        IpcOperationName::LocalNetworksSet => IpcOperationClass::UserScopedConfiguration,
         // Accepting a companion-domain suggestion writes the caller's OWN
         // rules and refusing one writes their own refusal record. Both are
         // per-SID user configuration: they enter the single-writer mutation
@@ -397,8 +442,12 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // rows — same per-SID user-configuration class.
         IpcOperationName::AutoRuleDismissedRestore
         | IpcOperationName::AutoRuleCandidatesForget => IpcOperationClass::UserScopedConfiguration,
-        // Read the caller's own block-notice mutes.
-        IpcOperationName::BlockNoticeMutesList => IpcOperationClass::ReadSnapshot,
+        // Read the caller's own block-notice mutes, and the notices raised
+        // for them while nothing was listening.
+        IpcOperationName::BlockNoticeMutesList
+        | IpcOperationName::BlockNoticeJournalList => IpcOperationClass::ReadSnapshot,
+        // Acknowledging shown notices deletes the caller's OWN backlog rows.
+        IpcOperationName::BlockNoticeJournalAck => IpcOperationClass::UserScopedConfiguration,
         // Setting/removing/clearing a mute writes the caller's OWN durable
         // mute row(s) — per-SID user configuration, no elevation, same shape
         // as the companion-domain refusal writes above.
@@ -412,6 +461,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Full reset purges the caller's OWN auxiliary state — per-SID user
         // configuration, no elevation, same class as BlockNoticeMutesClear.
         IpcOperationName::PrincipalDataPurge => IpcOperationClass::UserScopedConfiguration,
+        // A count of other principals, no identities and no writes.
+        IpcOperationName::PrincipalDataCount => IpcOperationClass::ReadSnapshot,
     }
 }
 
@@ -562,7 +613,8 @@ pub fn ipc_endpoint_security_specs() -> &'static [IpcEndpointSecuritySpec] {
 mod tests {
     use super::{
         ipc_endpoint_security_specs, IpcAclPrincipal, IpcDegradationBehavior,
-        IpcEndpointAccessClass, IpcEndpointName, IpcErrorCode, IpcFailureMode, IpcTransportKind,
+        IpcEndpointAccessClass, IpcEndpointName, IpcErrorCode, IpcFailureMode, IpcOperationClass,
+        IpcTransportKind, ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE, ACTION_RECOVER_NETWORK,
         IPC_ACL_POLICY, IPC_CALLER_IDENTITY_POLICY, IPC_FAILURE_AND_DEGRADATION_POLICY,
         IPC_TRANSPORT_KIND, SERVICE_ENDPOINT_ADDRESS,
     };
@@ -668,5 +720,47 @@ mod tests {
         let back: IpcErrorCode = serde_json::from_str("\"rules_locked\"").expect("deserialise");
         assert_eq!(back, IpcErrorCode::RulesLocked);
         assert_ne!(IpcErrorCode::RulesLocked, IpcErrorCode::Forbidden);
+    }
+
+    /// The action names are the product's, so they must be derived from its
+    /// unix spelling rather than typed independently. The test pins the SHAPE:
+    /// a rename reaches them, a typo does not survive.
+    #[test]
+    fn authorization_actions_are_named_after_the_product() {
+        for action in [
+            ACTION_EDIT_BASELINE,
+            ACTION_RECOVER_NETWORK,
+            ACTION_DISABLE_PROTECTION,
+        ] {
+            assert!(
+                action.starts_with(crate::product_identity::PRODUCT_NAME_UNIX),
+                "{action} does not carry the product's own name",
+            );
+            assert!(action.len() > crate::product_identity::PRODUCT_NAME_UNIX.len() + 1);
+        }
+    }
+
+    /// Every class that needs elevation must be askable about; a class that
+    /// needs none must not invent a prompt. Without this pairing a new class
+    /// would silently become either unaskable or gratuitously interactive.
+    #[test]
+    fn every_elevated_class_has_an_action_and_no_other_does() {
+        for class in [
+            IpcOperationClass::ReadSnapshot,
+            IpcOperationClass::DiagnosticQuery,
+            IpcOperationClass::DiagnosticAction,
+            IpcOperationClass::MutationRequest,
+            IpcOperationClass::ReviewConfirmation,
+            IpcOperationClass::RecoveryAction,
+            IpcOperationClass::SafeDisable,
+            IpcOperationClass::UserScopedConfiguration,
+            IpcOperationClass::UserScopedMutation,
+        ] {
+            assert_eq!(
+                class.requires_elevation(),
+                class.authorization_action().is_some(),
+                "{class:?}: elevation and an authorization action must agree",
+            );
+        }
     }
 }

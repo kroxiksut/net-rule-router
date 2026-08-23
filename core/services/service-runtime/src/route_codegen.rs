@@ -20,16 +20,15 @@
 //! | app-only rule (no address) | one route per destination the app has been observed connecting to (none observed yet → 0 + diagnostic). |
 //! | app + address rule | **0** — the two conditions match as AND and a route cannot be scoped to a process, so routing the address would over-route. |
 //!
-//! Tier boundary (`strategy.rs`): IPv4 IP/FQDN/domain-suffix/zone routing
-//! is **Free**. IP-subnet/CIDR zones are **Pro** (they do not exist in the
-//! canonical model today — `Zone` is always a *domain* suffix). Application
-//! rules route by destination, learned from observation: a route entry itself
-//! is never process-scoped (no route table is), so what the table carries is
-//! "this destination goes over that link" — precise per-PROCESS routing, where
-//! two processes reaching the same address take different links, still needs
-//! the Pro callout driver. The system route table is machine-wide, so precise
-//! per-user routing is likewise a Pro/callout feature; the caller decides whose
-//! effective rules drive the global table (block 16.18 wiring).
+//! Scope: IPv4 IP/FQDN/domain-suffix/zone routing. IP-subnet/CIDR zones do not
+//! exist in the canonical model — `Zone` is always a *domain* suffix.
+//! Application rules route by destination, learned from observation: a route
+//! entry is never process-scoped (no route table is), so what the table carries
+//! is "this destination goes over that link". Precise per-PROCESS routing,
+//! where two processes reaching the same address take different links, cannot
+//! be expressed this way at all; neither can per-user routing, the system route
+//! table being machine-wide. The caller decides whose effective rules drive the
+//! global table.
 
 use std::collections::{BTreeSet, HashSet};
 use std::net::Ipv4Addr;
@@ -91,8 +90,8 @@ pub struct SecondaryRouteTarget {
 }
 
 /// Non-fatal codegen observations surfaced to diagnostics/health so the
-/// GUI can explain "no routes yet — DNS warm-up pending" or "app routing
-/// needs Pro".
+/// GUI can explain "no routes yet — DNS warm-up pending" or "this rule
+/// cannot be routed".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteCodegenDiagnostic {
     /// An `ExactFqdn` rule had no cached IPs (cold DNS cache).
@@ -107,11 +106,33 @@ pub enum RouteCodegenDiagnostic {
     /// over-route every other process. Informational, not an error: the rule
     /// still takes effect through the filter layer (`wfp_codegen`). An
     /// app-ONLY rule is routed, by observed destination.
-    AppRuleRoutingProOnly { rule_id: String },
+    AppRuleAddressAndAppNotRouted { rule_id: String },
     /// An application rule has no observed destinations yet (cold start, or
     /// the app has not connected since the service came up), so it produced no
     /// route. Self-clearing: the first observed connection installs one.
     AppRuleUnobserved { rule_id: String, app: String },
+    /// An application rule's observed destination is an address the MAIN
+    /// link's own rules claim, so it was not routed to the additional link. A
+    /// route is machine-wide, so pinning it would have taken the address away
+    /// from every other process — including the browser the user wrote that
+    /// main-link rule for. Address rules outrank application rules, and this is
+    /// where that order is kept.
+    AppRuleDestinationClaimedByMainLink {
+        rule_id: String,
+        app: String,
+        ip: Ipv4Addr,
+    },
+    /// An application rule's observed destination is already in use by a
+    /// process no application rule names, so it was not routed to the
+    /// additional link. A host route moves every process that talks to the
+    /// address; claiming one somebody else is using would take their traffic
+    /// with it. Two application rules sharing a destination is NOT this case —
+    /// a route serves them both the same way.
+    AppRuleDestinationUsedByOtherProcess {
+        rule_id: String,
+        app: String,
+        ip: Ipv4Addr,
+    },
     /// a mode wanted to send some traffic to the **primary**
     /// NIC but no usable primary target is bound: in mode B the per-rule
     /// exceptions can't be carved back off the tunnel; in mode A the `/2`
@@ -135,9 +156,28 @@ pub fn generate_secondary_routes(
     cache: &dyn FqdnCacheLookup,
     app_observations: &dyn AppObservationLookup,
     denied: &HashSet<Ipv4Addr>,
+    // Addresses the OTHER link's own rules claim. Subtracted from the
+    // app-observation fan-out only — see the app branch for why.
+    ownership: &crate::address_ownership::AddressOwnership,
+    // Which link these rules route to, so the arbiter can tell "the other
+    // link's address rule names this" from "our own does".
+    link: crate::address_ownership::Link,
 ) -> RouteCodegenOutput {
     let mut out = RouteCodegenOutput::default();
     let mut seen: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    // Every application this rule set routes over the additional link, not just
+    // the one being compiled: a destination two routed applications share is
+    // not somebody else's, and a route serves both identically.
+    let friendly: Vec<String> = secondary_rules
+        .rules()
+        .iter()
+        .filter(|r| r.enabled && matches!(r.action, RuleAction::Route))
+        .filter(|r| r.address_match.is_none())
+        .filter_map(|r| r.app_match.as_ref())
+        .map(|app| match &app.pattern {
+            CanonicalAppPattern::Exact(v) | CanonicalAppPattern::Glob(v) => v.clone(),
+        })
+        .collect();
 
     for rule in secondary_rules.rules() {
         if !rule.enabled {
@@ -157,7 +197,7 @@ pub fn generate_secondary_routes(
         // user adds a separate address-only rule to route that destination.
         if rule.app_match.is_some() && rule.address_match.is_some() {
             out.diagnostics
-                .push(RouteCodegenDiagnostic::AppRuleRoutingProOnly {
+                .push(RouteCodegenDiagnostic::AppRuleAddressAndAppNotRouted {
                     rule_id: rule.id.as_str().to_string(),
                 });
             continue;
@@ -196,6 +236,40 @@ pub fn generate_secondary_routes(
                 // Shared with a direct destination and declined by policy —
                 // dropped from the route exactly as it is from the filter set.
                 if denied.contains(&ip) {
+                    continue;
+                }
+                // The other link's rules already claim this address, by name or
+                // by literal. An app rule learns its destinations by watching
+                // the app, so anything the app happens to touch would otherwise
+                // be pinned — machine-wide — over an explicit rule the user
+                // wrote for that very host. Address beats application in the
+                // evaluation order, and a route cannot be process-scoped, so
+                // the only way to honour the order here is to not emit it.
+                if !ownership.app_rule_may_claim(ip, link) {
+                    out.diagnostics.push(
+                        RouteCodegenDiagnostic::AppRuleDestinationClaimedByMainLink {
+                            rule_id: rule.id.as_str().to_string(),
+                            app: pattern.to_string(),
+                            ip,
+                        },
+                    );
+                    continue;
+                }
+                // Somebody the rule set never named is already using this
+                // address. Pinning it would move their traffic too — the
+                // browser reaching the same site is the case that matters — and
+                // the rule is not worth that. Nothing known about the address
+                // is not evidence of exclusivity, so an unobserved one still
+                // gets its route; the withdrawal path covers the other order,
+                // where the second process arrives after the pin.
+                if app_observations.destination_used_outside(&friendly, ip) {
+                    out.diagnostics.push(
+                        RouteCodegenDiagnostic::AppRuleDestinationUsedByOtherProcess {
+                            rule_id: rule.id.as_str().to_string(),
+                            app: pattern.to_string(),
+                            ip,
+                        },
+                    );
                     continue;
                 }
                 if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
@@ -307,12 +381,18 @@ pub fn generate_routes(
             // shared IP the policy declined (fed via a filtered cache view).
             let secondary_cache =
                 crate::secondary_ip_policy::DenylistFilteredCache::new(cache, denied);
+            // Read from the UNFILTERED cache: the denylist view exists to
+            // trim what goes to the tunnel, and using it here would understate
+            // what the main link claims.
+            let ownership = crate::address_ownership::AddressOwnership::resolve(rule_book, cache);
             let mut out = generate_secondary_routes(
                 &rule_book.secondary,
                 secondary_target,
                 &secondary_cache,
                 app_observations,
                 denied,
+                &ownership,
+                crate::address_ownership::Link::Additional,
             );
             // Mode-A selectivity over a redirect VPN: a /2 counter-overlay via
             // primary out-specifics the VPN's /1, so all non-rule traffic falls
@@ -346,12 +426,22 @@ pub fn generate_routes(
                     // Primary-bound exceptions are carved out of the tunnel, so
                     // the shared-address denylist (which only ever removes
                     // destinations from the tunnel) does not apply here.
+                    // In the always-on modes the tunnel carries everything, so
+                    // these are the main link's own carve-outs. The arbiter is
+                    // still consulted: an app rule here must not take an address
+                    // the ADDITIONAL link's rules name, or a host the user
+                    // deliberately tunnels would follow a program out onto the
+                    // open link.
+                    let ownership =
+                        crate::address_ownership::AddressOwnership::resolve(rule_book, cache);
                     let exceptions = generate_secondary_routes(
                         &rule_book.primary,
                         pt,
                         cache,
                         app_observations,
                         &HashSet::new(),
+                        &ownership,
+                        crate::address_ownership::Link::Main,
                     );
                     out.routes.extend(exceptions.routes);
                     out.diagnostics.extend(exceptions.diagnostics);
@@ -462,6 +552,12 @@ fn push_route(
 ///
 /// `include_apex` splits the two forms: a `SuffixDomain` rule covers its apex
 ///  while a `Zone` rule never covers the bare zone label.
+// The one definition of "this address is spoken for" lives in
+// `address_ownership`: the route side, the filter side and the kill-switch all
+// read it from there, because two definitions of one fact is exactly how the
+// halves came to disagree.
+pub use crate::address_ownership::address_rule_ips;
+
 fn fanout_suffix(
     suffix: &str,
     include_apex: bool,
@@ -530,7 +626,15 @@ mod tests {
         );
         let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
 
-        let out = generate_secondary_routes(&rs, &target(), &cache, &apps, &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &apps,
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
 
         let mut dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         dests.sort();
@@ -542,12 +646,53 @@ mod tests {
         assert!(out.diagnostics.is_empty());
     }
 
+    /// The case the census exists for: the browser reached the address an hour
+    /// before the routed application ever touched it. Pinning it would have
+    /// taken the browser's traffic into the tunnel with it.
+    #[test]
+    fn app_only_rule_skips_a_destination_another_process_already_uses() {
+        let cache = MockFqdnCacheLookup::new();
+        let apps = MockAppObservationLookup::new();
+        apps.set_ips(
+            "assistant.exe",
+            vec![ip(178, 248, 237, 68), ip(203, 0, 113, 9)],
+        );
+        apps.set_used_outside(ip(178, 248, 237, 68));
+        let rs = ruleset(vec![app_rule("R-app", "assistant.exe")]);
+
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &apps,
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
+
+        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
+        assert_eq!(dests, vec![ip(203, 0, 113, 9)]);
+        assert!(matches!(
+            out.diagnostics.as_slice(),
+            [RouteCodegenDiagnostic::AppRuleDestinationUsedByOtherProcess { ip: shared, app, .. }]
+                if *shared == ip(178, 248, 237, 68) && app == "assistant.exe"
+        ));
+    }
+
     #[test]
     fn app_only_rule_without_observations_diagnoses_and_routes_nothing() {
         let cache = MockFqdnCacheLookup::new();
         let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
 
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
 
         assert!(out.routes.is_empty());
         assert!(matches!(
@@ -564,7 +709,15 @@ mod tests {
         let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
         let denied: HashSet<Ipv4Addr> = [ip(8, 8, 8, 8)].into_iter().collect();
 
-        let out = generate_secondary_routes(&rs, &target(), &cache, &apps, &denied);
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &apps,
+            &denied,
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
 
         let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         assert_eq!(dests, vec![ip(91, 108, 56, 104)]);
@@ -605,7 +758,15 @@ mod tests {
             true,
             CanonicalAddressMatch::ExactIp(ip(93, 184, 216, 34)),
         )]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert_eq!(out.routes.len(), 1);
         let r = &out.routes[0];
         assert_eq!(r.destination, ip(93, 184, 216, 34));
@@ -624,7 +785,15 @@ mod tests {
             false,
             CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
         )]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert!(out.routes.is_empty());
     }
 
@@ -638,7 +807,15 @@ mod tests {
         );
         blocked.action = nrr_domain::RuleAction::Block;
         let rs = ruleset(vec![blocked]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         // A dropped destination gets no /32 route — the WFP block enforces it.
         assert!(out.routes.is_empty());
     }
@@ -659,7 +836,15 @@ mod tests {
                 CanonicalAddressMatch::ExactFqdn("cold.example.com".into()),
             ),
         ]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         assert_eq!(dests, BTreeSet::from([ip(20, 0, 0, 1), ip(20, 0, 0, 2)]));
         assert!(out
@@ -687,6 +872,8 @@ mod tests {
             &cache,
             &no_apps(),
             &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
         );
         let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         assert_eq!(dests, BTreeSet::from([ip(30, 0, 0, 1), ip(30, 0, 0, 2)]));
@@ -697,8 +884,15 @@ mod tests {
             true,
             CanonicalAddressMatch::Zone("example".into()),
         )]);
-        let out2 =
-            generate_secondary_routes(&zone_rules, &target(), &cache, &no_apps(), &HashSet::new());
+        let out2 = generate_secondary_routes(
+            &zone_rules,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert!(out2.routes.iter().any(|r| r.destination == ip(99, 0, 0, 9)));
     }
 
@@ -723,6 +917,8 @@ mod tests {
             &cache,
             &no_apps(),
             &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
         );
         let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         assert_eq!(dests, BTreeSet::from([ip(30, 0, 0, 7), ip(30, 0, 0, 1)]));
@@ -732,8 +928,15 @@ mod tests {
             true,
             CanonicalAddressMatch::Zone("example".into()),
         )]);
-        let out2 =
-            generate_secondary_routes(&zone_rules, &target(), &cache, &no_apps(), &HashSet::new());
+        let out2 = generate_secondary_routes(
+            &zone_rules,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert!(
             !out2.routes.iter().any(|r| r.destination == ip(88, 0, 0, 8)),
             "the bare zone label must not be routed"
@@ -748,7 +951,15 @@ mod tests {
             true,
             CanonicalAddressMatch::SuffixDomain("nothing.cached".into()),
         )]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert!(out.routes.is_empty());
         assert!(out
             .diagnostics
@@ -790,7 +1001,15 @@ mod tests {
                 CanonicalAddressMatch::ExactFqdn("mixed.example.com".into()),
             ),
         ]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         // Only the public IP survives; loopback + unspecified are dropped and
         // the loopback-only FQDN yields nothing.
         let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
@@ -804,7 +1023,15 @@ mod tests {
             rule("r1", true, CanonicalAddressMatch::ExactIp(ip(40, 0, 0, 1))),
             rule("r2", true, CanonicalAddressMatch::ExactIp(ip(40, 0, 0, 1))),
         ]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert_eq!(out.routes.len(), 1, "same destination must route once");
     }
 
@@ -828,15 +1055,23 @@ mod tests {
             origin: None,
         };
         let rs = ruleset(vec![combined]);
-        let out = generate_secondary_routes(&rs, &target(), &cache, &no_apps(), &HashSet::new());
+        let out = generate_secondary_routes(
+            &rs,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &crate::address_ownership::AddressOwnership::default(),
+            crate::address_ownership::Link::Additional,
+        );
         assert!(
             out.routes.is_empty(),
             "combined app+address rule must not route the address globally"
         );
-        assert!(out
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, RouteCodegenDiagnostic::AppRuleRoutingProOnly { .. })));
+        assert!(out.diagnostics.iter().any(|d| matches!(
+            d,
+            RouteCodegenDiagnostic::AppRuleAddressAndAppNotRouted { .. }
+        )));
     }
 
     // ── mode-aware generate_routes (block 16.18.vpn) ──
@@ -846,6 +1081,94 @@ mod tests {
             primary: CanonicalRuleSet::from_rules(primary),
             secondary: CanonicalRuleSet::from_rules(secondary),
         }
+    }
+
+    /// The regression: an application routed over the additional link reaches
+    /// a site the user put on the MAIN link by name. The destination is learned
+    /// from that first blocked attempt, and a `/32` pin would then take the
+    /// address away from every other process on the machine — the browser
+    /// included. Address rules outrank application rules; the pin must not
+    /// appear.
+    #[test]
+    fn mode_a_app_observation_never_pins_an_address_the_main_link_claims() {
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("news.example", vec![ip(178, 248, 237, 68)]);
+        let apps = MockAppObservationLookup::new();
+        apps.set_ips(
+            "assistant.exe",
+            vec![ip(178, 248, 237, 68), ip(203, 0, 113, 9)],
+        );
+        let rb = book(
+            vec![rule(
+                "R-main",
+                true,
+                CanonicalAddressMatch::ExactFqdn("news.example".to_string()),
+            )],
+            vec![app_rule("R-app", "assistant.exe")],
+        );
+
+        let out = generate_routes(
+            RouteBehaviorMode::PreferPrimary,
+            &rb,
+            None,
+            &target(),
+            &cache,
+            &apps,
+            &std::collections::HashSet::new(),
+        );
+
+        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
+        assert_eq!(dests, vec![ip(203, 0, 113, 9)], "only the unclaimed one");
+        // `PrimaryExceptionsUnavailable` rides along (no primary target here),
+        // so look for the one that matters rather than matching the whole slice.
+        assert!(out.diagnostics.iter().any(|d| matches!(
+            d,
+            RouteCodegenDiagnostic::AppRuleDestinationClaimedByMainLink { ip: claimed, app, .. }
+                if *claimed == ip(178, 248, 237, 68) && app == "assistant.exe"
+        )));
+    }
+
+    /// A main-link rule can only defend addresses it actually resolves to, and
+    /// a suffix rule defends its whole cached fan-out.
+    #[test]
+    fn address_rule_ips_expands_names_and_ignores_app_and_block_rules() {
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("news.example", vec![ip(10, 0, 0, 1)]);
+        cache.set_ips("cdn.news.example", vec![ip(10, 0, 0, 2)]);
+        let mut blocked = rule(
+            "R-block",
+            true,
+            CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 3)),
+        );
+        blocked.action = nrr_domain::RuleAction::Block;
+        let mut disabled = rule(
+            "R-off",
+            false,
+            CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 4)),
+        );
+        disabled.enabled = false;
+        let rs = ruleset(vec![
+            rule(
+                "R-suffix",
+                true,
+                CanonicalAddressMatch::SuffixDomain("news.example".to_string()),
+            ),
+            rule(
+                "R-ip",
+                true,
+                CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 5)),
+            ),
+            app_rule("R-app", "assistant.exe"),
+            blocked,
+            disabled,
+        ]);
+
+        let claimed = address_rule_ips(&rs, &cache);
+
+        assert_eq!(
+            claimed,
+            HashSet::from([ip(10, 0, 0, 1), ip(10, 0, 0, 2), ip(10, 0, 0, 5)])
+        );
     }
 
     #[test]

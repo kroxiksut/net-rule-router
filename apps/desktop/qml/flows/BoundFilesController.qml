@@ -8,8 +8,8 @@ import "../lib/rules.js" as Rules
 // the content-truthful dirty reconcile, the persist-on-apply write, and the
 // safe (last-known-good) rollback submit. The shell keeps the shared STATE
 // these read/write (`_filesSyncDirtyPrimary` / `_filesSyncDirtySecondary` /
-// `_saveAsRoutes` / `_saveAsIndex` / `_resumeCloseAfterSaveBefore`) plus the
-// dialog instances (`saveBeforeCloseDialog` / `saveAsFileDialog` /
+// `_resumeCloseAfterSaveBefore`) plus the
+// dialog instances (`saveBeforeCloseDialog` / `saveRuleSetDialog` /
 // `safeRollbackConfirmDialog`) and the generic `_pushOperationToast`. RPC goes
 // through `root.rpc`; `nrrNativeBridge` is a global QML context property,
 // referenced bare. Reached as `root.boundFilesController` from the
@@ -33,7 +33,7 @@ QtObject {
         return !root.prefs || root.prefs.exportIncludeComments !== false
     }
 
-    /// The foreign-OS / Pro sections captured at the last import for `route`,
+    /// The foreign-OS / unsupported sections captured at the last import for `route`,
     /// handed to `onSections`. The sidecar is owned by the launcher, not the
     /// service, so this resolves with the service stopped; any failure
     /// degrades to "no passthrough" rather than blocking the save.
@@ -314,48 +314,67 @@ QtObject {
             return
         }
         _exportSetDone = (typeof onDone === "function") ? onDone : null
-        // Reuses the per-route Save-As picker with a sentinel route: one
-        // dialog names the set (its file name becomes the folder name, its
-        // parent folder becomes the container) instead of one dialog per
-        // route, so the pair can no longer come apart mid-gesture.
-        root.saveAsFileDialog.pendingRoute = "__set__"
-        root.saveAsFileDialog.title = root.tr(
-            "rules.dialog.export-set-title", "Save rules as a set...")
-        root.openRulesDialog(root.saveAsFileDialog)
+        // Asks for a NAME and a folder, not a file: what gets written is a
+        // folder with one file per route. The Save-As file picker that used to
+        // stand here promised a .txt and delivered a directory.
+        root.saveRuleSetDialog.folder = _defaultSetContainerDir()
+        root.saveRuleSetDialog.openFor(_suggestedSetName(), _defaultSetContainerDir())
     }
 
-    /// Pending target of `exportCurrentRulesInteractive`, resolved by
-    /// `_handleExportSetPathChosen` / cancelled by `_handleSaveAsCancelled`.
-    property var _exportSetDone: null
-
-    /// A set name is a folder name, never a path — the same refusal the
-    /// bridge applies when creating the folder, checked here first so the
-    /// error reads as "bad name" rather than a generic write failure.
-    function _isUsableSetName(name) {
-        var n = String(name || "").trim()
-        if (n === "" || n === ".") return false
-        if (n.indexOf("/") >= 0 || n.indexOf("\\") >= 0) return false
-        if (n.indexOf(":") >= 0 || n.indexOf("..") >= 0) return false
-        return true
+    /// Where a new set lands by default: the user's rule-set folder, else the
+    /// folder the currently bound route file lives in, else nothing (the
+    /// picker then opens wherever the OS defaults to).
+    function _defaultSetContainerDir() {
+        var configured = String(root.userPresetsDir || "")
+        if (configured !== "") return configured
+        var bound = String(root.prefs.lastSavedPathPrimary
+            || root.prefs.lastSavedPathSecondary || "").replace(/\\/g, "/")
+        var slash = bound.lastIndexOf("/")
+        if (slash > 0) {
+            // One level up from `<container>/<set>/rules_primary.txt`.
+            var setDir = bound.substring(0, slash)
+            var up = setDir.lastIndexOf("/")
+            return up > 0 ? setDir.substring(0, up) : setDir
+        }
+        return ""
     }
 
-    /// The Save-As picker returned a path for the `__set__` sentinel: split
-    /// it into the container folder and the set name (the file name minus
-    /// its extension), then hand off to the shared set-writer.
-    function _handleExportSetPathChosen(path) {
-        var norm = String(path || "").replace(/\\/g, "/")
-        var slash = norm.lastIndexOf("/")
-        var containerDir = slash >= 0 ? norm.substring(0, slash) : ""
-        var fileName = slash >= 0 ? norm.substring(slash + 1) : norm
-        var dot = fileName.lastIndexOf(".")
-        var setName = (dot > 0) ? fileName.substring(0, dot) : fileName
-        if (containerDir === "" || !_isUsableSetName(setName)) {
+    /// The set the rules came from, so re-saving suggests the same name.
+    function _suggestedSetName() {
+        var bound = String(root.prefs.lastSavedPathPrimary
+            || root.prefs.lastSavedPathSecondary || "").replace(/\\/g, "/")
+        var slash = bound.lastIndexOf("/")
+        if (slash <= 0) return ""
+        var setDir = bound.substring(0, slash)
+        var up = setDir.lastIndexOf("/")
+        return up >= 0 ? setDir.substring(up + 1) : ""
+    }
+
+    /// The dialog's answer: create `<folder>/<name>/` and write both routes.
+    function writeSetNamed(containerDir, setName) {
+        if (String(containerDir || "") === "" || !isUsableSetName(setName)) {
             root.statusLine = root.tr("status.save-as-set-name-invalid",
                 "Choose a plain file name for the set — it becomes the set's folder name.")
             _settleExportSet(false)
             return
         }
-        _createAndWriteSet(containerDir, setName, _settleExportSet)
+        _createAndWriteSet(String(containerDir), String(setName), _settleExportSet)
+    }
+
+    /// Pending target of `exportCurrentRulesInteractive`, resolved by
+    /// `writeSetNamed` / cancelled by `_handleSaveAsCancelled`.
+    property var _exportSetDone: null
+
+    /// A set name is a folder name, never a path — the same refusal the
+    /// bridge applies when creating the folder, checked here first so the
+    /// error reads as "bad name" rather than a generic write failure. Public:
+    /// the naming dialog greys its confirm button on the same rule.
+    function isUsableSetName(name) {
+        var n = String(name || "").trim()
+        if (n === "" || n === ".") return false
+        if (n.indexOf("/") >= 0 || n.indexOf("\\") >= 0) return false
+        if (n.indexOf(":") >= 0 || n.indexOf("..") >= 0) return false
+        return true
     }
 
     function _settleExportSet(ok) {
@@ -621,34 +640,49 @@ QtObject {
         })
     }
 
+    /// The folder a bound route file lives in, "" when the route has no file.
+    function _routeFolder(path) {
+        var norm = String(path || "").replace(/\\/g, "/")
+        var slash = norm.lastIndexOf("/")
+        return slash > 0 ? norm.substring(0, slash) : ""
+    }
+
     /// THE "save my rules to disk" gesture, behind the footer chip, the
     /// close dialog, the service-not-running gate and the offline apply guard.
-    /// Routes that already have a file are written; routes that do not get the
-    /// Save-As picker, so a user who never linked a file — or who just cleared
-    /// the table, which unlinks it — can still save. `onDone(ok)`.
+    ///
+    /// A rule set is a PAIR in one folder, so this always writes both route
+    /// files. A route with no file of its own gets one beside its partner
+    /// under the canonical name — that is what keeps a set from ending up half
+    /// in the bundled presets and half in Documents, which is exactly what the
+    /// per-route Save-As queue used to produce. With neither route bound there
+    /// is no folder to infer, so the set flow asks for one, once.
+    /// `onDone(ok)`.
     function saveRulesToFiles(toast, onDone) {
         var pathPrimary = String(root.prefs.lastSavedPathPrimary || "")
         var pathSecondary = String(root.prefs.lastSavedPathSecondary || "")
-        var unbound = []
-        if (root._filesSyncDirtyPrimary && pathPrimary === "") unbound.push("primary")
-        if (root._filesSyncDirtySecondary && pathSecondary === "") unbound.push("secondary")
-        // No file anywhere to save into: ask where rather than reporting a
-        // silent no-op.
-        if (pathPrimary === "" && pathSecondary === "" && unbound.length === 0) {
+        if (pathPrimary === "" && pathSecondary === "") {
             exportCurrentRulesInteractive(onDone)
             return
         }
-        _writeBoundFiles(toast, function(ok, written) {
-            if (!ok || unbound.length === 0) {
-                if (toast && ok && written.length === 0) {
-                    root.statusLine = root.tr("status.bound-file-already-current",
-                        "Your rules file already holds these rules.")
+        var folder = _routeFolder(pathPrimary !== "" ? pathPrimary : pathSecondary)
+        if (pathPrimary === "") pathPrimary = folder + "/rules_primary.txt"
+        if (pathSecondary === "") pathSecondary = folder + "/rules_secondary.txt"
+        // Both targets go into ONE call: the factory-folder gate then rebases
+        // the whole pair to the folder the user picks instead of moving one
+        // file and leaving the other behind.
+        _writeTargets([{ route: "primary", path: pathPrimary },
+                       { route: "secondary", path: pathSecondary }],
+            false,
+            function(ok, written) {
+                if (toast && ok) {
+                    root.statusLine = written.length > 0
+                        ? root.tr("status.bound-file-saved", "Bound rules file saved.")
+                            + " → " + written.join("\n")
+                        : root.tr("status.bound-file-already-current",
+                            "Your rules file already holds these rules.")
                 }
                 if (typeof onDone === "function") onDone(ok)
-                return
-            }
-            _startSaveAsQueue(unbound, onDone)
-        }, true /* includeClean */)
+            })
     }
 
     // Submit a Safe rollback (RollbackRequest recovery
@@ -677,90 +711,28 @@ QtObject {
         })
     }
 
-    // "Save As" from the close dialog: pick a path for every dirty route, one
-    // picker at a time, then finish the deferred close. Cancelling any picker
-    // ABORTS the close (nothing is lost, the window stays).
+    // "Save As" from the close dialog: name a folder for the set once, write
+    // both route files there, then finish the deferred close. Cancelling the
+    // picker ABORTS the close (nothing is lost, the window stays).
     function _handleSaveAsFromCloseDialog() {
-        // Same routes the prompt listed, so "Save As" cannot pop a picker for
-        // a route the user was never asked about.
-        var q = _boundDirtyRoutes()
-        if (q.length === 0) {
+        if (_boundDirtyRoutes().length === 0) {
             // Nothing pending to save → just proceed with the close.
             root.quittingToTray = true
             root.close()
             return
         }
-        _startSaveAsQueue(q, function(ok) {
+        exportCurrentRulesInteractive(function(ok) {
             if (!ok) { root._resumeCloseAfterSaveBefore = false; return }
             root.quittingToTray = true
             root.close()
         })
     }
 
-    // ── Save-As picker queue ─────────────────────────────────────────────
-    //
-    // The routes still to be picked live in the shell (`_saveAsRoutes` /
-    // `_saveAsIndex`) because the FileDialog does; the continuation lives here.
-    // `onDone(ok)` fires once the queue drains — or with `false` the moment the
-    // user cancels a picker, which abandons the remaining routes.
-    property var _saveAsDone: null
-
-    function _startSaveAsQueue(routes, onDone) {
-        root._saveAsRoutes = routes
-        root._saveAsIndex = 0
-        _saveAsDone = (typeof onDone === "function") ? onDone : null
-        _saveAsOpenNext()
-    }
-
-    function _settleSaveAsQueue(ok) {
-        root._saveAsRoutes = []
-        var cb = _saveAsDone
-        _saveAsDone = null
-        if (cb) cb(!!ok)
-    }
-
-    // Open the SaveFile picker for the next queued route, or settle the queue.
-    function _saveAsOpenNext() {
-        if (root._saveAsIndex >= root._saveAsRoutes.length) {
-            _settleSaveAsQueue(true)
-            return
-        }
-        var route = root._saveAsRoutes[root._saveAsIndex]
-        root.saveAsFileDialog.pendingRoute = route
-        // Title tells the user WHICH route they are choosing a path for.
-        root.saveAsFileDialog.title = (route === "primary")
-            ? root.tr("rules.dialog.export-title-primary", "Save primary rules as…")
-            : root.tr("rules.dialog.export-title-secondary", "Save additional-adapter rules as…")
-        root.openRulesDialog(root.saveAsFileDialog)
-    }
-
-    /// The picker returned a path. The `__set__` sentinel route means
-    /// `exportCurrentRulesInteractive` opened it — hand off to the set writer
-    /// instead of the per-route queue. Otherwise write the queued route from
-    /// the local table (which also links it), then advance.
-    function _handleSaveAsPathChosen(route, path) {
-        if (route === "__set__") { _handleExportSetPathChosen(path); return }
-        _writeTargets([{ route: route, path: String(path) }], false, function(ok, written) {
-            if (!ok) { _settleSaveAsQueue(false); return }
-            root.statusLine = root.tr("status.bound-file-saved", "Bound rules file saved.")
-                + " → " + (written.length > 0 ? written.join("\n") : String(path))
-            root._saveAsIndex += 1
-            _saveAsOpenNext()
-        })
-    }
-
-    /// The picker was cancelled. For the `__set__` sentinel, resolve the
-    /// pending export-as-set promise; otherwise the remaining per-route
-    /// queue is abandoned — nothing written so far is lost, and the caller
-    /// decides what the cancel means (a close is aborted, a plain save just
-    /// stops).
+    /// The set dialog was dismissed: nothing was written, and the caller
+    /// decides what that means (a close is aborted, a plain save just stops).
     function _handleSaveAsCancelled() {
         root.statusLine = root.tr("status.save-as-cancelled",
             "Save As cancelled — nothing more was saved.")
-        if (root.saveAsFileDialog.pendingRoute === "__set__") {
-            _settleExportSet(false)
-            return
-        }
-        _settleSaveAsQueue(false)
+        _settleExportSet(false)
     }
 }

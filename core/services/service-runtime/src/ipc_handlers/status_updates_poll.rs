@@ -60,6 +60,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: None,
+            caller_pid: None,
         };
         let err = h.handle(&req, &ctx).expect_err("always errors");
         assert_eq!(err.code, IpcErrorCode::RecoveryRequired);

@@ -245,11 +245,17 @@ impl DnsObservationConsumer {
             .auto_rules
             .as_ref()
             .and_then(|engine| engine.begin_batch(&sid));
+        // One instant for the whole drain, plus the observation's position in
+        // it. The observations carry no timestamps of their own, and stamping
+        // them all identically made "which anchor was active most recently" a
+        // tie that the ledger broke alphabetically — a companion fetched while
+        // one site loaded could be filed under another that merely happened to
+        // sort later. The order in the drain IS the order they were resolved.
         let batch_ms = now
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        for obs in observations {
+        for (index, obs) in observations.iter().enumerate() {
             if obs.ipv4s.is_empty() {
                 continue;
             }
@@ -285,14 +291,17 @@ impl DnsObservationConsumer {
                     // (`learning` is `None` when the mode is off), so this costs
                     // nothing on the default path.
                     if let Some(batch) = learning.as_mut() {
-                        let in_secondary =
-                            rule_set_matches(&obs.hostname, &snapshot.rule_book.secondary);
-                        let in_primary =
-                            rule_set_matches(&obs.hostname, &snapshot.rule_book.primary);
+                        let secondary =
+                            rule_set_match_origin(&obs.hostname, &snapshot.rule_book.secondary);
+                        let primary =
+                            rule_set_match_origin(&obs.hostname, &snapshot.rule_book.primary);
                         batch.observe(
-                            batch_ms,
+                            batch_ms.saturating_add(index as u64),
                             &obs.hostname,
-                            crate::auto_rules::AutoRulesEngine::classify(in_primary, in_secondary),
+                            crate::auto_rules::AutoRulesEngine::classify(
+                                primary.user_authored,
+                                secondary.user_authored,
+                            ),
                         );
                     }
                     tracing::debug!(
@@ -309,8 +318,9 @@ impl DnsObservationConsumer {
                 }
                 continue;
             }
-            let in_secondary = rule_set_matches(&obs.hostname, &snapshot.rule_book.secondary);
-            let in_primary = rule_set_matches(&obs.hostname, &snapshot.rule_book.primary);
+            let secondary = rule_set_match_origin(&obs.hostname, &snapshot.rule_book.secondary);
+            let primary = rule_set_match_origin(&obs.hostname, &snapshot.rule_book.primary);
+            let (in_primary, in_secondary) = (primary.matched, secondary.matched);
             // Feed companion learning BEFORE the keep/discard branch below: a
             // hostname that matches no rule is discarded from the cache by
             // design, and those discarded names are exactly the ones a routed
@@ -320,9 +330,12 @@ impl DnsObservationConsumer {
             // above already dropped them) and so can never be suggested.
             if let Some(batch) = learning.as_mut() {
                 batch.observe(
-                    batch_ms,
+                    batch_ms.saturating_add(index as u64),
                     &obs.hostname,
-                    crate::auto_rules::AutoRulesEngine::classify(in_primary, in_secondary),
+                    crate::auto_rules::AutoRulesEngine::classify(
+                        primary.user_authored,
+                        secondary.user_authored,
+                    ),
                 );
             }
             if in_primary || in_secondary {
@@ -821,15 +834,51 @@ pub(crate) fn rule_set_matches(hostname: &str, set: &CanonicalRuleSet) -> bool {
     set.rules()
         .iter()
         .filter(|r| r.enabled)
-        .any(|r| match &r.address_match {
-            Some(CanonicalAddressMatch::ExactFqdn(h)) => h == hostname,
-            // `*.s` covers the apex `s` and every subdomain; a zone rule covers
-            // subdomains only. Both helpers live in `nrr-domain` so this gate
-            // and the decision engine can never disagree.
-            Some(CanonicalAddressMatch::SuffixDomain(s)) => match_suffix_domain(hostname, s),
-            Some(CanonicalAddressMatch::Zone(z)) => match_zone(hostname, z),
-            _ => false,
-        })
+        .any(|r| rule_covers(r, hostname))
+}
+
+/// What a rule set has to say about one hostname, in a single walk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RuleSetMatch {
+    /// Some enabled rule covers the hostname.
+    pub matched: bool,
+    /// One of those rules is one the USER wrote.
+    pub user_authored: bool,
+}
+
+/// Both facts about `hostname` at once: is it covered, and is it covered by a
+/// rule the user wrote rather than one the app added for them.
+///
+/// Companion learning anchors on the second. An auto-added rule is a companion
+/// somebody already accepted — usually a CDN or an API host — and letting its
+/// own hosts anchor makes every accepted suggestion breed the next generation
+/// (`*.githubusercontent.com` accepted, then `raw.githubusercontent.com`
+/// proposing `github.com`).
+pub(crate) fn rule_set_match_origin(hostname: &str, set: &CanonicalRuleSet) -> RuleSetMatch {
+    let mut out = RuleSetMatch::default();
+    for rule in set.rules().iter().filter(|r| r.enabled) {
+        if !rule_covers(rule, hostname) {
+            continue;
+        }
+        out.matched = true;
+        if rule.origin.is_none() {
+            out.user_authored = true;
+            break;
+        }
+    }
+    out
+}
+
+fn rule_covers(rule: &nrr_domain::canonical::CanonicalRule, hostname: &str) -> bool {
+    match &rule.address_match {
+        Some(CanonicalAddressMatch::ExactFqdn(h)) => h == hostname,
+        // `*.s` covers the apex `s` and every subdomain; a zone rule covers
+        // subdomains only. Both helpers live in `nrr-domain` so this gate
+        // and the decision engine can never disagree.
+        Some(CanonicalAddressMatch::SuffixDomain(s)) => match_suffix_domain(hostname, s),
+        Some(CanonicalAddressMatch::Zone(z)) => match_zone(hostname, z),
+        _ => false,
+    }
 }
 
 /// the KIND of the strongest enabled address rule covering
@@ -928,6 +977,27 @@ mod tests {
             action: nrr_domain::RuleAction::Route,
             origin: None,
         }
+    }
+
+    #[test]
+    fn an_auto_added_rule_covers_a_host_without_making_it_an_anchor() {
+        let mut auto = suffix_rule("r-auto", "githubusercontent.com");
+        auto.origin = Some(nrr_domain::RuleOrigin::auto(
+            nrr_domain::AutoRuleReason::UserConfirmed,
+            "www.googletagmanager.com",
+            "2026-08-11",
+        ));
+        let set = CanonicalRuleSet::from_rules(vec![auto, suffix_rule("r-user", "example.com")]);
+
+        let auto_host = rule_set_match_origin("raw.githubusercontent.com", &set);
+        assert!(auto_host.matched);
+        assert!(!auto_host.user_authored);
+
+        let user_host = rule_set_match_origin("www.example.com", &set);
+        assert!(user_host.matched);
+        assert!(user_host.user_authored);
+
+        assert!(!rule_set_match_origin("elsewhere.test", &set).matched);
     }
 
     fn zone_rule(id: &str, z: &str) -> CanonicalRule {

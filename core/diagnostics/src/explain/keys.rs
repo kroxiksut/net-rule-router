@@ -69,7 +69,7 @@ pub const UNCERTAINTY_STALE_CACHE: &str = "explain.uncertainty.stale_cache_used"
 pub const UNCERTAINTY_AMBIGUOUS_LOOKUP: &str = "explain.uncertainty.ambiguous_lookup";
 pub const UNCERTAINTY_STALE_AVAILABILITY: &str = "explain.uncertainty.stale_availability";
 pub const UNCERTAINTY_UNKNOWN_SECONDARY: &str = "explain.uncertainty.unknown_secondary_state";
-pub const UNCERTAINTY_IPV6_PRO_ONLY: &str = "explain.uncertainty.ipv6_destination_pro_only";
+pub const UNCERTAINTY_IPV6_UNSUPPORTED: &str = "explain.uncertainty.ipv6_destination_unsupported";
 
 // ── Fail-Closed reason keys ───────────────────────────────────────────────────
 

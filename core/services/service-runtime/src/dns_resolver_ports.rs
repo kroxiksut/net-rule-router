@@ -268,6 +268,12 @@ impl DirectUdpUpstreamResolver {
     /// actually went to the pool's server. A failure on the secondary link (or
     /// to a public resolver) says nothing about the primary upstream's health.
     fn note_attempt(&self, egress: &crate::dns_egress::DnsEgress, ok: bool) {
+        // The policy needs its own attempts back, whichever way they went: it
+        // is the only thing that can stop feeding a tunnel that has stopped
+        // carrying traffic.
+        if let Some(policy) = self.egress.as_ref() {
+            policy.note_outcome(egress.via_secondary, ok);
+        }
         let Some(pool) = self.pool.as_ref() else {
             return;
         };

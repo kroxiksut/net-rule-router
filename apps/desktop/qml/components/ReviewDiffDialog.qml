@@ -364,10 +364,10 @@ Dialog {
             }
         }
 
-        // ── Pro-section badging ──────────────────
+        // ── unsupported-section badging ──────────────────
         // When the imported preset carries `--- CIDR` / `--- Ports`
         // or any other unknown section, the wire field
-        // `pro-sections` lists them. The server currently always
+        // `extended-sections` lists them. The server currently always
         // returns empty (active revision doesn't persist unknown
         // sections — see project_block16_14_a_complete landmine #4),
         // so this block stays hidden until a future
@@ -376,7 +376,7 @@ Dialog {
             Layout.fillWidth: true
             spacing: 4
             visible: {
-                var ps = root.summary && root.summary["pro-sections"]
+                var ps = root.summary && root.summary["extended-sections"]
                 // Coerce to a real bool — when `summary` is `{}` the
                 // first `&&` yields `undefined`, which Qt rejects as a
                 // `bool` binding ("Unable to assign [undefined] to bool").
@@ -387,13 +387,13 @@ Dialog {
             Label {
                 Layout.fillWidth: true
                 text: root.tr(
-                    "dialog.review-diff.pro-sections-title",
+                    "dialog.review-diff.extended-sections-title",
                     "Extended sections preserved as-is")
                 font.bold: true
                 color: root.ownerRoot ? root.ownerRoot.textColor : "white"
             }
             Repeater {
-                model: (root.summary && root.summary["pro-sections"]) || []
+                model: (root.summary && root.summary["extended-sections"]) || []
                 delegate: RowLayout {
                     Layout.fillWidth: true
                     spacing: 6
@@ -411,7 +411,7 @@ Dialog {
                     Label {
                         Layout.fillWidth: true
                         text: root.tr(
-                            "dialog.review-diff.pro-section-line",
+                            "dialog.review-diff.extended-section-line",
                             "{name}: {count} rules preserved (not applied)")
                             .replace("{name}", String(modelData.name || "?"))
                             .replace("{count}", String(modelData["preserved-count"] || 0))

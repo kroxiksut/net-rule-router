@@ -423,6 +423,14 @@ pub struct RuleRowEntry {
     /// `"ok"` / `"warning"` / `"error"` — derived from
     /// `rule_value_validation::validate_rule_value`.
     pub validation_status: String,
+    /// What the last main-link check found for this rule's address:
+    /// `"answered"`, `"silent"`, or absent when it was never checked.
+    ///
+    /// A FACT about reachability, never advice: a site can answer on the main
+    /// link and still refuse to serve the user there, which is the very reason
+    /// the rule exists. The GUI words it accordingly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub main_route: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation_message_key: Option<String>,
     /// Read-only annotation: when the OS `hosts` file pins this rule's
@@ -442,6 +450,18 @@ pub struct RuleRowEntry {
     /// row loses its identity for the lack of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<RuleOrigin>,
+    /// Read-only annotation for an application rule: the addresses it is
+    /// currently holding on the additional link, learned from watching the
+    /// application.
+    ///
+    /// It is shown because the holding is MACHINE-WIDE — a route cannot be
+    /// scoped to a process, so every one of these addresses travels the
+    /// additional link for every program on the computer. Without the list a
+    /// user has no way to connect "this site went strange" to the application
+    /// rule that took it. Absent for rules that are not application rules, and
+    /// for those holding nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_destinations: Option<Vec<String>>,
 }
 
 /// Read-only OS `hosts`-file override annotation for one rule row.
@@ -616,9 +636,9 @@ impl PresetImportPayload {
 /// 5. Wraps the resulting UTF-8 bytes in base64 (standard alphabet,
 ///    padded) for wire framing.
 ///
-/// Unknown (Pro) sections from the original import are **not** preserved
-/// in this revision (the canonical store drops them). Round-trip Pro
-/// preservation is a follow-up.
+/// Extended sections from the original import are **not** preserved in this
+/// revision (the canonical store drops them). Round-trip preservation is a
+/// follow-up.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct PresetExportGetRequest {
@@ -653,8 +673,8 @@ pub struct PresetExportGetResponse {
 /// the txt files separately), behavior settings (route mode).
 ///
 /// Excludes: UI preferences (theme, language, accessibility, route
-/// display labels) — device-specific, carried over per device on a
-/// Free→Pro migration; internal revision metadata; runtime probe state.
+/// display labels) — device-specific, set again on each device;
+/// internal revision metadata; runtime probe state.
 ///
 /// # Client-supplied fields
 ///
@@ -877,31 +897,31 @@ pub struct ReviewSummaryResponse {
     pub rules_modified: Vec<RuleSummaryEntryDto>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_retargeted: Vec<RuleSummaryEntryDto>,
-    /// Pro-only sections preserved verbatim from the
+    /// unsupported sections preserved verbatim from the
     /// imported preset file. Each entry names a section (e.g. `CIDR`,
     /// `Ports`) that the Free edition parses but does not apply, plus
     /// the number of entries it carries. The GUI renders them in the
-    /// review diff with a `pro.svg` badge so the user knows the file
-    /// contains Pro-tier rules being preserved unchanged.
+    /// review diff with a "not applied" badge so the user knows the file
+    /// contains unsupported rules being preserved unchanged.
     ///
     /// Currently always empty — the active revision storage drops
     /// unknown sections. The wire field is plumbed now so a future
     /// schema-bump that adds `unknown_sections_json` to the `revisions`
     /// table requires only server-side population — the GUI is ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pro_sections: Vec<ProSectionSummaryDto>,
+    pub extended_sections: Vec<ExtendedSectionSummaryDto>,
 }
 
-/// One Pro-only section preserved from the imported
-/// preset file. See [`ReviewSummaryResponse::pro_sections`].
+/// One unsupported section preserved from the imported
+/// preset file. See [`ReviewSummaryResponse::extended_sections`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct ProSectionSummaryDto {
+pub struct ExtendedSectionSummaryDto {
     /// Raw section name as it appeared in the file, e.g. `"CIDR"`,
     /// `"Ports"`. Not localized — readers display it verbatim.
     pub name: String,
     /// Number of rule entries (active + disabled) in this section.
-    /// Displayed as "<name>: N rules preserved as-is (Pro feature)".
+    /// Displayed as "<name>: N rules preserved as-is (unsupported feature)".
     pub preserved_count: u32,
 }
 
@@ -1231,6 +1251,21 @@ pub enum StatusUpdateEvent {
         /// Dotted-quad IPv4 as observed from outside the local NAT.
         external_address: String,
     },
+    /// A tunnel came up while this SID has no additional route assigned, so
+    /// nothing the rules send there can go anywhere.
+    ///
+    /// Only raised for a tunnel that looks like a PERSONAL VPN. A corporate
+    /// client is normally installed by an employer and is not meant to become
+    /// the additional route, and telling that user to assign it would be the
+    /// product guessing at their IT policy. The two mistakes cost different
+    /// amounts: an unwanted notice is dismissed once, a missing one leaves the
+    /// user testing against a route that was never assigned.
+    UnassignedTunnelDetected {
+        sid: String,
+        /// Adapter description as the interfaces list shows it, so the notice
+        /// can name the connection the user just started.
+        adapter_name: String,
+    },
     /// A new block episode was recorded for `sid` and survived muting — the
     /// tray shows it as a notice. Fires once per episode (see
     /// `nrr_domain::block_notice`), not once per retried packet: a blocked
@@ -1243,10 +1278,34 @@ pub enum StatusUpdateEvent {
         /// Image name of the process that tried; empty when unknown.
         app: String,
         /// Reason slug (`"route-unavailable"` / `"not-covered-by-rules"` /
-        /// `"blocked-by-rule"` / `"unattributed"`), drives the notice wording.
+        /// `"blocked-by-rule"` / `"ipv6-blocked"` / `"unattributed"`), drives
+        /// the notice wording.
         reason: String,
         /// Attempts folded into this episode so far.
         attempts: u64,
+    },
+    /// Whether this SID's policy is actually being enforced, and what the user
+    /// has to do when it is not.
+    ///
+    /// Exists because "the service is running" and "your rules are in force"
+    /// are different facts, and only the first one was ever visible: a binding
+    /// the service cannot resolve, or a missing primary, left the product
+    /// looking healthy while it routed nothing. Published on CHANGE only —
+    /// `status = "ok"` clears a standing notice.
+    EnforcementStatusChanged {
+        sid: String,
+        /// `"ok"` | `"adapter-choice-needed"` | `"no-primary-route"` |
+        /// `"no-policy"` | `"adapters-unreadable"`. A client that does not
+        /// recognise a value shows the generic "your rules are not being
+        /// applied" wording rather than nothing.
+        status: String,
+        /// Binding role the status is about (`"primary"` / `"secondary"`);
+        /// empty when it is not about one role.
+        role: String,
+        /// Adapters the user could pick from, by the name the interfaces list
+        /// shows. Only populated for `"adapter-choice-needed"`.
+        #[serde(default)]
+        candidates: Vec<String>,
     },
 }
 
@@ -1557,6 +1616,25 @@ pub struct RoutePolicyDto {
     #[serde(default)]
     pub auto_rules_eager_delivery_names: bool,
     pub binding_source: BindingSourceDto,
+    /// May the service check "does this answer on the main link?" on its own?
+    /// Defaulted so an older peer reads as "only when asked", which is the
+    /// stored default too.
+    #[serde(default)]
+    pub primary_probe_auto: bool,
+    /// Bounds for one such pass. Defaulted to the service's own values so an
+    /// omitted key means the same thing everywhere; the service clamps each one
+    /// into its allowed range regardless of who sent it.
+    #[serde(default = "default_probe_timeout_ms")]
+    pub primary_probe_timeout_ms: u32,
+    #[serde(default = "default_probe_max_targets")]
+    pub primary_probe_max_targets: u32,
+    #[serde(default = "default_probe_repeat_secs")]
+    pub primary_probe_repeat_secs: u32,
+    /// Cut IPv6 while leak protection is on. Defaults to ON: Free pins IPv4
+    /// only, so a host with an AAAA record would otherwise keep a second,
+    /// unpinned way out — the rule would be applied to half the host.
+    #[serde(default = "default_block_ipv6_when_protected")]
+    pub block_ipv6_when_protected: bool,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -1587,7 +1665,7 @@ pub struct LinkProviderAppDto {
 /// `route.link-provider.set` request — replace the caller's link-provider app
 /// set for one binding role. Full-replacement semantics: an empty list clears
 /// the set ("I don't use a VPN"). `role` defaults to `secondary` (the only
-/// role with a provider-app story in Free; Pro grows more roles/bindings).
+/// role with a provider-app story; more roles may come with more bindings).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct RouteLinkProviderSetRequest {
@@ -1779,6 +1857,25 @@ pub struct RoutePolicyUpdateRequest {
     #[serde(default)]
     pub auto_rules_eager_delivery_names: bool,
     pub binding_source: BindingSourceDto,
+    /// May the service check "does this answer on the main link?" on its own?
+    /// Defaulted so an older peer reads as "only when asked", which is the
+    /// stored default too.
+    #[serde(default)]
+    pub primary_probe_auto: bool,
+    /// Bounds for one such pass. Defaulted to the service's own values so an
+    /// omitted key means the same thing everywhere; the service clamps each one
+    /// into its allowed range regardless of who sent it.
+    #[serde(default = "default_probe_timeout_ms")]
+    pub primary_probe_timeout_ms: u32,
+    #[serde(default = "default_probe_max_targets")]
+    pub primary_probe_max_targets: u32,
+    #[serde(default = "default_probe_repeat_secs")]
+    pub primary_probe_repeat_secs: u32,
+    /// Cut IPv6 while leak protection is on. Defaults to ON: Free pins IPv4
+    /// only, so a host with an AAAA record would otherwise keep a second,
+    /// unpinned way out — the rule would be applied to half the host.
+    #[serde(default = "default_block_ipv6_when_protected")]
+    pub block_ipv6_when_protected: bool,
 }
 
 impl RoutePolicyUpdateRequest {
@@ -1822,6 +1919,11 @@ impl RoutePolicyUpdateRequest {
             kill_switch_strict_shared_ips,
             auto_rules_mode,
             auto_rules_eager_delivery_names,
+            primary_probe_auto,
+            primary_probe_timeout_ms,
+            primary_probe_max_targets,
+            primary_probe_repeat_secs,
+            block_ipv6_when_protected,
             binding_source: _,
         } = self;
         let RoutePolicyDto {
@@ -1845,6 +1947,11 @@ impl RoutePolicyUpdateRequest {
             kill_switch_strict_shared_ips: stored_strict_shared_ips,
             auto_rules_mode: stored_auto_rules_mode,
             auto_rules_eager_delivery_names: stored_eager_delivery,
+            primary_probe_auto: stored_probe_auto,
+            primary_probe_timeout_ms: stored_probe_timeout,
+            primary_probe_max_targets: stored_probe_max_targets,
+            primary_probe_repeat_secs: stored_probe_repeat,
+            block_ipv6_when_protected: stored_block_v6,
             binding_source: _,
         } = current;
 
@@ -1867,6 +1974,11 @@ impl RoutePolicyUpdateRequest {
             || kill_switch_strict_shared_ips != stored_strict_shared_ips
             || auto_rules_mode != stored_auto_rules_mode
             || auto_rules_eager_delivery_names != stored_eager_delivery
+            || primary_probe_auto != stored_probe_auto
+            || primary_probe_timeout_ms != stored_probe_timeout
+            || primary_probe_max_targets != stored_probe_max_targets
+            || primary_probe_repeat_secs != stored_probe_repeat
+            || block_ipv6_when_protected != stored_block_v6
     }
 }
 
@@ -2977,6 +3089,160 @@ pub struct TrafficStatsSetRequest {
     pub settings: TrafficStatsSettingsDto,
 }
 
+/// Probing bounds a peer that omits them agrees to. Declared once so the wire,
+/// the stored row and the QML defaults table cannot drift apart — the contract
+/// test compares all three.
+/// IPv6 is cut by default while protection is on — see the field docs.
+fn default_block_ipv6_when_protected() -> bool {
+    true
+}
+
+fn default_probe_timeout_ms() -> u32 {
+    1500
+}
+fn default_probe_max_targets() -> u32 {
+    8
+}
+fn default_probe_repeat_secs() -> u32 {
+    300
+}
+
+// ── Probing a suggestion against the main link ───────────────────────────────
+
+/// `autorules.candidates.probe` — check the named suggestions, or every pending
+/// one when `ids` is empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutoRuleCandidatesProbeRequest {
+    #[serde(default)]
+    pub ids: Vec<String>,
+    /// Rule hosts to examine instead of pending suggestions.
+    ///
+    /// The same question asked of an address already in the rule set: does the
+    /// main link reach it? A user looking at their rules wants to know which
+    /// ones still earn their place, and the mechanism is identical — only the
+    /// source of the host list differs. Empty (the default) keeps the original
+    /// behaviour, so an older GUI is unaffected.
+    #[serde(default)]
+    pub rule_hostnames: Vec<String>,
+}
+
+/// The pass is accepted, not awaited: verdicts land through
+/// `AutoRuleCandidatesChanged` once the probing thread finishes, so a slow link
+/// cannot hold the GUI's request open.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AutoRuleCandidatesProbeResponse {
+    /// How many hosts the pass will examine after limits and the repeat window
+    /// were applied. Zero means everything was already answered recently — the
+    /// GUI says so instead of showing a spinner that resolves to nothing.
+    pub accepted: u32,
+    /// Hosts left out because the pass hit the caller's target limit.
+    #[serde(default)]
+    pub over_limit: u32,
+}
+
+// ── Sites that refuse main-link addresses ────────────────────────────────────
+
+/// `autorules.refusing-anchor.set` — mark or unmark one site.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RefusingAnchorSetRequest {
+    pub hostname: String,
+    pub refusing: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RefusingAnchorSetResponse {
+    /// Every site the caller has marked, after the write.
+    #[serde(default)]
+    pub refusing: Vec<String>,
+}
+
+// ── Local networks under the kill-switch ─────────────────────────────────────
+
+/// Where a local network in the list came from, so the GUI can explain itself:
+/// the main link's own subnet, the host side of a hypervisor adapter, or a
+/// network the user named because nothing on the machine reveals it.
+pub const LOCAL_NETWORK_KIND_MAIN_LINK: &str = "main-link";
+pub const LOCAL_NETWORK_KIND_VIRTUAL_MACHINE: &str = "virtual-machine";
+pub const LOCAL_NETWORK_KIND_MANUAL: &str = "manual";
+
+/// One local network the kill-switch may leave reachable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworkDto {
+    /// Canonical `a.b.c.d/len`.
+    pub cidr: String,
+    /// One of the `LOCAL_NETWORK_KIND_*` slugs.
+    pub kind: String,
+    /// Adapter this network belongs to, by the name the interfaces list shows.
+    /// Empty for a network the user named themselves.
+    #[serde(default)]
+    pub adapter: String,
+    /// Whether it is exempt right now — the automatic answer, with the user's
+    /// own decision already applied.
+    pub allowed: bool,
+    /// `true` when the state above comes from a stored decision rather than the
+    /// automatic answer, so the GUI can offer "back to automatic".
+    #[serde(default)]
+    pub decided_by_user: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworksGetRequest {}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworksGetResponse {
+    /// Discovered networks first (main link, then hypervisor segments), then
+    /// the user's own entries; each group ordered by network.
+    #[serde(default)]
+    pub networks: Vec<LocalNetworkDto>,
+}
+
+/// One decision to store. `allowed` is what the user wants; `cidr` may name a
+/// network the service never discovered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworkDecisionDto {
+    pub cidr: String,
+    pub allowed: bool,
+}
+
+/// `settings.local-networks.set` — decisions to record, and decisions to
+/// forget (the network returns to the automatic answer).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworksSetRequest {
+    #[serde(default)]
+    pub decisions: Vec<LocalNetworkDecisionDto>,
+    #[serde(default)]
+    pub forget: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworksSetResponse {
+    /// The list as it stands after the write — same shape as the read, so the
+    /// GUI never has to guess what the service made of its request.
+    #[serde(default)]
+    pub networks: Vec<LocalNetworkDto>,
+    /// Entries the service refused, with the reason slug (`malformed-cidr`,
+    /// `not-private`). Refusing one entry never fails the whole write.
+    #[serde(default)]
+    pub rejected: Vec<LocalNetworkRejectionDto>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct LocalNetworkRejectionDto {
+    pub cidr: String,
+    pub reason: String,
+}
+
 // ── Companion-domain suggestions ─────────────────────────────────────────────
 
 /// Slug for [`AutoRuleCandidateDto::match_kind`] when the suggestion is one
@@ -3112,6 +3378,12 @@ pub struct AutoRuleCandidateDto {
     /// predate it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub primary_behavior: String,
+    /// Whether the user marked this candidate's anchor as answering the main
+    /// link with a refusal. Defaulted so an older service reads as "not
+    /// marked"; the GUI uses it to explain why a reachable address is still
+    /// worth adding.
+    #[serde(default)]
+    pub anchor_refuses_main_link: bool,
 }
 
 /// `autorules.candidates.list` request — no parameters; the caller's own SID
@@ -3126,6 +3398,14 @@ pub struct AutoRuleCandidatesListRequest {}
 #[serde(rename_all = "kebab-case")]
 pub struct AutoRuleCandidatesListResponse {
     pub candidates: Vec<AutoRuleCandidateDto>,
+    /// Companions the last pass declined to offer because the site pulling them
+    /// already travels the route they would be sent to. Lets the screen explain
+    /// an empty list instead of looking broken.
+    #[serde(default)]
+    pub inert_dropped: u64,
+    /// A few of those names, for a concrete "your site was among them".
+    #[serde(default)]
+    pub inert_sample: Vec<String>,
 }
 
 /// Request shared by `autorules.candidates.accept` and
@@ -3237,6 +3517,53 @@ pub struct BlockNoticeMuteDto {
     pub until_unix_ms: Option<u64>,
 }
 
+/// One notice from the caller's backlog — a block that happened while no
+/// surface was subscribed to show it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BlockNoticeJournalEntryDto {
+    /// Backlog id; the largest one shown goes back in the ack.
+    pub id: i64,
+    /// Wall-clock Unix ms the notice was raised at.
+    pub raised_at_unix_ms: i64,
+    pub destination: String,
+    /// Empty when the owning process could not be determined.
+    pub app: String,
+    /// `BlockReason` slug, same vocabulary the live push event uses.
+    pub reason: String,
+    pub attempts: u64,
+}
+
+/// `block-notices.journal.list` request — no parameters; the caller's own SID
+/// scopes the read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BlockNoticeJournalListRequest {}
+
+/// `block-notices.journal.list` response — oldest first, the order the
+/// notices would have arrived in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BlockNoticeJournalListResponse {
+    pub entries: Vec<BlockNoticeJournalEntryDto>,
+}
+
+/// `block-notices.journal.ack` request — everything up to and including
+/// `through-id` has been shown.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BlockNoticeJournalAckRequest {
+    pub through_id: i64,
+}
+
+/// `block-notices.journal.ack` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BlockNoticeJournalAckResponse {
+    /// Backlog entries dropped by this call.
+    pub acknowledged: u64,
+}
+
 /// `block-notices.mutes.list` request — no parameters; the caller's own SID
 /// scopes the read.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3325,7 +3652,33 @@ pub struct BlockNoticeRouteToSecondaryResponse {
 /// own principal, same shape as `block-notices.mutes.clear`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct PrincipalDataPurgeRequest {}
+pub struct PrincipalDataPurgeRequest {
+    /// Also drop the rules the SERVICE holds for this caller — revision
+    /// history, the active pointer, unconsumed mutation tokens. Only a full
+    /// reset asks for it; every other caller leaves the rules alone.
+    #[serde(default)]
+    pub include_rules_history: bool,
+    /// Purge EVERY principal, not just the caller. Machine-wide, so the
+    /// service refuses it without elevation. Absent = the caller alone, which
+    /// is what every pre-existing peer meant.
+    #[serde(default)]
+    pub all_principals: bool,
+}
+
+/// `principal-data.count` request — no parameters.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PrincipalDataCountRequest {}
+
+/// `principal-data.count` response. A COUNT, never a list of identities: full
+/// reset needs to know whether other OS users have rules here, not who they
+/// are.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PrincipalDataCountResponse {
+    /// Principals other than the caller that the service holds rules for.
+    pub other_principals: u32,
+}
 
 /// `principal-data.purge` response.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -3335,6 +3688,14 @@ pub struct PrincipalDataPurgeResponse {
     pub rows_deleted: u64,
     /// How many of the purged tables actually held a row for this caller.
     pub tables_touched: u32,
+    /// Rows deleted from the service's own rule storage; zero unless the
+    /// request asked for it.
+    #[serde(default)]
+    pub rules_rows_deleted: u64,
+    /// How many principals were purged. 1 for the ordinary caller-scoped
+    /// reset; more only when `all-principals` was asked for and granted.
+    #[serde(default)]
+    pub principals_purged: u32,
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -3458,6 +3819,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: auto_rules_mode.to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -3788,6 +4154,7 @@ mod tests {
             }],
             consumers_changed_unix_ms: 2,
             primary_behavior: AUTO_RULE_PRIMARY_BEHAVIOR_STALLS.into(),
+            anchor_refuses_main_link: false,
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         for key in [
@@ -3830,6 +4197,7 @@ mod tests {
             consumers: Vec::new(),
             consumers_changed_unix_ms: 0,
             primary_behavior: String::new(),
+            anchor_refuses_main_link: false,
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         let keys: Vec<&String> = json.as_object().expect("object").keys().collect::<Vec<_>>();

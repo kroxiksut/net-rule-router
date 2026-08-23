@@ -266,6 +266,15 @@ Exact IPv4 address. IPv6 and CIDR notation are not supported yet.
 203.0.113.7
 ```
 
+> Whole subnets are not written here — the rules file matches single IPv4
+> addresses only. A whole subnet belongs to the **Local networks** list in
+> Settings, a separate mechanism that is the only place accepting CIDR
+> notation. That list has a different job: it names local network segments —
+> for example a hypervisor's virtual-machine network, or the subnet of your
+> main connection — that must stay reachable while routed traffic is
+> blocked. It does not send traffic anywhere; it only keeps local segments
+> reachable.
+
 #### Windows / Linux / MacOS (application sections)
 
 Process filename match. Both exact names and glob patterns are accepted.
@@ -573,6 +582,27 @@ Key properties:
 - **A line without an `auto:` token is still a rule.** It is imported as an
   ordinary rule of that file's route and reported as a warning, never dropped
   and never treated as an error. Hand-editing this section cannot lose rules.
+
+### 1.14 Routing another VPN client through the public VPN
+
+A common question: you already route traffic through a public VPN, and you
+want a *different* VPN client — for example a corporate one — to go out
+through that same connection. There are two ways to do it. Assign the public
+VPN as the **main route**, and everything on the machine goes through it by
+default, with no further rules needed. Or leave the public VPN as the
+**additional route**, set default behavior (§1.5) so unmatched traffic
+prefers the additional route, and add an application rule for the other
+client's executable under the application sections (§1.8, `Windows` /
+`Linux` / `MacOS`).
+
+Name the **other** client's executable in that rule — never the client whose
+own tunnel is already serving as the route. Pointing a client at its own
+tunnel is a loop, not a chain.
+
+One thing worth knowing before setting this up: it is a VPN running inside a
+VPN. Double encryption costs noticeable speed, and a corporate VPN client may
+refuse to connect at all once it detects it is running through another
+tunnel.
 
 ---
 

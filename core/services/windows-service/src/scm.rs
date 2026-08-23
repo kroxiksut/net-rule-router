@@ -36,7 +36,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use nrr_platform_api::service_control::{ServiceControlError, ServiceControlPort};
+use nrr_platform_windows::event_log::WindowsEventLog;
 use nrr_platform_windows::service_control::WindowsServiceControl;
+use nrr_service_runtime::lifecycle_journal::LifecycleJournal;
 use nrr_service_runtime::{
     run_bootstrap, run_supervised_runtime, BootstrapConfig, InstallConfig, InstallOutcome,
     LifecycleEvent, ServiceController, ServiceRuntimeState, StopToken, UninstallConfig,
@@ -122,6 +124,7 @@ pub fn run_under_scm() -> Result<(), ScmError> {
 fn scm_service_main(_args: Vec<OsString>) {
     // First thing in the process under SCM: without this, a panic during
     // startup leaves no trace anywhere.
+    #[cfg(windows)]
     capture_stderr();
     let _ = run_scm_inner();
 }
@@ -129,6 +132,7 @@ fn scm_service_main(_args: Vec<OsString>) {
 /// Send stderr to a file in the log directory. Resolves the directory
 /// directly rather than waiting for bootstrap, because the failures worth
 /// catching happen before bootstrap returns.
+#[cfg(windows)]
 fn capture_stderr() {
     let Ok(topology) =
         nrr_storage::resolve_storage_topology(&nrr_storage::StorageProfile::ProductionService)
@@ -183,9 +187,15 @@ fn run_scm_inner() -> Result<(), ScmError> {
         /// Bumped on every pending report. SCM reads a rising checkpoint as
         /// "still making progress"; a fixed one lets it decide we are wedged.
         checkpoint: std::sync::atomic::AtomicU32,
+        /// Mirrors the outcomes into the Application event log, so an operator
+        /// who has never opened this product still sees that it started, stopped
+        /// or came up unable to enforce. SCM state alone cannot say the last one:
+        /// `RecoveryRequired` reports as `Running`.
+        journal: LifecycleJournal,
     }
     impl ServiceController for ScmController {
         fn report(&self, state: ServiceRuntimeState) {
+            self.journal.observe(state);
             let scm_state = match state {
                 ServiceRuntimeState::Starting => ServiceState::StartPending,
                 ServiceRuntimeState::Running
@@ -237,6 +247,7 @@ fn run_scm_inner() -> Result<(), ScmError> {
     let controller = ScmController {
         handle: status_handle,
         checkpoint: std::sync::atomic::AtomicU32::new(0),
+        journal: LifecycleJournal::new(std::sync::Arc::new(WindowsEventLog::new())),
     };
     // Production bootstrap profile (`%ProgramData%`-rooted service-owned
     // topology). The topology resolver itself is profile-agnostic.
@@ -322,6 +333,14 @@ fn run_scm_inner() -> Result<(), ScmError> {
     tracing::info!(target: "nrr::boot", stage = "run-runtime", "boot stage entered");
     let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
 
+    // Net-event collection is a MACHINE-WIDE Base Filtering Engine setting, not
+    // a property of our handle: left on, BFE goes on recording every classify
+    // for every process on the host with nobody consuming the events. Put it
+    // back here rather than trusting the observer's `Drop` — a source the
+    // consumer threads still reference is never dropped.
+    #[cfg(target_os = "windows")]
+    nrr_platform_windows::conn_observe::wfp_events::restore_engine_options();
+
     // Drain any control events that arrived after Stop so we don't
     // leave them dangling in the channel.
     while rx.try_recv().is_ok() {}
@@ -388,6 +407,7 @@ pub fn uninstall_service_with_config(
     Ok(UninstallOutcome {
         data_removed: report.data_removed,
         rule_files_preserved: config.preserve_user_rule_files,
+        machine_state_cleared: report.machine_state_cleared,
     })
 }
 

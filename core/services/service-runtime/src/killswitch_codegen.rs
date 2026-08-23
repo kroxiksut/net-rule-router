@@ -732,6 +732,9 @@ pub fn catch_all_kill_switch_filters(
     // #6 — limited broadcast (DHCP discover/request).
     filters.push(exempt_host(sid, Ipv4Addr::BROADCAST, weight));
     weight += 1;
+    // #7 — the local network control block (mDNS/LLMNR/IGMP).
+    filters.push(exempt_subnet(sid, V4_LOCAL_NETWORK_CONTROL, 24, weight));
+    weight += 1;
     // #4 — the VPN server(s), so the tunnel can (re)establish.
     for ip in &resolution.bootstrap_server_ips {
         filters.push(exempt_host(sid, *ip, weight));
@@ -788,6 +791,14 @@ pub fn catch_all_kill_switch_filters(
         pw += 1;
         filters.push(packet_exempt_host(sid, TR, Ipv4Addr::BROADCAST, pw));
         pw += 1;
+        filters.push(packet_exempt_subnet(
+            sid,
+            TR,
+            V4_LOCAL_NETWORK_CONTROL,
+            24,
+            pw,
+        ));
+        pw += 1;
         for ip in &resolution.bootstrap_server_ips {
             filters.push(packet_exempt_host(sid, TR, *ip, pw));
             pw += 1;
@@ -800,9 +811,10 @@ pub fn catch_all_kill_switch_filters(
     }
 
     // ── IPv6 (Free's only IPv6 handling) ──
-    // Whenever the catch-all arms, cut ALL outbound IPv6 too (except loopback +
-    // link-local), independent of the V4 protocol mask above. Selective per-IP
-    // V6 needs AAAA (Pro); the catch-all just closes the IPv6 leak entirely.
+    // Whenever the catch-all arms, cut ALL outbound IPv6 too (except loopback,
+    // link-local and link-local multicast), independent of the V4 protocol
+    // mask above. Selective per-IP
+    // V6 needs AAAA, which is not done; the catch-all closes the IPv6 leak.
     filters.extend(catch_all_v6_filters(sid));
 
     filters
@@ -1064,27 +1076,44 @@ fn catch_all_block(sid: &str) -> WfpFilterSpec {
 
 // ── IPv6 catch-all coverage (Free's only IPv6 handling) ─────────────────────
 //
-// Free does no IPv6 routing (selective per-destination V6 needs AAAA — a Pro
-// feature), so the only IPv6 the product ever touches is this: whenever a
+// There is no IPv6 routing (selective per-destination V6 needs AAAA, which is
+// not done), so the only IPv6 the product ever touches is this: whenever a
 // catch-all block arms, ALL outbound IPv6 is cut too, except loopback
-// (`::1/128`) and link-local (`fe80::/10`). It mirrors the V4
+// (`::1/128`), link-local (`fe80::/10`) and link-local multicast
+// (`ff02::/16`). It mirrors the V4
 // exemption-permit-over-block-all pattern at the two IPv6 WFP layers (ALE
 // connect for TCP/UDP, packet for ICMPv6/etc.). The exemption/block weight
 // bands are reused from V4 — the V6 layers arbitrate SEPARATELY, so there is no
 // cross-layer weight collision.
 
+/// IPv4 local network control block `224.0.0.0/24` — exempt. The v4 twin of
+/// `ff02::/16`: mDNS (`224.0.0.251`), LLMNR (`.252`), IGMP membership (`.22`)
+/// and the router/all-hosts groups live here, routers never forward it, so
+/// cutting it breaks the link's own upkeep and leaks nothing. Wider multicast
+/// (SSDP's `239.255.255.250`, any global-scope group) is NOT exempt — its scope
+/// does leave the link.
+const V4_LOCAL_NETWORK_CONTROL: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 0);
+
 /// IPv6 loopback `::1/128` — exempt (local IPC / stub resolvers over v6).
 const V6_LOOPBACK: Ipv6Addr = Ipv6Addr::LOCALHOST;
-/// IPv6 link-local base `fe80::` (paired with `/10`) — exempt (SLAAC/NDP/mDNS).
+/// IPv6 link-local base `fe80::` (paired with `/10`) — exempt (the unicast
+/// half of SLAAC/NDP).
 const V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
+/// IPv6 link-local MULTICAST base `ff02::` (paired with `/16`) — exempt.
+/// Neighbour discovery, duplicate-address detection, MLD, mDNS, LLMNR and
+/// DHCPv6 all address the GROUP, not `fe80::`, so the unicast exemption above
+/// never covered them: cutting this scope breaks the link's own upkeep while
+/// leaking nothing — link-local multicast cannot cross a router.
+const V6_LINK_LOCAL_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0);
 
-/// Emit the IPv6 half of a catch-all block: loopback + link-local exemption
-/// permits over an unconditional block-all, at BOTH the V6 ALE-connect and V6
+/// Emit the IPv6 half of a catch-all block: loopback + link-local +
+/// link-local-multicast exemption permits over an unconditional block-all, at
+/// BOTH the V6 ALE-connect and V6
 /// packet layers. ALE-layer filters are scoped to `sid` (the V6 ALE layer
 /// exposes `ALE_USER_ID`); packet-layer filters carry `user_sid = None` (no ALE
 /// id there — the same caveat as the V4 packet layer). Distinct id seeds per
 /// (layer, target) so every filter gets a unique UUID.
-fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
+pub fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
     vec![
         // ── V6 ALE connect layer (TCP/UDP over IPv6) ──
         exempt_subnet_v6(
@@ -1101,6 +1130,13 @@ fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
             10,
             CATCHALL_EXEMPT_BASE + 1,
         ),
+        exempt_subnet_v6(
+            sid,
+            WfpLayerKey::AleAuthConnectV6,
+            V6_LINK_LOCAL_MULTICAST,
+            16,
+            CATCHALL_EXEMPT_BASE + 2,
+        ),
         block_all_v6(sid, WfpLayerKey::AleAuthConnectV6),
         // ── V6 packet layer (ICMPv6 / everything else) ──
         exempt_subnet_v6(
@@ -1116,6 +1152,13 @@ fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
             V6_LINK_LOCAL,
             10,
             PACKET_EXEMPT_BASE + 1,
+        ),
+        exempt_subnet_v6(
+            sid,
+            WfpLayerKey::OutboundIpPacketV6,
+            V6_LINK_LOCAL_MULTICAST,
+            16,
+            PACKET_EXEMPT_BASE + 2,
         ),
         block_all_v6(sid, WfpLayerKey::OutboundIpPacketV6),
     ]
@@ -1367,6 +1410,9 @@ pub fn fail_closed_block_all_filters(
     // Limited broadcast (DHCP discover/request).
     filters.push(exempt_host(sid, Ipv4Addr::BROADCAST, weight));
     weight += 1;
+    // The local network control block (mDNS/LLMNR/IGMP).
+    filters.push(exempt_subnet(sid, V4_LOCAL_NETWORK_CONTROL, 24, weight));
+    weight += 1;
     // Known VPN server(s), so the tunnel can (re)establish.
     for ip in &exemptions.bootstrap_server_ips {
         filters.push(exempt_host(sid, *ip, weight));
@@ -1440,6 +1486,14 @@ pub fn fail_closed_block_all_filters(
         pw += 1;
         filters.push(packet_exempt_host(sid, TR, Ipv4Addr::BROADCAST, pw));
         pw += 1;
+        filters.push(packet_exempt_subnet(
+            sid,
+            TR,
+            V4_LOCAL_NETWORK_CONTROL,
+            24,
+            pw,
+        ));
+        pw += 1;
         for ip in &exemptions.bootstrap_server_ips {
             filters.push(packet_exempt_host(sid, TR, *ip, pw));
             pw += 1;
@@ -1489,8 +1543,9 @@ pub fn fail_closed_block_all_filters(
     }
 
     // ── IPv6 (Free's only IPv6 handling) ──
-    // The secondary is gone, so cut ALL outbound IPv6 too (except loopback +
-    // link-local), independent of the V4 protocol mask above.
+    // The secondary is gone, so cut ALL outbound IPv6 too (except loopback,
+    // link-local and link-local multicast), independent of the V4 protocol
+    // mask above.
     filters.extend(catch_all_v6_filters(sid));
 
     filters
@@ -2415,13 +2470,13 @@ mod tests {
     #[test]
     fn catch_all_emits_exemptions_and_block() {
         let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
-        // ALE layer: egress + loopback + link-local + broadcast + 1 server
-        //   + 1 subnet + block = 7.
+        // ALE layer: egress + loopback + link-local + broadcast +
+        //   local-network-control + 1 server + 1 subnet + block = 8.
         let ale: Vec<_> = out
             .iter()
             .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
             .collect();
-        assert_eq!(ale.len(), 7, "ALE: 6 exemptions + 1 catch-all block");
+        assert_eq!(ale.len(), 8, "ALE: 7 exemptions + 1 catch-all block");
         assert_eq!(
             ale.iter()
                 .filter(|f| f.local_interface_luid == Some(LUID))
@@ -2431,9 +2486,13 @@ mod tests {
         );
         assert_eq!(
             ale.iter().filter(|f| f.remote_subnet.is_some()).count(),
-            3,
-            "loopback + link-local + LAN subnet"
+            4,
+            "loopback + link-local + local-network-control + LAN subnet"
         );
+        // The v4 twin of the `ff02::/16` exemption: mDNS/LLMNR/IGMP live here
+        // and never leave the link, so cutting them only breaks discovery.
+        assert!(ale.iter().any(|f| f.action == WfpAction::Permit
+            && f.remote_subnet == Some((Ipv4Addr::new(224, 0, 0, 0), 24))));
         assert_eq!(
             ale.iter().filter(|f| f.remote_ip.is_some()).count(),
             2,
@@ -2444,16 +2503,17 @@ mod tests {
             1,
             "exactly one ALE catch-all block"
         );
-        // Packet layer (P2): egress + loopback + link-local + broadcast
-        //   + 1 server + 1 subnet + 4 named protocol blocks = 10
-        //   (16.HW-0716: one block per ICMP/IGMP/GRE/ESP, no agnostic block-all).
+        // Packet layer: egress + loopback + link-local + broadcast +
+        //   local-network-control + 1 server + 1 subnet + 4 named protocol
+        //   blocks = 11 (one block per ICMP/IGMP/GRE/ESP, no agnostic
+        //   block-all).
         let pkt: Vec<_> = out
             .iter()
             .filter(|f| f.layer == WfpLayerKey::OutboundTransportV4)
             .collect();
         assert_eq!(
             pkt.len(),
-            10,
+            11,
             "packet layer mirrors the ALE exemptions + named blocks"
         );
         assert_eq!(
@@ -2899,12 +2959,12 @@ mod tests {
             ..FailClosedExemptions::default()
         };
         let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);
-        // ALE: loopback+link-local+broadcast+server+subnet + block-all = 6.
-        // Packet: same 5 exemptions + 4 named protocol blocks = 9
-        //   (16.HW-0716: ICMP/IGMP/GRE/ESP, no agnostic block-all).
-        // IPv6: V6 ALE (loopback+link-local+block = 3) + V6 packet (3) = 6.
-        // Total 21.
-        assert_eq!(out.len(), 21);
+        // ALE: loopback+link-local+broadcast+local-network-control+server+
+        //   subnet + block-all = 7. Packet: same 6 exemptions + 4 named
+        //   protocol blocks = 10 (ICMP/IGMP/GRE/ESP, no agnostic block-all).
+        // IPv6: V6 ALE (loopback+link-local+link-local-multicast+block = 4)
+        // + V6 packet (4) = 8. Total 25.
+        assert_eq!(out.len(), 25);
         let ale_block = out
             .iter()
             .find(|f| f.action == WfpAction::Block && f.layer == WfpLayerKey::AleAuthConnectV4)
@@ -3016,10 +3076,11 @@ mod tests {
             &FailClosedExemptions::default(),
             KillSwitchProtocols::ALL,
         );
-        // ALE: loopback+link-local+broadcast + block = 4. Packet: same 3
-        // exemptions + 4 named protocol blocks = 7 (16.HW-0716). IPv6: V6 ALE
-        // (loopback+link-local+block = 3) + V6 packet (3) = 6. Total 17.
-        assert_eq!(out.len(), 17);
+        // ALE: loopback+link-local+broadcast+local-network-control + block = 5.
+        // Packet: same 4 exemptions + 4 named protocol blocks = 8. IPv6: V6 ALE
+        // (loopback+link-local+link-local-multicast+block = 4) + V6 packet (4)
+        // = 8. Total 21.
+        assert_eq!(out.len(), 21);
         assert_eq!(
             out.iter().filter(|f| f.action == WfpAction::Block).count(),
             7,
@@ -3029,8 +3090,9 @@ mod tests {
 
     // ── IPv6 catch-all coverage (Free's only IPv6 handling) ─────────────────
 
-    /// Every V6 filter emitted by a catch-all: loopback + link-local exemption
-    /// permits over a block-all, at BOTH V6 layers.
+    /// Every V6 filter emitted by a catch-all: loopback + link-local +
+    /// link-local-multicast exemption permits over a block-all, at BOTH V6
+    /// layers.
     fn v6_filters(out: &[WfpFilterSpec]) -> Vec<&WfpFilterSpec> {
         out.iter()
             .filter(|f| {
@@ -3052,14 +3114,18 @@ mod tests {
             let at: Vec<_> = out.iter().filter(|f| f.layer == layer).collect();
             assert_eq!(
                 at.len(),
-                3,
-                "{layer:?}: loopback + link-local exemptions + one block-all"
+                4,
+                "{layer:?}: loopback + link-local + link-local-multicast exemptions + one block-all"
             );
-            // ::1/128 and fe80::/10 exemptions.
+            // ::1/128, fe80::/10 and ff02::/16 exemptions.
             assert!(at.iter().any(|f| f.action == WfpAction::Permit
                 && f.remote_subnet_v6 == Some((Ipv6Addr::LOCALHOST, 128))));
             assert!(at.iter().any(|f| f.action == WfpAction::Permit
                 && f.remote_subnet_v6 == Some((Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10))));
+            // Neighbour discovery, MLD, mDNS and DHCPv6 address the GROUP, so
+            // without this one the link's own upkeep is what the cut destroys.
+            assert!(at.iter().any(|f| f.action == WfpAction::Permit
+                && f.remote_subnet_v6 == Some((Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0), 16))));
             // One unconditional block-all.
             let block = at.iter().find(|f| f.action == WfpAction::Block).unwrap();
             assert!(block.remote_ip.is_none());
@@ -3094,8 +3160,8 @@ mod tests {
         let out = catch_all_kill_switch_filters("S", &full_resolution(), tcp_udp);
         assert_eq!(
             v6_filters(&out).len(),
-            6,
-            "6 V6 filters regardless of V4 mask"
+            8,
+            "8 V6 filters regardless of V4 mask"
         );
     }
 
@@ -3108,7 +3174,7 @@ mod tests {
         );
         assert_eq!(
             v6_filters(&out).len(),
-            6,
+            8,
             "V6 half present in fail-closed mode B"
         );
     }
@@ -3116,7 +3182,7 @@ mod tests {
     #[test]
     fn per_ip_paths_never_emit_v6() {
         // The per-destination / per-app fail-closed + kill-switch paths stay
-        // IPv4-only (selective V6 needs AAAA — a Pro feature). None of them may
+        // IPv4-only (selective V6 needs AAAA — not supported). None of them may
         // ever emit a V6-layer filter.
         assert!(v6_filters(&kill_switch_filters(
             "S",

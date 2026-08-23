@@ -164,7 +164,7 @@ pub struct RuntimeInput {
     ///
     /// The raw WFP observation — may be IPv4, IPv6, or IPv4-mapped IPv6.
     /// The normalization stage converts this to [`NormalizedIp`], rejecting
-    /// native IPv6 as Pro-only in Free edition and normalising IPv4-mapped
+    /// native IPv6 as unsupported in Free edition and normalising IPv4-mapped
     /// IPv6 to IPv4 with a warning.
     pub destination_ip: Option<IpAddr>,
     /// Protocol and port hints.

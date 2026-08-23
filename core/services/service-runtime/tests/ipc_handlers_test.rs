@@ -112,7 +112,7 @@ impl MutationExecutor for FakeExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         }
     }
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
@@ -149,7 +149,7 @@ impl MutationExecutor for FailingExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         }
     }
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
@@ -599,6 +599,11 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 kill_switch_strict_shared_ips: request.kill_switch_strict_shared_ips,
                 auto_rules_mode: request.auto_rules_mode.clone(),
                 auto_rules_eager_delivery_names: request.auto_rules_eager_delivery_names,
+                primary_probe_auto: false,
+                primary_probe_timeout_ms: 1500,
+                primary_probe_max_targets: 8,
+                primary_probe_repeat_secs: 300,
+                block_ipv6_when_protected: true,
                 binding_source: request.binding_source,
             },
         )
@@ -676,6 +681,7 @@ fn elevated_gui_ctx() -> IpcRequestContext {
             "S-1-5-21-test-elevated-gui",
         )
         .ok(),
+        caller_pid: None,
     }
 }
 
@@ -687,6 +693,7 @@ fn unprivileged_gui_ctx() -> IpcRequestContext {
             "S-1-5-21-test-unprivileged-gui",
         )
         .ok(),
+        caller_pid: None,
     }
 }
 

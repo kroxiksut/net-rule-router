@@ -153,6 +153,75 @@ Window {
                     "License agreement text")
             }
         }
+        // The agreement points at the emergency reset script; a path the reader
+        // has to hunt for is not a way out of a machine with no network. The
+        // in-app "Restore network" button is still the ordinary route — this is
+        // for the case where the app itself will not start.
+        ColumnLayout {
+            id: resetScriptStrip
+            Layout.fillWidth: true
+            spacing: root.uiTheme.spacingXxs
+            readonly property string scriptPath:
+                String(((root.context || {}).about || {}).resetScriptPath || "")
+            readonly property string scriptCommand:
+                String(((root.context || {}).about || {}).resetScriptCommand || "")
+            visible: licenseWindow.activeTab === "eula" && scriptPath !== ""
+
+            Label {
+                Layout.fillWidth: true
+                color: root.textColor
+                font.bold: true
+                wrapMode: Text.WordWrap
+                text: root.tr("dialog.eula.reset-script.title",
+                    "Emergency network reset script")
+            }
+            Label {
+                Layout.fillWidth: true
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("dialog.eula.reset-script.hint",
+                    "Only needed when the application will not start. The ordinary route is Settings -> Service management -> Restore network.")
+            }
+            Label {
+                Layout.fillWidth: true
+                color: root.mutedTextColor
+                wrapMode: Text.WrapAnywhere
+                font.family: "Consolas, monospace"
+                text: resetScriptStrip.scriptPath
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("action.open-folder", "Open folder")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: {
+                        if (typeof nrrNativeBridge !== "undefined"
+                                && typeof nrrNativeBridge.openContainingFolder === "function") {
+                            nrrNativeBridge.openContainingFolder(resetScriptStrip.scriptPath)
+                        }
+                    }
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    visible: resetScriptStrip.scriptCommand !== ""
+                    text: root.tr("dialog.eula.reset-script.copy-command", "Copy command")
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                    onClicked: {
+                        if (typeof nrrNativeBridge !== "undefined"
+                                && typeof nrrNativeBridge.copyToClipboard === "function") {
+                            nrrNativeBridge.copyToClipboard(resetScriptStrip.scriptCommand)
+                            root.statusLine = root.tr("status.copied-to-clipboard",
+                                "Copied to clipboard.")
+                        }
+                    }
+                }
+                Item { Layout.fillWidth: true }
+            }
+        }
         RowLayout {
             Layout.fillWidth: true
             // Same bilingual switch the acceptance window offers, so the

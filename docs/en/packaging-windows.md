@@ -31,7 +31,8 @@ directory carrying that marker.
 ```
 NetRuleRouter\
   NetRuleRouter.exe     start here
-  READ-ME.txt           end-user notes, in Russian
+  README.txt            end-user notes (English)
+  README.ru.txt         the same notes in Russian
   build-info.json       version, revision, build time
   <tray, service, console, Qt host, the Qt runtime, wintun.dll>
   qml\                  Qt's own modules
@@ -71,7 +72,7 @@ Every package carries `build-info.json`:
 `uncommitted` records whether the working tree had local changes when the
 package was built. When it is `true`, `commit` alone does not identify this
 code — say so in any report about that copy. The same version and revision are
-printed at the top of `READ-ME.txt`, and `-Zip` puts them in the archive name
+printed at the top of both README files, and `-Zip` puts them in the archive name
 so two builds cannot be mistaken for one another.
 
 ## Installing the service on the target machine

@@ -444,6 +444,9 @@ impl ServiceControlPort for LinuxServiceControl {
             data_dirs_created: Vec::new(),
             recovery_configured: true,
             acl_applied: None,
+            // The journal takes the daemon's own output as it is; there is no
+            // source to register.
+            event_source_registered: None,
         })
     }
 
@@ -460,9 +463,17 @@ impl ServiceControlPort for LinuxServiceControl {
         let plan = plan_uninstall(binary_path.as_deref());
         self.execute_uninstall_plan(&plan)?;
 
+        // The unit is gone, but the packet policy the daemon installed is not:
+        // an instance that was killed rather than stopped leaves its nft table
+        // behind, and nothing is left that would clear it. Same reason the
+        // Windows port sweeps WFP and NRPT here.
+        let machine_state_cleared = Some(sweep_nft_policy());
+        sweep_autostart_entry();
+
         if !spec.remove_service_owned_data {
             return Ok(ServiceUninstallReport {
                 data_removed: false,
+                machine_state_cleared,
             });
         }
         // Only the two directories the unit itself provisions. User rule files
@@ -472,7 +483,10 @@ impl ServiceControlPort for LinuxServiceControl {
                 .remove_dir_all(&dir)
                 .map_err(|e| classify_io_failure(&e, "removing the service data directory"))?;
         }
-        Ok(ServiceUninstallReport { data_removed: true })
+        Ok(ServiceUninstallReport {
+            data_removed: true,
+            machine_state_cleared,
+        })
     }
 
     fn start(&self, timeout: Duration) -> Result<(), ServiceControlError> {
@@ -507,6 +521,47 @@ impl ServiceControlPort for LinuxServiceControl {
             return Err(classify_command_failure(&outcome, &argv));
         }
         Ok(parse_show_output(&outcome.stdout))
+    }
+}
+
+/// Delete the daemon's own nftables table, and nothing else.
+///
+/// Returns whether the machine can be considered clean. `nft` unavailable is a
+/// real failure — something may be installed and we cannot see it. A rejection
+/// is read as "there was no table of ours to delete": this product writes
+/// exactly one table, removal runs as root, so with a working `nft` the only
+/// ordinary reason the delete is refused is that the table is not there.
+fn sweep_nft_policy() -> bool {
+    let cli = crate::nft_apply::NftCliEnforcement::new();
+    if cli.probe().is_err() {
+        return false;
+    }
+    if let Err(e) = cli.teardown(crate::lower_linux::NRR_TABLE) {
+        tracing::debug!(
+            target: "nrr::nft",
+            error = %e,
+            "no nftables policy of ours to remove at uninstall",
+        );
+    }
+    true
+}
+
+/// Remove the autostart entry of whoever is running the removal.
+///
+/// Per-user by nature (an XDG desktop entry under the caller's `~/.config`),
+/// so this reaches exactly one home directory. Another account that enabled
+/// autostart keeps its file; the residue is inert, since it names a binary
+/// that no longer exists.
+fn sweep_autostart_entry() {
+    let Ok(registry) = crate::autostart::XdgAutostartRegistry::new() else {
+        return;
+    };
+    if let Err(e) = nrr_platform_api::autostart::AutostartRegistryPort::delete_value(&registry) {
+        tracing::debug!(
+            target: "nrr::autostart",
+            error = ?e,
+            "no autostart entry of ours to remove for this user",
+        );
     }
 }
 

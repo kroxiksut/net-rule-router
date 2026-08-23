@@ -60,6 +60,7 @@ use nrr_platform_windows::{
     MockWindowsApi,
     PlatformStateSnapshot,
     RouteEntry,
+    RouteTablePort,
     RoutingAction,
     WfpAction,
     WfpFilterAction,

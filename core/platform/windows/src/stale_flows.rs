@@ -65,6 +65,41 @@ impl StaleFlowReset for WindowsStaleFlowReset {
         }
         sweep
     }
+
+    /// One table read for the whole address set — a policy apply hands us
+    /// hundreds of freshly-pinned addresses at once.
+    fn reset_flows_to_any(&self, targets: &[Ipv4Addr]) -> StaleFlowSweep {
+        if targets.is_empty() {
+            return StaleFlowSweep::default();
+        }
+        let wanted: std::collections::HashSet<u32> =
+            targets.iter().copied().map(u32::from).collect();
+        let Some(buffer) = read_tcp_owner_pid_table() else {
+            return StaleFlowSweep::default();
+        };
+        let mut sweep = StaleFlowSweep::default();
+        // SAFETY: same invariant as `reset_flows_to` above — the buffer holds a
+        // valid `MIB_TCPTABLE_OWNER_PID` and we read only its declared rows.
+        unsafe {
+            let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+            let count = (*table).dwNumEntries as usize;
+            let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
+            for i in 0..count {
+                let row = &*rows.add(i);
+                if row.dwState != MIB_TCP_STATE_ESTAB.0 as u32 {
+                    continue;
+                }
+                if !wanted.contains(&u32::from_be(row.dwRemoteAddr)) {
+                    continue;
+                }
+                sweep.found += 1;
+                if delete_established_row(row) {
+                    sweep.torn_down += 1;
+                }
+            }
+        }
+        sweep
+    }
 }
 
 /// `ESTABLISHED` and its remote address inside `base`/`prefix_len` — the only

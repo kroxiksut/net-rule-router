@@ -16,7 +16,7 @@ use nrr_platform_api::enforcement::{
     ApplyReport, EnforcementBackend, EnforcementCapabilities, EnforcementPlan,
 };
 
-use crate::lower_linux::{lower_plan, EgressNames, UnsupportedReason};
+use crate::lower_linux::{lower_plans, EgressNames, UnsupportedReason, UnsupportedRule};
 use crate::nft_apply::{NftApplyError, NftCliEnforcement};
 
 /// Enforces a plan with nftables, driving `nft` as the mechanism.
@@ -53,7 +53,11 @@ impl EnforcementBackend for NftablesEnforcement {
     type Error = NftApplyError;
 
     fn reconcile(&self, plan: &EnforcementPlan) -> Result<ApplyReport, Self::Error> {
-        let lowered = lower_plan(plan, &self.egress);
+        self.reconcile_all(std::slice::from_ref(plan))
+    }
+
+    fn reconcile_all(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, Self::Error> {
+        let lowered = lower_plans(plans, &self.egress);
         let applied = lowered.ruleset.rules.len();
 
         self.cli.apply(&lowered.ruleset)?;
@@ -61,21 +65,7 @@ impl EnforcementBackend for NftablesEnforcement {
         // What could not be expressed is REPORTED, never dropped in silence: a
         // backend that quietly enforces less than it was given is
         // indistinguishable from one that enforces all of it.
-        let mut notes = Vec::new();
-        for rule in &lowered.unsupported {
-            notes.push(match &rule.reason {
-                UnsupportedReason::AppScoped { key } => format!(
-                    "rule {} is scoped to application `{key}`: nftables has no per-executable \
-                     match, so it is enforced through observed destinations instead",
-                    rule.index
-                ),
-                UnsupportedReason::UnresolvedEgress => format!(
-                    "rule {} pins egress to an adapter that is not present right now; \
-                     it was NOT applied, so the pinned traffic is not routed by it",
-                    rule.index
-                ),
-            });
-        }
+        let notes = lowered.unsupported.iter().map(note_for).collect();
 
         Ok(ApplyReport {
             applied,
@@ -87,6 +77,23 @@ impl EnforcementBackend for NftablesEnforcement {
 
     fn capabilities(&self) -> EnforcementCapabilities {
         EnforcementCapabilities::linux_mvp()
+    }
+}
+
+/// Say whose rule went unenforced and what the user loses by it — this note is
+/// the only thing about it that reaches an operator.
+pub(crate) fn note_for(rule: &UnsupportedRule) -> String {
+    let (index, who) = (rule.index, &rule.principal);
+    match &rule.reason {
+        UnsupportedReason::AppScoped { key } => format!(
+            "rule {index} of {who} is scoped to application `{key}`: nftables has no per-executable match, so it is enforced through observed destinations instead"
+        ),
+        UnsupportedReason::UnresolvedEgress => format!(
+            "rule {index} of {who} pins egress to an adapter that is not present right now; it was NOT applied, so the pinned traffic is not routed by it"
+        ),
+        UnsupportedReason::UnresolvablePrincipal { stored } => format!(
+            "rule {index} is scoped to `{stored}`, which has no uid on this system; it was NOT applied, because dropping the user condition would apply one user's policy to everyone"
+        ),
     }
 }
 
@@ -153,7 +160,7 @@ mod tests {
             primary: Some("eth0".into()),
             secondary: Some("tun0".into()),
         });
-        let lowered = lower_plan(&plan_with(vec![app_rule()]), &backend.egress);
+        let lowered = lower_plans(&[plan_with(vec![app_rule()])], &backend.egress);
         assert_eq!(lowered.unsupported.len(), 1);
         assert!(lowered.ruleset.rules.is_empty());
     }

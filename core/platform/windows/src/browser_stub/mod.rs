@@ -1,6 +1,6 @@
 //! Browser stub experimental feature.
 //!
-//! ## Status: deferred to post-MVP (Pro-only future feature)
+//! ## Status: deferred to post-MVP (unsupported future feature)
 //!
 //! This module is gated behind the `browser-stub` Cargo feature flag.
 //! In MVP the feature is **disabled at compile time** — no infrastructure
@@ -27,7 +27,7 @@
 //!    Simple to implement but only useful if the DNS redirect works.
 //!
 //! 3. **Kernel callout driver**: the only reliable per-process redirect
-//!    mechanism at the network layer. Out of scope for MVP (Pro feature).
+//!    mechanism at the network layer. Out of scope for MVP (unsupported feature).
 //!
 //! ## Known limitations (must be communicated to user)
 //!

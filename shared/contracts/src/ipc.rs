@@ -367,6 +367,33 @@ pub enum IpcOperationName {
     /// totals + cursors); the settings are kept. Service-global command,
     /// admin-gated.
     TrafficStatsClear,
+    /// Mark (or unmark) a routed site as answering the MAIN link with a
+    /// refusal — the one fact about it no measurement here can establish.
+    /// Per-SID, no elevation; answers with the full marked list.
+    /// [`crate::ipc_payloads::RefusingAnchorSetRequest`] →
+    /// [`crate::ipc_payloads::RefusingAnchorSetResponse`].
+    RefusingAnchorSet,
+    /// Read the local networks the caller may keep reachable while the
+    /// kill-switch blocks everything else: what the service discovered (the
+    /// main link's own subnets and the host side of hypervisor adapters) plus
+    /// the caller's own decisions. Read-only query, per-SID.
+    /// [`crate::ipc_payloads::LocalNetworksGetRequest`] →
+    /// [`crate::ipc_payloads::LocalNetworksGetResponse`].
+    LocalNetworksGet,
+    /// Ask the service to check, right now, whether the addresses behind the
+    /// caller's pending suggestions answer on the MAIN link. Bounded in count
+    /// and time by the caller's probe limits; the verdicts arrive through the
+    /// existing `AutoRuleCandidatesChanged` push, so the reply only says the
+    /// pass was accepted.
+    /// [`crate::ipc_payloads::AutoRuleCandidatesProbeRequest`] →
+    /// [`crate::ipc_payloads::AutoRuleCandidatesProbeResponse`].
+    AutoRuleCandidatesProbe,
+    /// Record the caller's decisions about local networks: refuse a discovered
+    /// one, or name one the service cannot discover (a hypervisor in NAT mode
+    /// creates no host interface). Per-SID configuration, no elevation.
+    /// [`crate::ipc_payloads::LocalNetworksSetRequest`] →
+    /// [`crate::ipc_payloads::LocalNetworksSetResponse`].
+    LocalNetworksSet,
     /// Read the caller's pending companion-domain suggestions —
     /// hosts a routed site turned out to need whose rules do not cover them.
     /// Read-only query over an in-memory per-SID registry. GUI **and tray**:
@@ -411,6 +438,14 @@ pub enum IpcOperationName {
     /// user silencing their own notices never meets a UAC prompt, same stance
     /// as [`Self::AutoRuleCandidatesAccept`].
     BlockNoticeMutesSet,
+    /// Read the notices raised for the caller while no surface was listening
+    /// (no tray, no window). Read-only query over durable per-SID storage;
+    /// GUI **and tray**, since either may be the first one up.
+    BlockNoticeJournalList,
+    /// Drop the backlog entries the caller has now been shown, up to the id
+    /// given. Bounded by id rather than "clear it": a notice raised while the
+    /// list travelled must survive to be shown next time.
+    BlockNoticeJournalAck,
     /// Undo one block-notice mute for the caller. Removing a mute that was
     /// never set is a no-op, not an error — the caller only ever asks for
     /// their own mute to go away, not to confirm one existed.
@@ -426,10 +461,14 @@ pub enum IpcOperationName {
     /// Full-reset support: erase the CALLER's own auxiliary per-principal
     /// rows — never rules history, the shared cache, or audit. Not elevated.
     PrincipalDataPurge,
+    /// How many OTHER OS users this service holds rules for. A count, never an
+    /// identity: full reset has to ask "yours or everyone's?", and it cannot
+    /// ask that without knowing whether anyone else is there.
+    PrincipalDataCount,
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 69] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -480,18 +519,25 @@ impl IpcOperationName {
         Self::TrafficStatsGet,
         Self::TrafficStatsSet,
         Self::TrafficStatsClear,
+        Self::AutoRuleCandidatesProbe,
+        Self::RefusingAnchorSet,
+        Self::LocalNetworksGet,
+        Self::LocalNetworksSet,
         Self::AutoRuleCandidatesList,
         Self::AutoRuleCandidatesAccept,
         Self::AutoRuleCandidatesDismiss,
         Self::AutoRuleDismissedList,
         Self::AutoRuleDismissedRestore,
         Self::AutoRuleCandidatesForget,
+        Self::BlockNoticeJournalList,
+        Self::BlockNoticeJournalAck,
         Self::BlockNoticeMutesList,
         Self::BlockNoticeMutesSet,
         Self::BlockNoticeMutesRemove,
         Self::BlockNoticeMutesClear,
         Self::BlockNoticeRouteToSecondary,
         Self::PrincipalDataPurge,
+        Self::PrincipalDataCount,
     ];
 
     pub const fn slug(self) -> &'static str {
@@ -546,18 +592,25 @@ impl IpcOperationName {
             Self::TrafficStatsGet => "traffic-stats.get",
             Self::TrafficStatsSet => "traffic-stats.set",
             Self::TrafficStatsClear => "traffic-stats.clear",
+            Self::AutoRuleCandidatesProbe => "autorules.candidates.probe",
+            Self::RefusingAnchorSet => "autorules.refusing-anchor.set",
+            Self::LocalNetworksGet => "settings.local-networks.get",
+            Self::LocalNetworksSet => "settings.local-networks.set",
             Self::AutoRuleCandidatesList => "autorules.candidates.list",
             Self::AutoRuleCandidatesAccept => "autorules.candidates.accept",
             Self::AutoRuleCandidatesDismiss => "autorules.candidates.dismiss",
             Self::AutoRuleDismissedList => "autorules.dismissed.list",
             Self::AutoRuleDismissedRestore => "autorules.dismissed.restore",
             Self::AutoRuleCandidatesForget => "autorules.candidates.forget",
+            Self::BlockNoticeJournalList => "block-notices.journal.list",
+            Self::BlockNoticeJournalAck => "block-notices.journal.ack",
             Self::BlockNoticeMutesList => "block-notices.mutes.list",
             Self::BlockNoticeMutesSet => "block-notices.mutes.set",
             Self::BlockNoticeMutesRemove => "block-notices.mutes.remove",
             Self::BlockNoticeMutesClear => "block-notices.mutes.clear",
             Self::BlockNoticeRouteToSecondary => "block-notices.route-to-secondary",
             Self::PrincipalDataPurge => "principal-data.purge",
+            Self::PrincipalDataCount => "principal-data.count",
         }
     }
 
@@ -586,7 +639,7 @@ const CLIENTS_GUI_AND_TRAY: [IpcClientProfile; 2] = [
     IpcClientProfile::TrayLightweight,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 62] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -984,6 +1037,40 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 62] = [
         allowed_clients: &CLIENTS_GUI_ONLY,
         requires_service_mutation_privilege: true,
     },
+    IpcOperationSpec {
+        name: IpcOperationName::AutoRuleCandidatesProbe,
+        // The caller's own suggestions, examined on their own machine — no
+        // elevation, GUI only (the tray offers no probing surface).
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::RefusingAnchorSet,
+        // The caller's own observation about their own site.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: false,
+    },
+    // ── Local networks under the kill-switch ───────────────────
+    IpcOperationSpec {
+        name: IpcOperationName::LocalNetworksGet,
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::LocalNetworksSet,
+        // The caller's OWN exemptions — per-SID, like every other route policy
+        // a non-elevated user may change for themselves.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: false,
+    },
     // ── Companion-domain suggestions ────────────────────────
     IpcOperationSpec {
         name: IpcOperationName::AutoRuleCandidatesList,
@@ -1041,6 +1128,24 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 62] = [
     },
     // ── Block-notice mutes + notice-driven routing ──────────────────
     IpcOperationSpec {
+        name: IpcOperationName::BlockNoticeJournalList,
+        // Read of the caller's own undelivered notices. GUI + TRAY: whichever
+        // surface comes up first is the one that shows them.
+        class: IpcInteractionClass::Query,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::BlockNoticeJournalAck,
+        // Drops the caller's own backlog entries once shown — their data,
+        // their surface, no elevation.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
         name: IpcOperationName::BlockNoticeMutesList,
         // Read of durable per-SID storage. GUI + TRAY: the tray is the
         // surface the notice (and its mute action) appear on.
@@ -1090,6 +1195,13 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 62] = [
         // Caller's own state, no elevation. GUI-only: the tray never
         // triggers full reset.
         class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::PrincipalDataCount,
+        class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_ONLY,
         requires_service_mutation_privilege: false,
@@ -1404,6 +1516,8 @@ mod tests {
         // notices and their own rules.
         let catalog = ipc_operation_catalog();
         for name in [
+            IpcOperationName::BlockNoticeJournalList,
+            IpcOperationName::BlockNoticeJournalAck,
             IpcOperationName::BlockNoticeMutesList,
             IpcOperationName::BlockNoticeMutesSet,
             IpcOperationName::BlockNoticeMutesRemove,

@@ -1,7 +1,7 @@
 //! Stub for the Free-edition full settings export format (v1).
 //!
 //! [`SettingsExportV1`] is the top-level type for the YAML settings export used
-//! for Free → Pro migration and for backup/restore. Serialization and
+//! for backup, restore and moving to another machine. Serialization and
 //! deserialization are not yet wired.
 //!
 //! # What is included
@@ -75,7 +75,7 @@ pub struct ExportedBehaviorSettings {
 /// UI preference fields within a settings export.
 ///
 /// These are the visual and interaction preferences that should follow the user
-/// to a new device or Pro installation. Device-specific runtime state is excluded.
+/// to a new device. Device-specific runtime state is excluded.
 pub struct ExportedUiPreferences {
     /// Theme slug (`"light"`, `"dark"`, `"system"`, or `"high-contrast"`).
     pub theme: String,
@@ -94,11 +94,11 @@ pub struct ExportedUiPreferences {
 /// Full YAML serialization/deserialization is not yet wired.
 /// This struct defines the data boundary only and carries no serde derives.
 ///
-/// # Pro migration
+/// # Moving to another installation
 ///
-/// A Pro installation can import this export as its starting configuration.
-/// Adapter bindings, rule file paths, and behavior settings are migrated
-/// directly. UI preferences are applied if the Pro version supports them.
+/// Another installation can import this export as its starting configuration.
+/// Adapter bindings, rule file paths, and behavior settings carry over
+/// directly. UI preferences are applied where supported.
 pub struct SettingsExportV1 {
     /// Schema version. Always [`SettingsExportV1::VERSION`] for this struct.
     pub version: u32,

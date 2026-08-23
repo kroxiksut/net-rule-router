@@ -64,12 +64,27 @@ fn add_script(listener_ip: &str, marker: &str) -> String {
     )
 }
 
-/// Remove every NRPT rule carrying our marker (restore to prior state).
+/// Remove every NRPT rule carrying our marker (restore to prior state) and
+/// echo how many there were. The count is what lets the boot sweep report
+/// whether it healed anything — a silent sweep leaves the next crash analysis
+/// unable to tell "nothing to clean" from "never ran".
 fn remove_script(marker: &str) -> String {
     format!(
-        "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{marker}' }} | \
-         ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}"
+        "$r = @(Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{marker}' }}); \
+         $r | ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}; \
+         $r.Count"
     )
+}
+
+/// Parse the trailing count [`remove_script`] echoes. An unreadable answer
+/// means "removed something, count unknown" rather than an error: the removal
+/// itself already succeeded.
+fn removed_count(stdout: &str) -> usize {
+    stdout
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// Flush the Windows DNS client cache so warm entries re-resolve through the
@@ -195,7 +210,7 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
 /// regardless of the current enforcement mode. Marker-scoped: never touches a
 /// VPN client's or an admin's own NRPT rule. Generic over [`CommandRunner`] for
 /// unit-testing.
-pub fn clear_orphan_redirect<R: CommandRunner>(runner: &R) -> Result<(), PlatformError> {
+pub fn clear_orphan_redirect<R: CommandRunner>(runner: &R) -> Result<usize, PlatformError> {
     let out = runner.run_powershell(&remove_script(NRPT_MARKER))?;
     if !out.success {
         return Err(PlatformError::Transient {
@@ -203,7 +218,7 @@ pub fn clear_orphan_redirect<R: CommandRunner>(runner: &R) -> Result<(), Platfor
             detail: format!("orphan NRPT cleanup failed: {}", out.stderr.trim()),
         });
     }
-    Ok(())
+    Ok(removed_count(&out.stdout))
 }
 
 /// Echo our marker iff a rule of ours is present (empty stdout otherwise).
@@ -280,6 +295,20 @@ impl<R: CommandRunner> SystemDnsRedirectPort for NrptDnsRedirect<R> {
 #[cfg(target_os = "windows")]
 pub struct PowerShellRunner;
 
+/// Longest one NRPT cmdlet may take before it is given up on and killed.
+///
+/// Generous on purpose: a cold `powershell.exe` plus the WMI round-trip these
+/// cmdlets make is seconds, not milliseconds, and killing a healthy-but-slow
+/// call would leave the redirect half-applied. Bounded all the same — every
+/// caller here is a boot step, a stop step or a recovery command, and each of
+/// them turns an unbounded wait into the failure it is trying to prevent.
+#[cfg(target_os = "windows")]
+const POWERSHELL_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How often the spawned process is checked while waiting.
+#[cfg(target_os = "windows")]
+const POWERSHELL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 #[cfg(target_os = "windows")]
 impl CommandRunner for PowerShellRunner {
     fn run_powershell(&self, script: &str) -> Result<CommandOutput, PlatformError> {
@@ -287,12 +316,55 @@ impl CommandRunner for PowerShellRunner {
         // CREATE_NO_WINDOW — never flash a console window from the background
         // service. (Not `unsafe`: it is a plain process-creation flag.)
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("powershell.exe")
+        // Spawned rather than `output()`ed: `output()` waits forever, and every
+        // caller of this runner is a boot step, a stop step or a recovery
+        // command. A `powershell.exe` that never returns would hang the very
+        // paths that exist to unstick a machine.
+        let mut child = std::process::Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| PlatformError::Transient {
                 operation: "nrpt.powershell.spawn",
+                detail: e.to_string(),
+            })?;
+
+        // Polling rather than draining the pipes concurrently: every script in
+        // this module answers with a marker or a count, far below the pipe
+        // buffer, so the child cannot block on a full pipe while we wait.
+        let deadline = std::time::Instant::now() + POWERSHELL_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(PlatformError::Transient {
+                        operation: "nrpt.powershell.timeout",
+                        detail: format!(
+                            "powershell did not answer within {:?}; the call was killed",
+                            POWERSHELL_BUDGET
+                        ),
+                    });
+                }
+                Ok(None) => std::thread::sleep(POWERSHELL_POLL),
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(PlatformError::Transient {
+                        operation: "nrpt.powershell.wait",
+                        detail: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|e| PlatformError::Transient {
+                operation: "nrpt.powershell.output",
                 detail: e.to_string(),
             })?;
         Ok(CommandOutput {
@@ -441,6 +513,20 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, PlatformError::Transient { .. }));
         assert!(format!("{err}").contains("Access is denied"));
+    }
+
+    #[test]
+    fn clear_orphan_reports_how_many_rules_it_removed() {
+        let runner = FakeRunner::new(ok("2
+"));
+        assert_eq!(clear_orphan_redirect(&runner).expect("clear"), 2);
+        // Nothing to clean is a successful sweep of zero, not a failure.
+        let empty = FakeRunner::new(ok("0"));
+        assert_eq!(clear_orphan_redirect(&empty).expect("clear"), 0);
+        // An answer we cannot parse still means the removal itself succeeded.
+        let noisy = FakeRunner::new(ok("WARNING: something
+"));
+        assert_eq!(clear_orphan_redirect(&noisy).expect("clear"), 0);
     }
 
     #[test]

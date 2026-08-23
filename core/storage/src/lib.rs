@@ -41,6 +41,7 @@ pub mod auto_rule_pending;
 pub mod auto_rules;
 pub mod autostart_state;
 pub mod backup;
+pub mod block_notice_journal;
 pub mod block_notice_mutes;
 pub mod bootstrap;
 pub mod doh_lockdown;
@@ -49,6 +50,7 @@ pub mod error;
 pub mod explain;
 pub mod explain_snapshots;
 pub mod integrity;
+pub mod local_network_rules;
 pub mod log_retention_config;
 pub mod migration;
 pub mod mutation_tokens;
@@ -58,6 +60,7 @@ pub mod principal_purge;
 pub mod profile;
 pub mod query;
 pub mod rebuild;
+pub mod refusing_anchors;
 pub mod repository;
 pub mod resolution_source;
 pub mod retention_settings;
@@ -113,7 +116,9 @@ pub use policy_settings::{
     ApplyFailurePolicyRecord, ApplyFailurePolicySettingsRepository, DEFAULT_POLICY_SLUG,
     VALID_POLICY_SLUGS,
 };
-pub use principal_purge::{purge_principal_data, PrincipalPurgeSummary};
+pub use principal_purge::{
+    principals_with_rules, purge_principal_data, purge_principal_rules, PrincipalPurgeSummary,
+};
 pub use profile::{resolve_storage_topology, StorageProfile, StorageTopology};
 pub use query::{
     classify_ambiguity, classify_observed_ip, compute_refresh_hint, derive_event_state,

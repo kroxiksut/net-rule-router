@@ -418,6 +418,12 @@ public:
             // window runs its normal load-from-file + review flow.
             launchMainGuiWithAction(QStringLiteral("rules"), false, false,
                                     QStringLiteral("rules-drift-apply"), {});
+        } else if (actionId == QStringLiteral("rules-drift-compare")) {
+            // "Open and compare" on the same notice: the window re-measures the
+            // three legs and opens the comparison, instead of landing on a rules
+            // table that says nothing about the divergence.
+            launchMainGuiWithAction(QStringLiteral("rules"), false, false,
+                                    QStringLiteral("rules-drift-compare"), {});
         } else if (actionId == QStringLiteral("open-about-window")) {
             launchMainGui({}, true, false);
         } else if (actionId == QStringLiteral("open-license-window")) {
@@ -935,6 +941,20 @@ public:
                               QJsonObject::fromVariantMap(payload));
     }
 
+    /// The local networks that stay reachable while the kill-switch blocks
+    /// everything else: what the service discovered (the main link's subnets,
+    /// the host side of hypervisor adapters) plus the user's own decisions.
+    /// The write takes `{"decisions": [{"cidr", "allowed"}], "forget": [...]}`
+    /// and answers with the list as it stands afterwards.
+    Q_INVOKABLE QString rpcLocalNetworksGet() {
+        return emitRpcRequest(QStringLiteral("settings.local-networks.get"),
+                              QJsonObject());
+    }
+    Q_INVOKABLE QString rpcLocalNetworksSet(const QVariantMap &payload) {
+        return emitRpcRequest(QStringLiteral("settings.local-networks.set"),
+                              QJsonObject::fromVariantMap(payload));
+    }
+
     /// The hosts a routed site turned out to need, parked by the service
     /// while `auto-rules-mode` is `suggest`.
     /// The tray lists the pending candidates and then accepts or dismisses a
@@ -956,6 +976,22 @@ public:
     /// the pending offer, the refusal and the quiet period after authoring —
     /// so the host is offered again once the evidence returns. Unlike a
     /// refusal, this records no answer.
+    /// Ask the service to check whether the addresses behind these suggestions
+    /// answer on the MAIN link (`{"ids": [...]}`, empty = every pending one).
+    /// The reply only says the pass was accepted; verdicts arrive through the
+    /// suggestion-changed push.
+    /// Mark or unmark a routed site as answering the MAIN link with a refusal
+    /// (`{"hostname": "...", "refusing": true}`). Answers with the full marked
+    /// list. The only effect is that this site's companion addresses stop being
+    /// quietened by "it answers on the main route".
+    Q_INVOKABLE QString rpcRefusingAnchorSet(const QVariantMap &payload) {
+        return emitRpcRequest(QStringLiteral("autorules.refusing-anchor.set"),
+                              QJsonObject::fromVariantMap(payload));
+    }
+    Q_INVOKABLE QString rpcAutoRuleCandidatesProbe(const QVariantMap &payload) {
+        return emitRpcRequest(QStringLiteral("autorules.candidates.probe"),
+                              QJsonObject::fromVariantMap(payload));
+    }
     Q_INVOKABLE QString rpcAutoRuleCandidatesForget(const QVariantMap &payload) {
         return emitRpcRequest(QStringLiteral("autorules.candidates.forget"),
                               QJsonObject::fromVariantMap(payload));
@@ -997,6 +1033,19 @@ public:
                               QJsonObject());
     }
 
+    /// Notices raised while neither the tray nor the window was up. `List`
+    /// returns them oldest first; `Ack` takes `{"through-id": <id>}` — the
+    /// largest id the surface actually showed. Wire shapes live in
+    /// `nrr_shared::ipc_payloads::BlockNoticeJournal*`.
+    Q_INVOKABLE QString rpcBlockNoticeJournalList() {
+        return emitRpcRequest(QStringLiteral("block-notices.journal.list"),
+                              QJsonObject());
+    }
+    Q_INVOKABLE QString rpcBlockNoticeJournalAck(const QVariantMap &payload) {
+        return emitRpcRequest(QStringLiteral("block-notices.journal.ack"),
+                              QJsonObject::fromVariantMap(payload));
+    }
+
     /// Turn one blocked destination into a rule that routes it over the
     /// additional link. `payload` is `{"destination": "<hostname>"}`.
     Q_INVOKABLE QString rpcBlockNoticeRouteToSecondary(const QVariantMap &payload) {
@@ -1006,9 +1055,21 @@ public:
 
     /// Full-reset support: erase the caller's auxiliary per-principal rows.
     /// No payload; response carries `{rows-deleted, tables-touched}`.
-    Q_INVOKABLE QString rpcPrincipalDataPurge() {
-        return emitRpcRequest(QStringLiteral("principal-data.purge"),
-                              QJsonObject());
+    /// `includeRulesHistory` additionally drops the service's own copy of this
+    /// caller's rules (revision history + active pointer) — the full reset asks
+    /// for it, routine cleanup does not.
+    Q_INVOKABLE QString rpcPrincipalDataPurge(bool includeRulesHistory = false,
+                                              bool allPrincipals = false) {
+        QJsonObject payload;
+        payload.insert(QStringLiteral("include-rules-history"), includeRulesHistory);
+        payload.insert(QStringLiteral("all-principals"), allPrincipals);
+        return emitRpcRequest(QStringLiteral("principal-data.purge"), payload);
+    }
+
+    /// How many OTHER users this machine holds rules for. Read op; full reset
+    /// asks it before deciding whose data it clears.
+    Q_INVOKABLE QString rpcPrincipalDataCount() {
+        return emitRpcRequest(QStringLiteral("principal-data.count"), QJsonObject());
     }
 
     /// Read the SHARED DoH/DoT resolver baseline list (machine-wide,

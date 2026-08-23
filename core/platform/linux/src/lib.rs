@@ -1,23 +1,19 @@
 //! Linux platform backend.
 //!
 //! Mirrors `nrr-platform-windows`: the same neutral port traits from
-//! `nrr-platform-api`. The observation and host-integration ports are real
-//! (autostart, key store, service control, local time, interface counters,
-//! network change, reachability, app-path resolution, peer credentials, adapter
-//! enumeration); the ENFORCEMENT port [`LinuxApi`] is still a stub whose routing
-//! and packet-filter calls answer [`PlatformError::NotSupported`], because the
-//! nftables / rtnetlink mechanism has not landed. The caller constructs
-//! [`LinuxApi`] under `#[cfg(target_os = "linux")]` exactly where it constructs
-//! `ProductionWindowsApi` under `#[cfg(windows)]`, so `service-runtime` links
-//! and runs on Linux and fails closed instead of routing anything.
+//! `nrr-platform-api`. Enforcement is real — packet filters through `nft`
+//! ([`nft_backend`], [`nft_policy_enforcer`]) and routes through rtnetlink
+//! ([`LinuxApi`] as [`nrr_platform_api::route_table::RouteTablePort`]) — as are
+//! the observation and host-integration ports (autostart, key store, service
+//! control, local time, interface counters, network change, reachability,
+//! app-path resolution, peer credentials, adapter enumeration, logind).
+//! Honest stubs remain, each saying so in its own module: fake-IP TUN, VPN and
+//! app-group discovery, the resolver-cache read.
 //!
-//! The real mechanism (nftables `WfpEnginePort`, rtnetlink `RouteTablePort`,
-//! systemd service, unix-socket IPC, …) still needs a VM with root to build
-//! and verify against.
-//!
-//! Because it is pure Rust over the api traits, this crate compiles on *every*
-//! target (it takes no Linux-only dependency yet), so it can be built and
-//! unit-tested from the Windows dev host too.
+//! Much of the crate is pure Rust over the api traits — message encoding, plan
+//! lowering, parsers — so those parts compile and their tests run on the Windows
+//! dev host too; only the syscalls and the `nft`/`loginctl` calls sit behind
+//! `#[cfg(target_os = "linux")]`.
 
 /// Linux autostart mechanism (XDG `.desktop`) — the first REAL (non-stub) port
 /// impl in this crate. Unlike the enforcement ports below (which need root /
@@ -58,6 +54,40 @@ pub mod elevation;
 #[cfg(target_os = "linux")]
 pub mod peer_cred;
 
+/// Wire codec for the DNS messages the resolver exchanges — pure over bytes, so
+/// its tests run on any host.
+pub mod dns_message;
+
+/// Passive observation of DNS resolutions through systemd-resolved's query
+/// monitor — the Linux analog of the ETW DNS-Client source. Silent by design on
+/// a machine whose programs bypass resolved; the module doc says how to tell.
+#[cfg(target_os = "linux")]
+pub mod dns_observe;
+
+/// The active DNS resolver: asks the machine's own nameservers over UDP (with
+/// the protocol's TCP retry) so an answer carries a TTL, which `getaddrinfo`
+/// discards.
+#[cfg(target_os = "linux")]
+pub mod dns_resolver;
+
+/// Passive observation of outbound connections from procfs — the Linux analog
+/// of the WFP net-event / ETW sources. Reports sockets that exist when it polls
+/// and never a verdict; the module doc says what that costs.
+#[cfg(target_os = "linux")]
+pub mod conn_observe;
+
+/// The Linux authorization mechanism: polkit, consulted through `pkcheck`.
+/// Answers "may this caller do this", including asking them for a password
+/// through their own session — the reason no elevation broker is needed here.
+#[cfg(target_os = "linux")]
+pub mod polkit;
+
+/// Graceful-stop signals (`SIGTERM`/`SIGINT`) — the Linux analog of the SCM
+/// stop control. Without it the daemon dies on the default disposition and its
+/// filters and routes outlive the service that installed them.
+#[cfg(target_os = "linux")]
+pub mod signals;
+
 /// Unix mechanism for pointing this process's error stream at a file
 /// (`dup2` onto descriptor 2) — the analog of the Windows standard-handle
 /// table. Compiled on every host so the launcher can select it under
@@ -94,6 +124,13 @@ pub mod service_control;
 #[cfg(target_os = "linux")]
 pub mod logrotate;
 
+/// Who currently has a live login, asked of `logind` through `loginctl`. The
+/// Linux answer to the question the Windows side answers by watching for a tray
+/// connection — and a better one for a machine reached over SSH, where the work
+/// outlives the terminal that started it.
+#[cfg(target_os = "linux")]
+pub mod logind;
+
 /// Linux host system-information collector for the diagnostic archive — the
 /// analog of `nrr_platform_windows::system_info`. Reads procfs / `os-release`
 /// (`/proc/cpuinfo`, `/proc/meminfo`, `/etc/os-release`) to enrich the
@@ -125,6 +162,7 @@ pub mod nft_apply;
 /// Thin by design: it joins [`lower_linux`] (pure) with [`nft_apply`] (the
 /// mechanism) and reports what could not be expressed rather than dropping it.
 pub mod nft_backend;
+pub mod nft_policy_enforcer;
 
 /// Linux VPN-client discovery seam (design + stub).
 /// The neutral port lives in `nrr_platform_api::vpn_discovery`; this backend
@@ -175,6 +213,9 @@ pub mod app_path_resolver;
 /// it happens instead of at the next poll. Message framing is parsed by a pure
 /// function tested on every host; only the socket half is Linux-only.
 pub mod network_change;
+// The IPv4 route table over rtnetlink — the mechanism behind `RouteTablePort`'s
+// route half.
+pub mod route_table;
 
 /// Linux active-reachability backend behind
 /// `nrr_platform_api::reachability::ReachabilityProbe`. ICMP echo over an
@@ -199,44 +240,65 @@ mod adapters_addr;
 
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::error::PlatformError;
-use nrr_platform_api::types::{
-    RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec,
-};
-use nrr_platform_api::windows_api::WindowsApiPort;
+use nrr_platform_api::route_table::RouteTablePort;
+use nrr_platform_api::types::RouteEntry;
 
-/// Reason string every stub returns until the real Linux backend lands. Read by
-/// a user in an error message, so it says what is missing, not where it is
-/// tracked.
-const NOT_YET: &str = "the Linux platform backend is not implemented yet";
+/// Reason returned by the route methods when this crate is compiled for a
+/// non-Linux host — the mechanism is rtnetlink, and there is none to reach.
+/// Read by a user in an error message, so it says what is missing.
+#[cfg(not(target_os = "linux"))]
+const NOT_YET: &str = "the Linux route backend needs a Linux kernel";
 
-/// Convenience: the `NotSupported` error every stub returns.
+/// Convenience: the `NotSupported` error the off-Linux fallbacks return.
+#[cfg(not(target_os = "linux"))]
 fn not_yet<T>() -> Result<T, PlatformError> {
     Err(PlatformError::NotSupported { reason: NOT_YET })
 }
 
-/// Linux stub of the enforcement port ([`WindowsApiPort`], the route-table +
-/// packet-filter engine). Every operation returns
-/// [`PlatformError::NotSupported`]; the real nftables / rtnetlink backend is
-/// not implemented yet. Selected by the consumer under `#[cfg(target_os = "linux")]`
-/// where Windows selects `nrr_platform_windows::ProductionWindowsApi`.
+/// Linux implementation of [`RouteTablePort`].
+///
+/// Route reads and mutations go through rtnetlink ([`crate::route_table`]);
+/// adapter enumeration reads sysfs and `/proc/net/route`. The WFP filter engine
+/// is deliberately absent rather than stubbed — it is a Windows mechanism, and
+/// this type no longer has to pretend otherwise now that the two ports are
+/// separate. Packet filtering on Linux is
+/// [`crate::nft_backend::NftablesEnforcement`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LinuxApi;
 
-impl WindowsApiPort for LinuxApi {
+impl RouteTablePort for LinuxApi {
+    #[cfg(target_os = "linux")]
+    fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
+        crate::route_table::get_ipv4_routes()
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
         not_yet()
     }
 
+    #[cfg(target_os = "linux")]
+    fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+        crate::route_table::add_ipv4_route(entry)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn create_ip_forward_entry(&self, _entry: &RouteEntry) -> Result<(), PlatformError> {
         not_yet()
     }
 
+    #[cfg(target_os = "linux")]
+    fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+        crate::route_table::delete_ipv4_route(entry)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn delete_ip_forward_entry(&self, _entry: &RouteEntry) -> Result<(), PlatformError> {
         not_yet()
     }
 
     /// Implemented: enumeration is observation, not enforcement, so it does not
-    /// wait on the nftables backend the rest of this port is blocked behind.
+    /// wait on the route backend the rest of this port is blocked behind.
     /// Without it the routing layer cannot even name a link, and the GUI shows
     /// mock interfaces on a real machine.
     #[cfg(target_os = "linux")]
@@ -249,51 +311,17 @@ impl WindowsApiPort for LinuxApi {
         not_yet()
     }
 
-    fn interface_luid_for_index(&self, _ifindex: u32) -> Result<u64, PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_engine_open(&self) -> Result<WfpEngineToken, PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_engine_close(&self, _token: WfpEngineToken) -> Result<(), PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_transaction_begin(&self, _token: &WfpEngineToken) -> Result<(), PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_transaction_commit(&self, _token: &WfpEngineToken) -> Result<(), PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_transaction_abort(&self, _token: &WfpEngineToken) {
-        // Nothing to abort — no session was ever opened.
-    }
-
-    fn wfp_filter_add(
-        &self,
-        _token: &WfpEngineToken,
-        _spec: &WfpFilterSpec,
-    ) -> Result<WfpFilterId, PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_filter_delete(
-        &self,
-        _token: &WfpEngineToken,
-        _id: WfpFilterId,
-    ) -> Result<(), PlatformError> {
-        not_yet()
-    }
-
-    fn wfp_enumerate_our_filters(
-        &self,
-        _token: &WfpEngineToken,
-    ) -> Result<Vec<WfpFilterRecord>, PlatformError> {
-        not_yet()
+    /// On Linux the interface index IS the stable identity — there is no second
+    /// identifier to convert to. The port only requires that the value be
+    /// stable for the life of the interface and non-zero, and `ifindex` is
+    /// both; index 0 means "unspecified" and is never a real interface.
+    fn interface_luid_for_index(&self, ifindex: u32) -> Result<u64, PlatformError> {
+        if ifindex == 0 {
+            return Err(PlatformError::StateCorrupted {
+                detail: "interface index 0 is the unspecified index, not an interface".to_string(),
+            });
+        }
+        Ok(u64::from(ifindex))
     }
 }
 
@@ -301,8 +329,31 @@ impl WindowsApiPort for LinuxApi {
 mod tests {
     use super::*;
 
+    /// The filter-engine methods are not in this list because they are no
+    /// longer part of this port at all: `WfpEnginePort` is a Windows mechanism,
+    /// and Linux filters with nftables instead. What remains stubbed here is
+    /// route-table mutation, until the rtnetlink backend lands.
     #[test]
-    fn every_enforcement_op_reports_not_supported() {
+    fn the_interface_index_is_its_own_stable_identity() {
+        assert_eq!(LinuxApi.interface_luid_for_index(3).expect("index 3"), 3);
+    }
+
+    /// Index 0 is "unspecified" in every kernel API. Returning it as an
+    /// identity would hand enforcement a pin that matches no interface, which
+    /// on the Windows side is exactly the `luid == 0` case the kill-switch
+    /// fails open on.
+    #[test]
+    fn the_unspecified_index_is_refused() {
+        assert!(matches!(
+            LinuxApi.interface_luid_for_index(0),
+            Err(PlatformError::StateCorrupted { .. })
+        ));
+    }
+
+    /// Off Linux the route methods have no mechanism to reach.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn route_table_access_reports_not_supported_off_linux() {
         let api = LinuxApi;
         assert!(matches!(
             api.get_ip_forward_table(),
@@ -312,14 +363,20 @@ mod tests {
             api.create_ip_forward_entry(&sample_route()),
             Err(PlatformError::NotSupported { .. })
         ));
-        assert!(matches!(
-            api.interface_luid_for_index(3),
-            Err(PlatformError::NotSupported { .. })
-        ));
-        assert!(matches!(
-            api.wfp_engine_open(),
-            Err(PlatformError::NotSupported { .. })
-        ));
+    }
+
+    /// On a live kernel the dump must actually answer. Reading routes needs no
+    /// privilege, so this runs as an ordinary user in CI and in WSL.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_route_dump_answers_on_a_live_kernel() {
+        let routes = LinuxApi
+            .get_ip_forward_table()
+            .expect("reading the route table needs no privilege");
+        assert!(
+            routes.iter().all(|r| r.interface_index != 0),
+            "every returned route must name an interface"
+        );
     }
 
     /// Enumeration is the exception, and deliberately so: it observes rather
@@ -353,6 +410,9 @@ mod tests {
         );
     }
 
+    /// Only the off-Linux fallbacks take a route argument; on Linux the same
+    /// paths reach the kernel and are covered by `tests/route_live.rs`.
+    #[cfg(not(target_os = "linux"))]
     fn sample_route() -> RouteEntry {
         RouteEntry {
             destination: std::net::Ipv4Addr::new(10, 0, 0, 0),

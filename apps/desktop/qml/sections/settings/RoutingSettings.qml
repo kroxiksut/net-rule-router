@@ -61,6 +61,17 @@ ColumnLayout {
     // snapshot is the SSOT (no prefs mirror), like the DoH-lockdown toggle.
     property string autoRulesMode: "suggest"
     property bool autoRulesEagerDeliveryNames: false
+    // Main-link checking: the opt-in plus the bounds one pass may cost. Off by
+    // default — a check is an outgoing connection, so it happens when the user
+    // asks unless they say otherwise.
+    property bool primaryProbeAuto: false
+    property int primaryProbeTimeoutMs: 1500
+    property int primaryProbeMaxTargets: 8
+    property int primaryProbeRepeatSecs: 300
+    property bool primaryProbeLimitsExpanded: false
+    // Cut IPv6 while protection is on. ON by default: Free pins IPv4 only, so a
+    // host with an AAAA record would otherwise keep an uncovered way out.
+    property bool blockIpv6WhenProtected: true
     // Enforcement mechanism: "reactive" (Mode A,
     // default — the existing reactive kill-switch) vs "resolver" (Mode B — a
     // local DNS resolver that enforces BEFORE the app connects). Global service
@@ -182,6 +193,114 @@ ColumnLayout {
         return panel.sharedExemptAddresses.map(panel._exemptAddressLine)
     }
 
+    // ── Local networks under leak protection ─────────────────────────────
+    // What the service discovered plus the user's own decisions, exactly as the
+    // service composed it: the panel never derives the effective state itself,
+    // so what is ticked here and what the enforcement exempts cannot diverge.
+    property var localNetworks: []
+    property string localNetworkError: ""
+
+    function loadLocalNetworks() {
+        if (!root.bridgeAvailable || typeof root.rpc.rpcLocalNetworksGet !== "function") return
+        var corr = root.rpc.rpcLocalNetworksGet()
+        if (!corr || corr === "") return
+        root.rpc.registerRpcCallback(corr, function(ok, payload) {
+            if (!ok) return
+            panel.localNetworks = (payload || {}).networks || []
+        })
+    }
+
+    /// Networks the service found and nobody has answered for. Their tick is
+    /// the service's default, not a decision, so the offer banner keeps asking
+    /// while the list here looks already settled — this is what makes the
+    /// difference visible, and the confirm below is what ends it.
+    readonly property var undecidedLocalNetworks: {
+        var out = []
+        for (var i = 0; i < localNetworks.length; i += 1) {
+            var entry = localNetworks[i] || {}
+            if (entry["decided-by-user"] !== true) out.push(entry)
+        }
+        return out
+    }
+
+    /// Confirm every unanswered network at its current value in one write.
+    function confirmUndecidedLocalNetworks() {
+        var rows = panel.undecidedLocalNetworks
+        if (rows.length === 0) return
+        var decisions = []
+        for (var i = 0; i < rows.length; i += 1) {
+            decisions.push({
+                "cidr": String(rows[i].cidr || ""),
+                "allowed": rows[i].allowed !== false
+            })
+        }
+        panel._writeLocalNetworks({ "decisions": decisions })
+    }
+
+    /// One decision, written straight through — the service answers with the
+    /// whole list, which is what the panel then shows. `cidr` may be a network
+    /// the service never discovered; it validates and reports back.
+    function setLocalNetworkAllowed(cidr, allowed) {
+        panel._writeLocalNetworks({ "decisions": [{ "cidr": cidr, "allowed": allowed }] })
+    }
+
+    function forgetLocalNetwork(cidr) {
+        panel._writeLocalNetworks({ "forget": [cidr] })
+    }
+
+    function _writeLocalNetworks(payload) {
+        if (!root.bridgeAvailable || typeof root.rpc.rpcLocalNetworksSet !== "function") {
+            panel.localNetworkError = root.tr("status.bindings-require-service",
+                "Adapter bindings can only be changed while the background service is running.")
+            return
+        }
+        var corr = root.rpc.rpcLocalNetworksSet(payload)
+        if (!corr || corr === "") return
+        root.rpc.registerRpcCallback(corr, function(ok, response, code, msg) {
+            if (!ok) {
+                panel.localNetworkError = String(msg || code || "")
+                return
+            }
+            panel.localNetworks = (response || {}).networks || []
+            // The banner asks about exactly these networks; answering one here
+            // must retire it without waiting for the daily re-read.
+            if (typeof root.refreshPendingLocalNetworks === "function") {
+                root.refreshPendingLocalNetworks()
+            }
+            var rejected = (response || {}).rejected || []
+            panel.localNetworkError = rejected.length === 0
+                ? ""
+                : panel._localNetworkRejectionText(rejected[0])
+        })
+    }
+
+    function _localNetworkRejectionText(rejection) {
+        var reason = String((rejection || {}).reason || "")
+        var cidr = String((rejection || {}).cidr || "")
+        if (reason === "not-private") {
+            return root.tr("settings.routing.local-networks.reject-not-private",
+                "{cidr} is not a local network — only private ranges can be kept reachable.")
+                .replace("{cidr}", cidr)
+        }
+        return root.tr("settings.routing.local-networks.reject-malformed",
+            "{cidr} is not a network address. Write it as 10.0.2.0/24.").replace("{cidr}", cidr)
+    }
+
+    /// Row subtitle: whose network this is, in the user's terms.
+    function localNetworkSubtitle(entry) {
+        var kind = String((entry || {}).kind || "")
+        var adapter = String((entry || {}).adapter || "")
+        if (kind === "manual") {
+            return root.tr("settings.routing.local-networks.kind-manual", "added by you")
+        }
+        if (kind === "main-link") {
+            return root.tr("settings.routing.local-networks.kind-main-link",
+                "main connection: {name}").replace("{name}", adapter)
+        }
+        return root.tr("settings.routing.local-networks.kind-virtual-machine",
+            "virtual machine: {name}").replace("{name}", adapter)
+    }
+
     function _loadExemptHostNames() {
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
         if (!root.bridgeAvailable || bridge === null
@@ -247,7 +366,9 @@ ColumnLayout {
         "shared-ip-policy", "kill-switch-block-all", "kill-switch-enabled",
         "allow-dns-over-primary", "mode-a-coverage-strategy", "resolve-hosts-bypass",
         "doh-lockdown-enabled", "doh-lockdown-scope", "kill-switch-strict-shared-ips",
-        "auto-rules-mode", "auto-rules-eager-delivery-names"
+        "auto-rules-mode", "auto-rules-eager-delivery-names",
+        "primary-probe-auto", "primary-probe-timeout-ms", "primary-probe-max-targets",
+        "primary-probe-repeat-secs", "block-ipv6-when-protected"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -388,6 +509,16 @@ ColumnLayout {
         panel.autoRulesEagerDeliveryNames = _offlineRoutePolicyPick(parked, mirror,
             "auto-rules-eager-delivery-names",
             root.routePolicyDefault("auto-rules-eager-delivery-names"))
+        panel.primaryProbeAuto = _offlineRoutePolicyPick(parked, mirror,
+            "primary-probe-auto", root.routePolicyDefault("primary-probe-auto"))
+        panel.primaryProbeTimeoutMs = _offlineRoutePolicyPick(parked, mirror,
+            "primary-probe-timeout-ms", root.routePolicyDefault("primary-probe-timeout-ms"))
+        panel.primaryProbeMaxTargets = _offlineRoutePolicyPick(parked, mirror,
+            "primary-probe-max-targets", root.routePolicyDefault("primary-probe-max-targets"))
+        panel.primaryProbeRepeatSecs = _offlineRoutePolicyPick(parked, mirror,
+            "primary-probe-repeat-secs", root.routePolicyDefault("primary-probe-repeat-secs"))
+        panel.blockIpv6WhenProtected = _offlineRoutePolicyPick(parked, mirror,
+            "block-ipv6-when-protected", root.routePolicyDefault("block-ipv6-when-protected"))
     }
 
     function _loadKillSwitchPosture() {
@@ -430,6 +561,15 @@ ColumnLayout {
             panel.autoRulesMode = root._routePolicyEffective(cur, "auto-rules-mode")
             panel.autoRulesEagerDeliveryNames =
                 root._routePolicyEffective(cur, "auto-rules-eager-delivery-names")
+            panel.primaryProbeAuto = root._routePolicyEffective(cur, "primary-probe-auto")
+            panel.primaryProbeTimeoutMs =
+                root._routePolicyEffective(cur, "primary-probe-timeout-ms")
+            panel.primaryProbeMaxTargets =
+                root._routePolicyEffective(cur, "primary-probe-max-targets")
+            panel.primaryProbeRepeatSecs =
+                root._routePolicyEffective(cur, "primary-probe-repeat-secs")
+            panel.blockIpv6WhenProtected =
+                root._routePolicyEffective(cur, "block-ipv6-when-protected")
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back.
             panel._rememberRoutePolicy(cur)
@@ -1231,7 +1371,7 @@ ColumnLayout {
     function _reloadServiceBackedControls() {
         _loadKillSwitchPosture(); _loadEnforcementMode()
         _loadLivenessWindow(); _loadStopScope()
-        _loadFakeIpDriverStatus()
+        _loadFakeIpDriverStatus(); loadLocalNetworks()
     }
 
     Component.onCompleted: {
@@ -1330,6 +1470,7 @@ ColumnLayout {
 
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: !pauseGroup.trayActive
                 color: root.uiTheme.colorWarning
                 wrapMode: Text.WordWrap
@@ -1340,6 +1481,7 @@ ColumnLayout {
 
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1367,6 +1509,7 @@ ColumnLayout {
             spacing: root.uiTheme.spacingSm
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.default-route.description",
@@ -1434,6 +1577,7 @@ ColumnLayout {
             // updates as the user changes the dropdown.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -1459,6 +1603,7 @@ ColumnLayout {
             // does not read a shared-IP quirk as a routing failure.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: root.routingDefaultRouteDetailsExpanded
                 color: root.mutedTextColor
@@ -1485,6 +1630,7 @@ ColumnLayout {
             CheckBox {
                 id: includeSubdomainsCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 checked: panel.includeSubdomains
                 text: root.tr("settings.routing-behavior.include-subdomains.label",
                     "Also cover subdomains for domain rules (treat “example.com” as “example.com” + “*.example.com”)")
@@ -1503,6 +1649,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: root.routingDefaultRouteDetailsExpanded
                 color: root.mutedTextColor
@@ -1547,6 +1694,7 @@ ColumnLayout {
 
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1558,6 +1706,7 @@ ColumnLayout {
                 spacing: root.uiTheme.spacingSm
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     color: root.textColor
                     wrapMode: Text.WordWrap
                     text: vpnClientGroup.vpnName !== ""
@@ -1600,6 +1749,7 @@ ColumnLayout {
             CheckBox {
                 id: killSwitchEnableCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 checked: panel.killSwitchEnabled
                 text: root.tr("settings.routing.kill-switch.enable-label",
                     "Enable the kill-switch (block traffic when the additional adapter is down)")
@@ -1640,6 +1790,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -1665,6 +1816,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled && root.routingKsDetailsExpanded
                 color: root.mutedTextColor
@@ -1680,6 +1832,7 @@ ColumnLayout {
             // Stated plainly so users do not over-trust the guard.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled && root.routingKsDetailsExpanded
                 color: root.mutedTextColor
@@ -1700,6 +1853,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.killSwitchEnabled
                 color: root.textColor
                 wrapMode: Text.WordWrap
@@ -1774,6 +1928,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                 color: root.mutedTextColor
@@ -1802,6 +1957,7 @@ ColumnLayout {
                 CheckBox {
                     id: dnsViaSecondaryCheck
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     checked: panel.dnsViaSecondary
                     text: root.tr("settings.routing.dns-via-secondary.label",
                         "DNS through the tunnel")
@@ -1832,6 +1988,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                     && root.routingDnsViaSecondaryDetailsExpanded
@@ -1857,6 +2014,7 @@ ColumnLayout {
             CheckBox {
                 id: dnsFastAnswersCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.killSwitchEnabled
                 checked: panel.dnsFastAnswers
                 text: root.tr("settings.routing.dns-fast-answers.label",
@@ -1878,6 +2036,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                 color: root.mutedTextColor
@@ -1897,6 +2056,7 @@ ColumnLayout {
                 CheckBox {
                     id: fakeIpCheck
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     checked: panel.fakeIpEnabled
                     text: root.tr("settings.routing.fake-ip.label",
                         "Route sites over virtual addresses (fake-IP)")
@@ -1925,6 +2085,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
@@ -1939,6 +2100,7 @@ ColumnLayout {
             // (Linux/macOS: kernel TUN is native) and until the probe answers.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
@@ -1961,6 +2123,7 @@ ColumnLayout {
             CheckBox {
                 id: fakeIpUdpRelayCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
@@ -1985,6 +2148,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
@@ -2003,6 +2167,7 @@ ColumnLayout {
             CheckBox {
                 id: fakeIpInstantRstCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
@@ -2027,6 +2192,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
@@ -2056,6 +2222,7 @@ ColumnLayout {
             Label {
                 visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.mode-a-coverage.label",
@@ -2114,6 +2281,7 @@ ColumnLayout {
             Label {
                 visible: panel.killSwitchEnabled && panel.enforcementMode !== "resolver"
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -2153,6 +2321,7 @@ ColumnLayout {
                     // Default balanced.
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         visible: panel.killSwitchEnabled
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
@@ -2162,6 +2331,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         visible: panel.killSwitchEnabled
                         color: root.textColor
                         wrapMode: Text.WordWrap
@@ -2223,6 +2393,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
                         visible: panel.killSwitchEnabled
                         color: root.mutedTextColor
@@ -2246,6 +2417,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         visible: panel.killSwitchEnabled && panel.ksFailClosed
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
@@ -2256,6 +2428,7 @@ ColumnLayout {
                     CheckBox {
                         id: ksStrictSharedCheck
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         visible: panel.killSwitchEnabled && panel.ksFailClosed
                         checked: panel.ksStrictSharedIps
                         text: root.tr("settings.routing.kill-switch.shared-strict-label",
@@ -2285,6 +2458,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
                         visible: panel.killSwitchEnabled && panel.ksFailClosed
                             && root.routingSharedStrictDetailsExpanded
@@ -2296,6 +2470,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
                         visible: panel.killSwitchEnabled && panel.ksFailClosed
                             && !panel.ksStrictSharedIps
@@ -2333,6 +2508,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         Layout.leftMargin: root.uiTheme.spacingSm
                         visible: root.routingSharedExemptAddressesExpanded
                             && panel.killSwitchEnabled && panel.ksFailClosed
@@ -2354,6 +2530,7 @@ ColumnLayout {
                             && panel.sharedExemptAddresses.length > 0
                         Label {
                             Layout.fillWidth: true
+                            Layout.preferredWidth: 0
                             color: root.mutedTextColor
                             wrapMode: Text.WordWrap
                             font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2423,6 +2600,7 @@ ColumnLayout {
             // the "adapter not found / not started" case the user raged about.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -2441,6 +2619,7 @@ ColumnLayout {
             CheckBox {
                 id: ksBlockAllCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 // Track 1 Chunk 5 — hidden entirely when the posture is
                 // fail-open (leak protection not blocking); shown fail-closed.
                 visible: panel.killSwitchEnabled && panel.ksFailClosed
@@ -2473,6 +2652,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 // Track 1 Chunk 5 — travels with its checkbox: hidden fail-open.
                 visible: panel.killSwitchEnabled && panel.ksFailClosed
@@ -2515,6 +2695,7 @@ ColumnLayout {
                     }
                     Label {
                         Layout.fillWidth: true
+                        Layout.preferredWidth: 0
                         color: root.textColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2533,6 +2714,7 @@ ColumnLayout {
             CheckBox {
                 id: allowDnsOverPrimaryCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled && panel.ksFailClosed && panel.ksBlockAll
                 checked: panel.allowDnsOverPrimary
@@ -2553,6 +2735,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled && panel.ksFailClosed && panel.ksBlockAll
                 color: root.mutedTextColor
@@ -2570,6 +2753,7 @@ ColumnLayout {
             CheckBox {
                 id: ksBlockAllWarnCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.killSwitchEnabled && panel.ksFailClosed
                 checked: root.uiRevision >= 0
                     ? root.prefs.warnKillSwitchBlockAll !== false : true
@@ -2586,6 +2770,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.killSwitchEnabled && panel.ksFailClosed
                 color: root.mutedTextColor
@@ -2608,6 +2793,7 @@ ColumnLayout {
                 visible: panel.killSwitchEnabled
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     color: root.textColor
                     wrapMode: Text.WordWrap
                     text: root.tr("settings.routing.kill-switch.failure-mode.label",
@@ -2667,6 +2853,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     // Fail-open is the risky choice — colour it as a warning so
                     // the trade-off (possible real-address exposure) is obvious.
                     color: panel.ksFailClosed
@@ -2685,6 +2872,7 @@ ColumnLayout {
                 // connect-layer-only block let ping through (HW test 06-29).
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.topMargin: root.uiTheme.spacingSm
                     // Track 1 Chunk 5 — protocol picker is meaningless while
                     // fail-open (nothing is blocked); hide it there.
@@ -2742,6 +2930,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     visible: panel.killSwitchEnabled && panel.ksFailClosed
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
@@ -2756,6 +2945,7 @@ ColumnLayout {
                 // (default off). F7 Track 1 Chunk 5 — hidden while fail-open.
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.topMargin: root.uiTheme.spacingSm
                     visible: panel.killSwitchEnabled && panel.ksFailClosed
                     color: root.textColor
@@ -2871,6 +3061,7 @@ ColumnLayout {
                 // limits (user report). State the unit + range explicitly.
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.leftMargin: root.uiTheme.spacingSm
                     visible: livenessCustomSpin.visible
                     color: root.mutedTextColor
@@ -2881,6 +3072,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     visible: panel.killSwitchEnabled && panel.ksFailClosed
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
@@ -2888,6 +3080,138 @@ ColumnLayout {
                     text: root.tr("settings.routing.liveness-window.note",
                         "Optional. When set, NetRuleRouter actively pings the additional adapter's next hop; if it stays unreachable for this many seconds, leak protection fail-closes even if no traffic has failed yet. Off by default. It may false-positive if the tunnel peer silently drops ICMP (many VPNs do), so leave it off unless you know the peer answers pings.")
                 }
+            }
+        }
+    }
+
+    // Local networks. Leak protection blocks everything that is not the tunnel,
+    // and a virtual machine's own segment is caught in that net even though its
+    // traffic never leaves this computer. The service exempts what it can
+    // recognise; this is where the user corrects it — refuse a discovered
+    // segment, or name one nothing on the machine reveals (a hypervisor in NAT
+    // mode creates no host interface). Per-SID, no elevation.
+    GroupBox {
+        id: localNetworksGroup
+        title: root.tr("settings.routing.local-networks.title", "Local networks")
+        Layout.fillWidth: true
+        visible: panel.killSwitchEnabled
+
+        ColumnLayout {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            spacing: root.uiTheme.spacingSm
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.local-networks.description",
+                    "While leak protection is on, only these local networks stay reachable. Traffic to them never leaves this computer.")
+            }
+
+            Repeater {
+                model: panel.localNetworks
+                delegate: RowLayout {
+                    required property var modelData
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+
+                    CheckBox {
+                        checked: modelData.allowed === true
+                        onToggled: panel.setLocalNetworkAllowed(
+                            String(modelData.cidr), checked)
+                        Accessible.name: String(modelData.cidr)
+                    }
+                    Label {
+                        text: String(modelData.cidr)
+                        color: root.textColor
+                    }
+                    Label {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        color: root.mutedTextColor
+                        text: panel.localNetworkSubtitle(modelData)
+                    }
+                    Label {
+                        visible: modelData["decided-by-user"] !== true
+                        color: root.uiTheme.colorWarning
+                        text: root.tr("settings.routing.local-networks.undecided",
+                            "no answer yet")
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        visible: String(modelData.kind) === "manual"
+                        text: root.tr("action.delete", "Delete")
+                        onClicked: panel.forgetLocalNetwork(String(modelData.cidr))
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.localNetworks.length === 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.local-networks.empty",
+                    "No local networks found yet. Add one below if you reach a virtual machine at an address this list does not show.")
+            }
+
+            // A discovered network is exempt by default, so its tick says
+            // nothing about whether the user agreed. Until it does, the offer
+            // banner keeps asking — one confirm here answers for all of them.
+            ColumnLayout {
+                Layout.fillWidth: true
+                visible: panel.undecidedLocalNetworks.length > 0
+                spacing: root.uiTheme.spacingSm
+
+                Label {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 0
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("settings.routing.local-networks.undecided-hint",
+                        "A tick alone is what this computer does by default, not your answer. Confirm and the offer stops coming back.")
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("status.local-network-offer-keep", "Keep them reachable")
+                    onClicked: panel.confirmUndecidedLocalNetworks()
+                    Accessible.name: text
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                ThemedTextField {
+                    id: localNetworkInput
+                    theme: root.uiTheme
+                    Layout.fillWidth: true
+                    placeholderText: root.tr("settings.routing.local-networks.add-placeholder",
+                        "For example 10.0.2.0/24")
+                    Accessible.name: root.tr("settings.routing.local-networks.add",
+                        "Add a network")
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    text: root.tr("settings.routing.local-networks.add", "Add a network")
+                    enabled: localNetworkInput.text.trim() !== ""
+                    onClicked: {
+                        panel.setLocalNetworkAllowed(localNetworkInput.text.trim(), true)
+                        localNetworkInput.text = ""
+                    }
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.localNetworkError !== ""
+                color: root.uiTheme.colorWarning
+                wrapMode: Text.WordWrap
+                text: panel.localNetworkError
             }
         }
     }
@@ -2907,8 +3231,140 @@ ColumnLayout {
             anchors.fill: parent
             spacing: root.uiTheme.spacingSm
 
+            CheckBox {
+                id: blockIpv6Check
+                Layout.fillWidth: true
+                visible: panel.killSwitchEnabled
+                text: root.tr("settings.routing.block-ipv6",
+                    "Switch IPv6 off while leak protection is on")
+                checked: panel.blockIpv6WhenProtected
+                onToggled: {
+                    panel.blockIpv6WhenProtected = checked
+                    if (typeof root.routePolicyController.applyBlockIpv6WhenProtected === "function")
+                        root.routePolicyController.applyBlockIpv6WhenProtected(checked)
+                }
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+            }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingMd
+                visible: panel.killSwitchEnabled
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                text: root.tr("settings.routing.block-ipv6-description",
+                    "Rules cover IPv4 addresses. A site that also has an IPv6 address could otherwise reach it over the main connection while its IPv4 traffic goes through the additional route. Turn this off only if your network needs IPv6.")
+            }
+
+            // Checking the main route. The suggestions screen has a Check
+            // button; this is the standing permission to do it unasked, plus
+            // what one pass may cost. The service clamps every bound, so a
+            // number here can only narrow a pass.
+            CheckBox {
+                id: primaryProbeAutoCheck
+                Layout.fillWidth: true
+                text: root.tr("settings.routing.primary-probe.auto",
+                    "Check the main route for new suggestions automatically")
+                checked: panel.primaryProbeAuto
+                onToggled: {
+                    panel.primaryProbeAuto = checked
+                    if (typeof root.routePolicyController.applyPrimaryProbeAuto === "function")
+                        root.routePolicyController.applyPrimaryProbeAuto(checked)
+                }
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingMd
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                text: root.tr("settings.routing.primary-probe.description",
+                    "One short connection attempt per address, from the main connection. It answers whether the address is reachable there — not whether the site works there.")
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                Layout.leftMargin: root.uiTheme.spacingMd
+                text: panel.primaryProbeLimitsExpanded
+                    ? root.tr("settings.routing.show-less", "Hide details")
+                    : root.tr("settings.routing.primary-probe.limits", "Configure limits")
+                onClicked: panel.primaryProbeLimitsExpanded = !panel.primaryProbeLimitsExpanded
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+            }
+            GridLayout {
+                Layout.fillWidth: true
+                Layout.leftMargin: root.uiTheme.spacingMd
+                visible: panel.primaryProbeLimitsExpanded
+                columns: 2
+                columnSpacing: root.uiTheme.spacingSm
+                rowSpacing: root.uiTheme.spacingXs
+
+                Label {
+                    text: root.tr("settings.routing.primary-probe.timeout", "Wait per address, ms")
+                    color: root.textColor
+                }
+                ThemedSpinBox {
+                    theme: root.uiTheme
+                    from: 300
+                    to: 5000
+                    stepSize: 100
+                    value: panel.primaryProbeTimeoutMs
+                    onValueModified: {
+                        panel.primaryProbeTimeoutMs = value
+                        root.routePolicyController.applyPrimaryProbeLimit(
+                            "primary-probe-timeout-ms", value)
+                    }
+                    Accessible.role: Accessible.SpinBox
+                    Accessible.name: root.tr("settings.routing.primary-probe.timeout",
+                        "Wait per address, ms")
+                }
+                Label {
+                    text: root.tr("settings.routing.primary-probe.max-targets",
+                        "Addresses per check")
+                    color: root.textColor
+                }
+                ThemedSpinBox {
+                    theme: root.uiTheme
+                    from: 1
+                    to: 32
+                    value: panel.primaryProbeMaxTargets
+                    onValueModified: {
+                        panel.primaryProbeMaxTargets = value
+                        root.routePolicyController.applyPrimaryProbeLimit(
+                            "primary-probe-max-targets", value)
+                    }
+                    Accessible.role: Accessible.SpinBox
+                    Accessible.name: root.tr("settings.routing.primary-probe.max-targets",
+                        "Addresses per check")
+                }
+                Label {
+                    text: root.tr("settings.routing.primary-probe.repeat",
+                        "Do not re-check the same address for, s")
+                    color: root.textColor
+                }
+                ThemedSpinBox {
+                    theme: root.uiTheme
+                    from: 30
+                    to: 86400
+                    stepSize: 30
+                    value: panel.primaryProbeRepeatSecs
+                    onValueModified: {
+                        panel.primaryProbeRepeatSecs = value
+                        root.routePolicyController.applyPrimaryProbeLimit(
+                            "primary-probe-repeat-secs", value)
+                    }
+                    Accessible.role: Accessible.SpinBox
+                    Accessible.name: root.tr("settings.routing.primary-probe.repeat",
+                        "Do not re-check the same address for, s")
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.auto-rules.label",
@@ -2987,6 +3443,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -3002,6 +3459,7 @@ ColumnLayout {
             CheckBox {
                 id: autoRulesEagerCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.autoRulesMode !== "off"
                 checked: panel.autoRulesEagerDeliveryNames
                 text: root.tr("settings.routing.auto-rules.eager-label",
@@ -3029,6 +3487,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.autoRulesMode !== "off"
                 color: root.mutedTextColor
@@ -3045,6 +3504,7 @@ ColumnLayout {
             // divergence they never caused.
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.autoRulesMode !== "off"
                 color: root.mutedTextColor
@@ -3188,6 +3648,7 @@ ColumnLayout {
             CheckBox {
                 id: dohEnableCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 checked: panel.dohLockdownEnabled
                 text: root.tr("settings.routing.doh-lockdown.label", "Block browser DoH/DoT")
                 contentItem: Label {
@@ -3206,6 +3667,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -3217,6 +3679,7 @@ ColumnLayout {
             // ── Part A: scope selector (gated on the master toggle) ──
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 visible: panel.dohLockdownEnabled
                 color: root.textColor
                 wrapMode: Text.WordWrap
@@ -3274,6 +3737,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.dohLockdownEnabled
                 color: root.mutedTextColor
@@ -3299,6 +3763,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 visible: panel.dohLockdownEnabled && root.routingDohLockdownDetailsExpanded
                 color: root.mutedTextColor
@@ -3331,6 +3796,7 @@ ColumnLayout {
 
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     color: root.uiTheme.colorWarning
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -3339,6 +3805,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -3534,6 +4001,7 @@ ColumnLayout {
                 CheckBox {
                     id: allowRuleEditsCheck
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     text: root.tr("settings.routing.rule-lock.allow.label",
                         "Allow users to change routing rules")
                     // A click writes `checked` directly and destroys a plain
@@ -3563,6 +4031,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.leftMargin: root.uiTheme.spacingLg
                     text: root.tr("settings.routing.rule-lock.help",
                         "Affects the whole machine and needs administrator approval. While it is off, the Rules view is read-only for everyone: viewing, searching and exporting still work, but adding, editing, applying, importing and resetting to the baseline are turned off. The background service refuses the change as well, so the lock does not depend on this window.")
@@ -3611,6 +4080,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.leftMargin: root.uiTheme.spacingLg
                     text: root.tr("settings.diagnostics.rule-scope.help",
                         "Affects the whole machine and needs administrator approval. On = always-on (managed/business deployments). Off = active only while you keep the app open. Stopping the service always clears the routes.")
@@ -3656,6 +4126,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     Layout.leftMargin: root.uiTheme.spacingLg
                     text: root.tr("settings.diagnostics.routing-stop.help",
                         "Applies to both “safe disable”/pause and stopping the service. Affects the whole machine and needs administrator approval. Note: simply closing the app keeps routing active because the background service keeps running — use Stop service (or Disable) to turn routing off.")
@@ -3693,6 +4164,7 @@ ColumnLayout {
             CheckBox {
                 id: hostsBypassCheck
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 checked: panel.resolveHostsBypass
                 text: root.tr("settings.routing.hosts-bypass.label",
                     "Resolve routed domains bypassing the hosts file")
@@ -3711,6 +4183,7 @@ ColumnLayout {
             }
             Label {
                 Layout.fillWidth: true
+                Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -3755,7 +4228,7 @@ ColumnLayout {
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        text: root.tr("settings.routing.hosts-file.open-folder", "Open folder")
+                        text: root.tr("action.open-folder", "Open folder")
                         icon.source: root.uiIconSource("open-file")
                         enabled: hostsFilePathField.text.length > 0
                         onClicked: {
@@ -3766,6 +4239,7 @@ ColumnLayout {
                 }
                 Label {
                     Layout.fillWidth: true
+                    Layout.preferredWidth: 0
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1

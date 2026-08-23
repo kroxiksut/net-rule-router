@@ -99,6 +99,7 @@ QtObject {
             adminBaseline: !!adminBaseline
         }
         root._activeReviewKind = "rules-update"
+        var startedAtMs = Date.now()
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, true /* dryRun */, ""
         )
@@ -106,6 +107,13 @@ QtObject {
             if (!ok) {
                 console.log("review-flow: dry-run failed:", code, msg)
                 // Release the guard without navigating.
+                _resolveGuardRulesApply(false)
+                return
+            }
+            // An apply landed while this review was in flight — it describes a
+            // revision that is already history.
+            if (root.reviewIsSuperseded(startedAtMs)) {
+                root.announceReviewSuperseded()
                 _resolveGuardRulesApply(false)
                 return
             }
@@ -273,6 +281,14 @@ QtObject {
                 return
             }
             console.log("review-flow: activate completed:", JSON.stringify(p))
+            root._lastRulesActivationMs = Date.now()
+            // A second review raised BEFORE this one landed now describes a
+            // revision that no longer exists: its diff renders empty and its
+            // token dies on "revision-status-mismatch". One activation, one
+            // live review — take the stale one down here.
+            if (root.reviewDiffDialog && root.reviewDiffDialog.opened) {
+                root.reviewDiffDialog.close()
+            }
             if (root.pendingReviewState.adminBaseline) {
                 // Admin baseline edit succeeded.
                 root.statusLine = root.tr("status.baseline-activate-completed",
@@ -308,12 +324,27 @@ QtObject {
             // re-applies content already equal to the bound file must NOT raise the
             // "Save to file" chip. The SaveBeforeCloseDialog then prompts only on a
             // genuine divergence.
-            root.boundFilesController._reconcileBoundFileDirty()
-            // The linked .txt mirrors what is enforced: re-export the
-            // just-activated rules so it never goes stale and the next launch's
-            // auto-open is never a false-delete.
-            root.boundFilesController._persistBoundFilesAfterApply()
-            root._mergeApplyPendingWrite = false
+            // A MERGE activates rules the merge preview built, not the rows on
+            // screen: exporting the model here wrote the pre-merge set straight
+            // back over the file the merge had just resolved, so the files came
+            // out of a merge diverged again. Pull the activated revision into
+            // the table first, then export from it.
+            if (root._mergeApplyPendingWrite) {
+                root._mergeApplyPendingWrite = false
+                root._refreshRulesFromService({ silent: true, onComplete: function() {
+                    // The refresh already re-captured the drift baseline off the
+                    // freshly loaded model.
+                    root.boundFilesController._reconcileBoundFileDirty()
+                    root.boundFilesController._persistBoundFilesAfterApply()
+                    Qt.callLater(root.driftController._driftRecheckNow)
+                } })
+            } else {
+                root.boundFilesController._reconcileBoundFileDirty()
+                // The linked .txt mirrors what is enforced: re-export the
+                // just-activated rules so it never goes stale and the next
+                // launch's auto-open is never a false-delete.
+                root.boundFilesController._persistBoundFilesAfterApply()
+            }
             // Successful activation supersedes any
             // parked changeset. Clear sidecar so the post-connect
             // toast won't fire again on the next launch / reconnect.

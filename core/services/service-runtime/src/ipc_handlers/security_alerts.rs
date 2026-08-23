@@ -164,6 +164,7 @@ mod tests {
                     client_profile: IpcClientProfile::GuiInteractive,
                     caller_is_elevated: false,
                     caller_principal: None,
+                    caller_pid: None,
                 },
             )
             .expect("handler ok");
@@ -243,6 +244,7 @@ mod tests {
                     client_profile: IpcClientProfile::GuiInteractive,
                     caller_is_elevated: false,
                     caller_principal: None,
+                    caller_pid: None,
                 },
             )
             .unwrap_err();

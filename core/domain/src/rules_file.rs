@@ -73,8 +73,8 @@ use nrr_shared::auto_rule::{parse_provenance_comment, RuleOrigin};
 /// appear exactly as listed in files. The GUI may display localized descriptions
 /// *about* each section, but the name itself is invariant.
 ///
-/// The enum is `#[non_exhaustive]` because the Pro edition will introduce
-/// additional sections (`CIDR`, `Ports`, etc.) as new variants.
+/// The enum is `#[non_exhaustive]`: further sections (`CIDR`, `Ports`, …) may
+/// become variants later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[non_exhaustive]
 pub enum RulesFileSection {
@@ -86,7 +86,7 @@ pub enum RulesFileSection {
     /// Suffix and exact FQDN domain rules.
     /// Active in the Free edition on all platforms.
     Domains,
-    /// Exact IP address rules. No CIDR; CIDR matching is a Pro feature.
+    /// Exact IP address rules. No CIDR; CIDR matching is not supported.
     /// Active in the Free edition on all platforms.
     Ip,
     /// Windows application rules matched by `.exe` filename (case-insensitive).
@@ -420,7 +420,7 @@ impl RulesFileParsed {
 /// 2. **Domains (exact FQDN)** — longest label wins among domain rules.
 /// 3. **Domains (suffix/subdomain)** — e.g. `example.com` matches
 ///    `www.example.com` at any depth.
-/// 4. **IP** — exact IP address. CIDR matching is a Pro feature.
+/// 4. **IP** — exact IP address. CIDR matching is not supported.
 /// 5. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
 ///    name. Only the platform-appropriate section is evaluated.
 /// 6. **Default route** — `ActiveConfiguration.behavior_mode` decides.
@@ -443,10 +443,10 @@ pub struct RulesFileEvaluationPriority;
 ///
 /// Unknown sections are **preserved** so they survive a Free-edition
 /// round-trip without data loss. This is the forward-compatibility mechanism
-/// for Pro-edition sections (`CIDR`, `Ports`, etc.) appearing in a file from
+/// for unsupported sections (`CIDR`, `Ports`, etc.) appearing in a file from
 /// a newer product version.
 ///
-/// The GUI displays these rules with a Pro badge ("Available in Pro") and
+/// The GUI displays these rules with a "not applied" badge and
 /// keeps them inactive until the user upgrades.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnknownSection {
@@ -557,7 +557,7 @@ pub struct ParseOutcome {
     pub parsed: RulesFileParsed,
     /// Sections with names not recognised by this version of the parser.
     /// Preserved so they can be written back on export without data loss.
-    /// Corresponds to Pro-edition sections when a file from a newer product
+    /// Corresponds to unsupported sections when a file from a newer product
     /// version is opened in the Free edition.
     pub unknown_sections: Vec<UnknownSection>,
     /// Non-blocking warnings about the input.
@@ -1158,7 +1158,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
 
 // ── RulesFileParsed → text writer ─────────────────────────────────────────────
 
-/// Serialises a [`RulesFileParsed`] (and optional Pro-only sections) back to
+/// Serialises a [`RulesFileParsed`] (and optional unsupported sections) back to
 /// canonical rules-file text.
 ///
 /// This is the inverse of [`parse_rules_file`]: feeding the output back through
@@ -1173,7 +1173,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
 ///   (Zones → Domains → IP → Windows → Linux → MacOS → Auto), **including
 ///   empty sections** (docs/en/rules-file-format.md Sections — empty sections must not be stripped).
 /// - Unknown sections from `unknown` are written after the known ones, in the
-///   order supplied. This preserves Pro-only sections through a Free
+///   order supplied. This preserves unsupported sections through a Free
 ///   round-trip.
 /// - Active rule line: `value` (no inline comment) or `value  # comment`
 ///   (two spaces before `#`, matching docs/en/rules-file-format.md Complete example examples).
@@ -1190,7 +1190,7 @@ pub fn canonical_rule_set_to_rules_file_parsed(
 /// assert_eq!(again, *parsed);
 /// ```
 ///
-/// Pro section preservation requires the caller to thread the original
+/// unsupported section preservation requires the caller to thread the original
 /// `unknown_sections` through (the canonical revision store does not retain
 /// them today).
 pub fn write_rules_file(
@@ -1254,7 +1254,7 @@ pub fn write_rules_file(
         }
     }
 
-    // Append unknown (Pro-only) sections in supplied order.
+    // Append unknown (unsupported) sections in supplied order.
     for unknown_section in unknown {
         if !first_section {
             out.push('\n');
@@ -1498,10 +1498,24 @@ mod tests {
 
     // ── HostPlatform ─────────────────────────────────────────────────────────
 
+    /// The compiled platform must be the one the test binary was built for.
+    /// Asserting a constant `Windows` here made the whole crate's test run fail
+    /// under Linux — a false alarm that hid whatever else the Linux run had to
+    /// say, on a project that is deliberately going cross-platform.
     #[test]
-    fn compiled_platform_is_windows_in_test_environment() {
-        // This project is Windows-first; tests run on Windows.
-        assert_eq!(HostPlatform::compiled(), HostPlatform::Windows);
+    fn compiled_platform_matches_the_build_target() {
+        let expected = if cfg!(target_os = "windows") {
+            HostPlatform::Windows
+        } else if cfg!(target_os = "linux") {
+            HostPlatform::Linux
+        } else if cfg!(target_os = "macos") {
+            HostPlatform::MacOS
+        } else {
+            // Anything else falls back to Windows by construction — the same
+            // branch `compiled()` takes.
+            HostPlatform::Windows
+        };
+        assert_eq!(HostPlatform::compiled(), expected);
     }
 
     // ── RulesFileEntry ───────────────────────────────────────────────────────

@@ -148,19 +148,24 @@ use std::collections::HashSet;
 /// shelf (`autorules.dismissed.{list,restore}`, `autorules.candidates.forget`)
 /// and the blocked-connection notices the tray raises
 /// (`block-notices.mutes.{list,set,remove,clear}`,
-/// `block-notices.route-to-secondary`).
+/// `block-notices.route-to-secondary`), plus the local networks a user may keep
+/// reachable under the kill-switch (`settings.local-networks.{get,set}`) and the
+/// on-demand main-route check (`autorules.candidates.probe`) plus the mark for a
+/// site that refuses main-link addresses (`autorules.refusing-anchor.set`) and
+/// the backlog a surface drains when it comes up
+/// (`block-notices.journal.{list,ack}`).
 /// The catalog must list every variant in `IpcOperationName::ALL` exactly
 /// once, with unique kebab-case slugs.
 #[test]
 fn block16_catalog_size_is_pinned_and_slugs_are_unique() {
     assert_eq!(
         IpcOperationName::ALL.len(),
-        62,
+        69,
         "block 16 catalog size has drifted — update the gate test if intentional"
     );
     assert_eq!(
         ipc_operation_catalog().len(),
-        62,
+        69,
         "catalog spec count must match `ALL` count"
     );
     let mut slugs: HashSet<&'static str> = HashSet::new();

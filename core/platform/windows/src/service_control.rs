@@ -145,10 +145,17 @@ impl ServiceControlPort for WindowsServiceControl {
             None
         };
 
+        // Step 6 — event-source registration, so lifecycle records show up under
+        // our name instead of as "description cannot be found". Best-effort for
+        // the same reason as recovery actions: a service that logs plainly is
+        // still an installed service.
+        let event_source_registered = crate::event_log::register_event_source().is_ok();
+
         Ok(ServiceInstallReport {
             data_dirs_created: dirs_created,
             recovery_configured,
             acl_applied,
+            event_source_registered: Some(event_source_registered),
         })
     }
 
@@ -170,7 +177,19 @@ impl ServiceControlPort for WindowsServiceControl {
             let _ = wait_for_stopped(&service, UNINSTALL_STOP_BUDGET);
         }
 
+        // Between the stop and the delete is the only moment this can be done:
+        // an instance that was hard-killed or that timed out its drain still
+        // has its filters and its DNS redirect on the machine, and the boot
+        // sweep that heals them dies with the registration. Missing it leaves a
+        // machine with no internet or no name resolution and nothing installed
+        // that could put it right.
+        let machine_state_cleared = Some(sweep_enforcement_state());
+
         service.delete().map_err(map_service_error)?;
+
+        // Leaving the source registered would keep an orphan key pointing at a
+        // service that no longer exists.
+        let _ = crate::event_log::deregister_event_source();
 
         let data_removed = if spec.remove_service_owned_data {
             let root = service_data_root()?;
@@ -186,7 +205,10 @@ impl ServiceControlPort for WindowsServiceControl {
             false
         };
 
-        Ok(ServiceUninstallReport { data_removed })
+        Ok(ServiceUninstallReport {
+            data_removed,
+            machine_state_cleared,
+        })
     }
 
     fn start(&self, timeout: Duration) -> Result<(), ServiceControlError> {
@@ -473,4 +495,97 @@ fn wait_for_stopped(service: &Service, timeout: Duration) -> Result<(), ServiceC
         }
         std::thread::sleep(POLL_INTERVAL);
     }
+}
+
+/// Longest the uninstall sweep waits on the filtering engine before giving up
+/// and saying so.
+const SWEEP_BUDGET: Duration = Duration::from_secs(30);
+
+/// Run `work` on a worker thread and give up on it after `budget`.
+///
+/// `None` means it did not answer in time. The thread is abandoned rather than
+/// cancelled — a blocked RPC into the filtering engine cannot be interrupted,
+/// and this runs in a short-lived process that is about to exit anyway.
+fn within<T, F>(budget: Duration, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    if std::thread::Builder::new()
+        .name("nrr-uninstall-sweep".to_string())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .is_err()
+    {
+        return None;
+    }
+    rx.recv_timeout(budget).ok()
+}
+
+/// Remove the two things this product leaves on the machine that can lock a
+/// user out: WFP filters under our provider, and the Mode-B NRPT redirect
+/// pointing all name resolution at a loopback listener that is about to stop
+/// existing. Both sweeps are scoped to our own marker/provider, so an admin's
+/// or another product's objects are never touched.
+///
+/// Routes are deliberately not swept here: ours are non-persistent and clear on
+/// the next reboot, and adopting them needs the reconciler from the service
+/// layer, which this crate must not depend on.
+///
+/// Returns `false` if either sweep could not run — the caller reports it rather
+/// than failing the removal, because a registered service is the worse outcome.
+fn sweep_enforcement_state() -> bool {
+    let api: std::sync::Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
+        std::sync::Arc::new(crate::windows_api::ProductionWindowsApi);
+    // Budgeted: opening the engine and sweeping it are both RPC into the Base
+    // Filtering Engine, and a wedged engine answers neither. Removal must not
+    // be the command that hangs — a service left registered is the worse
+    // outcome, and our filters are not persistent, so a reboot clears whatever
+    // this could not.
+    let filters_swept = within(SWEEP_BUDGET, move || {
+        crate::wfp::WfpSession::open(api)
+            .and_then(|session| session.cleanup_all())
+            .is_ok()
+    })
+    .unwrap_or(false);
+    // Only once the filters are gone: the sub-layer cannot be deleted while
+    // anything still references it. Its own handle rather than the session's —
+    // that one belongs to the neutral layer and does not hand out its token.
+    if filters_swept {
+        if let Ok(token) = crate::win32_ffi::wfp_engine::engine_open() {
+            if let Err(e) = crate::win32_ffi::wfp_sublayer::delete_sublayer(&token) {
+                tracing::warn!(
+                    target: "nrr::wfp",
+                    error = %e,
+                    "could not remove the WFP sub-layer; a reboot clears it",
+                );
+            }
+            let _ = crate::win32_ffi::wfp_engine::engine_close(token);
+        }
+    }
+    // Machine-wide engine options, including ones an instance that was killed
+    // rather than stopped left changed — it wrote down what they held.
+    crate::conn_observe::wfp_events::restore_engine_options();
+    // The autostart entry, for whoever is running the removal.
+    //
+    // Per-user by nature (`HKCU`), so this reaches exactly one hive: the
+    // caller's. Another account that also enabled autostart keeps its entry,
+    // and reaching it would mean walking other users' registry — invasive, and
+    // still blind to anyone not logged in. The residue is inert (it names an
+    // executable that no longer exists), so the honest split is: clear what we
+    // can reach here, and leave the rest to a per-user uninstall action.
+    if let Err(e) = nrr_platform_api::autostart::AutostartRegistryPort::delete_value(
+        &crate::autostart::ProductionAutostartRegistry,
+    ) {
+        tracing::debug!(
+            target: "nrr::autostart",
+            error = ?e,
+            "no autostart entry of ours to remove for this user",
+        );
+    }
+    let dns_swept =
+        crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::PowerShellRunner).is_ok();
+    filters_swept && dns_swept
 }

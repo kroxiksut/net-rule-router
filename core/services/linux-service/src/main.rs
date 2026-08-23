@@ -17,6 +17,9 @@ mod cli;
 
 #[cfg(target_os = "linux")]
 mod install;
+// The provider bundle behind the daemon's full IPC surface.
+#[cfg(target_os = "linux")]
+mod ipc_deps;
 #[cfg(target_os = "linux")]
 mod run;
 // The Linux counterpart of `windows-service/runtime_deps.rs`: assembles the

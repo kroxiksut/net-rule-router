@@ -83,6 +83,24 @@ pub struct PlannerInput<'a> {
 /// the SSOT of the per-rule slot width across the planner + `lower_windows`.
 pub const SLOTS_PER_RULE: u32 = WFP_SLOTS_PER_RULE as u32;
 
+/// The neutral principal scope for a stored partition key.
+///
+/// Reads the key for what it is on THIS OS — a Windows SID, `unix:uid:<n>`, or
+/// the baseline sentinel — rather than assuming one spelling. Parsing it as a
+/// Windows SID left every Linux rule unscoped, and an unscoped rule applies to
+/// the whole machine: one user's policy would have governed everyone the first
+/// time two people logged in.
+///
+/// The baseline maps to `None` deliberately: it belongs to no user, and a rule
+/// planned from it is meant to hold for all of them.
+fn principal_scope(sid: &str) -> PrincipalScope {
+    PrincipalScope(
+        UserPrincipal::from_stored(sid)
+            .ok()
+            .filter(|p| !p.is_baseline()),
+    )
+}
+
 /// Per-destination packet-layer slot window (Sub-slice 4b), mirroring the
 /// `idx * 16` weight window in `killswitch_codegen::packet_egress_pairs`. Each
 /// protected destination reserves 16 within-band ordinal slots at the packet
@@ -119,7 +137,7 @@ pub fn plan_route_rules(
     behavior_mode: RouteBehaviorMode,
     input: &PlannerInput,
 ) -> Vec<FlowRule> {
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let mut flows = Vec::new();
     for (role, set) in [
         (RouteRole::Primary, &rule_book.primary),
@@ -326,7 +344,7 @@ pub fn plan_kill_switch_destinations(
     protected_ips: &[Ipv4Addr],
     protocols: KillSwitchProtocols,
 ) -> Vec<FlowRule> {
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let mut flows = Vec::new();
     for (idx, ip) in protected_ips
         .iter()
@@ -461,7 +479,7 @@ pub fn plan_catch_all_kill_switch(
     // `other` does not activate the packet layer
     // (mirrors `KillSwitchProtocols::wants_packet_layer`).
     let wants_packet = protocols.icmp || protocols.igmp || protocols.gre || protocols.esp;
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let mut flows = Vec::new();
 
     // ── V4 exemptions, in codegen order (egress, loopback, link-local, broadcast,
@@ -487,6 +505,14 @@ pub fn plan_catch_all_kill_switch(
             EgressConstraint::Any,
         ),
         (DstMatch::HostV4(Ipv4Addr::BROADCAST), EgressConstraint::Any),
+        // Local network control block: mDNS/LLMNR/IGMP never leave the link.
+        (
+            DstMatch::SubnetV4 {
+                net: Ipv4Addr::new(224, 0, 0, 0),
+                prefix: 24,
+            },
+            EgressConstraint::Any,
+        ),
     ];
     for ip in server_ips {
         exemptions.push((DstMatch::HostV4(*ip), EgressConstraint::Any));
@@ -554,17 +580,17 @@ pub fn plan_catch_all_kill_switch(
         }
     }
 
-    // ── IPv6 cut (always): loopback + link-local exemptions over an ::/0
-    //    block-all, at BOTH V6 layers (ALE + packet). ──
+    // ── IPv6 cut (always): loopback + link-local + link-local-multicast
+    //    exemptions over an ::/0 block-all, at BOTH V6 layers (ALE + packet). ──
     push_ipv6_cut(&principal, &mut flows);
 
     flows
 }
 
-/// Append the IPv6 cut (Free's blanket IPv6 handling) — loopback `::1/128` +
-/// link-local `fe80::/10` exemptions over an `::/0` block-all, at BOTH V6 layers.
-/// Shared by the catch-all and fail-closed block-all planners
-/// (`killswitch_codegen::catch_all_v6_filters`).
+/// Append the IPv6 cut (Free's blanket IPv6 handling) — loopback `::1/128`,
+/// link-local `fe80::/10` and link-local-multicast `ff02::/16` exemptions over
+/// an `::/0` block-all, at BOTH V6 layers. Shared by the catch-all and
+/// fail-closed block-all planners (`killswitch_codegen::catch_all_v6_filters`).
 fn push_ipv6_cut(principal: &PrincipalScope, flows: &mut Vec<FlowRule>) {
     let v6_exempts = [
         DstMatch::SubnetV6 {
@@ -574,6 +600,12 @@ fn push_ipv6_cut(principal: &PrincipalScope, flows: &mut Vec<FlowRule>) {
         DstMatch::SubnetV6 {
             net: Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0),
             prefix: 10,
+        },
+        // Neighbour discovery, MLD, mDNS and DHCPv6 address the group, not
+        // `fe80::` — cutting this scope breaks the link, leaks nothing.
+        DstMatch::SubnetV6 {
+            net: Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0),
+            prefix: 16,
         },
     ];
     for (e, dst) in v6_exempts.into_iter().enumerate() {
@@ -719,7 +751,7 @@ pub fn plan_app_kill_switch(
     if !(protocols.tcp || protocols.udp) {
         return Vec::new();
     }
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     app_patterns
         .iter()
         .take(KILLSWITCH_MAX_DESTINATIONS)
@@ -750,7 +782,7 @@ pub fn plan_app_kill_switch(
 /// egress condition; `lower_catch_all_kill_switch` maps it to the `APP_EXEMPT_BASE`
 /// band. There is no block half — this is a pure exemption.
 pub fn plan_primary_app_exempt(sid: &str, app_patterns: &[String]) -> Vec<FlowRule> {
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     app_patterns
         .iter()
         .take(KILLSWITCH_MAX_DESTINATIONS)
@@ -795,7 +827,7 @@ pub fn plan_fail_closed_destinations(
     if !any_selected {
         return Vec::new();
     }
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let ale_proto = ale_protocol(protocols);
     let mut flows = Vec::new();
     for (idx, ip) in protected_ips
@@ -852,7 +884,7 @@ pub fn plan_fail_closed_apps(
     if !(protocols.tcp || protocols.udp) {
         return Vec::new();
     }
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     app_patterns
         .iter()
         .take(KILLSWITCH_MAX_DESTINATIONS)
@@ -894,7 +926,7 @@ pub fn plan_fail_closed_apps(
 /// the ascending `ordinal` so `lower_windows::lower_doh_dot_block` reproduces the
 /// exact same arbitration order as the codegen.
 pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[Ipv4Addr], block_dot: bool) -> Vec<FlowRule> {
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let mut flows = Vec::new();
     let mut ordinal = 0u32;
     let flow_for = |dst: DstMatch, port: u16, ordinal: u32| FlowRule {
@@ -964,7 +996,7 @@ pub fn plan_fail_closed_block_all(
     // `other` does not activate the packet layer
     // (mirrors `KillSwitchProtocols::wants_packet_layer`).
     let wants_packet = protocols.icmp || protocols.igmp || protocols.gre || protocols.esp;
-    let principal = PrincipalScope(UserPrincipal::from_windows_sid(sid).ok());
+    let principal = principal_scope(sid);
     let mut flows = Vec::new();
 
     // ── ALE exemptions (+ packet mirror iff the packet layer is active), in
@@ -985,6 +1017,14 @@ pub fn plan_fail_closed_block_all(
             EgressConstraint::Any,
         ),
         (DstMatch::HostV4(Ipv4Addr::BROADCAST), EgressConstraint::Any),
+        // Local network control block: mDNS/LLMNR/IGMP never leave the link.
+        (
+            DstMatch::SubnetV4 {
+                net: Ipv4Addr::new(224, 0, 0, 0),
+                prefix: 24,
+            },
+            EgressConstraint::Any,
+        ),
     ];
     for ip in server_ips {
         exemptions.push((DstMatch::HostV4(*ip), EgressConstraint::Any));
@@ -1428,6 +1468,64 @@ mod tests {
             action,
             origin: None,
         }
+    }
+
+    /// A Linux principal must survive planning. Parsing the partition key as a
+    /// Windows SID silently produced an UNSCOPED rule, and unscoped means "every
+    /// user on this machine" — one user's routing policy would have governed
+    /// everyone else's traffic.
+    #[test]
+    fn a_unix_principal_scopes_the_flows_it_plans() {
+        let rb = book(
+            vec![exact_ip_rule("p-0", Ipv4Addr::new(203, 0, 113, 1))],
+            vec![],
+        );
+        let (cache, resolver, obs) = (
+            MapCache::default(),
+            MapResolver::default(),
+            MapObs::default(),
+        );
+        let flows = plan_route_rules(
+            &rb,
+            "unix:uid:1000",
+            RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        );
+
+        assert!(!flows.is_empty(), "the rule must plan at least one flow");
+        for flow in &flows {
+            let scoped = flow
+                .principal
+                .0
+                .as_ref()
+                .and_then(|p| p.as_unix_uid())
+                .expect("every flow must carry the uid it was planned for");
+            assert_eq!(scoped, 1000);
+        }
+    }
+
+    /// The baseline belongs to no user, so it plans unscoped on purpose — the
+    /// one case where a missing principal is the answer rather than a bug.
+    #[test]
+    fn the_baseline_plans_without_a_principal() {
+        let rb = book(
+            vec![exact_ip_rule("p-0", Ipv4Addr::new(203, 0, 113, 1))],
+            vec![],
+        );
+        let (cache, resolver, obs) = (
+            MapCache::default(),
+            MapResolver::default(),
+            MapObs::default(),
+        );
+        let flows = plan_route_rules(
+            &rb,
+            nrr_domain::user_principal::BASELINE_PRINCIPAL,
+            RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        );
+
+        assert!(!flows.is_empty());
+        assert!(flows.iter().all(|f| f.principal.0.is_none()));
     }
 
     #[test]
@@ -1894,22 +1992,22 @@ mod tests {
             );
         };
 
-        // ALL: ALE 7 (egress+loopback+link-local+broadcast+server+subnet+block) +
-        // packet 10 (6 mirror exempts + 4 named blocks — no agnostic
-        // block-all) + IPv6 6 (3 ALE + 3 packet) = 23.
-        check(KillSwitchProtocols::ALL, 23);
+        // ALL: ALE 8 (egress+loopback+link-local+broadcast+local-network-
+        // control+server+subnet+block) + packet 11 (7 mirror exempts + 4 named
+        // blocks — no agnostic block-all) + IPv6 8 (4 ALE + 4 packet) = 27.
+        check(KillSwitchProtocols::ALL, 27);
 
-        // TCP/UDP only: no V4 packet layer at all → ALE 7 + IPv6 6 = 13.
-        check(KillSwitchProtocols::from_bits(0x03), 13);
+        // TCP/UDP only: no V4 packet layer at all → ALE 8 + IPv6 8 = 16.
+        check(KillSwitchProtocols::from_bits(0x03), 16);
 
-        // All-except-ICMP: ALE 7 + packet 9 (6 mirror exempts + IGMP/GRE/ESP
-        // named blocks; unchecked ICMP simply gets no filter) + IPv6 6 = 22.
+        // All-except-ICMP: ALE 8 + packet 10 (7 mirror exempts + IGMP/GRE/ESP
+        // named blocks; unchecked ICMP simply gets no filter) + IPv6 8 = 26.
         check(
             KillSwitchProtocols {
                 icmp: false,
                 ..KillSwitchProtocols::ALL
             },
-            22,
+            26,
         );
     }
 

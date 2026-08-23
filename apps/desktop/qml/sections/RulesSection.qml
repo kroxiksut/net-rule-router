@@ -58,6 +58,71 @@ ColumnLayout {
     // add / remove / toggle / move). Every displayModel row carries `masterId`
     // (= the rule id, a stable R-NNNN) so the delegate maps back to the master
     // for selection and edits.
+    /// True while a main-route check is in flight. The pass is accepted, not
+    /// awaited: verdicts arrive with the next rules read.
+    property bool mainRouteCheckBusy: false
+
+    /// Ask the service whether the main route reaches the addresses this rule
+    /// set names.
+    ///
+    /// Only address rules can be checked — an application rule names a program,
+    /// not a destination. Hosts with nothing resolved yet are skipped by the
+    /// service rather than resolved on the spot, so a fresh rule may need one
+    /// more pass before it has an answer.
+    function _checkMainRoute() {
+        if (section.mainRouteCheckBusy) return
+        if (!root.bridgeAvailable
+                || typeof root.rpc.rpcAutoRuleCandidatesProbe !== "function") {
+            root.statusLine = root.tr("status.bindings-require-service",
+                "Adapter bindings can only be changed while the background service is running.")
+            return
+        }
+        var hosts = []
+        var seen = ({})
+        for (var i = 0; i < root.rulesModel.count; i += 1) {
+            var entry = root.rulesModel.get(i)
+            var type = String(entry.ruleType || "")
+            if (type !== "domain" && type !== "zone") continue
+            if (entry.enabled === false) continue
+            var host = String(entry.matchValue || "").replace(/^\*\./, "")
+            if (host === "" || seen[host]) continue
+            seen[host] = true
+            hosts.push(host)
+        }
+        if (hosts.length === 0) {
+            root.statusLine = root.tr("rules.main-route.nothing-to-check",
+                "There are no address rules to check.")
+            return
+        }
+        var corr = root.rpc.rpcAutoRuleCandidatesProbe({ "rule-hostnames": hosts })
+        if (!corr || corr === "") return
+        section.mainRouteCheckBusy = true
+        root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
+            section.mainRouteCheckBusy = false
+            if (!ok) {
+                root.statusLine = String(msg || code || "")
+                return
+            }
+            var accepted = Number((payload || {}).accepted || 0)
+            root.statusLine = accepted > 0
+                ? root.tr("rules.main-route.check-started",
+                        "Checking {count} addresses over the main connection...")
+                    .replace("{count}", String(accepted))
+                : root.tr("rules.main-route.check-nothing",
+                    "Nothing to check: these addresses were checked recently, or none of them has been resolved yet.")
+            if (accepted > 0) mainRouteVerdictsLater.restart()
+        })
+    }
+
+    /// The pass runs for seconds; re-read the rules once it has had time to
+    /// file its verdicts.
+    Timer {
+        id: mainRouteVerdictsLater
+        interval: 6000
+        onTriggered: if (typeof root.reloadActiveRulesFromService === "function")
+            root.reloadActiveRulesFromService()
+    }
+
     function rebuildDisplay() {
         if (typeof displayModel === "undefined" || displayModel === null
                 || !root.rulesModel) return
@@ -90,7 +155,9 @@ ColumnLayout {
         }
         arr.sort(compareRules)
         displayModel.clear()
-        for (var j = 0; j < arr.length; j += 1) displayModel.append(arr[j])
+        // Single append for the whole snapshot — see `_appendRowsChunked` in
+        // Main.qml: the cost is the per-append countChanged, not the rows.
+        if (arr.length > 0) displayModel.append(arr)
     }
     // 0 ms coalescing timer: populating `rulesModel` (clear + 300 appends) fires
     // countChanged ~301 times in one batch; restarting a 0 ms timer collapses
@@ -728,7 +795,7 @@ ColumnLayout {
                 }
                 ThemedButton {
                     theme: root.uiTheme
-                    text: root.tr("rules.source.open-folder", "Open folder")
+                    text: root.tr("action.open-folder", "Open folder")
                     icon.source: root.uiIconSource("open-file")
                     // Fixed size: the button must never grow with the row, the
                     // free width belongs to the path label next to it.
@@ -928,7 +995,7 @@ ColumnLayout {
         Layout.fillWidth: true
         columnSpacing: root.uiTheme.spacingSm
         rowSpacing: root.uiTheme.spacingSm
-        columns: width >= 1100 ? 6 : width >= 720 ? 3 : width >= 480 ? 2 : 1
+        columns: width >= 1100 ? 4 : width >= 720 ? 3 : width >= 480 ? 2 : 1
 
         ThemedButton {
             theme: root.uiTheme
@@ -957,23 +1024,19 @@ ColumnLayout {
         ThemedButton {
             theme: root.uiTheme
             Layout.fillWidth: true
-            text: root.tr("action.load-rule-list", "Load rule list...")
-            icon.source: root.uiIconSource("load-list")
-            enabled: !section.rulesLocked
-            onClicked: root.openLoadRuleListWindow()
-        }
-        ThemedButton {
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: root.tr("action.update-rules-from-file", "Update rules from file")
+            text: section.mainRouteCheckBusy
+                ? root.tr("rules.suggestions.inbox.action-check-main-route-busy", "Checking...")
+                : root.tr("rules.main-route.action-check", "Check the main route")
             icon.source: root.uiIconSource("refresh-dot")
-            enabled: !section.rulesLocked
-            onClicked: section._updateRulesFromCurrentFile()
+            enabled: !section.mainRouteCheckBusy && root.rulesModel.count > 0
+            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+            ToolTip.text: root.tr("rules.main-route.action-check-tooltip",
+                "Tries to reach the addresses your rules name over the main connection, and marks what it finds beside each rule. Answering there does not mean the site works there — a rule may still be earning its place.")
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            Accessible.description: ToolTip.text
+            onClicked: section._checkMainRoute()
         }
-        // Save & Review opens the review-flow
-        // (ReviewDiffDialog → ConfirmActivateDialog → activate). The
-        // button is disabled while any mutation is in flight so
-        // accidental double-submit can't race the coordinator.
         ThemedButton {
             theme: root.uiTheme
             Layout.fillWidth: true
@@ -995,92 +1058,6 @@ ColumnLayout {
         // table so the user can see exactly what is being enforced,
         // independent of any local edits or file binding. Guarded by a
         // confirm when there are unsaved local edits.
-        ThemedButton {
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: root.tr("rules.action.show-service-rules",
-                "Show rules applied by the service")
-            icon.source: root.uiIconSource("refresh-dot")
-            enabled: !root.mutationsModel.hasInFlight
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr(
-                "rules.action.show-service-rules-tooltip",
-                "Load the rules the service is currently enforcing into the table.")
-            onClicked: {
-                if (typeof root.reloadActiveRulesFromService === "function") {
-                    root.reloadActiveRulesFromService()
-                }
-            }
-        }
-        // "Reset to baseline": discard this user's own
-        // per-SID rule customizations and fall back to the shared baseline
-        // rules (read-through resumes). Runs through the same two-phase
-        // review flow (dry-run → confirm); when the user has no custom
-        // rules the dry-run reports a benign "already on baseline" notice
-        // instead of opening the confirm dialog. Non-elevated — a user can
-        // only ever reset its OWN rules, never the admin baseline.
-        ThemedButton {
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: root.tr("rules.action.reset-to-baseline", "Reset to baseline rules")
-            icon.source: root.uiIconSource("refresh-dot")
-            enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr(
-                "rules.action.reset-to-baseline-tooltip",
-                "Discard your custom rules and return to the baseline rules shared on this computer.")
-            onClicked: {
-                if (typeof root.reviewFlowController.startResetToBaselineFlow === "function") {
-                    root.reviewFlowController.startResetToBaselineFlow()
-                }
-            }
-        }
-        // Admin "Set as baseline": commit the current table
-        // as the shared baseline rules for every OS-user on this machine.
-        // Elevated (UAC-shield); routes through the session broker. Daily
-        // per-user edits stay non-elevated ("Save and review" above).
-        ThemedButton {
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: root.tr("rules.action.set-baseline", "Save as baseline (admin)")
-            icon.source: root.uiIconSource("shield")
-            enabled: !root.mutationsModel.hasInFlight
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr(
-                "rules.action.set-baseline-tooltip",
-                "Administrator: make the current rules the baseline that every user on this computer falls back to. Asks for administrator approval.")
-            onClicked: section._triggerBaselineReviewFlow()
-        }
-        // Demo-rules loader. Single demo
-        // entry point: reads the bundled `builtin-demo/rules_*.txt` preset
-        // and MERGES it into the current table through the review flow.
-        // Available regardless of table state (was previously split into
-        // two near-duplicate buttons — a synthetic "Load demo rules" and an
-        // empty-table-only "Apply built-in demo rules"; consolidated here).
-        ThemedButton {
-            theme: root.uiTheme
-            Layout.fillWidth: true
-            text: root.tr("rules.action.load-demo-rules", "Load demo rules...")
-            icon.source: root.uiIconSource("add")
-            enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr(
-                "rules.action.load-demo-rules-tooltip",
-                "Merge the bundled built-in demo rules into the table and open the review flow."
-            )
-            onClicked: {
-                if (typeof root.loadDemoRules === "function") {
-                    root.loadDemoRules()
-                }
-            }
-        }
-        // "Import from file…" removed from
-        // toolbar; functionality lives in File → Load rule list
-        // (Ctrl+O) which opens the same `loadListWindow` with the
-        // two-file picker + Replace/Merge radio. Single entry point.
-        // "Export to file…" toolbar action. Same
-        // route-picker pattern as Import; the exporter reads the
-        // currently-active revision and emits canonical txt bytes.
         ThemedButton {
             id: exportToFileButton
             theme: root.uiTheme
@@ -1111,25 +1088,69 @@ ColumnLayout {
                 }
             }
         }
-        // "Clear all rules" destructive action.
-        // Clears the local rulesModel AND pushes an empty preset to
-        // the service when reachable (so the OS handles routing
-        // without our overlay). When offline, GUI-only clear; user
-        // can push later via Save & review or the next preset import.
+        // Everything that is not day-to-day. Thirteen equally-weighted buttons
+        // above the table pushed the rules themselves into a strip a few rows
+        // tall; the ones a user touches while WORKING stay out here, the rest
+        // live one click away.
         ThemedButton {
-            id: clearAllRulesButton
+            id: rulesMoreButton
             theme: root.uiTheme
             Layout.fillWidth: true
-            text: root.tr("rules.action.clear-all", "Clear all rules...")
-            icon.source: root.uiIconSource("delete")
-            enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
-                && root.rulesModel && root.rulesModel.count > 0
-            ToolTip.visible: hovered
-            ToolTip.text: root.tr(
-                "rules.action.clear-all-tooltip",
-                "Remove all rules from this app and the service. Without rules, the OS handles routing on its own."
-            )
-            onClicked: clearAllRulesConfirm.open()
+            text: root.tr("rules.action.more", "More...")
+            icon.source: root.uiIconSource("settings")
+            onClicked: rulesMoreMenu.popup()
+            Menu {
+                id: rulesMoreMenu
+                MenuItem {
+                    text: root.tr("action.load-rule-list", "Load rule list...")
+                    enabled: !section.rulesLocked
+                    onTriggered: root.openLoadRuleListWindow()
+                }
+                MenuItem {
+                    text: root.tr("action.update-rules-from-file", "Update rules from file")
+                    enabled: !section.rulesLocked
+                    onTriggered: section._updateRulesFromCurrentFile()
+                }
+                MenuItem {
+                    text: root.tr("rules.action.show-service-rules",
+                        "Show rules applied by the service")
+                    enabled: !root.mutationsModel.hasInFlight
+                    onTriggered: {
+                        if (typeof root.reloadActiveRulesFromService === "function") {
+                            root.reloadActiveRulesFromService()
+                        }
+                    }
+                }
+                MenuItem {
+                    text: root.tr("rules.action.reset-to-baseline", "Reset to baseline rules")
+                    enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
+                    onTriggered: {
+                        if (typeof root.reviewFlowController.startResetToBaselineFlow === "function") {
+                            root.reviewFlowController.startResetToBaselineFlow()
+                        }
+                    }
+                }
+                MenuItem {
+                    text: root.tr("rules.action.set-baseline", "Save as baseline (admin)")
+                    enabled: !root.mutationsModel.hasInFlight
+                    onTriggered: section._triggerBaselineReviewFlow()
+                }
+                MenuItem {
+                    text: root.tr("rules.action.load-demo-rules", "Load demo rules...")
+                    enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
+                    onTriggered: {
+                        if (typeof root.loadDemoRules === "function") {
+                            root.loadDemoRules()
+                        }
+                    }
+                }
+                MenuItem {
+                    text: root.tr("rules.action.clear-all", "Clear all rules...")
+                    enabled: !root.mutationsModel.hasInFlight && !section.rulesLocked
+                        && root.rulesModel && root.rulesModel.count > 0
+                    onTriggered: clearAllRulesConfirm.open()
+                }
+            }
         }
     }
 
@@ -1192,7 +1213,7 @@ ColumnLayout {
                         text: root.routeLabel("secondary")
                         onTriggered: section._bulkMoveSelectedToRoute("secondary")
                     }
-                    // "Move to block" removed: block became a Pro-tier action
+                    // "Move to block" removed: block became a unsupported action
                     // (WFP block, not a hosts entry). Existing block rules from
                     // imports still round-trip; they just can't be authored here.
                 }
@@ -2643,6 +2664,96 @@ ColumnLayout {
                         ToolTip.delay: 300
                         ToolTip.text: root.tr("rules.hosts-override.tooltip",
                             "The operating system's hosts file resolves this hostname before NetRuleRouter sees any traffic, so NetRuleRouter cannot override it. Edit the OS hosts file to change this.")
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+                // What an application rule is currently holding. Shown
+                // because a route cannot be scoped to a process: every one of
+                // these addresses travels the additional link for the whole
+                // computer, which is how an unrelated site can end up there.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 28
+                    visible: (model.pinnedCount || 0) > 0
+                    Rectangle {
+                        id: pinnedBadge
+                        Layout.alignment: Qt.AlignVCenter
+                        radius: root.uiTheme.radiusSm
+                        color: "transparent"
+                        border.width: 1
+                        border.color: root.uiTheme.colorAccent
+                        opacity: model.enabled ? 0.9 : 0.5
+                        implicitWidth: pinnedBadgeLabel.implicitWidth
+                            + root.uiTheme.spacingSm * 2
+                        implicitHeight: pinnedBadgeLabel.implicitHeight
+                            + root.uiTheme.spacingXxs * 2
+                        Label {
+                            id: pinnedBadgeLabel
+                            anchors.centerIn: parent
+                            text: root.uiRevision >= 0
+                                ? root.tr("rules.app-pins.badge",
+                                    "holds {count} addresses")
+                                    .replace("{count}",
+                                        String(model.pinnedCount || 0))
+                                : ""
+                            color: root.uiTheme.colorAccent
+                            font.pixelSize: Math.max(10,
+                                root.uiTheme.baseFontSizePx - 2)
+                        }
+                        HoverHandler { id: pinnedBadgeHover }
+                        ToolTip.visible: pinnedBadgeHover.hovered
+                        ToolTip.delay: 300
+                        ToolTip.text: root.tr("rules.app-pins.tooltip",
+                            "These are the addresses this application has been seen using, and they now travel the additional link for EVERY program on this computer — a route cannot be told which process it is for. An address another program starts using is given back to the main connection automatically.")
+                            + "\n" + String(model.pinnedSample || "")
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+                // What the last main-route check found for this address.
+                // Deliberately a fact and not advice: a site can answer on the
+                // main route and still refuse to serve the user there, which is
+                // the very reason a rule exists for it.
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 28
+                    visible: String(model.mainRoute || "") !== ""
+                    Rectangle {
+                        id: mainRouteBadge
+                        readonly property bool answered:
+                            String(model.mainRoute || "") === "answered"
+                        Layout.alignment: Qt.AlignVCenter
+                        radius: root.uiTheme.radiusSm
+                        color: "transparent"
+                        border.width: 1
+                        border.color: root.mutedTextColor
+                        opacity: model.enabled ? 0.9 : 0.5
+                        implicitWidth: mainRouteBadgeLabel.implicitWidth
+                            + root.uiTheme.spacingSm * 2
+                        implicitHeight: mainRouteBadgeLabel.implicitHeight
+                            + root.uiTheme.spacingXxs * 2
+                        Label {
+                            id: mainRouteBadgeLabel
+                            anchors.centerIn: parent
+                            text: {
+                                if (root.uiRevision < 0) return ""
+                                return mainRouteBadge.answered
+                                    ? root.tr("rules.main-route.answered",
+                                        "the main route reaches it")
+                                    : root.tr("rules.main-route.silent",
+                                        "the main route does not reach it")
+                            }
+                            color: root.mutedTextColor
+                            font.pixelSize: Math.max(10,
+                                root.uiTheme.baseFontSizePx - 2)
+                        }
+                        HoverHandler { id: mainRouteBadgeHover }
+                        ToolTip.visible: mainRouteBadgeHover.hovered
+                        ToolTip.delay: 300
+                        ToolTip.text: mainRouteBadge.answered
+                            ? root.tr("rules.main-route.answered-tooltip",
+                                "Something answered at this address over the main connection. That does not mean the site works there — it may still refuse to serve you. Checked within the last half hour.")
+                            : root.tr("rules.main-route.silent-tooltip",
+                                "Nothing answered at this address over the main connection, so this rule is doing real work. Checked within the last half hour.")
                     }
                     Item { Layout.fillWidth: true }
                 }

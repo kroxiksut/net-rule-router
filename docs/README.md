@@ -11,6 +11,7 @@
 | [Packaging a portable build — Windows](en/packaging-windows.md) | Making a folder that runs on a clean machine, and what the build stamp records |
 | Building from source — Linux | *will arrive together with Linux support* |
 | [Rules format](en/rules-file-format.md) | Rule syntax for humans, with examples |
+| [Answering the setup questions ahead of time](en/first-run-answers.md) | Supplying the first-run answers in a file so the setup window never appears |
 | [Where NetRuleRouter keeps its files](en/where-files-live.md) | What lives in `ProgramData`, `AppData` and `%TEMP%`, what survives a reinstall, and what is safe to delete |
 | [Diagnostic archive](en/diagnostic-archive.md) | What the "Export diagnostic archive" button collects, file by file |
 | [Recovering network access](en/recovering-network-access.md) | What to do if an abnormal service stop left the network or DNS blocked |

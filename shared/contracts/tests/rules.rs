@@ -238,12 +238,14 @@ fn rule_row_entry_carries_origin_in_the_published_wire_shape() {
         enabled: true,
         validation_status: "ok".into(),
         validation_message_key: None,
+        main_route: None,
         hosts_override: None,
         origin: Some(RuleOrigin::auto(
             AutoRuleReason::SiteCompanion,
             "example.test",
             "2026-07-31",
         )),
+        pinned_destinations: None,
     };
     let json = serde_json::to_string(&row).expect("serialize");
     assert!(

@@ -268,6 +268,42 @@ impl DnsRefreshOrchestrator {
         summary
     }
 
+    /// Resolve these hostnames NOW, outside the expiry schedule.
+    ///
+    /// A rule the user just added names a host the cache has never confirmed,
+    /// so enforcement builds no filter for it and — worse — the browser tab
+    /// that prompted the rule keeps its existing socket, never asks DNS again,
+    /// and the rule looks like it did nothing. The periodic refresh cannot help:
+    /// it only re-resolves rows that are already in the cache and expired.
+    ///
+    /// Resolving here puts the addresses in the cache, the next reconcile builds
+    /// the pins, and the teardown on that pass breaks the sockets that predate
+    /// them. Callers run this off the apply path — each name is a live DNS
+    /// round-trip.
+    pub fn resolve_now(&self, hostnames: &[String], now: SystemTime) -> RefreshSummary {
+        let mut summary = RefreshSummary::default();
+        for hostname in hostnames {
+            let canonical = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+            if canonical.is_empty() {
+                continue;
+            }
+            summary.attempted = summary.attempted.saturating_add(1);
+            if self.loopback_retry_suppressed(&canonical) {
+                summary.skipped = summary.skipped.saturating_add(1);
+                continue;
+            }
+            let row = ExpiredHostname {
+                canonical_hostname: canonical,
+                last_seen_at: None,
+            };
+            self.refresh_one(&row, now, &mut summary);
+        }
+        if summary.succeeded > 0 {
+            self.touch_last_rebuild_at(now);
+        }
+        summary
+    }
+
     fn touch_last_rebuild_at(&self, now: SystemTime) {
         let now_ms = now
             .duration_since(std::time::UNIX_EPOCH)
@@ -602,6 +638,63 @@ mod tests {
         let summary = orchestrator.run_once(SystemTime::now(), 16);
         assert_eq!(summary, RefreshSummary::default());
         assert!(!summary.made_progress());
+    }
+
+    /// A host the cache has never seen is exactly the case the periodic refresh
+    /// cannot reach — `list_expired_resolutions` only returns rows that exist.
+    /// This is the path a freshly-added rule depends on.
+    #[test]
+    fn resolve_now_resolves_a_host_the_cache_has_never_seen() {
+        let now = SystemTime::now();
+        let resolver_mock = Arc::new(MockDnsResolver::new());
+        resolver_mock.set_response(
+            "mattermost.com",
+            ResolvedRecord {
+                canonical_hostname: "mattermost.com".into(),
+                addresses: vec![Ipv4Addr::new(203, 0, 113, 9)],
+                ttl_seconds: Some(300),
+            },
+        );
+        let resolver: Arc<dyn DnsResolverPort> = resolver_mock.clone();
+        let cache = make_cache();
+
+        let orchestrator = DnsRefreshOrchestrator::new(resolver, cache.clone());
+        // Trailing dot and case are what a rule file can carry.
+        let summary = orchestrator.resolve_now(&["MatterMost.com.".to_string()], now);
+
+        assert_eq!(summary.attempted, 1);
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(
+            resolver_mock.observed_queries(),
+            vec!["mattermost.com".to_string()],
+            "the name must be canonicalised before it reaches the resolver"
+        );
+
+        let guard = cache.lock().unwrap();
+        let lookup = guard
+            .get_by_hostname(
+                "mattermost.com",
+                &FreshnessThresholds::default_production(),
+                nrr_storage::resolution_source::CachePriorityStrategy::default(),
+            )
+            .expect("lookup after resolve_now");
+        assert!(
+            lookup
+                .resolved_ips
+                .iter()
+                .any(|e| e.addr == Ipv4Addr::new(203, 0, 113, 9)),
+            "the address must be in the cache for enforcement to build a filter"
+        );
+    }
+
+    #[test]
+    fn resolve_now_ignores_blank_names() {
+        let resolver: Arc<dyn DnsResolverPort> = Arc::new(MockDnsResolver::new());
+        let cache = make_cache();
+        let orchestrator = DnsRefreshOrchestrator::new(resolver, cache);
+        let summary =
+            orchestrator.resolve_now(&["".to_string(), "   ".to_string()], SystemTime::now());
+        assert_eq!(summary.attempted, 0);
     }
 
     #[test]

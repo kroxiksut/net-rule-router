@@ -280,7 +280,7 @@ QtObject {
 
     // Format the "preserved sections" suffix
     // appended to import status banners when the user's preset
-    // contained foreign-OS / Pro sections we passed through. Empty
+    // contained foreign-OS / unsupported sections we passed through. Empty
     // when no passthrough was captured (the suffix simply disappears).
     function _formatImportPassthroughSuffix(passthroughByRoute) {
         // Aggregate sections across routes — `{name: {lines, routes:[]}}`.
@@ -569,11 +569,6 @@ QtObject {
     }
 
     function _applyImportReplace(target, parsedRowsByRoute) {
-        // [perf] Temporary instrumentation — times the synchronous file-import
-        // append (the offline path that populates ~300 rows in one burst). If
-        // this dominates "rules take long to display", convert to the chunked
-        // `_appendRowsChunked` path the service refetch uses. Remove once the
-        // populate cost is characterised.
         console.time("[perf] _applyImportReplace")
         if (target === "both") {
             Pure.clearModel(root.rulesModel)
@@ -589,11 +584,12 @@ QtObject {
         var routes = (target === "both") ? ["primary", "secondary"] : [target]
         for (var i = 0; i < routes.length; i += 1) {
             var rows = parsedRowsByRoute[routes[i]] || []
+            var batch = []
             for (var j = 0; j < rows.length; j += 1) {
                 var row = rows[j]
                 row.id = "R-" + ("0000" + String(nextId)).slice(-4)
                 row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
-                root.rulesModel.append(row)
+                batch.push(row)
                 // Preset comments persist via sidecar.
                 // Import in Replace mode OVERWRITES any prior comment
                 // for the same signature (spec'd behaviour — no merge
@@ -603,6 +599,8 @@ QtObject {
                 }
                 nextId += 1
             }
+            // One append for the whole route — see `_appendRowsChunked`.
+            if (batch.length > 0) root.rulesModel.append(batch)
         }
         console.timeEnd("[perf] _applyImportReplace")
     }
@@ -619,13 +617,14 @@ QtObject {
         var routes = ["primary", "secondary"]
         for (var i = 0; i < routes.length; i += 1) {
             var rows = parsedRowsByRoute[routes[i]] || []
+            var batch = []
             for (var j = 0; j < rows.length; j += 1) {
                 var row = rows[j]
                 var key = Rules.mergeKey(row)
                 if (seen[key]) continue
                 row.id = "R-" + ("0000" + String(nextId)).slice(-4)
                 row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
-                root.rulesModel.append(row)
+                batch.push(row)
                 // Merge mode: only NEW rules are
                 // appended (existing ones with the same signature stay
                 // untouched, comment and all). Write the new row's
@@ -636,6 +635,8 @@ QtObject {
                 seen[key] = true
                 nextId += 1
             }
+            // One append for the whole route — see `_appendRowsChunked`.
+            if (batch.length > 0) root.rulesModel.append(batch)
         }
     }
 
@@ -669,9 +670,13 @@ QtObject {
                 // reflects the actual import outcome, not a
                 // "started-then-finished" gap that the async parser
                 // flow would otherwise expose.
-                var base = root.tr("status.preset-import-offline",
-                    "Imported {count} rules into the GUI. Service is unreachable — start the service and use 'Save and review...' to push them.")
-                    .replace("{count}", String(summary.rulesCount))
+                var base = state.hydration
+                    ? root.tr("status.rules-shown-from-files",
+                        "The service is not running, so these {count} rule(s) are what your files hold. They will be compared with what the service applies once it starts.")
+                        .replace("{count}", String(summary.rulesCount))
+                    : root.tr("status.preset-import-offline",
+                        "Imported {count} rules into the GUI. Service is unreachable — start the service and use 'Save and review...' to push them.")
+                        .replace("{count}", String(summary.rulesCount))
                 root.statusLine = base + _formatImportPassthroughSuffix(summary.passthroughByRoute)
                 // Mark the offline import on disk so it survives BOTH a
                 // mid-session service start (the post-connect backlog dialog
@@ -681,7 +686,8 @@ QtObject {
                 // preset import was the missing case. `sha256Hex` is sync, and
                 // the model is fully populated here (the offline apply path is
                 // synchronous, unlike the chunked service refetch).
-                if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                if (!state.hydration
+                        && typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
                         && typeof nrrNativeBridge.sha256Hex === "function"
                         && typeof nrrNativeBridge.rpcSidecarPendingApplyWrite === "function") {
                     var parkJson = root._buildRulesJsonFromModel()
@@ -740,7 +746,8 @@ QtObject {
             mode: (String(mode || "replace") === "merge") ? "merge" : "replace",
             correlationId: corr,
             summary: null,
-            confirmationToken: ""
+            confirmationToken: "",
+            hydration: !!(options && options.hydration)
         }
         root._activeReviewKind = "preset-import"
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
@@ -803,7 +810,12 @@ QtObject {
     /// byte fields are populated so the server-side
     /// `PresetImportTarget::BothRoutes` branch fires, producing one
     /// revision covering both routes.
-    function startBothRoutesPresetImportReviewFlow(primaryBytesB64, secondaryBytesB64, primaryPath, secondaryPath) {
+    /// `options.hydration` marks a load the APP started to have something on
+    /// screen (cold start with the service down), not one the user asked for.
+    /// The difference matters offline: a user's import is work to be pushed
+    /// once the service is up, while hydration is only a view of the bound
+    /// files and must never be offered back as "changes you made".
+    function startBothRoutesPresetImportReviewFlow(primaryBytesB64, secondaryBytesB64, primaryPath, secondaryPath, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import-both: bridge unavailable, aborting")
             return
@@ -838,6 +850,7 @@ QtObject {
             confirmationToken: ""
         }
         root._activeReviewKind = "preset-import"
+        var startedAtMs = Date.now()
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, true /* dryRun */, ""
         )
@@ -853,6 +866,10 @@ QtObject {
                     ((typeof root.ipcErrorLabel === "function")
                         ? root.ipcErrorLabel(String(code || "unknown"))
                         : String(code || "unknown"))
+                return
+            }
+            if (root.reviewIsSuperseded(startedAtMs)) {
+                root.announceReviewSuperseded()
                 return
             }
             var summary = (p && p["review-summary"]) || p || {}

@@ -231,6 +231,75 @@ QtObject {
         root._openPendingApplyPreview(rulesJson, contentHash)
     }
 
+    /// Does a service-computed review summary say "nothing about the rules
+    /// changes"? All four buckets empty is the service's own verdict that the
+    /// candidate set and the active revision describe the same routing.
+    function _summaryHasNoRuleChanges(summary) {
+        if (!summary) return false
+        var buckets = ["rules-added", "rules-removed", "rules-modified", "rules-retargeted"]
+        for (var i = 0; i < buckets.length; i += 1) {
+            var b = summary[buckets[i]]
+            if (b && b.length > 0) return false
+        }
+        return true
+    }
+
+    /// The alarm was raised by a hash difference the service does not consider
+    /// a rule change. Remember THIS PAIR of hashes as agreed and stand the
+    /// banner down.
+    ///
+    /// Re-pinning the service leg from the on-screen model (what this did
+    /// before) only looked like a fix: the next poll re-read the live service
+    /// leg, the same two hashes came back, and the banner returned a minute
+    /// later — the case the user hit three times in one session. Recording the
+    /// pair is what actually holds, and it holds only until either side moves.
+    function _standDownDriftAsEqual() {
+        root._driftDetected = false
+        root._mergeAvailable = false
+        _driftAgreedPair = _driftPairKey()
+        root.statusLine = root.tr("status.drift-none-after-compare",
+            "Compared with the service: the rules match. Nothing to apply.")
+    }
+
+    /// The (gui, service) hash pair the service has already judged equivalent,
+    /// or "" when nothing has been judged. Any edit on either side changes the
+    /// key, so the alarm re-arms by itself.
+    property string _driftAgreedPair: ""
+
+    function _driftPairKey() {
+        return String(root._driftGuiHashPrimary) + "|" + String(root._driftServiceHashPrimary)
+            + "|" + String(root._driftGuiHashSecondary) + "|" + String(root._driftServiceHashSecondary)
+    }
+
+    /// Name the rules behind a gui-vs-service mismatch in the log. The hashes
+    /// say THAT the two sides differ and the dialog then shows nothing, which
+    /// leaves no way to find out WHAT differs; this prints the routing keys
+    /// present on one side only.
+    function _logDriftDetail() {
+        if (!root.bridgeAvailable
+                || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcRulesList !== "function") return
+        var corr = nrrNativeBridge.rpcRulesList()
+        root.rpc.registerRpcCallback(corr, function(ok, p) {
+            if (!ok || !p) return
+            var serviceRows = (p.rows || []).map(Rules.driftRowFromServiceWire)
+            var guiKeys = Rules.ruleRoutingKeys(root._rulesModelToRowArray(), root._aceEncodeHost)
+            var svcKeys = Rules.ruleRoutingKeys(serviceRows, root._aceEncodeHost)
+            var count = function(list) {
+                var m = {}
+                for (var i = 0; i < list.length; i += 1) m[list[i]] = (m[list[i]] || 0) + 1
+                return m
+            }
+            var g = count(guiKeys), s = count(svcKeys), k
+            var onlyGui = [], onlyService = []
+            for (k in g) { if ((s[k] || 0) < g[k]) onlyGui.push(k + " x" + (g[k] - (s[k] || 0))) }
+            for (k in s) { if ((g[k] || 0) < s[k]) onlyService.push(k + " x" + (s[k] - (g[k] || 0))) }
+            console.log("drift detail: app=" + guiKeys.length + " service=" + svcKeys.length
+                + " only-in-app=" + JSON.stringify(onlyGui.slice(0, 12))
+                + " only-in-service=" + JSON.stringify(onlyService.slice(0, 12)))
+        })
+    }
+
     /// Dialog action: clear ALL rules from
     /// the app AND push an empty revision to the service. Gated upstream
     /// by `driftClearAllConfirmDialog`. Reuses `_applyEmptyRulesForReset`
@@ -300,15 +369,19 @@ QtObject {
         // Offline fallback — replay the last-known cold-start snapshot.
         Pure.clearModel(root.rulesModel)
         var rulesRows = ((root.context.rules || {}).rows) || []
+        var batch = []
         for (var k = 0; k < rulesRows.length; k += 1) {
             var row = rulesRows[k]
-            if (row && row.id) row.id = Rules.canonicalRuleId(row.id)
-            if (row && Rules.isHostlikeRuleType(row.ruleType)) {
+            if (!row) continue
+            if (row.id) row.id = Rules.canonicalRuleId(row.id)
+            if (Rules.isHostlikeRuleType(row.ruleType)) {
                 row.matchValue = root._unicodeDecodeHost(row.matchValue)
             }
-            if (row) row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
-            root.rulesModel.append(row)
+            row.aceMatchValue = root._aceLowerForSearch(row.matchValue)
+            batch.push(row)
         }
+        // One append for the whole book — see `_appendRowsChunked`.
+        if (batch.length > 0) root.rulesModel.append(batch)
         // Dedupe per-route id collisions.
         root._renumberRuleIdsSequential()
         // Re-overlay comments + recompute drift baseline.
@@ -544,16 +617,73 @@ QtObject {
     /// rules on screen, in the file and in the service agree again.
     /// `announceOffline` belongs to the button only — an automatic follow-up
     /// must not overwrite the status line the finished operation just set.
-    function _driftRecheckNow(announceOffline) {
+    /// `done(compared)` fires once the legs are fresh and `_driftCompare` has
+    /// run, so a caller that wants to SHOW the difference (the tray's "Open and
+    /// compare") acts on measured state instead of whatever the last poll left.
+    function _driftRecheckNow(announceOffline, done) {
         if (((root.backendStatus || {}).kind) !== "connected") {
             if (announceOffline === true) {
                 root.statusLine = root.tr("status.drift-recheck-offline",
                     "The service is not running, so the rules it applies cannot be compared right now.")
             }
+            console.log("drift recheck: skipped — backend is not connected")
+            if (typeof done === "function") done(false)
             return
+        }
+        if (typeof done === "function") _driftRecheckDone.push(done)
+        // The button has to answer. Re-measuring silently looks identical to a
+        // button that does nothing — which is exactly how it was reported —
+        // because the usual outcome is "still different" and the banner it
+        // would clear simply stays put.
+        if (announceOffline === true) {
+            _driftRecheckDone.push(function() {
+                root.statusLine = root._driftDetected
+                    ? root.tr("status.drift-still-different",
+                        "Compared just now: the rules on screen and the ones the service applies still differ.")
+                    : root.tr("status.drift-none-after-compare",
+                        "Compared with the service: the rules match. Nothing to apply.")
+            })
         }
         if (root._driftRecheckInFlight) { _driftRecheckQueued = true; return }
         _driftRecheck()
+    }
+
+    /// Callbacks waiting for the running comparison. Plain array on a `var`
+    /// property: nothing binds to it, only `_driftRecheck` drains it.
+    property var _driftRecheckDone: []
+
+    /// Answer everyone waiting when the pass cannot run at all — a caller left
+    /// hanging would silently never show the comparison it asked for.
+    function _drainRecheckDone() {
+        var waiting = _driftRecheckDone
+        _driftRecheckDone = []
+        for (var i = 0; i < waiting.length; i += 1) waiting[i](false)
+    }
+
+    /// Show the divergence the last comparison found, picking the view that
+    /// fits it: the app↔service dialog for the safety-critical mismatch, the
+    /// file↔service merge preview for a bound file that ran ahead of (or behind)
+    /// what is applied. Entry point for the tray's "Open and compare", which
+    /// knows only that two hashes differ.
+    function _driftOpenComparison() {
+        var alarms = function(m) {
+            return m === "gui-vs-service" || m === "all-three-differ"
+        }
+        var mismatchP = String((root._driftDetailsPrimary || {}).mismatch || "none")
+        var mismatchS = String((root._driftDetailsSecondary || {}).mismatch || "none")
+        console.log("drift compare hand-off: primary=" + mismatchP
+            + " secondary=" + mismatchS)
+        if (alarms(mismatchP) || alarms(mismatchS)) {
+            _openDriftDialog()
+            return
+        }
+        if (mismatchP === "file-vs-service" || mismatchS === "file-vs-service"
+                || mismatchP === "file-vs-gui" || mismatchS === "file-vs-gui") {
+            _openMergeDialog()
+            return
+        }
+        root.statusLine = root.tr("status.drift-none-after-compare",
+            "Compared with the service: the rules match. Nothing to apply.")
     }
 
     /// Periodic poll entry. Re-fetches file legs (mtime-cached) and
@@ -561,11 +691,12 @@ QtObject {
     /// so overlapping triggers don't interleave their async chains.
     function _driftRecheck() {
         if (root._driftRecheckInFlight) return
-        if (((root.backendStatus || {}).kind) !== "connected") return
+        if (((root.backendStatus || {}).kind) !== "connected") { _drainRecheckDone(); return }
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcCanonicalRulesHash !== "function") {
+            _drainRecheckDone()
             return
         }
         root._driftRecheckInFlight = true
@@ -583,6 +714,9 @@ QtObject {
             if (pending <= 0) {
                 _driftCompare()
                 root._driftRecheckInFlight = false
+                var waiting = _driftRecheckDone
+                _driftRecheckDone = []
+                for (var i = 0; i < waiting.length; i += 1) waiting[i](true)
                 if (_driftRecheckQueued) {
                     _driftRecheckQueued = false
                     Qt.callLater(_driftRecheck)
@@ -652,6 +786,13 @@ QtObject {
             return m === "gui-vs-service" || m === "all-three-differ"
         }
         if (alarms(detP.mismatch) || alarms(detS.mismatch)) anyDrift = true
+        // A pair the service itself called equivalent stays down until one of
+        // the two sides actually changes.
+        if (anyDrift && _driftAgreedPair !== "" && _driftPairKey() === _driftAgreedPair) {
+            anyDrift = false
+        } else if (anyDrift) {
+            _logDriftDetail()
+        }
         root._driftDetected = anyDrift
         // Re-promote the SUPPRESSED `file-vs-service` leg as a
         // SEPARATE quiet "Merge available" affordance. Offered when a route's

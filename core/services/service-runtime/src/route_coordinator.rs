@@ -15,12 +15,12 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nrr_domain::ipv4_network::Ipv4Network;
 use nrr_domain::RouteBehaviorMode;
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::reachability::ReachabilityProbe;
-use nrr_platform_api::{
-    classify_availability, AdapterAvailability, PlatformError, RouteEntry, WindowsApiPort,
-};
+use nrr_platform_api::route_table::RouteTablePort;
+use nrr_platform_api::{classify_availability, AdapterAvailability, PlatformError, RouteEntry};
 
 use crate::app_observation_lookup::{AppObservationLookup, AppObservationStore};
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
@@ -70,16 +70,10 @@ pub fn resolve_secondary_target(
 /// "secondary adapter not found" for a live, working VPN and route nothing.
 /// Reconstruct the persistent id here (keep in sync with `build_persistent_id`).
 pub fn adapter_binding_matches(info: &AdapterInfo, bound_id: &str) -> bool {
-    let mac_dash = info.mac.map(|mac| {
-        mac.iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join("-")
-    });
     identity_matches(
         &info.adapter_name,
         info.index,
-        mac_dash.as_deref(),
+        mac_dash(info).as_deref(),
         &info.stable_id(),
         bound_id,
     )
@@ -129,6 +123,14 @@ fn identity_matches(
     }
     if let Some(mac) = mac_dash {
         if bound_id.eq_ignore_ascii_case(&format!("win-ifindex-mac:{index}:{mac}")) {
+            return true;
+        }
+        // The ifindex-free anchor. A Wi-Fi or Bluetooth adapter that lost power
+        // comes back with a new ifindex and sometimes a new GUID, but never a
+        // new burned-in MAC — so this is the identity that survives what the
+        // other two do not. Only written for adapters whose MAC is independent
+        // of their GUID (see `mac_anchor_id`).
+        if bound_id.eq_ignore_ascii_case(&format!("win-mac:{mac}")) {
             return true;
         }
     }
@@ -201,6 +203,90 @@ fn description_matches_display_name(description: &str, display_name: &str) -> bo
 fn adapter_answers_to_saved_name(info: &AdapterInfo, display_name: &str) -> bool {
     description_matches_display_name(&info.description, display_name)
         || description_matches_display_name(&info.friendly_name, display_name)
+}
+
+/// Per-kind counts of one codegen's diagnostics, so the log line states which
+/// cause fired instead of listing the ones that might have.
+#[derive(Default)]
+struct DiagnosticTally {
+    hostname_unresolved: usize,
+    suffix_empty: usize,
+    zone_empty: usize,
+    app_rule_address_and_app_not_routed: usize,
+    app_rule_unobserved: usize,
+    app_rule_dest_claimed_by_main_link: usize,
+    app_rule_dest_used_by_other_process: usize,
+    primary_exceptions_unavailable: usize,
+}
+
+fn diagnostic_tally(
+    diagnostics: &[crate::route_codegen::RouteCodegenDiagnostic],
+) -> DiagnosticTally {
+    use crate::route_codegen::RouteCodegenDiagnostic as D;
+    let mut t = DiagnosticTally::default();
+    for d in diagnostics {
+        match d {
+            D::HostnameUnresolved { .. } => t.hostname_unresolved += 1,
+            D::SuffixEmpty { .. } => t.suffix_empty += 1,
+            D::ZoneEmpty { .. } => t.zone_empty += 1,
+            D::AppRuleAddressAndAppNotRouted { .. } => t.app_rule_address_and_app_not_routed += 1,
+            D::AppRuleUnobserved { .. } => t.app_rule_unobserved += 1,
+            D::AppRuleDestinationClaimedByMainLink { .. } => {
+                t.app_rule_dest_claimed_by_main_link += 1
+            }
+            D::AppRuleDestinationUsedByOtherProcess { .. } => {
+                t.app_rule_dest_used_by_other_process += 1
+            }
+            D::PrimaryExceptionsUnavailable => t.primary_exceptions_unavailable += 1,
+        }
+    }
+    t
+}
+
+/// Dash-separated upper-case MAC, the spelling every persistent-id form uses.
+fn mac_dash(info: &AdapterInfo) -> Option<String> {
+    info.mac.map(|mac| {
+        mac.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join("-")
+    })
+}
+
+/// `true` when the MAC identifies the adapter independently of its GUID.
+///
+/// A tunnel adapter derives its MAC from its own GUID — a live TAP-Windows
+/// instance was observed as MAC `00:FF:0C:93:B1:CC` under GUID
+/// `{0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}` — so the two rotate together on
+/// every reconnect and the MAC carries no identity the GUID did not already
+/// carry. Anchoring on it would either never match or, worse, match whatever
+/// instance the client created last. Interface TYPE cannot make this call:
+/// TAP reports itself as Ethernet.
+fn mac_is_independent_identity(info: &AdapterInfo) -> bool {
+    let Some(mac) = info.mac else {
+        return false;
+    };
+    if nrr_platform_api::adapters::description_matches_virtual_software(&info.description) {
+        return false;
+    }
+    let guid_head: String = info
+        .adapter_name
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect();
+    let mac_tail: String = mac[2..].iter().map(|b| format!("{b:02x}")).collect();
+    !guid_head.eq_ignore_ascii_case(&mac_tail)
+}
+
+/// The MAC-only identity to remember for a binding, or `None` when this
+/// adapter's MAC is not an identity of its own (see
+/// [`mac_is_independent_identity`]).
+fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
+    if !mac_is_independent_identity(info) {
+        return None;
+    }
+    mac_dash(info).map(|mac| format!("win-mac:{mac}"))
 }
 
 /// The name to store for an adapter: the connection name the GUI lists, with
@@ -328,6 +414,26 @@ pub type RuleScopeProvider = Arc<dyn Fn() -> bool + Send + Sync>;
 /// adapter (user decision : "autosave the healed binding").
 pub type BindingHealPersistFn = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync>;
 
+/// What one principal decided about LOCAL networks under the kill-switch:
+/// networks to keep reachable on top of what the service discovers, and
+/// discovered ones they refused. Read per resolve, so a change in Settings
+/// takes effect on the next reconcile without a restart.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LocalNetworkPolicy {
+    pub allowed: Vec<Ipv4Network>,
+    pub refused: Vec<Ipv4Network>,
+}
+
+/// Reads [`LocalNetworkPolicy`] for a principal. A closure over the state DB at
+/// the composition root; `None` means "no stored decisions", which is the
+/// behaviour before the setting existed.
+pub type LocalNetworkPolicyFn = Arc<dyn Fn(&str) -> LocalNetworkPolicy + Send + Sync>;
+
+/// Persist one more identity for a binding that resolved correctly — the MAC
+/// anchor learned on first resolve. Args: `(sid, role, anchor_stable_id)`.
+/// Runs outside the settings-DB lock, like the heal callback.
+pub type BindingAnchorPersistFn = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
 /// persist the observed VPN bootstrap server IPs so the
 /// kill-switch exemption survives a service restart. Invoked (best-effort) each
 /// time the live route table yields a fresh, non-empty server-IP set — the same
@@ -383,7 +489,7 @@ const LIVENESS_PROBE_TIMEOUT: Duration = Duration::from_millis(1000);
 
 pub struct SecondaryRouteCoordinator {
     reconciler: SecondaryRouteReconciler,
-    api: Arc<dyn WindowsApiPort>,
+    api: Arc<dyn RouteTablePort>,
     rules_provider: Arc<dyn RulesProvider>,
     route_source: Arc<dyn RoutePolicySource>,
     fqdn_cache: Arc<dyn FqdnCacheLookup>,
@@ -423,6 +529,19 @@ pub struct SecondaryRouteCoordinator {
     /// usable again (see [`Self::clear_not_usable`]), so the NEXT
     /// usable→not-usable transition warns again.
     not_usable_logged: Mutex<HashMap<String, String>>,
+    /// Last enforcement status published per SID, so the push fires on change
+    /// instead of at reconcile cadence.
+    enforcement_status: Mutex<HashMap<String, String>>,
+    /// When each SID was last told a tunnel is up with no additional route
+    /// assigned, keyed by `"{sid}|{adapter}"`. Resolve runs at reconcile
+    /// cadence — hundreds of times an hour — so without this the reminder would
+    /// be a stream rather than a notice.
+    unassigned_tunnel_notified: Mutex<HashMap<String, std::time::Instant>>,
+    /// MAC anchors already handed to the persist callback this session, keyed by
+    /// `"{sid}|{role}|{anchor}"`. The binding snapshot the resolve reads may be
+    /// a cycle behind the write, so without this the same anchor would be
+    /// written (and logged) on every reconcile until the reload catches up.
+    anchor_persisted: Mutex<std::collections::HashSet<String>>,
     ///  — once-per-transition latch for the "UP but no derivable or
     /// cached next-hop" WARN, keyed `"{sid}|{role}"`. The state occurs in a
     /// tight burst while OpenVPN has brought the adapter Up but not yet
@@ -448,6 +567,16 @@ pub struct SecondaryRouteCoordinator {
     /// degraded boot (heal stays in-memory only, as before). See
     /// [`BindingHealPersistFn`].
     binding_heal_persist: Option<BindingHealPersistFn>,
+    /// optional write-through for a newly-learned identity of an
+    /// already-correct binding (the MAC anchor). Separate from the heal
+    /// callback because it must NOT move the binding to another adapter — it
+    /// only widens what counts as the same one. See [`BindingAnchorPersistFn`].
+    binding_anchor_persist: Option<BindingAnchorPersistFn>,
+    /// The user's own answers about local networks (see [`LocalNetworkPolicyFn`]).
+    local_networks: Option<LocalNetworkPolicyFn>,
+    /// Push channel for [`Self::publish_enforcement_status`]. `None` in tests
+    /// and in a degraded boot — the resolve then behaves exactly as before.
+    events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
     /// optional write-through of the observed VPN server
     /// IPs (paired with [`Self::server_ip_cache`]) so the exemption survives a
     /// restart. See [`ServerIpPersistFn`].
@@ -492,7 +621,7 @@ pub struct SecondaryRouteCoordinator {
 
 impl SecondaryRouteCoordinator {
     pub fn new(
-        api: Arc<dyn WindowsApiPort>,
+        api: Arc<dyn RouteTablePort>,
         rules_provider: Arc<dyn RulesProvider>,
         route_source: Arc<dyn RoutePolicySource>,
         fqdn_cache: Arc<dyn FqdnCacheLookup>,
@@ -509,10 +638,16 @@ impl SecondaryRouteCoordinator {
             heal_logged: Mutex::new(HashMap::new()),
             not_found_logged: Mutex::new(HashMap::new()),
             not_usable_logged: Mutex::new(HashMap::new()),
+            anchor_persisted: Mutex::new(std::collections::HashSet::new()),
+            enforcement_status: Mutex::new(HashMap::new()),
+            unassigned_tunnel_notified: Mutex::new(HashMap::new()),
             no_next_hop_logged: Mutex::new(std::collections::HashSet::new()),
             probed_ifindex: Mutex::new(HashMap::new()),
             rule_scope_service_driven,
             binding_heal_persist: None,
+            binding_anchor_persist: None,
+            local_networks: None,
+            events: None,
             server_ip_persist: None,
             server_ip_loader: None,
             paused_check: None,
@@ -559,6 +694,29 @@ impl SecondaryRouteCoordinator {
     /// applied in-memory each reconcile but the stored id stays stale.
     pub fn with_binding_heal_persist(mut self, persist: BindingHealPersistFn) -> Self {
         self.binding_heal_persist = Some(persist);
+        self
+    }
+
+    /// Attaches the MAC-anchor persist callback. Chain before the coordinator is
+    /// wrapped in `Arc`. Without it the anchor is recomputed every resolve and
+    /// never stored, so a binding still depends on the GUID and the name alone.
+    pub fn with_binding_anchor_persist(mut self, persist: BindingAnchorPersistFn) -> Self {
+        self.binding_anchor_persist = Some(persist);
+        self
+    }
+
+    /// Wire the user's local-network decisions. Chain before the coordinator is
+    /// wrapped in `Arc`. Without it only the automatic answer applies.
+    pub fn with_local_network_policy(mut self, read: LocalNetworkPolicyFn) -> Self {
+        self.local_networks = Some(read);
+        self
+    }
+
+    /// Share the push bus so the GUI and tray learn when policy stops being
+    /// enforced. Chain before the coordinator is wrapped in `Arc`. Without it
+    /// the state is logged and nothing else, which is how it stayed invisible.
+    pub fn with_event_bus(mut self, events: Arc<crate::ipc_handlers::event_bus::EventBus>) -> Self {
+        self.events = Some(events);
         self
     }
 
@@ -617,6 +775,16 @@ impl SecondaryRouteCoordinator {
         }
         guard.insert(key, value);
         true
+    }
+
+    /// Returns `true` the first time this `(sid, role, anchor)` is offered for
+    /// persistence, `false` while it repeats — the reconcile re-derives the same
+    /// anchor every cycle, and the reloaded binding only shows it a cycle later.
+    fn note_anchor_once(&self, sid: &str, role: &str, anchor: &str) -> bool {
+        self.anchor_persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(format!("{sid}|{role}|{anchor}"))
     }
 
     /// Returns `true` the first time the "bound adapter NOT FOUND" state is seen
@@ -696,8 +864,8 @@ impl SecondaryRouteCoordinator {
     ///
     /// Resolves the active user's secondary target (binding × live adapter
     /// info) itself, so the wiring layer only has to forward the trigger.
-    /// Pro (multiple concurrently-active users) would route per session via
-    /// a callout driver; here the first active SID owns the global table.
+    /// Per-session routing for several concurrently-active users cannot be
+    /// expressed in a machine-wide table; the first active SID owns it.
     pub fn recompute_active(
         &self,
         active_sids: &[String],
@@ -907,10 +1075,16 @@ impl SecondaryRouteCoordinator {
                 }
             }
         }
-        let local_subnets = resolution
+        let mut local_subnets = resolution
             .primary
             .map(|p| primary_local_subnets(&routes, p.interface_index))
             .unwrap_or_default();
+        self.apply_local_network_policy(
+            sid,
+            &routes,
+            Some(secondary.interface_index),
+            &mut local_subnets,
+        );
         // Reactive VPN-endpoint learning — fold in any role-verified server IP
         // learned from a kill-switch drop (deduped against the route-observed
         // set above), so the catch-all pair (and the mirrored per-IP subtract
@@ -939,10 +1113,16 @@ impl SecondaryRouteCoordinator {
     pub fn fail_closed_exemptions(&self, sid: &str) -> FailClosedExemptions {
         let resolution = self.resolve(sid);
         let routes = self.api.get_ip_forward_table().unwrap_or_default();
-        let local_subnets = resolution
+        let mut local_subnets = resolution
             .primary
             .map(|p| primary_local_subnets(&routes, p.interface_index))
             .unwrap_or_default();
+        self.apply_local_network_policy(
+            sid,
+            &routes,
+            resolution.secondary.map(|s| s.interface_index),
+            &mut local_subnets,
+        );
         // Best-effort: exempt every VPN-server IP we have ever cached (we do
         // not know which secondary ifindex applies when it is unresolved).
         // Exempting a stale server is harmless — it only permits a little more.
@@ -1092,6 +1272,11 @@ impl SecondaryRouteCoordinator {
                 sid = %sid,
                 "no route policy for this user — no secondary routes will be applied",
             );
+            // From outside this is indistinguishable from a working product: the
+            // service runs, the tray is green, and nothing is routed. Acceptance
+            // run 19 spent ten minutes in exactly this state (339 log lines, zero
+            // filters) with no way for the user to see it.
+            self.publish_enforcement_status(sid, "no-policy", "", Vec::new());
             return RouteResolution {
                 mode: RouteBehaviorMode::PreferPrimary,
                 primary: None,
@@ -1102,6 +1287,7 @@ impl SecondaryRouteCoordinator {
         let infos = match self.api.get_adapter_infos() {
             Ok(i) => i,
             Err(e) => {
+                self.publish_enforcement_status(sid, "adapters-unreadable", "", Vec::new());
                 tracing::warn!(
                     target: "nrr::route-coordinator",
                     sid = %sid,
@@ -1125,6 +1311,7 @@ impl SecondaryRouteCoordinator {
                     sid = %sid,
                     "NO SECONDARY ADAPTER BOUND — assign primary+secondary in 'Interfaces & routes' and apply (needs elevation). Without a secondary target nothing is routed out the secondary NIC.",
                 );
+                self.offer_unassigned_tunnel(sid, &infos);
                 None
             }
         };
@@ -1159,6 +1346,15 @@ impl SecondaryRouteCoordinator {
                             secondary_ifindex = sec.interface_index,
                             "no primary adapter bound and no OS default route to derive one — in 'direct' mode unmatched traffic stays on the secondary (VPN). Bind a primary adapter in 'Interfaces & routes'.",
                         );
+                        // Nothing the service can do about this one: without a
+                        // main link there is nowhere to send what the rules do
+                        // not route, so the user has to name one.
+                        self.publish_enforcement_status(
+                            sid,
+                            "no-primary-route",
+                            "primary",
+                            Vec::new(),
+                        );
                     }
                 }
             }
@@ -1168,6 +1364,245 @@ impl SecondaryRouteCoordinator {
             primary,
             secondary,
         }
+    }
+
+    /// Teach the binding the MAC of the adapter it just resolved to, so a later
+    /// GUID and ifindex change (Wi-Fi or Bluetooth after sleep, a NIC that came
+    /// back on another port) is recognised directly instead of relying on the
+    /// name heal — which needs the name to be both unchanged and unique.
+    ///
+    /// Skipped for adapters whose MAC rotates with their GUID (see
+    /// [`mac_anchor_id`]) and for a binding that already knows it, so the steady
+    /// state costs one string compare per reconcile and no write.
+    fn remember_mac_anchor(
+        &self,
+        sid: &str,
+        role: &str,
+        binding: &PerSidBinding,
+        info: &AdapterInfo,
+    ) {
+        let Some(anchor) = mac_anchor_id(info) else {
+            return;
+        };
+        if binding.stable_id.eq_ignore_ascii_case(&anchor)
+            || binding
+                .known_stable_ids
+                .iter()
+                .any(|id| id.eq_ignore_ascii_case(&anchor))
+        {
+            return;
+        }
+        let Some(persist) = self.binding_anchor_persist.as_ref() else {
+            return;
+        };
+        if !self.note_anchor_once(sid, role, &anchor) {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::route-coordinator",
+            sid = %sid,
+            role = role,
+            anchor = %anchor,
+            adapter = %preferred_display_name(info),
+            "remembered the adapter's MAC as a second identity for this binding",
+        );
+        persist(sid, role, &anchor);
+    }
+
+    /// The subnets that belong to the ADDITIONAL route itself — the tunnel's own
+    /// interior.
+    ///
+    /// Read by the fake-IP answerer, which must never substitute a virtual
+    /// address for one of these: they are reachable only from inside the tunnel,
+    /// and a virtual address would send the caller to our TUN instead (the VPN
+    /// client's own authorization endpoint is exactly such an address).
+    pub fn publish_secondary_subnets(&self, sid: &str) {
+        crate::secondary_subnets::global_secondary_subnets()
+            .publish(self.secondary_local_networks(sid));
+    }
+
+    pub fn secondary_local_networks(&self, sid: &str) -> Vec<Ipv4Network> {
+        let Some(secondary) = self.resolve(sid).secondary else {
+            return Vec::new();
+        };
+        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        primary_local_subnets(&routes, secondary.interface_index)
+            .into_iter()
+            .filter_map(|(net, prefix)| Ipv4Network::new(net, prefix))
+            .collect()
+    }
+
+    /// The local networks this principal's kill-switch can discover on its own:
+    /// the main link's connected subnets and the host side of hypervisor
+    /// adapters, each with the adapter it belongs to and whether it is the main
+    /// link's. The settings screen lists exactly this, so what the user ticks
+    /// and what the enforcement exempts are derived from one enumeration.
+    pub fn discovered_local_networks(&self, sid: &str) -> Vec<(Ipv4Network, String, bool)> {
+        let resolution = self.resolve(sid);
+        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        let Ok(adapters) = self.api.get_adapter_infos() else {
+            return Vec::new();
+        };
+        let name_of = |ifindex: u32| {
+            adapters
+                .iter()
+                .find(|info| info.index == ifindex)
+                .map(|info| preferred_display_name(info).to_string())
+                .unwrap_or_default()
+        };
+        let mut out: Vec<(Ipv4Network, String, bool)> = Vec::new();
+        if let Some(primary) = resolution.primary {
+            for (net, prefix) in primary_local_subnets(&routes, primary.interface_index) {
+                if let Some(network) = Ipv4Network::new(net, prefix) {
+                    out.push((network, name_of(primary.interface_index), true));
+                }
+            }
+        }
+        for info in adapters
+            .iter()
+            .filter(|info| Some(info.index) != resolution.secondary.map(|s| s.interface_index))
+            .filter(|info| nrr_platform_api::adapters::is_virtual_machine_adapter(info))
+        {
+            for (net, prefix) in primary_local_subnets(&routes, info.index) {
+                let Some(network) = Ipv4Network::new(net, prefix) else {
+                    continue;
+                };
+                if out.iter().any(|(found, _, _)| *found == network) {
+                    continue;
+                }
+                out.push((network, preferred_display_name(info).to_string(), false));
+            }
+        }
+        out
+    }
+
+    /// Settle which LOCAL networks stay reachable while the kill-switch blocks
+    /// everything else.
+    ///
+    /// A kill-switch exists to stop traffic escaping to the provider instead of
+    /// the tunnel. Traffic to a hypervisor's host-only segment never leaves
+    /// this machine, so blocking it protects nothing and takes the user's
+    /// virtual machines away with the tunnel. The tunnel's own subnet is
+    /// excluded, and a VPN adapter is never mistaken for a hypervisor one —
+    /// both live in RFC1918 space, and that is exactly the confusion this must
+    /// not make.
+    ///
+    /// The user has the last word in both directions: a network they named
+    /// themselves is added (a hypervisor in NAT mode creates no host interface,
+    /// so nothing here can discover it), and a network they refused is removed
+    /// even if it was discovered automatically.
+    fn apply_local_network_policy(
+        &self,
+        sid: &str,
+        routes: &[RouteEntry],
+        secondary_ifindex: Option<u32>,
+        out: &mut Vec<(Ipv4Addr, u8)>,
+    ) {
+        if let Ok(adapters) = self.api.get_adapter_infos() {
+            for subnet in crate::route_reconciler::virtual_machine_local_subnets(
+                routes,
+                &adapters,
+                secondary_ifindex,
+            ) {
+                if !out.contains(&subnet) {
+                    out.push(subnet);
+                }
+            }
+        }
+        let Some(policy) = self.local_networks.as_ref().map(|read| read(sid)) else {
+            return;
+        };
+        for network in &policy.allowed {
+            let pair = (network.network(), network.prefix_len());
+            if !out.contains(&pair) {
+                out.push(pair);
+            }
+        }
+        // Compared as NETWORKS, not as pairs: the route table and the user's
+        // text can spell the same network differently.
+        out.retain(|(net, prefix)| {
+            Ipv4Network::new(*net, *prefix)
+                .is_none_or(|candidate| !policy.refused.contains(&candidate))
+        });
+    }
+
+    /// Tell subscribers whether this SID's policy is in force, and what to do
+    /// when it is not. Published on CHANGE only: the resolve runs at reconcile
+    /// cadence and an unchanged state is not news.
+    /// Tell the user a tunnel is up while nothing is bound to the additional
+    /// route — the setup where every rule that names the additional route
+    /// silently does nothing, which reads as the product being broken.
+    ///
+    /// A corporate client is left alone: it usually belongs to an employer and
+    /// is not a candidate for the additional route. See
+    /// [`StatusUpdateEvent::UnassignedTunnelDetected`] for why the ambiguous,
+    /// protocol-named clients count as personal.
+    fn offer_unassigned_tunnel(
+        &self,
+        sid: &str,
+        infos: &[nrr_platform_api::adapters::AdapterInfo],
+    ) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        let Some(name) = personal_tunnel_name(infos) else {
+            return;
+        };
+        let key = format!("{sid}|{name}");
+        let now = std::time::Instant::now();
+        {
+            let mut seen = self
+                .unassigned_tunnel_notified
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(last) = seen.get(&key) {
+                if now.duration_since(*last) < std::time::Duration::from_secs(24 * 60 * 60) {
+                    return;
+                }
+            }
+            seen.insert(key, now);
+        }
+        bus.publish(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::UnassignedTunnelDetected {
+                sid: sid.to_string(),
+                adapter_name: name,
+            },
+        );
+    }
+
+    fn publish_enforcement_status(
+        &self,
+        sid: &str,
+        status: &str,
+        role: &str,
+        candidates: Vec<String>,
+    ) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        // Keyed by role: one user can have a resolved secondary and a missing
+        // primary at the same time, and a single per-SID latch made the two
+        // states overwrite each other into an endless alternating push.
+        let key = format!("{sid}|{role}");
+        let fingerprint = format!("{status}|{}", candidates.join(","));
+        {
+            let mut seen = self
+                .enforcement_status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if seen.get(&key) == Some(&fingerprint) {
+                return;
+            }
+            seen.insert(key, fingerprint);
+        }
+        bus.publish(
+            nrr_shared::ipc_payloads::StatusUpdateEvent::EnforcementStatusChanged {
+                sid: sid.to_string(),
+                status: status.to_string(),
+                role: role.to_string(),
+                candidates,
+            },
+        );
     }
 
     /// Resolve one route binding (primary or secondary) to a
@@ -1210,7 +1645,20 @@ impl SecondaryRouteCoordinator {
                         && adapter_answers_to_saved_name(i, &binding.display_name)
                 });
                 let first = healed.next();
-                let ambiguous = healed.next().is_some();
+                let second = healed.next();
+                let ambiguous = second.is_some();
+                // Several live adapters answer to the saved name: picking one
+                // would route the user's traffic through an adapter they never
+                // chose, so the choice goes back to them instead of being made
+                // silently or swallowed into a fail-closed nobody can explain.
+                if let (Some(a), Some(b)) = (first, second) {
+                    let candidates: Vec<String> = std::iter::once(a)
+                        .chain(std::iter::once(b))
+                        .chain(healed)
+                        .map(|i| preferred_display_name(i).to_string())
+                        .collect();
+                    self.publish_enforcement_status(sid, "adapter-choice-needed", role, candidates);
+                }
                 match first {
                     Some(only) if !ambiguous => {
                         let healed_id = format!(
@@ -1268,6 +1716,18 @@ impl SecondaryRouteCoordinator {
                                 // minutes of verbose capture). The transition
                                 // into the state warned above; the transition
                                 // out re-arms via `clear_not_usable`.
+                                //
+                                // The user, however, must not be left guessing:
+                                // failing closed here is what stops their rule
+                                // traffic, and until this push existed the only
+                                // trace was a log line. Deduped inside the
+                                // publisher, so the steady state stays quiet.
+                                self.publish_enforcement_status(
+                                    sid,
+                                    "secondary-down",
+                                    role,
+                                    Vec::new(),
+                                );
                             }
                             None => {
                                 let live: Vec<String> = infos
@@ -1323,6 +1783,8 @@ impl SecondaryRouteCoordinator {
         // not-usable WARN latch so the next usable→not-usable transition logs
         // again instead of staying silently deduped forever.
         self.clear_not_usable(sid, role);
+        self.publish_enforcement_status(sid, "ok", role, Vec::new());
+        self.remember_mac_anchor(sid, role, binding, info);
         let gateway = match info.gateways.first().copied() {
             Some(gw) => gw,
             None => {
@@ -1538,9 +2000,17 @@ impl SecondaryRouteCoordinator {
         resolution: &RouteResolution,
     ) -> Result<RouteReconcileDelta, PlatformError> {
         let Some(secondary) = resolution.secondary else {
-            // resolve() already logged the specific reason.
+            // resolve() already logged the specific reason. The tunnel is gone,
+            // so its interior is nobody's subnet any more — publish the empty
+            // set rather than leave a stale one gating fake-IP answers.
+            crate::secondary_subnets::global_secondary_subnets().publish(Vec::new());
             return self.reconciler.clear();
         };
+        // The tunnel's own interior, refreshed while we already hold the
+        // enumeration: the fake-IP answerer must never substitute an address
+        // inside it (a VPN client authorizing against its own tunnel address is
+        // the live case).
+        self.publish_secondary_subnets(sid);
         let Some(snapshot) = self.rules_provider.active_rules_for(sid) else {
             // No effective rules for this principal → no routes.
             tracing::info!(
@@ -1611,12 +2081,24 @@ impl SecondaryRouteCoordinator {
             }
         }
         if !out.diagnostics.is_empty() {
+            // Counted by kind, not summed: the old line named all three possible
+            // causes in its text and printed only a total, so a run where the
+            // primary was missing read exactly like one with a cold DNS cache.
+            let tally = diagnostic_tally(&out.diagnostics);
             tracing::debug!(
                 target: "nrr::route-coordinator",
                 sid = %sid,
                 diagnostics = out.diagnostics.len(),
                 routes = out.routes.len(),
-                "route codegen produced diagnostics (cold cache / app-routing-pro / no primary target)",
+                hostname_unresolved = tally.hostname_unresolved,
+                suffix_empty = tally.suffix_empty,
+                zone_empty = tally.zone_empty,
+                app_rule_address_and_app_not_routed = tally.app_rule_address_and_app_not_routed,
+                app_rule_unobserved = tally.app_rule_unobserved,
+                app_rule_dest_claimed_by_main_link = tally.app_rule_dest_claimed_by_main_link,
+                app_rule_dest_used_by_other_process = tally.app_rule_dest_used_by_other_process,
+                primary_exceptions_unavailable = tally.primary_exceptions_unavailable,
+                "route codegen produced diagnostics",
             );
         }
         // Route-shape breakdown so the log alone answers "is mode-A selectivity
@@ -1844,6 +2326,30 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
     }
 }
 
+/// The connection name of an up personal-VPN tunnel, if one is present.
+///
+/// Both names are tested: a VPN client commonly keeps the stock driver
+/// description ("TAP-Windows Adapter V9") and renames only the connection, so
+/// reading either one alone misses half the installations.
+fn personal_tunnel_name(infos: &[nrr_platform_api::adapters::AdapterInfo]) -> Option<String> {
+    use nrr_platform_api::vpn_discovery::{vpn_client_class, VpnClientClass};
+    infos
+        .iter()
+        .find(|info| {
+            info.oper_status == nrr_platform_api::adapters::IfOperStatus::Up
+                && [info.friendly_name.as_str(), info.description.as_str()]
+                    .iter()
+                    .any(|name| vpn_client_class(name) == Some(VpnClientClass::Consumer))
+        })
+        .map(|info| {
+            if info.friendly_name.is_empty() {
+                info.description.clone()
+            } else {
+                info.friendly_name.clone()
+            }
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2023,13 +2529,18 @@ mod tests {
                 doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
                 doh_resolver_ips: Vec::new(),
                 auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
+                primary_probe_auto: false,
+                primary_probe_timeout_ms: 1500,
+                primary_probe_max_targets: 8,
+                primary_probe_repeat_secs: 300,
+                block_ipv6_when_protected: true,
             })
         }
     }
 
     fn coordinator(api: Arc<MockWindowsApi>, rules: Arc<FakeRules>) -> SecondaryRouteCoordinator {
         SecondaryRouteCoordinator::new(
-            api as Arc<dyn WindowsApiPort>,
+            api as Arc<dyn RouteTablePort>,
             rules as Arc<dyn RulesProvider>,
             Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
             Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
@@ -2043,7 +2554,7 @@ mod tests {
         policy: Arc<FakePolicy>,
     ) -> SecondaryRouteCoordinator {
         SecondaryRouteCoordinator::new(
-            api as Arc<dyn WindowsApiPort>,
+            api as Arc<dyn RouteTablePort>,
             rules as Arc<dyn RulesProvider>,
             policy as Arc<dyn RoutePolicySource>,
             Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
@@ -2057,7 +2568,7 @@ mod tests {
         service_driven: bool,
     ) -> SecondaryRouteCoordinator {
         SecondaryRouteCoordinator::new(
-            api as Arc<dyn WindowsApiPort>,
+            api as Arc<dyn RouteTablePort>,
             rules as Arc<dyn RulesProvider>,
             Arc::new(FakePolicy::new()) as Arc<dyn RoutePolicySource>,
             Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
@@ -2349,6 +2860,208 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_adapter_whose_mac_follows_its_guid_gets_no_anchor() {
+        // Taken from a live run: TAP-Windows reported MAC 00:FF:0C:93:B1:CC under
+        // GUID {0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}. The two rotate together on
+        // every reconnect, so the MAC is not an identity of its own.
+        let mut tap = adapter(
+            "{0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}",
+            14,
+            true,
+            true,
+            None,
+        );
+        tap.mac = Some([0x00, 0xFF, 0x0C, 0x93, 0xB1, 0xCC]);
+        tap.description = "TAP-Windows Adapter V9".into();
+        assert_eq!(mac_anchor_id(&tap), None);
+    }
+
+    #[test]
+    fn a_physical_adapter_anchors_on_its_mac_and_is_found_by_it_after_a_guid_change() {
+        let mut nic = adapter(
+            "{282A0045-3DE1-4BFE-8296-B000D7F933ED}",
+            18,
+            true,
+            true,
+            None,
+        );
+        nic.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2E]);
+        nic.description = "Realtek(R) PCI(e) Ethernet Controller".into();
+        let anchor = mac_anchor_id(&nic).expect("a burned-in MAC is an anchor");
+        assert_eq!(anchor, "win-mac:D8-C4-97-14-BA-2E");
+
+        // Same card, new GUID and new ifindex (came back on another port): the
+        // anchor still names it, which is the whole point.
+        let mut moved = adapter(
+            "{99999999-0000-0000-0000-000000000000}",
+            41,
+            true,
+            true,
+            None,
+        );
+        moved.mac = nic.mac;
+        assert!(adapter_binding_matches(&moved, &anchor));
+        // A different card must not answer to it.
+        let mut other = adapter(
+            "{88888888-0000-0000-0000-000000000000}",
+            42,
+            true,
+            true,
+            None,
+        );
+        other.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2F]);
+        assert!(!adapter_binding_matches(&other, &anchor));
+    }
+
+    #[test]
+    fn a_virtual_software_adapter_gets_no_anchor() {
+        let mut vswitch = adapter(
+            "{11111111-0000-0000-0000-000000000000}",
+            20,
+            true,
+            true,
+            None,
+        );
+        vswitch.mac = Some([0x00, 0x15, 0x5D, 0x01, 0x02, 0x03]);
+        vswitch.description = "Hyper-V Virtual Ethernet Adapter".into();
+        assert_eq!(mac_anchor_id(&vswitch), None);
+    }
+
+    #[test]
+    fn the_mac_anchor_is_persisted_once_per_binding() {
+        let api = Arc::new(MockWindowsApi::new());
+        let mut nic = adapter("boundnic", 7, true, true, Some([10, 0, 0, 1]));
+        nic.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2E]);
+        api.set_adapter_infos(vec![nic]);
+
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary_named("S-ANCHOR", "win-adapter:boundnic", "desc boundnic");
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let cap = Arc::clone(&captured);
+        let coord = coordinator_with_policy(
+            Arc::clone(&api),
+            Arc::new(FakeRules::new()),
+            Arc::clone(&policy),
+        )
+        .with_binding_anchor_persist(Arc::new(move |sid, role, anchor| {
+            cap.lock().unwrap().push(format!("{sid}|{role}|{anchor}"));
+        }));
+
+        let _ = coord.resolve("S-ANCHOR");
+        let _ = coord.resolve("S-ANCHOR");
+        let c = captured.lock().unwrap();
+        assert_eq!(
+            *c,
+            vec!["S-ANCHOR|secondary|win-mac:D8-C4-97-14-BA-2E".to_string()],
+            "the anchor is learned on resolve and written once, not every reconcile"
+        );
+    }
+
+    #[test]
+    fn two_live_adapters_answering_to_the_saved_name_ask_the_user_instead_of_guessing() {
+        use crate::ipc_handlers::event_bus::EventBus;
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        let api = Arc::new(MockWindowsApi::new());
+        // Two usable adapters of the same family — the bound GUID is gone.
+        let mut a = adapter("tap-a", 21, true, true, Some([10, 0, 0, 1]));
+        a.description = "vpn adapter".into();
+        a.friendly_name = "vpn adapter".into();
+        let mut b = adapter("tap-b", 22, true, true, Some([10, 0, 0, 2]));
+        b.description = "vpn adapter".into();
+        b.friendly_name = "vpn adapter".into();
+        api.set_adapter_infos(vec![a, b]);
+
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary_named("S-AMBIG", "win-adapter:{gone}", "vpn adapter");
+
+        let bus = Arc::new(EventBus::new());
+        let sub = bus.subscribe("test".into(), None).subscription_id;
+        let coord = coordinator_with_policy(
+            Arc::clone(&api),
+            Arc::new(FakeRules::new()),
+            Arc::clone(&policy),
+        )
+        .with_event_bus(Arc::clone(&bus));
+
+        let r = coord.resolve("S-AMBIG");
+        assert!(
+            r.secondary.is_none(),
+            "an ambiguous name must not be resolved by guessing"
+        );
+        // Re-resolving the same state must not re-publish.
+        let _ = coord.resolve("S-AMBIG");
+
+        let events = bus.peek_pending_for(&sub, 16);
+        let published: Vec<_> = events
+            .iter()
+            .filter_map(|e| match &e.event {
+                StatusUpdateEvent::EnforcementStatusChanged {
+                    status,
+                    role,
+                    candidates,
+                    ..
+                } => Some((status.clone(), role.clone(), candidates.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            vec![(
+                "adapter-choice-needed".to_string(),
+                "secondary".to_string(),
+                vec!["vpn adapter".to_string(), "vpn adapter".to_string()]
+            )],
+            "the choice is announced once, with the adapters to choose from"
+        );
+    }
+
+    #[test]
+    fn a_binding_that_resolves_clears_the_standing_enforcement_notice() {
+        use crate::ipc_handlers::event_bus::EventBus;
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        let api = Arc::new(MockWindowsApi::new());
+        api.set_adapter_infos(vec![adapter("nic", 30, true, true, Some([10, 0, 0, 1]))]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary_named("S-OK", "win-adapter:nic", "desc nic");
+
+        let bus = Arc::new(EventBus::new());
+        let sub = bus.subscribe("test".into(), None).subscription_id;
+        let coord = coordinator_with_policy(
+            Arc::clone(&api),
+            Arc::new(FakeRules::new()),
+            Arc::clone(&policy),
+        )
+        .with_event_bus(Arc::clone(&bus));
+
+        let _ = coord.resolve("S-OK");
+        let _ = coord.resolve("S-OK");
+        let statuses: Vec<(String, String)> = bus
+            .peek_pending_for(&sub, 16)
+            .iter()
+            .filter_map(|e| match &e.event {
+                StatusUpdateEvent::EnforcementStatusChanged { status, role, .. } => {
+                    Some((role.clone(), status.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        // The secondary resolves; this fixture has no primary and no OS default
+        // route to derive one, so the two roles report independently — and each
+        // reports once, however many times the reconcile runs.
+        assert_eq!(
+            statuses,
+            vec![
+                ("secondary".to_string(), "ok".to_string()),
+                ("primary".to_string(), "no-primary-route".to_string()),
+            ],
+            "published on change only, per role"
+        );
+    }
+
+    #[test]
     fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
         // the bound GUID is still ENUMERATED but DOWN (a GUID-churning
         // VPN can leave a stale/down TAP instance visible while the freshly-connected
@@ -2571,6 +3284,38 @@ mod tests {
             HashSet::from([Ipv4Addr::new(1, 1, 1, 1)]),
             "the matched host still egresses the secondary under Persist pause"
         );
+    }
+
+    /// A VPN client that renamed only the connection is the common case; the
+    /// driver description stays generic, so both names have to be read.
+    #[test]
+    fn a_renamed_connection_still_reads_as_a_personal_tunnel() {
+        let mut tun = adapter("tap", 7, true, true, None);
+        tun.description = "TAP-Windows Adapter V9".into();
+        tun.friendly_name = "hidemy.name VPN OpenVPN Adapter".into();
+        assert_eq!(
+            personal_tunnel_name(&[adapter("wifi", 3, true, true, Some([192, 168, 0, 1])), tun]),
+            Some("hidemy.name VPN OpenVPN Adapter".to_string())
+        );
+    }
+
+    /// A corporate client belongs to an employer; telling that user to make it
+    /// their additional route would be the product guessing at IT policy.
+    #[test]
+    fn a_corporate_client_raises_no_offer() {
+        let mut tun = adapter("fort", 8, true, true, None);
+        tun.friendly_name = "FortiClient VPN".into();
+        tun.description = "FortiClient Virtual Ethernet Adapter".into();
+        assert_eq!(personal_tunnel_name(&[tun]), None);
+    }
+
+    /// An installed-but-disconnected client is not a tunnel the user is
+    /// waiting on.
+    #[test]
+    fn a_tunnel_that_is_down_raises_no_offer() {
+        let mut tun = adapter("tap", 9, false, false, None);
+        tun.friendly_name = "Mullvad VPN".into();
+        assert_eq!(personal_tunnel_name(&[tun]), None);
     }
 
     fn adapter(

@@ -17,25 +17,25 @@
 //!   → PresetFileValidationOutcome             →  Accepted
 //! ```
 //!
-//! Semantic validation (IDNA normalisation, IP format, Pro-feature rejection
+//! Semantic validation (IDNA normalisation, IP format, unsupported-feature rejection
 //! on known sections) occurs in a later pipeline stage when the preset is
 //! incorporated into an `ActiveConfiguration` and passed to
 //! [`crate::validation::validate_and_canonicalize`]. This module focuses on
 //! structural safety — ensuring the file is parseable, within resource limits,
-//! and that Pro-only content is flagged rather than silently discarded.
+//! and that unsupported content is flagged rather than silently discarded.
 //!
 //! # Outcome model
 //!
 //! | Outcome                | Meaning                                           |
 //! |------------------------|---------------------------------------------------|
 //! | `Accepted`             | No issues; import candidate build may proceed.    |
-//! | `AcceptedWithWarnings` | Non-blocking issues (Pro sections, future format  |
+//! | `AcceptedWithWarnings` | Non-blocking issues (unsupported sections, future format  |
 //! |                        | version); import may proceed, GUI shows warnings. |
 //! | `Rejected`             | Hard error; import candidate build must not start.|
 //!
-//! **Warnings allow continuation; rejections do not.** A file with only Pro
-//! sections and no Free-section rules is still `Accepted` — the user chose to
-//! import it and the GUI will show the Pro badges.
+//! **Warnings allow continuation; rejections do not.** A file with only
+//! extended sections and no applicable rules is still `Accepted` — the user
+//! chose to import it and the GUI shows the badges.
 
 use core::fmt;
 
@@ -52,7 +52,7 @@ use crate::{
 /// Maximum total number of rule entries across all sections in one rules file.
 ///
 /// Applies to both working rules files and preset files. Counts entries in
-/// known Free-edition sections **and** unknown (Pro-only) sections combined.
+/// known Free-edition sections **and** unknown (unsupported) sections combined.
 /// Disabled entries count toward the limit — they are stored and must not
 /// cause unbounded resource consumption.
 ///
@@ -253,9 +253,8 @@ impl fmt::Display for PresetImportRejectedReason {
 pub enum PresetImportWarning {
     /// A section with an unrecognised name was found (e.g. `--- CIDR`,
     /// `--- Ports`). Its entries are preserved but will not be applied to
-    /// routing policy in the Free edition. The GUI displays them with a Pro
-    /// badge ("Available in Pro").
-    UnknownProSection { name: String, entry_count: usize },
+    /// routing policy. The GUI displays them with a "not applied" badge.
+    UnknownSection { name: String, entry_count: usize },
 
     /// The file's version header declares a format version newer than this
     /// build supports. Known sections are parsed; unrecognised sections are
@@ -266,10 +265,10 @@ pub enum PresetImportWarning {
 impl fmt::Display for PresetImportWarning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownProSection { name, entry_count } => write!(
+            Self::UnknownSection { name, entry_count } => write!(
                 f,
-                "section '{name}' contains {entry_count} rule(s) that require the Pro edition \
-                 and will not be applied"
+                "section '{name}' contains {entry_count} rule(s) this build does not \
+                 support and will not apply"
             ),
             Self::FormatVersionMismatch { found, supported } => write!(
                 f,
@@ -288,7 +287,7 @@ impl fmt::Display for PresetImportWarning {
 /// module-level docs). The caller reads the file bytes; this function handles
 /// everything from the size check through parse-level validation.
 ///
-/// Semantic validation (IDNA, IP format, Pro-feature rejection on known
+/// Semantic validation (IDNA, IP format, unsupported-feature rejection on known
 /// sections) is not performed here — it requires a full `ActiveConfiguration`
 /// and happens via [`crate::validation::validate_and_canonicalize`].
 ///
@@ -413,7 +412,7 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
         .iter()
         .filter_map(|w| match w {
             ParseWarning::UnknownSection { name, entry_count } => {
-                Some(PresetImportWarning::UnknownProSection {
+                Some(PresetImportWarning::UnknownSection {
                     name: name.clone(),
                     entry_count: *entry_count,
                 })
@@ -436,7 +435,7 @@ pub fn validate_preset_bytes(bytes: &[u8]) -> PresetFileValidationOutcome {
             // Provenance defects in the app-authored section are not an import
             // concern: the rule itself is imported intact either way, and the
             // import-review dialog reports what the user must *decide* about
-            // (Pro sections, format version). Callers that want to surface them
+            // (unsupported sections, format version). Callers that want to surface them
             // read `ParseOutcome::warnings` directly.
             ParseWarning::AutoRuleMissingProvenance { .. }
             | ParseWarning::AutoRuleIncompleteProvenance { .. } => None,
@@ -512,7 +511,7 @@ mod tests {
     // ── AcceptedWithWarnings ──────────────────────────────────────────────────
 
     #[test]
-    fn pro_only_section_produces_accepted_with_warning() {
+    fn unsupported_section_produces_accepted_with_warning() {
         let input = b"--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.is_accepted());
@@ -521,12 +520,12 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(matches!(
             &warnings[0],
-            PresetImportWarning::UnknownProSection { name, entry_count: 1 } if name == "CIDR"
+            PresetImportWarning::UnknownSection { name, entry_count: 1 } if name == "CIDR"
         ));
     }
 
     #[test]
-    fn multiple_pro_sections_produce_one_warning_each() {
+    fn multiple_extended_sections_produce_one_warning_each() {
         let input = b"--- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n--- Ports\n443\n";
         let outcome = validate_preset_bytes(input);
         assert!(outcome.has_warnings());
@@ -547,7 +546,7 @@ mod tests {
     }
 
     #[test]
-    fn pro_section_and_version_mismatch_both_reported() {
+    fn extended_section_and_version_mismatch_both_reported() {
         let input = b"# NetRuleRouter preset \xe2\x80\x94 version 99\n\
                       --- Domains\nexample.com\n--- CIDR\n10.0.0.0/8\n";
         let outcome = validate_preset_bytes(input);
@@ -671,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_count_includes_unknown_pro_section_entries() {
+    fn rule_count_includes_unknown_extended_section_entries() {
         // Entries in unknown sections count toward the total rule limit.
         let mut content = String::from("--- CIDR\n");
         for i in 0..=(MAX_RULES_PER_FILE as usize) {
@@ -885,7 +884,7 @@ mod tests {
     #[test]
     fn warning_display_is_nonempty() {
         let warnings = [
-            PresetImportWarning::UnknownProSection {
+            PresetImportWarning::UnknownSection {
                 name: "CIDR".to_string(),
                 entry_count: 3,
             },

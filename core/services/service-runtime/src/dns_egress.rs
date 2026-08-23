@@ -41,8 +41,9 @@
 //! rule routes. This module owns only the socket-side decision.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Public resolvers used when DNS-over-secondary is on, in preference order.
 ///
@@ -65,6 +66,21 @@ pub const DNS_PORT: u16 = 53;
 /// query, and the second attempt is the availability guarantee — it must
 /// succeed even when the tunnel silently eats packets.
 pub const SECONDARY_ATTEMPTS_PER_QUERY: u32 = 1;
+
+/// Consecutive tunnel failures before the secondary is skipped for a while.
+///
+/// Not one: a single timeout is ordinary (a packet lost, an operator rate
+/// limiting us), and tripping on it would give up the setting's whole point
+/// over noise.
+pub const SECONDARY_FAILURE_THRESHOLD: u32 = 3;
+
+/// How long the secondary is skipped once the threshold is reached, before one
+/// query is allowed through to see whether the tunnel came back.
+///
+/// The cost of being wrong in either direction is small and symmetric: too
+/// short and a dead tunnel costs one extra timeout per window; too long and a
+/// recovered tunnel keeps queries on the primary a little longer.
+pub const SECONDARY_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// One resolved decision: which upstream to ask and which local address to
 /// leave from.
@@ -108,6 +124,14 @@ pub trait DnsEgressPolicy: Send + Sync {
     /// [`SECONDARY_ATTEMPTS_PER_QUERY`] must fall back to the caller's own
     /// upstream so a silently-dead tunnel costs one timeout, never the query.
     fn decide(&self, attempt: u32) -> Option<DnsEgress>;
+
+    /// Report how an attempt this policy chose actually went.
+    ///
+    /// Without it the policy is blind: it keeps sending the first attempt of
+    /// every query into a tunnel that stopped carrying traffic, and each one
+    /// costs a full timeout before the caller falls back. The default does
+    /// nothing, so a policy that has no state to keep is unaffected.
+    fn note_outcome(&self, _via_secondary: bool, _ok: bool) {}
 }
 
 /// Resolves the secondary link's current IPv4 source address, or `None` when
@@ -142,6 +166,18 @@ pub struct SecondaryPreferredEgress {
     /// operators any more — successive QUERIES do it instead, so one operator
     /// rate-limiting us degrades every other query, not every query.
     rotation: std::sync::atomic::AtomicU32,
+    /// Consecutive failures of attempts this policy sent over the tunnel.
+    consecutive_failures: AtomicU32,
+    /// While set and unexpired, the tunnel is skipped: `decide` answers `None`
+    /// and the caller uses its own upstream immediately.
+    ///
+    /// This costs no privacy. The caller ALREADY falls back to its own upstream
+    /// on the next attempt — that is what `SECONDARY_ATTEMPTS_PER_QUERY = 1`
+    /// means — so the query reaches the same server either way. All the breaker
+    /// removes is the timeout in front of it, which is what makes every name on
+    /// the machine slow while the tunnel is down.
+    open_until: Mutex<Option<Instant>>,
+    cooldown: Duration,
 }
 
 impl SecondaryPreferredEgress {
@@ -151,13 +187,46 @@ impl SecondaryPreferredEgress {
             source,
             servers: PUBLIC_DNS_SERVERS,
             rotation: std::sync::atomic::AtomicU32::new(0),
+            consecutive_failures: AtomicU32::new(0),
+            open_until: Mutex::new(None),
+            cooldown: SECONDARY_COOLDOWN,
         }
+    }
+
+    /// Override how long the tunnel stays skipped (tests).
+    #[must_use]
+    pub fn with_cooldown(mut self, cooldown: Duration) -> Self {
+        self.cooldown = cooldown;
+        self
     }
 
     /// Override the public-resolver list (tests).
     pub fn with_servers(mut self, servers: &'static [Ipv4Addr]) -> Self {
         self.servers = servers;
         self
+    }
+}
+
+impl SecondaryPreferredEgress {
+    /// Is the tunnel currently being skipped? Clears the latch once the
+    /// cooldown is up, which is what lets the next query act as the trial.
+    fn skipping_tunnel(&self) -> bool {
+        let mut open = self.open_until.lock().unwrap_or_else(|p| p.into_inner());
+        match *open {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                *open = None;
+                // Leave the counter one short of the threshold so a single
+                // failure re-opens immediately: a tunnel that is still dead
+                // must not cost another full round of failures to notice.
+                self.consecutive_failures.store(
+                    SECONDARY_FAILURE_THRESHOLD.saturating_sub(1),
+                    Ordering::Relaxed,
+                );
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -172,6 +241,9 @@ impl DnsEgressPolicy for SecondaryPreferredEgress {
         if attempt >= SECONDARY_ATTEMPTS_PER_QUERY {
             return None;
         }
+        if self.skipping_tunnel() {
+            return None;
+        }
         // Tunnel down / no address — asking a public resolver would either
         // leave over the primary link anyway (defeating the point) or fail to
         // bind. Fall back to the caller's upstream rather than fail.
@@ -183,6 +255,31 @@ impl DnsEgressPolicy for SecondaryPreferredEgress {
             bind: Some(IpAddr::V4(src)),
             via_secondary: true,
         })
+    }
+
+    fn note_outcome(&self, via_secondary: bool, ok: bool) {
+        if !via_secondary {
+            return;
+        }
+        if ok {
+            self.consecutive_failures.store(0, Ordering::Relaxed);
+            *self.open_until.lock().unwrap_or_else(|p| p.into_inner()) = None;
+            return;
+        }
+        let failures = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures < SECONDARY_FAILURE_THRESHOLD {
+            return;
+        }
+        let mut open = self.open_until.lock().unwrap_or_else(|p| p.into_inner());
+        if open.is_none() {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                failures,
+                cooldown_secs = self.cooldown.as_secs(),
+                "DNS-over-secondary: the tunnel stopped answering — sending queries straight to the captured upstream for now. They already fell back there after a timeout; this only drops the wait",
+            );
+        }
+        *open = Some(Instant::now() + self.cooldown);
     }
 }
 
@@ -206,6 +303,67 @@ mod tests {
 
     fn policy(enabled: bool, src: Option<Ipv4Addr>) -> SecondaryPreferredEgress {
         SecondaryPreferredEgress::new(Arc::new(AtomicBool::new(enabled)), Arc::new(move || src))
+    }
+
+    fn fail(p: &SecondaryPreferredEgress, times: u32) {
+        for _ in 0..times {
+            p.note_outcome(true, false);
+        }
+    }
+
+    #[test]
+    fn a_run_of_tunnel_failures_stops_queries_being_sent_into_it() {
+        let p = policy(true, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        fail(&p, SECONDARY_FAILURE_THRESHOLD - 1);
+        assert!(
+            p.decide(0).is_some(),
+            "one short of the threshold still tries"
+        );
+        fail(&p, 1);
+        assert_eq!(p.decide(0), None, "at the threshold the tunnel is skipped");
+    }
+
+    #[test]
+    fn an_answer_clears_the_run() {
+        let p = policy(true, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        fail(&p, SECONDARY_FAILURE_THRESHOLD - 1);
+        p.note_outcome(true, true);
+        fail(&p, SECONDARY_FAILURE_THRESHOLD - 1);
+        assert!(p.decide(0).is_some(), "the run restarted from zero");
+    }
+
+    #[test]
+    fn after_the_cooldown_one_query_is_let_through_to_look() {
+        let p =
+            policy(true, Some(Ipv4Addr::new(10, 0, 0, 2))).with_cooldown(Duration::from_millis(5));
+        fail(&p, SECONDARY_FAILURE_THRESHOLD);
+        assert_eq!(p.decide(0), None);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(
+            p.decide(0).is_some(),
+            "the cooldown expired — try the tunnel again"
+        );
+    }
+
+    #[test]
+    fn a_tunnel_that_is_still_dead_is_dropped_again_on_the_first_failure() {
+        // The trial query must not cost another full run of failures.
+        let p =
+            policy(true, Some(Ipv4Addr::new(10, 0, 0, 2))).with_cooldown(Duration::from_millis(5));
+        fail(&p, SECONDARY_FAILURE_THRESHOLD);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(p.decide(0).is_some());
+        fail(&p, 1);
+        assert_eq!(p.decide(0), None);
+    }
+
+    #[test]
+    fn outcomes_of_attempts_that_did_not_use_the_tunnel_are_not_counted() {
+        let p = policy(true, Some(Ipv4Addr::new(10, 0, 0, 2)));
+        for _ in 0..(SECONDARY_FAILURE_THRESHOLD * 3) {
+            p.note_outcome(false, false);
+        }
+        assert!(p.decide(0).is_some());
     }
 
     #[test]

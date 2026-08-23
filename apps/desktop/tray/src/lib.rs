@@ -310,13 +310,15 @@ struct TrayContextPayload {
     /// Per-kind mute for the suggestions-changed stripe, under the master
     /// toggle above. Same launch-time snapshot rule.
     notify_suggestion_changes: bool,
-    /// Per-kind mute for the "connection blocked" notice. The tray does not
-    /// raise that notice itself today; carried through for parity with the
-    /// main GUI context.
+    /// Per-kind mute for the "connection blocked" notice — the tray is the
+    /// surface that raises it, so it honours this like `show_notifications`.
     notify_block_notices: bool,
-    /// Whether the "connection blocked" notice hides the destination
-    /// address. Same parity rule as `notify_block_notices`.
+    /// Whether that notice may name the destination. Off-screen leaks are the
+    /// point: a shared screen must not show what the user browses.
     hide_block_notice_addresses: bool,
+    /// Opacity of the notice window in percent — it is our own window, so the
+    /// preference reaches the tray the same way the mutes do.
+    tray_notice_opacity_percent: u16,
     /// Mirrors the "Detailed routing mode" preference. The tray does not
     /// itself gate anything on it today; carried through for parity with the
     /// main GUI context.
@@ -772,6 +774,7 @@ pub fn write_qt_tray_context_file(
         notify_suggestion_changes: preferences.notify_suggestion_changes,
         notify_block_notices: preferences.notify_block_notices,
         hide_block_notice_addresses: preferences.hide_block_notice_addresses,
+        tray_notice_opacity_percent: preferences.tray_notice_opacity_percent,
         routing_detailed_mode: preferences.routing_detailed_mode,
         theme: TrayThemeContext {
             selected_mode: theme.selected_mode.slug().to_string(),
@@ -843,6 +846,7 @@ fn emit_tray_context(output_path: &Path, options: TrayLaunchOptions) -> Result<(
         notify_suggestion_changes: preferences.notify_suggestion_changes,
         notify_block_notices: preferences.notify_block_notices,
         hide_block_notice_addresses: preferences.hide_block_notice_addresses,
+        tray_notice_opacity_percent: preferences.tray_notice_opacity_percent,
         routing_detailed_mode: preferences.routing_detailed_mode,
         theme: TrayThemeContext {
             selected_mode: theme.selected_mode.slug().to_string(),

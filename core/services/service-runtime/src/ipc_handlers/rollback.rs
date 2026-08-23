@@ -134,6 +134,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
             caller_principal: None,
+            caller_pid: None,
         }
     }
 
@@ -211,6 +212,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: crate::UserPrincipal::from_windows_sid("S-1-5-21-KID").ok(),
+            caller_pid: None,
         };
         let err = h
             .handle(&req(serde_json::json!({})), &non_elevated)

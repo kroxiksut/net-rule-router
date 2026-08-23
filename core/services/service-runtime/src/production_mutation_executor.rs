@@ -254,6 +254,41 @@ impl ProductionMutationExecutor {
         Ok(())
     }
 
+    /// Re-spell the incoming rule book the one canonical way, and re-hash it.
+    ///
+    /// A client can send a rule book that never went through validation, so
+    /// `Cloud.exe` and `cloud.exe` arrive as two different payloads with two
+    /// different content hashes — and since the hash is what dedupes
+    /// revisions, the same rule set became a NEW revision every time the
+    /// spelling flipped, which the apply layer then saw as a rule added and
+    /// removed on every pass. Canonicalizing here makes the two identical
+    /// before anything downstream compares them.
+    ///
+    /// A payload we cannot decode is left exactly as it came: rejecting it is
+    /// the validation layer's call, not this one's.
+    fn canonicalize_rules_payload(payload: &mut RulesUpdatePayload) {
+        let Ok(dto) = serde_json::from_str::<nrr_shared::rules_json::CanonicalRulesJsonV1>(
+            &payload.rules_json,
+        ) else {
+            return;
+        };
+        let Ok(content) = nrr_domain::rules_json_codec::decode(dto) else {
+            return;
+        };
+        let Ok(canonical) = nrr_shared::rules_json::to_canonical_string(
+            &nrr_domain::rules_json_codec::encode(&content),
+        ) else {
+            return;
+        };
+        if canonical == payload.rules_json {
+            return;
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(canonical.as_bytes());
+        payload.content_hash = format!("{:x}", hasher.finalize());
+        payload.rules_json = canonical;
+    }
+
     fn submission_from(
         payload: &RulesUpdatePayload,
         fallback_correlation: &str,
@@ -282,10 +317,13 @@ impl ProductionMutationExecutor {
         payload: &serde_json::Value,
         principal: &str,
     ) -> ReviewSummaryResponse {
-        let parsed = match Self::parse_rules_payload(payload) {
+        let mut parsed = match Self::parse_rules_payload(payload) {
             Ok(p) => p,
             Err(e) => return malformed_summary(&e.message),
         };
+        // Same spelling the execute path will store, so the preview scores and
+        // dedupes against exactly what would be applied.
+        Self::canonicalize_rules_payload(&mut parsed);
         if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
             return malformed_summary(&e.message);
         }
@@ -522,7 +560,7 @@ impl ProductionMutationExecutor {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         }
     }
 
@@ -727,10 +765,11 @@ impl ProductionMutationExecutor {
         payload: &serde_json::Value,
         principal: &str,
     ) -> MutationOutcome {
-        let parsed = match Self::parse_rules_payload(payload) {
+        let mut parsed = match Self::parse_rules_payload(payload) {
             Ok(p) => p,
             Err(e) => return MutationOutcome::Failed(e),
         };
+        Self::canonicalize_rules_payload(&mut parsed);
         if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
             return MutationOutcome::Failed(e);
         }
@@ -1212,7 +1251,7 @@ fn reset_review_summary(
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1228,7 +1267,7 @@ fn malformed_summary(message: &str) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1285,7 +1324,7 @@ fn preset_failure_summary(err: &OperationError) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1299,7 +1338,7 @@ fn preset_failure_summary(err: &OperationError) -> ReviewSummaryResponse {
 /// - `match-value-too-long`, `inline-comment-too-long`, `too-many-rules`
 ///   — corresponding rejection reasons from `validate_preset_bytes`.
 /// - `canonicalize-rejected` — semantic validation failure
-///   (IDNA / IPv4 / Pro section in a known slot / etc.).
+///   (IDNA / IPv4 / unsupported section in a known slot / etc.).
 fn canonicalize_route_bytes(
     b64: &str,
     route: RouteRole,
@@ -1330,7 +1369,7 @@ fn canonicalize_route_bytes(
         }
     };
     // Diagnostic: surface how many rules the SERVER-side
-    // parser actually recognised vs dropped into unknown/Pro sections.
+    // parser actually recognised vs dropped into unknown/unsupported sections.
     // A report of "GUI shows N rules but the service stores 0" pins here:
     // if known_rules==0 while the file clearly had Free-section rules, the
     // server parser disagrees with the launcher parser (nrr_shared::
@@ -1504,7 +1543,7 @@ fn not_implemented_summary(reason: &str) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1520,7 +1559,7 @@ fn policy_error_summary(err: &PolicyError) -> ReviewSummaryResponse {
         rules_removed: Vec::new(),
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1666,7 +1705,7 @@ fn dry_run_to_review_summary(
         rules_removed,
         rules_modified,
         rules_retargeted,
-        pro_sections: Vec::new(),
+        extended_sections: Vec::new(),
     }
 }
 
@@ -1807,6 +1846,58 @@ mod tests {
         let raw = serde_json::json!({"rules-json": "{}"});
         let err = ProductionMutationExecutor::parse_rules_payload(&raw).unwrap_err();
         assert_eq!(err.code, "malformed-payload");
+    }
+
+    /// One rule book, two spellings of the same application name: after
+    /// canonicalization both payloads are byte-identical and carry the same
+    /// content hash, which is what stops the revision churn that made the same
+    /// rule look added and removed on every pass.
+    #[test]
+    fn two_spellings_of_one_app_rule_become_one_payload() {
+        fn payload(app: &str) -> RulesUpdatePayload {
+            let rules_json = serde_json::json!({
+                "schema-version": 1,
+                "primary": [{
+                    "id": "r-1",
+                    "enabled": true,
+                    "app-match": { "pattern": { "kind": "exact", "value": app },
+                                   "include-child-processes": false },
+                    "comment": "",
+                    "action": "route",
+                }],
+                "secondary": [],
+            })
+            .to_string();
+            let mut p = RulesUpdatePayload {
+                rules_json,
+                content_hash: "client-supplied".into(),
+                correlation_id: None,
+            };
+            ProductionMutationExecutor::canonicalize_rules_payload(&mut p);
+            p
+        }
+
+        let typed = payload("hidemy.name VPN 3.0.exe");
+        let stored = payload("hidemy.name vpn 3.0.exe");
+        assert_eq!(typed.rules_json, stored.rules_json);
+        assert_eq!(typed.content_hash, stored.content_hash);
+        assert_ne!(
+            typed.content_hash, "client-supplied",
+            "the hash must be recomputed from the canonical form, not trusted"
+        );
+        assert!(typed.rules_json.contains("hidemy.name vpn 3.0.exe"));
+    }
+
+    #[test]
+    fn an_undecodable_payload_is_left_alone_for_the_validator_to_reject() {
+        let mut p = RulesUpdatePayload {
+            rules_json: "not json at all".into(),
+            content_hash: "h".into(),
+            correlation_id: None,
+        };
+        ProductionMutationExecutor::canonicalize_rules_payload(&mut p);
+        assert_eq!(p.rules_json, "not json at all");
+        assert_eq!(p.content_hash, "h");
     }
 
     #[test]

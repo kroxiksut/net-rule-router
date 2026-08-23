@@ -17,6 +17,7 @@
 //! (adapter selections, role confirmations, behavior mode) will be migrated to
 //! service-owned state once real service integration is complete.
 
+pub mod address_class;
 pub mod alert;
 pub mod auto_rule_budget;
 pub mod block8_outputs;
@@ -47,6 +48,7 @@ mod decision_scenarios;
 pub mod enforcement_mode;
 pub mod extension_channel;
 pub mod import;
+pub mod ipv4_network;
 pub mod isp_block_pages;
 pub mod linked_source;
 pub mod merge;
@@ -80,6 +82,9 @@ pub use canonical::RuleAction;
 // Rule provenance is declared once in `nrr-shared` — the rules-file parser,
 // the GUI preset parser, and the canonical wire DTO all read the same slugs,
 // so a mirrored domain copy would only add a way for them to drift.
+// Process-name canonicalisation lives in contracts: the launcher hashes rule
+// sets for comparison and has to fold names exactly as validation does.
+pub use nrr_shared::app_identity;
 pub use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
 pub use nrr_shared::{BindingSource, RouteBehaviorMode, RouteRole};
 
@@ -187,13 +192,13 @@ impl fmt::Display for RuleId {
 /// `Zone(name)` matches all traffic whose destination hostname ends with
 /// `.{name}` — e.g. zone `intra` matches `server.corp.intra`. Zone applies
 /// only when a hostname is available; IP-only traffic bypasses Zone in Free.
-/// IP subnet zones are a Pro edition feature.
+/// IP subnet zones are not supported.
 ///
 /// # ExactIp semantics
 ///
 /// `ExactIp(addr)` matches only the exact IPv4 address. CIDR and IPv6 are
-/// Pro edition features. `IpAddr::V6` inputs are rejected at normalization
-/// time as Pro-only unsupported.
+/// unsupported. `IpAddr::V6` inputs are rejected at normalization
+/// time as unsupported unsupported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddressMatch {
     /// Matches the exact FQDN only (runtime priority tier 1 — highest).
@@ -207,7 +212,7 @@ pub enum AddressMatch {
     /// Runtime priority vs `ExactIp` is user-configurable (default: `ExactIp` wins).
     Zone(String),
     /// Matches one exact IPv4 address (runtime priority tier 3 by default; configurable vs Zone).
-    /// No CIDR prefix matching — that is a Pro edition feature.
+    /// No CIDR prefix matching — that is not supported.
     ExactIp(std::net::IpAddr),
 }
 
@@ -418,7 +423,7 @@ impl RuleBook {
 ///    `ExactIp` before `Zone`; controlled by `zone_priority_over_ip` setting).
 ///    Zone fires if the hostname ends with `.{zone_name}`; applies only when a
 ///    hostname is available (IP-only traffic skips Zone in Free). IP subnet zones
-///    are a Pro edition feature. An optional `app_match` is an AND filter.
+///    are not supported. An optional `app_match` is an AND filter.
 ///
 /// If Pass 1 finds a match, evaluation stops and the matched route is used.
 ///
@@ -526,8 +531,7 @@ impl FreeEditionConstraints {
     /// There is no multi-profile manager and no scenario library.
     pub const MAX_ACTIVE_CONFIGURATIONS: usize = 1;
 
-    /// The Pro edition will lift this limit. In the Free edition, exactly
-    /// `Primary` and `Secondary` are the only route roles available.
+    /// `Primary` and `Secondary` are the only route roles there are.
     pub const MAX_ROUTE_BINDINGS: usize = 2;
 
     /// Users cannot save multiple named configuration profiles in the Free

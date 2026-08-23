@@ -988,6 +988,7 @@ dependencies = [
  "nrr-service-runtime",
  "nrr-shared",
  "nrr-storage",
+ "rusqlite",
  "serde_json",
  "tracing",
 ]
@@ -1008,6 +1009,7 @@ name = "nrr-platform-api"
 version = "0.1.0-prealpha"
 dependencies = [
  "getrandom 0.3.4",
+ "libc",
  "nrr-domain",
  "nrr-shared",
  "serde",
@@ -1025,7 +1027,9 @@ dependencies = [
  "nftables",
  "nrr-platform-api",
  "nrr-shared",
+ "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

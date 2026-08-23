@@ -51,6 +51,9 @@ nrr-diagnostics = { path = "../../diagnostics" }
 # The enforcement-mode enum the runtime deps carry (the daemon boots Reactive:
 # the local DNS resolver is a Windows mechanism today).
 nrr-domain = { path = "../../domain" }
+# The IPC provider bundle is assembled over the state database: every provider
+# behind the handler registry takes the same shared connection.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # The handshake payload is read to narrow the connection's client profile —
 # peer credentials name the user, not the program.
 serde_json = "1"

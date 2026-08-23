@@ -200,6 +200,14 @@ pub enum PreFlightCategory {
     RoutingConflict,
     /// Rules JSON failed to deserialise / interpret. Pre-flight blocker.
     InvalidRulesContent,
+    /// An application rule matched no executable, so it would be stored and
+    /// enforce nothing. Not a blocker — the rest of the revision is fine — but
+    /// the user asked for something that will not happen.
+    AppRuleUnenforceable,
+    /// The SID has a secondary (additional) route bound to an adapter the OS
+    /// cannot resolve. The revision applies, and its leak guard sits
+    /// fail-closed until the adapter comes back.
+    BindingUnresolved,
 }
 
 /// Returned by [`ActivationCoordinator::dry_run_apply`].

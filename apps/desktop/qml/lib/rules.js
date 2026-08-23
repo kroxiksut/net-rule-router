@@ -175,7 +175,7 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
         for (var b = 0; b < bucket.length; b += 1) lines.push(bucket[b])
         lines.push("")
     }
-    // Foreign-OS app rules and Pro-tier sections captured at the previous
+    // Foreign-OS app rules and unsupported sections captured at the previous
     // import ride through untouched. Section names are emitted alphabetically
     // so the output does not depend on object-key iteration order.
     if (passthroughSections) {
@@ -292,8 +292,14 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
             dto["address-match"] = { kind: "exact-ipv4", address: value }
             break
         case "application":
+            // A `*` makes it a pattern, exactly as the preset parser reads it.
+            // Emitting `exact` for `disko*.exe` stored a filename no process can
+            // ever have, so the rule matched nothing at all.
             dto["app-match"] = {
-                pattern: { kind: "exact", value: value },
+                pattern: {
+                    kind: value.indexOf("*") >= 0 ? "glob" : "exact",
+                    value: value
+                },
                 "include-child-processes": false
             }
             break

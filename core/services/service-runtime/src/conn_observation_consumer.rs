@@ -15,7 +15,7 @@
 //! so it is complete regardless of how the name was resolved.
 //!
 //! It is **observation only** — it never installs routes or filters. Per-process
-//! *enforcement* (acting on this) is the Pro experiment; the trace itself is a
+//! *enforcement* (acting on this) is out of scope here; the trace itself is a
 //! Free diagnostic.
 
 use std::collections::{HashSet, VecDeque};
@@ -30,7 +30,7 @@ use nrr_platform_api::conn_observe::{
     ConnectionObservation, ConnectionProgress, ConnectionVerdict, TransportProtocol,
 };
 use nrr_platform_api::fake_ip::stale_flows::StaleFlowReset;
-use nrr_platform_api::windows_api::WindowsApiPort;
+use nrr_platform_api::route_table::RouteTablePort;
 
 use crate::app_observation_lookup::AppObservationStore;
 use crate::dns_observation_consumer::ActiveSidFn;
@@ -55,6 +55,11 @@ pub struct ConnConsumeSummary {
     /// recorded this batch. `> 0` means an `Application` rule may now have new
     /// destinations to route, so the conn-observe task fires a recompute.
     pub app_ips_added: u32,
+    /// App-routing collateral — count of app→IP pairs WITHDRAWN this batch
+    /// because the host route they produced was carrying a process the rule
+    /// never named. `> 0` fires a recompute the same way a new pair does: the
+    /// `/32` has to come off promptly, not at the next apply.
+    pub app_ips_retracted: u32,
     /// Count of VPN bootstrap endpoints learned
     /// this batch: distinct remote IPs of flows that OUR kill-switch dropped
     /// from a process whose name matches a VPN-client pattern. `> 0` means the
@@ -289,7 +294,7 @@ pub fn proto_str(p: TransportProtocol) -> &'static str {
 /// [`crate::dns_observation_consumer::DnsObservationConsumer`] reads the active
 /// SID + rules per call.
 pub struct ConnectionObservationConsumer {
-    api: Arc<dyn WindowsApiPort>,
+    api: Arc<dyn RouteTablePort>,
     coordinator: Arc<SecondaryRouteCoordinator>,
     active_sid: ActiveSidFn,
     /// Whether to emit the per-connection detail line (process + remote IP +
@@ -302,6 +307,19 @@ pub struct ConnectionObservationConsumer {
     /// `Application` rule's traffic via the secondary adapter. `None` keeps the
     /// observer purely diagnostic.
     app_observations: Option<Arc<AppObservationStore>>,
+    /// Delete one remembered destination from the cross-session store. Wired
+    /// alongside `app_observations`: withdrawing a pair only in memory would
+    /// leave the persisted row to re-seed it at the next start, and the
+    /// collateral would come back with it. `None` keeps the withdrawal
+    /// in-memory (tests, degraded boot).
+    app_destination_forget: Option<AppDestinationForgetFn>,
+    /// Which applications a rule actually routes. Without it the collateral
+    /// check cannot tell a pin from an ordinary observation — the store holds
+    /// an entry for EVERY process, and withdrawing a "pin" from one no rule
+    /// names is a withdrawal of nothing. `None` disables the check entirely,
+    /// which is the safe direction: no false withdrawals.
+    routed_apps: Option<RoutedAppsFn>,
+
     /// When wired, every resolved trace is pushed into
     /// this ring so the Diagnostics panel can read recent connections over IPC.
     /// `None` keeps the observer log-only.
@@ -326,6 +344,12 @@ pub struct ConnectionObservationConsumer {
     /// `None` leaves every verified drop counted as destination-scoped, which
     /// is the conservative reading (it over-reports the actionable half).
     killswitch_app_scope_check: Option<KillswitchDropCheckFn>,
+    /// Classifier for the blanket IPv6 cut: `true` when the dropping filter is
+    /// one of the filters that close the v6 family while the protection is on.
+    /// Drives the notice wording only. `None` leaves such a drop reported as
+    /// whatever its spec id says, which is how it came to blame the user's
+    /// rules for a family the product closed on purpose.
+    ipv6_cut_drop_check: Option<KillswitchDropCheckFn>,
     /// Proactive VPN-client learning — when wired, the OBSERVED
     /// PROCESS PATH of every role-verified kill-switch drop from a VPN-named
     /// process is handed to this sink, which registers the client for an
@@ -364,6 +388,8 @@ pub struct ConnectionObservationConsumer {
     /// Addresses already reported this session. A page reconnects to the same
     /// host constantly; the ledger needs the fact once.
     companion_reported: Mutex<HashSet<std::net::Ipv4Addr>>,
+    /// Destinations already torn down once (see [`Self::note_torn_down`]).
+    torn_down_before: Mutex<HashSet<std::net::Ipv4Addr>>,
     /// Last time traffic left over the SECONDARY link, as a cheap proxy for
     /// "the user is on a routed site right now". Gates the reverse lookup
     /// below: without it every direct connection on an idle machine would
@@ -411,6 +437,58 @@ const MAX_STALE_FLOW_RESETS_PER_BATCH: usize = 64;
 /// learned server is exempted on the next recompute. `Send + Sync` so the
 /// consumer can live behind an `Arc` shared with the supervised task.
 pub type VpnEndpointLearnFn = Arc<dyn Fn(std::net::Ipv4Addr) + Send + Sync>;
+
+/// Delete one `(app, destination)` pair from the cross-session store, so a
+/// withdrawal survives the restart that would otherwise re-seed it.
+pub type AppDestinationForgetFn = Arc<dyn Fn(&str, std::net::Ipv4Addr) + Send + Sync>;
+
+/// The application patterns the rule book currently routes over the additional
+/// link. Read per batch: a rule edit must take effect without a restart.
+pub type RoutedAppsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// Which application rules' pins this observation proves to be collateral.
+///
+/// A host route cannot be scoped to a process, so a destination learned for one
+/// application moves every process that talks to it. Seeing a DIFFERENT process
+/// egress the additional link on such an address is that collateral caught in
+/// the act — no failure has to happen first, and waiting for one would mean
+/// waiting on a timeout that may never arrive.
+///
+/// `routed` is the rule book's application patterns, and it is what makes the
+/// answer mean anything. The observation store holds an entry for EVERY process
+/// the observer ever saw, so an "owner" that no rule names never had a pin to
+/// withdraw — a live run produced exactly that: `chrome.exe`, which no rule
+/// mentions, and `claude.exe.old.<stamp>`, an updater's leftover. Both sides are
+/// filtered: an intruder that is itself a routed application is no intruder
+/// either, because the route serves both of them the same way.
+///
+/// Nothing is returned unless all of it holds: the flow left over the additional
+/// link (on the main link no pin is in effect), the process is identified, it is
+/// not this service (the relay dials an application's destinations over the
+/// tunnel on its behalf, which is the mechanism working), the process is not
+/// itself a routed application, and the owner is one.
+fn collateral_pin_owners(
+    store: &AppObservationStore,
+    this_app: &str,
+    own_process_key: &str,
+    routed: &[String],
+    role: EgressRole,
+    ip: std::net::Ipv4Addr,
+) -> Vec<String> {
+    use crate::app_observation_lookup::pattern_matches;
+    if role != EgressRole::Secondary || this_app.is_empty() || this_app == own_process_key {
+        return Vec::new();
+    }
+    if routed.iter().any(|p| pattern_matches(p, this_app)) {
+        return Vec::new();
+    }
+    store
+        .apps_for_ip(ip)
+        .into_iter()
+        .filter(|owner| owner != this_app)
+        .filter(|owner| routed.iter().any(|p| pattern_matches(p, owner)))
+        .collect()
+}
 
 /// Proactive VPN-client learning — sink for the observed process
 /// path of a role-verified kill-switch drop from a VPN-named process. The
@@ -465,7 +543,7 @@ pub type BlockNoticeSinkFn = Arc<dyn Fn(&str, BlockAttempt) + Send + Sync>;
 
 impl ConnectionObservationConsumer {
     pub fn new(
-        api: Arc<dyn WindowsApiPort>,
+        api: Arc<dyn RouteTablePort>,
         coordinator: Arc<SecondaryRouteCoordinator>,
         active_sid: ActiveSidFn,
         log_ndjson: bool,
@@ -476,10 +554,13 @@ impl ConnectionObservationConsumer {
             active_sid,
             log_ndjson,
             app_observations: None,
+            app_destination_forget: None,
+            routed_apps: None,
             trace_ring: None,
             vpn_endpoint_learner: None,
             killswitch_drop_check: None,
             killswitch_app_scope_check: None,
+            ipv6_cut_drop_check: None,
             vpn_client_app_learner: None,
             reverse_dns_learner: None,
             drop_logged: Mutex::new(HashSet::new()),
@@ -487,6 +568,7 @@ impl ConnectionObservationConsumer {
             companion_in_use: None,
             companion_primary_health: None,
             companion_reported: Mutex::new(HashSet::new()),
+            torn_down_before: Mutex::new(HashSet::new()),
             last_secondary_at: Mutex::new(None),
             block_notice_name_for_address: None,
             block_notice_sink: None,
@@ -615,6 +697,27 @@ impl ConnectionObservationConsumer {
         sink(&hostname);
     }
 
+    /// Destinations whose flows this session already tore down once — the fact
+    /// that separates "socket older than the pin" from "the application holds a
+    /// pre-rule DNS answer". Bounded like every other per-session set here.
+    fn note_torn_down(&self, ip: std::net::Ipv4Addr) {
+        let mut seen = self
+            .torn_down_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if seen.len() >= COMPANION_REPORT_CAP {
+            seen.clear();
+        }
+        seen.insert(ip);
+    }
+
+    fn was_torn_down_before(&self, ip: std::net::Ipv4Addr) -> bool {
+        self.torn_down_before
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&ip)
+    }
+
     /// Did traffic leave over the secondary link recently enough that a direct
     /// connection now is plausibly part of the same page?
     fn beside_routed_traffic(&self) -> bool {
@@ -639,11 +742,22 @@ impl ConnectionObservationConsumer {
         let Some(sink) = self.block_notice_sink.as_ref() else {
             return;
         };
+        // Discovery, neighbour upkeep, address configuration: no site behind
+        // it and no rule the user could write about it. The drop still shows
+        // up in the trace line above — only the news is withheld.
+        if nrr_domain::address_class::classify(rec.remote.ip()).is_local_housekeeping() {
+            return;
+        }
+        let ipv6_cut = rec
+            .nrr_drop_spec_id
+            .zip(self.ipv6_cut_drop_check.as_ref())
+            .is_some_and(|(spec_id, check)| check(spec_id));
         let reason = block_reason_for(
             rec.nrr_drop_spec_id,
             killswitch_verified,
             default_block_id,
             self.fail_closed_armed.as_ref().is_some_and(|armed| armed()),
+            ipv6_cut,
         );
         let host = match rec.remote.ip() {
             IpAddr::V4(ip) => self
@@ -692,6 +806,11 @@ impl ConnectionObservationConsumer {
             Some(false) => "foreign",
             None => "unknown",
         };
+        // What the destination IS, when it is a well-known group rather than a
+        // site — the line for `ff02::fb` is unreadable without it.
+        let purpose =
+            nrr_domain::address_class::well_known_purpose(rec.remote.ip(), rec.remote.port())
+                .unwrap_or("");
         if first {
             tracing::info!(
                 target: "nrr::conn-trace",
@@ -700,6 +819,7 @@ impl ConnectionObservationConsumer {
                 protocol = proto_str(rec.protocol),
                 process = process,
                 blocked_by = owner,
+                purpose,
                 drop_filter_id = drop_filter_id.unwrap_or(0),
                 // The reason is decided from the SPEC id, not the runtime one:
                 // without it a line cannot tell "filter unidentified" from
@@ -714,6 +834,7 @@ impl ConnectionObservationConsumer {
                 remote_port = rec.remote.port(),
                 process = process,
                 blocked_by = owner,
+                purpose,
                 "observed blocked connection (repeat)",
             );
         }
@@ -755,6 +876,15 @@ impl ConnectionObservationConsumer {
         self
     }
 
+    /// Wire the IPv6-cut classifier (in production: the same registry's
+    /// `is_ipv6_cut`) so a drop of the closed family is announced as that,
+    /// with the switch that governs it, instead of as a rule the user would
+    /// search for in vain.
+    pub fn with_ipv6_cut_drop_check(mut self, check: KillswitchDropCheckFn) -> Self {
+        self.ipv6_cut_drop_check = Some(check);
+        self
+    }
+
     /// Wire the client-app sink
     /// so a role-verified kill-switch drop registers the CLIENT PROCESS for an
     /// app-scoped exemption (in addition to the per-IP endpoint learner).
@@ -770,6 +900,19 @@ impl ConnectionObservationConsumer {
     /// Without it the consumer stays diagnostic-only.
     pub fn with_app_observations(mut self, store: Arc<AppObservationStore>) -> Self {
         self.app_observations = Some(store);
+        self
+    }
+
+    /// Wire the cross-session delete used when a destination is withdrawn.
+    pub fn with_app_destination_forget(mut self, forget: AppDestinationForgetFn) -> Self {
+        self.app_destination_forget = Some(forget);
+        self
+    }
+
+    /// Wire the rule book's routed application patterns, which is what makes
+    /// the collateral check able to fire at all.
+    pub fn with_routed_apps(mut self, routed: RoutedAppsFn) -> Self {
+        self.routed_apps = Some(routed);
         self
     }
 
@@ -796,6 +939,13 @@ impl ConnectionObservationConsumer {
             unicast = build_unicast_table(&self.api.get_adapter_infos().unwrap_or_default());
         }
         let active_sid_now = (self.active_sid)();
+        // Once per batch: the collateral check consults it for every observation
+        // and a rule edit must land without a restart.
+        let routed_apps: Vec<String> = self
+            .routed_apps
+            .as_ref()
+            .map(|read| read())
+            .unwrap_or_default();
         let (primary_ifindex, secondary_ifindex) = match active_sid_now.as_deref() {
             Some(sid) => self.coordinator.resolve_egress_ifindexes(sid),
             None => (None, None),
@@ -1001,10 +1151,49 @@ impl ConnectionObservationConsumer {
             // App-routing via observation: record (app → remote IP)
             // so the codegen routes this app's destinations via the secondary on
             // the next apply. The store ignores unroutable IPs itself.
+            //
+            // Before recording, the reverse question: is this flow somebody
+            // ELSE riding a route an application rule installed? A host route
+            // cannot be scoped to a process, so an address learned for one
+            // application moves every process that talks to it — which is how a
+            // site the user put on the main link ended up inside the tunnel.
+            // A foreign process EGRESSING THE SECONDARY on such an address is
+            // that collateral, in the act; nothing else needs to go wrong first,
+            // and waiting for a failure would mean waiting for a timeout that
+            // may never come. The pin comes off and the owner does not relearn
+            // it this session.
             if let Some(store) = self.app_observations.as_ref() {
                 if let (Some(path), IpAddr::V4(rip)) =
                     (rec.process_path.as_deref(), rec.remote.ip())
                 {
+                    let this_app = crate::app_observation_lookup::app_key(path);
+                    for owner in collateral_pin_owners(
+                        store,
+                        &this_app,
+                        crate::app_observation_lookup::own_process_key(),
+                        &routed_apps,
+                        rec.egress.role,
+                        rip,
+                    ) {
+                        if store.retract(&owner, rip) {
+                            summary.app_ips_retracted += 1;
+                            if let Some(forget) = self.app_destination_forget.as_ref() {
+                                forget(&owner, rip);
+                            }
+                            tracing::info!(
+                                target: "nrr::conn-trace",
+                                owner = %owner,
+                                intruder = %this_app,
+                                destination = %rip,
+                                "withdrew a destination an application rule had pinned: another process was travelling the additional link on it, and a host route cannot tell the two apart. That address goes back to the main link for everyone, this application included",
+                            );
+                        }
+                    }
+                    // Evidence first, claim second: the census must see this
+                    // process before the rule set is compiled against it, or a
+                    // destination could be pinned in the same tick that proved
+                    // somebody else was already using it.
+                    store.note_process_destination(path, rip);
                     if store.record(path, rip) {
                         summary.app_ips_added += 1;
                     }
@@ -1066,16 +1255,38 @@ impl ConnectionObservationConsumer {
         let dest_scope = summary.killswitch_drops_live_secondary_dest_scope();
         if dest_scope > 0 {
             let sample = dest_scope_sample.unwrap_or_default();
-            tracing::warn!(
-                target: "nrr::conn-trace",
-                count = dest_scope,
-                app_scoped = summary.killswitch_drops_live_secondary_app_scope,
-                filter_id = sample.filter_id,
-                spec_id = sample.spec_id,
-                process = sample.process.as_str(),
-                remote = %sample.remote,
-                "a destination pin dropped connections while the secondary was resolved and USABLE — the usual cause is a socket older than the pin, kept on the wrong interface for life, which the teardown below repairs. Counts that stay nonzero after the teardown mean the blocking scope is wider than the outage, i.e. a scope bug. The sampled filter/spec/process/remote is one concrete victim of this batch",
-            );
+            // Two different faults produce this same count, and saying only the
+            // first one sent a live diagnosis down the wrong path: a socket
+            // OLDER than the pin (torn down below, gone next batch) versus an
+            // application that keeps dialling the pinned address because it
+            // still holds the pre-rule DNS answer — that one survives the
+            // teardown and needs a re-query, not a reset. Which one it is shows
+            // in whether we already tore this destination down.
+            let repeat = stale_flow_victims
+                .iter()
+                .any(|ip| self.was_torn_down_before(*ip));
+            if repeat {
+                tracing::warn!(
+                    target: "nrr::conn-trace",
+                    count = dest_scope,
+                    filter_id = sample.filter_id,
+                    spec_id = sample.spec_id,
+                    process = sample.process.as_str(),
+                    remote = %sample.remote,
+                    "a destination pin is still dropping connections we already tore down — the application is dialling the address it was answered with BEFORE the rule existed, so no reset can fix it; it needs a fresh lookup (the OS resolver cache is flushed on a rule change) or the pin has no working path at all",
+                );
+            } else {
+                tracing::warn!(
+                    target: "nrr::conn-trace",
+                    count = dest_scope,
+                    app_scoped = summary.killswitch_drops_live_secondary_app_scope,
+                    filter_id = sample.filter_id,
+                    spec_id = sample.spec_id,
+                    process = sample.process.as_str(),
+                    remote = %sample.remote,
+                    "a destination pin dropped connections while the secondary was resolved and USABLE — a socket older than the pin, kept on the wrong interface for life, which the teardown below repairs. The sampled filter/spec/process/remote is one concrete victim of this batch",
+                );
+            }
         }
         // The socket predates the pin and can never reach the tunnel; tearing it
         // down is what makes the application reconnect onto the route.
@@ -1083,6 +1294,7 @@ impl ConnectionObservationConsumer {
             let mut torn_down = 0usize;
             for ip in &stale_flow_victims {
                 torn_down = torn_down.saturating_add(reset.reset_flows_to(*ip, 32).torn_down);
+                self.note_torn_down(*ip);
             }
             if torn_down > 0 {
                 tracing::info!(
@@ -1149,12 +1361,19 @@ fn block_reason_for(
     killswitch_verified: bool,
     default_block_id: Option<u64>,
     fail_closed_armed: bool,
+    ipv6_cut: bool,
 ) -> BlockReason {
     if killswitch_verified {
         return BlockReason::RouteUnavailable;
     }
     if spec_id.is_some() && spec_id == default_block_id {
         return BlockReason::NotCoveredByRules;
+    }
+    // Before the fail-closed reading: while the block-all is armed the v6 cut
+    // rides along with it, and "IPv6 is closed" is the cause the user can act
+    // on — the outage is already announced by its own notice.
+    if ipv6_cut {
+        return BlockReason::Ipv6Blocked;
     }
     if fail_closed_armed {
         return BlockReason::RouteUnavailable;
@@ -1256,6 +1475,178 @@ mod tests {
         }
     }
 
+    // ── App-pin collateral detection ────────────────────────────────────────
+
+    /// The rule book routes this one application over the additional link.
+    fn routed() -> Vec<String> {
+        vec!["assistant.exe".to_string()]
+    }
+
+    fn pinned_store() -> AppObservationStore {
+        let store = AppObservationStore::new();
+        store.record("assistant.exe", Ipv4Addr::new(178, 248, 237, 68));
+        store
+    }
+
+    fn owners_for(
+        store: &AppObservationStore,
+        this_app: &str,
+        routed_apps: &[String],
+        role: EgressRole,
+        ip: Ipv4Addr,
+    ) -> Vec<String> {
+        collateral_pin_owners(store, this_app, "nrr-service.exe", routed_apps, role, ip)
+    }
+
+    #[test]
+    fn a_foreign_process_on_the_tunnel_names_the_pin_that_moved_it() {
+        let owners = owners_for(
+            &pinned_store(),
+            "chrome.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(178, 248, 237, 68),
+        );
+        assert_eq!(owners, vec!["assistant.exe".to_string()]);
+    }
+
+    /// Regression from a live run: the store holds an entry for EVERY process,
+    /// so `chrome.exe` — which no rule names — was reported as the owner of a
+    /// pin it never had, and the log claimed a rule had pinned the address.
+    #[test]
+    fn a_process_no_rule_names_never_owns_a_pin() {
+        let store = AppObservationStore::new();
+        store.record("chrome.exe", Ipv4Addr::new(209, 85, 233, 188));
+        let owners = owners_for(
+            &store,
+            "assistant.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(209, 85, 233, 188),
+        );
+        assert!(owners.is_empty(), "{owners:?}");
+    }
+
+    /// The same run also withdrew from `claude.exe.old.<stamp>` — an updater's
+    /// leftover, with the real application as the supposed intruder.
+    #[test]
+    fn an_updaters_leftover_binary_is_not_an_owner() {
+        let store = AppObservationStore::new();
+        store.record(
+            "assistant.exe.old.1787377508929",
+            Ipv4Addr::new(34, 149, 66, 165),
+        );
+        let owners = owners_for(
+            &store,
+            "assistant.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(34, 149, 66, 165),
+        );
+        assert!(owners.is_empty(), "{owners:?}");
+    }
+
+    #[test]
+    fn one_routed_application_is_not_an_intruder_on_another() {
+        // Both want the tunnel and the route serves them identically.
+        let store = AppObservationStore::new();
+        store.record("assistant.exe", Ipv4Addr::new(178, 248, 237, 68));
+        let both = vec!["assistant.exe".to_string(), "helper.exe".to_string()];
+        let owners = owners_for(
+            &store,
+            "helper.exe",
+            &both,
+            EgressRole::Secondary,
+            Ipv4Addr::new(178, 248, 237, 68),
+        );
+        assert!(owners.is_empty(), "{owners:?}");
+    }
+
+    #[test]
+    fn a_glob_rule_covers_the_processes_it_names() {
+        let store = AppObservationStore::new();
+        store.record("codex-helper.exe", Ipv4Addr::new(178, 248, 237, 68));
+        let routed = vec!["codex*.exe".to_string()];
+        // Owner matches the glob → a real pin, and chrome is a real intruder.
+        assert_eq!(
+            owners_for(
+                &store,
+                "chrome.exe",
+                &routed,
+                EgressRole::Secondary,
+                Ipv4Addr::new(178, 248, 237, 68)
+            ),
+            vec!["codex-helper.exe".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_owning_application_using_its_own_pin_is_not_collateral() {
+        let owners = owners_for(
+            &pinned_store(),
+            "assistant.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(178, 248, 237, 68),
+        );
+        assert!(owners.is_empty());
+    }
+
+    #[test]
+    fn the_relays_own_dials_are_never_collateral() {
+        // The service connects to an application's destinations over the tunnel
+        // on its behalf; mistaking that for an intruder would withdraw every
+        // pin the moment it started working.
+        let owners = owners_for(
+            &pinned_store(),
+            "nrr-service.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(178, 248, 237, 68),
+        );
+        assert!(owners.is_empty());
+    }
+
+    #[test]
+    fn the_same_flow_over_the_main_link_proves_nothing() {
+        // No pin is in effect there, so there is nothing to withdraw.
+        for role in [EgressRole::Primary, EgressRole::Unknown, EgressRole::Other] {
+            let owners = owners_for(
+                &pinned_store(),
+                "chrome.exe",
+                &routed(),
+                role,
+                Ipv4Addr::new(178, 248, 237, 68),
+            );
+            assert!(owners.is_empty(), "{role:?}");
+        }
+    }
+
+    #[test]
+    fn an_address_no_application_rule_pinned_is_left_alone() {
+        let owners = owners_for(
+            &pinned_store(),
+            "chrome.exe",
+            &routed(),
+            EgressRole::Secondary,
+            Ipv4Addr::new(93, 184, 216, 34),
+        );
+        assert!(owners.is_empty());
+    }
+
+    #[test]
+    fn without_a_rule_book_the_check_stays_silent() {
+        // `None` provider → empty slice → no withdrawal is ever proposed.
+        let owners = owners_for(
+            &pinned_store(),
+            "chrome.exe",
+            &[],
+            EgressRole::Secondary,
+            Ipv4Addr::new(178, 248, 237, 68),
+        );
+        assert!(owners.is_empty());
+    }
+
     // ── Reactive VPN self-learning: consume()-level gate tests ──────────────
 
     /// `RoutePolicySource` that never resolves a policy — sufficient here
@@ -1303,7 +1694,7 @@ mod tests {
         ConnectionObservationConsumer,
         Arc<Mutex<Vec<std::net::Ipv4Addr>>>,
     ) {
-        let api: Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
+        let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> =
             Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new());
         let coordinator = Arc::new(SecondaryRouteCoordinator::new(
             Arc::clone(&api),
@@ -1475,6 +1866,11 @@ mod tests {
                 doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
                 doh_resolver_ips: Vec::new(),
                 auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
+                primary_probe_auto: false,
+                primary_probe_timeout_ms: 1500,
+                primary_probe_max_targets: 8,
+                primary_probe_repeat_secs: 300,
+                block_ipv6_when_protected: true,
             })
         }
     }
@@ -1497,7 +1893,7 @@ mod tests {
         };
         let stable_id = vpn.stable_id();
         mock.set_adapter_infos(vec![vpn]);
-        let api: Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> = Arc::new(mock);
+        let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> = Arc::new(mock);
         let coordinator = Arc::new(SecondaryRouteCoordinator::new(
             Arc::clone(&api),
             Arc::new(crate::per_sid_orchestrator::NoopRulesProvider)
@@ -1781,34 +2177,49 @@ mod tests {
     fn block_reason_prefers_killswitch_then_default_block_then_falls_back_to_rule() {
         // Role-verified kill-switch/fail-closed drop → the route is down.
         assert_eq!(
-            block_reason_for(Some(1), true, Some(99), false),
+            block_reason_for(Some(1), true, Some(99), false, false),
             BlockReason::RouteUnavailable
         );
         // Not kill-switch, but matches the deterministic default-block-all id
         // → nothing routed this destination.
         assert_eq!(
-            block_reason_for(Some(99), false, Some(99), false),
+            block_reason_for(Some(99), false, Some(99), false, false),
             BlockReason::NotCoveredByRules
         );
         // Neither → the only remaining production source is an explicit rule.
         assert_eq!(
-            block_reason_for(Some(5), false, Some(99), false),
+            block_reason_for(Some(5), false, Some(99), false, false),
             BlockReason::BlockedByRule
         );
         // No active SID this batch (default id unknown) → same cautious default.
         assert_eq!(
-            block_reason_for(Some(5), false, None, false),
+            block_reason_for(Some(5), false, None, false, false),
             BlockReason::BlockedByRule
         );
         // Unidentified filter: ours, but which one is unknown — say only that.
         assert_eq!(
-            block_reason_for(None, false, Some(99), false),
+            block_reason_for(None, false, Some(99), false, false),
             BlockReason::Unattributed
         );
         // The fail-closed window still outranks it: there the cause is known.
         assert_eq!(
-            block_reason_for(None, false, Some(99), true),
+            block_reason_for(None, false, Some(99), true, false),
             BlockReason::RouteUnavailable
+        );
+    }
+
+    #[test]
+    fn a_drop_of_the_closed_ipv6_family_names_the_family_not_a_rule() {
+        // The v6 cut is an identified filter of ours that no rule can explain.
+        assert_eq!(
+            block_reason_for(Some(5), false, Some(99), false, true),
+            BlockReason::Ipv6Blocked
+        );
+        // Even while the block-all is armed: the outage has its own notice,
+        // and the switch that closed v6 is what the user can act on here.
+        assert_eq!(
+            block_reason_for(Some(5), false, Some(99), true, true),
+            BlockReason::Ipv6Blocked
         );
     }
 
@@ -1818,13 +2229,13 @@ mod tests {
         // outside the current kill-switch registry (a fake-address block).
         // Calling that "a rule blocked you" sends the user editing rules.
         assert_eq!(
-            block_reason_for(Some(5), false, Some(99), true),
+            block_reason_for(Some(5), false, Some(99), true, false),
             BlockReason::RouteUnavailable
         );
         // "No rule covers this host" is still the more specific answer and keeps
         // precedence over the posture.
         assert_eq!(
-            block_reason_for(Some(99), false, Some(99), true),
+            block_reason_for(Some(99), false, Some(99), true, false),
             BlockReason::NotCoveredByRules
         );
     }
@@ -1860,7 +2271,7 @@ mod tests {
         ConnectionObservationConsumer,
         Arc<Mutex<Vec<nrr_domain::block_notice::BlockNotice>>>,
     ) {
-        let api: Arc<dyn nrr_platform_api::windows_api::WindowsApiPort> =
+        let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> =
             Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new());
         let coordinator = Arc::new(SecondaryRouteCoordinator::new(
             Arc::clone(&api),
@@ -1931,6 +2342,42 @@ mod tests {
         assert_eq!(got[0].reason, BlockReason::RouteUnavailable);
         assert_eq!(got[0].destination, "203.0.113.9");
         assert_eq!(got[0].app, "telegram.exe");
+    }
+
+    #[test]
+    fn housekeeping_destinations_never_produce_a_block_notice() {
+        // The field case: mDNS, MLD and a BitTorrent discovery group made up
+        // 1400 of 1420 blocked v6 destinations in one session. None of them is
+        // a site, and none of them is a rule the user could edit.
+        for dest in [
+            "ff02::fb",
+            "ff02::16",
+            "ff15::efc0:988f",
+            "224.0.0.251",
+            "255.255.255.255",
+        ] {
+            let (consumer, notices) = block_notice_consumer(None);
+            let mut obs = block_obs(Some(true), Some(42));
+            obs.remote = SocketAddr::new(dest.parse().expect("address literal"), 5353);
+            consumer.consume(&[obs], SystemTime::now());
+            assert!(
+                notices.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+                "{dest} must not raise a notice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cut_ipv6_destination_is_announced_as_the_closed_family() {
+        let (mut consumer, notices) = block_notice_consumer(None);
+        consumer = consumer.with_ipv6_cut_drop_check(Arc::new(|id| id == 42));
+        let mut obs = block_obs(Some(true), Some(42));
+        obs.remote = SocketAddr::new("2606:4700::1111".parse().expect("v6"), 443);
+        consumer.consume(&[obs], SystemTime::now());
+
+        let got = notices.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].reason, BlockReason::Ipv6Blocked);
     }
 
     #[test]

@@ -31,15 +31,16 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::core::{GUID, PWSTR};
 use windows::Win32::Foundation::{LocalFree, HANDLE, HLOCAL};
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
-    FwpmEngineClose0, FwpmEngineOpen0, FwpmEngineSetOption0, FwpmFilterGetById0, FwpmFreeMemory0,
-    FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0, FWPM_ENGINE_COLLECT_NET_EVENTS,
-    FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0, FWPM_NET_EVENT2,
-    FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW, FWPM_NET_EVENT_SUBSCRIPTION0,
+    FwpmEngineClose0, FwpmEngineGetOption0, FwpmEngineOpen0, FwpmEngineSetOption0,
+    FwpmFilterGetById0, FwpmFreeMemory0, FwpmNetEventSubscribe1, FwpmNetEventUnsubscribe0,
+    FWPM_ENGINE_COLLECT_NET_EVENTS, FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS, FWPM_FILTER0,
+    FWPM_NET_EVENT2, FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW, FWPM_NET_EVENT_SUBSCRIPTION0,
     FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW, FWPM_NET_EVENT_TYPE_CLASSIFY_DROP, FWP_IP_VERSION_V4,
     FWP_IP_VERSION_V6, FWP_UINT32, FWP_VALUE0, FWP_VALUE0_0,
 };
@@ -62,6 +63,142 @@ const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
 
 type Buffer = Arc<Mutex<Vec<ConnectionObservation>>>;
+
+/// The machine-wide engine options this process changed, as they were before.
+/// Kept outside the observer because putting them back must not depend on who
+/// still holds an `Arc` to it at exit: `Drop` on a source the consumer threads
+/// still reference never runs, and the setting would outlive the service.
+static PRIOR_ENGINE_OPTIONS: OnceLock<(Option<u32>, Option<u32>)> = OnceLock::new();
+/// One restore per process, whoever gets there first.
+static ENGINE_OPTIONS_RESTORED: AtomicBool = AtomicBool::new(false);
+
+/// File name of the note left beside the filter ledger recording what the
+/// engine options held before this process changed them.
+///
+/// A process that is killed rather than stopped never runs its restore, and the
+/// next one cannot know what to put back — the previous value lives only in the
+/// memory that just died. Writing it down is what lets `cleanup` and the
+/// uninstall sweep undo a change made by an instance that is long gone.
+const PRIOR_OPTIONS_FILE: &str = "wfp-engine-options.prior";
+
+fn prior_options_path() -> Option<std::path::PathBuf> {
+    nrr_platform_api::paths::production_data_root().map(|root| root.join(PRIOR_OPTIONS_FILE))
+}
+
+/// Remember, on disk, what the options held before we touched them.
+fn write_prior_options_note(prior: (Option<u32>, Option<u32>)) {
+    let Some(path) = prior_options_path() else {
+        return;
+    };
+    let mut body = String::new();
+    if let Some(v) = prior.0 {
+        body.push_str(&format!("collect={v}\n"));
+    }
+    if let Some(v) = prior.1 {
+        body.push_str(&format!("keywords={v}\n"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!(
+            target: "nrr::conn-observe",
+            error = %e,
+            "could not record the previous WFP engine options; a hard kill would leave them changed",
+        );
+    }
+}
+
+/// Read back a note a previous instance left. `None` when there is none.
+fn read_prior_options_note() -> Option<(Option<u32>, Option<u32>)> {
+    let text = std::fs::read_to_string(prior_options_path()?).ok()?;
+    let mut prior = (None, None);
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Ok(parsed) = value.trim().parse::<u32>() else {
+            continue;
+        };
+        match key.trim() {
+            "collect" => prior.0 = Some(parsed),
+            "keywords" => prior.1 = Some(parsed),
+            _ => {}
+        }
+    }
+    (prior != (None, None)).then_some(prior)
+}
+
+fn clear_prior_options_note() {
+    if let Some(path) = prior_options_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Hand the machine-wide Base Filtering Engine options this process changed
+/// back to their previous values.
+///
+/// Call it on the service's stop path: leaving `COLLECT_NET_EVENTS` on makes
+/// BFE go on recording every classify for every process on the host, for as
+/// long as Windows runs, with nobody left to consume the events. Safe to call
+/// repeatedly and from a path that owns no observer — it opens its own
+/// short-lived engine handle. A no-op when nothing was changed.
+pub fn restore_engine_options() {
+    // This process's own change if it made one; otherwise the note a previous
+    // instance left before it was killed. The second case is the whole point:
+    // `cleanup` and the uninstall sweep run in a fresh process that changed
+    // nothing and would otherwise have nothing to put back.
+    let prior = PRIOR_ENGINE_OPTIONS
+        .get()
+        .copied()
+        .filter(|p| *p != (None, None))
+        .or_else(read_prior_options_note);
+    let Some(prior) = prior else {
+        return;
+    };
+    if ENGINE_OPTIONS_RESTORED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut engine = HANDLE::default();
+    // SAFETY: same open as `start`; the handle is closed below on every path.
+    let code = unsafe {
+        FwpmEngineOpen0(
+            windows::core::PCWSTR(std::ptr::null()),
+            RPC_C_AUTHN_WINNT,
+            None,
+            None,
+            &mut engine,
+        )
+    };
+    if code != 0 {
+        tracing::warn!(
+            target: "nrr::conn-observe",
+            code,
+            "could not reopen WFP to hand the machine-wide net-event options back",
+        );
+        return;
+    }
+    // SAFETY: `engine` is the handle just opened and is closed right after.
+    unsafe {
+        restore_engine_options_with(engine, prior);
+        let _ = FwpmEngineClose0(engine);
+    }
+    clear_prior_options_note();
+}
+
+/// Put both options back over an already-open engine handle.
+///
+/// # Safety
+/// `engine` must be an open WFP management handle.
+unsafe fn restore_engine_options_with(engine: HANDLE, prior: (Option<u32>, Option<u32>)) {
+    restore_uint32_option(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, prior.0, 1);
+    restore_uint32_option(
+        engine,
+        FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
+        prior.1,
+        FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
+    );
+}
 
 /// A running WFP net-event subscription. Events arrive on WFP's own threads
 /// into [`Self`]'s buffer; [`ConnectionObservationSource::drain`] empties it.
@@ -138,19 +275,29 @@ impl WfpConnectionObserver {
         }
 
         // ── Enable net-event collection + ask for CLASSIFY_ALLOW events. ──
+        // Both are MACHINE-WIDE and outlive this process inside the Base
+        // Filtering Engine: collection makes BFE record every classify for
+        // every process on the host. Read first, so teardown can hand the
+        // machine back the way it was found.
         // SAFETY: each call passes a stack `FWP_VALUE0` (UINT32) by const ptr,
         // valid for the call; `engine` is the just-opened handle.
-        let opt1 = unsafe { set_uint32_option(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, 1) };
-        let opt2 = unsafe {
-            set_uint32_option(
+        let (prior_collect, opt1) =
+            unsafe { set_uint32_option_restorable(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, 1) };
+        let (prior_keywords, opt2) = unsafe {
+            set_uint32_option_restorable(
                 engine,
                 FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
                 FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
             )
         };
+        let _ = PRIOR_ENGINE_OPTIONS.set((prior_collect, prior_keywords));
+        if (prior_collect, prior_keywords) != (None, None) {
+            write_prior_options_note((prior_collect, prior_keywords));
+        }
         if opt1 != 0 || opt2 != 0 {
-            // SAFETY: `engine` is open and consumed by this close.
+            // SAFETY: `engine` is open; undo whatever did take, then close.
             unsafe {
+                restore_engine_options_with(engine, (prior_collect, prior_keywords));
                 let _ = FwpmEngineClose0(engine);
             }
             let code = if opt1 != 0 { opt1 } else { opt2 };
@@ -184,12 +331,13 @@ impl WfpConnectionObserver {
             )
         };
         if sub != 0 {
-            // SAFETY: reclaim the leaked Arc ref and close the engine; nothing
-            // else holds either.
+            // SAFETY: reclaim the leaked Arc ref, put the machine-wide options
+            // back and close the engine; nothing else holds either.
             unsafe {
                 drop(Arc::from_raw(
                     ctx as *const Mutex<Vec<ConnectionObservation>>,
                 ));
+                restore_engine_options_with(engine, (prior_collect, prior_keywords));
                 let _ = FwpmEngineClose0(engine);
             }
             return Err(PlatformError::Win32 {
@@ -257,10 +405,22 @@ impl Drop for WfpConnectionObserver {
     fn drop(&mut self) {
         let engine = HANDLE(self.engine_raw as usize as *mut c_void);
         let events = HANDLE(self.events_raw as usize as *mut c_void);
-        // SAFETY: both handles came from successful opens in `start`; we
-        // unsubscribe before closing the engine, then reclaim the leaked Arc.
+        // Order is load-bearing: stop the callback first, so no event arrives
+        // against a half-torn-down subscription; hand the machine-wide options
+        // back while there is still a handle to hand them back WITH; close
+        // last. Closing first would leave BFE recording every classify on the
+        // host for as long as it runs.
+        // SAFETY: both handles came from successful opens in `start`; the Arc
+        // ref reclaimed last was leaked exactly once, there.
+        let prior = PRIOR_ENGINE_OPTIONS.get().copied().unwrap_or((None, None));
+        let restore_here =
+            prior != (None, None) && !ENGINE_OPTIONS_RESTORED.swap(true, Ordering::AcqRel);
         unsafe {
             let _ = FwpmNetEventUnsubscribe0(engine, events);
+            if restore_here {
+                restore_engine_options_with(engine, prior);
+                clear_prior_options_note();
+            }
             let _ = FwpmEngineClose0(engine);
             drop(Arc::from_raw(
                 self.ctx as *const Mutex<Vec<ConnectionObservation>>,
@@ -283,6 +443,81 @@ unsafe fn set_uint32_option(
         Anonymous: FWP_VALUE0_0 { uint32: value },
     };
     FwpmEngineSetOption0(engine, option, &v)
+}
+
+/// Read a UINT32 engine option. `None` when the call fails or the engine
+/// answers with another type - an unreadable option is one we must not pretend
+/// to know the previous value of.
+///
+/// # Safety
+/// `engine` must be an open WFP management handle.
+unsafe fn get_uint32_option(
+    engine: HANDLE,
+    option: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ENGINE_OPTION,
+) -> Option<u32> {
+    let mut value: *mut FWP_VALUE0 = std::ptr::null_mut();
+    if FwpmEngineGetOption0(engine, option, &mut value) != 0 || value.is_null() {
+        return None;
+    }
+    let read = if (*value).r#type == FWP_UINT32 {
+        Some((*value).Anonymous.uint32)
+    } else {
+        None
+    };
+    FwpmFreeMemory0(&mut (value as *mut c_void));
+    read
+}
+
+/// Set a UINT32 engine option and report what it held before, so the change can
+/// be undone. A previous value comes back only when it differs from `value` and
+/// the write succeeded: there is nothing to restore when the option already
+/// held what we need, and claiming otherwise would have us switch collection
+/// off under a product that switched it on.
+///
+/// # Safety
+/// `engine` must be an open WFP management handle.
+unsafe fn set_uint32_option_restorable(
+    engine: HANDLE,
+    option: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ENGINE_OPTION,
+    value: u32,
+) -> (Option<u32>, u32) {
+    let prior = get_uint32_option(engine, option);
+    if prior == Some(value) {
+        return (None, 0);
+    }
+    let code = set_uint32_option(engine, option, value);
+    if code != 0 {
+        return (None, code);
+    }
+    (prior, 0)
+}
+
+/// Put a machine-wide engine option back, but only while it still holds the
+/// value this process wrote: something else may have taken it over since, and
+/// overwriting that would break a component we know nothing about.
+///
+/// # Safety
+/// `engine` must be an open WFP management handle.
+unsafe fn restore_uint32_option(
+    engine: HANDLE,
+    option: windows::Win32::NetworkManagement::WindowsFilteringPlatform::FWPM_ENGINE_OPTION,
+    prior: Option<u32>,
+    written: u32,
+) {
+    let Some(prior) = prior else {
+        return;
+    };
+    if get_uint32_option(engine, option) != Some(written) {
+        return;
+    }
+    let code = set_uint32_option(engine, option, prior);
+    if code != 0 {
+        tracing::warn!(
+            target: "nrr::conn-observe",
+            code,
+            "could not hand a machine-wide WFP engine option back to its previous value",
+        );
+    }
 }
 
 /// C-ABI WFP net-event callback. Maps a classified connection (IPv4 or IPv6)

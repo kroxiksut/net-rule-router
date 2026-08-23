@@ -91,6 +91,27 @@ impl<'c> AppDestinationsRepository<'c> {
     /// while a later re-confirmation can still revive the row in one write.
     ///
     /// A row whose `ip` fails to parse is skipped rather than failing the whole
+    /// Drop one remembered destination for `app_key`.
+    ///
+    /// The upsert path is additive, so an address the in-memory set has stopped
+    /// carrying would linger here until it aged out of the reader's freshness
+    /// window — long enough for the next start to re-seed it and re-install the
+    /// host route it produced. A destination withdrawn because it was moving
+    /// somebody ELSE's traffic has to leave immediately, hence this explicit
+    /// delete. Idempotent: removing what is not there is not an error.
+    pub fn forget(&self, app_key: &str, ip: Ipv4Addr) -> StorageResult<bool> {
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM app_observed_destinations WHERE app_key = ?1 AND ip = ?2",
+                params![app_key, ip.to_string()],
+            )
+            .map_err(|e| {
+                StorageError::Internal(format!("app_observed_destinations delete: {e}"))
+            })?;
+        Ok(removed > 0)
+    }
+
     /// load — a can't-happen guard against a hand-edited database (this module
     /// only ever writes `Ipv4Addr::to_string`).
     pub fn load_confirmed_since(
@@ -154,6 +175,20 @@ mod tests {
 
     fn ip(d: u8) -> Ipv4Addr {
         Ipv4Addr::new(203, 0, 113, d)
+    }
+
+    #[test]
+    fn forget_removes_one_destination_and_is_idempotent() {
+        let conn = migrated_conn();
+        let repo = AppDestinationsRepository::new(&conn);
+        repo.upsert("telegram.exe", &[ip(1), ip(2)], 1_000)
+            .expect("upsert");
+
+        assert!(repo.forget("telegram.exe", ip(1)).expect("forget"));
+        assert!(!repo.forget("telegram.exe", ip(1)).expect("forget again"));
+
+        let loaded = repo.load_confirmed_since(0).expect("load");
+        assert_eq!(loaded, vec![("telegram.exe".to_string(), ip(2))]);
     }
 
     #[test]

@@ -143,6 +143,20 @@ mod windows_impl {
     const FS_WALK_MAX_DEPTH: u32 = 4;
     const FS_WALK_MAX_FILES: u32 = 4000;
 
+    /// Store-package walk limits.
+    ///
+    /// Depth 2 on purpose: a package is `WindowsApps\<Name>_<ver>_<arch>__<hash>`
+    /// and MSIX puts executables at the package root or one directory below it
+    /// (`…\app\Foo.exe`), which is where depth 2 reaches. Going deeper would
+    /// spend the budget on asset trees that hold no `.exe` we could ever match,
+    /// and an app that hides its binary deeper is still found the moment it
+    /// runs — the process source covers it.
+    const PACKAGED_WALK_MAX_DEPTH: u32 = 2;
+    /// A machine can carry hundreds of packages, so this budget is much larger
+    /// than the Program-Files one AND separate from it: sharing would let
+    /// whichever ran first starve the other.
+    const PACKAGED_WALK_MAX_FILES: u32 = 20_000;
+
     /// Windows [`AppPathResolver`]: unions three sources (App Paths registry,
     /// running-process images, Program Files walk), case-insensitively dedups,
     /// keeps only existing exe files, and caches the result briefly.
@@ -186,7 +200,7 @@ mod windows_impl {
         }
     }
 
-    /// Union all three sources for `key` (already trimmed + lowercased).
+    /// Union all four sources for `key` (already trimmed + lowercased).
     fn resolve_uncached(key: &str) -> Vec<PathBuf> {
         let is_glob = key.contains('*') || key.contains('?');
 
@@ -200,6 +214,14 @@ mod windows_impl {
         // never see, and a glob is meant to catch every such install.
         if is_glob || out.is_empty() {
             out.extend(resolve_from_program_files(key));
+        }
+        // Store-installed software is invisible to the three sources above: it
+        // registers no `App Paths` entry and lives outside every ordinary
+        // install root. Without this, a rule naming such an application does
+        // nothing until the application happens to be running — which is
+        // exactly when it is too late to have its filter already in place.
+        if is_glob || out.is_empty() {
+            out.extend(resolve_from_packaged_apps(key));
         }
 
         // The port contract is "concrete, existing exe file paths": a stale App
@@ -523,6 +545,40 @@ mod windows_impl {
         out
     }
 
+    // ── Source 4: bounded Store-package walk ──────────────────────────────────
+
+    /// Walk `%ProgramFiles%\WindowsApps` for `*.exe` matching `query`.
+    ///
+    /// The directory is ACL-locked to TrustedInstaller, SYSTEM and the package
+    /// SIDs — the service runs as LocalSystem and can read it; anything else
+    /// gets an unreadable-directory skip and this source contributes nothing.
+    /// That degradation is silent by design: it is the ordinary case for every
+    /// caller that is not the service.
+    fn resolve_from_packaged_apps(query: &str) -> Vec<PathBuf> {
+        let Ok(program_files) = std::env::var("ProgramFiles") else {
+            return Vec::new();
+        };
+        if program_files.is_empty() {
+            return Vec::new();
+        }
+        let root = PathBuf::from(program_files).join("WindowsApps");
+        let mut out = Vec::new();
+        let mut budget = PACKAGED_WALK_MAX_FILES;
+        walk_dir_bounded(&root, query, PACKAGED_WALK_MAX_DEPTH, &mut budget, &mut out);
+        if budget == 0 {
+            // Truncation must not look like absence: a rule that quietly stops
+            // covering an application is the kind of thing nobody notices until
+            // traffic goes the wrong way.
+            tracing::warn!(
+                target: "nrr::app_path_resolver",
+                query,
+                files = PACKAGED_WALK_MAX_FILES,
+                "Store-package search hit its file budget — an application installed from the Store may be missed until it runs",
+            );
+        }
+        out
+    }
+
     fn walk_dir_bounded(
         dir: &Path,
         query: &str,
@@ -576,6 +632,98 @@ mod windows_impl {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Build a fake `WindowsApps` tree and return its root.
+        fn packaged_tree() -> tempfile::TempDir {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            // The shape MSIX actually uses: a versioned package directory with
+            // the executable either at its root or one level below.
+            for (sub, name) in [
+                ("Vendor.AtRoot_1.0.0.0_x64__abc/", "target.exe"),
+                ("Vendor.OneDown_1.0.0.0_x64__abc/app", "target.exe"),
+                ("Vendor.OneDown_1.0.0.0_x64__abc/app", "unrelated.exe"),
+                ("Vendor.TooDeep_1.0.0.0_x64__abc/app/bin", "target.exe"),
+            ] {
+                let d = root.join(sub);
+                std::fs::create_dir_all(&d).expect("mkdir");
+                std::fs::write(d.join(name), b"").expect("write");
+            }
+            dir
+        }
+
+        fn walk(root: &Path, query: &str, depth: u32, budget: u32) -> Vec<PathBuf> {
+            let mut out = Vec::new();
+            let mut left = budget;
+            walk_dir_bounded(root, query, depth, &mut left, &mut out);
+            out
+        }
+
+        #[test]
+        fn a_store_package_executable_is_found_at_the_package_root_and_one_below() {
+            let tree = packaged_tree();
+            let found = walk(
+                tree.path(),
+                "target.exe",
+                PACKAGED_WALK_MAX_DEPTH,
+                PACKAGED_WALK_MAX_FILES,
+            );
+            let names: Vec<String> = found
+                .iter()
+                .map(|p| {
+                    p.parent()
+                        .and_then(|d| d.file_name())
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .collect();
+            assert!(
+                names.iter().any(|n| n.starts_with("Vendor.AtRoot")),
+                "package-root executable: {names:?}"
+            );
+            assert!(names.iter().any(|n| n == "app"), "one below: {names:?}");
+        }
+
+        #[test]
+        fn the_depth_bound_is_real_and_a_deeper_executable_is_left_to_the_process_source() {
+            let tree = packaged_tree();
+            let found = walk(
+                tree.path(),
+                "target.exe",
+                PACKAGED_WALK_MAX_DEPTH,
+                PACKAGED_WALK_MAX_FILES,
+            );
+            assert!(
+                !found
+                    .iter()
+                    .any(|p| p.to_string_lossy().contains("TooDeep")),
+                "depth 2 must not reach a third level: {found:?}"
+            );
+        }
+
+        #[test]
+        fn only_the_queried_name_comes_back() {
+            let tree = packaged_tree();
+            let found = walk(
+                tree.path(),
+                "target.exe",
+                PACKAGED_WALK_MAX_DEPTH,
+                PACKAGED_WALK_MAX_FILES,
+            );
+            assert!(
+                found.iter().all(|p| p
+                    .file_name()
+                    .is_some_and(|n| n.eq_ignore_ascii_case("target.exe"))),
+                "{found:?}"
+            );
+        }
+
+        #[test]
+        fn an_unreadable_root_contributes_nothing_instead_of_failing() {
+            // What a non-SYSTEM caller sees: the real WindowsApps is ACL-locked.
+            let missing = PathBuf::from(r"C:\this-path-does-not-exist-nrr-test");
+            assert!(walk(&missing, "target.exe", 2, 100).is_empty());
+        }
 
         #[test]
         fn unquote_strips_a_single_surrounding_pair() {

@@ -84,10 +84,34 @@ QtObject {
     // SSOT (route.link-provider.set), feeding per-app kill-switch exemptions and
     // triggering a server-side recompile. An empty "link-provider-apps" clears
     // the set. Returns the correlation id, or "" when the bridge is unavailable.
+    // Local networks kept reachable under the kill-switch: the read returns
+    // what the service discovered plus the caller's decisions, the write takes
+    // `{ "decisions": [...], "forget": [...] }` and answers with the new list.
+    function rpcLocalNetworksGet() {
+        return (bridgeAvailable && typeof bridge.rpcLocalNetworksGet === "function")
+            ? bridge.rpcLocalNetworksGet()
+            : ""
+    }
+    function rpcLocalNetworksSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcLocalNetworksSet === "function")
+            ? bridge.rpcLocalNetworksSet(payload)
+            : ""
+    }
+
     // Auto-rule suggestions. The tray fetches the pending candidate list and
     // then either accepts or dismisses a set of ids; both mutations take
     // `{ "ids": [...] }`. Read-then-mutate, no elevation of their own — the
     // service scopes every one of them to the calling SID.
+    function rpcRefusingAnchorSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcRefusingAnchorSet === "function")
+            ? bridge.rpcRefusingAnchorSet(payload)
+            : ""
+    }
+    function rpcAutoRuleCandidatesProbe(payload) {
+        return (bridgeAvailable && typeof bridge.rpcAutoRuleCandidatesProbe === "function")
+            ? bridge.rpcAutoRuleCandidatesProbe(payload)
+            : ""
+    }
     function rpcAutoRuleCandidatesList() {
         return (bridgeAvailable && typeof bridge.rpcAutoRuleCandidatesList === "function")
             ? bridge.rpcAutoRuleCandidatesList()
@@ -144,6 +168,18 @@ QtObject {
     function rpcBlockNoticeMutesClear() {
         return (bridgeAvailable && typeof bridge.rpcBlockNoticeMutesClear === "function")
             ? bridge.rpcBlockNoticeMutesClear()
+            : ""
+    }
+    // The backlog a surface drains when it comes up: notices the service
+    // raised while nothing was subscribed to show them.
+    function rpcBlockNoticeJournalList() {
+        return (bridgeAvailable && typeof bridge.rpcBlockNoticeJournalList === "function")
+            ? bridge.rpcBlockNoticeJournalList()
+            : ""
+    }
+    function rpcBlockNoticeJournalAck(payload) {
+        return (bridgeAvailable && typeof bridge.rpcBlockNoticeJournalAck === "function")
+            ? bridge.rpcBlockNoticeJournalAck(payload)
             : ""
     }
     function rpcBlockNoticeRouteToSecondary(payload) {

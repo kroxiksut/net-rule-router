@@ -355,6 +355,52 @@ fn resolve_native_icon_path() -> Option<PathBuf> {
     None
 }
 
+/// Emergency network-recovery script shipped beside the executable. Surfaced
+/// so the licence screen can point at the real file instead of a path the user
+/// has to find; `None` when the build does not carry `scripts/` (the in-app
+/// "Restore network" button is the ordinary route either way).
+fn resolve_reset_script_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    const RESET_SCRIPT: &str = "scripts/reset-network.ps1";
+    #[cfg(not(windows))]
+    const RESET_SCRIPT: &str = "scripts/reset-network.sh";
+
+    if let Ok(exe) = env::current_exe() {
+        let mut dir = exe.parent();
+        for _ in 0..6 {
+            let Some(d) = dir else { break };
+            let candidate = d.join(RESET_SCRIPT);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            dir = d.parent();
+        }
+    }
+
+    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../")
+        .join(RESET_SCRIPT);
+    if manifest_candidate.exists() {
+        return manifest_candidate.canonicalize().ok();
+    }
+
+    let cwd_candidate = env::current_dir().ok()?.join(RESET_SCRIPT);
+    cwd_candidate.exists().then_some(cwd_candidate)
+}
+
+/// The console line that runs the recovery script, spelled the way this OS
+/// spells it. Quoted: the shipped path may sit under "Program Files".
+fn reset_script_command_line(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("powershell -ExecutionPolicy Bypass -File \"{path}\"")
+    }
+    #[cfg(not(windows))]
+    {
+        format!("sudo bash \"{path}\"")
+    }
+}
+
 fn default_archive_folder_hint() -> String {
     if let Some(profile) = env::var_os("USERPROFILE") {
         let mut path = PathBuf::from(profile);
@@ -572,6 +618,9 @@ pub fn write_qt_context_file_at(
     let logs_folder_url = resolve_logs_directory()
         .as_ref()
         .map(|path| path_to_file_url(path));
+    let reset_script_path =
+        resolve_reset_script_path().map(|path| path.to_string_lossy().into_owned());
+    let reset_script_command = reset_script_path.as_deref().map(reset_script_command_line);
     let license_text = load_license_text();
     let eula_text = load_eula_text(&preferences.language);
     let locale_diagnostics = json!({
@@ -725,6 +774,24 @@ pub fn write_qt_context_file_at(
     // capability-driven (a section shows only when `supports.<feature>` is
     // true), so OS knowledge stays in Rust and never leaks into a
     // `Qt.platform.os` branch in QML.
+    // First-run answers handed over before launch. Absent on an ordinary
+    // install, which is the case the wizard exists for.
+    let provisioning_payload = match crate::provisioning::load() {
+        Some(loaded) => json!({
+            "present": true,
+            "sourcePath": loaded.source_path.display().to_string(),
+            "completesFirstRun": loaded.answers.completes_first_run(),
+            "primaryConnection": loaded.answers.primary_connection,
+            "secondaryConnection": loaded.answers.secondary_connection,
+            "killSwitch": loaded.answers.kill_switch,
+            "dohLockdown": loaded.answers.doh_lockdown,
+            "fakeIp": loaded.answers.fake_ip,
+            "ruleSet": loaded.answers.rule_set,
+            "language": loaded.answers.language,
+        }),
+        None => json!({ "present": false, "completesFirstRun": false }),
+    };
+
     let mut platform_profile =
         serde_json::to_value(nrr_shared::platform_profile::PlatformProfile::current())
             .unwrap_or(serde_json::Value::Null);
@@ -766,6 +833,10 @@ pub fn write_qt_context_file_at(
         "backendServiceBacked": backend_service_backed,
         "iconFileUrl": icon_file_url,
         "platformProfile": platform_profile,
+        // First-run answers supplied ahead of launch (installer payload, or a
+        // file beside a portable copy). `completesFirstRun` is the wizard's
+        // whole gate; the individual answers pre-fill it when it does open.
+        "provisioning": provisioning_payload,
         "startupDialog": if request.open_license {
             Some("license")
         } else if request.open_about {
@@ -773,12 +844,19 @@ pub fn write_qt_context_file_at(
         } else {
             None::<&str>
         },
+        // Intent slug of the launch that produced this context ("open and
+        // compare" on the tray's rules-drift notice, "safe disable", …). On a
+        // warm launch it travels in the activation-request file instead; a cold
+        // one has no window to hand it to, so it rides the context.
+        "launchAction": request.action,
+        "launchReason": request.reason,
         "preferences": {
             "launchWindowOnStartup": preferences.launch_window_on_startup,
             "minimizeToTrayInsteadOfClose": preferences.minimize_to_tray_instead_of_close,
             "showNotifications": preferences.show_notifications,
             "notifySuggestionChanges": preferences.notify_suggestion_changes,
             "notifyBlockNotices": preferences.notify_block_notices,
+            "trayNoticeOpacityPercent": preferences.tray_notice_opacity_percent,
             "hideBlockNoticeAddresses": preferences.hide_block_notice_addresses,
             "routingDetailedMode": preferences.routing_detailed_mode,
             "reopenLastSectionOnStartup": preferences.reopen_last_section_on_startup,
@@ -822,7 +900,6 @@ pub fn write_qt_context_file_at(
             // Experimental opt-in that reveals the "pre-flight, then
             // all-or-nothing" apply-failure policy option in routing settings
             // (default off). Device-local.
-            "preFlightApplyPolicyOptIn": preferences.pre_flight_apply_policy_opt_in,
             // Display toggle for the "remembered but absent" ghost
             // rows in the Interfaces section (default on). Device-local.
             "showRememberedAdapters": preferences.show_remembered_adapters,
@@ -1012,23 +1089,11 @@ pub fn write_qt_context_file_at(
             ),
         },
         "interfaces": {
-            "previewNotice": resolve_catalog_text(
-                &locale_catalog,
-                &preferences.language,
-                "interfaces.preview-notice",
-                interfaces_snapshot.preview_notice,
-            ),
             "roleExplanation": resolve_catalog_text(
                 &locale_catalog,
                 &preferences.language,
                 "interfaces.role-explanation",
                 interfaces_snapshot.role_explanation,
-            ),
-            "dataScopeNote": resolve_catalog_text(
-                &locale_catalog,
-                &preferences.language,
-                "interfaces.data-scope-note",
-                interfaces_snapshot.data_scope_note,
             ),
             "dataSource": interfaces_snapshot.data_source.title(),
             "selectedBehaviorMode": interfaces_snapshot.selected_behavior_mode.slug(),
@@ -1207,6 +1272,10 @@ pub fn write_qt_context_file_at(
             "toolchain": about.rust_toolchain,
             "projectUrl": shell.about.project_url,
             "buildChannel": shell.about.build_channel,
+            "author": shell.about.author,
+            "authorEmail": shell.about.author_email,
+            "resetScriptPath": reset_script_path,
+            "resetScriptCommand": reset_script_command,
             "logsFolderUrl": logs_folder_url,
             "licenseText": license_text,
         },
@@ -1407,6 +1476,9 @@ struct QtPreferencesPayload {
     /// visible, which is the pre-existing behaviour.
     #[serde(default)]
     hide_block_notice_addresses: bool,
+    /// Additive: absent means the opaque default.
+    #[serde(default = "default_tray_notice_opacity_percent")]
+    tray_notice_opacity_percent: u16,
     reopen_last_section_on_startup: bool,
     first_run_completed: bool,
     // EULA acceptance version. `#[serde(default)]` (→ 0 = not accepted) keeps
@@ -1467,12 +1539,6 @@ struct QtPreferencesPayload {
     // matches the safe default (mode A hidden from the selector).
     #[serde(default)]
     allow_mode_a_killswitch: bool,
-    // Pre-flight apply-failure policy opt-in. `#[serde(default)]` (→ false)
-    // keeps the round-trip backward-compatible with QML builds that don't
-    // emit the key and matches the safe default (option hidden from the
-    // picker unless already selected).
-    #[serde(default)]
-    pre_flight_apply_policy_opt_in: bool,
     // Detailed routing mode: reveals the DNS/fake-IP tuning toggles in
     // routing settings. `#[serde(default)]` (→ false) keeps the round-trip
     // backward-compatible with QML builds that don't emit the key and matches
@@ -1691,6 +1757,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_tray_notice_opacity_percent() -> u16 {
+    100
+}
+
 fn default_compat_banner_mode() -> String {
     String::from("auto")
 }
@@ -1732,6 +1802,7 @@ impl QtPreferencesPayload {
         current.notify_suggestion_changes = self.notify_suggestion_changes;
         current.notify_block_notices = self.notify_block_notices;
         current.hide_block_notice_addresses = self.hide_block_notice_addresses;
+        current.tray_notice_opacity_percent = self.tray_notice_opacity_percent.clamp(40, 100);
         current.reopen_last_section_on_startup = self.reopen_last_section_on_startup;
         current.first_run_completed = self.first_run_completed;
         current.accepted_eula_version = self.accepted_eula_version;
@@ -1884,7 +1955,6 @@ impl QtPreferencesPayload {
             current.admin_auto_revoke_minutes = self.admin_auto_revoke_minutes;
         }
         current.allow_mode_a_killswitch = self.allow_mode_a_killswitch;
-        current.pre_flight_apply_policy_opt_in = self.pre_flight_apply_policy_opt_in;
         current.routing_detailed_mode = self.routing_detailed_mode;
         current.show_remembered_adapters = self.show_remembered_adapters;
         current.auto_confirm_adapter_id_change = self.auto_confirm_adapter_id_change;
@@ -2047,6 +2117,23 @@ fn backend_provider_is_service_backed(kind: BackendProviderKind) -> bool {
         | BackendProviderKind::IpcDisconnected
         | BackendProviderKind::IpcServiceNotInstalled
         | BackendProviderKind::IpcProtocolMismatch => true,
+    }
+}
+
+#[cfg(test)]
+mod reset_script_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_script_resolves_and_its_command_quotes_the_path() {
+        let path = resolve_reset_script_path()
+            .expect("the source tree always carries the recovery script");
+        let path = path.to_string_lossy().into_owned();
+        let command = reset_script_command_line(&path);
+        assert!(
+            command.contains(&format!("\"{path}\"")),
+            "the path must be quoted so a space in it cannot split the command: {command}"
+        );
     }
 }
 

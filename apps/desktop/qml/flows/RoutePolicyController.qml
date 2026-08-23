@@ -86,23 +86,6 @@ QtObject {
                 "Could not update the default route: ")
         })
     }
-    /// Toggle the leak-proof kill-switch (service per-SID
-    /// `block-secondary-when-unavailable`): matched traffic is blocked if the
-    /// additional adapter drops.
-    function applyKillSwitch(enabled) {
-        var want = enabled === true
-        _applyRoutePolicyKey("block-secondary-when-unavailable", want, {
-            ok: want
-                ? root.tr("status.kill-switch-on",
-                    "Leak protection enabled: matched traffic is blocked if the additional adapter drops.")
-                : root.tr("status.kill-switch-off",
-                    "Leak protection disabled."),
-            uac: root.tr("status.kill-switch-uac-declined",
-                "Administrator approval was declined; leak protection was not changed."),
-            failPrefix: root.tr("status.kill-switch-failed",
-                "Could not update leak protection: ")
-        })
-    }
     /// Kill-switch FAILURE POSTURE. fail-closed (default) blocks when the
     /// additional adapter can't be resolved; fail-open allows + warns. Persisted
     /// locally first so the posture survives a service-DB wipe / offline toggle.
@@ -272,6 +255,63 @@ QtObject {
     /// delivery endpoint, so they are offered on first sight. Trades precision
     /// for speed: ad and tracking CDNs share that shape, so this can put hosts
     /// the user did not intend into the rules.
+    /// Cut IPv6 while leak protection is on. ON by default: Free pins IPv4
+    /// only, so a host with an AAAA record otherwise keeps a way out the rules
+    /// never covered — the same site travelling the tunnel over v4 and the main
+    /// link over v6.
+    function applyBlockIpv6WhenProtected(enabled) {
+        var want = enabled === true
+        _applyRoutePolicyKey("block-ipv6-when-protected", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ blockIpv6WhenProtected: v })
+            },
+            ok: want
+                ? root.tr("status.block-ipv6-on",
+                    "IPv6 is switched off while leak protection is on, so rules cover a site completely.")
+                : root.tr("status.block-ipv6-off",
+                    "IPv6 stays on. Sites with an IPv6 address can bypass your rules over it."),
+            uac: root.tr("status.kill-switch-uac-declined",
+                "Administrator approval was declined; leak protection was not changed."),
+            failPrefix: root.tr("status.kill-switch-failed",
+                "Could not update leak protection: ")
+        })
+    }
+
+    /// "May the service check the main route on its own?" — the opt-in behind
+    /// the probe. Off by default: a probe is an outgoing connection, and making
+    /// one unasked is the user's call, not ours.
+    function applyPrimaryProbeAuto(enabled) {
+        var want = enabled === true
+        _applyRoutePolicyKey("primary-probe-auto", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ primaryProbeAuto: v })
+            },
+            ok: want
+                ? root.tr("status.primary-probe-auto-on",
+                    "The service will check the main route for new suggestions itself.")
+                : root.tr("status.primary-probe-auto-off",
+                    "The main route will only be checked when you ask."),
+            uac: root.tr("status.doh-lockdown-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.primary-probe-failed",
+                "Could not change the main-route check: ")
+        })
+    }
+
+    /// One probing bound. The service clamps every value into its allowed range,
+    /// so a number typed here can only narrow a pass, never widen it past what
+    /// the service permits.
+    function applyPrimaryProbeLimit(key, value) {
+        _applyRoutePolicyKey(key, Number(value), {
+            onApplied: function() {},
+            ok: root.tr("status.primary-probe-limits-saved", "Check limits saved."),
+            uac: root.tr("status.doh-lockdown-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.primary-probe-failed",
+                "Could not change the main-route check: ")
+        })
+    }
+
     function applyAutoRulesEagerDeliveryNames(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("auto-rules-eager-delivery-names", want, {
@@ -469,19 +509,24 @@ QtObject {
     /// first to preserve mode + failover (mirrors `applyRouteBehaviorMode`).
     /// A blank pref slot keeps the service's current binding; pass
     /// `opts.unbindPrimary` / `opts.unbindSecondary` to actually clear a slot.
-    function pushRouteBindingToService(opts) {
+    function pushRouteBindingToService(opts, onDone) {
+        var settle = function(ok, code) {
+            if (typeof onDone === "function") onDone(ok === true, String(code || ""))
+        }
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function"
                 || typeof nrrNativeBridge.rpcRoutePolicyUpdate !== "function") {
             // Offline / preview: prefs is the only sink; `_resyncRouteBinding`
             // re-pushes on the next connect.
+            settle(false, "bridge-unavailable")
             return
         }
         var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
         root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok) { settle(false, code); return }
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
-            _sendRoutePolicyUpdate(_routeBindingReqFromPrefs(cur, opts))
+            _sendRoutePolicyUpdate(_routeBindingReqFromPrefs(cur, opts), settle)
         })
     }
     /// Attempts left in the current re-sync run, and the backoff between them.

@@ -112,7 +112,7 @@ pub mod cache {
     pub const LOOKUP_FAILED: ReasonCode = ReasonCode("cache.lookup_failed");
     /// An IP address maps to a different hostname than expected (conflict).
     pub const CONFLICTING_MAPPING: ReasonCode = ReasonCode("cache.conflicting_mapping");
-    /// A native IPv6 address was presented; IPv6 ExactIp is Pro-only in Free.
+    /// A native IPv6 address was presented; IPv6 ExactIp is unsupported in Free.
     pub const UNSUPPORTED_ADDRESS_FAMILY: ReasonCode =
         ReasonCode("cache.unsupported_address_family");
 }

@@ -113,19 +113,35 @@ fn timeout_for(op: IpcOperationName) -> Duration {
         // `rpcTimeoutMs`.
         IpcOperationName::MutationSubmit => Duration::from_secs(30),
         IpcOperationName::OperationStatusGet => Duration::from_secs(1),
+        // Both read live adapters and the route table before answering, the
+        // same enumeration the interfaces snapshot budgets 5s for.
+        IpcOperationName::LocalNetworksGet | IpcOperationName::LocalNetworksSet => {
+            Duration::from_secs(5)
+        }
+        // Accepting a probe pass only reads the pending list and starts a
+        // thread — the pass itself never holds this reply open.
+        IpcOperationName::AutoRuleCandidatesProbe => Duration::from_secs(2),
+        // One small per-SID row write plus a read-back.
+        IpcOperationName::RefusingAnchorSet => Duration::from_secs(2),
         IpcOperationName::RollbackRequest => Duration::from_secs(1),
         IpcOperationName::InterfacesRefreshRequest => Duration::from_secs(5),
         IpcOperationName::ProductImpactDisableTemporary => Duration::from_secs(5),
         IpcOperationName::StatusUpdatesPoll | IpcOperationName::StatusUpdatesSubscribe => {
             Duration::from_secs(2)
         }
-        // Per-SID configuration writes and migration ledger reads. Single
-        // SQLite write per call; 1 s is generous. RouteLinkProviderSet is
-        // the same shape (one SQLite replace + best-effort recompile
-        // trigger).
-        IpcOperationName::RoutePolicyUpdate
-        | IpcOperationName::RouteLinkProviderSet
-        | IpcOperationName::MigrationStatusGet
+        // Per-SID configuration writes. NOT "one SQLite write": they are
+        // user-scoped configuration, so they enter the single-writer mutation
+        // queue and then trigger a recompile. A one-second budget therefore
+        // timed out whenever anything else was mid-apply — observed as
+        // "add automatically" failing with `timeout` while a preset import was
+        // still committing, leaving the setting unchanged and the user with no
+        // explanation. Ten seconds covers the queue without turning a stuck
+        // service into a frozen dialog.
+        IpcOperationName::RoutePolicyUpdate | IpcOperationName::RouteLinkProviderSet => {
+            Duration::from_secs(10)
+        }
+        // Migration ledger: genuinely one row read/write.
+        IpcOperationName::MigrationStatusGet
         | IpcOperationName::MigrationMarkComplete => Duration::from_secs(1),
         // Settings reads/writes. Singleton row + simple validation for the
         // four 'Set' ops; routing-pause writes also poke the apply layer
@@ -218,7 +234,9 @@ fn timeout_for(op: IpcOperationName) -> Duration {
         // Block-notice mutes: an indexed per-SID read and single-row
         // upsert/delete — same trivial shape as the companion-domain
         // refusal ops above.
-        IpcOperationName::BlockNoticeMutesList
+        IpcOperationName::BlockNoticeJournalList
+        | IpcOperationName::BlockNoticeJournalAck
+        | IpcOperationName::BlockNoticeMutesList
         | IpcOperationName::BlockNoticeMutesSet
         | IpcOperationName::BlockNoticeMutesRemove
         | IpcOperationName::BlockNoticeMutesClear => Duration::from_secs(2),
@@ -228,6 +246,7 @@ fn timeout_for(op: IpcOperationName) -> Duration {
         // Nine bounded per-SID DELETEs in one transaction — small row counts,
         // same tier as the other maintenance transactions above.
         IpcOperationName::PrincipalDataPurge => Duration::from_secs(5),
+        IpcOperationName::PrincipalDataCount => Duration::from_secs(2),
     }
 }
 

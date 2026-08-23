@@ -43,7 +43,7 @@
 //!   carried over from the current active revision.
 //! - Adapter bindings and `behavior_mode` are always carried from the current
 //!   active configuration; the preset file does not carry them.
-//! - Pro-only section entries are preserved in the file on disk but are never
+//! - unsupported section entries are preserved in the file on disk but are never
 //!   applied to routing policy.
 //!
 //! # Round-trip guarantee
@@ -51,8 +51,8 @@
 //! An exported preset file can be re-imported without semantic loss:
 //!
 //! 1. The exported file uses the same format as working rules files (docs/en/rules-file-format.md Rules File Format).
-//! 2. Pro-only sections are written back unchanged on export (if present in the
-//!    file — Free edition does not add Pro sections, only preserves them).
+//! 2. unsupported sections are written back unchanged on export (if present in the
+//!    file — Free edition does not add unsupported sections, only preserves them).
 //! 3. Disabled rules are written as commented lines and are parsed back as
 //!    disabled — `enabled: false` in both directions.
 //! 4. Inline comments are preserved.
@@ -115,7 +115,7 @@ pub struct PresetExportSpec {
     /// `PresetExportGet` IPC op → service returns base64-wrapped txt bytes;
     /// the GUI writes them to a user-chosen path via
     /// `Qt.labs.platform.FileDialog::Save`. The service never sees this
-    /// path. Pro-section preservation is documented as a known gap (active
+    /// path. unsupported-section preservation is documented as a known gap (active
     /// revision does not retain unknown sections).
     pub dest_path: String,
     /// Whether to write preset metadata header comments.
@@ -200,7 +200,7 @@ pub struct PresetImportPipelineDoc;
 ///    - The same match values in the same canonical order.
 ///    - The same `enabled` flags.
 ///    - The same inline comments.
-///    - Pro-only section entries are preserved in `ParseOutcome::unknown_sections`
+///    - unsupported section entries are preserved in `ParseOutcome::unknown_sections`
 ///      but do not appear in `S'` (they are outside the Free canonical boundary).
 ///
 /// # What may differ

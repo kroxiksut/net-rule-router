@@ -42,7 +42,7 @@ use crate::{
     types::ApplyActionPlan,
     verify::{VerifyEngine, VerifyResult},
     wfp::WfpSession,
-    windows_api::WindowsApiPort,
+    windows_api::{RouteTablePort, WindowsApiPort},
 };
 
 // ── EngineResult ──────────────────────────────────────────────────────────────
@@ -145,7 +145,8 @@ impl WindowsApplyEngine {
         }
 
         // ── Routing batch ──────────────────────────────────────────────────
-        let mut routing_tx = RoutingTransaction::new(Arc::clone(&self.api));
+        let mut routing_tx =
+            RoutingTransaction::new(Arc::clone(&self.api) as Arc<dyn RouteTablePort>);
 
         if let Err(e) = routing_tx.execute(&plan.routing_actions) {
             let _retryable = e.classify() == ErrorClass::Retryable;

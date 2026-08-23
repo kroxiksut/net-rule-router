@@ -175,48 +175,6 @@ GroupBox {
             }
         }
 
-        // Reveals the "pre-flight, then all-or-nothing" apply-failure policy
-        // in Settings -> Routing. Off by default: its checks (FilterId
-        // collisions, batch overflow, missing adapter/executable) are not
-        // implemented yet, so today it would just be all-or-nothing with an
-        // extra label. Turning this on only changes what is offered — a
-        // previously-selected value is always shown regardless.
-        Frame {
-            Layout.fillWidth: true
-            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
-            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: root.uiTheme.spacingSm
-                CheckBox {
-                    id: preFlightApplyPolicyCheck
-                    Layout.fillWidth: true
-                    text: root.tr("settings.experimental.pre-flight-apply-policy.label",
-                        "Offer the pre-flight apply-check policy")
-                    checked: root.uiRevision >= 0
-                        ? (root.prefs.preFlightApplyPolicyOptIn === true) : false
-                    contentItem: Label {
-                        text: preFlightApplyPolicyCheck.text
-                        leftPadding: preFlightApplyPolicyCheck.indicator.width + preFlightApplyPolicyCheck.spacing
-                        color: root.textColor
-                        wrapMode: Text.WordWrap
-                        verticalAlignment: Text.AlignVCenter
-                    }
-                    onToggled: {
-                        root.updatePrefs({ preFlightApplyPolicyOptIn: checked })
-                        root.emitPrefs()
-                    }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.tr("settings.experimental.pre-flight-apply-policy.note",
-                        "Adds \"Pre-flight, then all-or-nothing\" to the apply failure policy in Settings → Routing. The pre-flight checks themselves are still in development — until they land, this option behaves the same as All or nothing.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                }
-            }
-        }
-
         // ISP block-page rule suggestions. Working end to end, but not yet
         // verified on a live machine — hence the badge and living here.
         Frame {

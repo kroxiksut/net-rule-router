@@ -195,6 +195,14 @@ pub enum AppScope {
     /// Any application.
     Any,
     /// A named program plus its resolved executable paths (Windows consumer).
+    ///
+    /// Path-shaped by design on the two platforms that ship: WFP matches an NT
+    /// path and the Linux fallback matches observed destinations. macOS will
+    /// need a sibling variant — there an application is its bundle id and code
+    /// signature, and the path changes on every update while the signature does
+    /// not. Adding that variant is additive: each lowering handles the shapes
+    /// its mechanism can express and refuses the rest through
+    /// [`EnforcementCapabilities::app_match`].
     Program {
         key: String,
         exe_paths: Vec<PathBuf>,
@@ -369,6 +377,12 @@ pub enum AppMatchMechanism {
     LinuxCgroupFwmark,
     /// Portable fallback: match only the destinations an app was observed using.
     ObservedDestOnly,
+    /// macOS Network Extension — per-app by bundle id and code signature, not
+    /// by path. Declared before the backend exists so a change to the plan has
+    /// to answer for a THIRD platform rather than fitting the two that ship:
+    /// on macOS the addresses are pf's job and the applications are the
+    /// extension's, so one backend fronts two mechanisms.
+    MacosNetworkExtension,
 }
 
 /// The honest per-platform capability set, declared (not inferred). Wired into
@@ -421,6 +435,31 @@ impl EnforcementCapabilities {
             app_match: AppMatchMechanism::ObservedDestOnly,
         }
     }
+
+    /// macOS MVP (pf, no Network Extension yet). Declared AHEAD of the backend
+    /// on purpose: two platforms can quietly agree on a shape that suits both
+    /// and fits nothing else, and the cost of finding that out lands on
+    /// whoever ports the third. Every claim here is conservative — an
+    /// unverified capability is `false`, never a promise.
+    ///
+    /// Nothing is claimed. pf is expected to match on user — which would make
+    /// per-user scoping a macOS win the way it is on Linux — but expectation is
+    /// not verification, and this is the file the GUI reads to decide what to
+    /// promise the user. It matches `PlatformProfile::macos()`, which took the
+    /// same conservative line for the same reason.
+    ///
+    /// What it does NOT claim, it claims deliberately: until the Network
+    /// Extension backend exists, an app rule on macOS can only cover the
+    /// destinations that app was observed using, exactly as on Linux today.
+    pub const fn macos_mvp() -> Self {
+        Self {
+            per_user_routing: false,
+            per_app_routing_true: false,
+            per_app_block_leakproof: false,
+            per_user_all_protocol_scoping: false,
+            app_match: AppMatchMechanism::ObservedDestOnly,
+        }
+    }
 }
 
 /// The per-OS mechanism boundary. `reconcile` is AUTHORITATIVE — it always runs
@@ -432,8 +471,92 @@ pub trait EnforcementBackend {
     /// Drive the platform to match `plan`, returning what changed. Idempotent by
     /// construction (re-apply is a no-op) — NOT gated on any neutral hash.
     fn reconcile(&self, plan: &EnforcementPlan) -> Result<ApplyReport, Self::Error>;
+    /// Drive the platform to match the plans of ALL active principals at once.
+    ///
+    /// Deliberately without a default body: whether several users' policies can
+    /// be applied one after another, or must be committed together, is a fact
+    /// about the mechanism. nftables replaces a table wholesale, so a per-plan
+    /// loop there would leave only the last user enforced — a default hiding
+    /// that would be a silent, machine-wide policy failure.
+    fn reconcile_all(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, Self::Error>;
     /// The platform's honest capability set (see [`EnforcementCapabilities`]).
     fn capabilities(&self) -> EnforcementCapabilities;
+}
+
+/// The object-safe face of enforcement, for callers that hold no platform types.
+///
+/// [`EnforcementBackend`] carries an associated error type and per-OS egress
+/// identities (WFP LUIDs, interface names), so neutral orchestration cannot name
+/// it. This trait is what the service actually calls: hand it the plans of every
+/// active principal and it resolves the platform identities itself, freshly, on
+/// each pass.
+pub trait PolicyEnforcer: Send + Sync {
+    /// Make the platform match these plans, together. `plans` is the COMPLETE
+    /// set in force — anything absent from it stops being enforced, which is how
+    /// a user logging out drops their policy.
+    fn enforce(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, EnforcementFailure>;
+
+    /// Which of the principal's bound channels are usable RIGHT NOW.
+    ///
+    /// Asked before planning, because the plan differs: a rule routed over a
+    /// live secondary is a pin, and the same rule with the secondary gone is a
+    /// decision between blocking that traffic and letting it out over the
+    /// primary. Only the platform can answer, and only for this instant — which
+    /// is why it is asked every pass rather than cached.
+    fn channel_availability(&self, principal: &UserPrincipal) -> ChannelAvailability;
+
+    /// Remove everything this product installed, and nothing else.
+    fn teardown(&self) -> Result<(), EnforcementFailure>;
+}
+
+/// Why enforcement could not be carried out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnforcementFailure {
+    pub reason: String,
+}
+
+impl EnforcementFailure {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for EnforcementFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for EnforcementFailure {}
+
+/// Which of a principal's bound channels resolve to a usable link right now.
+///
+/// `false` means the binding does not currently resolve — the adapter is absent,
+/// down, or renamed. It deliberately does not distinguish those: for the policy
+/// above, "cannot send over it" is the whole fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelAvailability {
+    pub primary: bool,
+    pub secondary: bool,
+}
+
+/// Which adapters a principal has bound to the primary and secondary roles.
+///
+/// Names as the user saved them — resolving them to a live interface is the
+/// platform's job, and doing it per pass is what keeps a reconnected link from
+/// being enforced under an identity it no longer has.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EgressBinding {
+    pub primary: Option<String>,
+    pub secondary: Option<String>,
+}
+
+/// Reads a principal's saved adapter bindings. Implemented over the per-user
+/// policy store; kept neutral so the platform side needs no storage knowledge.
+pub trait EgressBindingSource: Send + Sync {
+    fn bindings_for(&self, principal: &UserPrincipal) -> EgressBinding;
 }
 
 #[cfg(test)]
@@ -915,5 +1038,41 @@ mod tests {
             lin_sup.per_user_all_protocol_scoping,
             lin_caps.per_user_all_protocol_scoping
         );
+
+        // macOS is declared before its backend exists precisely so this
+        // assertion can hold from the start: whoever ports it changes both
+        // sides at once, or the test says so.
+        let mac_caps = EnforcementCapabilities::macos_mvp();
+        let mac_sup = PlatformProfile::macos().supports;
+        assert_eq!(mac_sup.per_user_routing, mac_caps.per_user_routing);
+        assert_eq!(
+            mac_sup.per_app_block_leakproof,
+            mac_caps.per_app_block_leakproof
+        );
+        assert_eq!(
+            mac_sup.per_user_all_protocol_scoping,
+            mac_caps.per_user_all_protocol_scoping
+        );
+    }
+
+    /// Every platform the product declares must be expressible as a capability
+    /// set — the guard against two shipping platforms quietly agreeing on a
+    /// shape that fits nothing else. A third declaration costs nothing today
+    /// and is what makes a plan change answer for macOS at compile time.
+    #[test]
+    fn every_declared_platform_has_a_capability_set() {
+        let sets = [
+            EnforcementCapabilities::windows(),
+            EnforcementCapabilities::linux_mvp(),
+            EnforcementCapabilities::macos_mvp(),
+        ];
+        // Distinct mechanisms, not one mechanism wearing three labels: the
+        // moment two platforms need the SAME app-match mechanism for different
+        // reasons, that is the signal the neutral shape has drifted toward one
+        // of them.
+        assert_eq!(sets[0].app_match, AppMatchMechanism::WfpAppId);
+        assert!(sets
+            .iter()
+            .all(|c| !c.per_app_routing_true || c.per_app_block_leakproof));
     }
 }

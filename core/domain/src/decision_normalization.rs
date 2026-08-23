@@ -11,7 +11,7 @@
 //! |----------------------|--------------------------------------------------------------|
 //! | `destination_hostname` | lowercase, trailing dot removal, IDNA2008/punycode         |
 //! | `destination_ip`     | IPv4 → pass through; IPv4-mapped IPv6 → IPv4 + warning;     |
-//! |                      | native IPv6 → `ProOnlyNativeIpv6` (blocks `ExactIp` only)   |
+//! |                      | native IPv6 → `UnsupportedNativeIpv6` (blocks `ExactIp` only)   |
 //! | `process_context`    | lowercase basename, path stripped, `.exe` suffix ensured     |
 //! | zone name (rule-side)| lowercase, leading dot stripped; empty/whitespace → error    |
 //!
@@ -42,14 +42,14 @@
 //! # `AddressMatch::ExactIp(IpAddr::V6)` in saved rules
 //!
 //! If the active rule book contains a rule with `AddressMatch::ExactIp(V6)`,
-//! that rule is treated as Pro-only unsupported in Free edition:
+//! that rule is treated as unsupported unsupported in Free edition:
 //! - The rule is preserved in storage and exported unchanged.
-//! - The GUI marks it with the `pro.svg` badge.
+//! - The GUI marks it with the extended-section badge.
 //! - The rule does **not** participate in `ExactIp` matching.
 //!
 //! This check is performed at rule-matching time rather than during
 //! `RuntimeInput` normalization.  It is documented here because it follows
-//! from the same "IPv6 = Pro-only" invariant.
+//! from the same "IPv6 = unsupported" invariant.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -105,7 +105,7 @@ pub enum NormalizationError {
     // ── IP errors — block ExactIp ─────────────────────────────────────────────
     /// A native IPv6 address was observed.  Free edition does not support
     /// `ExactIp` matching for IPv6.  Hostname and application matching continue.
-    IpNativeIpv6ProOnly { addr: Ipv6Addr },
+    IpNativeIpv6Unsupported { addr: Ipv6Addr },
 
     // ── Zone name errors — block Zone matching for that specific rule ──────────
     /// A zone name from a saved rule was empty after trimming.
@@ -162,7 +162,7 @@ impl NormalizedHostname {
 /// - `ValidIpv4` → used for `ExactIp` matching.
 /// - `Unavailable` → explain signal `ip_unavailable`; `ExactIp` skipped.  The
 ///   lookup stage may attempt DNS resolution from the hostname.
-/// - `ProOnlyNativeIpv6` → explain signal `ip_native_ipv6_pro_only`; `ExactIp`
+/// - `UnsupportedNativeIpv6` → explain signal `ip_native_ipv6_unsupported`; `ExactIp`
 ///   skipped in Free.  All hostname and application matching continues normally.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NormalizedIp {
@@ -171,7 +171,7 @@ pub enum NormalizedIp {
     /// No IP was present in `RuntimeInput`.
     Unavailable,
     /// A native IPv6 address was observed — not used for matching in Free edition.
-    ProOnlyNativeIpv6 { addr: Ipv6Addr },
+    UnsupportedNativeIpv6 { addr: Ipv6Addr },
 }
 
 impl NormalizedIp {
@@ -236,7 +236,7 @@ pub enum InputAvailabilitySignal {
 /// | `ExactFqdn`    | hostname unavailable or invalid                           |
 /// | `SuffixDomain` | hostname unavailable or invalid                           |
 /// | `Zone`         | hostname unavailable or invalid                           |
-/// | `ExactIp`      | IP unavailable, or native IPv6 (`IpNativeIpv6ProOnly`)    |
+/// | `ExactIp`      | IP unavailable, or native IPv6 (`IpNativeIpv6Unsupported`)    |
 /// | `Application`  | process name absent or empty (`ApplicationNameEmpty`)     |
 ///
 /// The `Default` route is never blocked — it is the guaranteed final fallback.
@@ -360,9 +360,9 @@ mod tests {
     }
 
     #[test]
-    fn normalized_ip_pro_only_native_ipv6_is_not_usable() {
+    fn normalized_ip_unsupported_native_ipv6_is_not_usable() {
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let ip = NormalizedIp::ProOnlyNativeIpv6 { addr };
+        let ip = NormalizedIp::UnsupportedNativeIpv6 { addr };
         assert!(!ip.is_usable());
     }
 
@@ -410,7 +410,7 @@ mod tests {
             exact_fqdn: Some(NormalizationError::DomainEmpty),
             suffix_domain: Some(NormalizationError::DomainEmpty),
             zone: Some(NormalizationError::DomainEmpty),
-            exact_ip: Some(NormalizationError::IpNativeIpv6ProOnly {
+            exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported {
                 addr: "2001:db8::1".parse().unwrap(),
             }),
             application: Some(NormalizationError::ApplicationNameEmpty),
@@ -433,7 +433,7 @@ mod tests {
             exact_fqdn: Some(NormalizationError::DomainEmpty),
             suffix_domain: Some(NormalizationError::DomainEmpty),
             zone: Some(NormalizationError::DomainEmpty),
-            exact_ip: Some(NormalizationError::IpNativeIpv6ProOnly {
+            exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported {
                 addr: "2001:db8::1".parse().unwrap(),
             }),
             application: None,
@@ -513,13 +513,13 @@ mod tests {
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
         let input = NormalizedDecisionInput {
             hostname: NormalizedHostname::Valid("ipv6host.example.com".to_owned()),
-            ip: NormalizedIp::ProOnlyNativeIpv6 { addr },
+            ip: NormalizedIp::UnsupportedNativeIpv6 { addr },
             app_identity: None,
             match_class_availability: MatchClassAvailability {
                 exact_fqdn: None,
                 suffix_domain: None,
                 zone: None,
-                exact_ip: Some(NormalizationError::IpNativeIpv6ProOnly { addr }),
+                exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported { addr }),
                 application: Some(NormalizationError::ApplicationNameEmpty),
             },
             availability_signals: vec![InputAvailabilitySignal::AppContextUnavailable],

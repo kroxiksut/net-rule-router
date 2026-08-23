@@ -310,12 +310,12 @@ pub fn dispatch_request(
     }
 
     // `autostart.get` / `autostart.toggle` are answered locally by the
-    // launcher on Windows. The service runs as
-    // `LocalSystem`, so its `HKEY_CURRENT_USER` is the SYSTEM hive, not the
-    // interactive user's — the tray Run key it wrote never fired at logon.
-    // The launcher runs AS the user, so it owns the correct hive. Off
-    // Windows `is_local_autostart_op` is always false and these fall through
-    // to the service (which there runs in the user's own context).
+    // launcher: autostart is a per-user setting, and no background service
+    // runs as that user. On Windows the service is `LocalSystem`, so its
+    // `HKEY_CURRENT_USER` is the SYSTEM hive; on Linux the daemon is root, so
+    // its `$HOME` is `/root`. Either would write an entry the session never
+    // reads. Where no user-context mechanism exists yet (macOS),
+    // `is_local_autostart_op` is false and these fall through to the service.
     if crate::autostart_local::is_local_autostart_op(&parsed.operation) {
         let response = match crate::autostart_local::handle_local_autostart(
             &parsed.operation,
@@ -579,10 +579,10 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
                     crate::archive_localize::service_log_budget_bytes(),
                 )
             } else if op == IpcOperationName::SnapshotInitialGet {
-                // The service's `autostart` field reflects the SYSTEM hive;
-                // re-probe the interactive user's HKCU so the GUI's first
+                // The service's `autostart` field reflects its own system
+                // context; re-probe the interactive user's so the GUI's first
                 // paint shows the real state. Best-effort: passes through
-                // unchanged off Windows or on any probe failure.
+                // unchanged on any probe failure.
                 crate::autostart_local::patch_snapshot_autostart(value)
             } else {
                 value

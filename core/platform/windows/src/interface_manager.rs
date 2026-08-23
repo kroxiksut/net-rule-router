@@ -129,6 +129,9 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
     ]
 }
 
+// Only the live Windows enumeration calls these three; off Windows the
+// snapshot comes from `fallback_adapters`.
+#[cfg(windows)]
 fn resolve_windows_name(friendly_name: &str, adapter_name: &str) -> String {
     let friendly_name = friendly_name.trim();
     if friendly_name.is_empty() {
@@ -138,10 +141,12 @@ fn resolve_windows_name(friendly_name: &str, adapter_name: &str) -> String {
     }
 }
 
+#[cfg(windows)]
 fn normalize_adapter_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+#[cfg(windows)]
 fn format_physical_address(value: Option<&[u8]>) -> Option<String> {
     let bytes = value?;
     if bytes.is_empty() {
@@ -156,6 +161,9 @@ fn format_physical_address(value: Option<&[u8]>) -> Option<String> {
     )
 }
 
+// The identity policy itself is neutral and its tests run on every host, so
+// unlike its three neighbours this one stays compiled for tests off Windows.
+#[cfg(any(windows, test))]
 fn build_persistent_id(
     normalized_adapter_name: &str,
     ipv6_if_index: u32,

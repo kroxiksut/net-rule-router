@@ -116,7 +116,7 @@ impl ProductImpactDisableTemporaryHandler {
             rules_removed: Vec::new(),
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
-            pro_sections: Vec::new(),
+            extended_sections: Vec::new(),
         };
 
         let stored_payload = serde_json::json!({
@@ -252,6 +252,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
             caller_principal: None,
+            caller_pid: None,
         }
     }
 

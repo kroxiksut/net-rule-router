@@ -264,6 +264,19 @@ pub enum CodegenDiagnostic {
     /// Permit is still in place, and the next apply after the app connects
     /// picks up the destinations.
     AppUnobserved { rule_id: String, app: String },
+    /// An `Application` rule observed a destination the user's own MAIN-route
+    /// rules already claim by name, so the address was NOT taken over.
+    ///
+    /// Two of the user's rules point one address in opposite directions. Pinning
+    /// it to the additional link cannot win — the named rule sends it the other
+    /// way — and the two orders cancel into a dead destination for EVERY process
+    /// on the machine, not just the app. The named rule is the specific
+    /// statement about that destination, so it holds.
+    AppDestinationClaimedByPrimary {
+        rule_id: String,
+        app: String,
+        ip: Ipv4Addr,
+    },
     /// an `Application` rule's exe name/glob resolved to NO concrete
     /// exe path on this machine (app not installed / not found). 0 `ALE_APP_ID`
     /// filters emitted this pass — the WFP condition needs a real file path
@@ -335,6 +348,12 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
     // filter from this offset on is secondary-driven — that slice gives
     // us the kill-switch's protected destination set.
     let mut secondary_filter_start = 0usize;
+    // Who owns which address, decided once by the arbiter every mechanism reads.
+    // Resolved from the UNFILTERED cache: the denylist view exists to trim what
+    // goes to the tunnel, and reading it here would understate what the main
+    // link claims.
+    let ownership =
+        crate::address_ownership::AddressOwnership::resolve(input.rule_book, input.fqdn_cache);
     for (role_idx, role) in [RouteRole::Primary, RouteRole::Secondary]
         .into_iter()
         .enumerate()
@@ -367,6 +386,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
                 cache_for_role,
                 input.app_observations,
                 input.app_resolver,
+                &ownership,
                 &mut out,
             );
         }
@@ -503,6 +523,7 @@ fn generate_for_rule(
     cache: &dyn FqdnCacheLookup,
     app_observations: &dyn AppObservationLookup,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
+    ownership: &crate::address_ownership::AddressOwnership,
     out: &mut CodegenOutput,
 ) {
     if !rule.enabled {
@@ -551,6 +572,11 @@ fn generate_for_rule(
             app,
             app_observations,
             app_resolver,
+            ownership,
+            match role {
+                RouteRole::Primary => crate::address_ownership::Link::Main,
+                RouteRole::Secondary => crate::address_ownership::Link::Additional,
+            },
             out,
         );
     }
@@ -724,6 +750,8 @@ fn emit_for_app_match(
     app: &CanonicalAppMatch,
     app_observations: &dyn AppObservationLookup,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
+    ownership: &crate::address_ownership::AddressOwnership,
+    link: crate::address_ownership::Link,
     out: &mut CodegenOutput,
 ) {
     let pattern_str = match &app.pattern {
@@ -794,7 +822,27 @@ fn emit_for_app_match(
     // `/32` fan-out starts AFTER the resolved-path band (slots
     // `APP_PATH_FANOUT_CAP + 1 + i`) so it never collides with the per-path
     // app-id filters above.
-    let ips = app_observations.ips_for_app(&pattern_str);
+    let observed = app_observations.ips_for_app(&pattern_str);
+    // An address the user's own main-route rules name is NOT taken over by an
+    // app rule. The pin could not win anyway — the named rule steers the traffic
+    // the other way — and the pair cancels into a destination that is dead for
+    // every process on the machine. Reported, never silent: the app really is
+    // talking to that host and the user may want to know which rule won.
+    let ips: Vec<Ipv4Addr> = observed
+        .into_iter()
+        .filter(|ip| {
+            let claimed = !ownership.app_rule_may_claim(*ip, link);
+            if claimed {
+                out.diagnostics
+                    .push(CodegenDiagnostic::AppDestinationClaimedByPrimary {
+                        rule_id: rule.id.as_str().to_string(),
+                        app: pattern_str.clone(),
+                        ip: *ip,
+                    });
+            }
+            !claimed
+        })
+        .collect();
     if ips.is_empty() {
         out.diagnostics.push(CodegenDiagnostic::AppUnobserved {
             rule_id: rule.id.as_str().to_string(),
@@ -2034,6 +2082,84 @@ mod tests {
             vec![Ipv4Addr::new(5, 5, 5, 5)],
             "the same resolved IP across three secondary rules collapses to one"
         );
+    }
+
+    /// The failure this prevents, seen on a live machine: an application on the
+    /// additional link had once connected to the address of a site the user had
+    /// explicitly routed over the MAIN link. The address entered the
+    /// kill-switch set, and the site went dead in every browser on the machine.
+    /// Two of the user's own rules pointed one address in opposite directions,
+    /// and the outcome was neither — it was a block.
+    #[test]
+    fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
+        let shared = Ipv4Addr::new(178, 248, 237, 68);
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("habr.com", vec![shared]);
+        let observations = MockAppObservationLookup::new();
+        observations.set_ips("claude.exe", vec![shared]);
+        let resolver = MockAppPathResolver::new()
+            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+
+        let rule_book = book(
+            vec![exact_fqdn_rule("r-main", "habr.com")],
+            vec![app_rule("r-app", "claude.exe", false)],
+        );
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &observations,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+        });
+
+        assert!(
+            !out.secondary_dest_ips.contains(&shared),
+            "the app rule took over an address the main-route rule names; the kill-switch              would then block it for every process",
+        );
+        assert!(
+            out.primary_dest_ips.contains(&shared),
+            "the main-route rule keeps the address it named",
+        );
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                CodegenDiagnostic::AppDestinationClaimedByPrimary { ip, .. } if *ip == shared
+            )),
+            "the conflict must be reported, not silently resolved",
+        );
+        // The per-process filter is untouched: the app is still routed over the
+        // additional link for everything else it talks to.
+        assert!(
+            out.filters.iter().any(|f| f.app_pattern.is_some()),
+            "the app rule itself still enforces",
+        );
+    }
+
+    /// The mirror case: an address NO main-route rule names is taken over as
+    /// before. The guard must not turn into "app rules never route anything".
+    #[test]
+    fn an_app_rule_still_claims_addresses_nobody_else_named() {
+        let only_app = Ipv4Addr::new(203, 0, 113, 9);
+        let cache = MockFqdnCacheLookup::new();
+        let observations = MockAppObservationLookup::new();
+        observations.set_ips("claude.exe", vec![only_app]);
+        let resolver = MockAppPathResolver::new()
+            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+
+        let rule_book = book(Vec::new(), vec![app_rule("r-app", "claude.exe", false)]);
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &observations,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+        });
+
+        assert!(out.secondary_dest_ips.contains(&only_app));
     }
 
     #[test]

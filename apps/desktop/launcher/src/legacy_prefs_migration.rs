@@ -239,6 +239,14 @@ fn push_route_policy<C: IpcClient + ?Sized>(
         // suggesting a delivery-named host). The user can opt in in Routing.
         auto_rules_eager_delivery_names: false,
         binding_source: BindingSourceDto::MigratedFromPreferences,
+        // No legacy prefs for the main-link probe or the v6 cut — migrate to the
+        // same defaults a fresh install gets (probe on demand only; v6 closed
+        // while protection is on, because Free pins IPv4).
+        primary_probe_auto: false,
+        primary_probe_timeout_ms: 1500,
+        primary_probe_max_targets: 8,
+        primary_probe_repeat_secs: 300,
+        block_ipv6_when_protected: true,
     };
     let payload = serde_json::to_value(&req).map_err(|e| StageError {
         stage: FailureStage::PolicyUpdate,
@@ -473,6 +481,11 @@ mod tests {
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
             binding_source: BindingSourceDto::MigratedFromPreferences,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
         };
         let mark = MigrationMarkCompleteResponse {
             recorded: true,

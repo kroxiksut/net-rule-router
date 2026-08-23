@@ -138,18 +138,6 @@ impl<'c> AutostartStateRepository<'c> {
             .map_err(|e| StorageError::Internal(format!("autostart_state set: {e}")))?;
         Ok(())
     }
-
-    /// Updates only the last-known registry observation, leaving the
-    /// user's `enabled` intent unchanged. Called by the registry probe
-    /// after each scan.
-    pub fn record_observation(
-        &self,
-        last_known_state: AutostartLastKnownState,
-        now: i64,
-    ) -> StorageResult<()> {
-        let current = self.get_or_default()?;
-        self.set(current.enabled, Some(last_known_state), now)
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -210,23 +198,6 @@ mod tests {
         assert!(r.enabled);
         assert_eq!(r.last_known_state, Some(AutostartLastKnownState::Enabled));
         assert_eq!(r.updated_at, 1_700_000_000);
-    }
-
-    #[test]
-    fn record_observation_preserves_enabled() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let conn = open_state_db(&dir);
-        let repo = AutostartStateRepository::new(&conn);
-        repo.set(true, None, 100).expect("set initial");
-        repo.record_observation(AutostartLastKnownState::OverriddenExternally, 200)
-            .expect("observe");
-        let r = repo.get_or_default().expect("get");
-        assert!(r.enabled, "user intent must survive observation update");
-        assert_eq!(
-            r.last_known_state,
-            Some(AutostartLastKnownState::OverriddenExternally)
-        );
-        assert_eq!(r.updated_at, 200);
     }
 
     #[test]

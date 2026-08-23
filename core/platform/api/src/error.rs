@@ -91,6 +91,17 @@ pub enum PlatformError {
     StateCorrupted { detail: String },
     /// Feature not supported (e.g. IPv6 is out-of-scope for this product).
     NotSupported { reason: &'static str },
+    /// A POSIX errno from a Unix mechanism (rtnetlink, nftables, sockets).
+    ///
+    /// The peer of [`Self::Win32`]: the same idempotent/conflict/retryable
+    /// distinctions exist on Unix, and collapsing them into `Transient` would
+    /// turn "this route already exists" into an endless retry.
+    Errno {
+        operation: &'static str,
+        /// Positive errno as the platform reports it (`EEXIST`, not `-EEXIST`).
+        code: i32,
+        message: String,
+    },
 }
 
 impl fmt::Display for PlatformError {
@@ -117,6 +128,13 @@ impl fmt::Display for PlatformError {
             }
             Self::StateCorrupted { detail } => {
                 write!(f, "platform state corrupted: {detail}")
+            }
+            Self::Errno {
+                operation,
+                code,
+                message,
+            } => {
+                write!(f, "error in {operation}: errno {code} — {message}")
             }
             Self::NotSupported { reason } => {
                 write!(f, "not supported: {reason}")
@@ -172,7 +190,7 @@ impl PlatformError {
     ///   `FwpmGetAppIdFromFileName0` — the executable is absent
     ///   (`ERROR_FILE/PATH_NOT_FOUND` 2/3), the pattern is not a valid path
     ///   such as a glob `disko*.exe` (`ERROR_INVALID_NAME` 123 — globs are a
-    ///   Pro feature, not materializable as a single ALE_APP_ID filter), the
+    ///   unsupported feature, not materializable as a single ALE_APP_ID filter), the
     ///   blob came back degenerate/empty (`ERROR_INVALID_DATA` 13), or the
     ///   file is unreadable. Failing to compute an app-id means this one app
     ///   filter cannot be built on this host — a per-rule condition, never a
@@ -238,8 +256,34 @@ impl PlatformError {
             Self::Transient { .. } => ErrorClass::Retryable,
             Self::StateCorrupted { .. } => ErrorClass::Fatal,
             Self::NotSupported { .. } => ErrorClass::Fatal,
+            Self::Errno { code, .. } => classify_errno(*code),
         }
     }
+}
+
+/// Map well-known POSIX errnos to their classification, mirroring
+/// [`classify_win32_error`].
+///
+/// The numbers are named through `libc` rather than written out: the values
+/// differ between Unix targets, and a literal here would be right on Linux and
+/// wrong on macOS.
+#[cfg(unix)]
+fn classify_errno(code: i32) -> ErrorClass {
+    match code {
+        // Already gone is success for an idempotent reconcile.
+        libc::ENOENT | libc::ESRCH => ErrorClass::Idempotent,
+        libc::EEXIST => ErrorClass::Conflict,
+        libc::EPERM | libc::EACCES => ErrorClass::PrivilegeRequired,
+        libc::EAGAIN | libc::EBUSY | libc::EINTR | libc::ENOBUFS => ErrorClass::Retryable,
+        _ => ErrorClass::Fatal,
+    }
+}
+
+/// Off-Unix the variant can still be constructed (and carried across IPC), but
+/// there is no errno table to consult.
+#[cfg(not(unix))]
+fn classify_errno(_code: i32) -> ErrorClass {
+    ErrorClass::Fatal
 }
 
 /// Map well-known Win32 error codes to their classification.

@@ -119,6 +119,9 @@ impl TaskId {
 /// the stop token flips.
 pub type TickFn = Box<dyn FnMut(&StopToken) -> TaskOutcome + Send>;
 
+/// Teardown closure — see [`ServiceTask::on_stop`].
+pub type StopHook = Box<dyn FnOnce() + Send>;
+
 /// Per-task restart back-off schedule used by `TaskClass::Recoverable`
 /// in the supervisor's failure handler. The default (`100 ms × attempt`,
 /// capped at `1 s`) applies to any task constructed via
@@ -173,6 +176,14 @@ pub struct ServiceTask {
     /// over time.
     pub backoff: BackoffSchedule,
     pub tick: TickFn,
+    /// Run exactly once when the task's loop ends, however it ends.
+    ///
+    /// A tick cannot be relied on for teardown: the loop condition is the stop
+    /// token, so a task asleep when the stop arrives exits WITHOUT another tick,
+    /// and a task blocked in a syscall exits at the very next condition check.
+    /// That is how the IPC accept loop came to sit in `ConnectNamedPipe` through
+    /// a whole stop — the tick holding its "wake the accept" branch never ran.
+    pub on_stop: Option<StopHook>,
 }
 
 impl ServiceTask {
@@ -190,6 +201,7 @@ impl ServiceTask {
             max_restarts,
             backoff: BackoffSchedule::default(),
             tick: Box::new(tick),
+            on_stop: None,
         }
     }
 
@@ -198,6 +210,13 @@ impl ServiceTask {
     /// definition site.
     pub fn with_backoff(mut self, backoff: BackoffSchedule) -> Self {
         self.backoff = backoff;
+        self
+    }
+
+    /// Chainable teardown hook — see [`ServiceTask::on_stop`].
+    #[must_use]
+    pub fn with_on_stop(mut self, hook: impl FnOnce() + Send + 'static) -> Self {
+        self.on_stop = Some(Box::new(hook));
         self
     }
 }
@@ -318,6 +337,11 @@ impl ServiceSupervisor {
                             }
                         }
                     }
+                }
+                // Teardown runs on every exit path, including the one that
+                // skips the tick entirely (stop observed while asleep).
+                if let Some(hook) = task.on_stop.take() {
+                    hook();
                 }
             })
             .map_err(|_| "thread spawn failed")?;
@@ -598,6 +622,50 @@ mod tests {
                 OperationPriority::CacheRefresh,
                 OperationPriority::DiagnosticsCleanup,
             ]
+        );
+    }
+
+    /// The defect this exists for: a task asleep when the stop arrives exits on
+    /// the loop CONDITION, so its tick — and any teardown that lived there —
+    /// never runs. The IPC accept loop stayed parked in the transport's blocking
+    /// accept for the whole stop budget because of exactly this.
+    #[test]
+    fn teardown_runs_even_when_the_stop_skips_the_last_tick() {
+        let stop = StopToken::new();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), counting_sink() as Arc<dyn TaskFailureSink>);
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let torn_down = Arc::new(AtomicUsize::new(0));
+        let ticks_in_task = Arc::clone(&ticks);
+        let torn_down_in_hook = Arc::clone(&torn_down);
+        supervisor
+            .spawn(
+                ServiceTask::periodic(
+                    "sleepy",
+                    TaskClass::Recoverable,
+                    // Long enough that the stop lands during the sleep, which is
+                    // the case the runner used to lose.
+                    Duration::from_secs(30),
+                    1,
+                    move |_stop| {
+                        ticks_in_task.fetch_add(1, Ordering::SeqCst);
+                        TaskOutcome::Continue
+                    },
+                )
+                .with_on_stop(move || {
+                    torn_down_in_hook.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .expect("spawn");
+        // Let the task take its single tick and settle into the sleep.
+        thread::sleep(Duration::from_millis(80));
+        let report = supervisor.shutdown();
+        assert_eq!(report.detached.len(), 0, "the task must exit on the stop");
+        assert_eq!(ticks.load(Ordering::SeqCst), 1, "no tick after the stop");
+        assert_eq!(
+            torn_down.load(Ordering::SeqCst),
+            1,
+            "teardown must run exactly once even though the last tick was skipped"
         );
     }
 

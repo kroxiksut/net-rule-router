@@ -893,6 +893,10 @@ impl IpcHandler for ConnTraceEntriesListHandler {
         let expected_route = |remote: &std::net::SocketAddr| -> String {
             match owner_of(remote) {
                 Some(_) => "secondary".to_string(),
+                // An IPv6 remote is not "no rule covers it" — no rule CAN, the
+                // family is not routed in this edition. Say which of the two it
+                // is instead of letting the row read as an uncovered host.
+                None if remote.is_ipv6() => "ipv6".to_string(),
                 None => String::new(),
             }
         };
@@ -1448,6 +1452,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: None,
+            caller_pid: None,
         };
         let value = handler.handle(&env, &ctx).expect("cache.clear ok");
         serde_json::from_value(value).expect("decode CacheClearResponse")
@@ -1572,6 +1577,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: true,
             caller_principal: crate::UserPrincipal::from_windows_sid("S-1-5-21-test").ok(),
+            caller_pid: None,
         }
     }
 
@@ -2118,6 +2124,11 @@ mod tests {
             kill_switch_strict_shared_ips: false,
             auto_rules_mode: "suggest".to_string(),
             auto_rules_eager_delivery_names: false,
+            primary_probe_auto: false,
+            primary_probe_timeout_ms: 1500,
+            primary_probe_max_targets: 8,
+            primary_probe_repeat_secs: 300,
+            block_ipv6_when_protected: true,
             binding_source: BindingSourceDto::UserAssigned,
         });
 

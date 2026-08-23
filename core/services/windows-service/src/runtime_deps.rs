@@ -44,7 +44,6 @@ use nrr_service_runtime::{
     production_rules_provider::ProductionRulesProvider,
     register_production_handlers,
     routing_pause::{NoopRoutingPauseAudit, PauseDispatcher, RoutingPauseCoordinator},
-    run_autostart_startup_probe,
     service_stability::ServiceStabilityConfig,
     tamper_bootstrap::run_tamper_bootstrap,
     AdaptersSnapshotProvider, ApplyFailurePolicyProvider, ApplyFailurePolicyWriter,
@@ -185,11 +184,11 @@ pub(crate) fn build_supervised_runtime_deps(
     let tray_path = resolve_tray_binary_path();
     let autostart_helper = Arc::new(AutostartHelper::new(ProductionAutostartRegistry));
 
-    // Once-per-startup probe so the GUI sees up-to-date `last_known_state`
-    // (incl. external overrides) on the first SnapshotInitial after boot.
-    if let Some(conn) = settings_conn.as_ref() {
-        run_autostart_startup_probe(conn.as_ref(), autostart_helper.as_ref(), &tray_path);
-    }
+    // No startup probe here. The service runs as LocalSystem, so its
+    // `HKEY_CURRENT_USER` is the SYSTEM hive — a probe would persist a reading
+    // that cannot be true for the interactive user. The launcher owns autostart
+    // (it runs as that user) and answers `autostart.*` before the pipe hop; an
+    // absent row states "the service does not know", which is the truth.
 
     // ── Event bus ────────────────────────────────────────────────────
     // Shared across all settings writers so push events surface on the
@@ -258,6 +257,14 @@ pub(crate) fn build_supervised_runtime_deps(
     let (fake_ip_scope, fake_ip_pool) = fake_ip_policy();
     let fake_ip_assembly = Arc::new(
         nrr_service_runtime::fake_ip::FakeIpAssembly::new(fake_ip_scope, fake_ip_pool)
+            // The tunnel's own interior is off limits to virtual addresses: a
+            // caller sent to our TUN for an address that only exists inside the
+            // tunnel gets nothing. Read through the process cell because the
+            // coordinator that learns these subnets is built further down.
+            .with_secondary_subnets({
+                let cell = nrr_service_runtime::secondary_subnets::global_secondary_subnets();
+                std::sync::Arc::new(move || cell.current())
+            })
             // A relayed flow owned by the VPN client the user confirmed leaves
             // over the PRIMARY link: that client's traffic is the tunnel's own
             // transport, so carrying it over the secondary routes the tunnel
@@ -344,6 +351,18 @@ pub(crate) fn build_supervised_runtime_deps(
     let killswitch_drop_registry = Arc::new(
         nrr_service_runtime::killswitch_drop_registry::KillswitchBlockFilterRegistry::new(),
     );
+    // What the user's last "check the main route" pass found for their own
+    // rules. Written by the probe runner, read back by the rules snapshot.
+    let main_route_verdicts =
+        Arc::new(nrr_service_runtime::main_route_verdicts::MainRouteVerdicts::new());
+    // Filled once the DNS refresher exists; the apply path holds only this
+    // slot, so a rule naming an unresolved host can ask for a resolution
+    // without the two construction orders having to meet.
+    let dns_resolve_now_slot: Arc<std::sync::OnceLock<Arc<DnsRefreshOrchestrator>>> =
+        Arc::new(std::sync::OnceLock::new());
+    // One resolve pass at a time: applies can arrive in bursts (import, review,
+    // activation) and each pass is a run of live DNS round-trips.
+    let dns_resolve_now_busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Block-notice reporting — folds the connection observer's qualifying
     // drops into episodes and logs the notices that survive (see
     // `nrr_service_runtime::block_notice_center`). Shared for the same
@@ -363,9 +382,24 @@ pub(crate) fn build_supervised_runtime_deps(
             ),
         ) as Arc<dyn nrr_service_runtime::block_notice_mute_store::BlockNoticeMuteStore>
     });
+    // Backlog for notices raised with no surface subscribed — the shape a user
+    // gets by running the service without the tray. Same connection again.
+    let block_notice_journal_store: Option<
+        Arc<dyn nrr_service_runtime::block_notice_journal_store::BlockNoticeJournalStore>,
+    > = settings_conn.as_ref().map(|conn| {
+        Arc::new(
+            nrr_service_runtime::block_notice_journal_store::SqliteBlockNoticeJournalStore::new(
+                Arc::clone(conn),
+            ),
+        )
+            as Arc<dyn nrr_service_runtime::block_notice_journal_store::BlockNoticeJournalStore>
+    });
     let block_notice_center = {
-        let center = nrr_service_runtime::block_notice_center::BlockNoticeCenter::new()
+        let mut center = nrr_service_runtime::block_notice_center::BlockNoticeCenter::new()
             .with_event_bus(Arc::clone(&event_bus));
+        if let Some(journal) = block_notice_journal_store.clone() {
+            center = center.with_journal(journal);
+        }
         // Mutes are personal and must outlive a restart: without the store a
         // silenced host would start shouting again on every service start.
         match settings_conn.as_ref() {
@@ -502,6 +536,52 @@ pub(crate) fn build_supervised_runtime_deps(
                             }
                         })
                     };
+                // Remember the MAC of an adapter a binding resolved to, so the
+                // binding survives a GUID + ifindex change (Wi-Fi or Bluetooth
+                // after sleep). Widens the identity set only — never moves the
+                // binding — hence a callback of its own.
+                let binding_anchor_persist: nrr_service_runtime::route_coordinator::BindingAnchorPersistFn = {
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |sid: &str, role: &str, anchor_id: &str| {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            if let Err(e) = repo.remember_stable_id(sid, role, anchor_id, now) {
+                                tracing::warn!(target: "nrr::route-coordinator", sid = %sid, error = %e, "MAC anchor persist failed");
+                            }
+                        })
+                    };
+                // The user's own answers about local networks: which segments
+                // stay reachable while the kill-switch blocks everything else.
+                // Read per resolve so a change in Settings lands on the next
+                // reconcile; unreadable rows degrade to "no stored decisions",
+                // never to a wider exemption.
+                let local_network_policy: nrr_service_runtime::route_coordinator::LocalNetworkPolicyFn = {
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |sid: &str| {
+                            use nrr_domain::ipv4_network::Ipv4Network;
+                            let mut policy = nrr_service_runtime::route_coordinator::LocalNetworkPolicy::default();
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            let repo = nrr_storage::local_network_rules::LocalNetworkRulesRepository::new(&guard);
+                            let Ok(rules) = repo.list_for_sid(sid) else {
+                                return policy;
+                            };
+                            for rule in rules {
+                                let Some(network) = Ipv4Network::parse(&rule.cidr) else {
+                                    continue;
+                                };
+                                if rule.allow {
+                                    policy.allowed.push(network);
+                                } else {
+                                    policy.refused.push(network);
+                                }
+                            }
+                            policy
+                        })
+                    };
                 // Safe-disable (ROUTE-half) — the route coordinator gates
                 // EVERY recompute on the persistent pause flag, so a paused
                 // user's routes are never (re)installed by any re-drive path
@@ -578,13 +658,15 @@ pub(crate) fn build_supervised_runtime_deps(
                 };
                 let route_coord = Arc::new(
                     nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator::new(
-                        Arc::clone(&api),
+                        Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
                         Arc::clone(&rules_provider),
                         Arc::clone(&route_source),
                         Arc::clone(&fqdn_cache),
                         rule_scope_provider,
                     )
                     .with_binding_heal_persist(binding_heal_persist)
+                    .with_binding_anchor_persist(binding_anchor_persist)
+                    .with_local_network_policy(local_network_policy)
                     .with_bootstrap_server_persistence(server_ip_persist, server_ip_loader)
                     .with_pause_state(pause_reader)
                     .with_liveness_probe(
@@ -606,7 +688,10 @@ pub(crate) fn build_supervised_runtime_deps(
                     // Reactive VPN-endpoint learning — fold role-verified
                     // learned server IPs into the kill-switch/fail-closed
                     // exemption bands alongside the route-observed set.
-                    .with_learned_vpn_endpoints(Arc::clone(&learned_vpn_endpoints)),
+                    .with_learned_vpn_endpoints(Arc::clone(&learned_vpn_endpoints))
+                    // So "your rules are not in force, and here is why" reaches
+                    // the GUI banner and the tray instead of only the log.
+                    .with_event_bus(Arc::clone(&event_bus)),
                 );
                 // The rule-hostname seeder resolves the active user's
                 // `ExactFqdn` rule hostnames into the FQDN cache so domain
@@ -648,7 +733,12 @@ pub(crate) fn build_supervised_runtime_deps(
                         nrr_service_runtime::app_destination_memory::AppDestinationMemory::new(
                             nrr_service_runtime::app_observation_lookup::global_app_observations(),
                             Arc::clone(&rules_provider),
-                            Arc::clone(&seeder_active_sid),
+                            {
+                                // One console user here; the neutral type takes
+                                // a list because other platforms have several.
+                                let active = Arc::clone(&seeder_active_sid);
+                                Arc::new(move || active().into_iter().collect())
+                            },
                             {
                                 let conn = Arc::clone(state_conn);
                                 Arc::new(move |app: &str, ips: &[std::net::Ipv4Addr], now| {
@@ -772,7 +862,24 @@ pub(crate) fn build_supervised_runtime_deps(
                     // below, so a Save flips this gate live, no restart.
                     .with_isp_block_candidates_flag(
                         nrr_service_runtime::auto_rules::global_isp_block_candidates_enabled(),
-                    ),
+                    )
+                    // Suggestions wait for the additional route: with it down
+                    // every address already travels the main link, so there is
+                    // no half-loaded page to offer a fix for. Same resolve the
+                    // reconcile does, once per 10 s tick.
+                    .with_refusing_anchors({
+                        let conn = Arc::clone(state_conn);
+                        Arc::new(move |sid: &str| {
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            nrr_storage::refusing_anchors::RefusingAnchorsRepository::new(&guard)
+                                .list_for_sid(sid)
+                                .unwrap_or_default()
+                        })
+                    })
+                    .with_secondary_ready({
+                        let coord = Arc::clone(&route_coord);
+                        Arc::new(move |sid: &str| coord.resolve_egress_ifindexes(sid).1.is_some())
+                    }),
                 );
                 let observe_consumer = Arc::new(
                     nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer::new(
@@ -901,6 +1008,11 @@ pub(crate) fn build_supervised_runtime_deps(
                         artifacts.topology.data_dir.join("wfp-filters.ledger"),
                     ),
                 );
+                // The DNS refresher is built much further down (it needs the
+                // cache and the egress policy), so the apply path reaches it
+                // through a slot filled once that construction lands.
+                let dns_resolve_slot = Arc::clone(&dns_resolve_now_slot);
+                let dns_resolve_busy = Arc::clone(&dns_resolve_now_busy);
                 let orch = Arc::new(
                         PerSidApplyOrchestrator::new(
                             Arc::new(session),
@@ -995,6 +1107,13 @@ pub(crate) fn build_supervised_runtime_deps(
                                 }
                             })
                         })
+                        // Break the connections a newly enforced destination
+                        // inherited: a socket opened before the rule keeps its
+                        // interface for life, so the page the user just added a
+                        // rule for would otherwise finish over the old link.
+                        .with_stale_flow_reset(Arc::new(
+                            nrr_platform_windows::stale_flows::WindowsStaleFlowReset::new(),
+                        ))
                         // Proactive VPN-client exemption: fold
                         // the verified client paths into the block-all app
                         // exemption set on every compute, so a known client is
@@ -1002,6 +1121,50 @@ pub(crate) fn build_supervised_runtime_deps(
                         .with_vpn_client_apps_provider({
                             let registry = Arc::clone(&learned_vpn_client_apps);
                             Arc::new(move || registry.current())
+                        })
+                        // A rule can name a host nothing has resolved yet — the
+                        // browser tab that prompted it is sitting on an
+                        // established socket and will never ask DNS again. Ask
+                        // for those names ourselves, off this thread: the
+                        // addresses land in the cache, the next reconcile builds
+                        // the pins, and its teardown breaks the stale sockets.
+                        .with_unresolved_hosts_sink({
+                            let slot = Arc::clone(&dns_resolve_slot);
+                            let busy = Arc::clone(&dns_resolve_busy);
+                            Arc::new(move |hosts: Vec<String>| {
+                                let Some(refresher) = slot.get().map(Arc::clone) else {
+                                    return;
+                                };
+                                if busy
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        std::sync::atomic::Ordering::AcqRel,
+                                        std::sync::atomic::Ordering::Acquire,
+                                    )
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                                let busy_done = Arc::clone(&busy);
+                                let spawned = std::thread::Builder::new()
+                                    .name("nrr-rule-host-resolve".to_string())
+                                    .spawn(move || {
+                                        let summary = refresher
+                                            .resolve_now(&hosts, std::time::SystemTime::now());
+                                        tracing::info!(
+                                            target: "nrr::dns",
+                                            attempted = summary.attempted,
+                                            succeeded = summary.succeeded,
+                                            "resolved rule hosts that had no confirmed address — enforcement picks them up on the next reconcile",
+                                        );
+                                        busy_done
+                                            .store(false, std::sync::atomic::Ordering::Release);
+                                    });
+                                if spawned.is_err() {
+                                    busy.store(false, std::sync::atomic::Ordering::Release);
+                                }
+                            })
                         })
                         // Fake-IP: the WFP additions (pool permit +
                         // UDP block, real-/32 suppression, real-IP hard-blocks)
@@ -1553,8 +1716,9 @@ pub(crate) fn build_supervised_runtime_deps(
         // tick already owns (never a second connection to
         // `nrr_traffic_stats.db`). `None` when the traffic sampler itself
         // failed to open — the probe still runs, it just does not persist.
-        let mut adapters_snapshot_provider =
-            MonitoredAdaptersSnapshotProvider::new(Arc::clone(&api));
+        let mut adapters_snapshot_provider = MonitoredAdaptersSnapshotProvider::new(
+            Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+        );
         if let Some(sampler) = traffic_sampler.as_ref() {
             adapters_snapshot_provider = adapters_snapshot_provider.with_address_recorder(
                 Arc::new(
@@ -1570,7 +1734,15 @@ pub(crate) fn build_supervised_runtime_deps(
             health,
             policy,
             Arc::new(adapters_snapshot_provider) as Arc<dyn AdaptersSnapshotProvider>,
-            Arc::new(ProductionRulesSnapshotProvider::new(Arc::clone(conn)))
+            Arc::new(
+                ProductionRulesSnapshotProvider::new(Arc::clone(conn))
+                    .with_main_route_verdicts(Arc::clone(&main_route_verdicts))
+                    // So an application rule can show what it is holding: the
+                    // same store the codegen turns into host routes.
+                    .with_app_observations(
+                        nrr_service_runtime::app_observation_lookup::global_app_observations(),
+                    ),
+            )
                 as Arc<dyn RulesSnapshotProvider>,
             diagnostics,
             // ProductionMutationExecutor handles RulesUpdate
@@ -2003,6 +2175,76 @@ pub(crate) fn build_supervised_runtime_deps(
         // mechanism as the boot / block-all-edge flushes).
         deps = deps
             .with_dns_cache_control(Arc::new(nrr_platform_windows::WindowsDnsCacheControl::new()));
+        // Local networks under the kill-switch: the same coordinator that
+        // computes the exemptions also answers what it discovered, so the list
+        // the user ticks and the set the enforcement applies cannot drift.
+        // "Does this address answer on the main link?" — asked when the user
+        // presses Check. Bounded by their own limits; the verdicts travel the
+        // same health channel observed traffic uses.
+        if let (Some(engine), Some(coord), Some(cache_arc), Some(conn_for_probe)) = (
+            auto_rules_engine.as_ref(),
+            route_coordinator.as_ref(),
+            cache_store.as_ref(),
+            settings_conn.as_ref(),
+        ) {
+            let fqdn_for_probe: Arc<dyn FqdnCacheLookup> = Arc::new(SqliteFqdnCacheLookup::new(
+                Arc::clone(cache_arc),
+                FreshnessThresholds::default_production(),
+            ));
+            deps = deps.with_auto_rule_probe(Arc::new(
+                nrr_service_runtime::production_auto_rule_probe::ProductionAutoRuleProbe::new(
+                    Arc::clone(engine),
+                    fqdn_for_probe,
+                    Arc::clone(coord),
+                    Arc::new(
+                        nrr_service_runtime::primary_path_probe::PrimaryPathProber::new(Arc::new(
+                            nrr_service_runtime::primary_path_probe::SystemPrimaryPathProbe,
+                        )),
+                    ),
+                    {
+                        // The user's own bounds, clamped by `ProbeLimits::new`
+                        // — a stored value can widen nothing.
+                        let conn = Arc::clone(conn_for_probe);
+                        Arc::new(move |sid: &str| {
+                            use nrr_service_runtime::primary_path_probe::ProbeLimits;
+                            let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                            let repo =
+                                nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+                            match repo.load_for_sid(sid) {
+                                Ok(record) => ProbeLimits::new(
+                                    std::time::Duration::from_millis(u64::from(
+                                        record.primary_probe_timeout_ms,
+                                    )),
+                                    record.primary_probe_max_targets as usize,
+                                    std::time::Duration::from_secs(u64::from(
+                                        record.primary_probe_repeat_secs,
+                                    )),
+                                ),
+                                Err(_) => ProbeLimits::default(),
+                            }
+                        })
+                    },
+                )
+                .with_verdicts(Arc::clone(&main_route_verdicts)),
+            ));
+        }
+        // The one fact about a routed site nothing here can measure: the user
+        // says it, and it only ever un-quietens that site's companions.
+        if let Some(conn) = settings_conn.as_ref() {
+            deps = deps.with_refusing_anchors(Arc::new(
+                nrr_service_runtime::production_local_networks::ProductionRefusingAnchors::new(
+                    Arc::clone(conn),
+                ),
+            ));
+        }
+        if let (Some(conn), Some(coord)) = (settings_conn.as_ref(), route_coordinator.as_ref()) {
+            deps = deps.with_local_networks(Arc::new(
+                nrr_service_runtime::production_local_networks::ProductionLocalNetworks::new(
+                    Arc::clone(coord),
+                    Arc::clone(conn),
+                ),
+            ));
+        }
         // Wire the third-party binary inspector so the GUI
         // can show the user WHERE the shipped Wintun driver is, its SHA-256 and
         // who signed it, rather than only asserting that it is genuine.
@@ -2068,6 +2310,11 @@ pub(crate) fn build_supervised_runtime_deps(
         // through IPC silences the very next matching episode.
         if let Some(store) = block_notice_mute_store.clone() {
             deps = deps.with_block_notice_mutes(store, Arc::clone(&block_notice_center));
+        }
+        // The SAME backlog the centre appends to, so a surface reads what the
+        // drop path recorded.
+        if let Some(store) = block_notice_journal_store.clone() {
+            deps = deps.with_block_notice_journal(store);
         }
         // "Route this blocked host" — the SAME author the companion-domain
         // engine's accept path uses.
@@ -2141,6 +2388,12 @@ pub(crate) fn build_supervised_runtime_deps(
                 );
             Arc::new(DnsRefreshOrchestrator::new(resolver, Arc::clone(cache_arc)))
         });
+    // Hand the refresher to the apply path (see `with_unresolved_hosts_sink`).
+    // Before this point a rule naming an unresolved host simply waits for the
+    // ordinary refresh, which is the old behaviour.
+    if let Some(refresher) = dns_refresh_orchestrator.as_ref() {
+        let _ = dns_resolve_now_slot.set(Arc::clone(refresher));
+    }
 
     // ── Diagnostics cleanup wiring ──────────────────────────────────────
     let logs_dir: PathBuf = artifacts.topology.logs_dir.clone();
@@ -2249,6 +2502,12 @@ pub(crate) fn build_supervised_runtime_deps(
             // reconcile below (a paused SID's filters must never reinstall
             // from a periodic tick).
             let pause = pause_coordinator.clone();
+            // The IPv6 route table, written to the log whenever it CHANGES.
+            // This hook already fires on every adapter/network change, so it is
+            // the cheapest honest place to notice one; the logger itself stays
+            // silent while the table is stable.
+            let v6_routes = Arc::new(nrr_service_runtime::ipv6_route_log::Ipv6RouteTableLog::new());
+            let v6_api = Arc::clone(&api);
             Arc::new(move || {
                 // A recompute that lands after the stop teardown stripped the
                 // filters puts them back into a process that is about to exit —
@@ -2256,6 +2515,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 if nrr_service_runtime::teardown_in_progress() {
                     return;
                 }
+                v6_routes.log_if_changed(v6_api.as_ref(), "network-change");
                 let tray_active = registry.active_sids();
                 // Enforce for the effective routing
                 // user even with NO tray connected (console-session user,
@@ -2366,13 +2626,16 @@ pub(crate) fn build_supervised_runtime_deps(
                         }
                     }
                 }
+                // A new link usually means a new resolver, and the old one can
+                // keep answering while pointing at the network we just left.
+                // Rate-limited inside the pool. Runs BEFORE the watchdog so an
+                // upstream that just appeared clears the re-arm backoff in the
+                // same pass instead of the tick after next.
+                let upstream = upstream_dns_pool().note_network_change();
+                dns_ctl.note_upstream_present(upstream.is_some());
                 // Mode-B resolver watchdog (see above): re-arm the
                 // resolver if it is enabled but its serve thread has died.
                 dns_ctl.tick();
-                // A new link usually means a new resolver, and the old one can
-                // keep answering while pointing at the network we just left.
-                // Rate-limited inside the pool.
-                upstream_dns_pool().note_network_change();
             }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
         });
 
@@ -2623,7 +2886,50 @@ pub(crate) fn build_supervised_runtime_deps(
         active_routing_sid.as_ref(),
         conn_trace_ndjson,
         conn_trace_ring.clone(),
-        fcrdns_hook,
+        ObservationSinks {
+            reverse_dns_learner_tx: fcrdns_hook,
+            app_destination_forget: settings_conn.as_ref().map(|conn| {
+            let conn = Arc::clone(conn);
+            Arc::new(move |app: &str, ip: std::net::Ipv4Addr| {
+                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                if let Err(e) =
+                    nrr_storage::app_destinations::AppDestinationsRepository::new(&guard)
+                        .forget(app, ip)
+                {
+                    tracing::warn!(
+                        target: "nrr::app-routing",
+                        error = %e,
+                        "failed to delete a withdrawn application destination — it will age out of the freshness window instead",
+                    );
+                }
+            })
+                    as nrr_service_runtime::conn_observation_consumer::AppDestinationForgetFn
+            }),
+            // Read fresh on every batch, so a rule the user just added or
+            // removed changes what may own a pin without a restart.
+            routed_apps: match (settings_conn.as_ref(), active_routing_sid.as_ref()) {
+                (Some(conn), Some(active_sid)) => {
+                    let rules: Arc<dyn nrr_service_runtime::per_sid_orchestrator::RulesProvider> =
+                        Arc::new(ProductionRulesProvider::new(Arc::clone(conn)));
+                    let active_sid = Arc::clone(active_sid);
+                    Some(Arc::new(move || {
+                        let Some(sid) = active_sid() else {
+                            return Vec::new();
+                        };
+                        let Some(snapshot) = rules.active_rules_for(&sid) else {
+                            return Vec::new();
+                        };
+                        nrr_service_runtime::app_destination_memory::routed_app_patterns(
+                            &snapshot.rule_book.secondary,
+                        )
+                        .into_iter()
+                        .collect()
+                    })
+                        as nrr_service_runtime::conn_observation_consumer::RoutedAppsFn)
+                }
+                _ => None,
+            },
+        },
         VpnLearningDeps {
             learned_vpn_endpoints: &learned_vpn_endpoints,
             killswitch_drop_registry: &killswitch_drop_registry,
@@ -2649,13 +2955,18 @@ pub(crate) fn build_supervised_runtime_deps(
     // crashed Resolver session may have left (a dead :53 would break ALL DNS),
     // regardless of the current mode, then arm the local resolver iff the
     // persisted mode is Resolver.
-    if let Err(e) = nrr_platform_windows::dns_redirect::clear_orphan_redirect(
+    match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
         &nrr_platform_windows::dns_redirect::PowerShellRunner,
     ) {
-        tracing::warn!(
+        Ok(removed) => tracing::info!(
+            target: "nrr::dns-resolver",
+            removed,
+            "startup: orphaned NRPT redirect sweep finished",
+        ),
+        Err(e) => tracing::warn!(
             target: "nrr::dns-resolver",
             "Mode B: orphan NRPT cleanup at boot failed ({e})",
-        );
+        ),
     }
     // Install the platform resolver factory now that the cache / routing-SID /
     // recompute-hook inputs exist, and read the persisted boot mode. The factory
@@ -2733,6 +3044,31 @@ pub(crate) fn build_supervised_runtime_deps(
         let controller = Arc::clone(&fake_ip_controller);
         Arc::new(move || controller.is_running())
     };
+    // Second gate, for SCOPE hosts only (the ones the relay carries over the
+    // additional route). A running stack whose secondary is unresolved refuses
+    // every such dial — "dialing would leak via the primary link" — so the
+    // virtual address it handed out is a guaranteed reset. A cold boot hits
+    // exactly that: the service arms while the VPN client is still starting,
+    // and every rule host gets a fake address nothing can carry. The real
+    // addresses were resolved and cached a moment earlier, so falling back to
+    // them leaves enforcement to WFP, which blocks or pins them by policy
+    // instead of resetting the client.
+    //
+    // Deliberately NOT folded into `fake_ip_running`: direct and collateral
+    // fake-IP relay over the PRIMARY link and must keep working while the
+    // additional route is down.
+    let fake_ip_secondary_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+        match (route_coordinator.as_ref(), active_routing_sid.as_ref()) {
+            (Some(coord), Some(sid)) => {
+                let source = Arc::new(CoordinatorRelaySourceAddrs {
+                    coordinator: Arc::clone(coord),
+                    active_sid: Arc::clone(sid),
+                    cache: Mutex::new(None),
+                });
+                Some(Arc::new(move || source.current().1.is_some()))
+            }
+            _ => None,
+        };
     // Pre-seed the fake-IP exclusion set with the previously learned VPN
     // servers, so the first VPN connect of THIS session goes direct instead of
     // paying one failed relay round to re-learn them.
@@ -2842,6 +3178,7 @@ pub(crate) fn build_supervised_runtime_deps(
         block_all_armed,
         Some(Arc::clone(&fake_ip_assembly)),
         Some(Arc::clone(&fake_ip_running)),
+        fake_ip_secondary_ready,
         dns_egress_policy,
         auto_rules_engine.clone(),
     ) {
@@ -3010,6 +3347,11 @@ pub(crate) fn build_supervised_runtime_deps(
         log_retention,
         cleanup_scope,
         state_db_conn: settings_conn,
+        // Windows enforces through `PerSidApplyOrchestrator`, which owns its own
+        // trigger (activation, drift, adapter change) rather than a poll. Wiring
+        // the neutral cycle beside it would give one machine two authorities on
+        // what is applied, and the losing one would still be writing filters.
+        principal_enforcement: None,
         traffic_tick,
         activation_coordinator,
         dns_refresh_orchestrator,
@@ -3036,6 +3378,18 @@ pub(crate) fn build_supervised_runtime_deps(
         rebind_requests: Some(rebind_requests),
         secondary_liveness_hook,
         secondary_external_address,
+        // Windows learns application destinations and resolutions through the
+        // observation CONSUMERS above (WFP net-events and ETW), which do more
+        // than fold addresses into a store — attribution, traces, collateral
+        // detection. These two ticks are the leaner path a platform without
+        // those sources uses instead; running both would record every
+        // destination twice.
+        app_observation: None,
+        dns_observation: None,
+        // One console user at a time here, so the per-user tasks keep reading
+        // `active_routing_sid`. The list form exists for platforms where several
+        // people are logged in at once.
+        present_principals: None,
     }
 }
 
@@ -3104,6 +3458,14 @@ const CONN_OBSERVER_START_BUDGET: std::time::Duration = std::time::Duration::fro
 /// START_PENDING for good. Timing out costs enforcement (the apply layer drops to
 /// noop) and buys a service that is up, reachable over IPC and diagnosable.
 const WFP_OPEN_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long the offline sweep waits on the filtering engine.
+///
+/// Generous: a real sweep of a few thousand filters measures in seconds, and
+/// this runs when something is already wrong. Bounded all the same — the whole
+/// point of this tool is to rescue a machine whose engine may be the thing that
+/// is stuck, and a recovery command that hangs forever rescues nobody.
+const WFP_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How slow an engine open has to be before it is worth a line in the log. A
 /// healthy open is single-digit milliseconds.
@@ -3246,39 +3608,70 @@ fn strip_orphaned_block_filters_blocking() {
 /// non-elevated caller, which we detect via [`ErrorClass::PrivilegeRequired`]
 /// and turn into a "re-run elevated" message (no new `unsafe` token probe).
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
+    if sweep_orphaned_machine_state() {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::from(1)
+    }
+}
+
+/// The sweep itself. `false` means it could not finish — the caller decides
+/// whether that is fatal (the `cleanup` verb) or a warning to carry on past
+/// (uninstall, where leaving the service registered would be worse).
+pub(crate) fn sweep_orphaned_machine_state() -> bool {
     use nrr_platform_windows::ErrorClass;
 
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
 
     // ── WFP filter sweep (the lockout risk) ────────────────────────────
-    let session = match WfpSession::open(Arc::clone(&api)) {
-        Ok(s) => s,
+    // Opening the engine and sweeping it are one budgeted unit: both are RPC
+    // into the Base Filtering Engine, and a wedged engine answers neither. This
+    // command exists to rescue a machine that is already in trouble, so it must
+    // come back and say so rather than sit there.
+    //
+    // `cleanup_all` enumerates every filter under the NRR provider GUID and
+    // deletes it in one transaction (block AND permit) — the same sweep the
+    // orchestrator's `cleanup_wfp` runs, minus the in-memory tracked-id pass
+    // (there is no live orchestrator state to consult offline).
+    let swept = with_budget("WFP filter sweep", WFP_SWEEP_BUDGET, {
+        let api = Arc::clone(&api);
+        move || WfpSession::open(api).and_then(|session| session.cleanup_all())
+    });
+    let filters_removed = match swept {
+        Ok(n) => n,
         Err(e) if e.classify() == ErrorClass::PrivilegeRequired => {
             eprintln!(
                 "cleanup: access denied opening the WFP engine. Re-run from an elevated \
                  (Administrator) console (the `scripts/reset-network.ps1` wrapper \
                  self-elevates via UAC)."
             );
-            return std::process::ExitCode::from(1);
+            return false;
         }
-        Err(e) => {
-            eprintln!("cleanup: could not open the WFP engine: {e:?}");
-            return std::process::ExitCode::from(1);
+        Err(nrr_platform_windows::PlatformError::Transient {
+            operation: "budgeted start",
+            ..
+        }) => {
+            eprintln!(
+                "cleanup: the Windows Base Filtering Engine did not answer within \
+                 {} s — it is wedged, and nothing here can move it.",
+                WFP_SWEEP_BUDGET.as_secs()
+            );
+            eprintln!(
+                "  Our filters are not persistent: a REBOOT clears them and restores \
+                 the network. Restarting the `BFE` service first is worth a try."
+            );
+            return false;
         }
-    };
-    // `cleanup_all` enumerates every filter under the NRR provider GUID and
-    // deletes it in one transaction (block AND permit) — the same sweep the
-    // orchestrator's `cleanup_wfp` runs, minus the in-memory tracked-id pass
-    // (there is no live orchestrator state to consult offline).
-    let filters_removed = match session.cleanup_all() {
-        Ok(n) => n,
         Err(e) => {
             eprintln!("cleanup: WFP filter sweep failed: {e:?}");
-            return std::process::ExitCode::from(1);
+            return false;
         }
     };
-    // Release the engine handle before the route sweep (independent surface).
-    drop(session);
+
+    // Machine-wide Base Filtering Engine options. An instance that was killed
+    // rather than stopped never ran its own restore and left them changed; it
+    // wrote down what they held, which is what makes this possible from here.
+    nrr_platform_windows::conn_observe::wfp_events::restore_engine_options();
 
     // ── Route sweep (best-effort) ──────────────────────────────────────
     // Enumerate the live OS route table and adopt every route carrying our
@@ -3307,7 +3700,7 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
             } else {
                 let reconciler =
                     nrr_service_runtime::route_reconciler::SecondaryRouteReconciler::new(
-                        Arc::clone(&api),
+                        Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
                     );
                 reconciler.adopt_owned(orphans);
                 match reconciler.clear() {
@@ -3344,14 +3737,14 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
     let nrpt_cleared = match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
         &nrr_platform_windows::dns_redirect::PowerShellRunner,
     ) {
-        Ok(()) => true,
+        Ok(removed) => Some(removed),
         Err(e) => {
             eprintln!(
                 "cleanup: NRPT/DNS-redirect sweep failed ({e:?}); if DNS is broken, remove the \
                  rule manually (`Get-DnsClientNrptRule | Where Comment -eq \
                  'NetRuleRouter-ModeB-DnsRedirect' | Remove-DnsClientNrptRule -Force`) or reboot."
             );
-            false
+            None
         }
     };
 
@@ -3363,11 +3756,11 @@ pub(crate) fn run_offline_reset() -> std::process::ExitCode {
         None => println!("  routes removed: <sweep skipped — clears on reboot>"),
     }
     match nrpt_cleared {
-        true => println!("  DNS redirect (NRPT) rules: cleared"),
-        false => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
+        Some(n) => println!("  DNS redirect (NRPT) rules removed: {n}"),
+        None => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
     }
     println!("Reboot to fully clear any remainder.");
-    std::process::ExitCode::SUCCESS
+    nrpt_cleared.is_some()
 }
 
 /// Persist-on-stop — read the `routing_stop_policy` FRESH from
@@ -3549,6 +3942,24 @@ fn observed_path_to_win32(path: &str) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Optional hooks the connection observer feeds as it classifies a batch.
+/// Grouped because they arrive together and are wired from the same place —
+/// and because passing them loose put the builder over the argument limit.
+struct ObservationSinks {
+    /// When the FCrDNS worker is active, this sender is the drop hook: OUR
+    /// block of a routable V4 enqueues the IP for the worker to name +
+    /// forward-confirm. `None` disables reverse-learning.
+    reverse_dns_learner_tx: Option<std::sync::mpsc::SyncSender<(std::net::Ipv4Addr, bool)>>,
+    /// Deletes one remembered application destination. Wired when the state DB
+    /// is open: a destination withdrawn for moving another process's traffic
+    /// must not be re-seeded from disk at the next start.
+    app_destination_forget:
+        Option<nrr_service_runtime::conn_observation_consumer::AppDestinationForgetFn>,
+    /// The rule book's routed application patterns. Without it the collateral
+    /// check cannot tell a pin from an ordinary observation and stays silent.
+    routed_apps: Option<nrr_service_runtime::conn_observation_consumer::RoutedAppsFn>,
+}
+
 fn build_conn_trace_pair(
     api: &Arc<dyn WindowsApiPort>,
     route_coordinator: Option<
@@ -3557,15 +3968,17 @@ fn build_conn_trace_pair(
     active_routing_sid: Option<&nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn>,
     ndjson_on: bool,
     trace_ring: Option<Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>>,
-    // When the FCrDNS worker is active, this
-    // sender is the drop hook: OUR block of a routable V4 enqueues the IP for the
-    // worker to name + forward-confirm. `None` disables reverse-learning.
-    reverse_dns_learner_tx: Option<std::sync::mpsc::SyncSender<(std::net::Ipv4Addr, bool)>>,
+    sinks: ObservationSinks,
     vpn_learning: VpnLearningDeps<'_>,
 ) -> (
     Option<Arc<dyn nrr_platform_windows::conn_observe::ConnectionObservationSource>>,
     Option<Arc<nrr_service_runtime::conn_observation_consumer::ConnectionObservationConsumer>>,
 ) {
+    let ObservationSinks {
+        reverse_dns_learner_tx,
+        app_destination_forget,
+        routed_apps,
+    } = sinks;
     // The observer runs whenever the route path is available (it is a
     // passive kernel event subscription that also feeds app-routing's observed
     // app→IP store) and ALWAYS feeds the in-memory GUI ring, so "Show
@@ -3580,7 +3993,7 @@ fn build_conn_trace_pair(
     };
     let mut consumer_builder =
         nrr_service_runtime::conn_observation_consumer::ConnectionObservationConsumer::new(
-            Arc::clone(api),
+            Arc::clone(api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
             Arc::clone(coord),
             Arc::clone(active_sid),
             // Write to the on-disk NDJSON sink only when explicitly enabled;
@@ -3592,6 +4005,12 @@ fn build_conn_trace_pair(
         .with_app_observations(
             nrr_service_runtime::app_observation_lookup::global_app_observations(),
         );
+    if let Some(forget) = app_destination_forget {
+        consumer_builder = consumer_builder.with_app_destination_forget(forget);
+    }
+    if let Some(routed) = routed_apps {
+        consumer_builder = consumer_builder.with_routed_apps(routed);
+    }
     // Feed the connection-trace ring so the Diagnostics panel can read
     // recent connections (only wired when the GUI stream is on → ring is Some).
     if let Some(ring) = trace_ring {
@@ -3637,6 +4056,11 @@ fn build_conn_trace_pair(
         let scope_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
         consumer_builder = consumer_builder
             .with_killswitch_app_scope_check(Arc::new(move |id| scope_registry.is_app_scoped(id)));
+        // …and identifies the blanket IPv6 cut, so a drop of the closed family
+        // is announced as that instead of as one of the user's rules.
+        let v6_registry = Arc::clone(vpn_learning.killswitch_drop_registry);
+        consumer_builder = consumer_builder
+            .with_ipv6_cut_drop_check(Arc::new(move |id| v6_registry.is_ipv6_cut(id)));
         // The same posture the GUI banner reads decides how a drop is
         // EXPLAINED: while the block-all is armed, an outage is the cause.
         let posture = vpn_learning.block_all_posture.clone();
@@ -4465,6 +4889,9 @@ fn build_dns_resolver_factory(
     // gate. Both absent leaves Mode B exactly as before fake-IP.
     fake_assembly: Option<Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>>,
     fake_ip_running: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    // "Can the relay actually carry a scope host right now?" Absent leaves the
+    // scope answerer gated on the stack alone, as before.
+    fake_ip_secondary_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     // DNS-over-secondary policy. `None` (no route coordinator) leaves every
     // query on the captured primary upstream, exactly as before.
     egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
@@ -4488,6 +4915,7 @@ fn build_dns_resolver_factory(
                 block_all_armed.clone(),
                 fake_assembly.as_ref(),
                 fake_ip_running.clone(),
+                fake_ip_secondary_ready.clone(),
                 egress.clone(),
                 auto_rules.clone(),
             )
@@ -4918,6 +5346,7 @@ fn build_dns_resolver_instance(
     block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fake_assembly: Option<&Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>>,
     fake_ip_running: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    fake_ip_secondary_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverService> {
@@ -5032,10 +5461,19 @@ fn build_dns_resolver_instance(
         let running = fake_ip_running
             .clone()
             .unwrap_or_else(|| Arc::new(|| false) as Arc<dyn Fn() -> bool + Send + Sync>);
+        // Scope hosts ride the additional route, so they need the relay to be
+        // able to dial there — see `fake_ip_secondary_ready`.
+        let scope_gate: Arc<dyn Fn() -> bool + Send + Sync> = match fake_ip_secondary_ready {
+            Some(ready) => {
+                let running_for_scope = Arc::clone(&running);
+                Arc::new(move || running_for_scope() && ready())
+            }
+            None => Arc::clone(&running),
+        };
         let answerer: Arc<dyn nrr_service_runtime::dns_resolver::FakeIpAnswerer> =
             Arc::new(nrr_service_runtime::dns_resolver::GatedFakeIpAnswerer::new(
                 Arc::new(assembly.answerer()),
-                Arc::clone(&running),
+                scope_gate,
             ));
         listener = listener.with_fake_ip(answerer);
         if let Some(block_armed) = block_all_armed.clone() {

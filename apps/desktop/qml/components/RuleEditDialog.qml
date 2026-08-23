@@ -39,7 +39,7 @@ Dialog {
     // true on Add; carries existing state on Edit.
     property bool localEnabled: true
     // Grandfather flag: `block` is no longer an offerable route for new
-    // Free rules (it moved to Pro). When Edit opens on a pre-existing block
+    // Free rules (it was removed). When Edit opens on a pre-existing block
     // rule we keep the option in the target-route combo so saving doesn't
     // silently downgrade it to `primary`. Latched in resetForEdit(), so the
     // combo model stays stable for the whole dialog session.
@@ -120,6 +120,20 @@ Dialog {
         if (root.platformProfile.os === "macos") return "application-macos"
         return "application-windows"
     }
+    /// One sentence naming the hosts the rule on screen will match, with the
+    /// machine-wide subdomain setting folded in.
+    function _coverageHint() {
+        var v = String(localValue || "")
+        var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
+        if (v.indexOf("*.") === 0 || root.prefs.routeIncludeSubdomains !== false) {
+            return root.tr("dialog.rule.coverage-with-subdomains",
+                "Covers {host} and every subdomain of it.").replace("{host}", bare)
+        }
+        return root.tr("dialog.rule.coverage-exact-only",
+            "Covers {host} only. Type *.{host} to include its subdomains.")
+            .replace(/\{host\}/g, bare)
+    }
+
     function matchValueKeySuffix(ruleType) {
         if (ruleType === "application") return applicationPlatformKey()
         return ruleType
@@ -405,6 +419,36 @@ Dialog {
                     "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.")
                 : ""
         }
+        // What this rule will actually cover, spelled out. A bare
+        // `example.com` is an exact host on its own; subdomains come from the
+        // "Treat a domain as domain + *.domain" setting, which ships ON. A
+        // user cannot be expected to hold that in their head while typing, and
+        // the answer changes with a setting they may have turned off.
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            color: root.mutedTextColor
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            visible: ruleDialog.localRuleType === "domain"
+                && ruleDialog.localValue !== ""
+                && ruleDialog.isMatchValueValid(ruleDialog.localRuleType, ruleDialog.localValue)
+            text: root.uiRevision >= 0 ? ruleDialog._coverageHint() : ""
+        }
+        // Offered ONLY when subdomain coverage is off machine-wide: with the
+        // setting on, a "without subdomains" choice would be a lie — the
+        // service expands every bare domain anyway.
+        CheckBox {
+            Layout.fillWidth: true
+            visible: ruleDialog.localRuleType === "domain"
+                && root.prefs.routeIncludeSubdomains === false
+            checked: ruleDialog.localValue.indexOf("*.") === 0
+            text: root.tr("dialog.rule.include-subdomains", "Include subdomains")
+            onToggled: {
+                var v = ruleDialog.localValue
+                var bare = v.indexOf("*.") === 0 ? v.substring(2) : v
+                matchValueField.text = checked ? ("*." + bare) : bare
+            }
+        }
         // Inline validation message — visible only when the field has
         // text but fails the strict per-type check. Blank value is
         // simply "incomplete" and not flagged as an error.
@@ -455,8 +499,10 @@ Dialog {
                 ruleDialog.localComment = text
             }
             maximumLength: ruleDialog.commentMaxLength
-            placeholderText: (root.uiRevision, root.tr("rules.comment.max-length",
-                "Up to {max} characters").replace("{max}", ruleDialog.commentMaxLength))
+            placeholderText: root.uiRevision >= 0
+                ? root.tr("rules.comment.max-length",
+                    "Up to {max} characters").replace("{max}", ruleDialog.commentMaxLength)
+                : ""
         }
         // Enabled toggle. Disabled rules stay in the
         // rules file (and on disk) but are NOT applied to routing.

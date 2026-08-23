@@ -75,6 +75,7 @@ mod tests {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
             caller_principal: None,
+            caller_pid: None,
         }
     }
 
