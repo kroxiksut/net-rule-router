@@ -422,6 +422,12 @@ pub type BindingHealPersistFn = Arc<dyn Fn(&str, &str, &str, &str) + Send + Sync
 pub struct LocalNetworkPolicy {
     pub allowed: Vec<Ipv4Network>,
     pub refused: Vec<Ipv4Network>,
+    /// The same answers keyed by the adapter they were given about, as
+    /// `(adapter, allowed)`. A hypervisor switch renumbers its segment on every
+    /// host reboot; without this the answer would apply to a network that no
+    /// longer exists and the settings screen would promise what enforcement
+    /// does not do.
+    pub adapter_answers: Vec<(String, bool)>,
 }
 
 /// Reads [`LocalNetworkPolicy`] for a principal. A closure over the state DB at
@@ -1498,21 +1504,43 @@ impl SecondaryRouteCoordinator {
         secondary_ifindex: Option<u32>,
         out: &mut Vec<(Ipv4Addr, u8)>,
     ) {
-        if let Ok(adapters) = self.api.get_adapter_infos() {
-            for subnet in crate::route_reconciler::virtual_machine_local_subnets(
-                routes,
-                &adapters,
-                secondary_ifindex,
-            ) {
-                if !out.contains(&subnet) {
-                    out.push(subnet);
-                }
+        let adapters = self.api.get_adapter_infos().unwrap_or_default();
+        for subnet in crate::route_reconciler::virtual_machine_local_subnets(
+            routes,
+            &adapters,
+            secondary_ifindex,
+        ) {
+            if !out.contains(&subnet) {
+                out.push(subnet);
             }
         }
         let Some(policy) = self.local_networks.as_ref().map(|read| read(sid)) else {
             return;
         };
-        for network in &policy.allowed {
+        // An answer was given about an ADAPTER, so it carries over to whatever
+        // segment that adapter holds now. A refusal outranks a confirmation
+        // through the retain below, which is the direction that never reopens
+        // something the user closed.
+        let mut allowed = policy.allowed.clone();
+        let mut refused = policy.refused.clone();
+        for (adapter, allow) in &policy.adapter_answers {
+            for info in adapters
+                .iter()
+                .filter(|info| preferred_display_name(info) == adapter)
+            {
+                for (net, prefix) in primary_local_subnets(routes, info.index) {
+                    let Some(network) = Ipv4Network::new(net, prefix) else {
+                        continue;
+                    };
+                    if *allow {
+                        allowed.push(network);
+                    } else {
+                        refused.push(network);
+                    }
+                }
+            }
+        }
+        for network in &allowed {
             let pair = (network.network(), network.prefix_len());
             if !out.contains(&pair) {
                 out.push(pair);
@@ -1521,8 +1549,7 @@ impl SecondaryRouteCoordinator {
         // Compared as NETWORKS, not as pairs: the route table and the user's
         // text can spell the same network differently.
         out.retain(|(net, prefix)| {
-            Ipv4Network::new(*net, *prefix)
-                .is_none_or(|candidate| !policy.refused.contains(&candidate))
+            Ipv4Network::new(*net, *prefix).is_none_or(|candidate| !refused.contains(&candidate))
         });
     }
 

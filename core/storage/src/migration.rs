@@ -45,8 +45,8 @@ use crate::schema::{
     STATE_DB_V43_DDL, STATE_DB_V44_DDL, STATE_DB_V45_DDL, STATE_DB_V46_DDL, STATE_DB_V47_DDL,
     STATE_DB_V48_DDL, STATE_DB_V49_DDL, STATE_DB_V4_DDL, STATE_DB_V50_DDL, STATE_DB_V51_DDL,
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
-    STATE_DB_V57_DDL, STATE_DB_V5_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
-    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
+    STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V5_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL,
+    STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
 };
 
 // ── schema_migrations bootstrap DDL ──────────────────────────────────────────
@@ -568,6 +568,13 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         version: 57,
         name: "add_block_notice_journal",
         stmts: STATE_DB_V57_DDL,
+    },
+    // A local-network answer follows its ADAPTER, not the segment number a
+    // hypervisor switch reassigns on every reboot.
+    MigrationDef {
+        version: 58,
+        name: "add_local_network_adapter",
+        stmts: STATE_DB_V58_DDL,
     },
 ];
 
@@ -1266,7 +1273,7 @@ mod tests {
         // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
         // + v49 (block_notice_mutes table — durable "do not show" choices)
         // + v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(s.to_version, 57);
+        assert_eq!(s.to_version, 58);
         assert_eq!(
             s.migrations_applied,
             [
@@ -1327,6 +1334,7 @@ mod tests {
                 "add_refusing_anchors",
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
+                "add_local_network_adapter",
             ]
         );
     }
@@ -1338,8 +1346,8 @@ mod tests {
 
         runner.run_pending_migrations().expect("first run");
         let s = runner.run_pending_migrations().expect("second run");
-        assert_eq!(s.from_version, 57);
-        assert_eq!(s.to_version, 57);
+        assert_eq!(s.from_version, 58);
+        assert_eq!(s.to_version, 58);
         assert!(s.migrations_applied.is_empty());
     }
 
@@ -1365,7 +1373,7 @@ mod tests {
         let v = runner.verify_schema().expect("verify");
         assert!(v.is_ok(), "state schema verification failed: {v:?}");
         // through v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(v.version, 57);
+        assert_eq!(v.version, 58);
     }
 
     #[test]
@@ -1665,7 +1673,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
         assert_eq!(summary.from_version, 1);
-        assert_eq!(summary.to_version, 57);
+        assert_eq!(summary.to_version, 58);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1725,6 +1733,7 @@ mod tests {
                 "add_refusing_anchors",
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
+                "add_local_network_adapter",
             ]
         );
 
@@ -1760,7 +1769,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
         assert_eq!(summary.from_version, 2);
-        assert_eq!(summary.to_version, 57);
+        assert_eq!(summary.to_version, 58);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1819,6 +1828,7 @@ mod tests {
                 "add_refusing_anchors",
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
+                "add_local_network_adapter",
             ]
         );
 

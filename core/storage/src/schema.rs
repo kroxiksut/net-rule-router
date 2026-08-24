@@ -1705,11 +1705,10 @@ pub const STATE_DB_V52_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS auto_rule_ev
 /// Per-principal decisions about LOCAL networks under the kill-switch —
 /// `local_network_rules`.
 ///
-/// Holds only what DIFFERS from the automatic answer: a hypervisor segment the
-/// user does not want exempted (`allow = 0`), or a network we cannot discover
-/// at all and the user named themselves (`allow = 1`, `origin = 'manual'`). The
-/// discovered-and-accepted case stores nothing, so a machine whose virtual
-/// networks come and go does not accumulate rows.
+/// One row per answer the user gave: a hypervisor segment they do not want
+/// exempted (`allow = 0`), a network we cannot discover at all and they named
+/// themselves (`origin = 'manual'`), or a plain confirmation of a discovered
+/// one — stored too, because an answer that leaves no trace is asked again.
 /// Purely additive CREATE. DEV schema; wiped freely.
 pub const STATE_DB_V53_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS local_network_rules (
     sid        TEXT    NOT NULL,
@@ -1778,6 +1777,22 @@ pub const STATE_DB_V57_DDL: &[&str] = &[
 )",
     "CREATE INDEX IF NOT EXISTS idx_block_notice_journal_sid
      ON block_notice_journal(sid, id)",
+];
+
+/// The adapter a local-network decision belongs to — v58.
+///
+/// A hypervisor switch renumbers its segment on every host reboot, so an answer
+/// keyed by network alone dies with the network and the same question comes
+/// back the next day. Keyed by adapter it survives the renumbering.
+///
+/// The DELETE drops the rows that cannot carry an adapter: a discovered network
+/// the user confirmed is a confirmation of the automatic answer, and without an
+/// adapter to inherit through it holds nothing. Refusals are kept — losing one
+/// would silently reopen a segment the user closed.
+/// DEV schema; wiped freely.
+pub const STATE_DB_V58_DDL: &[&str] = &[
+    "ALTER TABLE local_network_rules ADD COLUMN adapter TEXT NOT NULL DEFAULT ''",
+    "DELETE FROM local_network_rules WHERE origin = 'discovered' AND allow = 1",
 ];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

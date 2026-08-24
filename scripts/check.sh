@@ -97,7 +97,9 @@ check_comment_hygiene() {
 cyan "[check] NetRuleRouter workspace quality baseline"
 
 cyan "[check] sync duplicates"
-"$script_dir/clean-sync-duplicates.sh"
+# Through `bash`, like CI invokes this script: the .sh files are recorded in
+# git without an executable bit, so a direct call fails on a fresh checkout.
+bash "$script_dir/clean-sync-duplicates.sh"
 
 cyan "[check] comment hygiene: no task references or dates in comments"
 check_comment_hygiene

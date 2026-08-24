@@ -1,17 +1,16 @@
-//! Per-principal exceptions for LOCAL networks under the kill-switch.
+//! Per-principal answers about LOCAL networks under the kill-switch.
 //!
 //! The service already exempts what it can recognise on its own: the main
-//! link's own subnets and the host-side segments of hypervisor adapters. This
-//! table holds only the DIFFERENCES from that answer, and there are exactly
-//! two:
+//! link's own subnets and the host-side segments of hypervisor adapters. A row
+//! here is the user's ANSWER about one of those, or about a network no
+//! interface names at all (a hypervisor in NAT mode creates none) — which is
+//! why a plain confirmation is stored too: without it the offer would come back
+//! every time.
 //!
-//! - a discovered segment the user does not want exempted (`allow = false`);
-//! - a network the service cannot discover at all, named by the user
-//!   (`allow = true`, `origin = Manual`) — a hypervisor in NAT mode creates no
-//!   host interface, so nothing in the route table names its network.
-//!
-//! Storing only the differences is what keeps a laptop whose virtual networks
-//! come and go from accumulating rows for segments it already handles right.
+//! Each row carries the ADAPTER it was decided about. A hypervisor switch
+//! renumbers its segment on every host reboot, and an answer keyed by the
+//! network alone dies with the number — the same question every day, one dead
+//! row per day. Keyed by adapter it survives the renumbering.
 
 use rusqlite::{params, Connection};
 
@@ -49,6 +48,9 @@ pub struct LocalNetworkRule {
     pub cidr: String,
     pub allow: bool,
     pub origin: LocalNetworkOrigin,
+    /// Adapter the network belonged to when the answer was given. Empty for a
+    /// network the user typed in, since nothing on the machine names one.
+    pub adapter: String,
 }
 
 pub struct LocalNetworkRulesRepository<'a> {
@@ -66,7 +68,7 @@ impl<'a> LocalNetworkRulesRepository<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT cidr, allow, origin FROM local_network_rules
+                "SELECT cidr, allow, origin, adapter FROM local_network_rules
                  WHERE sid = ?1 ORDER BY cidr",
             )
             .map_err(|e| StorageError::Internal(format!("local networks prepare: {e}")))?;
@@ -76,12 +78,13 @@ impl<'a> LocalNetworkRulesRepository<'a> {
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)? != 0,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .map_err(|e| StorageError::Internal(format!("local networks query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (cidr, allow, origin) =
+            let (cidr, allow, origin, adapter) =
                 row.map_err(|e| StorageError::Internal(format!("local networks row: {e}")))?;
             // An origin this build does not know is a row from a newer schema:
             // drop it rather than guess what it meant.
@@ -90,6 +93,7 @@ impl<'a> LocalNetworkRulesRepository<'a> {
                     cidr,
                     allow,
                     origin,
+                    adapter,
                 });
             }
         }
@@ -106,22 +110,48 @@ impl<'a> LocalNetworkRulesRepository<'a> {
     ) -> StorageResult<()> {
         self.conn
             .execute(
-                "INSERT INTO local_network_rules (sid, cidr, allow, origin, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO local_network_rules
+                     (sid, cidr, allow, origin, updated_at, adapter)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(sid, cidr) DO UPDATE SET
                      allow = excluded.allow,
                      origin = excluded.origin,
-                     updated_at = excluded.updated_at",
+                     updated_at = excluded.updated_at,
+                     adapter = excluded.adapter",
                 params![
                     sid,
                     rule.cidr,
                     rule.allow as i64,
                     rule.origin.as_str(),
-                    now_epoch_secs
+                    now_epoch_secs,
+                    rule.adapter
                 ],
             )
             .map(|_| ())
             .map_err(|e| StorageError::Internal(format!("local networks upsert: {e}")))
+    }
+
+    /// Drop the confirmations this adapter has outgrown: same adapter, same
+    /// "yes", a network number it no longer carries. `keep_cidr` is the answer
+    /// just given, the one that inherits from here on. Refusals are never
+    /// touched — forgetting one reopens a segment the user closed.
+    pub fn forget_superseded_confirmations(
+        &self,
+        sid: &str,
+        adapter: &str,
+        keep_cidr: &str,
+    ) -> StorageResult<usize> {
+        if adapter.is_empty() {
+            return Ok(0);
+        }
+        self.conn
+            .execute(
+                "DELETE FROM local_network_rules
+                 WHERE sid = ?1 AND adapter = ?2 AND cidr <> ?3
+                   AND origin = 'discovered' AND allow = 1",
+                params![sid, adapter, keep_cidr],
+            )
+            .map_err(|e| StorageError::Internal(format!("local networks prune: {e}")))
     }
 
     /// Forget one decision — the network goes back to whatever the automatic
@@ -156,6 +186,16 @@ mod tests {
             cidr: cidr.into(),
             allow: true,
             origin: LocalNetworkOrigin::Manual,
+            adapter: String::new(),
+        }
+    }
+
+    fn discovered(cidr: &str, adapter: &str, allow: bool) -> LocalNetworkRule {
+        LocalNetworkRule {
+            cidr: cidr.into(),
+            allow,
+            origin: LocalNetworkOrigin::Discovered,
+            adapter: adapter.into(),
         }
     }
 
@@ -177,20 +217,36 @@ mod tests {
         let repo = LocalNetworkRulesRepository::new(&c);
         repo.upsert("S", &manual("192.168.56.0/24"), 1)
             .expect("save");
-        repo.upsert(
-            "S",
-            &LocalNetworkRule {
-                cidr: "192.168.56.0/24".into(),
-                allow: false,
-                origin: LocalNetworkOrigin::Discovered,
-            },
-            2,
-        )
-        .expect("save again");
+        repo.upsert("S", &discovered("192.168.56.0/24", "vEthernet", false), 2)
+            .expect("save again");
         let stored = repo.list_for_sid("S").expect("read");
         assert_eq!(stored.len(), 1);
         assert!(!stored[0].allow, "the later answer wins");
         assert_eq!(stored[0].origin, LocalNetworkOrigin::Discovered);
+    }
+
+    #[test]
+    fn a_renumbered_switch_leaves_one_row_not_one_per_reboot() {
+        let c = conn();
+        let repo = LocalNetworkRulesRepository::new(&c);
+        let switch = "Ethernet (Default Switch)";
+        repo.upsert("S", &discovered("172.23.208.0/20", switch, true), 1)
+            .expect("yesterday");
+        repo.upsert("S", &discovered("172.28.176.0/20", switch, true), 2)
+            .expect("today");
+        // A refusal on another adapter must survive the prune.
+        repo.upsert("S", &discovered("192.168.56.0/24", "VirtualBox", false), 2)
+            .expect("refusal");
+        let pruned = repo
+            .forget_superseded_confirmations("S", switch, "172.28.176.0/20")
+            .expect("prune");
+        assert_eq!(pruned, 1);
+        let stored = repo.list_for_sid("S").expect("read");
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|r| r.cidr == "172.28.176.0/20"));
+        assert!(stored
+            .iter()
+            .any(|r| r.cidr == "192.168.56.0/24" && !r.allow));
     }
 
     #[test]
