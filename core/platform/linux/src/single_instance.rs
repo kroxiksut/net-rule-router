@@ -62,6 +62,23 @@ fn current_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Keep claiming until the key comes free or `budget` runs out.
+    fn claim_within(
+        port: &LinuxSingleInstance,
+        key: &str,
+        budget: Duration,
+    ) -> Option<Box<dyn SingleInstanceClaim>> {
+        let deadline = Instant::now() + budget;
+        loop {
+            match port.claim(key).expect("claim succeeds") {
+                Some(claim) => return Some(claim),
+                None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                None => return None,
+            }
+        }
+    }
 
     #[test]
     fn second_claim_of_the_same_key_is_refused_while_the_first_is_held() {
@@ -72,7 +89,15 @@ mod tests {
         let second = port.claim(&key).expect("claim succeeds");
         assert!(second.is_none(), "a held key must refuse a second claim");
         drop(first);
-        let third = port.claim(&key).expect("claim succeeds");
+        // The name is free the instant the last descriptor for the socket
+        // closes — and a descriptor is not this thread's alone. Every
+        // `Command::spawn` in a sibling test forks THIS process, and the copy
+        // the child holds keeps the name taken until its exec runs CLOEXEC.
+        // That window is microseconds and only opens under a parallel test
+        // run, which is exactly where it was found: green everywhere, red on a
+        // loaded CI runner. Production never sees it — a fork of the launcher
+        // is the only way to copy this descriptor, and the claim outlives it.
+        let third = claim_within(&port, &key, Duration::from_secs(2));
         assert!(third.is_some(), "releasing the claim must free the key");
     }
 }
