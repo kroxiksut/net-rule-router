@@ -253,8 +253,8 @@ GroupBox {
             color: root.uiTheme.colorBorder
         }
 
-        // Autostart toggle. Source of truth will be
-        // the AutostartGet/Toggle IPC ops; here we mutate `routingState`.
+        // Autostart toggle. The state comes from the launcher's probe of the
+        // user's own registry, carried in the initial snapshot.
         CheckBox {
             id: autostartCheckbox
             Layout.fillWidth: true

@@ -2261,7 +2261,7 @@ ApplicationWindow {
             // to the same "no secondary routes will be applied" outcome.
             window._servicePolicySecondaryBound = !!(rpRaw && rp.secondary)
             window._servicePolicyRead = true
-            updateRoutingState({
+            var patch = {
                 unenforcedAppRules: list,
                 // Keep the auto-seed checkbox in sync with the
                 // service-side per-SID value on every reconnect/rules refresh.
@@ -2286,7 +2286,21 @@ ApplicationWindow {
                 // state (kill-switch armed + secondary adapter unresolved).
                 killSwitchBlockAllArmed:
                     p["kill-switch-block-all-armed"] === true
-            })
+            }
+            // Autostart is the LAUNCHER's answer, not the service's: the
+            // service runs as LocalSystem and its registry hive is not the
+            // user's, so the launcher re-probes the real one and replaces this
+            // field on the way through. Absent means the probe failed — keep
+            // the last known value instead of painting a fabricated "off".
+            var au = p.autostart
+            if (au) {
+                var slug = String(au["last-known-state"] || "absent")
+                patch.autostartEnabled = au.enabled === true
+                patch.autostartLastKnownState = slug
+                patch.autostartBinaryMatches = slug !== "overridden-externally"
+                patch.autostartOverrideValue = String(au["overridden-value"] || "")
+            }
+            updateRoutingState(patch)
             _resyncLinkProvidersFromPrefs(p)
         })
     }

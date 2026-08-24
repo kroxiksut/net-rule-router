@@ -61,17 +61,18 @@ impl ProductionLocalNetworks {
     fn compose(&self, sid: &str) -> Vec<LocalNetworkDto> {
         let discovered = self.coordinator.discovered_local_networks(sid);
         let stored = self.stored(sid);
-        let decision_for = |network: Ipv4Network| {
+        let decision_for = |network: Ipv4Network, adapter: &str| {
             stored
                 .iter()
                 .find(|rule| Ipv4Network::parse(&rule.cidr) == Some(network))
                 .map(|rule| rule.allow)
+                .or_else(|| inherited_from_adapter(&stored, adapter))
         };
 
         let mut out: Vec<LocalNetworkDto> = discovered
             .iter()
             .map(|(network, adapter, from_main_link)| {
-                let decided = decision_for(*network);
+                let decided = decision_for(*network, adapter);
                 LocalNetworkDto {
                     cidr: network.to_cidr_string(),
                     kind: if *from_main_link {
@@ -89,11 +90,17 @@ impl ProductionLocalNetworks {
 
         // The user's own entries, minus the ones that also turned up in
         // discovery — those are already listed above with their real adapter.
+        // An answer whose adapter is still here is listed there too, under the
+        // number that adapter carries today; showing its old number as well
+        // would present one decision as two, the second of them nameless.
         for rule in &stored {
             let Some(network) = Ipv4Network::parse(&rule.cidr) else {
                 continue;
             };
-            if discovered.iter().any(|(found, _, _)| *found == network) {
+            if discovered
+                .iter()
+                .any(|(found, adapter, _)| *found == network || is_same_adapter(adapter, rule))
+            {
                 continue;
             }
             out.push(LocalNetworkDto {
@@ -106,6 +113,31 @@ impl ProductionLocalNetworks {
         }
         out
     }
+}
+
+/// The answer this adapter already carries, for a segment number it did not
+/// have when the answer was given. A refusal outranks a confirmation: the other
+/// direction would reopen a segment the user closed.
+fn inherited_from_adapter(stored: &[LocalNetworkRule], adapter: &str) -> Option<bool> {
+    if adapter.is_empty() {
+        return None;
+    }
+    let mut confirmed = None;
+    for rule in stored.iter().filter(|rule| is_same_adapter(adapter, rule)) {
+        if !rule.allow {
+            return Some(false);
+        }
+        confirmed = Some(true);
+    }
+    confirmed
+}
+
+/// A stored answer belongs to `adapter` only if discovery named one when it was
+/// given; a network the user typed in names none and inherits nothing.
+fn is_same_adapter(adapter: &str, rule: &LocalNetworkRule) -> bool {
+    rule.origin == LocalNetworkOrigin::Discovered
+        && !rule.adapter.is_empty()
+        && rule.adapter == adapter
 }
 
 impl LocalNetworksProvider for ProductionLocalNetworks {
@@ -146,15 +178,19 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                     });
                     continue;
                 }
-                let was_discovered = discovered.iter().any(|(found, _, _)| *found == network);
+                let adapter = discovered
+                    .iter()
+                    .find(|(found, _, _)| *found == network)
+                    .map(|(_, adapter, _)| adapter.clone());
                 let rule = LocalNetworkRule {
                     cidr: network.to_cidr_string(),
                     allow: decision.allowed,
-                    origin: if was_discovered {
+                    origin: if adapter.is_some() {
                         LocalNetworkOrigin::Discovered
                     } else {
                         LocalNetworkOrigin::Manual
                     },
+                    adapter: adapter.unwrap_or_default(),
                 };
                 // A confirmed "yes" is stored even though discovery already
                 // answers yes: `decided_by_user` is what tells the surfaces a
@@ -166,6 +202,19 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                         sid = %sid,
                         cidr = %rule.cidr,
                         "could not store the local-network decision: {e}",
+                    );
+                    continue;
+                }
+                // This answer now speaks for the adapter, so the numbers it
+                // used to carry have nothing left to say. Without this a
+                // switch that renumbers on every reboot leaves a row per boot.
+                if let Err(e) = repo.forget_superseded_confirmations(sid, &rule.adapter, &rule.cidr)
+                {
+                    tracing::warn!(
+                        target: "nrr::local-networks",
+                        sid = %sid,
+                        adapter = %rule.adapter,
+                        "could not prune superseded local-network answers: {e}",
                     );
                 }
             }
@@ -238,6 +287,70 @@ impl crate::ipc_handlers::providers::RefusingAnchorsWriter for ProductionRefusin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rule(
+        cidr: &str,
+        adapter: &str,
+        allow: bool,
+        origin: LocalNetworkOrigin,
+    ) -> LocalNetworkRule {
+        LocalNetworkRule {
+            cidr: cidr.into(),
+            allow,
+            origin,
+            adapter: adapter.into(),
+        }
+    }
+
+    #[test]
+    fn an_answer_follows_its_adapter_through_a_renumbering() {
+        let switch = "Ethernet (Default Switch)";
+        let stored = vec![rule(
+            "172.23.208.0/20",
+            switch,
+            true,
+            LocalNetworkOrigin::Discovered,
+        )];
+        assert_eq!(inherited_from_adapter(&stored, switch), Some(true));
+        assert_eq!(
+            inherited_from_adapter(&stored, "VirtualBox Host-Only"),
+            None
+        );
+        assert_eq!(inherited_from_adapter(&stored, ""), None);
+    }
+
+    #[test]
+    fn a_refusal_outranks_a_confirmation_on_the_same_adapter() {
+        let switch = "Ethernet (Default Switch)";
+        let stored = vec![
+            rule(
+                "172.23.208.0/20",
+                switch,
+                true,
+                LocalNetworkOrigin::Discovered,
+            ),
+            rule(
+                "172.28.176.0/20",
+                switch,
+                false,
+                LocalNetworkOrigin::Discovered,
+            ),
+        ];
+        assert_eq!(inherited_from_adapter(&stored, switch), Some(false));
+    }
+
+    #[test]
+    fn a_typed_in_network_inherits_nothing() {
+        // Manual rows carry no adapter, and one that somehow did must still not
+        // speak for an interface the user never pointed at.
+        let stored = vec![rule(
+            "10.9.0.0/16",
+            "Ethernet",
+            true,
+            LocalNetworkOrigin::Manual,
+        )];
+        assert_eq!(inherited_from_adapter(&stored, "Ethernet"), None);
+    }
 
     #[test]
     fn only_rfc1918_counts_as_a_local_segment() {

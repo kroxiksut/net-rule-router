@@ -570,6 +570,15 @@ pub(crate) fn build_supervised_runtime_deps(
                                 return policy;
                             };
                             for rule in rules {
+                                // The adapter half is what survives a
+                                // hypervisor switch renumbering its segment;
+                                // the coordinator resolves it against the
+                                // adapters that exist at reconcile time.
+                                if !rule.adapter.is_empty() {
+                                    policy
+                                        .adapter_answers
+                                        .push((rule.adapter.clone(), rule.allow));
+                                }
                                 let Some(network) = Ipv4Network::parse(&rule.cidr) else {
                                     continue;
                                 };
