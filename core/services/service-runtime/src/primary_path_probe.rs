@@ -78,9 +78,27 @@ impl PrimaryPathProbe for SystemPrimaryPathProbe {
                 return PrimaryPathVerdict::Indeterminate;
             }
         }
+        // A zero budget cannot measure anything, and the platform reports the
+        // attempt as a timeout — indistinguishable from a host that stayed
+        // silent, which is evidence the block-detector acts on.
+        if timeout.is_zero() {
+            return PrimaryPathVerdict::Indeterminate;
+        }
         match socket.connect_timeout(&address.into(), timeout) {
             Ok(()) => PrimaryPathVerdict::Answered,
-            Err(_) => PrimaryPathVerdict::Silent,
+            // Only a refusal or a timeout is evidence that the host did not
+            // answer. Everything else — a zero timeout, an unreachable network,
+            // a socket the OS would not let us use — means the probe never ran,
+            // and calling that "silent" hands the block-detector evidence
+            // nothing measured.
+            Err(e) => match e.kind() {
+                std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted => PrimaryPathVerdict::Silent,
+                _ => PrimaryPathVerdict::Indeterminate,
+            },
         }
     }
 }
@@ -284,6 +302,21 @@ impl PrimaryPathProber {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A probe that could not run is not a host that stayed silent: the
+    /// block-detector treats silence as evidence, and a zero timeout measured
+    /// nothing at all.
+    #[test]
+    fn a_probe_that_cannot_run_is_indeterminate_not_silent() {
+        let probe = SystemPrimaryPathProbe;
+        let verdict = probe.probe(
+            Ipv4Addr::new(203, 0, 113, 1),
+            443,
+            None,
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(verdict, PrimaryPathVerdict::Indeterminate);
+    }
 
     fn target(host: &str, last_octet: u8) -> ProbeTarget {
         ProbeTarget {

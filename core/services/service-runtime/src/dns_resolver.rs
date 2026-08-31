@@ -57,6 +57,38 @@ pub trait RuleHostOracle: Send + Sync {
     fn is_rule_host(&self, hostname: &str) -> bool;
 }
 
+/// Is the leak guard currently BLOCKING because the additional link could not
+/// be resolved? Read once per rule-host answer that missed its reconcile
+/// deadline — a latch read, off the fast path.
+///
+/// The production impl mirrors
+/// [`crate::app_enforcement_status::FailClosedPostureStatus`]; a caller wired
+/// without one reports "not blocking" and keeps the historic fail-open.
+pub trait LeakGuardPosture: Send + Sync {
+    fn blocking(&self) -> bool;
+}
+
+/// Any `bool`-yielding closure is a posture — lets the composition root hand in
+/// a latch read without declaring a type for it.
+impl<F> LeakGuardPosture for F
+where
+    F: Fn() -> bool + Send + Sync,
+{
+    fn blocking(&self) -> bool {
+        self()
+    }
+}
+
+/// A posture that never blocks: the default for listeners wired without the
+/// latch (tests, previews, the Linux daemon until it publishes one).
+pub struct OpenLeakGuard;
+
+impl LeakGuardPosture for OpenLeakGuard {
+    fn blocking(&self) -> bool {
+        false
+    }
+}
+
 /// Block D (fake-IP, slice 4) — decides whether a rule host is answered with a
 /// **virtual** (fake) address instead of its real ones.
 ///
@@ -288,15 +320,18 @@ pub trait FactSink: Send + Sync {
 /// gemini/youtube secondary rules). Production memoizes over the rule book ×
 /// FQDN cache; the default empty set disables steering.
 pub trait SecondaryOwnedIps: Send + Sync {
-    fn secondary_owned_ips(&self) -> std::collections::HashSet<Ipv4Addr>;
+    /// Handed out behind an `Arc`: the production impl memoizes one set and
+    /// every DIRECT answer asks for it, so returning it by value copied the
+    /// whole pinned set per DNS reply.
+    fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>>;
 }
 
 /// No-op [`SecondaryOwnedIps`]: empty set → direct-answer steering disabled.
 pub struct NoopSecondaryOwnedIps;
 
 impl SecondaryOwnedIps for NoopSecondaryOwnedIps {
-    fn secondary_owned_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
-        std::collections::HashSet::new()
+    fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>> {
+        Arc::new(std::collections::HashSet::new())
     }
 }
 
@@ -473,6 +508,13 @@ pub enum QueryOutcome {
     Answer { ips: Vec<Ipv4Addr>, enforced: bool },
     /// Upstream resolution failed — propagate as a DNS failure to the app.
     Upstream(ResolveError),
+    /// Upstream answered, but the addresses were WITHHELD: the leak guard is
+    /// blocking with the additional link unresolved and the reconcile did not
+    /// confirm a filter for them in time. Handing them over would put the very
+    /// destinations the guard exists to hold back on the main link, so the
+    /// caller is failed rather than answered — and, unlike
+    /// [`Self::Upstream`], must NOT be forwarded raw.
+    Withheld,
 }
 
 /// The last two labels of `host` (the whole name when it has fewer).
@@ -536,6 +578,10 @@ pub struct AnswerHold {
 /// stays quiet). Diagnostics logs may carry hostnames/IPs per the project's
 /// redaction exception. The upstream server address is not visible here — it is
 /// logged at the port layer (`dns_resolver_ports`).
+// Every argument is one injected port — the module is deliberately
+// mechanism-free, and grouping them into a struct would only move the same
+// list one level down.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_a_query(
     hostname: &str,
     hold: AnswerHold,
@@ -544,6 +590,7 @@ pub fn handle_a_query(
     sink: &dyn FactSink,
     reconciler: &dyn SyncReconciler,
     fake_ip: &dyn FakeIpAnswerer,
+    leak_guard: &dyn LeakGuardPosture,
 ) -> QueryOutcome {
     // Upstream resolve is needed for BOTH paths — do it first.
     let resolved = match upstream.resolve_a(hostname) {
@@ -706,7 +753,26 @@ pub fn handle_a_query(
         reconcile = ?reconcile,
         "Mode B: rule host resolved and reconciled before answering",
     );
-    // Fail-open on latency: return the answer whether or not install confirmed.
+    // Fail-open on latency is the right trade while the additional link is UP:
+    // the worst case is a fraction of a second on the wrong route. It is the
+    // wrong one while the guard is blocking a link it could not resolve —
+    // there is no route to be early for, nothing has a filter for these
+    // addresses yet, and the caller connects the instant it holds them. That is
+    // an egress over the main link for exactly the destination the guard exists
+    // to hold back, so the answer is withheld instead.
+    //
+    // Only the missed deadline qualifies: `Deferred` means every answered
+    // address was already cached-routable (its filters are installed), and
+    // withholding those would cost connectivity the guard never protects.
+    if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
+        tracing::warn!(
+            target: "nrr::dns-resolver",
+            host = %hostname,
+            addresses = ?answered,
+            "leak guard is blocking with the additional link unresolved and enforcement for this answer did not install in time — withholding the addresses instead of leaking them to the main link",
+        );
+        return QueryOutcome::Withheld;
+    }
     QueryOutcome::Answer {
         ips: answered,
         enforced,
@@ -877,6 +943,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -926,6 +993,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &answerer,
+            &OpenLeakGuard,
         );
 
         match out {
@@ -963,6 +1031,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1005,6 +1074,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1063,6 +1133,7 @@ mod tests {
             },
             &RequestOnlyReconciler(&log),
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         // Answered immediately; not `enforced` (install was not awaited), but
         // the reconcile was still requested so the facts converge.
@@ -1097,6 +1168,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1131,6 +1203,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1161,6 +1234,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1194,6 +1268,7 @@ mod tests {
                 outcome: ReconcileOutcome::DeadlineExceeded,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         // Fail-open on latency: still answer, but flagged unenforced. The fact
         // was recorded, so the async safety tick converges shortly after.
@@ -1205,6 +1280,74 @@ mod tests {
             }
         );
         assert_eq!(log.snapshot(), vec!["record", "reconcile"]);
+    }
+
+    /// The same missed deadline, but with the guard blocking a link it could
+    /// not resolve: nothing has a filter for these addresses, so handing them
+    /// over sends the caller out the main link — the leak the guard exists to
+    /// prevent (the chatgpt.com case, HW-0830).
+    #[test]
+    fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_the_deadline() {
+        let log = CallLog::default();
+        let out = handle_a_query(
+            "chatgpt.com",
+            AnswerHold {
+                deadline: Duration::from_millis(150),
+                fast_answers: false,
+            },
+            &oracle(&["chatgpt.com"]),
+            &FakeUpstream {
+                answer: Ok(resolved(&[ip(172, 64, 155, 209)])),
+            },
+            &FakeSink(&log),
+            &FakeReconciler {
+                log: &log,
+                outcome: ReconcileOutcome::DeadlineExceeded,
+            },
+            &NoopFakeIpAnswerer,
+            &|| true,
+        );
+        assert_eq!(out, QueryOutcome::Withheld);
+        // The fact is still recorded: the next reconcile builds the filter, and
+        // the re-query moments later is answered normally.
+        assert_eq!(log.snapshot(), vec!["record", "reconcile"]);
+    }
+
+    /// A deferred answer is NOT withheld even while the guard blocks: every
+    /// address in it was already cached-routable, so its filters are installed.
+    /// Withholding those would cost connectivity the guard never protects.
+    #[test]
+    fn deferred_answer_is_not_withheld_while_the_guard_is_blocking() {
+        let log = CallLog::default();
+        let cached = ip(172, 64, 155, 209);
+        let out = handle_a_query(
+            "chatgpt.com",
+            AnswerHold {
+                deadline: Duration::from_millis(150),
+                fast_answers: true,
+            },
+            &oracle(&["chatgpt.com"]),
+            &FakeUpstream {
+                answer: Ok(resolved(&[cached])),
+            },
+            &CachedSink {
+                log: &log,
+                cached: vec![cached],
+            },
+            &FakeReconciler {
+                log: &log,
+                outcome: ReconcileOutcome::Deferred,
+            },
+            &NoopFakeIpAnswerer,
+            &|| true,
+        );
+        assert_eq!(
+            out,
+            QueryOutcome::Answer {
+                ips: vec![cached],
+                enforced: false,
+            }
+        );
     }
 
     #[test]
@@ -1264,6 +1407,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         match out {
             QueryOutcome::Answer { ips, enforced } => {
@@ -1299,6 +1443,7 @@ mod tests {
                 refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
+            &OpenLeakGuard,
         );
         // The app gets the FAKE address, flagged enforced (the TUN + relay carry
         // the flow, no per-IP install needed).
@@ -1339,6 +1484,7 @@ mod tests {
                 refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,
@@ -1441,6 +1587,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
         );
         assert_eq!(
             out,

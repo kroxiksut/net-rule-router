@@ -239,6 +239,8 @@ fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
         primary_probe_max_targets: 8,
         primary_probe_repeat_secs: 300,
         block_ipv6_when_protected: true,
+        local_networks_auto_accept: false,
+        zone_priority_over_ip: false,
         binding_source: BindingSource::UserAssigned,
     };
     repo.update_for_sid(sid, &record, 1_700_000_000)
@@ -522,7 +524,7 @@ fn dry_run_preview_emits_real_risk_signals_when_rules_emptied() {
     }
 
     // Construct coordinator with scripted dispatcher (no real WFP
-    // for the dry-run path — coordinator's dry_run_apply produces
+    // for the dry-run path — the coordinator's preview produces
     // SidActionPlanSummary entries directly from the dispatcher).
     let registry = Arc::new(ActiveSidRegistry::new());
     let dispatcher: Arc<dyn RulesApplyDispatcher> = Arc::new(ScriptedDispatcher::new());

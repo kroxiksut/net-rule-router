@@ -124,8 +124,35 @@ function settingsCategories() {
     ]
 }
 
+// Schemes the app is willing to hand to the OS. A URL string reaches this
+// helper from an about-payload, a third-party manifest and a user-editable
+// preference, and `Qt.openUrlExternally` will launch whatever the platform has
+// registered for a scheme — `file:` browsers a folder, and other schemes can
+// start programs. Nothing here needs more than the web and the local folders we
+// open ourselves.
+var EXTERNAL_URL_SCHEMES = ["http://", "https://", "file:///"]
+
+function isOpenableExternalUrl(url) {
+    var s = String(url || "")
+    for (var i = 0; i < EXTERNAL_URL_SCHEMES.length; i++) {
+        if (s.toLowerCase().indexOf(EXTERNAL_URL_SCHEMES[i]) === 0) return true
+    }
+    return false
+}
+
 function openExternalUrl(url) {
-    if (url && url !== "") Qt.openUrlExternally(url)
+    if (isOpenableExternalUrl(url)) Qt.openUrlExternally(String(url))
+}
+
+// The page the compatibility banner offers. A user/administrator override wins
+// when it is set and openable; otherwise the project's own releases page. The
+// override used to be stored, bridged into the QML context and read by nobody,
+// so setting it changed nothing.
+function updatesPageUrl(prefs, about) {
+    var override = String((prefs || {}).updatePageUrl || "")
+    if (isOpenableExternalUrl(override)) return override
+    var base = String((about || {}).projectUrl || "")
+    return base === "" ? "" : base + "/releases"
 }
 
 // ---- filesystem path containment ----
@@ -693,7 +720,9 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "primary-probe-timeout-ms": 1500,
     "primary-probe-max-targets": 8,
     "primary-probe-repeat-secs": 300,
-    "block-ipv6-when-protected": true
+    "block-ipv6-when-protected": true,
+    "local-networks-auto-accept": false,
+    "zone-priority-over-ip": false
 }
 
 // Keys the policy SNAPSHOT carries but the update REQUEST must not: they are
@@ -837,6 +866,40 @@ function autoRuleRowConsumers(row) {
 // A rule of "domain + *.domain" acts on the whole group, so selection and
 // bulk actions key on the DOMAIN, not on individual candidate ids -- callers
 // don't need an id->group lookup, just `group.pendingIds` / `.dismissedIds`.
+/// Split the merged suggestion groups by status.
+///
+/// The inbox is a list of things to answer; an address already answered with
+/// "don't suggest again" is history, and mixing the two made a screen of ten
+/// decisions look like a screen of forty. `showDismissed` false keeps only the
+/// groups that still hold something pending, and hides the answered hosts
+/// inside them.
+function filterAutoRuleGroupsByStatus(groups, showDismissed) {
+    if (showDismissed) return groups || []
+    var out = []
+    for (var i = 0; i < (groups || []).length; i += 1) {
+        var g = groups[i]
+        if (!g || (g.pendingIds || []).length === 0) continue
+        var hosts = []
+        for (var h = 0; h < (g.hosts || []).length; h += 1) {
+            if (g.hosts[h] && g.hosts[h].status === "pending") hosts.push(g.hosts[h])
+        }
+        var copy = Object.assign({}, g)
+        copy.hosts = hosts
+        copy.dismissedIds = []
+        out.push(copy)
+    }
+    return out
+}
+
+/// How many answered ("don't suggest again") hosts the merged groups hold.
+function countDismissedAutoRuleHosts(groups) {
+    var total = 0
+    for (var i = 0; i < (groups || []).length; i += 1) {
+        total += ((groups[i] || {}).dismissedIds || []).length
+    }
+    return total
+}
+
 function groupAutoRuleRows(candidates, dismissed) {
     var byDomain = {}
     var order = []

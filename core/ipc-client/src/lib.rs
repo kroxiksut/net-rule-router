@@ -45,7 +45,10 @@ mod protocol;
 #[cfg(target_os = "windows")]
 pub mod scm_probe;
 pub mod snapshot_cache;
-pub mod wire;
+/// The frame codec now lives in `nrr-shared`, where both ends of the protocol
+/// can reach it without a server depending on the client. Re-exported under the
+/// old path so client-side call sites are unchanged.
+pub use nrr_shared::ipc_wire as wire;
 pub mod wire_error;
 
 #[cfg(target_os = "windows")]

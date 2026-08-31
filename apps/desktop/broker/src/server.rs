@@ -74,9 +74,25 @@ const ALLOWED_SERVICE_ACTIONS: &[&str] = &[
     "cleanup",
 ];
 
-/// Path of the broker's own lifecycle log, `%TEMP%\NetRuleRouter\nrr-broker.log`.
-fn broker_log_path() -> std::path::PathBuf {
-    crate::spawn::broker_temp_dir().join("nrr-broker.log")
+/// Path of the broker's own lifecycle log.
+///
+/// NOT `%TEMP%`: the broker runs at high integrity, and a fixed, predictable
+/// name in a directory the unprivileged user can write is an invitation — a
+/// hard link planted there in advance (no admin right needed) turns every
+/// append into a write to whatever file the link names. The log lives under the
+/// machine's ProgramData root, falling back to the install directory beside the
+/// broker binary. Both need administrative rights to write to; if neither
+/// resolves, the broker logs to stderr only.
+fn broker_log_path() -> Option<std::path::PathBuf> {
+    if let Some(root) = crate::trusted_env::machine_program_data() {
+        let dir = root
+            .join(nrr_shared::product_identity::PRODUCT_NAME)
+            .join("logs");
+        if std::fs::create_dir_all(&dir).is_ok() {
+            return Some(dir.join("nrr-broker.log"));
+        }
+    }
+    current_exe_dir().map(|dir| dir.join("nrr-broker.log"))
 }
 
 /// Append one lifecycle line to the broker log file and also echo to stderr.
@@ -90,7 +106,9 @@ fn broker_log(msg: &str) {
         .unwrap_or(0);
     let line = format!("{millis} pid={} {msg}", std::process::id());
     eprintln!("[nrr-broker] {line}");
-    let path = broker_log_path();
+    let Some(path) = broker_log_path() else {
+        return;
+    };
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -207,6 +225,35 @@ fn normalised_dir(path: &Path) -> String {
 /// subcommand. The broker is already elevated, so the child inherits the
 /// elevated token with NO new UAC prompt. `CREATE_NO_WINDOW` keeps the
 /// console-subsystem service binary from flashing a window / spawning a
+/// How long a relayed service-control verb may take before the broker gives up
+/// on it. Generous — `reinstall` restarts a service — but finite: this runs in
+/// the broker's ONLY accept loop, so a wedged child used to take the whole
+/// elevation channel with it, `broker.shutdown` included.
+const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(90);
+
+/// Runs `cmd` to completion or kills it when the budget expires.
+fn run_with_budget(
+    mut cmd: Command,
+    budget: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = cmd.spawn()?;
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {}s", budget.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// visible conhost.
 fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
     if !ALLOWED_SERVICE_ACTIONS.contains(&action) {
@@ -220,12 +267,17 @@ fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
     broker_log(&format!("service-control: {action} via {service_exe}"));
     let mut cmd = Command::new(service_exe);
     cmd.arg(action);
+    // The elevated child derives its state root from `%PROGRAMDATA%`, and this
+    // process inherited the environment of the user who triggered the UAC
+    // prompt — who can rewrite it without any privilege. Hand the child the
+    // machine's environment instead of the one we were given.
+    crate::trusted_env::apply_machine_environment(&mut cmd);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    match cmd.status() {
+    match run_with_budget(cmd, SERVICE_CONTROL_BUDGET) {
         Ok(status) if status.success() => {
             broker_log(&format!("service-control: {action} OK"));
             BrokerResponse::ok(serde_json::json!({ "action": action, "ok": true }))
@@ -248,7 +300,9 @@ fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
 /// Entry point for broker mode. Never returns until the parent dies, a
 /// shutdown control op arrives, or a fatal setup error occurs.
 pub fn run_broker_server(args: BrokerServerArgs) -> ExitCode {
-    rotate_broker_log(&broker_log_path());
+    if let Some(path) = broker_log_path() {
+        rotate_broker_log(&path);
+    }
     let nonce = match read_and_delete_token_file(std::path::Path::new(&args.token_file)) {
         Ok(n) => n,
         Err(e) => {
@@ -455,7 +509,7 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{check_service_binary, rotate_broker_log};
+    use super::{broker_log_path, check_service_binary, rotate_broker_log};
     use nrr_shared::product_identity::BinaryRole;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -563,5 +617,42 @@ mod tests {
 
         assert!(!path.exists());
         assert!(!dir.path().join("nrr-broker.prev.log").exists());
+    }
+
+    #[test]
+    fn the_broker_log_never_lands_in_a_user_writable_temp_dir() {
+        let Some(path) = broker_log_path() else {
+            return; // no machine root and no install dir — stderr only
+        };
+        let temp = std::env::temp_dir();
+        assert!(
+            !path.starts_with(&temp),
+            "an elevated process must not append to a fixed name under {}: {}",
+            temp.display(),
+            path.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_child_that_never_answers_is_killed_at_the_budget() {
+        use std::time::Instant;
+
+        // A child that runs far longer than the budget — the shape of a
+        // wedged `nrr-service.exe stop`.
+        let mut cmd = std::process::Command::new("ping");
+        cmd.args(["-n", "30", "127.0.0.1"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let started = Instant::now();
+        let result = super::run_with_budget(cmd, std::time::Duration::from_millis(300));
+
+        assert!(result.is_err(), "the broker must give up on a hung child");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the accept loop must not be held past the budget"
+        );
     }
 }

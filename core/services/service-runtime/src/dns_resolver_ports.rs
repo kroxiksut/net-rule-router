@@ -198,23 +198,27 @@ pub struct DirectUdpUpstreamResolver {
     pool: Option<Arc<crate::dns_upstream::UpstreamDnsPool>>,
 }
 
-/// Process-wide message-id sequence, seeded from the clock so ids differ
-/// across service restarts. Sequential ids are fine here: the socket is
-/// connected to ONE trusted upstream and every response is matched on
-/// id + question before acceptance.
-static NEXT_QUERY_ID: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
-static QUERY_ID_SEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+/// A fresh, unguessable id for each query.
+///
+/// It used to be a counter from a nanosecond seed, which made every id after
+/// the first one predictable from any single observed query. The socket is
+/// connected and the answer is matched on id plus question, so a forger already
+/// has to guess the ephemeral port and spoof the server's source address - but
+/// this was the one of the three barriers that cost nothing to remove, and what
+/// it protects is the cache the routes, the pins and the kill-switch exemptions
+/// are all derived from.
+///
+/// A failed draw falls back to the clock rather than to a constant: worse than
+/// random, still not fixed, and it cannot fail the resolution.
 fn next_query_id() -> u16 {
-    use std::sync::atomic::Ordering;
-    if !QUERY_ID_SEEDED.swap(true, Ordering::Relaxed) {
-        let seed = SystemTime::now()
+    let mut bytes = [0u8; 2];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u16::from_ne_bytes(bytes),
+        Err(_) => SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos() as u16)
-            .unwrap_or(0);
-        NEXT_QUERY_ID.store(seed, Ordering::Relaxed);
+            .unwrap_or(0),
     }
-    NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 impl DirectUdpUpstreamResolver {
@@ -298,12 +302,19 @@ impl DirectUdpUpstreamResolver {
     fn open_socket(
         egress: &crate::dns_egress::DnsEgress,
     ) -> Result<std::net::UdpSocket, ResolveError> {
-        match egress.bind {
+        let sock = match egress.bind {
             Some(src) => std::net::UdpSocket::bind((src, 0))
-                .map_err(|e| ResolveError::Unavailable(format!("bind {src}: {e}"))),
+                .map_err(|e| ResolveError::Unavailable(format!("bind {src}: {e}")))?,
             None => std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .map_err(|e| ResolveError::Unavailable(format!("bind: {e}"))),
-        }
+                .map_err(|e| ResolveError::Unavailable(format!("bind: {e}")))?,
+        };
+        // Connected, so the kernel drops every datagram that did not come from
+        // the server we asked. An unconnected socket accepts an answer from
+        // anyone who guesses the ephemeral port, and what it answers into is the
+        // cache the routes, pins and kill-switch exemptions are built from.
+        sock.connect(egress.server)
+            .map_err(|e| ResolveError::Unavailable(format!("connect {}: {e}", egress.server)))?;
+        Ok(sock)
     }
 
     /// One send + receive window. Loops on non-matching datagrams (late replies
@@ -317,7 +328,7 @@ impl DirectUdpUpstreamResolver {
     ) -> Result<ResolvedA, ResolveError> {
         use crate::dns_wire::{parse_a_response, AResponseOutcome};
         let sock = Self::open_socket(egress)?;
-        sock.send_to(query, egress.server)
+        sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
         let mut buf = [0u8; 2048];
@@ -388,7 +399,7 @@ impl DirectUdpUpstreamResolver {
     ) -> Result<Vec<String>, ResolveError> {
         use crate::dns_wire::{parse_ptr_response, PtrResponseOutcome};
         let sock = Self::open_socket(egress)?;
-        sock.send_to(query, egress.server)
+        sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
         let started = std::time::Instant::now();
         let mut buf = [0u8; 2048];
@@ -989,7 +1000,7 @@ pub struct ActiveSecondaryOwnedIps {
     rules_provider: Arc<dyn RulesProvider>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     fqdn: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
-    memo: Mutex<Option<(std::time::Instant, std::collections::HashSet<Ipv4Addr>)>>,
+    memo: Mutex<Option<(std::time::Instant, Arc<std::collections::HashSet<Ipv4Addr>>)>>,
 }
 
 /// How long one computed owned-set snapshot serves steering before a rebuild.
@@ -1029,21 +1040,26 @@ impl ActiveSecondaryOwnedIps {
     /// Memoized read with an injected `now` — the trait impl passes
     /// `Instant::now()`; tests advance `now` to cross the memo TTL without
     /// sleeping.
-    fn owned_ips_at(&self, now: std::time::Instant) -> std::collections::HashSet<Ipv4Addr> {
+    fn owned_ips_at(
+        &self,
+        now: std::time::Instant,
+    ) -> std::sync::Arc<std::collections::HashSet<Ipv4Addr>> {
         let mut guard = self.memo.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((at, set)) = guard.as_ref() {
             if now.saturating_duration_since(*at) < OWNED_SET_MEMO_TTL {
-                return set.clone();
+                // An `Arc` clone: every direct answer takes this path, and the
+                // set is the whole pinned address space.
+                return std::sync::Arc::clone(set);
             }
         }
-        let set = self.rebuild();
-        *guard = Some((now, set.clone()));
+        let set = std::sync::Arc::new(self.rebuild());
+        *guard = Some((now, std::sync::Arc::clone(&set)));
         set
     }
 }
 
 impl crate::dns_resolver::SecondaryOwnedIps for ActiveSecondaryOwnedIps {
-    fn secondary_owned_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
+    fn secondary_owned_ips(&self) -> std::sync::Arc<std::collections::HashSet<Ipv4Addr>> {
         self.owned_ips_at(std::time::Instant::now())
     }
 }
@@ -1352,6 +1368,39 @@ impl crate::dns_resolver::DirectAnswerGate for ReconcilingDirectAnswerGate {
 
 #[cfg(test)]
 mod tests {
+
+    /// The id is one of three barriers between a forged answer and the cache
+    /// that routes, pins and kill-switch exemptions are derived from. It used
+    /// to be a counter: one observed query gave away every id after it.
+    #[test]
+    fn query_ids_are_not_a_counter() {
+        let ids: Vec<u16> = (0..32).map(|_| next_query_id()).collect();
+        let consecutive = ids
+            .windows(2)
+            .filter(|w| w[1] == w[0].wrapping_add(1))
+            .count();
+        assert!(
+            consecutive < 4,
+            "{consecutive} of 31 pairs increment by one, which is what a counter does: {ids:?}",
+        );
+        let distinct: std::collections::HashSet<u16> = ids.iter().copied().collect();
+        assert!(distinct.len() > 24, "too many repeats: {ids:?}");
+    }
+
+    /// The query socket must be CONNECTED to the upstream it asks. Unconnected,
+    /// it accepts an answer from anyone who guesses the ephemeral port, and what
+    /// that answer feeds is the host cache the routes, pins and kill-switch
+    /// exemptions are derived from.
+    #[test]
+    fn the_query_socket_only_accepts_the_server_it_asked() {
+        let server: std::net::SocketAddr = "127.0.0.1:5353".parse().expect("addr");
+        let egress = crate::dns_egress::DnsEgress::primary(server);
+        let sock = DirectUdpUpstreamResolver::open_socket(&egress).expect("socket");
+        assert_eq!(
+            sock.peer_addr().expect("connected socket has a peer"),
+            server,
+        );
+    }
     use super::*;
     use nrr_domain::canonical::{
         CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,

@@ -189,8 +189,12 @@ fn scenario_4_ack_re_signs_and_restart_is_clean() {
     {
         let g = conn.lock().unwrap();
         let signed = RevisionsRepository::with_signing_key(&g, key());
-        let n = signed.re_sign_all().unwrap();
-        assert_eq!(n, 1);
+        let report = signed.re_sign_all().unwrap();
+        assert_eq!(report.re_signed, 1);
+        // The row was tampered with, so this is an ADOPTION, and the report
+        // names it — the acknowledgement flow logs that rather than reporting a
+        // bare row count.
+        assert_eq!(report.adopted_tampered.len(), 1);
     }
     // Gate lifts immediately after ack.
     assert!(!mutations_blocked_by_alert(repo.as_ref()));

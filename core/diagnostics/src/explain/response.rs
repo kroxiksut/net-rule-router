@@ -42,6 +42,12 @@ pub struct ExplainResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<ExplainInputSection>,
     /// 3. Match section — present when a rule was evaluated.
+    ///
+    /// Sections 3-5 and the warning list are slots nothing fills today: the
+    /// routing check builds summary, input and final action directly, and the
+    /// mapper that produced the rest was removed as unreachable. They stay in
+    /// the DTO because they are `Option`/empty on the wire — absent, not
+    /// wrong — and a future producer would fill exactly these.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_section: Option<ExplainMatchSection>,
     /// 4. Lookup/cache section — present when lookup data is available.
@@ -109,11 +115,11 @@ pub struct ExplainSummarySection {
 
 /// Privacy-filtered summary of the input that was evaluated.
 ///
-/// At `CompactUi` level: hostname and process name only.
-/// At `Diagnostics`+: adds observed IP.
+/// At `CompactUi` level: hostname reduced to eTLD+1, plus the process name.
+/// At `Diagnostics`+: the full hostname and the observed IP.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExplainInputSection {
-    /// Destination hostname as observed (if present).
+    /// Destination hostname: eTLD+1 at `CompactUi`, as observed above it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination_hostname: Option<String>,
     /// Whether a destination IP was present (CompactUi hides the actual address).

@@ -30,6 +30,7 @@ use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension};
 
+use crate::backup::{backup_database, BackupPolicy, BackupReason};
 use crate::dto::{MigrationSummary, SchemaVerification};
 use crate::error::{StorageError, StorageResult};
 use crate::repository::MigrationRunner;
@@ -45,8 +46,9 @@ use crate::schema::{
     STATE_DB_V43_DDL, STATE_DB_V44_DDL, STATE_DB_V45_DDL, STATE_DB_V46_DDL, STATE_DB_V47_DDL,
     STATE_DB_V48_DDL, STATE_DB_V49_DDL, STATE_DB_V4_DDL, STATE_DB_V50_DDL, STATE_DB_V51_DDL,
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
-    STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V5_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL,
-    STATE_DB_V8_DDL, STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
+    STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
+    STATE_DB_V61_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL,
+    TRAFFIC_DB_V1_DDL,
 };
 
 // ── schema_migrations bootstrap DDL ──────────────────────────────────────────
@@ -576,6 +578,25 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_local_network_adapter",
         stmts: STATE_DB_V58_DDL,
     },
+    // Opt out of being asked about local networks nobody has seen before.
+    MigrationDef {
+        version: 59,
+        name: "add_local_networks_auto_accept",
+        stmts: STATE_DB_V59_DDL,
+    },
+    // The pre-per-principal singletons, whose last reader was an integrity
+    // check that verified its own bookkeeping.
+    MigrationDef {
+        version: 60,
+        name: "drop_legacy_revision_singletons",
+        stmts: STATE_DB_V60_DDL,
+    },
+    // Zone-vs-ExactIp order: documented as a user setting, never stored.
+    MigrationDef {
+        version: 61,
+        name: "add_zone_priority_over_ip",
+        stmts: STATE_DB_V61_DDL,
+    },
 ];
 
 // ── Required schema elements — used by verify_schema ─────────────────────────
@@ -623,8 +644,6 @@ const TRAFFIC_REQUIRED_INDEXES: &[&str] = &[];
 
 const STATE_REQUIRED_TABLES: &[&str] = &[
     "schema_migrations",
-    "active_revision",
-    "last_known_good",
     "integrity_log",
     "apply_snapshots",
     "route_bindings",
@@ -823,6 +842,10 @@ pub struct SqliteMigrationRunner {
     migrations: &'static [MigrationDef],
     required_tables: &'static [&'static str],
     required_indexes: &'static [&'static str],
+    /// Whether an upgrade of THIS database is snapshotted first, and what a
+    /// failed snapshot means. `None` for the databases that are rebuildable by
+    /// definition: losing them costs a rebuild, not data.
+    backup_policy: Option<BackupPolicy>,
 }
 
 impl SqliteMigrationRunner {
@@ -832,6 +855,7 @@ impl SqliteMigrationRunner {
             migrations: CACHE_MIGRATIONS,
             required_tables: CACHE_REQUIRED_TABLES,
             required_indexes: CACHE_REQUIRED_INDEXES,
+            backup_policy: None,
         }
     }
 
@@ -841,6 +865,8 @@ impl SqliteMigrationRunner {
             migrations: STATE_MIGRATIONS,
             required_tables: STATE_REQUIRED_TABLES,
             required_indexes: STATE_REQUIRED_INDEXES,
+            // The only database here that cannot be rebuilt from anything.
+            backup_policy: Some(BackupPolicy::Required),
         }
     }
 
@@ -851,7 +877,54 @@ impl SqliteMigrationRunner {
             migrations: TRAFFIC_MIGRATIONS,
             required_tables: TRAFFIC_REQUIRED_TABLES,
             required_indexes: TRAFFIC_REQUIRED_INDEXES,
+            backup_policy: None,
         }
+    }
+
+    /// Snapshot this database before the first pending migration touches it.
+    ///
+    /// Skipped for a database being created (`from_version == 0`): there is
+    /// nothing yet to lose, and every fresh install would otherwise leave a
+    /// snapshot of an empty file. Skipped for an in-memory database, which the
+    /// tests use and which has no file to snapshot.
+    ///
+    /// The destination mirrors `StorageTopology::migration_backup_dir`
+    /// (`<data dir>/backups/migrations`), derived from the database's own path
+    /// so the runner needs no topology of its own.
+    fn snapshot_before_migrating(&self, from_version: u32, to_version: u32) -> StorageResult<()> {
+        if from_version == 0 {
+            return Ok(());
+        }
+        let source = {
+            let conn = self.conn.borrow();
+            conn.path().map(std::path::PathBuf::from)
+        };
+        let Some(source) = source.filter(|p| {
+            let s = p.to_string_lossy();
+            !s.is_empty() && s != ":memory:"
+        }) else {
+            return Ok(());
+        };
+        let dir = source
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("backups")
+            .join("migrations");
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            StorageError::Internal(format!(
+                "pre-migration backup: cannot create {}: {e}",
+                dir.display()
+            ))
+        })?;
+        backup_database(
+            &source,
+            &dir,
+            &BackupReason::PreMigration {
+                from_version,
+                to_version,
+            },
+        )
+        .map(|_| ())
     }
 
     /// Consumes the runner and returns the underlying connection for use by the
@@ -894,6 +967,24 @@ impl MigrationRunner for SqliteMigrationRunner {
             .iter()
             .filter(|m| m.version > from_version)
             .collect();
+
+        // The promise in `MigrationRunner`'s doc — a copy before any structural
+        // change — was only ever a promise: nothing called the backup. Taken
+        // here, once, before the first migration runs, because a snapshot per
+        // migration would copy the same database N times for one upgrade.
+        if let Some(policy) = self.backup_policy.clone() {
+            if let Some(to_version) = pending.iter().map(|m| m.version).max() {
+                if let Err(e) = self.snapshot_before_migrating(from_version, to_version) {
+                    match policy {
+                        // Refusing to migrate is the point: this database cannot
+                        // be rebuilt, so an upgrade we could not undo must not
+                        // start.
+                        BackupPolicy::Required => return Err(e),
+                        BackupPolicy::Optional => {}
+                    }
+                }
+            }
+        }
 
         let mut applied_names: Vec<String> = Vec::with_capacity(pending.len());
         for migration in &pending {
@@ -1273,7 +1364,7 @@ mod tests {
         // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
         // + v49 (block_notice_mutes table — durable "do not show" choices)
         // + v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(s.to_version, 58);
+        assert_eq!(s.to_version, 61);
         assert_eq!(
             s.migrations_applied,
             [
@@ -1335,6 +1426,9 @@ mod tests {
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
                 "add_local_network_adapter",
+                "add_local_networks_auto_accept",
+                "drop_legacy_revision_singletons",
+                "add_zone_priority_over_ip",
             ]
         );
     }
@@ -1346,8 +1440,8 @@ mod tests {
 
         runner.run_pending_migrations().expect("first run");
         let s = runner.run_pending_migrations().expect("second run");
-        assert_eq!(s.from_version, 58);
-        assert_eq!(s.to_version, 58);
+        assert_eq!(s.from_version, 61);
+        assert_eq!(s.to_version, 61);
         assert!(s.migrations_applied.is_empty());
     }
 
@@ -1373,7 +1467,7 @@ mod tests {
         let v = runner.verify_schema().expect("verify");
         assert!(v.is_ok(), "state schema verification failed: {v:?}");
         // through v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(v.version, 58);
+        assert_eq!(v.version, 61);
     }
 
     #[test]
@@ -1498,6 +1592,59 @@ mod tests {
             .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
             .expect("pragma");
         assert_eq!(ms, 5_000, "busy_timeout must be 5000 ms baseline");
+    }
+
+    /// How many `.db` files sit in the runner's own backup directory.
+    fn migration_backups(db_path: &Path) -> usize {
+        let dir = db_path
+            .parent()
+            .expect("parent")
+            .join("backups")
+            .join("migrations");
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("db"))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn an_upgrade_of_the_state_db_is_snapshotted_first() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_service_state.db");
+        let conn = open_connection(&path).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        assert_eq!(
+            migration_backups(&path),
+            0,
+            "a database being CREATED has nothing to lose — no snapshot",
+        );
+
+        runner
+            .snapshot_before_migrating(1, 2)
+            .expect("snapshot an existing database");
+        assert_eq!(
+            migration_backups(&path),
+            1,
+            "an upgrade of an existing database is snapshotted",
+        );
+    }
+
+    #[test]
+    fn a_rebuildable_database_is_not_snapshotted() {
+        // Losing the cache costs a rebuild, not data, so it carries no policy —
+        // and a failed snapshot must never be able to block its migration.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_fqdn_ip_cache.db");
+        let conn = open_connection(&path).expect("open");
+        let runner = SqliteMigrationRunner::for_cache_db(conn);
+        assert!(runner.backup_policy.is_none());
+        runner.run_pending_migrations().expect("migrate");
+        assert_eq!(migration_backups(&path), 0);
     }
 
     // ── interrupted migration — transaction atomicity ─────────────────────────
@@ -1673,7 +1820,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
         assert_eq!(summary.from_version, 1);
-        assert_eq!(summary.to_version, 58);
+        assert_eq!(summary.to_version, 61);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1734,19 +1881,26 @@ mod tests {
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
                 "add_local_network_adapter",
+                "add_local_networks_auto_accept",
+                "drop_legacy_revision_singletons",
+                "add_zone_priority_over_ip",
             ]
         );
 
-        // The integrity_hash column added by v2 must be queryable.
+        // v2 added an `integrity_hash` column to the `active_revision`
+        // singleton; v60 drops that table, so the end state must NOT have it.
+        // The chain still has to run through both without error, which is what
+        // the migration list above asserts.
         let conn = runner.into_connection();
-        let _hash: Option<String> = conn
+        let singleton_gone = conn
             .query_row(
-                "SELECT integrity_hash FROM active_revision LIMIT 1",
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name IN ('active_revision', 'last_known_good')",
                 [],
-                |r| r.get(0),
+                |r| r.get::<_, i64>(0),
             )
-            .optional()
-            .expect("integrity_hash column must exist after v2");
+            .expect("count legacy tables");
+        assert_eq!(singleton_gone, 0, "v60 drops both legacy singletons");
     }
 
     #[test]
@@ -1769,7 +1923,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
         assert_eq!(summary.from_version, 2);
-        assert_eq!(summary.to_version, 58);
+        assert_eq!(summary.to_version, 61);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1829,6 +1983,9 @@ mod tests {
                 "add_block_ipv6_when_protected",
                 "add_block_notice_journal",
                 "add_local_network_adapter",
+                "add_local_networks_auto_accept",
+                "drop_legacy_revision_singletons",
+                "add_zone_priority_over_ip",
             ]
         );
 

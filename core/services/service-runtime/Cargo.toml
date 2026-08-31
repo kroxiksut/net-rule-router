@@ -21,7 +21,9 @@ license = "MPL-2.0"
 # names — see the test for the canonical list.
 
 [dependencies]
-nrr-application = { path = "../../application" }
+# NOTE: `nrr-application` is deliberately absent. It was declared here and used
+# nowhere, and through it `nrr-ui-support` and `nrr-mock-backend` reached the
+# service binary — the very crates the boundary test below forbids.
 nrr-diagnostics = { path = "../../diagnostics" }
 nrr-domain = { path = "../../domain" }
 # Block 19 (19.0.3) — service-runtime codes against the NEUTRAL platform ports,
@@ -33,6 +35,11 @@ nrr-storage = { path = "../../storage" }
 # Block 14.5 IPC server uses serde-friendly DTOs to wire request/response
 # envelopes; the actual Named Pipe transport (see `ipc.rs` doc-block)
 # layers on top of these types.
+# Cryptographic randomness for values an outsider must not be able to guess:
+# the DNS query id and the confirmation token. Already a direct dependency of
+# `nrr-platform-api` (STUN transaction ids, the DB-MAC key), so this adds a
+# declaration rather than code.
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Block 16.7: production adapters emit tracing events that the

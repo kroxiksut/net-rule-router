@@ -70,17 +70,22 @@ impl ProductionPerSidApplyAudit {
         }
     }
 
-    /// Build the compact JSON payload summary. Escapes embedded quotes
-    /// in `message` so the line stays valid JSON regardless of what
-    /// the orchestrator emitted.
+    /// Build the compact JSON payload summary.
+    ///
+    /// Serialised by the JSON library: hand-escaping covered the quote and the
+    /// backslash but not the control characters, and the audit trail is NDJSON
+    /// — one newline inside `message` split one event into two unparseable
+    /// lines. The message is assembled from platform error text, so what it can
+    /// contain is not ours to assume.
     fn payload_summary(record: &PerSidApplyAuditRecord) -> String {
-        format!(
-            r#"{{"event":"per_sid_apply","sid":"{}","kind":"{}","filter_count":{},"message":"{}"}}"#,
-            record.sid,
-            record.kind.slug(),
-            record.filter_count,
-            record.message.replace('\\', "\\\\").replace('"', "\\\""),
-        )
+        serde_json::json!({
+            "event": "per_sid_apply",
+            "sid": record.sid,
+            "kind": record.kind.slug(),
+            "filter_count": record.filter_count,
+            "message": record.message,
+        })
+        .to_string()
     }
 }
 
@@ -202,6 +207,25 @@ mod tests {
         assert_eq!(parsed["kind"], "per-sid-policy-failed");
         assert_eq!(parsed["filter_count"], 3);
         assert_eq!(parsed["message"], "err with \"quotes\" and \\backslashes");
+    }
+
+    /// The trail is NDJSON — one event per line. A newline inside the message
+    /// used to split one event into two lines, neither of them parseable.
+    #[test]
+    fn payload_summary_survives_control_characters_in_the_message() {
+        let newline = char::from(10u8);
+        let tab = char::from(9u8);
+        let record = PerSidApplyAuditRecord {
+            sid: "S-1-5-21-x".into(),
+            kind: PerSidApplyAuditKind::Failed,
+            filter_count: 1,
+            message: format!("first line{newline}second{tab}line"),
+        };
+        let payload = ProductionPerSidApplyAudit::payload_summary(&record);
+        assert_eq!(payload.lines().count(), 1, "one event is one line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&payload).expect("payload must parse as JSON");
+        assert_eq!(parsed["message"], record.message);
     }
 
     #[test]

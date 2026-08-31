@@ -20,6 +20,7 @@
 //! - `DeveloperTrace`: everything including Trace level
 
 pub mod filter;
+pub mod privacy;
 pub mod reader;
 pub mod session_window;
 pub mod tracing_layer;

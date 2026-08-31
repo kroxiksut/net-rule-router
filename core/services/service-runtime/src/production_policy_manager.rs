@@ -45,6 +45,59 @@ impl CoordinatorPolicyManager {
     }
 }
 
+/// The pending / superseded list for ONE principal, newest first.
+///
+/// Free function so the scoping can be tested against a real database without
+/// standing up a coordinator: the query is the whole of the behaviour.
+fn query_pending(conn: &Connection, principal: &str, limit: usize) -> Vec<RevisionSummary> {
+    // Query top-N revisions ordered by created_at desc, excluding
+    // the active row (the GUI gets active_revision_id separately).
+    let mut stmt = match conn.prepare(
+        "SELECT revision_id, content_hash, rules_json, status, source,
+                correlation_id, created_at, activated_at, superseded_at,
+                superseded_by, rejected_reason, review_summary_json, risk_level
+         FROM revisions
+         WHERE status != 'active' AND principal = ?1
+         ORDER BY created_at DESC
+         LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = stmt.query_map(rusqlite::params![principal, limit as i64], |row| {
+        Ok(nrr_storage::revisions::RevisionRecord {
+            revision_id: row.get(0)?,
+            content_hash: row.get(1)?,
+            rules_json: row.get(2)?,
+            status: nrr_domain::rules_revision::RevisionStatus::from_slug(
+                &row.get::<_, String>(3)?,
+            )
+            .unwrap_or(nrr_domain::rules_revision::RevisionStatus::Rejected),
+            source: parse_source_slug(&row.get::<_, String>(4)?),
+            correlation_id: row.get(5)?,
+            created_at: row.get(6)?,
+            activated_at: row.get(7)?,
+            superseded_at: row.get(8)?,
+            superseded_by: row.get(9)?,
+            rejected_reason: row.get(10)?,
+            review_summary_json: row.get(11)?,
+            // Parsed through the shared slug table rather than a fourth
+            // hand-written match — this one silently dropped `critical`, so the
+            // one level that means "this candidate can lock the user out"
+            // reached the GUI as "no risk level".
+            risk_level: row
+                .get::<_, Option<String>>(12)?
+                .and_then(|s| nrr_shared::ipc_dto::ReviewRiskLevel::from_slug(&s))
+                .map(nrr_domain::revision::RiskLevel::from),
+        })
+    });
+    let rows = match rows {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    rows.filter_map(|r| r.ok()).map(record_to_summary).collect()
+}
+
 fn record_to_summary(rec: nrr_storage::revisions::RevisionRecord) -> RevisionSummary {
     use nrr_domain::rules_revision::RevisionStatus;
     let status_slug: &'static str = match rec.status {
@@ -116,58 +169,11 @@ impl PolicyManager for CoordinatorPolicyManager {
         })
     }
 
-    fn pending_revisions(&self) -> Vec<RevisionSummary> {
-        let conn = match self.conn.lock() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
-        // Query top-N revisions ordered by created_at desc, excluding
-        // the active row (the GUI gets active_revision_id separately).
-        let limit = self.pending_limit;
-        let mut stmt = match conn.prepare(
-            "SELECT revision_id, content_hash, rules_json, status, source,
-                    correlation_id, created_at, activated_at, superseded_at,
-                    superseded_by, rejected_reason, review_summary_json, risk_level
-             FROM revisions
-             WHERE status != 'active'
-             ORDER BY created_at DESC
-             LIMIT ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let rows = stmt.query_map([limit as i64], |row| {
-            Ok(nrr_storage::revisions::RevisionRecord {
-                revision_id: row.get(0)?,
-                content_hash: row.get(1)?,
-                rules_json: row.get(2)?,
-                status: nrr_domain::rules_revision::RevisionStatus::from_slug(
-                    &row.get::<_, String>(3)?,
-                )
-                .unwrap_or(nrr_domain::rules_revision::RevisionStatus::Rejected),
-                source: parse_source_slug(&row.get::<_, String>(4)?),
-                correlation_id: row.get(5)?,
-                created_at: row.get(6)?,
-                activated_at: row.get(7)?,
-                superseded_at: row.get(8)?,
-                superseded_by: row.get(9)?,
-                rejected_reason: row.get(10)?,
-                review_summary_json: row.get(11)?,
-                risk_level: row
-                    .get::<_, Option<String>>(12)?
-                    .and_then(|s| match s.as_str() {
-                        "low" => Some(nrr_domain::revision::RiskLevel::Low),
-                        "medium" => Some(nrr_domain::revision::RiskLevel::Medium),
-                        "high" => Some(nrr_domain::revision::RiskLevel::High),
-                        _ => None,
-                    }),
-            })
-        });
-        let rows = match rows {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        rows.filter_map(|r| r.ok()).map(record_to_summary).collect()
+    fn pending_revisions(&self, principal: &str) -> Vec<RevisionSummary> {
+        match self.conn.lock() {
+            Ok(conn) => query_pending(&conn, principal, self.pending_limit),
+            Err(_) => Vec::new(),
+        }
     }
 
     fn last_known_good_id(&self) -> Option<String> {
@@ -248,6 +254,109 @@ fn epoch_days_to_ymd(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `critical` is the one level that means "this candidate can lock the user
+    /// out of the network", and the list dropped it on the floor: the GUI got a
+    /// candidate with no risk level at all.
+    #[test]
+    fn a_critical_candidate_keeps_its_risk_level_in_the_list() {
+        use nrr_domain::revision::RiskLevel;
+        use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
+        use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+        use nrr_storage::repository::MigrationRunner;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        {
+            let repo = RevisionsRepository::new(&conn);
+            for (id, level) in [
+                ("rev-crit", RiskLevel::Critical),
+                ("rev-high", RiskLevel::High),
+            ] {
+                repo.insert_candidate_for(
+                    "S-1-A",
+                    &nrr_storage::revisions::RevisionRecord {
+                        revision_id: id.into(),
+                        content_hash: format!("{id}-hash"),
+                        rules_json: r#"{"rules":[]}"#.into(),
+                        status: RevisionStatus::Candidate,
+                        source: RulesRevisionSource::GuiRulesEdit,
+                        correlation_id: "c".into(),
+                        created_at: 1_700_000_000,
+                        activated_at: None,
+                        superseded_at: None,
+                        superseded_by: None,
+                        rejected_reason: None,
+                        review_summary_json: None,
+                        risk_level: Some(level),
+                    },
+                )
+                .expect("insert");
+            }
+        }
+
+        let levels: Vec<Option<&'static str>> = query_pending(&conn, "S-1-A", 10)
+            .into_iter()
+            .map(|r| r.risk_level_slug)
+            .collect();
+        assert!(
+            levels.contains(&Some("critical")),
+            "critical must survive the round trip, got {levels:?}"
+        );
+        assert!(levels.contains(&Some("high")));
+    }
+
+    /// A revision belongs to a principal, and so does the list of them. This
+    /// query used to return every row in the table, so one user's GUI listed
+    /// the pending and superseded edits of everybody else on the machine.
+    #[test]
+    fn the_pending_list_shows_only_the_callers_own_revisions() {
+        use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
+        use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+        use nrr_storage::repository::MigrationRunner;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(Mutex::new(runner.into_connection()));
+
+        {
+            let guard = conn.lock().expect("lock");
+            let repo = RevisionsRepository::new(&guard);
+            for (principal, id) in [("S-1-A", "rev-a"), ("S-1-B", "rev-b")] {
+                repo.insert_candidate_for(
+                    principal,
+                    &nrr_storage::revisions::RevisionRecord {
+                        revision_id: id.into(),
+                        content_hash: format!("{id}-hash"),
+                        rules_json: r#"{"rules":[]}"#.into(),
+                        status: RevisionStatus::Candidate,
+                        source: RulesRevisionSource::GuiRulesEdit,
+                        correlation_id: "c".into(),
+                        created_at: 1_700_000_000,
+                        activated_at: None,
+                        superseded_at: None,
+                        superseded_by: None,
+                        rejected_reason: None,
+                        review_summary_json: None,
+                        risk_level: None,
+                    },
+                )
+                .expect("insert");
+            }
+        }
+
+        let guard = conn.lock().expect("lock");
+        let ids: Vec<String> = query_pending(&guard, "S-1-A", 10)
+            .into_iter()
+            .map(|r| r.revision_id)
+            .collect();
+        assert_eq!(ids, vec!["rev-a".to_string()]);
+    }
 
     #[test]
     fn epoch_days_to_ymd_known_dates() {

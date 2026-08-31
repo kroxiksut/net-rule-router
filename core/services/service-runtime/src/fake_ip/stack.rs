@@ -70,8 +70,34 @@ use super::relay::{RelayCore, RelayDecision, DEFAULT_SESSION_IDLE_MS};
 /// thousand idle flows stay well within a desktop's memory.
 pub const DEFAULT_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 
+/// Ceiling on simultaneously relayed TCP flows. Each one owns two
+/// [`DEFAULT_SOCKET_BUFFER_BYTES`] buffers plus two worker threads, so the cap
+/// is a memory bound before it is anything else: 512 flows is about 64 MiB of
+/// socket buffers. Past it a new SYN gets no socket — smoltcp resets it, the
+/// client falls back at once, and flows already carrying traffic are untouched.
+/// Evicting a live flow to admit a new one would trade a working download for
+/// a connection that may be a port scan.
+const MAX_ACTIVE_TCP_FLOWS: usize = 512;
+
+/// Idle window before a relayed TCP flow is torn down, and the keep-alive
+/// interval that keeps a genuinely live-but-quiet connection out of it. A
+/// client that vanishes without FIN (laptop lid, killed process, VPN flap)
+/// leaves smoltcp holding the socket forever otherwise.
+const TCP_FLOW_IDLE: std::time::Duration =
+    std::time::Duration::from_millis(super::relay::DEFAULT_SESSION_IDLE_MS);
+const TCP_FLOW_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Chunk size for moving bytes between a `smoltcp` socket and the flow buffers.
 const PUMP_CHUNK_BYTES: usize = 16 * 1024;
+
+/// High-water mark for each direction's hand-off queue. Both were unbounded:
+/// the poll loop drained the client's socket as fast as smoltcp could deliver,
+/// whatever the upstream writer managed, and the reader thread pushed replies
+/// in whether or not the client's socket was taking them. A stalled peer in
+/// either direction then grew a queue instead of applying backpressure — and
+/// TCP already has the mechanism, so the fix is to stop consuming and let the
+/// window close.
+const FLOW_QUEUE_HIGH_WATER_BYTES: usize = 256 * 1024;
 
 /// How long the run loop parks when idle (no packet processed and no worker
 /// wake). With a device that honours `set_readable_waker` this is only a
@@ -265,6 +291,10 @@ struct FlowShared {
     client_fin: AtomicBool,
     /// Upstream returned EOF: once `from_upstream` drains, close the client side.
     upstream_eof: AtomicBool,
+    /// Upstream broke off mid-answer (reset, hard I/O error). Mirrored to the
+    /// client as a reset, never as FIN: a truncated body that arrives under a
+    /// clean close reads as the whole answer.
+    upstream_reset: AtomicBool,
     /// Flow is being torn down: workers must exit.
     dead: AtomicBool,
     /// The upstream dial finished and the splice workers are running. Until
@@ -283,6 +313,10 @@ struct FlowShared {
     writer_cv: Condvar,
     /// Wakes the poll loop when `from_upstream` grows or upstream closed.
     stack_waker: Arc<StackWaker>,
+    /// Wakes the upstream *reader* parked on a full `from_upstream`. Paired
+    /// with that queue's mutex, so the poll loop can drain it while the reader
+    /// waits.
+    reader_cv: Condvar,
 }
 
 impl FlowShared {
@@ -292,11 +326,13 @@ impl FlowShared {
             from_upstream: Mutex::new(VecDeque::new()),
             client_fin: AtomicBool::new(false),
             upstream_eof: AtomicBool::new(false),
+            upstream_reset: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             dial_done: AtomicBool::new(false),
             dial_failed: AtomicBool::new(false),
             late_workers: Mutex::new(Vec::new()),
             writer_cv: Condvar::new(),
+            reader_cv: Condvar::new(),
             stack_waker,
         })
     }
@@ -348,6 +384,15 @@ impl FlowShared {
         self.stack_waker.wake();
     }
 
+    fn signal_upstream_reset(&self) {
+        self.upstream_reset.store(true, Ordering::SeqCst);
+        self.stack_waker.wake();
+    }
+
+    fn upstream_was_reset(&self) -> bool {
+        self.upstream_reset.load(Ordering::SeqCst)
+    }
+
     fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst)
     }
@@ -355,6 +400,7 @@ impl FlowShared {
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
         self.writer_cv.notify_all();
+        self.reader_cv.notify_all();
         self.stack_waker.wake();
     }
 
@@ -362,7 +408,32 @@ impl FlowShared {
     fn take_from_upstream(&self, max: usize) -> Vec<u8> {
         let mut buffer = guard(&self.from_upstream);
         let take = buffer.len().min(max);
-        buffer.drain(..take).collect()
+        let taken: Vec<u8> = buffer.drain(..take).collect();
+        if buffer.len() < FLOW_QUEUE_HIGH_WATER_BYTES {
+            self.reader_cv.notify_all();
+        }
+        taken
+    }
+
+    fn to_upstream_len(&self) -> usize {
+        guard(&self.to_upstream).len()
+    }
+
+    /// Park until the client-bound queue has room, the flow dies, or the wait
+    /// times out. The timeout is what keeps a wedged poll loop from turning
+    /// backpressure into a stuck reader.
+    fn await_upstream_queue_room(&self) {
+        let mut buffer = guard(&self.from_upstream);
+        while buffer.len() >= FLOW_QUEUE_HIGH_WATER_BYTES && !self.is_dead() {
+            // The timeout is a liveness check, not a licence to read on: a
+            // spurious wake or a missed notify must not let the queue grow by
+            // another chunk every 50 ms.
+            let (next, _elapsed) = self
+                .reader_cv
+                .wait_timeout(buffer, std::time::Duration::from_millis(50))
+                .unwrap_or_else(|p| p.into_inner());
+            buffer = next;
+        }
     }
 
     /// Return bytes a partial `send_slice` could not accept, to the front.
@@ -510,6 +581,7 @@ pub struct FakeIpStack {
     flows: HashMap<FlowKey, FlowConn>,
     udp_binds: HashMap<(std::net::IpAddr, u16), UdpBind>,
     socket_buffer_bytes: usize,
+    max_flows: usize,
     waker: Arc<StackWaker>,
     log_gate: Arc<DialLogGate>,
     flow_observer: Arc<dyn FlowObserver>,
@@ -529,6 +601,13 @@ pub struct FakeIpStack {
     worker_graveyard: Vec<JoinHandle<()>>,
     /// Rate limit for the lingering-worker warning below.
     last_graveyard_warn: Option<std::time::Instant>,
+    last_capacity_warn: Option<std::time::Instant>,
+    /// Reusable MTU-sized landing area for the device read.
+    ///
+    /// This is the data path: a fresh `vec![0u8; mtu]` per `step()` meant an
+    /// allocation on every poll, including the far more numerous polls that
+    /// read nothing at all.
+    read_buffer: Vec<u8>,
 }
 
 /// Graveyard size at which lingering workers become worth a warning.
@@ -587,6 +666,7 @@ impl FakeIpStack {
             flows: HashMap::new(),
             udp_binds: HashMap::new(),
             socket_buffer_bytes: DEFAULT_SOCKET_BUFFER_BYTES,
+            max_flows: MAX_ACTIVE_TCP_FLOWS,
             waker,
             log_gate: DialLogGate::new(),
             flow_observer: Arc::new(NoopFlowObserver),
@@ -594,6 +674,8 @@ impl FakeIpStack {
             instant_rst: Arc::new(AtomicBool::new(true)),
             worker_graveyard: Vec::new(),
             last_graveyard_warn: None,
+            last_capacity_warn: None,
+            read_buffer: Vec::new(),
         }
     }
 
@@ -627,6 +709,14 @@ impl FakeIpStack {
 
     /// Override the per-socket buffer size (tests use a small value).
     #[must_use]
+    /// Lower the flow ceiling. Only tests do: production wants the memory
+    /// bound the constant states.
+    #[cfg(test)]
+    fn with_max_flows(mut self, flows: usize) -> Self {
+        self.max_flows = flows.max(1);
+        self
+    }
+
     pub fn with_socket_buffer_bytes(mut self, bytes: usize) -> Self {
         self.socket_buffer_bytes = bytes.max(1);
         self
@@ -681,11 +771,16 @@ impl FakeIpStack {
     /// machines, and pump both directions. Returns whether a packet was
     /// processed — the caller drains without parking while that stays `true`.
     pub fn step(&mut self, now_ms: u64) -> Result<bool, PlatformError> {
-        let mut buf = vec![0u8; usize::from(self.device.mtu())];
-        let read = self.device.read_raw(&mut buf)?;
+        let mtu = usize::from(self.device.mtu());
+        if self.read_buffer.len() != mtu {
+            self.read_buffer.resize(mtu, 0);
+        }
+        let read = self.device.read_raw(&mut self.read_buffer)?;
         if read > 0 {
             self.health.record_ingress();
-            buf.truncate(read);
+            // `smoltcp` consumes the packet buffer, so this copy is the one the
+            // device hand-off needs — sized to the PACKET rather than the MTU.
+            let buf = self.read_buffer[..read].to_vec();
             if let Some(parsed) = parse_packet(&buf) {
                 match parsed.key.protocol {
                     FlowProtocol::Tcp => self.maybe_open_flow(&parsed, now_ms),
@@ -732,6 +827,24 @@ impl FakeIpStack {
         }
     }
 
+    /// Say it once a minute, not once per refused SYN: at the cap the refusals
+    /// arrive as fast as the client retries.
+    fn warn_at_flow_capacity(&mut self) {
+        if self
+            .last_capacity_warn
+            .is_some_and(|at| at.elapsed() < GRAVEYARD_WARN_INTERVAL)
+        {
+            return;
+        }
+        self.last_capacity_warn = Some(std::time::Instant::now());
+        tracing::warn!(
+            target: "nrr::fake-ip",
+            active = self.flows.len(),
+            cap = self.max_flows,
+            "fake-IP is carrying its maximum number of TCP flows — new connections are being reset until some finish",
+        );
+    }
+
     /// Open a flow for a fresh TCP SYN to an in-scope fake address.
     ///
     /// The client handshake is answered immediately; the upstream dial runs on
@@ -744,6 +857,11 @@ impl FakeIpStack {
             return;
         }
         if self.flows.contains_key(&packet.key) {
+            return;
+        }
+        if self.flows.len() >= self.max_flows {
+            self.health.record_tcp_flow_refused_at_capacity();
+            self.warn_at_flow_capacity();
             return;
         }
         let (hostname, target) = match self.relay.decide(packet) {
@@ -765,6 +883,11 @@ impl FakeIpStack {
         let rx = tcp::SocketBuffer::new(vec![0u8; self.socket_buffer_bytes]);
         let tx = tcp::SocketBuffer::new(vec![0u8; self.socket_buffer_bytes]);
         let mut socket = tcp::Socket::new(rx, tx);
+        // smoltcp's own liveness pair: probe a quiet peer, drop it if the probes
+        // go unanswered. Without them a client that disappeared without FIN
+        // holds its buffers and workers for the life of the stack.
+        socket.set_keep_alive(Some(TCP_FLOW_KEEP_ALIVE.into()));
+        socket.set_timeout(Some(TCP_FLOW_IDLE.into()));
         let listen = IpListenEndpoint {
             addr: Some(smoltcp_address(packet.key.destination.ip())),
             port: packet.key.destination.port(),
@@ -820,24 +943,17 @@ impl FakeIpStack {
             // dial is in flight the bytes stay in the socket buffer, so the
             // client's own TCP window backpressures instead of an unbounded
             // queue growing against a slow dial.
-            while flow.shared.dial_is_done() && socket.can_recv() {
+            while flow.shared.dial_is_done()
+                && socket.can_recv()
+                && flow.shared.to_upstream_len() < FLOW_QUEUE_HIGH_WATER_BYTES
+            {
                 let mut chunk = [0u8; PUMP_CHUNK_BYTES];
                 match socket.recv_slice(&mut chunk) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => flow.shared.push_to_upstream(&chunk[..n]),
                 }
             }
-            // Client half-closed its send direction. Detect this by the states
-            // that only follow the peer's FIN — NOT by `!may_recv()`, which is
-            // also true before the handshake completes (Listen / SynReceived)
-            // and would tear the upstream down before a byte ever flows.
-            if matches!(
-                socket.state(),
-                tcp::State::CloseWait
-                    | tcp::State::Closing
-                    | tcp::State::LastAck
-                    | tcp::State::TimeWait
-            ) {
+            if client_fin_may_propagate(flow.shared.dial_is_done(), socket.state()) {
                 flow.shared.signal_client_fin();
             }
 
@@ -858,6 +974,16 @@ impl FakeIpStack {
                         break;
                     }
                 }
+            }
+            // Upstream broke off: drain what did arrive, then reset — the
+            // client must not read a truncated body as a complete one.
+            if flow.shared.upstream_was_reset()
+                && flow.shared.upstream_queue_is_empty()
+                && !flow.abort_sent
+            {
+                socket.abort();
+                flow.abort_sent = true;
+                continue;
             }
             // Upstream is done and drained: mirror its close to the client once.
             if flow.shared.upstream_eof.load(Ordering::SeqCst)
@@ -1058,6 +1184,12 @@ impl FakeIpStack {
         else {
             return;
         };
+        // Its reader is gone, so nothing would ever carry a reply back.
+        if flow.replies.is_dead() {
+            self.retire_udp_client(key, client);
+            self.send_port_unreachable(*key, client, payload.len());
+            return;
+        }
         match flow.upstream.send(payload) {
             Ok(_) => flow.last_seen_at = now_ms,
             // The upstream socket is gone (route torn down under the flow, peer
@@ -1065,17 +1197,22 @@ impl FakeIpStack {
             // re-dials rather than being swallowed until the idle reap, and the
             // client learns now instead of at its own timeout.
             Err(_) => {
-                if let Some(retired) = self
-                    .udp_binds
-                    .get_mut(key)
-                    .and_then(|bind| bind.clients.remove(&client))
-                {
-                    retired.replies.mark_dead();
-                    // Graveyard, not join — same poll-thread rule as the reap.
-                    self.worker_graveyard.push(retired.worker);
-                }
+                self.retire_udp_client(key, client);
                 self.send_port_unreachable(*key, client, payload.len());
             }
+        }
+    }
+
+    /// Drop one client flow from its bind. The next datagram re-dials.
+    fn retire_udp_client(&mut self, key: &(std::net::IpAddr, u16), client: SocketAddr) {
+        if let Some(retired) = self
+            .udp_binds
+            .get_mut(key)
+            .and_then(|bind| bind.clients.remove(&client))
+        {
+            retired.replies.mark_dead();
+            // Graveyard, not join — same poll-thread rule as the reap.
+            self.worker_graveyard.push(retired.worker);
         }
     }
 
@@ -1108,7 +1245,10 @@ impl FakeIpStack {
             let stale: Vec<SocketAddr> = bind
                 .clients
                 .iter()
-                .filter(|(_, flow)| flow.last_seen_at < cutoff)
+                // A flow whose reader died is stale now, whatever the clock says
+                // — waiting out the idle window would hold two 64 KiB buffers
+                // and a client that can never be answered.
+                .filter(|(_, flow)| flow.last_seen_at < cutoff || flow.replies.is_dead())
                 .map(|(client, _)| *client)
                 .collect();
             for client in stale {
@@ -1270,7 +1410,15 @@ fn spawn_udp_reader(upstream: Arc<dyn RelayDatagram>, replies: Arc<UdpReplies>) 
             match upstream.receive(&mut buf) {
                 Ok(n) => replies.push(buf[..n].to_vec()),
                 Err(RelayError::WouldBlock) => {} // poll tick — re-check teardown
-                Err(_) => return,
+                // The upstream socket is finished (on Windows a connected UDP
+                // socket reports WSAECONNRESET once an ICMP port-unreachable
+                // comes back). Say so: a reader that just returns leaves the
+                // client bound to a flow nothing reads, and its `send` keeps
+                // succeeding, so the idle reap never comes for it either.
+                Err(_) => {
+                    replies.mark_dead();
+                    return;
+                }
             }
         }
     })
@@ -1406,6 +1554,35 @@ const HOLD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10
 /// [`HOLD_RETRY_INTERVAL`]/[`HOLD_RETRY_WINDOW`] constants directly) purely so
 /// tests can exercise the window-exhaustion path in milliseconds instead of
 /// really waiting out 10 s; production always calls with the two constants.
+/// Whether the client's half-close may be forwarded to the upstream yet.
+///
+/// Two conditions, and both were learned the hard way.
+///
+/// The STATE test is by the states that only follow the peer's FIN, never by
+/// `!may_recv()`: that is also true before the handshake completes (Listen /
+/// SynReceived) and would tear the upstream down before a byte ever flowed.
+///
+/// The DIAL test mirrors the drain that feeds the upstream queue. A client that
+/// sends its request and immediately half-closes — the ordinary shape of a
+/// one-shot request — does so while the dial is still in flight (2.8-3.2 s
+/// through a tunnel). Its bytes are still sitting in the socket buffer, so a
+/// FIN raised then reaches the upstream writer first: it finds an empty queue,
+/// shuts the write half and returns, and the request is never sent. Once the
+/// dial completes, the drain runs in the same tick and the FIN follows it.
+///
+/// A dial that FAILS never satisfies this — it marks the flow dead instead, and
+/// the writer exits on that.
+fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State) -> bool {
+    dial_is_done
+        && matches!(
+            state,
+            tcp::State::CloseWait
+                | tcp::State::Closing
+                | tcp::State::LastAck
+                | tcp::State::TimeWait
+        )
+}
+
 fn dial_tcp_with_hold(
     shared: &FlowShared,
     dialer: &dyn RelayDialer,
@@ -1534,6 +1711,12 @@ fn spawn_upstream_workers(shared: Arc<FlowShared>, split: RelaySplit) -> Vec<Joi
             if reader_shared.is_dead() {
                 return;
             }
+            // The client is not keeping up: stop reading so the upstream's own
+            // window closes, instead of buffering the difference here.
+            reader_shared.await_upstream_queue_room();
+            if reader_shared.is_dead() {
+                return;
+            }
             match reader.read(&mut buf) {
                 Ok(0) => {
                     reader_shared.signal_upstream_eof();
@@ -1551,8 +1734,11 @@ fn spawn_upstream_workers(shared: Arc<FlowShared>, split: RelaySplit) -> Vec<Joi
                 {
                     continue;
                 }
+                // Not an EOF: the peer went away mid-answer. Distinguished
+                // from `Ok(0)` so the poll loop mirrors a reset rather than a
+                // clean close.
                 Err(_) => {
-                    reader_shared.signal_upstream_eof();
+                    reader_shared.signal_upstream_reset();
                     return;
                 }
             }
@@ -1596,6 +1782,31 @@ fn spawn_upstream_workers(shared: Arc<FlowShared>, split: RelaySplit) -> Vec<Joi
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+
+    /// The half-close must not overtake the request it follows.
+    #[test]
+    fn a_half_close_waits_for_the_dial_that_carries_the_request() {
+        for state in [
+            tcp::State::CloseWait,
+            tcp::State::Closing,
+            tcp::State::LastAck,
+            tcp::State::TimeWait,
+        ] {
+            assert!(
+                !client_fin_may_propagate(false, state),
+                "{state:?}: while the dial is in flight the client's bytes are still in the                  socket buffer, so forwarding the FIN sends the upstream home empty-handed",
+            );
+            assert!(client_fin_may_propagate(true, state), "{state:?}");
+        }
+        // Before the handshake completes there is no half-close to forward.
+        for state in [
+            tcp::State::Listen,
+            tcp::State::SynReceived,
+            tcp::State::Established,
+        ] {
+            assert!(!client_fin_may_propagate(true, state), "{state:?}");
+        }
+    }
     use super::*;
     use nrr_platform_api::fake_ip::tun::{
         MockTunAdapter, MockTunState, TunAdapterConfig, TunAdapterPort,
@@ -1657,10 +1868,13 @@ mod tests {
         waker.wake();
         // Already signalled: returns immediately and clears the flag.
         waker.wait(std::time::Duration::from_millis(10));
-        // No signal now: returns after the timeout without hanging.
+        // No signal now: returns after the timeout without hanging. The bound
+        // is well under the requested 20 ms on purpose — the claim is "it
+        // waited rather than returning at once", and Windows timer granularity
+        // (~15.6 ms) lets a 20 ms sleep come back just under a 15 ms threshold.
         let start = std::time::Instant::now();
         waker.wait(std::time::Duration::from_millis(20));
-        assert!(start.elapsed() >= std::time::Duration::from_millis(15));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(5));
     }
 
     #[test]
@@ -1719,6 +1933,188 @@ mod tests {
             assert!(
                 worker.is_finished(),
                 "workers must exit promptly once the flow is dead"
+            );
+            let _ = worker.join();
+        }
+    }
+
+    #[test]
+    fn a_hard_upstream_read_error_is_a_reset_not_an_eof() {
+        // A body cut in half must not reach the client under a clean FIN: it
+        // would parse as the whole answer, and a cache would keep it.
+        use crate::fake_ip::RelayWriteHalf;
+        use std::io;
+        use std::io::{Read, Write};
+
+        struct ResettingReader;
+        impl Read for ResettingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+        struct SinkWriter;
+        impl Write for SinkWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RelayWriteHalf for SinkWriter {
+            fn shutdown_write(&mut self) -> Result<(), RelayError> {
+                Ok(())
+            }
+        }
+
+        let shared = FlowShared::new(StackWaker::new());
+        let workers = spawn_upstream_workers(
+            Arc::clone(&shared),
+            RelaySplit {
+                reader: Box::new(ResettingReader),
+                writer: Box::new(SinkWriter),
+            },
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !shared.upstream_was_reset() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            shared.upstream_was_reset(),
+            "a hard error must signal reset"
+        );
+        assert!(
+            !shared.upstream_eof.load(Ordering::SeqCst),
+            "and must not also claim a clean end of the answer"
+        );
+        shared.mark_dead();
+        for worker in workers {
+            let _ = worker.join();
+        }
+    }
+
+    #[test]
+    fn at_capacity_a_new_syn_is_refused_and_live_flows_are_kept() {
+        // Evicting a live flow to admit a new one trades a working download for
+        // a connection that may be a port scan; the cap exists to bound memory,
+        // not to ration fairness.
+        use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
+        const CAP: usize = 2;
+
+        let health = Arc::new(super::super::health::FakeIpHealth::new());
+        let mut allocator = FakeIpAllocator::default();
+        let fake_v4 = allocator.allocate("voice.test").expect("allocate").v4;
+        let relay = RelayCore::new(
+            Arc::new(std::sync::Mutex::new(allocator)),
+            FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(
+                super::super::relay::StaticUpstreamResolver::new()
+                    .with("voice.test", &[std::net::IpAddr::V4(fake_v4)]),
+            ),
+            Arc::new(super::super::relay::FixedRouteSelector(
+                nrr_shared::RouteRole::Primary,
+            )),
+        );
+        let (device, _state) = open_mock_device();
+        let mut stack = FakeIpStack::new(
+            device,
+            &FakeIpPoolConfig::default(),
+            relay,
+            Arc::new(super::super::dialer::MockRelayDialer::new()),
+            StackWaker::new(),
+        )
+        .with_health(Arc::clone(&health))
+        .with_socket_buffer_bytes(1024)
+        .with_max_flows(CAP);
+
+        let syn_from = |port: u16| ParsedPacket {
+            key: FlowKey {
+                protocol: FlowProtocol::Tcp,
+                source: SocketAddr::from((std::net::Ipv4Addr::new(10, 0, 0, 1), port)),
+                destination: SocketAddr::from((fake_v4, 443)),
+            },
+            is_connection_open: true,
+            payload_offset: 0,
+        };
+        for port in 0..CAP {
+            stack.maybe_open_flow(&syn_from(40_000 + u16::try_from(port).unwrap_or(0)), 0);
+        }
+        assert_eq!(stack.flows.len(), CAP, "the fixture must reach the cap");
+        let before: Vec<_> = stack.flows.keys().copied().collect();
+
+        stack.maybe_open_flow(&syn_from(50_000), 1_000);
+
+        assert_eq!(
+            stack.flows.len(),
+            CAP,
+            "the cap must hold — no socket for the new SYN"
+        );
+        assert_eq!(health.tcp_flows_refused_at_capacity(), 1);
+        assert!(
+            before.iter().all(|key| stack.flows.contains_key(key)),
+            "no live flow may be evicted to make room"
+        );
+    }
+
+    #[test]
+    fn a_reader_parks_while_the_client_bound_queue_is_full() {
+        // Unbounded, this queue grew to whatever the upstream could deliver
+        // while the client's socket stalled — memory instead of a closed window.
+        use crate::fake_ip::RelayWriteHalf;
+        use std::io;
+        use std::io::{Read, Write};
+
+        struct FloodingReader;
+        impl Read for FloodingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                buf.fill(0x41);
+                Ok(buf.len())
+            }
+        }
+        struct SinkWriter;
+        impl Write for SinkWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RelayWriteHalf for SinkWriter {
+            fn shutdown_write(&mut self) -> Result<(), RelayError> {
+                Ok(())
+            }
+        }
+
+        let shared = FlowShared::new(StackWaker::new());
+        let workers = spawn_upstream_workers(
+            Arc::clone(&shared),
+            RelaySplit {
+                reader: Box::new(FloodingReader),
+                writer: Box::new(SinkWriter),
+            },
+        );
+        // Nobody drains: the queue must settle just past the high-water mark
+        // (one chunk of overshoot), not keep growing.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let settled = guard(&shared.from_upstream).len();
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let later = guard(&shared.from_upstream).len();
+        assert!(
+            settled <= FLOW_QUEUE_HIGH_WATER_BYTES + PUMP_CHUNK_BYTES,
+            "queue overshot its high-water mark: {settled}"
+        );
+        assert_eq!(settled, later, "a parked reader must not keep buffering");
+
+        shared.mark_dead();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for worker in workers {
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                worker.is_finished(),
+                "a parked reader must still notice teardown"
             );
             let _ = worker.join();
         }
@@ -2921,6 +3317,51 @@ mod tests {
         }
     }
 
+    /// Upstream that accepts datagrams but whose reader dies at once — the
+    /// Windows shape: `send` keeps succeeding after an ICMP port-unreachable,
+    /// only `recv` reports the reset.
+    #[derive(Default)]
+    struct DeadReadDatagram {
+        read_failed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RelayDatagram for DeadReadDatagram {
+        fn send(&self, payload: &[u8]) -> Result<usize, RelayError> {
+            Ok(payload.len())
+        }
+        fn receive(&self, _buffer: &mut [u8]) -> Result<usize, RelayError> {
+            self.read_failed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(RelayError::Upstream {
+                detail: "connection reset by peer".to_string(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct DeadReadDialer {
+        read_failed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl RelayDialer for DeadReadDialer {
+        fn connect_tcp(
+            &self,
+            _target: &super::super::dialer::UpstreamTarget,
+        ) -> Result<Box<dyn super::super::dialer::RelayStream>, RelayError> {
+            Err(RelayError::Upstream {
+                detail: "tcp not used in this test".to_string(),
+            })
+        }
+        fn connect_udp(
+            &self,
+            _target: &super::super::dialer::UpstreamTarget,
+        ) -> Result<Box<dyn RelayDatagram>, RelayError> {
+            Ok(Box::new(DeadReadDatagram {
+                read_failed: Arc::clone(&self.read_failed),
+            }))
+        }
+    }
+
     impl RelayDialer for DeadSendDialer {
         fn connect_tcp(
             &self,
@@ -2940,9 +3381,11 @@ mod tests {
 
     /// Drive one client datagram to `fake_v4:443` through a stack built over
     /// `dialer`, and return every client-bound packet the stack emitted.
-    fn client_bound_after_one_udp_datagram(
+    fn client_bound_after_udp_datagrams(
         dialer: Arc<dyn RelayDialer>,
         health: &Arc<super::super::health::FakeIpHealth>,
+        datagrams: usize,
+        ready_for_next: &dyn Fn() -> bool,
     ) -> Vec<Vec<u8>> {
         use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
 
@@ -3004,25 +3447,33 @@ mod tests {
 
         // The client's inbound queue is deliberately detached from `s2c` so the
         // stack's reply stays inspectable instead of being consumed by a poll.
-        let mut sent = false;
+        let mut sent = 0usize;
         let mut now_ms = 0u64;
+        // Queue depth at the moment the LAST datagram went out. Waiting for the
+        // queue to be non-empty instead would stop the loop on the reply to an
+        // EARLIER datagram, which is a reply this caller has already seen — the
+        // stack then never gets the steps its last datagram needs.
+        let mut depth_at_last_send: Option<usize> = None;
         for _ in 0..200 {
             now_ms += 5;
             let t = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
             client.poll(t, &mut client_device, &mut client_sockets);
-            if !sent {
+            if sent < datagrams && (sent == 0 || ready_for_next()) {
                 let socket = client_sockets.get_mut::<udp::Socket>(handle);
                 if socket.can_send() {
                     socket
                         .send_slice(b"quic-initial", (IpAddress::Ipv4(fake_v4), 443))
                         .expect("client send");
-                    sent = true;
+                    sent += 1;
                 }
+            }
+            if sent == datagrams && depth_at_last_send.is_none() {
+                depth_at_last_send = Some(guard(&s2c).len());
             }
             for _ in 0..4 {
                 stack.step(now_ms).expect("stack step");
             }
-            if sent && !guard(&s2c).is_empty() {
+            if depth_at_last_send.is_some_and(|depth| guard(&s2c).len() > depth) {
                 break;
             }
         }
@@ -3050,8 +3501,12 @@ mod tests {
         let dialer = super::super::dialer::MockRelayDialer::new();
         dialer.fail_dials("secondary adapter unresolved");
         let health = Arc::new(super::super::health::FakeIpHealth::new());
-        let emitted =
-            client_bound_after_one_udp_datagram(Arc::new(dialer) as Arc<dyn RelayDialer>, &health);
+        let emitted = client_bound_after_udp_datagrams(
+            Arc::new(dialer) as Arc<dyn RelayDialer>,
+            &health,
+            1,
+            &|| true,
+        );
 
         assert!(
             emitted.iter().any(|p| is_port_unreachable(p)),
@@ -3064,9 +3519,11 @@ mod tests {
     #[test]
     fn a_dead_udp_upstream_retires_the_client_and_reports_unreachable() {
         let health = Arc::new(super::super::health::FakeIpHealth::new());
-        let emitted = client_bound_after_one_udp_datagram(
+        let emitted = client_bound_after_udp_datagrams(
             Arc::new(DeadSendDialer) as Arc<dyn RelayDialer>,
             &health,
+            1,
+            &|| true,
         );
 
         assert!(
@@ -3075,5 +3532,46 @@ mod tests {
         );
         assert_eq!(health.udp_dial_ok(), 1, "the dial itself succeeded");
         assert_eq!(health.udp_unreachable_sent(), 1);
+    }
+
+    #[test]
+    fn a_hard_read_error_marks_the_udp_flow_dead() {
+        let replies = UdpReplies::new(StackWaker::new());
+        let worker = spawn_udp_reader(Arc::new(DeadReadDatagram::default()), Arc::clone(&replies));
+        worker.join().expect("reader thread");
+        assert!(
+            replies.is_dead(),
+            "a reader that gives up silently leaves the client bound to a flow nobody reads"
+        );
+    }
+
+    #[test]
+    fn a_client_whose_reader_died_is_retired_instead_of_kept_forever() {
+        // `send` on this upstream never fails, so the old code refreshed
+        // `last_seen_at` on every datagram and the idle reap never came.
+        let health = Arc::new(super::super::health::FakeIpHealth::new());
+        let read_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dialer = DeadReadDialer {
+            read_failed: Arc::clone(&read_failed),
+        };
+        let _ = client_bound_after_udp_datagrams(
+            Arc::new(dialer) as Arc<dyn RelayDialer>,
+            &health,
+            2,
+            // Send the second datagram only once the reader has actually
+            // failed — otherwise it races a flow that is still alive.
+            &|| {
+                if !read_failed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+                true
+            },
+        );
+        assert!(
+            health.udp_dial_ok() >= 2,
+            "the dead flow must be dropped and re-dialed, not kept and fed (dials: {})",
+            health.udp_dial_ok()
+        );
     }
 }

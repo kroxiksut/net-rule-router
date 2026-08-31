@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../lib/pure.js" as Pure
 
 // Top banner stack (extracted from Main.qml). The status banners
 // (backend / combined-amber / drift / merge / compat / secondary-adapter /
@@ -445,12 +446,8 @@ Item {
                 Accessible.description: root.tr(
                     "status.compat-banner-update-description",
                     "Open the project's releases page in the default browser.")
-                onClicked: {
-                    var base = String((root.context.about || {}).projectUrl || "")
-                    if (base !== "") {
-                        Qt.openUrlExternally(base + "/releases")
-                    }
-                }
+                onClicked: Pure.openExternalUrl(
+                    Pure.updatesPageUrl(root.prefs, root.context.about))
             }
         }
     }
@@ -1009,6 +1006,20 @@ Item {
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: root.openSettingsCategory("routing")
+            }
+            // A machine grows local networks over time - a hypervisor, WSL, a
+            // second VPN - and each new one is a new question. This answers all
+            // of them, now and later, without hiding anything: every network
+            // still appears in Settings and any of them can be refused there.
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("status.local-network-offer-never-ask", "Stop asking")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                onClicked: {
+                    root.acceptPendingLocalNetworks()
+                    root.routePolicyController.applyLocalNetworksAutoAccept(true)
+                }
             }
         }
     }

@@ -30,6 +30,15 @@ pub fn product_dir_leaf() -> &'static str {
 /// `None` only on Windows with no `PROGRAMDATA` in the environment — the
 /// caller decides whether that is fatal (the service) or just one candidate
 /// that did not pan out (the GUI's "open logs folder").
+///
+/// TRUST NOTE: this reads the process environment, and on Windows a user can
+/// rewrite their own environment through `HKCU\Environment` without any
+/// administrative right. The service under SCM and a console the user elevated
+/// themselves are both fine — the environment is the system's or their own. A
+/// process elevated ON A USER'S BEHALF is not: it inherits the environment of
+/// whoever triggered the prompt. That path (the broker spawning the service's
+/// `install`/`cleanup` verbs) hands the child the MACHINE environment instead;
+/// see `nrr_broker::trusted_env`.
 pub fn production_data_root() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -91,6 +100,84 @@ pub fn user_runtime_dir() -> PathBuf {
     }
 }
 
+/// Creates [`user_runtime_dir`] if needed and refuses to use one that is not
+/// private to this user.
+///
+/// Without `XDG_RUNTIME_DIR` the path falls back into `/tmp`, which every local
+/// user can write. A directory another user created there first — with our
+/// exact name — would have us drop the activation hand-off into their hands,
+/// and the launcher and the C++ host DISPATCH what that file says. So: never
+/// follow a symlink, and never accept a directory that grants group or other
+/// any access at all. Windows keeps `%TEMP%`, which is already per-user.
+pub fn ensure_user_runtime_dir() -> std::io::Result<PathBuf> {
+    let dir = user_runtime_dir();
+
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(&dir)?;
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is a symlink; refusing to use it", dir.display()),
+                ));
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} is not a directory", dir.display()),
+                ));
+            }
+            Ok(meta) if meta.mode() & 0o077 != 0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is readable or writable by other users (mode {:o})",
+                        dir.display(),
+                        meta.mode() & 0o777
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Parents may already exist with looser modes (`/tmp` does);
+                // the mode applies to the ones this call creates, which is the
+                // leaf we are about to own.
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&dir)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(dir)
+}
+
+/// Creates `path` for writing, failing if anything is already there.
+///
+/// `fs::write` follows a symlink and reuses whatever file it finds, and on Unix
+/// leaves the result world-readable. These files carry a user's settings into
+/// the Qt host, so: exclusive creation (a planted name is an error, not a
+/// redirect) and owner-only mode.
+pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +231,32 @@ mod tests {
         } else {
             assert_eq!(logs, root.join("logs"));
         }
+    }
+
+    #[test]
+    fn a_second_writer_is_refused_rather_than_handed_the_same_file() {
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("context.json");
+
+        let first = create_private_file(&path);
+        assert!(first.is_ok(), "the first creation must succeed");
+        let second = create_private_file(&path);
+        assert!(
+            second.is_err(),
+            "a name that already exists is a planted file, not a target"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_context_file_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let path = dir.path().join("context.json");
+        create_private_file(&path).expect("create");
+
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "mode {:o} leaks the user's settings", mode);
     }
 }

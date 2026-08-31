@@ -11,6 +11,7 @@
 //! and the exit codes are.
 
 mod doctor;
+mod elevate;
 mod exit;
 mod export;
 mod logs;
@@ -36,10 +37,17 @@ const TRANSITION_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let exe = executable_name();
 
-    let command = match parse::parse(&args) {
-        Ok(command) => command,
+    // An elevated copy of ourselves, running the real command on behalf of the
+    // unelevated console that started us. Handled before parsing because it is
+    // a process re-entry mode, not a verb — see `elevate`.
+    if let Some(request) = elevate::relay_request(&args) {
+        return ExitCode::from(elevate::run_relay(&request));
+    }
+
+    let exe = executable_name();
+    let invocation = match parse::parse(&args) {
+        Ok(invocation) => invocation,
         Err(err) => {
             eprintln!("{err}");
             eprintln!("Run `{exe} help` for the list of verbs.");
@@ -47,10 +55,42 @@ fn main() -> ExitCode {
         }
     };
 
-    ExitCode::from(run(command, &exe))
+    // Decided before the command runs so the access-denied message can be
+    // written for what happens next: "open an elevated console and type this
+    // again" is wrong advice when a prompt is one line away.
+    let relaunch = platform::privileged_relaunch();
+    let ctx = Ctx {
+        exe: &exe,
+        elevation: elevate::plan(
+            invocation.elevate,
+            relaunch.is_some(),
+            elevate::interactive(),
+        ),
+    };
+
+    let code = run(invocation.command.clone(), &ctx);
+    if code != exit::NEEDS_PRIVILEGE {
+        return ExitCode::from(code);
+    }
+    // Only a verb that got as far as being refused for privilege is worth
+    // re-running: elevation cannot help anything else, and asking anyway would
+    // train the user to grant rights for unrelated failures.
+    match elevate::retry(ctx.elevation, relaunch.as_deref(), &invocation.command) {
+        Some(elevated) => ExitCode::from(elevated),
+        None => ExitCode::from(code),
+    }
 }
 
-fn run(command: Command, exe: &str) -> u8 {
+/// What every verb needs to know about the invocation it is running under.
+struct Ctx<'a> {
+    /// How this console was invoked, for the commands it prints back.
+    exe: &'a str,
+    /// What may happen if the verb turns out to need administrator rights.
+    elevation: elevate::ElevationPlan,
+}
+
+fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
+    let exe = ctx.exe;
     match command {
         Command::Help => {
             print!("{}", verbs::render_help(exe));
@@ -111,7 +151,7 @@ fn run(command: Command, exe: &str) -> u8 {
                     }
                     exit::SUCCESS
                 }
-                Err(err) => report_failure("install", &err, exe, "install"),
+                Err(err) => report_failure("install", &err, ctx, "install"),
             }
         }),
         Command::Uninstall { purge } => with_port(exe, "uninstall", |port| {
@@ -149,7 +189,7 @@ reset-network` elevated, or reboot"
                 Err(err) => report_failure(
                     "uninstall",
                     &err,
-                    exe,
+                    ctx,
                     if purge {
                         "uninstall --purge"
                     } else {
@@ -163,14 +203,14 @@ reset-network` elevated, or reboot"
                 println!("Start requested.");
                 exit::SUCCESS
             }
-            Err(err) => report_failure("start", &err, exe, "start"),
+            Err(err) => report_failure("start", &err, ctx, "start"),
         }),
         Command::Stop => with_port(exe, "stop", |port| match port.stop(TRANSITION_TIMEOUT) {
             Ok(()) => {
                 println!("Stopped.");
                 exit::SUCCESS
             }
-            Err(err) => report_failure("stop", &err, exe, "stop"),
+            Err(err) => report_failure("stop", &err, ctx, "stop"),
         }),
         Command::Restart => with_port(exe, "restart", |port| {
             match port.restart(TRANSITION_TIMEOUT) {
@@ -178,7 +218,7 @@ reset-network` elevated, or reboot"
                     println!("Restarted.");
                     exit::SUCCESS
                 }
-                Err(err) => report_failure("restart", &err, exe, "restart"),
+                Err(err) => report_failure("restart", &err, ctx, "restart"),
             }
         }),
         // What `doctor` recommends when the registered binary is a different
@@ -196,7 +236,7 @@ reset-network` elevated, or reboot"
             let start_mode = previous.as_ref().and_then(|report| report.start_mode);
             if previous.is_some() {
                 if let Err(err) = port.uninstall(&ServiceUninstallSpec::keep_data()) {
-                    return report_failure("reinstall", &err, exe, "reinstall");
+                    return report_failure("reinstall", &err, ctx, "reinstall");
                 }
             }
             let mut spec = ServiceInstallSpec::production_defaults(binary_path);
@@ -210,7 +250,7 @@ reset-network` elevated, or reboot"
                     "The old registration was removed but the new one failed — \
                      the service is NOT registered right now."
                 );
-                return report_failure("reinstall", &err, exe, "reinstall");
+                return report_failure("reinstall", &err, ctx, "reinstall");
             }
             println!("Re-registered the {PRODUCT_NAME} service.");
             println!("  binary:            {}", spec.binary_path.display());
@@ -220,7 +260,7 @@ reset-network` elevated, or reboot"
                     println!("  service:           started");
                     exit::SUCCESS
                 }
-                Err(err) => report_failure("reinstall", &err, exe, "start"),
+                Err(err) => report_failure("reinstall", &err, ctx, "start"),
             }
         }),
     }
@@ -276,12 +316,22 @@ fn print_status(report: &ServiceStatusReport) {
 
 /// Print an actionable failure and pick its exit code. Access denied gets the
 /// exact command to repeat, because "run it elevated" without the command is
-/// how people end up retyping a verb wrong.
-fn report_failure(operation: &str, err: &ServiceControlError, exe: &str, repeat_as: &str) -> u8 {
+/// how people end up retyping a verb wrong — unless elevation is about to be
+/// offered, in which case telling them to go and type it somewhere else is
+/// advice for a situation that is not theirs.
+fn report_failure(
+    operation: &str,
+    err: &ServiceControlError,
+    ctx: &Ctx<'_>,
+    repeat_as: &str,
+) -> u8 {
+    let exe = ctx.exe;
     match err {
         ServiceControlError::AccessDenied => {
             eprintln!("{operation} requires an elevated console.");
-            eprintln!("Open a console as administrator and run: {exe} {repeat_as}");
+            if !ctx.elevation.acts() {
+                eprintln!("Open a console as administrator and run: {exe} {repeat_as}");
+            }
         }
         ServiceControlError::NotInstalled => {
             eprintln!("The {PRODUCT_NAME} service is not installed.");

@@ -323,6 +323,14 @@ impl TrafficStatsWriter for ProductionTrafficStats {
         Ok(settings_dto(&settings))
     }
 
+    fn settings(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
+        Ok(self
+            .settings
+            .get()
+            .map(|s| settings_dto(&s))
+            .unwrap_or_else(|_| settings_dto(&TrafficStatsSettings::DEFAULT)))
+    }
+
     fn clear(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
         {
             let mut sampler = lock_sampler(&self.sampler);

@@ -27,9 +27,9 @@
 //! - `Stopping` → `StopPending`
 //! - `Stopped` → `Stopped`
 //!
-//! Supported control codes: `Stop`, `Shutdown`, `Interrogate`, `PowerEvent`.
-//! `Pause` and `Continue` are not advertised — the policy state machine has no
-//! coherent "paused" state.
+//! Supported control codes: `Stop`, `Shutdown`, `Interrogate`, `PowerEvent`,
+//! `SessionChange`. `Pause` and `Continue` are not advertised — the policy state
+//! machine has no coherent "paused" state.
 
 use std::ffi::OsString;
 use std::sync::mpsc;
@@ -144,6 +144,18 @@ fn capture_stderr() {
     }
 }
 
+/// Controls advertised while Running. Each entry is load-bearing, and an
+/// omission is silent: SCM simply never delivers that control. `SESSION_CHANGE`
+/// carries the sign-in the DNS resolver arms on; `PRESHUTDOWN` buys teardown
+/// more than the five seconds a shutdown handler gets.
+fn running_controls() -> ServiceControlAccept {
+    ServiceControlAccept::STOP
+        | ServiceControlAccept::PRESHUTDOWN
+        | ServiceControlAccept::SHUTDOWN
+        | ServiceControlAccept::POWER_EVENT
+        | ServiceControlAccept::SESSION_CHANGE
+}
+
 fn run_scm_inner() -> Result<(), ScmError> {
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
@@ -165,11 +177,27 @@ fn run_scm_inner() -> Result<(), ScmError> {
                 stop_for_handler.request_stop();
                 ServiceControlHandlerResult::NoError
             }
+            // Arrives before `Shutdown` and is waited on for minutes, against the
+            // five seconds `WaitToKillServiceTimeout` allows a shutdown handler.
+            // Teardown restores system DNS and unwinds packet filters; cut off
+            // halfway it leaves the OS resolving through a listener that is gone.
+            ServiceControl::Preshutdown => {
+                tracing::info!(target: "nrr::lifecycle", control = "preshutdown", "SCM control received");
+                let _ = tx.send(LifecycleEvent::Shutdown);
+                stop_for_handler.request_stop();
+                ServiceControlHandlerResult::NoError
+            }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             // A wake leaves every binding resolved against a network that is
             // gone; this is the only notification that survives the sleep.
             ServiceControl::PowerEvent(param) => {
                 crate::power_scm::dispatch(param);
+                ServiceControlHandlerResult::NoError
+            }
+            // Policy is per-principal: a sign-in is what makes one exist. This
+            // is the only prompt notification of it a service gets.
+            ServiceControl::SessionChange(param) => {
+                crate::logon_scm::dispatch(param);
                 ServiceControlHandlerResult::NoError
             }
             _ => ServiceControlHandlerResult::NotImplemented,
@@ -206,11 +234,7 @@ fn run_scm_inner() -> Result<(), ScmError> {
                 ServiceRuntimeState::Stopped => ServiceState::Stopped,
             };
             let controls_accepted = match scm_state {
-                ServiceState::Running => {
-                    ServiceControlAccept::STOP
-                        | ServiceControlAccept::SHUTDOWN
-                        | ServiceControlAccept::POWER_EVENT
-                }
+                ServiceState::Running => running_controls(),
                 _ => ServiceControlAccept::empty(),
             };
             let pending = matches!(
@@ -419,4 +443,29 @@ pub fn start_service(timeout_secs: u64) -> Result<(), ScmError> {
 /// Stop the registered service and wait for `Stopped`.
 pub fn stop_service(timeout_secs: u64) -> Result<(), ScmError> {
     Ok(control().stop(Duration::from_secs(timeout_secs))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every control the handler branches on has to be advertised too — an
+    /// unadvertised one is never delivered, so the branch is dead code that
+    /// looks alive.
+    #[test]
+    fn running_advertises_every_control_the_handler_acts_on() {
+        let accepted = running_controls();
+        for (control, name) in [
+            (ServiceControlAccept::STOP, "stop"),
+            (ServiceControlAccept::PRESHUTDOWN, "preshutdown"),
+            (ServiceControlAccept::SHUTDOWN, "shutdown"),
+            (ServiceControlAccept::POWER_EVENT, "power event"),
+            (ServiceControlAccept::SESSION_CHANGE, "session change"),
+        ] {
+            assert!(
+                accepted.contains(control),
+                "the handler acts on {name} but SCM is never told to send it",
+            );
+        }
+    }
 }

@@ -1,4 +1,4 @@
-//! What the relay does with each packet, and what it remembers between them.
+//! What the relay does with each packet.
 //!
 //! This is the neutral heart of fake-IP: given a parsed packet, decide whether
 //! it belongs to us, which hostname its fake destination stands for, where that
@@ -20,7 +20,7 @@ use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope, FakeIpVerdict};
 use nrr_shared::RouteRole;
 
 use super::dialer::UpstreamTarget;
-use super::flow::{FlowKey, FlowProtocol, ParsedPacket};
+use super::flow::ParsedPacket;
 
 /// Real addresses known for a hostname. Fed by the FQDN cache in production —
 /// the relay never performs a DNS lookup itself, because the answer it would
@@ -78,137 +78,18 @@ impl RelayDecision {
     }
 }
 
-/// One live flow the relay is carrying.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelaySession {
-    pub key: FlowKey,
-    pub hostname: String,
-    pub target: UpstreamTarget,
-    /// Monotonic tick (milliseconds) of the packet that opened the flow.
-    pub opened_at: u64,
-    /// Monotonic tick of the most recent packet seen in either direction.
-    pub last_seen_at: u64,
-}
-
-/// Live flows, bounded so a scan or a flood cannot grow it without limit.
-///
-/// Eviction is by idleness, not by age: a long download is a legitimate flow
-/// that must not be cut, while a flow with no packets for the idle window is
-/// finished as far as anyone can tell.
-#[derive(Debug)]
-pub struct SessionTable {
-    sessions: HashMap<FlowKey, RelaySession>,
-    capacity: usize,
-    idle_timeout_ms: u64,
-}
-
-/// Default ceiling on concurrent relayed flows. Generous for a desktop (a busy
-/// browser opens low hundreds), low enough that a runaway cannot exhaust memory.
-pub const DEFAULT_SESSION_CAPACITY: usize = 4096;
 /// Default idle window before a flow is considered finished (2 minutes).
+/// Handed to smoltcp as the per-socket timeout by the stack, which is what
+/// actually retires finished flows.
 pub const DEFAULT_SESSION_IDLE_MS: u64 = 120_000;
 
-impl Default for SessionTable {
-    fn default() -> Self {
-        Self::new(DEFAULT_SESSION_CAPACITY, DEFAULT_SESSION_IDLE_MS)
-    }
-}
-
-impl SessionTable {
-    #[must_use]
-    pub fn new(capacity: usize, idle_timeout_ms: u64) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            capacity: capacity.max(1),
-            idle_timeout_ms,
-        }
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.sessions.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
-    }
-
-    #[must_use]
-    pub fn get(&self, key: &FlowKey) -> Option<&RelaySession> {
-        self.sessions.get(key)
-    }
-
-    /// Record a packet for an existing flow. Returns false when the flow is
-    /// unknown — the caller then decides whether it may be opened.
-    pub fn touch(&mut self, key: &FlowKey, now_ms: u64) -> bool {
-        match self.sessions.get_mut(key) {
-            Some(session) => {
-                session.last_seen_at = now_ms;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Open a flow, first expiring idle ones and, if still full, evicting the
-    /// least recently used. Returns the session that was displaced, if any, so
-    /// the caller can tear its upstream down.
-    pub fn open(&mut self, session: RelaySession, now_ms: u64) -> Option<RelaySession> {
-        self.expire_idle(now_ms);
-        let mut displaced = None;
-        if self.sessions.len() >= self.capacity {
-            if let Some(victim) = self
-                .sessions
-                .values()
-                .min_by_key(|s| (s.last_seen_at, s.key))
-                .map(|s| s.key)
-            {
-                displaced = self.sessions.remove(&victim);
-            }
-        }
-        self.sessions.insert(session.key, session);
-        displaced
-    }
-
-    pub fn close(&mut self, key: &FlowKey) -> Option<RelaySession> {
-        self.sessions.remove(key)
-    }
-
-    /// Drop every flow with no packet within the idle window; returns them so
-    /// their upstream sockets can be closed.
-    pub fn expire_idle(&mut self, now_ms: u64) -> Vec<RelaySession> {
-        // Strictly older than the cutoff: a flow whose last packet lands exactly
-        // on the boundary is still within its window. With `<=`, a flow opened
-        // at tick 0 was expired by its own `open()` call (cutoff saturates to 0)
-        // and never survived to carry a byte.
-        let cutoff = now_ms.saturating_sub(self.idle_timeout_ms);
-        let expired: Vec<FlowKey> = self
-            .sessions
-            .values()
-            .filter(|s| s.last_seen_at < cutoff)
-            .map(|s| s.key)
-            .collect();
-        expired
-            .into_iter()
-            .filter_map(|key| self.sessions.remove(&key))
-            .collect()
-    }
-
-    /// Drop everything (feature switched off, adapter torn down).
-    pub fn clear(&mut self) -> Vec<RelaySession> {
-        self.sessions.drain().map(|(_, session)| session).collect()
-    }
-}
-
 /// The relay's decision layer: everything needed to turn a packet into a
-/// verdict, and the table of flows already decided.
+/// verdict.
 pub struct RelayCore {
     allocator: Arc<Mutex<FakeIpAllocator>>,
     scope: FakeIpScope,
     resolver: Arc<dyn UpstreamAddressResolver>,
     routes: Arc<dyn RouteSelector>,
-    sessions: SessionTable,
     /// Asked only for flows the route policy sends over the secondary: a
     /// confirmed VPN client's own traffic is the tunnel's transport and must
     /// never ride the tunnel. Inert by default — see
@@ -236,7 +117,6 @@ impl RelayCore {
             scope,
             resolver,
             routes,
-            sessions: SessionTable::default(),
             vpn_bypass: Arc::new(super::vpn_client_bypass::NoVpnClientBypass),
             resolve_at_dial: false,
         }
@@ -256,12 +136,6 @@ impl RelayCore {
         self.resolve_at_dial = enabled;
     }
 
-    #[must_use]
-    pub fn with_session_table(mut self, sessions: SessionTable) -> Self {
-        self.sessions = sessions;
-        self
-    }
-
     /// Wire the confirmed-VPN-client bypass. Builder-style; the default never
     /// bypasses, so every existing composition is byte-for-byte unchanged.
     #[must_use]
@@ -273,19 +147,17 @@ impl RelayCore {
         self
     }
 
-    #[must_use]
-    pub fn sessions(&self) -> &SessionTable {
-        &self.sessions
-    }
-
-    /// Decide what to do with a packet, WITHOUT touching the session table —
-    /// used by tests and by the explain surface to answer "what would happen to
-    /// this flow?".
+    /// Decide what to do with a packet. Pure: the caller owns flow lifetime, so
+    /// the explain surface can ask "what would happen to this flow?" without
+    /// disturbing anything.
     #[must_use]
     pub fn decide(&self, packet: &ParsedPacket) -> RelayDecision {
         let destination = packet.key.destination;
         let hostname = {
-            let mut allocator = self.allocator.lock().expect("fake-ip allocator mutex");
+            // A poisoned allocator must not take the decision path with it: the
+            // panic would be re-raised on every packet, and the poller's own
+            // restart loop would re-enter it forever with the block armed.
+            let mut allocator = self.allocator.lock().unwrap_or_else(|p| p.into_inner());
             if !allocator.is_fake_address(destination.ip()) {
                 // In-tunnel rescue: a VPN client that enumerates
                 // TUN adapters can bind its in-tunnel control socket to OUR
@@ -374,57 +246,6 @@ impl RelayCore {
             hostname,
         }
     }
-
-    /// Decide and update the flow table in one step — the packet-loop entry
-    /// point. Returns the decision plus whether this packet opened a new flow.
-    pub fn admit(&mut self, packet: &ParsedPacket, now_ms: u64) -> (RelayDecision, bool) {
-        if self.sessions.touch(&packet.key, now_ms) {
-            // Mid-flow packet: the decision was made when the flow opened and
-            // must not be revisited per packet — re-deciding would let a policy
-            // change mid-download silently redirect an open connection.
-            let session = self
-                .sessions
-                .get(&packet.key)
-                .expect("session was just touched");
-            return (
-                RelayDecision::Relay {
-                    hostname: session.hostname.clone(),
-                    target: session.target.clone(),
-                },
-                false,
-            );
-        }
-
-        // An unknown TCP flow that is not a SYN is a stray segment of a
-        // connection we do not carry (a retransmit after eviction, or a scan).
-        if packet.key.protocol == FlowProtocol::Tcp && !packet.is_connection_open {
-            return (RelayDecision::UnmappedFakeAddress, false);
-        }
-
-        let decision = self.decide(packet);
-        if let RelayDecision::Relay { hostname, target } = &decision {
-            self.sessions.open(
-                RelaySession {
-                    key: packet.key,
-                    hostname: hostname.clone(),
-                    target: target.clone(),
-                    opened_at: now_ms,
-                    last_seen_at: now_ms,
-                },
-                now_ms,
-            );
-            return (decision, true);
-        }
-        (decision, false)
-    }
-
-    pub fn close(&mut self, key: &FlowKey) -> Option<RelaySession> {
-        self.sessions.close(key)
-    }
-
-    pub fn expire_idle(&mut self, now_ms: u64) -> Vec<RelaySession> {
-        self.sessions.expire_idle(now_ms)
-    }
 }
 
 /// Private (RFC 1918) or CGNAT (RFC 6598) IPv4 — the only destinations the
@@ -490,7 +311,7 @@ impl RouteSelector for FixedRouteSelector {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::fake_ip::flow::FlowProtocol;
+    use crate::fake_ip::flow::{FlowKey, FlowProtocol};
 
     fn ip(text: &str) -> IpAddr {
         text.parse().expect("address")
@@ -734,93 +555,5 @@ mod tests {
             }
             other => panic!("expected out-of-scope, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn an_open_flow_keeps_its_decision_when_policy_changes_mid_stream() {
-        let (allocator, fake) = allocator_with("chatgpt.com");
-        let resolver = StaticUpstreamResolver::new().with("chatgpt.com", &[ip("104.18.32.47")]);
-        let mut relay = core(allocator, resolver, RouteRole::Secondary);
-        let destination = SocketAddr::new(fake, 443);
-
-        let (opened, is_new) = relay.admit(&packet(destination, true), 1_000);
-        assert!(is_new);
-        assert!(matches!(opened, RelayDecision::Relay { .. }));
-
-        // Mid-flow data packet: same flow, no re-decision, not counted as new.
-        let (continued, is_new) = relay.admit(&packet(destination, false), 1_500);
-        assert!(!is_new);
-        match continued {
-            RelayDecision::Relay { target, .. } => {
-                assert_eq!(target.route, RouteRole::Secondary)
-            }
-            other => panic!("expected the flow to continue, got {other:?}"),
-        }
-        assert_eq!(relay.sessions().len(), 1);
-    }
-
-    #[test]
-    fn a_stray_segment_of_an_unknown_tcp_flow_is_dropped() {
-        let (allocator, fake) = allocator_with("chatgpt.com");
-        let resolver = StaticUpstreamResolver::new().with("chatgpt.com", &[ip("104.18.32.47")]);
-        let mut relay = core(allocator, resolver, RouteRole::Primary);
-        let (decision, is_new) = relay.admit(&packet(SocketAddr::new(fake, 443), false), 10);
-        assert_eq!(decision, RelayDecision::UnmappedFakeAddress);
-        assert!(!is_new);
-        assert!(relay.sessions().is_empty());
-    }
-
-    #[test]
-    fn idle_flows_expire_and_busy_ones_survive() {
-        let mut table = SessionTable::new(16, 1_000);
-        let make = |port: u16| RelaySession {
-            key: FlowKey {
-                protocol: FlowProtocol::Tcp,
-                source: format!("10.0.0.2:{port}").parse().expect("source"),
-                destination: "198.18.0.2:443".parse().expect("destination"),
-            },
-            hostname: "chatgpt.com".to_string(),
-            target: UpstreamTarget::at(
-                "chatgpt.com".to_string(),
-                "104.18.32.47:443".parse().expect("addr"),
-                RouteRole::Primary,
-            ),
-            opened_at: 0,
-            last_seen_at: 0,
-        };
-        table.open(make(1), 0);
-        table.open(make(2), 0);
-        let busy = make(2).key;
-        assert!(table.touch(&busy, 900));
-
-        let expired = table.expire_idle(1_500);
-        assert_eq!(expired.len(), 1, "only the untouched flow expires");
-        assert!(table.get(&busy).is_some());
-    }
-
-    #[test]
-    fn a_full_table_evicts_the_least_recently_used_flow() {
-        let mut table = SessionTable::new(1, 60_000);
-        let session = |port: u16| RelaySession {
-            key: FlowKey {
-                protocol: FlowProtocol::Tcp,
-                source: format!("10.0.0.2:{port}").parse().expect("source"),
-                destination: "198.18.0.2:443".parse().expect("destination"),
-            },
-            hostname: "chatgpt.com".to_string(),
-            target: UpstreamTarget::at(
-                "chatgpt.com".to_string(),
-                "104.18.32.47:443".parse().expect("addr"),
-                RouteRole::Primary,
-            ),
-            opened_at: 0,
-            last_seen_at: 0,
-        };
-        assert!(table.open(session(1), 0).is_none());
-        let displaced = table
-            .open(session(2), 10)
-            .expect("the first flow is displaced");
-        assert_eq!(displaced.key.source.port(), 1);
-        assert_eq!(table.len(), 1);
     }
 }

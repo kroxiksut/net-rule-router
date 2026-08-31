@@ -31,7 +31,7 @@
 //!
 //! | Band | Range | Used by |
 //! |------|-------|---------|
-//! | Block rules     | `0x0060_0000 + pos * SLOTS_PER_RULE + fanout_idx` | `RuleAction::Block` rules (hard drop, role-independent, above the kill-switch permit band) |
+//! | Block rules     | `0x0070_0000 + pos * SLOTS_PER_RULE + fanout_idx` | `RuleAction::Block` rules (hard drop, role-independent, above the kill-switch permit band) |
 //! | Primary rules   | `0x0020_0000 + pos * SLOTS_PER_RULE + fanout_idx` | route rules in `rule_book.primary` |
 //! | Secondary rules | `0x0010_0000 + pos * SLOTS_PER_RULE + fanout_idx` | route rules in `rule_book.secondary` |
 //! | Default catch-all | `0x0000_FFFF` | fail-closed Block filter |
@@ -74,6 +74,7 @@ use nrr_domain::canonical::{
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 
+use crate::address_ownership::AppDestinationRefusal;
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 
@@ -83,7 +84,7 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 /// band so explicit primary rules outrank more general secondary
 /// rules. Each rule occupies a 256-slot range starting at
 /// `BASE_PRIMARY + pos * SLOTS_PER_RULE`.
-const BASE_PRIMARY: u64 = 0x0020_0000;
+pub(crate) const BASE_PRIMARY: u64 = 0x0020_0000;
 /// Base WFP weight for `secondary`-route rules.
 const BASE_SECONDARY: u64 = 0x0010_0000;
 /// Base WFP weight for per-rule **Block**-action filters. Placed ABOVE the
@@ -93,7 +94,43 @@ const BASE_SECONDARY: u64 = 0x0010_0000;
 /// `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`, which `wfp_filter.rs` stamps on every
 /// `WfpAction::Block` filter automatically. Block filters are role-independent
 /// (drop regardless of primary/secondary set membership).
-const BASE_BLOCK: u64 = 0x0060_0000;
+const BASE_BLOCK: u64 = 0x0070_0000;
+
+/// Width of one weight band. Every base above is a multiple of it, and a band
+/// holds [`MAX_RULE_SLOT`] + 1 rules.
+const BAND_WIDTH: u64 = 0x0010_0000;
+
+/// Highest rule position a band can hold. `pos` comes from the rule book and
+/// nothing upstream caps it, so without this the 8192nd primary rule would land
+/// on the kill-switch permit band and the 4096th block rule inside the app
+/// exemptions — a rule silently outranking a guard it must never outrank.
+/// Positions past the cap SHARE the last slot: still deterministic, still
+/// inside the band, and ordering among rules that far down is not what decides
+/// anything.
+const MAX_RULE_SLOT: u64 = BAND_WIDTH / SLOTS_PER_RULE - 1;
+
+/// Weight of the `fanout_idx`-th filter of the rule at `pos` within `base`'s
+/// band. The single place a rule weight is computed, so the cap cannot be
+/// applied in two of three call sites.
+fn rule_weight(base: u64, pos: u64, fanout_idx: u64) -> u64 {
+    base + pos.min(MAX_RULE_SLOT) * SLOTS_PER_RULE + fanout_idx.min(SLOTS_PER_RULE - 1)
+}
+
+// The bands must not overlap the kill-switch ones: our filters all live in ONE
+// sub-layer, where the highest weight wins outright. A tie or an inversion here
+// means a user's explicit Block and the kill-switch's app exemption arbitrate by
+// accident — and `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` does not help, since it
+// defends a Block against OTHER sub-layers, not against our own higher-weighted
+// permit.
+const _: () = {
+    assert!(BASE_BLOCK > crate::killswitch_codegen::APP_EXEMPT_BASE);
+    assert!(
+        BASE_BLOCK - crate::killswitch_codegen::APP_EXEMPT_BASE >= BAND_WIDTH,
+        "an explicit user Block must sit a full band above the app exemptions"
+    );
+    assert!(BASE_PRIMARY + BAND_WIDTH <= crate::killswitch_codegen::KILLSWITCH_PERMIT_BASE);
+    assert!(BASE_SECONDARY + BAND_WIDTH <= BASE_PRIMARY);
+};
 /// Weight of the fail-closed catch-all filter. Below every per-rule
 /// weight so a rule-driven `Permit` always wins.
 const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
@@ -165,6 +202,11 @@ pub struct CodegenInput<'a> {
     /// `/32` permit is emitted for them (kept consistent with the route codegen).
     /// Empty for the aggressive policy / no collateral — the common case.
     pub secondary_ip_denylist: &'a std::collections::HashSet<std::net::Ipv4Addr>,
+    /// Evaluate a zone rule ahead of an exact-address rule, from the
+    /// principal's stored `zone_priority_over_ip`. Reaches the
+    /// address-ownership arbiter, which is the one place the two can contest
+    /// the same address.
+    pub zone_priority_over_ip: bool,
 }
 
 /// Result of one codegen invocation.
@@ -180,8 +222,9 @@ pub struct CodegenOutput {
     pub diagnostics: Vec<CodegenDiagnostic>,
     /// the deduplicated destination
     /// IPv4 addresses the **secondary** (VPN) rules resolved to, in
-    /// emission order. This is exactly the set the per-destination
-    /// kill-switch protects: if the secondary adapter drops, these must be blocked
+    /// emission order. The per-destination kill-switch protects this set
+    /// minus [`Self::app_observed_secondary_ips`] (the orchestrator does the
+    /// subtraction): if the secondary adapter drops, these must be blocked
     /// rather than leak out the primary NIC. Primary-rule destinations
     /// are deliberately excluded — they are meant to use the primary
     /// adapter and must never be killed.
@@ -201,6 +244,12 @@ pub struct CodegenOutput {
     /// secondary is down (fail-closed), never rescued via the primary permit.
     /// Only used in the block-all branch; in the per-IP path primary IPs are
     /// never blocked in the first place.
+    ///
+    /// Reports what THIS codegen emitted a permit for — not the answer to "is
+    /// this address named by a main-link rule". That question has one owner,
+    /// `address_ownership::AddressOwnership`, and the orchestrator's exemption
+    /// sets ask it directly; this field's fan-out caps made it a second,
+    /// quietly smaller answer to the same question.
     pub primary_dest_ips: Vec<Ipv4Addr>,
     ///  — the deduplicated application id patterns the **secondary**
     /// (VPN) application route rules carry, in emission order. A secondary-
@@ -236,6 +285,18 @@ pub struct CodegenOutput {
     /// resolves to nothing (client not installed) simply contributes nothing; it
     /// never worked when stamped verbatim either.
     pub vpn_default_exempt_paths: Vec<String>,
+    /// Deduplicated destination IPs admitted through a RESOLVED secondary
+    /// **application** rule's observation fan-out (a subset of
+    /// [`Self::secondary_dest_ips`]). These are evidence, not policy: the app's
+    /// own leak-guard is its egress-conditional per-app pair, so the
+    /// orchestrator excludes them from the per-destination kill-switch pin set
+    /// — at ~12 standing filters per pinned address, hours of peer churn from
+    /// one P2P app otherwise grow the filter set the platform holds for us into
+    /// the thousands, well past what it is meant to carry. An address ALSO named by an address rule
+    /// stays pinned (the arbiter's set wins); an app whose exe did not resolve
+    /// contributes nothing here, so its destinations keep their pins — no
+    /// per-app pair protects them.
+    pub app_observed_secondary_ips: Vec<Ipv4Addr>,
 }
 
 impl CodegenOutput {
@@ -273,6 +334,32 @@ pub enum CodegenDiagnostic {
     /// on the machine, not just the app. The named rule is the specific
     /// statement about that destination, so it holds.
     AppDestinationClaimedByPrimary {
+        rule_id: String,
+        app: String,
+        ip: Ipv4Addr,
+    },
+    /// An ADDRESS rule on the additional link named an address the MAIN link's
+    /// address rules also name, so no per-address filter was emitted for it.
+    ///
+    /// The sibling of [`Self::AppDestinationClaimedByPrimary`] for the case
+    /// where BOTH claims are address rules. Rules name hosts and filters act on
+    /// addresses; one address carries many hosts, so steering a shared one into
+    /// the tunnel takes the main link's hosts with it. Aggregated per rule —
+    /// `ip` is one example, `count` is how many that rule lost.
+    AddressClaimedByPrimary {
+        rule_id: String,
+        ip: Ipv4Addr,
+        count: usize,
+    },
+    /// An `Application` rule observed a destination a process the rule set
+    /// never named is ALSO using, so the address was not pinned.
+    ///
+    /// A `/32` filter is not process-scoped any more than a route is: pinning
+    /// the address moves the other process's traffic too, and the kill-switch
+    /// then blocks the address whenever the additional link is down — for that
+    /// process as well. Nothing known about an address is not evidence of
+    /// exclusivity, so an unobserved one still gets its filter.
+    AppDestinationUsedByOtherProcess {
         rule_id: String,
         app: String,
         ip: Ipv4Addr,
@@ -352,8 +439,13 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
     // Resolved from the UNFILTERED cache: the denylist view exists to trim what
     // goes to the tunnel, and reading it here would understate what the main
     // link claims.
-    let ownership =
-        crate::address_ownership::AddressOwnership::resolve(input.rule_book, input.fqdn_cache);
+    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+        input.rule_book,
+        input.fqdn_cache,
+        crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+            input.zone_priority_over_ip,
+        ),
+    );
     for (role_idx, role) in [RouteRole::Primary, RouteRole::Secondary]
         .into_iter()
         .enumerate()
@@ -376,6 +468,11 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
             RouteRole::Primary => input.fqdn_cache,
             RouteRole::Secondary => &secondary_cache,
         };
+        let gate = crate::address_ownership::AppDestinationGate::for_rule_set(
+            &ownership,
+            input.app_observations,
+            rule_set,
+        );
         for (pos, rule) in rule_set.rules().iter().enumerate() {
             generate_for_rule(
                 input.sid,
@@ -384,9 +481,9 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
                 pos as u64,
                 rule,
                 cache_for_role,
-                input.app_observations,
-                input.app_resolver,
+                &gate,
                 &ownership,
+                input.app_resolver,
                 &mut out,
             );
         }
@@ -521,9 +618,9 @@ fn generate_for_rule(
     pos: u64,
     rule: &CanonicalRule,
     cache: &dyn FqdnCacheLookup,
-    app_observations: &dyn AppObservationLookup,
-    app_resolver: &dyn nrr_platform_api::AppPathResolver,
+    gate: &crate::address_ownership::AppDestinationGate<'_>,
     ownership: &crate::address_ownership::AddressOwnership,
+    app_resolver: &dyn nrr_platform_api::AppPathResolver,
     out: &mut CodegenOutput,
 ) {
     if !rule.enabled {
@@ -560,8 +657,19 @@ fn generate_for_rule(
         },
     };
 
+    let link = match role {
+        RouteRole::Primary => crate::address_ownership::Link::Main,
+        RouteRole::Secondary => crate::address_ownership::Link::Additional,
+    };
     if let Some(addr_match) = rule.address_match.as_ref() {
-        emit_for_address_match(sid, role_slug, ctx, pos, rule, addr_match, cache, out);
+        // A Block rule claims nothing and steers nothing — it drops its
+        // destination, so the arbiter has no say over it (module rule 3).
+        let steerable = |ip: Ipv4Addr| {
+            matches!(rule.action, RuleAction::Block) || ownership.address_rule_may_steer(ip, link)
+        };
+        emit_for_address_match(
+            sid, role_slug, ctx, pos, rule, addr_match, cache, &steerable, out,
+        );
     } else if let Some(app) = rule.app_match.as_ref() {
         emit_for_app_match(
             sid,
@@ -570,13 +678,9 @@ fn generate_for_rule(
             pos,
             rule,
             app,
-            app_observations,
+            gate,
             app_resolver,
-            ownership,
-            match role {
-                RouteRole::Primary => crate::address_ownership::Link::Main,
-                RouteRole::Secondary => crate::address_ownership::Link::Additional,
-            },
+            link,
             out,
         );
     }
@@ -593,11 +697,17 @@ fn emit_for_address_match(
     rule: &CanonicalRule,
     addr_match: &CanonicalAddressMatch,
     cache: &dyn FqdnCacheLookup,
+    steerable: &dyn Fn(Ipv4Addr) -> bool,
     out: &mut CodegenOutput,
 ) {
+    let mut held: Option<(Ipv4Addr, usize)> = None;
     match addr_match {
         CanonicalAddressMatch::ExactIp(addr) => {
-            emit_single_ip_filter(sid, role_slug, ctx, pos, 0, rule, "exact-ip", *addr, out);
+            if steerable(*addr) {
+                emit_single_ip_filter(sid, role_slug, ctx, pos, 0, rule, "exact-ip", *addr, out);
+            } else {
+                note_held(&mut held, *addr);
+            }
         }
         CanonicalAddressMatch::ExactFqdn(hostname) => {
             let ips = cache.ips_for_hostname(hostname);
@@ -609,6 +719,10 @@ fn emit_for_address_match(
                 return;
             }
             for (i, ip) in ips.into_iter().take(PER_HOSTNAME_IP_CAP).enumerate() {
+                if !steerable(ip) {
+                    note_held(&mut held, ip);
+                    continue;
+                }
                 emit_single_ip_filter(
                     sid,
                     role_slug,
@@ -634,6 +748,8 @@ fn emit_for_address_match(
                 // `*.suffix` covers the apex too — expand it into the fan-out.
                 SuffixFanoutKind::SuffixDomain,
                 cache,
+                steerable,
+                &mut held,
                 out,
                 |id, s| CodegenDiagnostic::SuffixEmpty {
                     rule_id: id,
@@ -653,6 +769,8 @@ fn emit_for_address_match(
                 // A zone rule never covers the bare zone label.
                 SuffixFanoutKind::Zone,
                 cache,
+                steerable,
+                &mut held,
                 out,
                 |id, z| CodegenDiagnostic::ZoneEmpty {
                     rule_id: id,
@@ -660,6 +778,23 @@ fn emit_for_address_match(
                 },
             );
         }
+    }
+    if let Some((ip, count)) = held {
+        out.diagnostics
+            .push(CodegenDiagnostic::AddressClaimedByPrimary {
+                rule_id: rule.id.as_str().to_string(),
+                ip,
+                count,
+            });
+    }
+}
+
+/// Record one held-back address: the first is kept as the example, all of them
+/// count.
+fn note_held(held: &mut Option<(Ipv4Addr, usize)>, ip: Ipv4Addr) {
+    match held {
+        Some((_, count)) => *count += 1,
+        None => *held = Some((ip, 1)),
     }
 }
 
@@ -687,6 +822,8 @@ fn emit_suffix_fanout<F>(
     suffix_or_zone: &str,
     kind: SuffixFanoutKind,
     cache: &dyn FqdnCacheLookup,
+    steerable: &dyn Fn(Ipv4Addr) -> bool,
+    held: &mut Option<(Ipv4Addr, usize)>,
     out: &mut CodegenOutput,
     empty_diagnostic: F,
 ) where
@@ -725,6 +862,10 @@ fn emit_suffix_fanout<F>(
             continue;
         }
         for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
+            if !steerable(ip) {
+                note_held(held, ip);
+                continue;
+            }
             // Weight slots exist to keep ADJACENT rules' bands from
             // overlapping; within one rule every fan-out target carries the
             // same Permit/Block action, so their relative order is
@@ -748,9 +889,8 @@ fn emit_for_app_match(
     pos: u64,
     rule: &CanonicalRule,
     app: &CanonicalAppMatch,
-    app_observations: &dyn AppObservationLookup,
+    gate: &crate::address_ownership::AppDestinationGate<'_>,
     app_resolver: &dyn nrr_platform_api::AppPathResolver,
-    ownership: &crate::address_ownership::AddressOwnership,
     link: crate::address_ownership::Link,
     out: &mut CodegenOutput,
 ) {
@@ -801,7 +941,7 @@ fn emit_for_app_match(
                 action: ctx.action,
                 remote_ip: None,
                 remote_port: None,
-                weight: ctx.base_weight + pos * SLOTS_PER_RULE + k as u64,
+                weight: rule_weight(ctx.base_weight, pos, k as u64),
                 id,
                 user_sid: Some(sid.to_string()),
                 app_pattern: Some(path_str.into_owned()),
@@ -822,34 +962,54 @@ fn emit_for_app_match(
     // `/32` fan-out starts AFTER the resolved-path band (slots
     // `APP_PATH_FANOUT_CAP + 1 + i`) so it never collides with the per-path
     // app-id filters above.
-    let observed = app_observations.ips_for_app(&pattern_str);
-    // An address the user's own main-route rules name is NOT taken over by an
-    // app rule. The pin could not win anyway — the named rule steers the traffic
-    // the other way — and the pair cancels into a destination that is dead for
-    // every process on the machine. Reported, never silent: the app really is
-    // talking to that host and the user may want to know which rule won.
-    let ips: Vec<Ipv4Addr> = observed
-        .into_iter()
-        .filter(|ip| {
-            let claimed = !ownership.app_rule_may_claim(*ip, link);
-            if claimed {
-                out.diagnostics
-                    .push(CodegenDiagnostic::AppDestinationClaimedByPrimary {
-                        rule_id: rule.id.as_str().to_string(),
-                        app: pattern_str.clone(),
-                        ip: *ip,
-                    });
+    // Ownership and the outside-use census, asked through the gate the route
+    // codegen reads — the two mechanisms must not disagree about who owns an
+    // address, because a pin one way and a block the other leave the
+    // destination dead for every process on the machine.
+    let destinations = gate.admit(&pattern_str, link);
+    let refused_count = destinations.refused.len();
+    for (ip, reason) in destinations.refused {
+        out.diagnostics.push(match reason {
+            AppDestinationRefusal::ClaimedByAddressRule => {
+                CodegenDiagnostic::AppDestinationClaimedByPrimary {
+                    rule_id: rule.id.as_str().to_string(),
+                    app: pattern_str.clone(),
+                    ip,
+                }
             }
-            !claimed
-        })
-        .collect();
-    if ips.is_empty() {
-        out.diagnostics.push(CodegenDiagnostic::AppUnobserved {
-            rule_id: rule.id.as_str().to_string(),
-            app: pattern_str,
+            AppDestinationRefusal::UsedByOtherProcess => {
+                CodegenDiagnostic::AppDestinationUsedByOtherProcess {
+                    rule_id: rule.id.as_str().to_string(),
+                    app: pattern_str.clone(),
+                    ip,
+                }
+            }
         });
+    }
+    let ips = destinations.admitted;
+    if ips.is_empty() {
+        // "Never observed" and "everything it was seen using belongs to
+        // somebody else" are different answers, and only the first one tells
+        // the user to go run the application. The refusals above already say
+        // which rule took each address; adding `AppUnobserved` on top sent the
+        // user looking for a process that had, in fact, been seen.
+        if refused_count == 0 {
+            out.diagnostics.push(CodegenDiagnostic::AppUnobserved {
+                rule_id: rule.id.as_str().to_string(),
+                app: pattern_str,
+            });
+        }
     } else {
+        // Only a RESOLVED route rule's destinations are marked app-observed:
+        // the mark tells the orchestrator "the per-app pair covers this IP, no
+        // per-destination pin needed", and an unresolved app has no pair.
+        let app_pair_covers = ctx.action == WfpAction::Permit
+            && link == crate::address_ownership::Link::Additional
+            && !paths.is_empty();
         for (i, ip) in ips.into_iter().take(PER_HOSTNAME_IP_CAP).enumerate() {
+            if app_pair_covers && !out.app_observed_secondary_ips.contains(&ip) {
+                out.app_observed_secondary_ips.push(ip);
+            }
             emit_single_ip_filter(
                 sid,
                 role_slug,
@@ -881,7 +1041,7 @@ fn emit_single_ip_filter(
 ) {
     let target = addr.to_string();
     let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
-    let weight = ctx.base_weight + pos * SLOTS_PER_RULE + fanout_idx;
+    let weight = rule_weight(ctx.base_weight, pos, fanout_idx);
     let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
     out.filters.push(WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
@@ -920,7 +1080,7 @@ fn emit_subdomain_ip_filter(
     // same suffix rule still get distinct filter ids.
     let target = format!("{subdomain}|{addr}");
     let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
-    let weight = ctx.base_weight + pos * SLOTS_PER_RULE + fanout_idx;
+    let weight = rule_weight(ctx.base_weight, pos, fanout_idx);
     let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
     out.filters.push(WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
@@ -1041,7 +1201,7 @@ mod tests {
     use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern, CanonicalRuleSet};
     use nrr_domain::RuleId;
     use nrr_platform_api::types::{WfpAction, WfpLayerKey};
-    use nrr_platform_api::{MockAppPathResolver, NoopAppPathResolver};
+    use nrr_platform_api::{AppPathResolver, MockAppPathResolver, NoopAppPathResolver};
     use std::path::PathBuf;
 
     // ── Fixture helpers ─────────────────────────────────────────────────────
@@ -1137,6 +1297,54 @@ mod tests {
         }
     }
 
+    /// The filter side of the 26.08 case. It has to reach the same verdict as
+    /// the route side, or the address is routed one way and permitted the
+    /// other — which is how a destination ends up dead for every process.
+    #[test]
+    fn a_shared_address_gets_no_secondary_filter() {
+        let shared = Ipv4Addr::new(172, 217, 17, 206);
+        let only_theirs = Ipv4Addr::new(142, 250, 150, 101);
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("translate.google.com", vec![shared]);
+        cache.set_ips("notebooklm.google.com", vec![shared, only_theirs]);
+        let rule_book = book(
+            vec![suffix_rule("p1", "google.com")],
+            vec![exact_fqdn_rule("s1", "notebooklm.google.com")],
+        );
+        let out = generate_filters(CodegenInput {
+            sid: "S-1-5-21-A",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &MockAppObservationLookup::new(),
+            app_resolver: &NoopAppPathResolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+        });
+
+        // The main link's own suffix rule still covers the shared address.
+        assert!(out
+            .filters
+            .iter()
+            .any(|f| f.remote_ip == Some(shared) && f.action == WfpAction::Permit));
+        // The additional link's rule got its private address and not the shared one.
+        assert!(
+            !out.secondary_dest_ips.contains(&shared),
+            "{:?}",
+            out.secondary_dest_ips
+        );
+        assert!(out.secondary_dest_ips.contains(&only_theirs));
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                CodegenDiagnostic::AddressClaimedByPrimary { rule_id, ip, count }
+                    if rule_id == "s1" && *ip == shared && *count == 1
+            )),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
     // ── ExactIp ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1154,6 +1362,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), 1);
         let f = &out.filters[0];
@@ -1187,6 +1396,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), 3, "one filter per cached IP");
         let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
@@ -1237,6 +1447,7 @@ mod tests {
             app_observations: &app_obs,
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
         };
 
         let first = generate_filters(input());
@@ -1266,6 +1477,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(
             !behaviorally_equivalent(&first.filters, &other.filters),
@@ -1285,6 +1497,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
         assert_eq!(
@@ -1315,6 +1528,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // 1 (api) + 2 (www) = 3 filters
         assert_eq!(out.filters.len(), 3);
@@ -1342,6 +1556,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
         assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)), "apex IP: {ips:?}");
@@ -1364,6 +1579,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
         assert_eq!(ips, vec![Ipv4Addr::new(2, 2, 2, 2)]);
@@ -1382,6 +1598,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), 1);
         assert!(out.diagnostics.is_empty());
@@ -1399,6 +1616,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
         assert_eq!(
@@ -1432,6 +1650,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), hosts, "no host may lose its filter");
         assert!(
@@ -1477,6 +1696,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(
             out.diagnostics
@@ -1506,6 +1726,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), 2);
     }
@@ -1522,6 +1743,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
         assert_eq!(
@@ -1549,6 +1771,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // The name resolves to one concrete path → one app-id filter carrying the
         // RESOLVED PATH (not the raw name) so `FwpmGetAppIdFromFileName0` can key
@@ -1558,6 +1781,49 @@ mod tests {
         assert!(f.remote_ip.is_none());
         assert_eq!(f.app_pattern.as_deref(), Some(r"C:\Apps\chrome.exe"));
         assert_eq!(f.action, WfpAction::Permit);
+    }
+
+    #[test]
+    fn app_observed_ips_are_marked_only_for_a_resolved_secondary_route_rule() {
+        // The mark tells the orchestrator "the per-app pair covers this IP, no
+        // per-destination pin needed" — so it may only appear when the pair
+        // can actually arm (secondary role, route rule, exe resolved).
+        let cache = MockFqdnCacheLookup::new();
+        let observed = Ipv4Addr::new(203, 0, 113, 7);
+        let app_obs = MockAppObservationLookup::new();
+        app_obs.set_ips("chrome.exe", vec![observed]);
+        let denylist = std::collections::HashSet::new();
+        let run = |rule_book: &CanonicalRuleBook, resolver: &dyn AppPathResolver| {
+            generate_filters(CodegenInput {
+                sid: "S",
+                rule_book,
+                behavior_mode: RouteBehaviorMode::PreferPrimary,
+                fqdn_cache: &cache,
+                app_observations: &app_obs,
+                app_resolver: resolver,
+                secondary_ip_denylist: &denylist,
+                zone_priority_over_ip: false,
+            })
+        };
+        let resolver = MockAppPathResolver::new()
+            .with("chrome.exe", vec![PathBuf::from(r"C:\Apps\chrome.exe")]);
+
+        // Resolved secondary route rule → the observed IP is marked.
+        let secondary = book(vec![], vec![app_rule("r-app", "chrome.exe", false)]);
+        assert_eq!(
+            run(&secondary, &resolver).app_observed_secondary_ips,
+            vec![observed]
+        );
+        // Unresolved exe → mirrors still emit, but no mark: no pair, no cover.
+        assert!(run(&secondary, &NoopAppPathResolver)
+            .app_observed_secondary_ips
+            .is_empty());
+        // Primary app rule → never marked (the per-dest kill-switch does not
+        // protect primary destinations anyway).
+        let primary = book(vec![app_rule("r-app", "chrome.exe", false)], vec![]);
+        assert!(run(&primary, &resolver)
+            .app_observed_secondary_ips
+            .is_empty());
     }
 
     // ── Built-in VPN glob resolution ──────────────────────────────────────
@@ -1579,6 +1845,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // `openvpn*` matched the seeded `openvpn.exe` → its concrete path surfaces.
         assert_eq!(
@@ -1609,6 +1876,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(
             out.vpn_default_exempt_paths.is_empty(),
@@ -1641,6 +1909,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // Deduped (openvpn.exe seen via two globs) and sorted ascending.
         assert_eq!(
@@ -1666,6 +1935,7 @@ mod tests {
             app_observations: &app_obs,
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // No ALE_APP_ID (app_pattern) filter — the WFP condition needs a real
         // path, which an unresolved name cannot supply.
@@ -1708,6 +1978,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // One ALE_APP_ID filter per resolved path.
         let app_id_filters: Vec<_> = out
@@ -1743,6 +2014,7 @@ mod tests {
             app_observations: &app_obs,
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let app_id = out
             .filters
@@ -1775,6 +2047,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(out.filters.len(), 1);
         let f = &out.filters[0];
@@ -1799,6 +2072,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
     }
@@ -1815,6 +2089,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
     }
@@ -1836,6 +2111,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.filters.is_empty());
         assert_eq!(
@@ -1869,6 +2145,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let b = generate_filters(CodegenInput {
             sid: "S",
@@ -1878,8 +2155,29 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(ids(&a), ids(&b));
+    }
+
+    #[test]
+    fn a_rule_position_past_the_band_shares_the_last_slot_instead_of_leaving_the_band() {
+        // Nothing upstream caps `pos`, and a band holds 4096 rules. Before the
+        // clamp the 8192nd primary rule landed on the kill-switch permit band —
+        // a user rule silently outranking the guard.
+        let band_top = BASE_PRIMARY + BAND_WIDTH;
+        assert!(rule_weight(BASE_PRIMARY, MAX_RULE_SLOT, SLOTS_PER_RULE - 1) < band_top);
+        assert!(rule_weight(BASE_PRIMARY, u64::from(u32::MAX), 0) < band_top);
+        assert_eq!(
+            rule_weight(BASE_PRIMARY, MAX_RULE_SLOT + 5, 0),
+            rule_weight(BASE_PRIMARY, MAX_RULE_SLOT, 0),
+            "positions past the cap share the last slot deterministically"
+        );
+        // A fan-out index cannot climb into the next rule's slot either.
+        assert_eq!(
+            rule_weight(BASE_PRIMARY, 0, SLOTS_PER_RULE + 10),
+            rule_weight(BASE_PRIMARY, 0, SLOTS_PER_RULE - 1)
+        );
     }
 
     #[test]
@@ -1897,6 +2195,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let primary_weight = out
             .filters
@@ -1931,6 +2230,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         for f in &out.filters {
             assert_eq!(f.user_sid.as_deref(), Some("S-1-5-21-XYZ"));
@@ -1952,6 +2252,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let b = generate_filters(CodegenInput {
             sid: "S-1-5-21-B",
@@ -1961,6 +2262,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_ne!(a.filters[0].id.raw, b.filters[0].id.raw);
     }
@@ -1982,6 +2284,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let ids: Vec<u64> = out.filters.iter().map(|f| f.id.raw).collect();
         assert_eq!(ids.len(), 2);
@@ -2008,6 +2311,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let ids: std::collections::HashSet<u64> = out.filters.iter().map(|f| f.id.raw).collect();
         assert_eq!(ids.len(), 3, "fan-out per IP must yield distinct ids");
@@ -2025,6 +2329,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert!(out.is_empty());
         assert!(out.diagnostics.is_empty());
@@ -2047,6 +2352,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(
             out.secondary_dest_ips,
@@ -2076,6 +2382,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         assert_eq!(
             out.secondary_dest_ips,
@@ -2112,6 +2419,7 @@ mod tests {
             app_observations: &observations,
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
 
         assert!(
@@ -2137,6 +2445,46 @@ mod tests {
         );
     }
 
+    /// "Never observed" sends the user off to run the application. When every
+    /// address it WAS seen using went to a main-link rule, that advice is wrong
+    /// and the refusals above already carry the real reason.
+    #[test]
+    fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
+        let shared = Ipv4Addr::new(178, 248, 237, 68);
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("habr.com", vec![shared]);
+        let observations = MockAppObservationLookup::new();
+        observations.set_ips("claude.exe", vec![shared]);
+        let resolver = MockAppPathResolver::new()
+            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+        let rule_book = book(
+            vec![exact_fqdn_rule("r-main", "habr.com")],
+            vec![app_rule("r-app", "claude.exe", false)],
+        );
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &observations,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+        });
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| matches!(d, CodegenDiagnostic::AppDestinationClaimedByPrimary { .. })),
+            "the real reason is reported",
+        );
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| matches!(d, CodegenDiagnostic::AppUnobserved { .. })),
+            "and the misleading one is not: the process WAS seen",
+        );
+    }
+
     /// The mirror case: an address NO main-route rule names is taken over as
     /// before. The guard must not turn into "app rules never route anything".
     #[test]
@@ -2157,6 +2505,7 @@ mod tests {
             app_observations: &observations,
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
 
         assert!(out.secondary_dest_ips.contains(&only_app));
@@ -2176,6 +2525,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // The resolved app-id filter carries an `app_pattern` but no `remote_ip`,
         // so it contributes nothing to the kill-switch's protected dest set.
@@ -2208,6 +2558,7 @@ mod tests {
             app_observations: &app_obs,
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // The app's observed IPs become secondary /32 destinations the
         // kill-switch protects — same as a domain rule's resolved IPs.
@@ -2241,6 +2592,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // The resolved path — not the raw name — is what the per-app kill-switch
         // pins, so `secondary_app_patterns` now carries it.
@@ -2281,6 +2633,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &resolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // Only the secondary ROUTE app is protected: the primary app uses the
         // primary NIC (never killed), and the block app is being dropped, not
@@ -2313,6 +2666,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // Exactly two filters: an ALE-layer block and a packet-layer mirror.
         assert_eq!(out.filters.len(), 2);
@@ -2362,6 +2716,7 @@ mod tests {
             app_observations: &MockAppObservationLookup::new(),
             app_resolver: &NoopAppPathResolver,
             secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
         });
         // Only the routed (Permit) destination is protected by the kill-switch;
         // a dropped destination must never be handed to it.
@@ -2385,10 +2740,43 @@ mod tests {
                 app_observations: &MockAppObservationLookup::new(),
                 app_resolver: &NoopAppPathResolver,
                 secondary_ip_denylist: &std::collections::HashSet::new(),
+                zone_priority_over_ip: false,
             })
         };
         let a = mk();
         let b = mk();
         assert_eq!(a.filters, b.filters);
+    }
+
+    /// The setting reaches ENFORCEMENT, not just explain.
+    ///
+    /// A zone on the main link and an exact-address rule on the additional one
+    /// name the same address. The rule model's default is that the exact
+    /// address wins; the filter codegen used to hand it to the main link no
+    /// matter what the user had chosen, because a literal address went into its
+    /// side of the arbiter unconditionally.
+    #[test]
+    fn the_zone_priority_setting_changes_which_link_the_filters_pin() {
+        use crate::address_ownership::{AddressOwnership, Link, ZoneVsIpOrder};
+
+        let ip = std::net::Ipv4Addr::new(203, 0, 113, 7);
+        let cache = crate::fqdn_cache_lookup::MockFqdnCacheLookup::new();
+        cache.set_ips("shop.example.com", vec![ip]);
+
+        let book = book(vec![zone_rule("p1", "com")], vec![exact_ip_rule("s1", ip)]);
+
+        let default_order = AddressOwnership::resolve_with_order(
+            &book,
+            &cache,
+            ZoneVsIpOrder::from_zone_priority_over_ip(false),
+        );
+        assert_eq!(default_order.owner_of(ip), Some(Link::Additional));
+
+        let zone_first = AddressOwnership::resolve_with_order(
+            &book,
+            &cache,
+            ZoneVsIpOrder::from_zone_priority_over_ip(true),
+        );
+        assert_eq!(zone_first.owner_of(ip), Some(Link::Main));
     }
 }

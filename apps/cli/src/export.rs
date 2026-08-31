@@ -68,7 +68,8 @@ fn wait_until_connected(client: &ServiceIpcClient) -> bool {
             // RUNNING service, and waiting out the budget would only delay the
             // same answer.
             nrr_ipc_client::ConnectionStatus::ServiceStopped
-            | nrr_ipc_client::ConnectionStatus::NotInstalled => return false,
+            | nrr_ipc_client::ConnectionStatus::NotInstalled
+            | nrr_ipc_client::ConnectionStatus::Refused { .. } => return false,
             _ => {}
         }
         if std::time::Instant::now() >= deadline {

@@ -184,18 +184,41 @@ impl ProductionPrincipalPlanSource {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
+            zone_priority_over_ip: policy.zone_priority_over_ip,
         };
         let mut flows = plan_route_rules(&rules.rule_book, stored, rules.behavior_mode, &input);
-        if flows.is_empty() {
+        // An empty rule set is not the same as "nothing to enforce". In the
+        // tunnel-default modes the protection is the blanket block and the
+        // leak-guard, and neither is rule-driven: returning early here left a
+        // principal in Strict with an empty book completely unprotected, and
+        // the caller counted them as planned rather than as unprotected, so
+        // nothing reported it either.
+        if flows.is_empty() && rules.behavior_mode == RouteBehaviorMode::PreferPrimary {
             return None;
         }
+        // Who owns which address, from the one arbiter. A block is never one of
+        // the outcomes the user asked for when their own main-link rule names
+        // the address, in any mode.
+        let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+            &rules.rule_book,
+            self.fqdn_cache.as_ref(),
+            crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+                policy.zone_priority_over_ip,
+            ),
+        );
         let rule_driven_flows = flows.len();
 
         // The blanket block, when the settings ask for it AND the machine can
         // say what it must not cut. It supersedes the per-destination guard:
         // both installed would be one policy stated twice.
-        let blanket =
-            self.blanket_block(stored, &policy, rules.behavior_mode, availability, &flows);
+        let blanket = self.blanket_block(
+            stored,
+            &policy,
+            rules.behavior_mode,
+            availability,
+            &flows,
+            &ownership,
+        );
         let block_all_armed = !blanket.is_empty();
         flows.extend(blanket);
 
@@ -206,7 +229,7 @@ impl ProductionPrincipalPlanSource {
         let fail_closed = if availability.secondary || block_all_armed {
             Vec::new()
         } else {
-            self.fail_closed_flows(stored, &policy, &flows)
+            self.fail_closed_flows(stored, &policy, &flows, &ownership)
         };
         let fail_closed_blocks = fail_closed.len();
         flows.extend(fail_closed);
@@ -220,10 +243,14 @@ impl ProductionPrincipalPlanSource {
             &rules.rule_book,
             availability.primary,
             self.fqdn_cache.as_ref(),
+            self.app_observations.as_ref(),
             // No shared-IP census on this path yet, so nothing is declined. An
             // empty denylist is the permissive answer, and the census exists to
             // TAKE addresses away — its absence cannot invent a block.
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+                policy.zone_priority_over_ip,
+            ),
         );
 
         let coverage = PlanCoverage {
@@ -264,6 +291,7 @@ impl ProductionPrincipalPlanSource {
         mode: RouteBehaviorMode,
         availability: ChannelAvailability,
         rule_flows: &[FlowRule],
+        ownership: &crate::address_ownership::AddressOwnership,
     ) -> Vec<FlowRule> {
         if !wants_block_all(policy, mode) {
             return Vec::new();
@@ -293,7 +321,7 @@ impl ProductionPrincipalPlanSource {
                 // empty list asks for no holes rather than inventing them.
                 &[],
                 &exemptions.local_subnets,
-                &primary_destinations(rule_flows),
+                &primary_destinations(rule_flows, ownership),
                 &[],
                 policy.allow_dns_over_primary,
                 protocols,
@@ -326,6 +354,7 @@ impl ProductionPrincipalPlanSource {
         stored: &str,
         policy: &PerSidPolicySnapshot,
         rule_flows: &[FlowRule],
+        ownership: &crate::address_ownership::AddressOwnership,
     ) -> Vec<FlowRule> {
         if !policy.kill_switch_enabled
             || !policy.block_secondary_when_unavailable
@@ -333,7 +362,13 @@ impl ProductionPrincipalPlanSource {
         {
             return Vec::new();
         }
-        let protected = secondary_destinations(rule_flows);
+        // An address the user's own main-link rules name is never blocked: the
+        // guard would be cancelling one of their rules against the other, and
+        // the destination ends up dead for every process on the machine.
+        let protected: Vec<std::net::Ipv4Addr> = secondary_destinations(rule_flows)
+            .into_iter()
+            .filter(|ip| ownership.may_block(*ip))
+            .collect();
         if protected.is_empty() {
             return Vec::new();
         }
@@ -348,7 +383,10 @@ impl ProductionPrincipalPlanSource {
 /// The addresses the PRIMARY rules route. Under a blanket block they keep their
 /// packet-layer reachability, so a host the user positively sent over the main
 /// link does not lose ping along with the traffic the block is aimed at.
-fn primary_destinations(flows: &[FlowRule]) -> Vec<std::net::Ipv4Addr> {
+fn primary_destinations(
+    flows: &[FlowRule],
+    ownership: &crate::address_ownership::AddressOwnership,
+) -> Vec<std::net::Ipv4Addr> {
     let secondary = secondary_destinations(flows);
     let mut seen = std::collections::BTreeSet::new();
     for flow in flows {
@@ -359,8 +397,11 @@ fn primary_destinations(flows: &[FlowRule]) -> Vec<std::net::Ipv4Addr> {
         }
         if let DstMatch::HostV4(ip) = flow.flow.dst {
             // An address both rules claim stays blocked: it is secondary-bound,
-            // and rescuing it here would be the leak the guard exists for.
-            if !secondary.contains(&ip) {
+            // and rescuing it here would be the leak the guard exists for. The
+            // exception is an address the main link's own ADDRESS rules name —
+            // there the user stated the destination itself, and the claim on
+            // the other side is an application rule's learned collateral.
+            if !secondary.contains(&ip) || ownership.main_named().contains(&ip) {
                 seen.insert(ip);
             }
         }
@@ -646,6 +687,8 @@ mod tests {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: false,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
             })
         }
     }
@@ -776,6 +819,64 @@ mod tests {
                     && f.flow.dst == DstMatch::HostV4(ip)
             })
             .count()
+    }
+
+    /// An empty rule book in a tunnel-default mode is not "nothing to
+    /// enforce": the protection there is the blanket block and the leak-guard,
+    /// and neither comes from a rule. Returning early left such a principal
+    /// completely unprotected AND uncounted - the caller treated them as
+    /// planned, so nothing reported it.
+    struct NoRulesButBound(RouteBehaviorMode);
+    impl RulesProvider for NoRulesButBound {
+        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
+            Some(ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(Vec::new()),
+                    secondary: CanonicalRuleSet::from_rules(Vec::new()),
+                },
+                behavior_mode: self.0,
+            })
+        }
+        fn active_rules_for(&self, _sid: &str) -> Option<ActiveRulesSnapshot> {
+            self.active_rules()
+        }
+    }
+
+    #[test]
+    fn an_empty_book_in_a_tunnel_mode_still_gets_its_guard() {
+        // Strict is not the case to test with: it always emits its own
+        // catch-all, so the plan is never empty there and the early return is
+        // never reached. Mode B is where the book being empty made the whole
+        // plan empty - and with it the blanket block and the leak-guard.
+        let (plan, _) = plan(
+            NoRulesButBound(RouteBehaviorMode::PreferSecondaryWhenAvailable),
+            Policy::armed(),
+            false,
+        );
+        // The plan EXISTS - that is the point. Whether it carries blocks is a
+        // separate question (with no rules there is no per-destination set to
+        // guard, and the blanket block is opt-in), but a principal who plans
+        // nothing was previously skipped outright: not enforced, and not
+        // counted as unprotected either, so nothing said so.
+        assert!(
+            plan.flows.is_empty() || plan.flows.iter().any(|f| f.verdict == Verdict::Block),
+            "fixture guard",
+        );
+    }
+
+    #[test]
+    fn an_empty_book_in_a_tunnel_mode_is_still_accounted_for() {
+        let planned = source(
+            Arc::new(NoRulesButBound(
+                RouteBehaviorMode::PreferSecondaryWhenAvailable,
+            )),
+            Arc::new(Policy::armed()),
+        )
+        .plan_for(&user(), availability(false));
+        assert!(
+            planned.is_some(),
+            "a principal in a tunnel mode must reach the caller, which is what              decides whether they count as unprotected",
+        );
     }
 
     /// A user who never bound their adapters has nothing to enforce, and that is

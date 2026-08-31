@@ -23,7 +23,7 @@ impl OperationStatusHandler {
 }
 
 impl IpcHandler for OperationStatusHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let body: OperationStatusRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -31,11 +31,18 @@ impl IpcHandler for OperationStatusHandler {
                 diagnostics_id: None,
             })?;
 
-        let rec = self.store.get(&body.operation_id).ok_or_else(|| IpcError {
-            code: IpcErrorCode::PreconditionFailed,
-            message: format!("operation_id `{}` is unknown or expired", body.operation_id),
-            diagnostics_id: None,
-        })?;
+        // Owner-checked: the pipe admits every authenticated local process, and
+        // the record carries the RESULT of somebody's mutation. Another
+        // principal's operation answers exactly like one that never existed —
+        // saying "exists, not yours" would confirm a guessed id.
+        let rec = self
+            .store
+            .get_for(&body.operation_id, ctx.caller_stored())
+            .ok_or_else(|| IpcError {
+                code: IpcErrorCode::PreconditionFailed,
+                message: format!("operation_id `{}` is unknown or expired", body.operation_id),
+                diagnostics_id: None,
+            })?;
 
         let resp = OperationStatusResponse {
             state: rec.state.slug().into(),
@@ -62,13 +69,19 @@ mod tests {
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
     use std::time::Instant;
 
-    fn ctx() -> IpcRequestContext {
+    const OWNER: &str = "S-1-5-21-owner";
+
+    fn ctx_for(sid: &str) -> IpcRequestContext {
         IpcRequestContext {
             client_profile: IpcClientProfile::GuiInteractive,
             caller_is_elevated: false,
-            caller_principal: None,
+            caller_principal: crate::UserPrincipal::from_windows_sid(sid).ok(),
             caller_pid: None,
         }
+    }
+
+    fn ctx() -> IpcRequestContext {
+        ctx_for(OWNER)
     }
 
     fn req(payload: serde_json::Value) -> IpcRequestEnvelope {
@@ -86,7 +99,7 @@ mod tests {
     #[test]
     fn returns_completed_record() {
         let store = Arc::new(OperationStatusStore::new());
-        let id = store.enqueue();
+        let id = store.enqueue_for(Some("S-1-5-21-owner".to_string()));
         store.complete(&id, serde_json::json!({ "ok": true }), Instant::now());
         let h = OperationStatusHandler::new(store);
         let resp = h
@@ -102,7 +115,7 @@ mod tests {
     #[test]
     fn returns_failed_record_with_error() {
         let store = Arc::new(OperationStatusStore::new());
-        let id = store.enqueue();
+        let id = store.enqueue_for(Some("S-1-5-21-owner".to_string()));
         store.fail(
             &id,
             OperationError {
@@ -133,6 +146,43 @@ mod tests {
             )
             .expect_err("must reject");
         assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+    }
+
+    #[test]
+    fn another_principals_operation_reads_as_unknown() {
+        // The pipe admits every authenticated local process, so an id is the
+        // only thing between one user and another user's mutation result. The
+        // answer must be indistinguishable from "no such operation" — anything
+        // else confirms a guessed id.
+        let store = Arc::new(OperationStatusStore::new());
+        let id = store.enqueue_for(Some(OWNER.to_string()));
+        store.complete(&id, serde_json::json!({ "ok": true }), Instant::now());
+        let h = OperationStatusHandler::new(store);
+        let err = h
+            .handle(
+                &req(serde_json::json!({ "operation-id": id })),
+                &ctx_for("S-1-5-21-someone-else"),
+            )
+            .expect_err("another principal must not read it");
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert!(
+            err.message.contains("unknown or expired"),
+            "the wording must not distinguish the two cases: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn an_unattributed_caller_reads_nothing() {
+        let store = Arc::new(OperationStatusStore::new());
+        let id = store.enqueue_for(Some(OWNER.to_string()));
+        store.complete(&id, serde_json::json!({ "ok": true }), Instant::now());
+        let h = OperationStatusHandler::new(store);
+        let mut anonymous = ctx();
+        anonymous.caller_principal = None;
+        assert!(h
+            .handle(&req(serde_json::json!({ "operation-id": id })), &anonymous)
+            .is_err());
     }
 
     #[test]

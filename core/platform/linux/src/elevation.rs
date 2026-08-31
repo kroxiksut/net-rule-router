@@ -1,29 +1,35 @@
-//! Linux privilege-elevation mechanism primitive (polkit `pkexec`).
+//! Linux privilege elevation via polkit `pkexec`.
 //!
-//! ## Honest scope — a primitive, not a wired end-to-end path
+//! ## Two different questions, and only one of them is this module's
 //!
-//! Elevation does NOT port cleanly the way autostart / key-store do. Windows
-//! uses a session **elevation broker**: the launcher spawns an *elevated copy
-//! of itself* (one UAC prompt), which holds admin rights and proxies
-//! privileged operations over an owner-bound pipe (`apps/desktop/broker`). That
-//! whole model is Windows-shaped and its `call()` is hard-stubbed to
-//! `Unavailable` off Windows.
+//! Windows's GUI uses a session **elevation broker**: the launcher spawns an
+//! *elevated copy of itself* (one UAC prompt) which then proxies many privileged
+//! operations over an owner-bound pipe (`apps/desktop/broker`). That model is
+//! Windows-shaped and its `call()` is hard-stubbed to `Unavailable` off Windows.
 //!
-//! Linux's privilege model is different: the privileged process is the
-//! **root systemd service**, already running — the GUI does not spawn an
-//! elevated copy of itself. polkit authorizes whether the calling user MAY
-//! invoke a privileged operation, either by gating the IPC call to the service
-//! or by launching a small privileged helper via `pkexec`. Which of those two
-//! the Linux launcher ultimately uses is a model decision deferred until the
-//! Linux launcher is wired up (there is no neutral `ElevationPort` trait yet —
-//! the broker is an app-layer, Windows-only crate).
+//! Linux's privilege model is different: the privileged process is the **root
+//! systemd service**, already running — the GUI does not spawn an elevated copy
+//! of itself. polkit authorises whether the calling user MAY invoke a privileged
+//! operation, either by gating the IPC call to the service or by launching a
+//! small privileged helper via `pkexec`. Which of those the Linux launcher
+//! ultimately uses is still a model decision, deferred until it is wired up.
 //!
-//! This module therefore ships only the **portable, testable primitive** the
-//! `pkexec` path needs — the argv builder and the polkit exit-code
-//! classification — the direct analog of the broker's tested
-//! PowerShell-`RunAs` command construction. Actually invoking `pkexec` needs a
-//! polkit agent (a graphical/desktop session), so [`run_pkexec`] is a thin
-//! wrapper over the two pure functions and is NOT unit-tested here.
+//! What IS settled and implemented here is the narrower question the
+//! administrative console asks: *run this one command again with administrator
+//! rights and wait for it*. That has a neutral port
+//! ([`nrr_platform_api::elevation::PrivilegedRelaunchPort`]) and
+//! [`PkexecRelaunch`] is its Linux answer.
+//!
+//! ## Why `pkexec` and not `sudo`
+//!
+//! `sudo` asks on the terminal, which is fine for a console and useless for a
+//! desktop action; `pkexec` asks through the session's polkit agent and works
+//! for both. Either way the child `execve`s in place and **keeps the caller's
+//! terminal** — the asymmetry with Windows that the port makes explicit.
+//!
+//! Actually invoking `pkexec` needs a polkit agent (a desktop session), so the
+//! spawn itself is exercised on real hardware; the argv builder and the exit-code
+//! classification are pure and tested here.
 //!
 //! Portable `std` (the logic is exit-code arithmetic + `Command`), so it
 //! compiles and its pure tests run on any host; the consumer selects it under
@@ -31,6 +37,8 @@
 
 use std::path::Path;
 use std::process::Command;
+
+use nrr_platform_api::elevation::{ElevatedRun, PrivilegedRelaunchPort};
 
 /// The polkit CLI used to run a helper with elevated privileges. Shows the
 /// polkit authentication dialog, then execs the helper as root.
@@ -96,6 +104,42 @@ pub fn run_pkexec(helper: &Path, args: &[String]) -> ElevationOutcome {
     }
 }
 
+/// The Linux answer to "run this one command again with administrator rights".
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PkexecRelaunch;
+
+impl PkexecRelaunch {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl PrivilegedRelaunchPort for PkexecRelaunch {
+    /// Always: `pkexec` `execve`s the helper with this process's stdin, stdout
+    /// and stderr, so the child writes straight into the terminal the user is
+    /// looking at. Nothing has to carry its output back.
+    fn inherits_terminal(&self) -> bool {
+        true
+    }
+
+    fn relaunch_and_wait(&self, program: &Path, args: &[String]) -> ElevatedRun {
+        let argv = pkexec_argv(program, args);
+        match Command::new(PKEXEC_PROGRAM).args(&argv).status() {
+            // The child's code and pkexec's own share one channel — 126 and 127
+            // are pkexec's, everything else is the child's. Documented on
+            // `classify_pkexec_exit`; the console's codes stay clear of both.
+            Ok(status) => match classify_pkexec_exit(status.code()) {
+                ElevationOutcome::Launched => ElevatedRun::Completed {
+                    exit_code: status.code().and_then(|c| u8::try_from(c).ok()),
+                },
+                ElevationOutcome::Declined => ElevatedRun::Declined,
+                ElevationOutcome::Failed(message) => ElevatedRun::Failed(message),
+            },
+            Err(e) => ElevatedRun::Failed(format!("spawn {PKEXEC_PROGRAM}: {e}")),
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -154,5 +198,13 @@ mod tests {
             classify_pkexec_exit(None),
             ElevationOutcome::Failed(_)
         ));
+    }
+
+    #[test]
+    fn this_mechanism_keeps_the_callers_terminal() {
+        // The whole output-handling branch of the console hangs off this
+        // answer: on Linux the elevated child has already printed to the user's
+        // terminal, so printing anything again would double it.
+        assert!(PkexecRelaunch::new().inherits_terminal());
     }
 }

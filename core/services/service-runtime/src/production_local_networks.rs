@@ -48,6 +48,23 @@ impl ProductionLocalNetworks {
         }
     }
 
+    /// Has this principal asked not to be questioned about networks it has not
+    /// seen before?
+    ///
+    /// Read from the stored policy rather than cached: the answer is a setting
+    /// the user can flip while the service runs, and the next read is the next
+    /// question.
+    fn auto_accept(&self, sid: &str) -> bool {
+        let guard = self
+            .state_conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+            .load_for_sid(sid)
+            .map(|policy| policy.local_networks_auto_accept)
+            .unwrap_or(false)
+    }
+
     fn stored(&self, sid: &str) -> Vec<LocalNetworkRule> {
         let guard = self
             .state_conn
@@ -61,6 +78,11 @@ impl ProductionLocalNetworks {
     fn compose(&self, sid: &str) -> Vec<LocalNetworkDto> {
         let discovered = self.coordinator.discovered_local_networks(sid);
         let stored = self.stored(sid);
+        // "Stop asking about networks I have not seen yet." Nothing is written:
+        // the setting suppresses the QUESTION, and turning it back off asks
+        // again - which is the honest behaviour for a switch that decides on
+        // the user's behalf.
+        let auto_accept = self.auto_accept(sid);
         let decision_for = |network: Ipv4Network, adapter: &str| {
             stored
                 .iter()
@@ -83,7 +105,7 @@ impl ProductionLocalNetworks {
                     adapter: adapter.clone(),
                     // Discovered networks are exempt unless the user said no.
                     allowed: decided.unwrap_or(true),
-                    decided_by_user: decided.is_some(),
+                    decided_by_user: decided.is_some() || auto_accept,
                 }
             })
             .collect();

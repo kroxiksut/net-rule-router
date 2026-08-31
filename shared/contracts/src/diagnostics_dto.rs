@@ -22,6 +22,34 @@ use crate::ipc_payloads::SnapshotInterfacesResponse;
 
 // ── DiagnosticsStatusDto ──────────────────────────────────────────────────────
 
+/// Where a diagnostics snapshot came from.
+///
+/// Without it an empty/positive snapshot is indistinguishable from a live
+/// verdict — preview content and "could not ask the service" both used to
+/// render as a healthy service.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticsDataOrigin {
+    /// Answered by the running service.
+    #[default]
+    Service,
+    /// Canned preview/mock content — never a verdict about this machine.
+    Preview,
+    /// The service could not be asked; the cards are placeholders.
+    Unavailable,
+}
+
+impl DiagnosticsDataOrigin {
+    /// Stable slug for the wire and for the QML context.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Service => "service",
+            Self::Preview => "preview",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 /// Top-level health and status overview for the Diagnostics screen.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiagnosticsStatusDto {
@@ -41,6 +69,48 @@ pub struct DiagnosticsStatusDto {
     pub diagnostic_mode: DiagnosticModeStateDto,
     /// Whether this snapshot may be stale (service unreachable).
     pub stale: bool,
+    /// Provenance of the snapshot. Older services do not send it; their
+    /// answers really are service answers, hence the `Service` default.
+    #[serde(default)]
+    pub origin: DiagnosticsDataOrigin,
+}
+
+impl DiagnosticsStatusDto {
+    /// The snapshot to hand out when the service could not be asked.
+    ///
+    /// Every card reads "unknown", never "fine": a failed call must not be
+    /// able to look like a positive answer.
+    pub fn unavailable() -> Self {
+        Self {
+            overall_healthy: false,
+            service_health: ServiceHealthCard {
+                state: "unavailable".to_string(),
+                active_revision_id: None,
+                pending_changes: 0,
+            },
+            security_status: SecurityStatusCard {
+                audit_chain_ok: false,
+                active_alert_count: 0,
+                audit_write_healthy: false,
+            },
+            active_alerts: Vec::new(),
+            cache_health: CacheHealthCard {
+                entry_count: 0,
+                healthy: false,
+                rebuilding: false,
+            },
+            log_health: LogHealthCard {
+                dir_writable: false,
+                total_size_bytes: 0,
+                file_count: 0,
+                dropped_count: 0,
+                last_cleanup_at: None,
+            },
+            diagnostic_mode: DiagnosticModeStateDto::inactive(),
+            stale: true,
+            origin: DiagnosticsDataOrigin::Unavailable,
+        }
+    }
 }
 
 /// Health of the Windows background service.
@@ -135,6 +205,33 @@ pub struct SecurityAlertDto {
     pub requires_action: bool,
 }
 
+/// Active security alerts plus the "we could not ask" bit.
+///
+/// An empty list from a failed call must not read as "no alerts".
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SecurityAlertsView {
+    pub alerts: Vec<SecurityAlertDto>,
+    /// The list is a placeholder, not an answer from the service.
+    pub stale: bool,
+}
+
+impl SecurityAlertsView {
+    pub fn fresh(alerts: Vec<SecurityAlertDto>) -> Self {
+        Self {
+            alerts,
+            stale: false,
+        }
+    }
+
+    /// The service could not be asked.
+    pub fn unavailable() -> Self {
+        Self {
+            alerts: Vec::new(),
+            stale: true,
+        }
+    }
+}
+
 // ── LogEntryDto ───────────────────────────────────────────────────────────────
 
 /// A single operational log entry for the Logs screen.
@@ -159,6 +256,15 @@ pub struct LogEntryDto {
     pub kind: String,
     /// Localization key for user-facing display.
     pub message_key: String,
+    /// The event's own message text, already redacted to the active mode.
+    ///
+    /// A tracing event has no locale key that can exist — its key is derived
+    /// from a call site — so the Logs section fell back to `kind` and showed
+    /// the reader a category name instead of what happened. Diagnostic text
+    /// from Rust is the one thing CLAUDE.md exempts from localisation, so it is
+    /// shown as written. Empty when the event carries no message.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub message: String,
     /// Whether additional payload detail is available (requires diagnostic mode).
     pub has_payload: bool,
     /// Brief correlation summary (decision id, revision id).
@@ -211,8 +317,6 @@ pub struct AuditEntryFilter {
     pub to_ms: Option<i64>,
     /// Audit event kind (e.g., `"revision_activated"`).
     pub kind: Option<String>,
-    /// Alert state filter: `"active"`, `"acknowledged"`, etc.
-    pub alert_state: Option<String>,
     pub revision_id: Option<String>,
 }
 
@@ -326,11 +430,37 @@ mod tests {
             },
             diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: false,
+            origin: DiagnosticsDataOrigin::Service,
         };
         let json = serde_json::to_string(&dto).expect("serialize");
         let back: DiagnosticsStatusDto = serde_json::from_str(&json).expect("deserialize");
         assert!(back.overall_healthy);
         assert!(!back.stale);
+        assert_eq!(back.origin, DiagnosticsDataOrigin::Service);
+    }
+
+    #[test]
+    fn an_unavailable_snapshot_cannot_read_as_a_healthy_service() {
+        let dto = DiagnosticsStatusDto::unavailable();
+        assert!(!dto.overall_healthy);
+        assert!(dto.stale);
+        assert_eq!(dto.service_health.state, "unavailable");
+        assert!(!dto.security_status.audit_chain_ok);
+        assert_eq!(dto.origin, DiagnosticsDataOrigin::Unavailable);
+    }
+
+    /// A service that predates the field still answers as the service.
+    #[test]
+    fn a_snapshot_without_an_origin_field_decodes_as_service_data() {
+        let json = serde_json::to_string(&DiagnosticsStatusDto::unavailable()).expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("value");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("origin")
+            .expect("origin present");
+        let back: DiagnosticsStatusDto = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(back.origin, DiagnosticsDataOrigin::Service);
     }
 
     #[test]
@@ -342,6 +472,7 @@ mod tests {
             category: "service".into(),
             kind: "service.started".into(),
             message_key: "diag.service.started.summary".into(),
+            message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
         };

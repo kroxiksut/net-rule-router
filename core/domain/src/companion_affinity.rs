@@ -1398,6 +1398,12 @@ impl CompanionAffinityLedger {
         if names_one_machine(hostname) {
             return;
         }
+        // Same door for a name that can never be written as a rule — resolver
+        // artifacts with empty labels ("..localmachine") or illegal characters.
+        // Each one squats a slot in the bounded candidate set until eviction.
+        if !crate::rule_value_validation::is_valid_hostname(hostname) {
+            return;
+        }
         // A candidate seen outside every anchor window carries no signal;
         // not tracking it keeps memory tied to co-activity, not to traffic.
         //
@@ -2422,6 +2428,23 @@ mod tests {
         let proposals = ledger.proposals(150_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_a_rule_never_becomes_a_candidate() {
+        // Resolver artifacts ("..localmachine" — empty labels) were observed
+        // in the wild squatting slots in the bounded candidate set.
+        let mut ledger = defaults();
+        two_visits(&mut ledger, "site.test", &["..localmachine"]);
+        assert!(
+            ledger
+                .snapshot()
+                .candidates
+                .iter()
+                .all(|c| c.hostname != "..localmachine"),
+            "an unwritable name must be dropped at the door"
+        );
+        assert!(ledger.proposals(150_000, &NoExclusions).is_empty());
     }
 
     // ── Tier 2: delivery names ───────────────────────────────────────────────

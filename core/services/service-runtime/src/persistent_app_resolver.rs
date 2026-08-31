@@ -39,6 +39,12 @@ use nrr_storage::AppPatternResolutionsRepository;
 pub struct PersistentAppPathResolver {
     inner: Arc<dyn AppPathResolver>,
     conn: Arc<Mutex<Connection>>,
+    /// Last set written per pattern. `resolve` is called once per application
+    /// rule on EVERY filter recompute — a few seconds apart, with an answer
+    /// that changes when an application is installed or removed — so writing
+    /// through each time put dozens of UPSERTs a tick on the shared state-DB
+    /// connection, on the enforcement path, to store what was already there.
+    last_written: Mutex<std::collections::HashMap<String, Vec<String>>>,
 }
 
 impl PersistentAppPathResolver {
@@ -46,7 +52,11 @@ impl PersistentAppPathResolver {
     /// state-DB connection). The connection is locked only briefly per resolve,
     /// OUTSIDE any policy recompute, so it never re-enters a held lock.
     pub fn new(inner: Arc<dyn AppPathResolver>, conn: Arc<Mutex<Connection>>) -> Self {
-        Self { inner, conn }
+        Self {
+            inner,
+            conn,
+            last_written: Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     fn now_millis() -> i64 {
@@ -64,6 +74,16 @@ impl PersistentAppPathResolver {
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
+        // Unchanged since the last write — nothing to store, and the DB lock is
+        // not taken at all.
+        if self
+            .last_written
+            .lock()
+            .map(|seen| seen.get(pattern).is_some_and(|prev| *prev == as_str))
+            .unwrap_or(false)
+        {
+            return;
+        }
         let Ok(guard) = self.conn.lock() else {
             tracing::warn!(
                 target: "nrr::persistent-app-resolver",
@@ -73,13 +93,20 @@ impl PersistentAppPathResolver {
             return;
         };
         let repo = AppPatternResolutionsRepository::new(&guard);
-        if let Err(e) = repo.upsert(pattern, &as_str, Self::now_millis()) {
-            tracing::warn!(
+        match repo.upsert(pattern, &as_str, Self::now_millis()) {
+            // Remembered only once it is actually stored, so a failed write is
+            // retried on the next resolve rather than assumed done.
+            Ok(()) => {
+                if let Ok(mut seen) = self.last_written.lock() {
+                    seen.insert(pattern.to_string(), as_str);
+                }
+            }
+            Err(e) => tracing::warn!(
                 target: "nrr::persistent-app-resolver",
                 pattern,
                 error = %e,
                 "failed to persist last-good app-path resolution (write-through) — continuing",
-            );
+            ),
         }
     }
 
@@ -162,6 +189,56 @@ mod tests {
         let runner = SqliteMigrationRunner::for_state_db(conn);
         runner.run_pending_migrations().expect("migrate");
         (dir, Arc::new(Mutex::new(runner.into_connection())))
+    }
+
+    /// `resolve` runs once per application rule on every filter recompute. The
+    /// write-through only has something to say when the answer CHANGES.
+    #[test]
+    fn an_unchanged_resolution_is_not_written_again() {
+        let (dir, conn) = state_conn();
+        let exe = touch(&dir, "vpn.exe");
+        let inner = Arc::new(ScriptedInner::default());
+        inner.set("vpn.exe", vec![exe.clone()]);
+        let resolver = PersistentAppPathResolver::new(inner.clone(), Arc::clone(&conn));
+
+        let stored_at = |conn: &Arc<Mutex<Connection>>| -> i64 {
+            let guard = conn.lock().expect("lock");
+            guard
+                .query_row(
+                    "SELECT resolved_at FROM app_pattern_resolutions WHERE pattern = ?1",
+                    ["vpn.exe"],
+                    |r| r.get(0),
+                )
+                .expect("row")
+        };
+
+        assert_eq!(resolver.resolve("vpn.exe"), vec![exe.clone()]);
+        let first = stored_at(&conn);
+
+        // Rewind the stored timestamp: a second write would move it forward.
+        {
+            let guard = conn.lock().expect("lock");
+            guard
+                .execute(
+                    "UPDATE app_pattern_resolutions SET resolved_at = ?1 WHERE pattern = ?2",
+                    rusqlite::params![first - 10_000, "vpn.exe"],
+                )
+                .expect("rewind");
+        }
+        for _ in 0..5 {
+            let _ = resolver.resolve("vpn.exe");
+        }
+        assert_eq!(
+            stored_at(&conn),
+            first - 10_000,
+            "an unchanged answer must not touch the row"
+        );
+
+        // A changed answer is written.
+        let other = touch(&dir, "vpn2.exe");
+        inner.set("vpn.exe", vec![other.clone()]);
+        assert_eq!(resolver.resolve("vpn.exe"), vec![other]);
+        assert!(stored_at(&conn) > first - 10_000);
     }
 
     /// Create a real on-disk file so `Path::is_file` survivor filtering passes.

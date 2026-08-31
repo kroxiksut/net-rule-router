@@ -478,7 +478,7 @@ mod tests {
                 .with_mute_loader(Arc::new(move |sid: &str| loader_store.list_active(sid, 0))),
         );
         let store: Arc<dyn BlockNoticeMuteStore> = store;
-        let sub = bus.subscribe("test-client".to_string(), None);
+        let sub = bus.subscribe_as("test-client".to_string(), Some("S-A".to_string()), None);
 
         let notice = |host: &str| nrr_domain::block_notice::BlockAttempt {
             host: Some(host.to_string()),
@@ -796,7 +796,7 @@ mod tests {
         // The complaint this fixes: the rule is added from the tray and the
         // notice keeps standing.
         let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
-        let sub = bus.subscribe("test-client".to_string(), None);
+        let sub = bus.subscribe_as("test-client".to_string(), Some("S-A".to_string()), None);
         let center = Arc::new(BlockNoticeCenter::new().with_event_bus(Arc::clone(&bus)));
         let attempt = nrr_domain::block_notice::BlockAttempt {
             host: Some("cdn.example".to_string()),

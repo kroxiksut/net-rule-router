@@ -129,7 +129,16 @@ impl SystemdOps for FsOps {
         let Some((exe, rest)) = argv.split_first() else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
         };
-        let out = std::process::Command::new(exe).args(rest).output()?;
+        // Budgeted, and in the C locale: `systemctl` can block on a busy
+        // system bus, and the failure classification below matches ENGLISH
+        // text in stderr — on a localised system a translated refusal read as
+        // an unclassified mechanism error instead of "access denied".
+        let borrowed: Vec<&str> = rest.iter().map(String::as_str).collect();
+        let out = crate::command::output_with_timeout(
+            exe,
+            &borrowed,
+            crate::command::DEFAULT_COMMAND_TIMEOUT,
+        )?;
         Ok(CommandOutcome {
             exit_code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -237,6 +246,11 @@ fn exec_start_binary(exec_start: &str) -> Option<PathBuf> {
 /// when writing to `/etc`), so the classification is a text match — kept in one
 /// pure function with its samples in the tests below rather than scattered
 /// across call sites.
+///
+/// Matching ENGLISH text only works because every shell-out in this crate goes
+/// through [`crate::command::output_with_timeout`], which forces `LC_ALL=C`. On
+/// a localised system without that, a translated refusal matched nothing and an
+/// access denial degraded into an unclassified mechanism error.
 pub fn classify_command_failure(outcome: &CommandOutcome, argv: &[String]) -> ServiceControlError {
     let text = format!("{} {}", outcome.stdout, outcome.stderr).to_ascii_lowercase();
     if text.contains("interactive authentication required")

@@ -64,6 +64,21 @@ impl ArchiveSection {
     }
 
     /// Mandatory sections for every archive.
+    /// Every section this build knows how to produce — the denominator for
+    /// "what was left out of this archive".
+    pub const ALL: &'static [Self] = &[
+        Self::Health,
+        Self::Logs,
+        Self::AuditSummary,
+        Self::AuditChain,
+        Self::ExplainSamples,
+        Self::CacheHealth,
+        Self::StorageHealth,
+        Self::Troubleshooting,
+        Self::RedactionReport,
+        Self::SystemInfo,
+    ];
+
     pub const MANDATORY: &'static [Self] = &[
         Self::Health,
         Self::Logs,

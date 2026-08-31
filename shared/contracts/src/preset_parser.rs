@@ -198,6 +198,11 @@ pub struct DuplicateGroup {
 /// Trailing carriage returns inside lines are stripped before parsing.
 pub fn parse_canonical_rules(text: &str) -> PresetParseResult {
     let mut state = ParserState::new();
+    // A file saved by a Windows editor starts with a BOM, and the service side
+    // strips it before parsing. Without the same strip here the first line —
+    // usually `--- Domains` — was not recognised as a header, so the GUI showed
+    // as prose exactly the rules the service imported.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (idx, raw_line) in text.split('\n').enumerate() {
         let line_number = idx + 1;
         // Strip the trailing \r on CRLF lines without allocating
@@ -216,7 +221,7 @@ pub fn parse_canonical_rules(text: &str) -> PresetParseResult {
 /// section name trimmed of surrounding whitespace. Returns `None` for
 /// any line that doesn't start with exactly `--- ` (three hyphens,
 /// one space).
-fn parse_section_header(line: &str) -> Option<&str> {
+pub fn parse_section_header(line: &str) -> Option<&str> {
     let stripped = line.strip_prefix("--- ")?;
     // docs/en/rules-file-format.md Syntax: "exactly three hyphens, one space, then the
     // section name". Extra whitespace between the mandatory space and
@@ -265,14 +270,20 @@ pub fn classify_section(name: &str) -> Option<ParsedRuleType> {
 /// non-canonical case (`--- zones`, `--- DOMAINS`). The parser uses this
 /// internally so existing user files keep importing the same way; new
 /// exports always emit canonical case.
-fn classify_section_lenient(name: &str) -> Option<ParsedRuleType> {
+pub fn classify_section_lenient(name: &str) -> Option<ParsedRuleType> {
     let lowered = name.to_ascii_lowercase();
     match lowered.as_str() {
         "zones" => Some(ParsedRuleType::Zone),
         "domains" => Some(ParsedRuleType::Domain),
         "ip" => Some(ParsedRuleType::ExactIp),
-        "windows" => Some(ParsedRuleType::Application),
         "auto" => Some(ParsedRuleType::Domain),
+        // The application section of the OS we are RUNNING ON is a rule
+        // section; the others are passthrough. `nrr_domain::rules_file` already
+        // decides it this way (`is_active_on`), and disagreeing meant a Linux
+        // host enforced `--- Linux` while the GUI displayed it as inert text.
+        "windows" if cfg!(target_os = "windows") => Some(ParsedRuleType::Application),
+        "linux" if cfg!(target_os = "linux") => Some(ParsedRuleType::Application),
+        "macos" if cfg!(target_os = "macos") => Some(ParsedRuleType::Application),
         _ => None,
     }
 }
@@ -302,7 +313,10 @@ struct ParserState {
     /// is preserved by walking `section_order` so the duplicate list
     /// matches file order (important for deterministic UI rendering).
     section_counts: std::collections::HashMap<String, u32>,
-    section_order: Vec<String>,
+    /// Encounter order as `(case-insensitive key, name as first written)`.
+    /// The key groups `--- Domains` with `--- domains`; the name is what the
+    /// user sees reported back.
+    section_order: Vec<(String, String)>,
     /// Monotonic id assigned to the next rule we emit.
     next_id_hint: u32,
     /// Current section, if any. `None` means we're in the file-level
@@ -339,21 +353,27 @@ impl ParserState {
         // Close the previous section (flushes any pending passthrough).
         self.close_current();
 
-        // Record the encounter so duplicate detection sees it.
-        let key = section_name.to_string();
+        // Keyed case-INSENSITIVELY, matching `classify_section_lenient`: with a
+        // raw-name key `--- Domains` and `--- domains` counted as two different
+        // sections, so the merge-policy dialog never came up for a file that has
+        // the same section twice in different case.
+        let key = section_name.to_ascii_lowercase();
         let count = self.section_counts.entry(key.clone()).or_insert(0);
         if *count == 0 {
-            self.section_order.push(key.clone());
+            self.section_order.push((key, section_name.to_string()));
         }
         *count += 1;
 
+        // The NAME carried forward is the one the file used — it is what the
+        // GUI shows and what a passthrough block writes back out. Only the
+        // duplicate bookkeeping above is case-insensitive.
         self.current = match classify_section_lenient(section_name) {
             Some(rule_type) => CurrentSection::Known {
                 rule_type,
-                section_name: key,
+                section_name: section_name.to_string(),
             },
             None => CurrentSection::Unknown {
-                section_name: key,
+                section_name: section_name.to_string(),
                 accumulated: String::new(),
             },
         };
@@ -410,12 +430,12 @@ impl ParserState {
 
         // Compute duplicate-sections in file-encounter order.
         let mut duplicate_sections = Vec::new();
-        for name in self.section_order {
-            if let Some(&count) = self.section_counts.get(&name) {
+        for (key, display_name) in self.section_order {
+            if let Some(&count) = self.section_counts.get(&key) {
                 if count >= 2 {
-                    let is_known = classify_section_lenient(&name).is_some();
+                    let is_known = classify_section_lenient(&key).is_some();
                     duplicate_sections.push(DuplicateGroup {
-                        section_name: name,
+                        section_name: display_name,
                         occurrences: count,
                         is_known_section: is_known,
                     });
@@ -435,6 +455,32 @@ impl ParserState {
 /// comment, or otherwise rejected by the docs/en/rules-file-format.md rules. Mirrors the
 /// QML implementation exactly so that the parser change is invisible
 /// at the rule level (passthrough is the only new behaviour).
+/// Is a `#`-prefixed line inside a rule section a DISABLED RULE, or prose?
+///
+/// A value without whitespace is always a rule value. Whitespace is the whole
+/// ambiguity: `# this is a note about example.com` is prose, while
+/// `# Adobe Reader.exe` is a real rule — program names carry spaces. Calling
+/// the second one prose loses the rule outright, because the GUI rewrites the
+/// file from its parsed model, so a space is allowed where a program name is
+/// expected and still looks like a file name.
+///
+/// One predicate for both parsers of this format, so the two cannot disagree
+/// about which lines survive a round-trip.
+pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
+    if !value.contains(char::is_whitespace) {
+        return true;
+    }
+    rule_type == ParsedRuleType::Application && has_file_extension(value)
+}
+
+fn has_file_extension(value: &str) -> bool {
+    value.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.trim().is_empty()
+            && (1..=8).contains(&ext.chars().count())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 fn parse_rule_line(
     raw: &str,
     rule_type: ParsedRuleType,
@@ -442,8 +488,12 @@ fn parse_rule_line(
     id_hint: u32,
     line_number: usize,
 ) -> Option<ParsedRule> {
-    // Strip trailing whitespace per QML behaviour.
-    let raw = raw.trim_end();
+    // Both ends. Trailing-only was the QML behaviour, and it disagreed with the
+    // service parser on `  # example.com`: there a disabled rule with an indent
+    // is preserved as a disabled rule, here the leading spaces kept the line
+    // from being recognised as one at all — the GUI dropped a rule the service
+    // was keeping.
+    let raw = raw.trim();
     if raw.is_empty() {
         return None;
     }
@@ -488,12 +538,9 @@ fn parse_rule_line(
         return None;
     }
 
-    // A line that started with `#` is a disabled rule only when the
-    // candidate value is a single token. Multi-word "# free text" is
-    // a documentation comment.
     let enabled = if started_with_hash {
-        if match_value.contains(char::is_whitespace) {
-            return None;
+        if !is_disabled_rule_value(rule_type, &match_value) {
+            return None; // prose comment
         }
         false
     } else {
@@ -630,6 +677,33 @@ mod tests {
         let result = parse_canonical_rules("# header line one\n# header line two\n");
         assert!(result.rules.is_empty());
         assert!(result.passthrough.is_empty());
+    }
+
+    /// Mirrors `nrr_domain::rules_file`: both parsers of this format must keep
+    /// the same lines, or saving from the GUI deletes what the service applies.
+    #[test]
+    fn a_disabled_program_name_with_a_space_is_a_rule_not_prose() {
+        let result = parse_canonical_rules(
+            "--- Windows
+# Adobe Reader.exe
+browser.exe
+",
+        );
+        assert_eq!(result.rules.len(), 2, "{:?}", result.rules);
+        assert_eq!(result.rules[0].match_value, "Adobe Reader.exe");
+        assert!(!result.rules[0].enabled);
+    }
+
+    #[test]
+    fn a_multi_word_note_stays_a_comment() {
+        let result = parse_canonical_rules(
+            "--- Domains
+# see example.com for details
+example.org
+",
+        );
+        assert_eq!(result.rules.len(), 1, "{:?}", result.rules);
+        assert_eq!(result.rules[0].match_value, "example.org");
     }
 
     #[test]

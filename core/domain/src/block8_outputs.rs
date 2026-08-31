@@ -8,7 +8,6 @@
 //! | [`crate::risk`]               | Risk scoring — `score_candidate()`, `RiskAssessment`, `RiskSignal` |
 //! | [`crate::alert`]              | Alert domain types — `Alert`, `AlertSeverity`, `AlertLifecycle` |
 //! | [`crate::linked_source`]      | Linked import state machine — `process_linked_check()`, `LinkedSourceRegistration` |
-//! | [`crate::change_event`]       | External change taxonomy — `ExternalChangeEvent`, `classify_change_event()` |
 //! | [`crate::extension_channel`]  | Extension channel boundary — `validate_extension_request()`, `ExtensionChannelPolicy` |
 //!
 //! Alert state persists via `nrr_service_runtime::ProductionSecurityAlertsRepository`,
@@ -47,9 +46,6 @@ impl Block8Outputs {
 mod tests {
     use super::*;
     use crate::alert::AlertSeverity;
-    use crate::change_event::{
-        classify_change_event, ChangeEventClassification, ExternalChangeEvent,
-    };
     use crate::extension_channel::{
         validate_extension_request, ExtensionChannelPolicy, ExtensionInteractivity,
         ExtensionRequestScope, ReviewRequirement,
@@ -58,7 +54,7 @@ mod tests {
         process_linked_check, LinkedCheckInput, LinkedSourceCheckOutcome, LinkedSourceRegistration,
         LinkedWatchMode, LinkedWatchStatus,
     };
-    use crate::revision::{ContentHash, RevisionId, UnixTimestamp};
+    use crate::revision::{ContentHash, UnixTimestamp};
 
     // ── Helpers shared by these integration tests ─────────────────────────────
 
@@ -68,11 +64,6 @@ mod tests {
 
     fn ts(secs: u64) -> UnixTimestamp {
         UnixTimestamp::from_secs(secs)
-    }
-
-    fn rev_id(s: &str) -> RevisionId {
-        RevisionId::from_prefixed_string(s.to_string())
-            .unwrap_or_else(|e| panic!("invalid rev id: {e}"))
     }
 
     fn lsrc_id(s: &str) -> crate::linked_source::LinkedSourceId {
@@ -109,141 +100,6 @@ mod tests {
     #[test]
     fn block8_is_complete() {
         assert!(Block8Outputs::is_complete());
-    }
-
-    // ── Integration: linked check suspicious → change event → tamper alert ────
-    //
-    // Verifies the full chain:
-    //   process_linked_check(changed while pending)
-    //     → LinkedSourceCheckOutcome::SourceSuspiciouslyChanged
-    //     → ExternalChangeEvent::LinkedSourceSuspicious
-    //     → classify_change_event → TamperAlert + Critical severity
-
-    #[test]
-    fn suspicious_linked_check_produces_tamper_alert_end_to_end() {
-        // Step 1: linked check detects change while pending revision exists.
-        let mut reg = base_registration();
-        reg.pending_revision_id = Some(rev_id("rev-pending-001"));
-
-        let check_input = LinkedCheckInput {
-            registration: reg,
-            file_read_result: Ok(hash(0xBB)),
-            checked_at: ts(1_700_001_000),
-            changed_rule_count: Some(3),
-        };
-
-        let check_outcome = process_linked_check(check_input);
-
-        // Step 2: outcome is suspicious.
-        let (new_file_hash, suspicion) = match check_outcome {
-            LinkedSourceCheckOutcome::SourceSuspiciouslyChanged {
-                new_file_hash,
-                suspicion,
-            } => (new_file_hash, suspicion),
-            other => panic!("expected SourceSuspiciouslyChanged, got {other:?}"),
-        };
-
-        // Step 3: construct change event from outcome.
-        let event = ExternalChangeEvent::LinkedSourceSuspicious {
-            source_id: lsrc_id("lsrc-integration-001"),
-            new_file_hash,
-            suspicion,
-        };
-
-        // Step 4: classify — must produce TamperAlert with Critical severity.
-        let response = classify_change_event(&event);
-        assert_eq!(
-            response.classification,
-            ChangeEventClassification::TamperAlert
-        );
-        assert_eq!(response.alert_severity, Some(AlertSeverity::Critical));
-        assert!(response.required_actions.freeze_activation);
-        assert!(response.required_actions.create_alert);
-        assert!(response.required_actions.write_audit_event);
-    }
-
-    // ── Integration: normal linked change → PendingRevision response ──────────
-
-    #[test]
-    fn normal_linked_change_produces_pending_revision_response() {
-        let reg = base_registration(); // no pending revision
-
-        let check_input = LinkedCheckInput {
-            registration: reg,
-            file_read_result: Ok(hash(0xCC)),
-            checked_at: ts(1_700_002_000),
-            changed_rule_count: Some(2),
-        };
-
-        let check_outcome = process_linked_check(check_input);
-        let new_file_hash = match check_outcome {
-            LinkedSourceCheckOutcome::SourceChanged { new_file_hash } => new_file_hash,
-            other => panic!("expected SourceChanged, got {other:?}"),
-        };
-
-        let event = ExternalChangeEvent::LinkedSourceChanged {
-            source_id: lsrc_id("lsrc-integration-001"),
-            new_file_hash,
-        };
-
-        let response = classify_change_event(&event);
-        assert_eq!(
-            response.classification,
-            ChangeEventClassification::PendingRevision
-        );
-        assert!(response.required_actions.create_pending_revision);
-        assert!(!response.required_actions.freeze_activation);
-        assert!(response.alert_severity.is_none());
-    }
-
-    // ── Integration: integrity failure → full tamper reaction ─────────────────
-
-    #[test]
-    fn integrity_failure_triggers_freeze_fallback_and_audit() {
-        let event = ExternalChangeEvent::ServiceStateIntegrityFailed {
-            revision_id: rev_id("rev-tampered-001"),
-            stored_hash: hash(0x01),
-            detected_hash: hash(0x02),
-        };
-
-        let response = classify_change_event(&event);
-
-        assert_eq!(
-            response.classification,
-            ChangeEventClassification::TamperAlert
-        );
-        assert_eq!(response.alert_severity, Some(AlertSeverity::Critical));
-
-        let actions = &response.required_actions;
-        assert!(actions.freeze_activation);
-        assert!(actions.fallback_to_last_known_good);
-        assert!(actions.create_alert);
-        assert!(actions.write_audit_event);
-        assert!(actions.notify_user);
-    }
-
-    // ── Integration: snapshot source change is informational only ─────────────
-
-    #[test]
-    fn snapshot_source_change_is_informational_not_policy_change() {
-        let event = ExternalChangeEvent::SnapshotSourceChanged {
-            source_path: "C:/rules/backup.txt".to_string(),
-            original_hash: hash(0xAA),
-            current_hash: hash(0xBB),
-        };
-
-        let response = classify_change_event(&event);
-
-        assert_eq!(
-            response.classification,
-            ChangeEventClassification::Informational
-        );
-        // No policy action — only notification.
-        assert!(!response.required_actions.create_pending_revision);
-        assert!(!response.required_actions.freeze_activation);
-        assert!(!response.required_actions.create_alert);
-        assert!(!response.required_actions.write_audit_event);
-        assert!(response.required_actions.notify_user);
     }
 
     // ── Integration: extension channel policy respected across scenarios ───────

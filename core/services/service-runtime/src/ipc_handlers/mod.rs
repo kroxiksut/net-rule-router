@@ -995,7 +995,10 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::RetentionSettingsSet => {
                 registry.register(
                     op,
-                    RetentionSettingsSetHandler::new(deps.retention_writer.clone()),
+                    RetentionSettingsSetHandler::new(
+                        deps.retention_writer.clone(),
+                        deps.retention.clone(),
+                    ),
                 );
             }
             // Log/audit retention config.
@@ -1008,7 +1011,10 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::LogRetentionConfigSet => {
                 registry.register(
                     op,
-                    LogRetentionConfigSetHandler::new(deps.log_retention_writer.clone()),
+                    LogRetentionConfigSetHandler::new(
+                        deps.log_retention_writer.clone(),
+                        deps.log_retention.clone(),
+                    ),
                 );
             }
             IpcOperationName::ApplyFailurePolicyGet => {
@@ -1020,7 +1026,10 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::ApplyFailurePolicySet => {
                 registry.register(
                     op,
-                    ApplyFailurePolicySetHandler::new(deps.apply_failure_policy_writer.clone()),
+                    ApplyFailurePolicySetHandler::new(
+                        deps.apply_failure_policy_writer.clone(),
+                        deps.apply_failure_policy.clone(),
+                    ),
                 );
             }
             IpcOperationName::StorageUsageGet => {

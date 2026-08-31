@@ -494,6 +494,8 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             primary_probe_max_targets: record.primary_probe_max_targets,
             primary_probe_repeat_secs: record.primary_probe_repeat_secs,
             block_ipv6_when_protected: record.block_ipv6_when_protected,
+            local_networks_auto_accept: record.local_networks_auto_accept,
+            zone_priority_over_ip: record.zone_priority_over_ip,
         })
     }
 }
@@ -685,6 +687,8 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             primary_probe_max_targets: request.primary_probe_max_targets,
             primary_probe_repeat_secs: request.primary_probe_repeat_secs,
             block_ipv6_when_protected: request.block_ipv6_when_protected,
+            local_networks_auto_accept: request.local_networks_auto_accept,
+            zone_priority_over_ip: request.zone_priority_over_ip,
             binding_source: dto_source_to_storage(request.binding_source),
         };
         let conn = self
@@ -855,6 +859,8 @@ fn record_to_dto(
         primary_probe_max_targets: rec.primary_probe_max_targets,
         primary_probe_repeat_secs: rec.primary_probe_repeat_secs,
         block_ipv6_when_protected: rec.block_ipv6_when_protected,
+        local_networks_auto_accept: rec.local_networks_auto_accept,
+        zone_priority_over_ip: rec.zone_priority_over_ip,
         binding_source: storage_source_to_dto(rec.binding_source),
     }
 }
@@ -1477,19 +1483,38 @@ mod adapters_snapshot_tests {
         }
     }
 
+    /// A fresh probe result on the Ethernet row. The placeholder dataset no
+    /// longer ships one — it never ran a probe, and pretending otherwise is what
+    /// made the adapter panel print an invented address — so the test states the
+    /// precondition it is actually about.
+    fn rows_with_fresh_ethernet_probe() -> Vec<nrr_platform_api::interface_rows::InterfaceRouteRow>
+    {
+        let mut rows = nrr_platform_api::interface_rows::fallback_rows();
+        for row in &mut rows {
+            if row.windows_name == "Ethernet" {
+                nrr_platform_api::interface_rows::apply_external_probe(
+                    &mut row.observed_facts,
+                    nrr_platform_api::ExternalIpProbeOutcome::Resolved(std::net::Ipv4Addr::new(
+                        203, 0, 113, 10,
+                    )),
+                );
+            }
+        }
+        rows
+    }
+
     #[test]
     fn fold_cached_external_persists_fresh_resolution_keyed_by_windows_name() {
-        // `fallback_rows()`'s Ethernet entry ships a FRESH external-IP
-        // resolution with `adapter_name` ("{FAKE-ETHERNET-ADAPTER}", a GUID)
-        // deliberately distinct from `windows_name` ("Ethernet") — proves the
-        // join key used is `windows_name`, matching the traffic ledger's
-        // `Alias`-derived key, not the low-level identity GUID.
+        // The Ethernet entry's `adapter_name` ("{FAKE-ETHERNET-ADAPTER}", a
+        // GUID) is deliberately distinct from `windows_name` ("Ethernet") —
+        // proves the join key used is `windows_name`, matching the traffic
+        // ledger's `Alias`-derived key, not the low-level identity GUID.
         let api = Arc::new(MockWindowsApi::new());
         let recorder = Arc::new(FakeAddressRecorder::new());
         let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
             .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
-        let mut rows = nrr_platform_api::interface_rows::fallback_rows();
+        let mut rows = rows_with_fresh_ethernet_probe();
         provider.fold_cached_external(&mut rows);
 
         let calls = recorder.calls.lock().expect("lock");
@@ -1520,11 +1545,11 @@ mod adapters_snapshot_tests {
         let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
             .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
 
-        let mut first = nrr_platform_api::interface_rows::fallback_rows();
+        let mut first = rows_with_fresh_ethernet_probe();
         provider.fold_cached_external(&mut first);
         assert_eq!(recorder.calls.lock().expect("lock").len(), 1);
 
-        let mut second = nrr_platform_api::interface_rows::fallback_rows();
+        let mut second = rows_with_fresh_ethernet_probe();
         for row in &mut second {
             row.observed_facts.external_ip = None;
         }
@@ -1758,6 +1783,8 @@ mod fail_closed_probe_tests {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: true,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
                 binding_source: BindingSource::UserAssigned,
             },
             100,
@@ -1917,6 +1944,8 @@ mod fail_closed_probe_tests {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: true,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
                 binding_source: BindingSource::UserAssigned,
             },
             100,

@@ -123,14 +123,37 @@ pub struct PrincipalEnforcementCycle {
     /// honest on a host with no route mechanism wired, and the cycle then says
     /// so rather than implying traffic is being steered.
     routes: Option<Arc<crate::route_apply::PlannedRouteApplier>>,
+    /// Where a principal is told that the protection their settings ask for is
+    /// not fully in force, or is in force because of somebody else's. The log
+    /// alone was not enough: nobody reads the service log to find out why their
+    /// IPv6 stopped working.
+    events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
     /// The plans installed by the previous pass — and, because the lock is held
     /// for the WHOLE pass, the thing that serialises passes against each other.
     /// Three callers drive this cycle (the timer, an apply from the GUI, a link
     /// change), and two of them planning concurrently would let the slower one
     /// install its older view of the machine last.
     last_applied: Mutex<Option<Vec<EnforcementPlan>>>,
+    /// Mirrors "this pass is holding destinations back" for readers that must
+    /// not treat a rule host as covered while it is armed — today the rule
+    /// hostname seeder's retry pacing. `None` leaves them on calm pacing.
+    fail_closed_posture: Option<crate::app_enforcement_status::FailClosedPostureStatus>,
     /// Latched by [`PrincipalEnforcementCycle::teardown`]; never cleared.
     stopped: AtomicBool,
+}
+
+/// Whether this plan asks for something the packet layer will apply to the
+/// WHOLE machine.
+///
+/// The packet layer carries no user context (`FWPM_CONDITION_ALE_USER_ID` exists
+/// only on the ALE layers), so a block emitted there is machine-wide no matter
+/// whose plan produced it. `AllPackets` coverage on a Block is exactly that
+/// shape.
+fn plan_cuts_machine_wide(plan: &EnforcementPlan) -> bool {
+    use nrr_platform_api::enforcement::{Coverage, Verdict};
+    plan.flows
+        .iter()
+        .any(|f| f.verdict == Verdict::Block && f.coverage == Coverage::AllPackets)
 }
 
 impl PrincipalEnforcementCycle {
@@ -144,9 +167,31 @@ impl PrincipalEnforcementCycle {
             plans,
             enforcer,
             routes: None,
+            events: None,
+            fail_closed_posture: None,
             last_applied: Mutex::new(None),
             stopped: AtomicBool::new(false),
         }
+    }
+
+    /// Attach the push bus so coverage notices reach the principals they
+    /// concern.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<crate::ipc_handlers::event_bus::EventBus>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// Publish "the guard is holding destinations back" so the rule-hostname
+    /// seeder can tighten its retry pacing: while the guard blocks, a rule host
+    /// with no cached address has nothing protecting it at all.
+    #[must_use]
+    pub fn with_fail_closed_posture_status(
+        mut self,
+        status: crate::app_enforcement_status::FailClosedPostureStatus,
+    ) -> Self {
+        self.fail_closed_posture = Some(status);
+        self
     }
 
     /// Attach the route applier. Builder-style because a host without a route
@@ -180,6 +225,8 @@ impl PrincipalEnforcementCycle {
         self.plans.begin_pass();
         let mut plans: Vec<EnforcementPlan> = Vec::new();
         let mut unprotected: Vec<String> = Vec::new();
+        let mut wants_machine_wide_cut: std::collections::BTreeMap<String, bool> =
+            std::collections::BTreeMap::new();
         let mut guarded = 0usize;
         for principal in &active {
             let availability = self.enforcer.channel_availability(principal);
@@ -189,6 +236,13 @@ impl PrincipalEnforcementCycle {
             if !planned.protection_complete {
                 unprotected.push(principal.as_stored().to_owned());
             }
+            // What each principal's own plan asks of the packet layer. Used
+            // below to find the ones who are about to lose ICMP and IPv6
+            // because somebody ELSE asked for it.
+            wants_machine_wide_cut.insert(
+                principal.as_stored().to_owned(),
+                plan_cuts_machine_wide(&planned.plan),
+            );
             guarded += planned.fail_closed_blocks;
             plans.push(planned.plan);
         }
@@ -216,6 +270,12 @@ impl PrincipalEnforcementCycle {
                     })
                 });
 
+                if changed {
+                    self.notify_coverage(&unprotected, &wants_machine_wide_cut);
+                }
+                if let Some(posture) = self.fail_closed_posture.as_ref() {
+                    posture.set(guarded > 0);
+                }
                 *last = Some(plans);
                 CycleOutcome::Applied {
                     principals,
@@ -251,6 +311,46 @@ impl PrincipalEnforcementCycle {
     /// moment with routes but no filters still carries traffic over the link
     /// the user chose; the reverse leaves the leak-guard `drop` in place with
     /// nothing steering around it, which is a machine with no network.
+    /// Tell the principals who need to know, and only them.
+    ///
+    /// Published on a CHANGE, never on the identical re-apply that follows every
+    /// ten seconds: a notice repeated forever is one the user learns to dismiss
+    /// without reading.
+    fn notify_coverage(
+        &self,
+        unprotected: &[String],
+        wants_machine_wide_cut: &std::collections::BTreeMap<String, bool>,
+    ) {
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        for sid in unprotected {
+            bus.publish_for(
+                sid.clone(),
+                nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
+                    reason: "blanket-block-not-armed".to_string(),
+                },
+            );
+        }
+        // Somebody armed a cut the packet layer cannot scope. Everyone else
+        // active loses ICMP and IPv6 without having asked for it, so they are
+        // told - the alternative was that their network changed silently.
+        let anybody_cuts = wants_machine_wide_cut.values().any(|v| *v);
+        if !anybody_cuts {
+            return;
+        }
+        for (sid, wants) in wants_machine_wide_cut {
+            if !*wants {
+                bus.publish_for(
+                    sid.clone(),
+                    nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
+                        reason: "machine-wide-cut-by-another-user".to_string(),
+                    },
+                );
+            }
+        }
+    }
+
     pub fn teardown(&self) -> Result<(), String> {
         // Held for the whole teardown, and the latch is set inside it: a pass
         // already under way finishes, no later one starts, and the last word on
@@ -379,6 +479,76 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
 
 #[cfg(test)]
 mod tests {
+
+    /// The packet layer carries no user context, so a cut one principal asks
+    /// for lands on everyone. Before this the others just lost ICMP and IPv6
+    /// with nothing to explain it.
+    #[test]
+    fn a_machine_wide_cut_is_announced_to_the_principals_who_did_not_ask_for_it() {
+        use nrr_platform_api::enforcement::{Coverage, Verdict};
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        let bus = std::sync::Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let asked = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bystander = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+
+        let mut wants = std::collections::BTreeMap::new();
+        wants.insert("S-1-A".to_string(), true);
+        wants.insert("S-1-B".to_string(), false);
+
+        let cycle = PrincipalEnforcementCycle::new(
+            std::sync::Arc::new(ScriptedPrincipals {
+                answer: Some(Vec::new()),
+            }),
+            std::sync::Arc::new(PlanEveryone {
+                without_policy: Vec::new(),
+            }),
+            std::sync::Arc::new(RecordingEnforcer::new(false)),
+        )
+        .with_events(std::sync::Arc::clone(&bus));
+        cycle.notify_coverage(&[], &wants);
+
+        let for_asker = bus.peek_pending_for(&asked.subscription_id, 8);
+        assert!(
+            for_asker.is_empty(),
+            "the principal who asked for the cut needs no notice",
+        );
+        let for_bystander = bus.peek_pending_for(&bystander.subscription_id, 8);
+        assert!(
+            for_bystander.iter().any(|e| matches!(
+                &e.event,
+                StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                    if reason == "machine-wide-cut-by-another-user"
+            )),
+            "the bystander must be told why their IPv6 stopped: {for_bystander:?}",
+        );
+
+        // A plan that blocks only at the connect layer is per-principal and
+        // announces nothing.
+        let ale_only = EnforcementPlan {
+            principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid("S-1-A")
+                .expect("sid"),
+            flows: vec![nrr_platform_api::enforcement::FlowRule {
+                verdict: Verdict::Block,
+                precedence: nrr_platform_api::enforcement::Precedence {
+                    class: nrr_platform_api::enforcement::PrecedenceClass::CatchAllBlock,
+                    ordinal: 0,
+                },
+                flow: nrr_platform_api::enforcement::FlowMatch {
+                    dst: nrr_platform_api::enforcement::DstMatch::Any,
+                    dst_port: None,
+                    protocol: None,
+                },
+                principal: nrr_platform_api::enforcement::PrincipalScope(None),
+                app: nrr_platform_api::enforcement::AppScope::Any,
+                egress: nrr_platform_api::enforcement::EgressConstraint::Any,
+                coverage: Coverage::ConnectOnly,
+            }],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        assert!(!plan_cuts_machine_wide(&ale_only));
+    }
     use super::*;
     use nrr_platform_api::active_principals::ActivePrincipalError;
     use nrr_platform_api::enforcement::EnforcementFailure;

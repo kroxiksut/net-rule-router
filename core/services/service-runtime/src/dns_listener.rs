@@ -20,7 +20,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dns_resolver::{
     handle_a_query, CompanionCandidateLookup, CompanionRescueObserver, DirectAnswerGate,
@@ -31,7 +31,7 @@ use crate::dns_resolver::{
 };
 use crate::dns_wire::{
     build_a_response, build_error_response, parse_a_response, parse_question, AResponseOutcome,
-    QTYPE_A, RCODE_NXDOMAIN,
+    QTYPE_A, RCODE_NXDOMAIN, RCODE_SERVFAIL,
 };
 
 /// TTL (seconds) stamped on resolver-built `A` responses. Deliberately SHORT so
@@ -51,6 +51,13 @@ const SERVE_WORKER_THREADS: usize = 8;
 /// behaviour) rather than dropping it.
 const SERVE_QUEUE_DEPTH: usize = 128;
 
+/// Everything one client datagram may cost, end to end. The stages used to
+/// budget independently — rule-host resolve, then the fail-open forward, then
+/// its rotation retry — and summed past seven seconds, while the client's stub
+/// resolver gives up and re-asks after about one. The stage timeouts stay as
+/// they are; this caps their sum.
+const QUERY_BUDGET: Duration = Duration::from_secs(3);
+
 /// What the listener should do with one datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerAction {
@@ -66,6 +73,11 @@ pub enum ListenerAction {
     /// collateral). Degrades to a plain relay whenever steering has nothing
     /// to do or cannot produce a clean answer.
     ForwardFiltered,
+    /// Answer nothing at all. Reached only when a response the handler decided
+    /// to send could not be built — the caller times out, which is the safe
+    /// direction here: every reachable case that produces it is one where
+    /// forwarding would hand over addresses the leak guard is holding back.
+    Drop,
 }
 
 /// The intercept listener. Holds the resolver ports plus the upstream DNS server
@@ -112,6 +124,11 @@ pub struct DnsInterceptListener {
     /// the operator-notice-page detector needs. The default no-op observes
     /// nothing, so the feature is absent until wired.
     resolution_observer: Arc<dyn ResolutionObserver>,
+    /// Whether the leak guard is blocking with the additional link unresolved.
+    /// A rule-host answer that missed its reconcile deadline is withheld while
+    /// it is — see [`crate::dns_resolver::LeakGuardPosture`]. The default never
+    /// blocks, keeping the historic fail-open.
+    leak_guard: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
     /// Live choice of forwarding upstream — rotates itself when the server it
     /// points at stops answering.
     upstream_dns: Arc<crate::dns_upstream::UpstreamDnsPool>,
@@ -128,6 +145,26 @@ pub trait ResolutionObserver: Send + Sync {
 
 /// The default: sees nothing.
 pub struct NoopResolutionObserver;
+
+/// Receive buffer for both directions of the DNS path.
+///
+/// 1500 was the old value, chosen for an Ethernet frame - but EDNS lets a
+/// client advertise 4096, and this listener forwards the query verbatim, OPT
+/// record included, so the answer can legitimately be that big. Undersized, the
+/// two failure modes are worse than a truncated packet: on Windows the receive
+/// fails with "message too long" instead of truncating, and on the upstream
+/// path a healthy server got a `note_failure` for an answer we could not hold -
+/// three of those rotate it away.
+const DNS_DATAGRAM_BUFFER_BYTES: usize = 4096;
+
+/// How many consecutive receive errors of a kind we do not recognise are
+/// tolerated before the serve loop gives up.
+///
+/// The loop used to return on the first one, so a single unusual datagram
+/// switched DNS interception off machine-wide until the watchdog noticed
+/// (~50 s). A genuinely dead socket fails every time, so a run of them still
+/// ends the loop; one odd packet no longer does.
+const DNS_RECV_ERROR_TOLERANCE: u32 = 16;
 
 impl ResolutionObserver for NoopResolutionObserver {
     fn note_resolution(&self, _hostname: &str, _rule_covered: bool) {}
@@ -156,6 +193,7 @@ impl DnsInterceptListener {
             companion_candidates: Arc::new(NoopCompanionCandidates),
             companion_rescue: Arc::new(NoopCompanionRescue),
             resolution_observer: Arc::new(NoopResolutionObserver),
+            leak_guard: Arc::new(crate::dns_resolver::OpenLeakGuard),
             upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
             deadline,
             forward_timeout,
@@ -174,6 +212,16 @@ impl DnsInterceptListener {
     /// Watch resolved names (operator-notice-page detection).
     pub fn with_resolution_observer(mut self, observer: Arc<dyn ResolutionObserver>) -> Self {
         self.resolution_observer = observer;
+        self
+    }
+
+    /// Read the live leak-guard posture, so a rule-host answer whose enforcement
+    /// did not install in time is withheld rather than leaked to the main link.
+    pub fn with_leak_guard_posture(
+        mut self,
+        posture: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
+    ) -> Self {
+        self.leak_guard = posture;
         self
     }
 
@@ -284,6 +332,7 @@ impl DnsInterceptListener {
             self.sink.as_ref(),
             self.reconciler.as_ref(),
             self.fake_ip.as_ref(),
+            self.leak_guard.as_ref(),
         ) {
             QueryOutcome::Answer { ips, .. } => build_a_response(query, &ips, self.response_ttl)
                 .map(ListenerAction::Respond)
@@ -292,6 +341,11 @@ impl DnsInterceptListener {
                     build_error_response(query, RCODE_NXDOMAIN)
                         .map_or(ListenerAction::Forward, ListenerAction::Respond)
                 }),
+            // Withheld deliberately: SERVFAIL, never a forward. Forwarding here
+            // would hand the caller the very addresses the guard is holding
+            // back, over the OS's own resolver.
+            QueryOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
+                .map_or(ListenerAction::Drop, ListenerAction::Respond),
             QueryOutcome::Upstream(ResolveError::NoRecords) => {
                 build_error_response(query, RCODE_NXDOMAIN)
                     .map_or(ListenerAction::Forward, ListenerAction::Respond)
@@ -348,7 +402,8 @@ impl DnsInterceptListener {
                     }
                 });
             }
-            let mut buf = [0u8; 1500];
+            let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
+            let mut consecutive_errors = 0u32;
             while !stop.load(Ordering::Relaxed) {
                 let (n, src) = match socket.recv_from(&mut buf) {
                     Ok(v) => v,
@@ -387,8 +442,24 @@ impl DnsInterceptListener {
                         );
                         continue;
                     }
-                    Err(e) => return Err(e),
+                    // Anything else: log and keep serving. Returning here is
+                    // what made one oversized datagram take DNS interception
+                    // down for the whole machine.
+                    Err(e) => {
+                        consecutive_errors += 1;
+                        if consecutive_errors >= DNS_RECV_ERROR_TOLERANCE {
+                            return Err(e);
+                        }
+                        tracing::warn!(
+                            target: "nrr::dns_resolver",
+                            error = %e,
+                            consecutive_errors,
+                            "Mode B: unrecognised receive error; continuing to serve",
+                        );
+                        continue;
+                    }
                 };
+                consecutive_errors = 0;
                 match tx.try_send((buf[..n].to_vec(), src)) {
                     Ok(()) => {}
                     Err(TrySendError::Full((query, src))) => {
@@ -409,59 +480,67 @@ impl DnsInterceptListener {
     /// under backpressure) — everything here may block for its own bounded
     /// budgets without stalling other queries.
     fn handle_datagram(&self, socket: &UdpSocket, query: &[u8], src: SocketAddr) {
+        let started = Instant::now();
+        let left = || QUERY_BUDGET.saturating_sub(started.elapsed());
         match self.answer_query(query) {
             ListenerAction::Respond(resp) => {
                 let _ = socket.send_to(&resp, src);
             }
             ListenerAction::Forward => {
-                if let Some(resp) = self.forward(query) {
-                    let _ = socket.send_to(&resp, src);
-                }
-                // else: drop — the client retries / times out; never hang.
-            }
-            ListenerAction::ForwardFiltered => {
-                if let Some(resp) = self.forward(query) {
-                    let (steered, still_pinned) = self.steer_direct_answer(query, resp);
-                    // under the armed block-all with
-                    // fake-IP active, hand the client a virtual address instead:
-                    // the relay carries the flow out the primary, nothing is
-                    // compiled on the answer path, no race to lose.
-                    if let Some(fake) = self.fake_direct_response(query, &steered) {
-                        // Gate before answering: the app may already hold these
-                        // real addresses (own cache / in-app DoH) and will not
-                        // re-resolve, so the virtual answer never reaches it and
-                        // its first connect meets the armed block-all.
-                        self.gate_direct_answer(query, &steered);
-                        let _ = socket.send_to(&fake, src);
-                        return;
+                match self.forward_within(query, left()) {
+                    Some(resp) => {
+                        let _ = socket.send_to(&resp, src);
                     }
-                    // Collateral rescue — steering could not produce a clean
-                    // answer (every address is committed to the secondary
-                    // link). With the fake-IP stack live, a virtual address
-                    // routes the host by NAME out the primary; the old
-                    // fail-open answer sent it out the VPN link instead
-                    // (geo captcha / kill-switch block).
-                    if still_pinned {
-                        // Reported here, not inside the rescue, so the evidence
-                        // is the same with or without the fake-IP stack.
-                        self.note_collateral_host(query);
-                        if !self.companion_is_pending(query) {
-                            if let Some(fake) = self.fake_collateral_response(query, &steered) {
-                                // Same reason as above: a cached real address
-                                // bypasses the virtual answer entirely.
-                                self.gate_direct_answer(query, &steered);
-                                let _ = socket.send_to(&fake, src);
-                                return;
-                            }
+                    // Silence costs the client its own timeout on top of ours.
+                    None => self.answer_servfail(socket, query, src),
+                }
+            }
+            ListenerAction::Drop => {}
+            ListenerAction::ForwardFiltered => {
+                let Some(resp) = self.forward_within(query, left()) else {
+                    self.answer_servfail(socket, query, src);
+                    return;
+                };
+                let (steered, still_pinned) = self.steer_direct_answer(query, resp, left());
+                // under the armed block-all with
+                // fake-IP active, hand the client a virtual address instead:
+                // the relay carries the flow out the primary, nothing is
+                // compiled on the answer path, no race to lose.
+                if let Some(fake) = self.fake_direct_response(query, &steered) {
+                    // Gate before answering: the app may already hold these
+                    // real addresses (own cache / in-app DoH) and will not
+                    // re-resolve, so the virtual answer never reaches it and
+                    // its first connect meets the armed block-all.
+                    self.gate_direct_answer(query, &steered);
+                    let _ = socket.send_to(&fake, src);
+                    return;
+                }
+                // Collateral rescue — steering could not produce a clean
+                // answer (every address is committed to the secondary
+                // link). With the fake-IP stack live, a virtual address
+                // routes the host by NAME out the primary; the old
+                // fail-open answer sent it out the VPN link instead
+                // (geo captcha / kill-switch block).
+                if still_pinned {
+                    // Reported here, not inside the rescue, so the evidence
+                    // is the same with or without the fake-IP stack.
+                    self.note_collateral_host(query);
+                    if !self.companion_is_pending(query) {
+                        if let Some(fake) = self.fake_collateral_response(query, &steered) {
+                            // Same reason as above: a cached real address
+                            // bypasses the virtual answer entirely.
+                            self.gate_direct_answer(query, &steered);
+                            let _ = socket.send_to(&fake, src);
+                            return;
                         }
                     }
-                    // while the block-all is armed, install the
-                    // known-direct exemption BEFORE the client learns these
-                    // addresses (its first connect would otherwise race
-                    // the catch-all and be dropped with no retry).
-                    self.gate_direct_answer(query, &steered);
-                    let _ = socket.send_to(&steered, src);
                 }
+                // while the block-all is armed, install the
+                // known-direct exemption BEFORE the client learns these
+                // addresses (its first connect would otherwise race
+                // the catch-all and be dropped with no retry).
+                self.gate_direct_answer(query, &steered);
+                let _ = socket.send_to(&steered, src);
             }
         }
     }
@@ -480,7 +559,12 @@ impl DnsInterceptListener {
     /// "this reply still carries nothing but secondary-pinned addresses" — so
     /// the caller can offer the host to the collateral fake-IP rescue instead
     /// of relaying an answer that egresses the wrong link.
-    fn steer_direct_answer(&self, query: &[u8], reply: Vec<u8>) -> (Vec<u8>, bool) {
+    fn steer_direct_answer(
+        &self,
+        query: &[u8],
+        reply: Vec<u8>,
+        budget: Duration,
+    ) -> (Vec<u8>, bool) {
         let owned = self.secondary_owned.secondary_owned_ips();
         if owned.is_empty() {
             return (reply, false);
@@ -515,7 +599,7 @@ impl DnsInterceptListener {
             );
         }
         // Whole answer pinned — try ONE fresh upstream answer (pools rotate).
-        if let Some(retry) = self.forward(query) {
+        if let Some(retry) = self.forward_within(query, budget) {
             if let AResponseOutcome::Answers { addresses, .. } =
                 parse_a_response(id, &q.qname, &retry)
             {
@@ -669,32 +753,135 @@ impl DnsInterceptListener {
     /// query is retried once against the replacement: every name on the machine
     /// comes through here, so waiting for the client's own timeout to expose a
     /// dead upstream would read as "the internet is down".
-    fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
+    /// Forward within what is left of this datagram's budget. The rotation
+    /// retry only runs if the budget can still pay for it — an answer nobody is
+    /// waiting for is worth less than the client's own retry.
+    fn forward_within(&self, query: &[u8], budget: Duration) -> Option<Vec<u8>> {
+        let started = Instant::now();
+        let left = || budget.saturating_sub(started.elapsed());
+        if left().is_zero() {
+            return None;
+        }
         let upstream = self.upstream_dns.current()?;
-        if let Some(reply) = self.forward_to(query, upstream) {
+        if let Some(reply) = self.forward_to(query, upstream, self.forward_timeout.min(left())) {
             self.upstream_dns.note_success();
             return Some(reply);
         }
+        if left().is_zero() {
+            return None;
+        }
+        // Rotation probes the candidates, which costs time of its own.
         let replacement = self.upstream_dns.note_failure()?;
-        let reply = self.forward_to(query, replacement)?;
+        let window = self.forward_timeout.min(left());
+        if window.is_zero() {
+            return None;
+        }
+        let reply = self.forward_to(query, replacement, window)?;
         self.upstream_dns.note_success();
         Some(reply)
     }
 
+    /// Tell the client the lookup failed instead of leaving it to time out.
+    /// Under an armed block-all the wait is pure loss: the address it is
+    /// waiting for would not have connected anyway.
+    fn answer_servfail(&self, socket: &UdpSocket, query: &[u8], src: SocketAddr) {
+        if let Some(resp) = build_error_response(query, RCODE_SERVFAIL) {
+            let _ = socket.send_to(&resp, src);
+        }
+    }
+
     /// One send + receive against a named server.
-    fn forward_to(&self, query: &[u8], upstream: SocketAddr) -> Option<Vec<u8>> {
+    ///
+    /// The socket is CONNECTED, so the kernel drops anything that did not come
+    /// from the server we asked, and the datagram is still checked against the
+    /// query before it is relayed: this path hands bytes straight back to the
+    /// client's stub resolver, so an accepted forgery poisons the OS cache and,
+    /// through it, the rule host cache that routes and pins are derived from.
+    fn forward_to(&self, query: &[u8], upstream: SocketAddr, window: Duration) -> Option<Vec<u8>> {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-        sock.set_read_timeout(Some(self.forward_timeout)).ok()?;
-        sock.send_to(query, upstream).ok()?;
-        let mut buf = [0u8; 1500];
-        let n = sock.recv(&mut buf).ok()?;
-        Some(buf[..n].to_vec())
+        sock.set_read_timeout(Some(window)).ok()?;
+        sock.connect(upstream).ok()?;
+        sock.send(query).ok()?;
+        let mut buf = [0u8; DNS_DATAGRAM_BUFFER_BYTES];
+        let started = std::time::Instant::now();
+        loop {
+            let remaining = window.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return None;
+            }
+            sock.set_read_timeout(Some(remaining)).ok()?;
+            let n = sock.recv(&mut buf).ok()?;
+            if reply_answers_query(query, &buf[..n]) {
+                return Some(buf[..n].to_vec());
+            }
+            // A late reply to an earlier query, or noise the kernel could not
+            // filter. Keep waiting for ours rather than relaying somebody
+            // else's answer.
+        }
+    }
+}
+
+/// Whether `reply` is an answer to `query`: same transaction id, the response
+/// bit set, and the same question echoed back.
+///
+/// Matching on the id alone is not enough — the id is 16 bits and, on this
+/// path, sequential.
+fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
+    use crate::dns_wire::parse_question;
+    if reply.len() < 12 || query.len() < 12 {
+        return false;
+    }
+    if reply[0..2] != query[0..2] {
+        return false;
+    }
+    // QR bit — a query echoed back is not an answer.
+    if reply[2] & 0x80 == 0 {
+        return false;
+    }
+    match (parse_question(query), parse_question(reply)) {
+        (Some(q), Some(r)) => q.qtype == r.qtype && q.qname.eq_ignore_ascii_case(&r.qname),
+        // A server may answer a malformed or empty-question query (FORMERR)
+        // with no question section; the id plus the connected socket is all
+        // there is to go on there.
+        (None, _) | (_, None) => true,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forward path relays bytes straight to the client's stub resolver, so
+    /// what it accepts becomes the OS cache and, downstream, the rule host cache
+    /// the routes and kill-switch exemptions are built from.
+    #[test]
+    fn a_forwarded_reply_is_accepted_only_when_it_answers_our_query() {
+        use crate::dns_wire::build_a_query;
+        let query = build_a_query(0x1234, "example.com").expect("query");
+
+        let mut good = query.clone();
+        good[2] |= 0x80; // QR = response
+        assert!(reply_answers_query(&query, &good));
+
+        // Somebody else's transaction.
+        let mut wrong_id = good.clone();
+        wrong_id[0] = 0xFF;
+        assert!(!reply_answers_query(&query, &wrong_id));
+
+        // Right id, different question - the shape a blind forger produces
+        // when it guesses the id but not what was asked.
+        let mut other = build_a_query(0x1234, "evil.example").expect("query");
+        other[2] |= 0x80;
+        assert!(!reply_answers_query(&query, &other));
+
+        // A query echoed back is not an answer.
+        assert!(!reply_answers_query(&query, &query));
+
+        // Case differences in the echoed name are legal (0x20 encoding).
+        let mut mixed = build_a_query(0x1234, "ExAmPlE.CoM").expect("query");
+        mixed[2] |= 0x80;
+        assert!(reply_answers_query(&query, &mixed));
+    }
     use crate::dns_resolver::{ReconcileOutcome, ResolvedA};
     use crate::dns_wire::{parse_question, QTYPE_HTTPS};
     use std::net::Ipv4Addr;
@@ -816,16 +1003,18 @@ mod tests {
 
     // ── П0-D — direct-answer steering ────────────────────────────────────────
 
-    struct OwnedSet(std::collections::HashSet<Ipv4Addr>);
+    struct OwnedSet(Arc<std::collections::HashSet<Ipv4Addr>>);
     impl crate::dns_resolver::SecondaryOwnedIps for OwnedSet {
-        fn secondary_owned_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
-            self.0.clone()
+        fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>> {
+            Arc::clone(&self.0)
         }
     }
 
     fn steering_listener(owned: &[Ipv4Addr]) -> DnsInterceptListener {
         listener(&["chatgpt.com"], Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])))
-            .with_direct_answer_steering(Arc::new(OwnedSet(owned.iter().copied().collect())))
+            .with_direct_answer_steering(Arc::new(OwnedSet(Arc::new(
+                owned.iter().copied().collect(),
+            ))))
     }
 
     /// Build an upstream-style reply to `query(name, A)` carrying `ips`.
@@ -838,7 +1027,10 @@ mod tests {
         let l = steering_listener(&[Ipv4Addr::new(9, 9, 9, 9)]);
         let q = query("www.google.com", QTYPE_A);
         let reply = reply_for("www.google.com", &[Ipv4Addr::new(142, 250, 1, 1)]);
-        assert_eq!(l.steer_direct_answer(&q, reply.clone()), (reply, false));
+        assert_eq!(
+            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+            (reply, false)
+        );
     }
 
     #[test]
@@ -848,7 +1040,7 @@ mod tests {
         let l = steering_listener(&[pinned]);
         let q = query("www.google.com", QTYPE_A);
         let reply = reply_for("www.google.com", &[pinned, clean]);
-        let (steered, still_pinned) = l.steer_direct_answer(&q, reply);
+        let (steered, still_pinned) = l.steer_direct_answer(&q, reply, QUERY_BUDGET);
         assert!(!still_pinned, "a partially clean answer is not pinned");
         let out = crate::dns_wire::parse_a_response(0x1234, "www.google.com", &steered);
         match out {
@@ -865,7 +1057,10 @@ mod tests {
         let q = query("www.google.com", QTYPE_A);
         let pinned = Ipv4Addr::new(142, 251, 150, 119);
         let reply = reply_for("www.google.com", &[pinned]);
-        assert_eq!(l.steer_direct_answer(&q, reply.clone()), (reply, false));
+        assert_eq!(
+            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+            (reply, false)
+        );
     }
 
     #[test]
@@ -873,7 +1068,10 @@ mod tests {
         let l = steering_listener(&[Ipv4Addr::new(1, 1, 1, 1)]);
         let q = query("www.google.com", QTYPE_A);
         let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-        assert_eq!(l.steer_direct_answer(&q, nx.clone()), (nx, false));
+        assert_eq!(
+            l.steer_direct_answer(&q, nx.clone(), QUERY_BUDGET),
+            (nx, false)
+        );
     }
 
     #[test]
@@ -886,7 +1084,10 @@ mod tests {
         let l = steering_listener(&[pinned]);
         let q = query("workspace.google.com", QTYPE_A);
         let reply = reply_for("workspace.google.com", &[pinned]);
-        assert_eq!(l.steer_direct_answer(&q, reply.clone()), (reply, true));
+        assert_eq!(
+            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
+            (reply, true)
+        );
     }
 
     #[test]
@@ -1076,5 +1277,63 @@ mod tests {
             .with_collateral_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
         let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
         assert_eq!(l.fake_collateral_response(&q, &nx), None);
+    }
+    // ── Per-datagram budget ──────────────────────────────────────────────────
+
+    #[test]
+    fn the_budget_cuts_a_forward_short_of_its_own_timeout() {
+        // The stage timeout is the ceiling, the budget is the floor of the two:
+        // spending two seconds on a client that re-asked a second ago is spent
+        // for nobody.
+        let l = DnsInterceptListener::new(
+            Arc::new(Oracle(Vec::new())),
+            Arc::new(Upstream(Ok(resolved(&[])))),
+            Arc::new(NoopSink),
+            Arc::new(OkReconciler),
+            "192.0.2.1:53".parse().expect("test-net address"),
+            Duration::from_millis(150),
+            Duration::from_secs(2),
+        );
+        let started = Instant::now();
+        assert_eq!(
+            l.forward_within(&query("example.com", QTYPE_A), Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the 2 s forward timeout must not outlive a 200 ms budget (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_forwards_nothing_at_all() {
+        let l = listener(&[], Ok(resolved(&[])));
+        let started = Instant::now();
+        assert_eq!(
+            l.forward_within(&query("example.com", QTYPE_A), Duration::ZERO),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn a_failed_forward_answers_servfail_instead_of_saying_nothing() {
+        // Silence makes the client wait out its own timeout on top of ours; the
+        // answer it is waiting for is not coming either way.
+        let l = listener(&[], Ok(resolved(&[])));
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("server socket");
+        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("client timeout");
+        let q = query("example.com", QTYPE_A);
+        l.handle_datagram(&server, &q, client.local_addr().expect("client addr"));
+        let mut buf = [0u8; 512];
+        let n = client.recv(&mut buf).expect("a reply, not silence");
+        assert!(n >= 12);
+        assert_eq!(buf[0..2], q[0..2], "same transaction id");
+        assert_eq!(buf[2] & 0x80, 0x80, "QR set");
+        assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
     }
 }

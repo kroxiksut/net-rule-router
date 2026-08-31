@@ -621,7 +621,10 @@ pub fn build_diagnostics_cleanup_task(
         // Optional ignores max_restarts (drops on first failure).
         0,
         move |_stop| {
-            let _result = CleanupJob::run_logs(&logs_dir, &policy, &scope);
+            report_cleanup(
+                "operational logs",
+                CleanupJob::run_logs(&logs_dir, &policy, &scope),
+            );
             TaskOutcome::Continue
         },
     )
@@ -642,10 +645,36 @@ pub fn build_diagnostics_audit_cleanup_task(
         DIAGNOSTICS_CLEANUP_INTERVAL,
         0,
         move |_stop| {
-            let _result = CleanupJob::run_audit(&audit_dir, &policy);
+            report_cleanup("audit", CleanupJob::run_audit(&audit_dir, &policy));
             TaskOutcome::Continue
         },
     )
+}
+
+/// Say what a retention pass did. Both passes used to drop their
+/// `CleanupResult` into `let _`, so a sweep that removed every log — or failed
+/// to remove anything — left no trace of itself in the very logs it was
+/// managing. A pass that deletes nothing stays quiet; there is one of these
+/// every hour and silence is the normal case.
+fn report_cleanup(what: &str, result: nrr_diagnostics::CleanupResult) {
+    if !result.errors.is_empty() {
+        tracing::warn!(
+            target: "nrr::retention",
+            kind = what,
+            deleted = result.files_deleted,
+            errors = ?result.errors,
+            "retention pass could not delete some files",
+        );
+    }
+    if result.files_deleted > 0 {
+        tracing::info!(
+            target: "nrr::retention",
+            kind = what,
+            deleted = result.files_deleted,
+            bytes_freed = result.bytes_freed,
+            "retention pass removed rotated files",
+        );
+    }
 }
 
 // ── Revisions retention prune ────────────────────────────────────────────────
@@ -728,14 +757,31 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
 /// drops everything past the deadline. `Optional` for the same reason
 /// as the diagnostics cleanup — a stalled GC produces a memory-growth
 /// degradation, not a routing failure.
-pub fn build_operation_results_gc_task(store: Arc<OperationStatusStore>) -> ServiceTask {
+pub fn build_operation_results_gc_task(
+    store: Arc<OperationStatusStore>,
+    tokens: Option<Arc<crate::ipc_handlers::mutation_token_store::MutationTokenStore>>,
+) -> ServiceTask {
     ServiceTask::periodic(
         TASK_ID_OPERATION_RESULTS_GC,
         TaskClass::Optional,
         OPERATION_RESULTS_GC_INTERVAL,
         0,
         move |_stop| {
-            let _expired = store.gc_expired(Instant::now());
+            let now = Instant::now();
+            let _expired = store.gc_expired(now);
+            // Same tick collects the dry-run confirmation tokens: they are
+            // issued by an unelevated, unqueued, unlimited call and each parks
+            // its payload until confirmed or expired.
+            if let Some(tokens) = tokens.as_ref() {
+                let dropped = tokens.gc_expired(now);
+                if dropped > 0 {
+                    tracing::debug!(
+                        target: "nrr::ipc",
+                        dropped,
+                        "expired confirmation tokens collected",
+                    );
+                }
+            }
             TaskOutcome::Continue
         },
     )
@@ -777,12 +823,15 @@ pub fn build_dns_refresh_task(
                     loopback_pinned = summary.loopback_pinned,
                     "DNS refresh tick"
                 );
-                // Fresh IPs landed in the FQDN cache, so a domain/zone rule
-                // whose hosts were cold may now produce routes. Recompute
-                // the active user's route table. Cheap and idempotent (a
-                // no-op diff when nothing changed).
-                if let Some(hook) = on_progress.as_ref() {
-                    hook();
+                // Recompute only when fresh IPs actually landed in the FQDN
+                // cache (a domain/zone rule whose hosts were cold may now
+                // produce routes). `made_progress` also counts pure attempts —
+                // failures and skips land nothing, and recomputing on them
+                // re-derived the full route + WFP set every refresh tick.
+                if summary.succeeded > 0 {
+                    if let Some(hook) = on_progress.as_ref() {
+                        hook();
+                    }
                 }
             }
             TaskOutcome::Continue
@@ -910,6 +959,7 @@ pub fn build_dns_observe_task(
                     tracing::info!(
                         target: "nrr::dns-observe",
                         matched = summary.matched,
+                        refreshed = summary.refreshed,
                         ignored = summary.ignored,
                         collateral = summary.collateral,
                         "DNS observation tick cached new suffix/zone hosts",
@@ -1357,13 +1407,41 @@ mod tests {
     #[test]
     fn operation_results_gc_task_runs_gc_on_underlying_store() {
         let store = Arc::new(OperationStatusStore::default());
-        let mut task = build_operation_results_gc_task(Arc::clone(&store));
+        let mut task = build_operation_results_gc_task(Arc::clone(&store), None);
         // Tick once to verify it doesn't panic on an empty store.
         let stop = StopToken::new();
         let outcome = (task.tick)(&stop);
         assert_eq!(outcome, TaskOutcome::Continue);
         assert_eq!(task.id.0, TASK_ID_OPERATION_RESULTS_GC);
         assert_eq!(task.class, TaskClass::Optional);
+    }
+
+    #[test]
+    fn the_housekeeping_tick_collects_expired_confirmation_tokens() {
+        // A dry-run mints its token without elevation, outside the mutation
+        // queue and without a rate limit, parking a payload until confirmed.
+        // Nothing collected them, so a client looping dry-runs grew the
+        // service's memory for as long as it ran.
+        use crate::ipc_handlers::mutation_token_store::MutationTokenStore;
+        let store = Arc::new(OperationStatusStore::default());
+        let tokens = Arc::new(MutationTokenStore::new());
+        tokens.issue(
+            crate::ipc_handlers::mutation_token_store::StoredMutation {
+                kind: crate::ipc_handlers::payloads::MutationKind::RulesUpdate,
+                payload: serde_json::json!({}),
+                correlation_id: None,
+                issuer_sid: "S-1-A".into(),
+                caller_is_elevated: false,
+            },
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(tokens.len(), 1);
+
+        let mut task =
+            build_operation_results_gc_task(Arc::clone(&store), Some(Arc::clone(&tokens)));
+        let stop = StopToken::new();
+        let _ = (task.tick)(&stop);
+        assert_eq!(tokens.len(), 0, "the expired token must be collected");
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //! cache only grows for hostnames a rule actually cares about (bounded;
 //! avoids caching every site the user visits).
 
-use std::collections::{HashMap, HashSet};
+use crate::bounded_set::BoundedRecentSet;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -33,14 +34,31 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::net_filter::{contains_fake_pool_addr, is_non_routable_v4};
 use crate::per_sid_orchestrator::RulesProvider;
 
+/// How many hostnames the "warn / purge once" memories keep.
+///
+/// Both are one-line-per-host guards against a tick that re-sees the same
+/// resolutions every few seconds, and both used to grow for the life of the
+/// process. Bounded and least-recently-seen first: an eviction means the host
+/// has not been seen in a long time, and the worst it costs is one repeated log
+/// line or one repeated census purge.
+const WARNED_HOSTS_CAP: usize = 4096;
+
 /// Returns the routing-active SID (Free single-active-user), or `None`.
 pub type ActiveSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// Outcome of consuming a batch of observations.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ConsumeSummary {
-    /// Observations whose hostname matched an active rule and were cached.
+    /// Rule-matching observations whose cached ENFORCEABLE address set actually
+    /// changed (new host, new/rotated IPs, or a stale entry back in the
+    /// confirmation window). Only these are progress: the recompute hook
+    /// re-derives routes + the full WFP filter set, and firing it for a pure
+    /// recency refresh kept that cycle running for as long as any rule site
+    /// stayed open in a browser.
     pub matched: u32,
+    /// Rule-matching observations upserted for recency only — the enforceable
+    /// address set is exactly what the codegen already sees. Not progress.
+    pub refreshed: u32,
     /// Observations discarded (no matching rule).
     pub ignored: u32,
     /// newly-detected collateral cases this
@@ -70,7 +88,7 @@ pub struct DnsObservationConsumer {
     /// Dedup keys (`"{direct_host}|{ip}"`) for collateral warnings already
     /// emitted this process lifetime, so the periodic observe tick does not
     /// re-warn the same victim/IP pair every few seconds.
-    collateral_warned: Mutex<HashSet<String>>,
+    collateral_warned: Mutex<BoundedRecentSet<String>>,
     /// OS resolver-cache reader used by [`seed_from_os_cache`]. Reads
     /// what the OS already resolved (hosts served from its cache never hit the
     /// wire, so the ETW observer misses them) and seeds the rule-matching ones.
@@ -123,7 +141,7 @@ pub struct DnsObservationConsumer {
     auto_rules: Option<Arc<crate::auto_rules::AutoRulesEngine>>,
     /// Hosts already dropped from the shared-IP census this process lifetime,
     /// so the purge runs once per host rather than on every observe tick.
-    census_purged: Mutex<HashSet<String>>,
+    census_purged: Mutex<BoundedRecentSet<String>>,
 }
 
 /// How long a reverse-confirmed `(hostname, ip)` pair suppresses identical
@@ -147,14 +165,14 @@ impl DnsObservationConsumer {
             cache,
             fqdn_lookup,
             active_sid,
-            collateral_warned: Mutex::new(HashSet::new()),
+            collateral_warned: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
             dns_cache_read: Arc::new(NoopDnsCacheRead),
             known_direct: None,
             fake_ip_running: Arc::new(|| false),
             secondary_usable: Arc::new(|| true),
             reverse_confirm_memo: Mutex::new(HashMap::new()),
             auto_rules: None,
-            census_purged: Mutex::new(HashSet::new()),
+            census_purged: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
         }
     }
 
@@ -339,9 +357,13 @@ impl DnsObservationConsumer {
                 );
             }
             if in_primary || in_secondary {
-                if self.upsert(&obs.hostname, &routable, now, StorageResolutionSource::Dns) {
-                    summary.matched = summary.matched.saturating_add(1);
-                }
+                self.upsert_counted(
+                    &obs.hostname,
+                    &routable,
+                    now,
+                    StorageResolutionSource::Dns,
+                    &mut summary,
+                );
             } else {
                 summary.ignored = summary.ignored.saturating_add(1);
             }
@@ -436,7 +458,8 @@ impl DnsObservationConsumer {
         self.collateral_warned
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(format!("{direct_host}|{ip}"))
+            .observe(format!("{direct_host}|{ip}"))
+            .is_new
     }
 
     fn is_pending_companion(&self, hostname: &str) -> bool {
@@ -453,7 +476,7 @@ impl DnsObservationConsumer {
             let Ok(mut purged) = self.census_purged.lock() else {
                 return;
             };
-            if !purged.insert(hostname.to_ascii_lowercase()) {
+            if !purged.observe(hostname.to_ascii_lowercase()).is_new {
                 return;
             }
         }
@@ -513,6 +536,39 @@ impl DnsObservationConsumer {
                 error = %e,
                 "record shared-IP direct-host census failed (heuristic only)",
             );
+        }
+    }
+
+    /// Upsert + classify: `matched` only when the ENFORCEABLE address set for
+    /// `hostname` changed, `refreshed` when the write merely renewed recency.
+    /// The before/after view is [`FqdnCacheLookup::ips_for_hostname`] — the
+    /// same confirmation-window read the codegen consumes — so "changed" means
+    /// exactly "the next recompute would derive something different".
+    fn upsert_counted(
+        &self,
+        hostname: &str,
+        ips: &[Ipv4Addr],
+        now: SystemTime,
+        source: StorageResolutionSource,
+        summary: &mut ConsumeSummary,
+    ) {
+        let before: std::collections::HashSet<Ipv4Addr> = self
+            .fqdn_lookup
+            .ips_for_hostname(hostname)
+            .into_iter()
+            .collect();
+        if !self.upsert(hostname, ips, now, source) {
+            return;
+        }
+        let after: std::collections::HashSet<Ipv4Addr> = self
+            .fqdn_lookup
+            .ips_for_hostname(hostname)
+            .into_iter()
+            .collect();
+        if after == before {
+            summary.refreshed = summary.refreshed.saturating_add(1);
+        } else {
+            summary.matched = summary.matched.saturating_add(1);
         }
     }
 
@@ -598,19 +654,19 @@ impl DnsObservationConsumer {
                 summary.ignored = summary.ignored.saturating_add(1);
                 continue;
             }
-            if self.upsert(
+            self.upsert_counted(
                 &entry.canonical_hostname,
                 &routable,
                 now,
                 StorageResolutionSource::OsCacheSeed,
-            ) {
-                summary.matched = summary.matched.saturating_add(1);
-            }
+                &mut summary,
+            );
         }
         if summary.matched > 0 {
             tracing::info!(
                 target: "nrr::dns-observe",
                 matched = summary.matched,
+                refreshed = summary.refreshed,
                 ignored = summary.ignored,
                 "seeded FQDN cache from OS resolver cache (rule-matching hosts the observer missed)",
             );
@@ -1293,6 +1349,57 @@ mod tests {
             lookup.ips_for_hostname("site.example.ru"),
             vec![Ipv4Addr::new(5, 5, 5, 5)]
         );
+    }
+
+    #[test]
+    fn re_observing_an_unchanged_host_is_refresh_not_progress() {
+        let (cache, lookup) = in_memory_cache();
+        let c = consumer(
+            vec![zone_rule("r1", "ru")],
+            Arc::clone(&cache),
+            Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+            active_sid("S-A"),
+        );
+        let first = c.consume(&[obs("site.example.ru", [5, 5, 5, 5])], SystemTime::now());
+        assert_eq!(first.matched, 1);
+        assert_eq!(first.refreshed, 0);
+        // Same host, same address: recency is renewed but the enforceable set
+        // is untouched — the recompute hook must stay silent, else an open
+        // rule site keeps the full route/WFP re-derivation cycling forever.
+        let second = c.consume(&[obs("site.example.ru", [5, 5, 5, 5])], SystemTime::now());
+        assert_eq!(second.matched, 0);
+        assert_eq!(second.refreshed, 1);
+        assert!(!second.made_progress());
+        // A new address IS progress — the codegen now derives a different set.
+        let third = c.consume(&[obs("site.example.ru", [6, 6, 6, 6])], SystemTime::now());
+        assert_eq!(third.matched, 1);
+        assert!(third.made_progress());
+    }
+
+    #[test]
+    fn re_seeding_unchanged_os_cache_entries_is_not_progress() {
+        use nrr_platform_api::dns::{MockDnsCacheRead, OsCachedResolution};
+        let (cache, lookup) = in_memory_cache();
+        let reader = Arc::new(MockDnsCacheRead::new());
+        reader.set_entries(vec![OsCachedResolution {
+            canonical_hostname: "avito.ru".into(),
+            addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
+        }]);
+        let c = consumer(
+            vec![zone_rule("r1", "ru")],
+            Arc::clone(&cache),
+            Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+            active_sid("S-A"),
+        )
+        .with_dns_cache_read(reader);
+        let first = c.seed_from_os_cache(SystemTime::now());
+        assert_eq!(first.matched, 1);
+        // The OS cache is re-read whole every seed tick; an unchanged snapshot
+        // must not re-fire the recompute hook every 30 s.
+        let second = c.seed_from_os_cache(SystemTime::now());
+        assert_eq!(second.matched, 0);
+        assert_eq!(second.refreshed, 1);
+        assert!(!second.made_progress());
     }
 
     #[test]

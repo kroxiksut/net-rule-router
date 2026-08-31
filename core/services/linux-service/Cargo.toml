@@ -42,9 +42,10 @@ nrr-platform-api = { path = "../../platform/api" }
 nrr-service-runtime = { path = "../service-runtime" }
 # Needed to construct the production `StorageProfile` for the bootstrap config.
 nrr-storage = { path = "../../storage" }
-# Wire codec (length-prefixed JSON frames) — the single source of truth shared
-# with the client (`nrr-ipc-client`).
-nrr-ipc-client = { path = "../../ipc-client" }
+# NOTE: no `nrr-ipc-client` here. The wire codec it used to provide moved to
+# `nrr-shared`, where both ends of the protocol reach it — a server has no
+# business depending on the client, and that edge carried the UI and preview
+# crates into the daemon.
 # Retention policies and the cleanup scope the supervised runtime's diagnostics
 # jobs take as inputs.
 nrr-diagnostics = { path = "../../diagnostics" }

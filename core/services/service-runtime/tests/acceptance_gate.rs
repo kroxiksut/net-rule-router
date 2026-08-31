@@ -329,6 +329,41 @@ fn ipc_mutation_from_unprivileged_client_is_forbidden() {
     );
 }
 
+/// The catalogue says which surfaces may invoke an operation, and that used to
+/// be a note nobody read: the tray could call every operation marked GUI-only.
+#[test]
+fn a_gui_only_operation_is_refused_to_the_tray() {
+    let router = make_router();
+    let mut req = read_req();
+    // Read-only, and GUI-only in the catalogue: the class check would let it
+    // through, so only the per-operation check can refuse it.
+    req.operation = IpcOperationName::ThirdPartyComponentsList;
+    req.operation_class = IpcOperationClass::ReadSnapshot;
+    let resp = router.dispatch(req, unprivileged_tray());
+    assert!(!resp.ok, "a GUI-only operation must not answer the tray");
+    assert_eq!(resp.error.expect("error").code, IpcErrorCode::Forbidden);
+}
+
+/// …and what the tray genuinely needs stays open to it. Enforcing the field as
+/// written would have silenced push events, which is how the tray shows state.
+#[test]
+fn the_tray_may_still_subscribe_to_push_events() {
+    let router = make_router();
+    let mut req = read_req();
+    req.operation = IpcOperationName::StatusUpdatesSubscribe;
+    req.operation_class = IpcOperationClass::ReadSnapshot;
+    let resp = router.dispatch(req, unprivileged_tray());
+    let refused_by_profile = resp
+        .error
+        .as_ref()
+        .is_some_and(|e| e.code == IpcErrorCode::Forbidden);
+    assert!(
+        !refused_by_profile,
+        "the tray must keep its push subscription: {:?}",
+        resp.error
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Gate 6: GUI/tray can reconnect (stateless IPC router)
 //

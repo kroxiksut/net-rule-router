@@ -55,12 +55,24 @@ use crate::wire::{read_frame, write_frame, WireError};
 /// Capacity of the per-request channel between caller threads and the worker.
 const REQUEST_CHANNEL_CAPACITY: usize = 32;
 
+/// Hard ceiling on one response read — the Unix twin of the Windows client's
+/// deadline. Above the slowest operation the service admits (a mutation
+/// budgets 30 s): it ends waits that will never be answered, not slow ones.
+const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
 // ── Public client ────────────────────────────────────────────────────────────
 
 /// Sync `AF_UNIX` IPC client. Cheap to clone — state lives behind `Arc`.
 #[derive(Clone)]
 pub struct UnixIpcClient {
     inner: Arc<ClientInner>,
+    /// Held only by client handles, so its strong count counts USERS — see
+    /// [`ClientLifetime`].
+    #[allow(
+        dead_code,
+        reason = "held for its Drop: ends the worker with the last handle"
+    )]
+    lifetime: Arc<ClientLifetime>,
 }
 
 impl UnixIpcClient {
@@ -87,7 +99,10 @@ impl UnixIpcClient {
         if let Ok(mut g) = inner.worker_handle.lock() {
             *g = Some(handle);
         }
-        Self { inner }
+        let lifetime = Arc::new(ClientLifetime {
+            inner: Arc::clone(&inner),
+        });
+        Self { inner, lifetime }
     }
 
     /// Current connection status. Cheap RwLock read.
@@ -116,13 +131,19 @@ impl UnixIpcClient {
         let envelope = build_request_envelope(operation, &request_id, payload);
 
         let (tx, rx) = sync_channel::<RequestResponse>(1);
+        let abandoned = Arc::new(AtomicBool::new(false));
         let pending = PendingRequest {
             envelope,
             response_tx: tx,
+            abandoned: Arc::clone(&abandoned),
         };
 
-        if self.inner.request_tx.try_send(pending).is_err() {
-            return Err(IpcClientError::Disconnected);
+        // A full queue is a busy client, not a dead one — see the Windows twin.
+        if let Err(e) = self.inner.request_tx.try_send(pending) {
+            return Err(match e {
+                std::sync::mpsc::TrySendError::Full(_) => IpcClientError::Timeout,
+                std::sync::mpsc::TrySendError::Disconnected(_) => IpcClientError::Disconnected,
+            });
         }
 
         match rx.recv_timeout(timeout) {
@@ -132,7 +153,10 @@ impl UnixIpcClient {
             }
             Ok(RequestResponse::BadResponse(reason)) => Err(IpcClientError::BadResponse { reason }),
             Ok(RequestResponse::Disconnected) => Err(IpcClientError::Disconnected),
-            Err(RecvTimeoutError::Timeout) => Err(IpcClientError::Timeout),
+            Err(RecvTimeoutError::Timeout) => {
+                abandoned.store(true, Ordering::SeqCst);
+                Err(IpcClientError::Timeout)
+            }
             Err(RecvTimeoutError::Disconnected) => Err(IpcClientError::ClientShutdown),
         }
     }
@@ -192,17 +216,29 @@ impl crate::connection::IpcClient for UnixIpcClient {
     fn negotiate_info(&self) -> Option<NegotiateInfo> {
         Self::negotiate_info(self)
     }
+
+    fn active_subscription_id(&self) -> Option<String> {
+        self.inner
+            .subscription_id
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+    }
 }
 
-impl Drop for UnixIpcClient {
+/// Shuts the worker down when the last client handle goes away. The Windows
+/// twin carries the same type for the same reason: counting `inner` could
+/// never reach one, because the worker holds an `Arc<ClientInner>` of its own.
+struct ClientLifetime {
+    inner: Arc<ClientInner>,
+}
+
+impl Drop for ClientLifetime {
     fn drop(&mut self) {
-        // Only the *last* Arc holder triggers shutdown + join.
-        if Arc::strong_count(&self.inner) == 1 {
-            self.shutdown();
-            if let Ok(mut g) = self.inner.worker_handle.lock() {
-                if let Some(h) = g.take() {
-                    let _ = h.join();
-                }
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        if let Ok(mut g) = self.inner.worker_handle.lock() {
+            if let Some(h) = g.take() {
+                let _ = h.join();
             }
         }
     }
@@ -215,10 +251,21 @@ struct ClientInner {
     status: RwLock<ConnectionStatus>,
     request_tx: SyncSender<PendingRequest>,
     request_rx: Mutex<Option<Receiver<PendingRequest>>>,
-    shutdown: AtomicBool,
+    /// `Arc` because the timed stream watches it while blocked in a read —
+    /// that is what makes shutdown prompt on a connection gone quiet.
+    shutdown: Arc<AtomicBool>,
     force_reconnect: AtomicBool,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     push_tx: Mutex<Option<SyncSender<Value>>>,
+    /// A push frame was dropped because the subscriber's channel was full —
+    /// see the Windows twin.
+    push_gap: AtomicBool,
+    /// Id the SERVICE currently knows this client's subscription by. A
+    /// reconnect re-subscribes and is handed a fresh one, so anything that
+    /// labels forwarded frames has to re-read it. Windows tracked this from
+    /// the start; without it the launcher stamped every Linux push with the
+    /// id captured when the forwarder started.
+    subscription_id: Mutex<Option<String>>,
     negotiate_info: RwLock<Option<NegotiateInfo>>,
     /// Envelope of the last accepted status subscription, replayed after a
     /// reconnect. A subscription belongs to the socket connection, so a caller
@@ -240,10 +287,12 @@ impl ClientInner {
             }),
             request_tx: tx,
             request_rx: Mutex::new(Some(rx)),
-            shutdown: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
             force_reconnect: AtomicBool::new(false),
             worker_handle: Mutex::new(None),
             push_tx: Mutex::new(None),
+            push_gap: AtomicBool::new(false),
+            subscription_id: Mutex::new(None),
             negotiate_info: RwLock::new(None),
             last_subscribe: Mutex::new(None),
             replay_seq: AtomicU64::new(0),
@@ -260,6 +309,8 @@ impl ClientInner {
 struct PendingRequest {
     envelope: Value,
     response_tx: SyncSender<RequestResponse>,
+    /// Raised by the caller when it stops waiting — see the Windows twin.
+    abandoned: Arc<AtomicBool>,
 }
 
 // ── Worker loop ──────────────────────────────────────────────────────────────
@@ -277,13 +328,32 @@ fn worker_loop(inner: Arc<ClientInner>) {
 
     while !inner.shutdown.load(Ordering::SeqCst) {
         inner.set_status(ConnectionStatus::Connecting);
-        let mut stream = match transport_unix::connect_to(&inner.endpoint) {
+        let stream = match transport_unix::connect_to(&inner.endpoint) {
             Ok(s) => s,
             Err(e) => {
                 // No SCM probe on Linux — the service is a systemd unit. Just
                 // back off and retry; systemd owns start/stop.
                 inner.set_status(ConnectionStatus::Disconnected {
                     last_error: format!("connect failed: {e}"),
+                });
+                let delay = backoff.next_delay();
+                sleep_observing_shutdown(&inner, delay);
+                continue;
+            }
+        };
+
+        // A read must not wait forever: a service that accepts the connection
+        // and then answers nothing would otherwise park this worker for the
+        // life of the process, with the status still reading `Connected`.
+        let mut stream = match transport_unix::TimedStream::new(
+            stream,
+            Arc::clone(&inner.shutdown),
+            RESPONSE_READ_TIMEOUT,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                inner.set_status(ConnectionStatus::Disconnected {
+                    last_error: format!("set read timeout: {e}"),
                 });
                 let delay = backoff.next_delay();
                 sleep_observing_shutdown(&inner, delay);
@@ -339,10 +409,10 @@ fn worker_loop(inner: Arc<ClientInner>) {
     }
 }
 
-fn serve_requests(
+fn serve_requests<S: Read + Write + IdleDrain>(
     inner: &Arc<ClientInner>,
     request_rx: &Receiver<PendingRequest>,
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut S,
 ) {
     // A subscription lives and dies with the socket connection, so the side
     // that owns reconnect owns restoring it — callers subscribe once.
@@ -362,7 +432,17 @@ fn serve_requests(
         // force-reconnect while idle.
         let pending = match request_rx.recv_timeout(Duration::from_millis(200)) {
             Ok(p) => p,
-            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle tick: a subscriber's push frames arrive whenever the
+                // service decides, not when we happen to be mid-request. The
+                // Windows client has always drained them here; on Linux they
+                // sat unread until the next call, so a client that subscribed
+                // and went quiet (the tray does exactly that) saw nothing.
+                if !stream.drain_idle(inner) {
+                    break;
+                }
+                continue;
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
@@ -374,14 +454,33 @@ fn serve_requests(
             .unwrap_or("")
             .to_string();
 
+        // The caller may have given up while this sat in the queue; sending it
+        // now would apply a change nobody is waiting for.
+        if pending.abandoned.load(Ordering::SeqCst) {
+            continue;
+        }
+
         let push = |frame: &Value| route_push_frame(inner, frame, "inline");
 
         match exchange(stream, &pending.envelope, &request_id, &push) {
             Ok(resp) => {
-                if matches!(resp, RequestResponse::Ok(_)) {
+                if let RequestResponse::Ok(ref payload) = resp {
                     remember_subscription(inner, &pending.envelope);
+                    if is_subscribe_envelope(&pending.envelope) {
+                        remember_subscription_id(inner, &serde_json::json!({ "payload": payload }));
+                    }
                 }
                 let _ = pending.response_tx.send(resp);
+            }
+            Err(e) if !e.is_transport_dead() => {
+                // The codec refused the request (oversized payload, say); it
+                // never reached the socket, so the connection is fine and the
+                // caller must hear what actually happened.
+                let _ = pending
+                    .response_tx
+                    .send(RequestResponse::BadResponse(format!(
+                        "request rejected: {e}"
+                    )));
             }
             Err(e) => {
                 // Transport dead — fail this request and break to reconnect.
@@ -394,6 +493,67 @@ fn serve_requests(
         }
     }
 }
+
+/// Draining server-initiated frames while idle.
+///
+/// Only the timed stream can do this without blocking, and only it is used in
+/// production; the plain `UnixStream` the unit tests drive has nothing to
+/// drain, so it answers "still alive" and moves on.
+trait IdleDrain {
+    fn drain_idle(&mut self, inner: &Arc<ClientInner>) -> bool;
+}
+
+impl IdleDrain for transport_unix::TimedStream {
+    fn drain_idle(&mut self, inner: &Arc<ClientInner>) -> bool {
+        drain_push_frames(inner, self)
+    }
+}
+
+#[cfg(test)]
+impl IdleDrain for std::os::unix::net::UnixStream {
+    fn drain_idle(&mut self, _inner: &Arc<ClientInner>) -> bool {
+        true
+    }
+}
+
+/// Read whatever server-initiated frames are already waiting, without
+/// committing to a long block. Returns `false` when the transport died and the
+/// caller must reconnect.
+///
+/// The probe window bounds only the wait for the first byte — see
+/// [`TimedStream::begin_probe`]. Anything with a `request-id` here belongs to
+/// no in-flight request, so it is logged and dropped.
+fn drain_push_frames(inner: &Arc<ClientInner>, stream: &mut transport_unix::TimedStream) -> bool {
+    stream.begin_probe(PUSH_PROBE_WINDOW);
+    let alive = loop {
+        match read_frame::<_, Value>(stream) {
+            Ok(frame) => {
+                let has_id = frame
+                    .get("request-id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if has_id {
+                    eprintln!("nrr-ipc-client(unix): discarding idle frame with a request_id");
+                } else if crate::protocol::is_server_refusal(&frame) {
+                    eprintln!("nrr-ipc-client(unix): service refused while idle");
+                    break false;
+                } else {
+                    route_push_frame(inner, &frame, "idle");
+                }
+                stream.begin_probe(PUSH_PROBE_WINDOW);
+            }
+            Err(WireError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => break true,
+            Err(_) => break false,
+        }
+    };
+    stream.end_probe();
+    alive
+}
+
+/// How long an idle tick waits for a push frame to start arriving. Short: the
+/// tick repeats every 200 ms anyway, and a longer wait would delay the next
+/// outgoing request by exactly that much.
+const PUSH_PROBE_WINDOW: Duration = Duration::from_millis(20);
 
 // ── Transport-generic frame exchanges ────────────────────────────────────────
 //
@@ -420,6 +580,7 @@ fn exchange<S: Read + Write>(
     request_id: &str,
     push: &dyn Fn(&Value),
 ) -> Result<RequestResponse, WireError> {
+    let op = crate::protocol::envelope_operation(envelope);
     write_frame(stream, envelope)?;
     loop {
         let frame: Value = read_frame(stream)?;
@@ -429,13 +590,18 @@ fn exchange<S: Read + Write>(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if frame_request_id.is_empty() {
+            // A refusal the server issues before it knows our request id is
+            // this call's answer — see `is_server_refusal`.
+            if crate::protocol::is_server_refusal(&frame) {
+                return Ok(parse_response(&frame, op));
+            }
             // Server-initiated frame; the whole frame goes to the router so a
             // payload-less one is reported rather than vanishing here.
             push(&frame);
             continue;
         }
         if frame_request_id == request_id {
-            return Ok(parse_response(&frame));
+            return Ok(parse_response(&frame, op));
         }
         // Mismatched request_id on a single-in-flight socket — log and skip.
         eprintln!(
@@ -449,17 +615,40 @@ fn exchange<S: Read + Write>(
 /// Remember an accepted subscription request so it can be replayed on the next
 /// connection. Only the subscribe operation is remembered; every other accepted
 /// request is stateless from the connection's point of view.
-fn remember_subscription(inner: &Arc<ClientInner>, envelope: &Value) {
-    let is_subscribe = envelope
+fn is_subscribe_envelope(envelope: &Value) -> bool {
+    envelope
         .get("operation")
         .and_then(|v| v.as_str())
         .map(|op| op == IpcOperationName::StatusUpdatesSubscribe.slug())
-        .unwrap_or(false);
-    if !is_subscribe {
+        .unwrap_or(false)
+}
+
+fn remember_subscription(inner: &Arc<ClientInner>, envelope: &Value) {
+    if !is_subscribe_envelope(envelope) {
         return;
     }
     if let Ok(mut g) = inner.last_subscribe.lock() {
         *g = Some(envelope.clone());
+    }
+}
+
+/// Record the id the service handed back for a subscribe. The Windows twin
+/// does the same; both re-read it after every reconnect rather than caching
+/// the first one.
+fn remember_subscription_id(inner: &Arc<ClientInner>, frame: &Value) {
+    let id = frame
+        .get("payload")
+        .and_then(|p| {
+            p.get("subscription-id")
+                .or_else(|| p.get("subscription_id"))
+        })
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if id.is_none() {
+        return;
+    }
+    if let Ok(mut g) = inner.subscription_id.lock() {
+        *g = id;
     }
 }
 
@@ -498,7 +687,10 @@ fn replay_subscription<S: Read + Write>(inner: &Arc<ClientInner>, stream: &mut S
     // exactly what `exchange` already does for a caller request.
     let push = |frame: &Value| route_push_frame(inner, frame, "resubscribe");
     match exchange(stream, &replay, &request_id, &push) {
-        Ok(RequestResponse::Ok(_)) => {
+        Ok(RequestResponse::Ok(payload)) => {
+            // The service allocated a NEW subscription for this connection;
+            // the id from the caller's original subscribe is dead.
+            remember_subscription_id(inner, &serde_json::json!({ "payload": payload }));
             eprintln!("nrr-ipc-client(unix): resubscribed after reconnect (id={request_id})");
             true
         }
@@ -543,9 +735,22 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
         eprintln!("nrr-ipc-client(unix): push {event_type} discarded — nobody subscribed");
         return;
     };
+    // A dropped frame is a hole in the event stream, and the subscriber has no
+    // way of knowing it. Announce the hole once, so the GUI can re-read the
+    // snapshots it would otherwise keep rendering from stale pushes.
+    if inner.push_gap.swap(false, Ordering::SeqCst) {
+        let gap = serde_json::json!({ "event": { "type": "push-gap" } });
+        if tx.try_send(gap).is_err() {
+            // Still full — keep the debt and try again with the next frame.
+            inner.push_gap.store(true, Ordering::SeqCst);
+        }
+    }
     match tx.try_send(payload) {
         Ok(()) => eprintln!("nrr-ipc-client(unix): push {event_type} delivered (source={source})"),
-        Err(e) => eprintln!("nrr-ipc-client(unix): push {event_type} dropped — channel full ({e})"),
+        Err(e) => {
+            eprintln!("nrr-ipc-client(unix): push {event_type} dropped — channel full ({e})");
+            inner.push_gap.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -612,6 +817,7 @@ mod tests {
                 "ok": true,
                 "payload": {
                     "server-version": 1,
+                    "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
                     "service-version": "test-1.0",
                     "session-id": "sess-1",
                 }
@@ -655,6 +861,328 @@ mod tests {
         }
         assert_eq!(pushed.lock().expect("lock").len(), 1);
         server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn dropping_the_last_handle_stops_the_worker() {
+        // The old `Arc::strong_count(&inner) == 1` test could never be true —
+        // the worker holds an `inner` of its own — so the client leaked a
+        // thread and a socket per `start()`. Watch `inner` directly.
+        let sock = temp_sock_path();
+        let client = UnixIpcClient::start_at(sock.0.clone());
+        let inner = Arc::clone(&client.inner);
+        let second = client.clone();
+        drop(client);
+        assert!(
+            !inner.shutdown.load(Ordering::SeqCst),
+            "a surviving handle must keep the worker running"
+        );
+        drop(second);
+        assert!(
+            inner.shutdown.load(Ordering::SeqCst),
+            "worker was told to stop"
+        );
+        assert!(
+            inner
+                .worker_handle
+                .lock()
+                .expect("worker handle lock")
+                .is_none(),
+            "the worker thread was joined"
+        );
+    }
+
+    #[test]
+    fn an_id_less_refusal_answers_the_caller_instead_of_going_to_push() {
+        // What the server sends when it refuses before reading the request:
+        // no request-id, ok=false, a typed error. The caller must get it.
+        let (mut client, mut server) = UnixStream::pair().expect("socketpair");
+        let server_thread = thread::spawn(move || {
+            let _req: Value = read_frame(&mut server).expect("server read");
+            let refusal = serde_json::json!({
+                "request-id": "",
+                "ok": false,
+                "error": { "code": "forbidden", "message": "client rejected" }
+            });
+            write_frame(&mut server, &refusal).expect("server refusal");
+        });
+
+        let envelope = serde_json::json!({ "request-id": "req-9", "operation": "x" });
+        let pushed = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let pushed_c = Arc::clone(&pushed);
+        let sink = move |v: &Value| pushed_c.lock().expect("lock").push(v.clone());
+
+        let resp = exchange(&mut client, &envelope, "req-9", &sink).expect("exchange");
+        match resp {
+            RequestResponse::ServerError { code, .. } => {
+                assert_eq!(code, nrr_shared::ipc_transport::IpcErrorCode::Forbidden);
+            }
+            _ => panic!("expected ServerError"),
+        }
+        assert!(
+            pushed.lock().expect("lock").is_empty(),
+            "a refusal must not reach the push channel"
+        );
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn the_subscription_id_follows_the_service_across_a_reconnect() {
+        // Windows tracked this; on Linux the launcher stamped every forwarded
+        // frame with the id captured when the forwarder started, which the
+        // service stops recognising after a reconnect.
+        let sock = temp_sock_path();
+        let listener = UnixListener::bind(&sock.0).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = spawn_stub_server(listener, Arc::clone(&stop));
+
+        let client = UnixIpcClient::start_at(sock.0.clone());
+        let _rx = client.subscribe_push();
+        assert!(
+            wait_until(Duration::from_secs(3), || client
+                .connection_status()
+                .is_connected()),
+            "client never reached Connected"
+        );
+        let resp = client.call(
+            IpcOperationName::StatusUpdatesSubscribe,
+            serde_json::json!({}),
+            Duration::from_secs(2),
+        );
+        assert!(resp.is_ok(), "stub answers subscribe");
+        assert_eq!(
+            crate::connection::IpcClient::active_subscription_id(&client),
+            Some("stub-subscription".to_string())
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        client.shutdown();
+        drop(client);
+        let _ = server.join();
+    }
+
+    #[test]
+    fn a_dropped_push_is_announced_as_a_gap() {
+        // A hole in the event stream the subscriber cannot see is worse than a
+        // late refresh: the GUI keeps rendering from state that stopped being
+        // updated.
+        let inner = Arc::new(ClientInner::new(PathBuf::from("/nonexistent.sock")));
+        let (push_tx, push_rx) = sync_channel::<Value>(2);
+        *inner.push_tx.lock().expect("push lock") = Some(push_tx);
+
+        let frame = |t: &str| {
+            serde_json::json!({
+                "request-id": "",
+                "ok": true,
+                "payload": { "event": { "type": t } }
+            })
+        };
+        route_push_frame(&inner, &frame("first"), "test");
+        route_push_frame(&inner, &frame("second"), "test");
+        // Third one has nowhere to go.
+        route_push_frame(&inner, &frame("third"), "test");
+        assert!(
+            inner.push_gap.load(Ordering::SeqCst),
+            "the drop is remembered"
+        );
+
+        // Drain, then deliver again: the gap is announced ahead of the frame.
+        assert_eq!(
+            push_rx.recv().expect("first push")["event"]["type"],
+            "first"
+        );
+        assert_eq!(
+            push_rx.recv().expect("second push")["event"]["type"],
+            "second"
+        );
+        route_push_frame(&inner, &frame("fourth"), "test");
+        let gap = push_rx.recv().expect("gap announcement");
+        assert_eq!(gap["event"]["type"], "push-gap");
+        assert_eq!(
+            push_rx.recv().expect("fourth push")["event"]["type"],
+            "fourth"
+        );
+        assert!(
+            !inner.push_gap.load(Ordering::SeqCst),
+            "the debt is settled"
+        );
+    }
+
+    #[test]
+    fn push_frames_are_drained_while_the_client_is_idle() {
+        // The Windows client always did this; on Linux a subscriber that went
+        // quiet received nothing until its next call.
+        let inner = Arc::new(ClientInner::new(PathBuf::from("/nonexistent.sock")));
+        let (push_tx, push_rx) = sync_channel::<Value>(4);
+        *inner.push_tx.lock().expect("push lock") = Some(push_tx);
+
+        let (client_side, mut server_side) = UnixStream::pair().expect("socketpair");
+        let mut timed = transport_unix::TimedStream::new(
+            client_side,
+            Arc::clone(&inner.shutdown),
+            Duration::from_secs(5),
+        )
+        .expect("wrap stream");
+
+        let push = serde_json::json!({
+            "request-id": "",
+            "ok": true,
+            "payload": { "event": { "type": "adapters-changed" } }
+        });
+        write_frame(&mut server_side, &push).expect("server push");
+
+        assert!(
+            drain_push_frames(&inner, &mut timed),
+            "transport stays alive"
+        );
+        let delivered = push_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("push delivered");
+        assert_eq!(delivered["event"]["type"], "adapters-changed");
+
+        // A second drain with nothing waiting must return promptly and keep
+        // the connection.
+        assert!(drain_push_frames(&inner, &mut timed));
+    }
+
+    #[test]
+    fn a_request_abandoned_while_queued_is_never_sent() {
+        // The caller timed out while this sat behind a slow one. Writing it now
+        // would apply a change nobody is waiting for — and for a mutation that
+        // is the same policy applied twice.
+        let inner = Arc::new(ClientInner::new(PathBuf::from("/nonexistent.sock")));
+        let request_rx = inner
+            .request_rx
+            .lock()
+            .expect("rx lock")
+            .take()
+            .expect("receiver");
+
+        let (client_side, mut server_side) = UnixStream::pair().expect("socketpair");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_c = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            while let Ok(frame) = read_frame::<_, Value>(&mut server_side) {
+                let rid = frame["request-id"].as_str().unwrap_or("").to_string();
+                seen_c.lock().expect("lock").push(rid.clone());
+                let resp = serde_json::json!({ "ok": true, "request-id": rid, "payload": {} });
+                if write_frame(&mut server_side, &resp).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let queue = |rid: &str, abandoned: bool| {
+            let (tx, _rx) = sync_channel::<RequestResponse>(1);
+            inner
+                .request_tx
+                .send(PendingRequest {
+                    envelope: serde_json::json!({ "request-id": rid, "operation": "x" }),
+                    response_tx: tx,
+                    abandoned: Arc::new(AtomicBool::new(abandoned)),
+                })
+                .expect("queue request");
+        };
+        queue("req-abandoned", true);
+        queue("req-live", false);
+        // `inner` owns the sender, so the queue never closes on its own — stop
+        // the loop the way the client does.
+        let stop = Arc::clone(&inner.shutdown);
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            stop.store(true, Ordering::SeqCst);
+        });
+
+        let mut stream = client_side;
+        serve_requests(&inner, &request_rx, &mut stream);
+        stopper.join().expect("stopper thread");
+        drop(stream);
+        server.join().expect("server thread");
+
+        let seen = seen.lock().expect("lock").clone();
+        assert_eq!(seen, vec!["req-live".to_string()]);
+    }
+
+    #[test]
+    fn an_oversized_request_is_refused_without_killing_the_connection() {
+        // The codec rejects it before a byte reaches the socket, so the pipe is
+        // fine — reporting `Disconnected` and reconnecting fixed nothing and
+        // hid the real reason from the caller.
+        let inner = Arc::new(ClientInner::new(PathBuf::from("/nonexistent.sock")));
+        let request_rx = inner
+            .request_rx
+            .lock()
+            .expect("rx lock")
+            .take()
+            .expect("receiver");
+
+        let (client_side, mut server_side) = UnixStream::pair().expect("socketpair");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_c = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            while let Ok(frame) = read_frame::<_, Value>(&mut server_side) {
+                let rid = frame["request-id"].as_str().unwrap_or("").to_string();
+                seen_c.lock().expect("lock").push(rid.clone());
+                let resp = serde_json::json!({ "ok": true, "request-id": rid, "payload": {} });
+                if write_frame(&mut server_side, &resp).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let (big_tx, big_rx) = sync_channel::<RequestResponse>(1);
+        inner
+            .request_tx
+            .send(PendingRequest {
+                envelope: serde_json::json!({
+                    "request-id": "req-big",
+                    "operation": "x",
+                    "payload": { "blob": "x".repeat(2 * 1024 * 1024) },
+                }),
+                response_tx: big_tx,
+                abandoned: Arc::new(AtomicBool::new(false)),
+            })
+            .expect("queue big");
+        let (small_tx, small_rx) = sync_channel::<RequestResponse>(1);
+        inner
+            .request_tx
+            .send(PendingRequest {
+                envelope: serde_json::json!({ "request-id": "req-small", "operation": "x" }),
+                response_tx: small_tx,
+                abandoned: Arc::new(AtomicBool::new(false)),
+            })
+            .expect("queue small");
+
+        let stop = Arc::clone(&inner.shutdown);
+        let stopper = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            stop.store(true, Ordering::SeqCst);
+        });
+
+        let mut stream = client_side;
+        serve_requests(&inner, &request_rx, &mut stream);
+        stopper.join().expect("stopper thread");
+        drop(stream);
+        server.join().expect("server thread");
+
+        assert!(
+            matches!(
+                big_rx.recv_timeout(Duration::from_millis(100)),
+                Ok(RequestResponse::BadResponse(_))
+            ),
+            "the caller must learn the request was rejected, not that the link died"
+        );
+        assert!(
+            matches!(
+                small_rx.recv_timeout(Duration::from_millis(100)),
+                Ok(RequestResponse::Ok(_))
+            ),
+            "the connection must survive and serve the next request"
+        );
+        assert_eq!(
+            seen.lock().expect("lock").clone(),
+            vec!["req-small".to_string()]
+        );
     }
 
     // ── End-to-end client against a stub listener ────────────────────────────
@@ -726,6 +1254,7 @@ mod tests {
                         subscribes.fetch_add(1, Ordering::SeqCst);
                         let push = serde_json::json!({
                             "request-id": "",
+                            "ok": true,
                             "payload": { "event": { "type": "stub-status-update" } }
                         });
                         if write_frame(&mut conn, &push).is_err() {
@@ -734,12 +1263,25 @@ mod tests {
                     }
                     let resp = if op == "contract.negotiate" {
                         serde_json::json!({
+                                "ok": true,
+                                "request-id": rid,
+                                "payload": {
+                                    "server-version": 1,
+                        "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                                    "service-version": "stub",
+                                    "session-id": "stub-session",
+                                }
+                            })
+                    } else if op == IpcOperationName::StatusUpdatesSubscribe.slug() {
+                        // Answer like the service does: the ack carries the id
+                        // the subscription is known by from now on.
+                        serde_json::json!({
                             "ok": true,
                             "request-id": rid,
                             "payload": {
-                                "server-version": 1,
-                                "service-version": "stub",
-                                "session-id": "stub-session",
+                                "subscription-id": "stub-subscription",
+                                "current-event-id": 0,
+                                "gap-detected": false,
                             }
                         })
                     } else {

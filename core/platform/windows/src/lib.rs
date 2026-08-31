@@ -41,7 +41,6 @@
 
 pub mod adapters;
 pub mod app_path_resolver;
-pub mod apply;
 pub mod autostart;
 #[cfg(feature = "browser-stub")]
 pub mod browser_stub;
@@ -50,6 +49,10 @@ pub mod constants;
 pub mod dns;
 pub mod dns_observe;
 pub mod dns_redirect;
+// One-shot UAC elevation of a single command, for the administrative console.
+// The session-long privileged channel the GUI uses is a different mechanism and
+// lives in `apps/desktop/broker`.
+pub mod elevation;
 pub mod error;
 // Operator-facing Windows event log (install-time source registration + the
 // runtime sink behind `SystemEventLogPort`).
@@ -84,7 +87,6 @@ pub mod path_registration;
 /// process started by another process stops writing into its parent's log.
 pub mod process_error_stream;
 pub mod reachability;
-pub mod rollback;
 pub mod routing;
 // SCM mechanism behind `nrr_platform_api::service_control::ServiceControlPort`.
 // Windows-only: the module talks to the Service Control Manager.
@@ -94,7 +96,6 @@ pub mod service_control;
 // `nrr_platform_api::single_instance::SingleInstancePort`.
 #[cfg(windows)]
 pub mod single_instance;
-pub mod snapshot;
 // Fake-IP mechanism behind `nrr_platform_api::fake_ip::stale_flows::StaleFlowReset`:
 // tears down TCP flows a restart left pointing at now-dead fake addresses.
 pub mod stale_flows;
@@ -102,8 +103,9 @@ pub mod strategy;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
 pub mod local_time;
 pub mod system_info;
+/// Windows implementation of the system light/dark probe.
+pub mod system_theme;
 pub mod types;
-pub mod verify;
 // Windows VPN-client discovery (processes + Uninstall registry).
 // `#![cfg(target_os = "windows")]` inside the module file.
 pub mod vpn_discovery;
@@ -130,7 +132,6 @@ pub use app_group_discovery::WindowsAppGroupDiscovery;
 #[cfg(target_os = "windows")]
 pub use app_path_resolver::WindowsAppPathResolver;
 pub use app_path_resolver::{AppPathResolver, MockAppPathResolver, NoopAppPathResolver};
-pub use apply::{EngineResult, WindowsApplyEngine};
 #[cfg(target_os = "windows")]
 pub use autostart::ProductionAutostartRegistry;
 pub use autostart::{
@@ -159,10 +160,7 @@ pub use dns::{
 };
 pub use dns_observe::{DnsObservation, DnsObservationSource, MockDnsObservationSource};
 pub use error::{ErrorClass, PlatformError};
-pub use fail_closed::{
-    compute_block_filters, compute_unblock_filter_ids, fail_closed_filter_id,
-    is_exempt_from_blocking, BlockReason, FailClosedPlan, FailClosedRuleSpec,
-};
+pub use fail_closed::{is_exempt_from_blocking, BlockReason};
 pub use hosts_file::{
     default_hosts_path, normalize_hostname, parse_hosts_map, HostsFileReader, HostsPin,
     OsHostsFileReader, StaticHostsFileReader,
@@ -184,17 +182,11 @@ pub use nrr_platform_api::vpn_discovery::{
     looks_like_vpn, MockVpnDiscovery, NoopVpnDiscovery, VpnCandidate, VpnCandidateSource,
     VpnDiscoveryPort,
 };
-pub use rollback::{invert_action_plan, snapshot_to_desired, RollbackEngine, RollbackResult};
-pub use snapshot::{
-    compute_action_plan, compute_snapshot_hash, DesiredPlatformState, PlatformStateSnapshot,
-    RoutingStateSnapshot, WfpFilterSnapshot, SNAPSHOT_SCHEMA_VERSION,
-};
 pub use strategy::{is_ipv6_address, rule_strategy, RuleImplementationStrategy};
 pub use types::{
     ApplyActionPlan, RouteEntry, RoutingAction, WfpAction, WfpFilterAction, WfpFilterId,
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
 };
-pub use verify::{DriftItem, DriftKind, DriftSeverity, VerifyEngine, VerifyResult};
 #[cfg(target_os = "windows")]
 pub use vpn_discovery::WindowsVpnDiscovery;
 // NT-device → Win32 path mapping for WFP-sourced process paths: the

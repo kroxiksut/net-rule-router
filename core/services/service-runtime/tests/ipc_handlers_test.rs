@@ -15,13 +15,14 @@ use nrr_diagnostics::error::DiagnosticsResult;
 use nrr_diagnostics::explain::{ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
-    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
-    SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
+    ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use nrr_diagnostics::facade::pagination::{PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
 use nrr_diagnostics::redaction::ExplainDetailLevel;
+use nrr_service_runtime::ipc::canonical_operation_class;
 use nrr_service_runtime::ipc_handlers::payloads::{
     AdapterEntry, ContractNegotiateResponse, InterfacesRefreshResponse, MutationConfirmResponse,
     MutationDryRunResponse, OperationStatusResponse, ProductImpactDisableConfirmResponse,
@@ -206,6 +207,7 @@ impl FakeDiagnostics {
                 },
                 diagnostic_mode: DiagnosticModeStateDto::inactive(),
                 stale: false,
+                origin: DiagnosticsDataOrigin::Service,
             }),
         }
     }
@@ -604,6 +606,8 @@ impl nrr_service_runtime::RoutePolicyWriter for EmptyRoutePolicyWriter {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: true,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
                 binding_source: request.binding_source,
             },
         )
@@ -664,7 +668,7 @@ fn read_envelope(op: IpcOperationName, payload: serde_json::Value) -> IpcRequest
         request_id: format!("req-{}", op.slug()),
         correlation_id: None,
         operation: op,
-        operation_class: IpcOperationClass::ReadSnapshot,
+        operation_class: canonical_operation_class(op, &payload),
         confirmation_token: None,
         payload,
     }
@@ -1057,7 +1061,7 @@ fn mutation_dry_run_envelope(payload: serde_json::Value) -> IpcRequestEnvelope {
         request_id: "r-dry".into(),
         correlation_id: None,
         operation: IpcOperationName::MutationSubmit,
-        operation_class: IpcOperationClass::ReadSnapshot,
+        operation_class: canonical_operation_class(IpcOperationName::MutationSubmit, &payload),
         confirmation_token: None,
         payload,
     }
@@ -1069,7 +1073,7 @@ fn mutation_confirm_envelope(payload: serde_json::Value, token: &str) -> IpcRequ
         request_id: "r-confirm".into(),
         correlation_id: None,
         operation: IpcOperationName::MutationSubmit,
-        operation_class: IpcOperationClass::MutationRequest,
+        operation_class: canonical_operation_class(IpcOperationName::MutationSubmit, &payload),
         confirmation_token: Some(token.into()),
         payload,
     }
@@ -1203,7 +1207,10 @@ fn rollback_request_requires_recovery_action_class_and_token() {
         request_id: "r-rb".into(),
         correlation_id: None,
         operation: IpcOperationName::RollbackRequest,
-        operation_class: IpcOperationClass::RecoveryAction,
+        operation_class: canonical_operation_class(
+            IpcOperationName::RollbackRequest,
+            &serde_json::json!({}),
+        ),
         confirmation_token: Some("any-issued-token".into()),
         payload: serde_json::json!({}),
     };
@@ -1223,7 +1230,10 @@ fn interfaces_refresh_returns_fresh_snapshot_via_router() {
         request_id: "r-ir".into(),
         correlation_id: None,
         operation: IpcOperationName::InterfacesRefreshRequest,
-        operation_class: IpcOperationClass::DiagnosticQuery,
+        operation_class: canonical_operation_class(
+            IpcOperationName::InterfacesRefreshRequest,
+            &serde_json::json!({}),
+        ),
         confirmation_token: None,
         payload: serde_json::json!({}),
     };
@@ -1249,7 +1259,10 @@ fn interfaces_refresh_succeeds_for_non_elevated_client() {
         request_id: "r-ir-non-elevated".into(),
         correlation_id: None,
         operation: IpcOperationName::InterfacesRefreshRequest,
-        operation_class: IpcOperationClass::DiagnosticQuery,
+        operation_class: canonical_operation_class(
+            IpcOperationName::InterfacesRefreshRequest,
+            &serde_json::json!({}),
+        ),
         confirmation_token: None,
         payload: serde_json::json!({}),
     };
@@ -1289,17 +1302,21 @@ fn product_impact_disable_full_two_phase_lifecycle_via_router() {
     let router = make_router(deps_with_executor(Arc::new(FakeExecutor)));
 
     // Dry run.
+    let dry_req_payload = serde_json::json!({
+        "reason": "investigating routing anomaly",
+        "dry-run": true,
+    });
     let dry_env = IpcRequestEnvelope {
         protocol_version: IPC_PROTOCOL_VERSION,
         request_id: "r-pid-dry".into(),
         correlation_id: None,
         operation: IpcOperationName::ProductImpactDisableTemporary,
-        operation_class: IpcOperationClass::ReadSnapshot,
+        operation_class: canonical_operation_class(
+            IpcOperationName::ProductImpactDisableTemporary,
+            &dry_req_payload,
+        ),
         confirmation_token: None,
-        payload: serde_json::json!({
-            "reason": "investigating routing anomaly",
-            "dry-run": true,
-        }),
+        payload: dry_req_payload,
     };
     let dry = router.dispatch(dry_env, elevated_gui_ctx());
     assert!(dry.ok, "dry-run should succeed: {:?}", dry.error);
@@ -1308,17 +1325,21 @@ fn product_impact_disable_full_two_phase_lifecycle_via_router() {
     assert!(!dry_payload.confirmation_token.is_empty());
 
     // Confirm.
+    let confirm_req_payload = serde_json::json!({
+        "reason": "investigating routing anomaly",
+        "dry-run": false,
+    });
     let confirm_env = IpcRequestEnvelope {
         protocol_version: IPC_PROTOCOL_VERSION,
         request_id: "r-pid-conf".into(),
         correlation_id: None,
         operation: IpcOperationName::ProductImpactDisableTemporary,
-        operation_class: IpcOperationClass::SafeDisable,
+        operation_class: canonical_operation_class(
+            IpcOperationName::ProductImpactDisableTemporary,
+            &confirm_req_payload,
+        ),
         confirmation_token: Some(dry_payload.confirmation_token.clone()),
-        payload: serde_json::json!({
-            "reason": "investigating routing anomaly",
-            "dry-run": false,
-        }),
+        payload: confirm_req_payload,
     };
     let confirm = router.dispatch(confirm_env, elevated_gui_ctx());
     assert!(confirm.ok, "confirm should succeed: {:?}", confirm.error);
@@ -1351,7 +1372,10 @@ fn product_impact_disable_confirm_without_token_rejected_by_router() {
         request_id: "r-pid-no-token".into(),
         correlation_id: None,
         operation: IpcOperationName::ProductImpactDisableTemporary,
-        operation_class: IpcOperationClass::SafeDisable,
+        operation_class: canonical_operation_class(
+            IpcOperationName::ProductImpactDisableTemporary,
+            &serde_json::json!({ "reason": "x", "dry-run": false }),
+        ),
         confirmation_token: None,
         payload: serde_json::json!({ "reason": "x", "dry-run": false }),
     };
@@ -1367,7 +1391,10 @@ fn subscribe_envelope(payload: serde_json::Value) -> IpcRequestEnvelope {
         request_id: "r-sub".into(),
         correlation_id: None,
         operation: IpcOperationName::StatusUpdatesSubscribe,
-        operation_class: IpcOperationClass::ReadSnapshot,
+        operation_class: canonical_operation_class(
+            IpcOperationName::StatusUpdatesSubscribe,
+            &payload,
+        ),
         confirmation_token: None,
         payload,
     }

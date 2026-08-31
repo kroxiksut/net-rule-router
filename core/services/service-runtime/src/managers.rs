@@ -82,13 +82,14 @@ pub trait PolicyManager: Send + Sync {
     fn current_revision(&self) -> Option<ActiveRevisionState>;
 
     /// Pending / superseded revision summaries surfaced
-    /// in `SnapshotInitialResponse.pending_revisions`. The default impl
-    /// returns an empty list so existing implementors (mocks, scaffolds)
-    /// compile unchanged; the production impl in
-    /// [`crate::policy_manager_production::CoordinatorPolicyManager`]
-    /// returns the latest N candidates + recent superseded entries from
-    /// `nrr-storage::RevisionsRepository`.
-    fn pending_revisions(&self) -> Vec<RevisionSummary> {
+    /// in `SnapshotInitialResponse.pending_revisions`, for ONE principal.
+    ///
+    /// Scoped because a revision belongs to a principal: unscoped, one user's
+    /// GUI listed every other user's pending and superseded edits. The default
+    /// impl returns an empty list so mocks and scaffolds compile unchanged; the
+    /// production impl returns the latest N candidates + recent superseded
+    /// entries from `nrr-storage::RevisionsRepository`.
+    fn pending_revisions(&self, _principal: &str) -> Vec<RevisionSummary> {
         Vec::new()
     }
 
@@ -173,6 +174,14 @@ pub trait IpcAcceptor: Send + Sync {
     /// because they observe the same shutdown flag flipped by
     /// `request_shutdown`.
     fn join_workers(&self);
+
+    /// Connections currently being served. Observable so a transport's
+    /// concurrency budget can be asserted rather than assumed - a leaked slot
+    /// is invisible until the cap is reached and the service stops answering.
+    /// Default `0` for transports that do not track it.
+    fn active_connections(&self) -> usize {
+        0
+    }
 }
 
 /// Result of one `IpcAcceptor::accept_one` tick.

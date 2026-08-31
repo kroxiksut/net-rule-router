@@ -41,11 +41,20 @@ pub enum DiagnosticsError {
     /// The scheduled retention cleanup job failed to remove expired files.
     /// The next scheduled run will retry; this is non-blocking.
     RetentionCleanupFailed { reason: String },
+
+    /// The caller passed a value the operation cannot act on (an empty id, an
+    /// unparseable filter). Nothing was attempted and nothing is degraded —
+    /// distinct from the write failures above, whose docs demand the caller
+    /// block the action or enter a recovery flow.
+    InvalidArgument { reason: String },
 }
 
 impl fmt::Display for DiagnosticsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidArgument { reason } => {
+                write!(f, "invalid argument: {reason}")
+            }
             Self::LogStorageUnavailable { reason } => {
                 write!(f, "log storage unavailable: {reason}")
             }

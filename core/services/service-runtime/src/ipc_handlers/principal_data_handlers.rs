@@ -52,8 +52,19 @@ impl PrincipalDataPurgeHandler {
 impl IpcHandler for PrincipalDataPurgeHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let sid = principal(ctx)?;
-        let req: PrincipalDataPurgeRequest =
-            serde_json::from_value(request.payload.clone()).unwrap_or_default();
+        // An absent payload is the plain "reset my own data" call and keeps the
+        // defaults. A payload that is PRESENT but unreadable is not: silently
+        // defaulting it turned "erase my rules history too" into a purge that
+        // kept the history and still answered success.
+        let req: PrincipalDataPurgeRequest = if request.payload.is_null() {
+            PrincipalDataPurgeRequest::default()
+        } else {
+            serde_json::from_value(request.payload.clone()).map_err(|e| IpcError {
+                code: IpcErrorCode::MalformedRequest,
+                message: format!("principal-data.purge payload invalid: {e}"),
+                diagnostics_id: None,
+            })?
+        };
         let response = if req.all_principals {
             // Erasing other users' routing is an administrative act. The
             // elevation check is here rather than in the catalog because the
@@ -243,6 +254,35 @@ mod tests {
                 &[asked]
             );
         }
+    }
+
+    #[test]
+    fn an_unreadable_payload_is_refused_instead_of_silently_defaulted() {
+        // `include-rules-history` misspelled (or of the wrong type) used to fall
+        // back to the defaults: the history stayed, and the caller was told the
+        // purge succeeded.
+        let purger = Arc::new(RecordingPurger::new(Ok(PrincipalDataPurgeResponse {
+            rows_deleted: 0,
+            tables_touched: 0,
+            rules_rows_deleted: 0,
+            principals_purged: 0,
+        })));
+        let handler =
+            PrincipalDataPurgeHandler::new(Arc::clone(&purger) as Arc<dyn PrincipalDataPurger>);
+        let mut request = req();
+        request.payload = serde_json::json!({ "include-rules-history": "yes please" });
+        let err = handler
+            .handle(&request, &ctx(Some("S-A")))
+            .expect_err("a payload we cannot read is not a purge request");
+        assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+        assert!(
+            purger
+                .calls
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "nothing may be purged on a request we did not understand"
+        );
     }
 
     #[test]

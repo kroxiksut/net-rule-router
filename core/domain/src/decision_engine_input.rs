@@ -159,9 +159,12 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
     };
     let lowercased = without_dot.to_lowercase();
     if lowercased.is_ascii() {
+        // `_` too: the rule validator accepts it (internal corp zones use it),
+        // and rejecting it here made a valid rule's host `Invalid`, which
+        // silently disables three match classes for that request.
         if lowercased
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
             (NormalizedHostname::Valid(lowercased), warnings)
         } else {
@@ -1009,6 +1012,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// The rule validator accepts `_`; the runtime path must not disagree, or
+    /// a live `*.corp.intra` rule answers "default route" for `db_srv.corp.intra`.
+    #[test]
+    fn hostname_underscore_is_valid_like_the_rule_validator_says() {
+        let (h, _) = normalize_hostname_value(Some("db_srv.corp.intra"));
+        assert_eq!(h, NormalizedHostname::Valid("db_srv.corp.intra".to_owned()));
     }
 
     #[test]

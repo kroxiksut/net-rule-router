@@ -108,6 +108,7 @@ Notes:
 - The **Exact-IP vs Zone** order is configurable (by default a more specific exact IP wins over a zone).
 - A rule may combine an address match **and** an app match — both must hold (logical **AND**).
 - **IPv6, CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
+  IPv6 is committed for the release after this one — see the roadmap.
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
 > A destination that matches no rule takes the default route — so a site
@@ -231,10 +232,15 @@ administrative console, RU/EN.
 interface per capability, so the shared decision logic is already OS-neutral),
 then macOS.
 
+**Committed, once the current version is stable: full IPv6.** Rules will name
+an IPv6 address, or a name that resolves to one, and be routed and protected
+exactly as IPv4 rules are today. Until that lands, rules act on IPv4 and IPv6
+is kept from becoming a way around them, so a rule you wrote still holds.
+
 **Explored for the future:** multiple saved profiles and scenario libraries,
-2+N adapters, richer rule types (IPv6, CIDR, ports, protocols), per-site /
-per-app routing across 3+ routes, and automated switching. The desktop UI
-stays a native Qt app throughout.
+2+N adapters, richer rule types (CIDR, ports, protocols), per-site / per-app
+routing across 3+ routes, and automated switching. The desktop UI stays a
+native Qt app throughout.
 
 ## Documentation
 

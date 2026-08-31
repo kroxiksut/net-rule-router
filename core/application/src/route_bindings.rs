@@ -1,11 +1,6 @@
 use nrr_shared::RouteBehaviorMode;
 use nrr_ui_support::ui_preferences::UiPreferences;
 
-pub const ROUTE_BINDING_REVISION_LINK_POLICY: &str =
-    "Route bindings are persisted in UI/config storage and linked to the currently visible active revision marker.";
-pub const ROUTE_BINDING_CHANGE_CLASSIFICATION_POLICY: &str =
-    "In block 2 changes are UI/config-only; service-owned pending/active revision flow will be enabled in later blocks.";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RouteBindingResolutionState {
     Unset,
@@ -58,8 +53,6 @@ pub struct RouteBindingsExportSnapshot {
     pub active_revision: String,
     pub behavior_mode: RouteBehaviorMode,
     pub change_class: RouteBindingChangeClass,
-    pub revision_link_policy: &'static str,
-    pub change_classification_policy: &'static str,
     pub primary: RouteRoleBindingExport,
     pub secondary: RouteRoleBindingExport,
 }
@@ -80,8 +73,6 @@ pub fn route_bindings_export_snapshot(
         active_revision: active_revision.trim().to_string(),
         behavior_mode: preferences.route_behavior_mode,
         change_class: RouteBindingChangeClass::UiConfigOnly,
-        revision_link_policy: ROUTE_BINDING_REVISION_LINK_POLICY,
-        change_classification_policy: ROUTE_BINDING_CHANGE_CLASSIFICATION_POLICY,
         primary: build_binding_export(
             &preferences.selected_primary_interface_id,
             &preferences.selected_primary_interface_name,

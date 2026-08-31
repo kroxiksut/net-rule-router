@@ -70,7 +70,7 @@ impl ProductImpactDisableTemporaryHandler {
 }
 
 impl IpcHandler for ProductImpactDisableTemporaryHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let body: ProductImpactDisableRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::MalformedRequest,
@@ -81,7 +81,7 @@ impl IpcHandler for ProductImpactDisableTemporaryHandler {
         if body.dry_run {
             self.handle_dry_run(request, body)
         } else {
-            self.handle_confirm(request, body)
+            self.handle_confirm(request, body, ctx)
         }
     }
 }
@@ -159,6 +159,7 @@ impl ProductImpactDisableTemporaryHandler {
         &self,
         request: &IpcRequestEnvelope,
         body: ProductImpactDisableRequest,
+        ctx: &IpcRequestContext,
     ) -> HandlerOutcome {
         if request.operation_class != IpcOperationClass::SafeDisable {
             return Err(IpcError {
@@ -214,7 +215,9 @@ impl ProductImpactDisableTemporaryHandler {
             });
         }
 
-        let op_id = self.operation_store.enqueue();
+        let op_id = self
+            .operation_store
+            .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
         let outcome = self.executor.safe_disable(&stored_reason);
         match outcome {
             MutationOutcome::Completed(result) => {

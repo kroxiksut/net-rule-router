@@ -92,6 +92,19 @@ impl IpcHandler for DohResolversSetHandler {
                 });
             }
         }
+        // The list is shared by every user of this machine. A non-elevated
+        // caller may still SAVE it - clients read-modify-write the whole
+        // settings page - as long as the list comes back unchanged.
+        let current = self.store.get_all().map_err(map_write_error)?;
+        if !crate::machine_scoped::machine_scoped_write_allowed(
+            &req.resolvers,
+            &current,
+            ctx.caller_is_elevated,
+        ) {
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "The DoH/DoT resolver list",
+            ));
+        }
         match self.store.replace_all(&req.resolvers) {
             Ok(stored) => {
                 // The resolver set feeds the DoH-lockdown blocks — recompile a

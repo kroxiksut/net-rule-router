@@ -170,7 +170,14 @@ fn address_match(
 pub enum NftApplyError {
     /// `nft` is not installed, or is too old for the JSON API.
     NftUnavailable { detail: String },
-    /// `nft` ran and refused the ruleset.
+    /// The process lacks the privilege to change the ruleset, or the kernel has
+    /// no `nf_tables` at all. Distinct from [`Self::Rejected`] because it is
+    /// about the ENVIRONMENT, not about what we built: retrying the same
+    /// ruleset can only fail the same way, and the operator has something to
+    /// fix (run privileged, load the module, leave the restricted container).
+    NotPermitted { detail: String },
+    /// `nft` ran and refused the ruleset. Our bug: the detail belongs in a
+    /// report, and a retry is pointless until the ruleset changes.
     Rejected { detail: String },
 }
 
@@ -181,6 +188,10 @@ impl std::fmt::Display for NftApplyError {
                 f,
                 "the nftables command-line tool (nft) is unavailable: {detail}. \
                  Install the `nftables` package and retry"
+            ),
+            Self::NotPermitted { detail } => write!(
+                f,
+                "the kernel refused the nftables change: {detail}.                  Check that the service runs privileged (CAP_NET_ADMIN) and                  that this kernel has nf_tables"
             ),
             Self::Rejected { detail } => write!(f, "nft refused the ruleset: {detail}"),
         }
@@ -262,10 +273,35 @@ fn classify_error(err: nftables::helper::NftablesError) -> NftApplyError {
         NftablesError::NftExecution { inner, .. } => NftApplyError::NftUnavailable {
             detail: inner.to_string(),
         },
-        other => NftApplyError::Rejected {
-            detail: other.to_string(),
-        },
+        other => {
+            let detail = other.to_string();
+            // One variant carried three very different answers — "the ruleset
+            // is invalid", "we lack CAP_NET_ADMIN" and "this kernel has no
+            // nf_tables" — and the orchestrator could not tell "retry" from
+            // "pointless". The tool's own words are what separate them; the C
+            // locale forced in `crate::command` is what keeps them readable.
+            if is_permission_or_kernel_refusal(&detail) {
+                NftApplyError::NotPermitted { detail }
+            } else {
+                NftApplyError::Rejected { detail }
+            }
+        }
     }
+}
+
+/// Does this `nft` failure describe the environment rather than our ruleset?
+#[cfg(target_os = "linux")]
+fn is_permission_or_kernel_refusal(detail: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "operation not permitted",
+        "permission denied",
+        "not permitted",
+        "no such file or directory",
+        "protocol not supported",
+        "could not process rule: no such file or directory",
+    ];
+    let lowered = detail.to_ascii_lowercase();
+    MARKERS.iter().any(|marker| lowered.contains(marker))
 }
 
 #[cfg(test)]
@@ -392,5 +428,23 @@ mod tests {
             comment: "catch-all-exempt#0".into(),
         }]);
         assert_eq!(json_of(&set), json_of(&set));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_environment_refusal_is_not_reported_as_our_bad_ruleset() {
+        // What `nft` says when the caller has no CAP_NET_ADMIN, and when the
+        // kernel has no nf_tables at all.
+        assert!(is_permission_or_kernel_refusal(
+            "Error: Could not process rule: Operation not permitted"
+        ));
+        assert!(is_permission_or_kernel_refusal(
+            "Error: Could not process rule: No such file or directory"
+        ));
+        // What it says when the ruleset really is wrong — retrying it is
+        // pointless for a different reason, and the operator can fix nothing.
+        assert!(!is_permission_or_kernel_refusal(
+            "Error: syntax error, unexpected string"
+        ));
     }
 }

@@ -210,10 +210,12 @@ pub enum PreFlightCategory {
     BindingUnresolved,
 }
 
-/// Returned by [`ActivationCoordinator::dry_run_apply`].
+/// Returned by [`ActivationCoordinator::dry_run_rules`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DryRunSummary {
-    pub revision_id: RevisionId,
+    /// The candidate this plan describes — `None` for a PREVIEW, which is
+    /// computed from submitted rules without storing a candidate at all.
+    pub revision_id: Option<RevisionId>,
     pub action_plans: Vec<SidActionPlanSummary>,
     pub pre_flight_warnings: Vec<PreFlightWarning>,
     pub estimated_duration_ms: u32,
@@ -264,6 +266,10 @@ pub enum PolicyError {
     ConfirmationTokenAlreadyUsed,
     /// Token past `expires_at`.
     ConfirmationTokenExpired,
+    /// Token is valid for this principal but was issued to activate a DIFFERENT
+    /// revision. It is consumed either way: a token used against something it
+    /// was not issued for does not get a second chance.
+    ConfirmationTokenForOtherRevision,
     /// Revision not found by id.
     RevisionNotFound(RevisionId),
     /// Revision exists but is in a status that cannot be activated /
@@ -355,7 +361,7 @@ pub struct DispatchFailure {
 pub trait RulesApplyDispatcher: Send + Sync {
     /// Compute the per-SID action plan summary for a hypothetical apply
     /// of `rules_json` against this SID's current bindings. Used by
-    /// `dry_run_apply`. Pure (no platform mutation).
+    /// `dry_run_rules`. Pure (no platform mutation).
     fn dry_run_for_sid(
         &self,
         sid: &str,
@@ -488,7 +494,8 @@ pub trait Clock: Send + Sync {
 }
 
 /// Generates new revision IDs, confirmation tokens, and apply attempt
-/// IDs. Production uses `uuid::Uuid::new_v4`; tests use a deterministic
+/// IDs. Production builds them from the clock plus a counter (there is no
+/// CSPRNG in this tree - see the predictable-token task); tests use a deterministic
 /// counter so assertions are stable.
 pub trait IdGenerator: Send + Sync {
     fn new_revision_id(&self) -> RevisionId;
@@ -575,20 +582,41 @@ impl ActivationCoordinator {
         self
     }
 
-    /// The SIDs an activation applies to: every routing-active
-    /// (tray-connected) SID, or — with no tray at all — the effective routing
-    /// user from the fallback (console-session user under service-driven
-    /// scope). Shared by dry-run, Phase 1 and the pre-flight re-check so all
-    /// three see the SAME set.
-    fn apply_target_sids(&self) -> Vec<String> {
-        let sids = self.sid_registry.active_sids();
-        if !sids.is_empty() {
-            return sids;
+    /// The SIDs an activation applies to — every routing-active (tray-connected)
+    /// SID, or the fallback routing user with no tray at all — SCOPED to the
+    /// principal whose revision is being applied.
+    ///
+    /// A revision belongs to one principal. Applying it to everyone active is
+    /// how a second user's machine ends up enforcing the first user's rules,
+    /// and how an `AllOrNothing` failure rolls that second user back to a
+    /// revision that was never theirs. The admin baseline is the one principal
+    /// that legitimately spans users, and only those who have not diverged: a
+    /// user running their own revision is not running the baseline.
+    ///
+    /// Shared by dry-run, Phase 1 and the pre-flight re-check so all three see
+    /// the SAME set.
+    fn apply_target_sids(&self, principal: &str) -> Vec<String> {
+        let active = self.sid_registry.active_sids();
+        let active = if active.is_empty() {
+            self.fallback_routing_sid
+                .as_ref()
+                .and_then(|f| f())
+                .into_iter()
+                .collect()
+        } else {
+            active
+        };
+        if principal != nrr_storage::BASELINE_PRINCIPAL {
+            return active.into_iter().filter(|s| s == principal).collect();
         }
-        self.fallback_routing_sid
-            .as_ref()
-            .and_then(|f| f())
+        active
             .into_iter()
+            .filter(|sid| {
+                // Unreadable is treated as diverged: applying the baseline over
+                // a user whose own revision we could not read would replace
+                // their policy with somebody else's on a storage hiccup.
+                matches!(self.current_active_for(sid), Ok(None))
+            })
             .collect()
     }
 
@@ -620,7 +648,9 @@ impl ActivationCoordinator {
     /// alert they accept the current DB state, so the service stamps it
     /// as authoritative and the next load verifies clean. No-op (returns
     /// 0) when no signing key is configured.
-    pub(crate) fn re_sign_all_revisions(&self) -> Result<usize, PolicyError> {
+    pub(crate) fn re_sign_all_revisions(
+        &self,
+    ) -> Result<nrr_storage::revisions::ReSignReport, PolicyError> {
         let conn = self.conn.lock().expect("connection mutex poisoned");
         self.revisions_repo(&conn)
             .re_sign_all()
@@ -718,25 +748,36 @@ impl ActivationCoordinator {
         Ok(revision_id)
     }
 
-    // ── dry_run_apply ────────────────────────────────────────────────────────
+    // ── dry run ──────────────────────────────────────────────────────────────
 
-    /// Builds a per-SID action plan for the candidate. Pure: no platform
-    /// state mutation, no token consumption.
+    /// The same plan for rules that have NOT been stored as a candidate.
     ///
-    /// `pub(crate)` for the same reason as
-    /// [`Self::submit_candidate`]: single-channel enforcement.
-    pub(crate) fn dry_run_apply(
+    /// The GUI's preview is a read: it asks "what would this do". Routing it
+    /// through `submit_candidate` meant every press of it wrote a revision row
+    /// — an operation classed as a read mutating the table it reads, and a
+    /// pending list that filled with previews the user never asked to keep.
+    pub(crate) fn dry_run_rules(
         &self,
-        revision_id: &RevisionId,
+        principal: &str,
+        rules_json: &str,
         correlation_id: &str,
-    ) -> Result<DryRunSummary, PolicyError> {
-        let record = self.load_record(revision_id)?;
-        let sids: Vec<String> = self.apply_target_sids();
+    ) -> DryRunSummary {
+        let summary = self.plan_rules(principal, rules_json);
+        self.audit.emit(ActivationAuditEvent::DryRunRequested {
+            revision_id: String::new(),
+            correlation_id: correlation_id.to_string(),
+        });
+        summary
+    }
 
+    /// Shared body: per-SID action plans plus pre-flight warnings for
+    /// `rules_json`, with no revision of its own.
+    fn plan_rules(&self, principal: &str, rules_json: &str) -> DryRunSummary {
+        let sids: Vec<String> = self.apply_target_sids(principal);
         let mut action_plans: Vec<SidActionPlanSummary> = Vec::with_capacity(sids.len());
         let mut warnings: Vec<PreFlightWarning> = Vec::new();
         for sid in &sids {
-            match self.dispatcher.dry_run_for_sid(sid, &record.rules_json) {
+            match self.dispatcher.dry_run_for_sid(sid, rules_json) {
                 Ok(plan) => action_plans.push(plan),
                 Err(failure) => warnings.push(PreFlightWarning {
                     sid: failure.sid,
@@ -744,22 +785,16 @@ impl ActivationCoordinator {
                     message: failure.message,
                 }),
             }
-            if let Ok(more) = self.dispatcher.pre_flight_for_sid(sid, &record.rules_json) {
+            if let Ok(more) = self.dispatcher.pre_flight_for_sid(sid, rules_json) {
                 warnings.extend(more);
             }
         }
-
-        self.audit.emit(ActivationAuditEvent::DryRunRequested {
-            revision_id: revision_id.as_str().to_string(),
-            correlation_id: correlation_id.to_string(),
-        });
-
-        Ok(DryRunSummary {
-            revision_id: revision_id.clone(),
+        DryRunSummary {
+            revision_id: None,
             action_plans,
             pre_flight_warnings: warnings,
             estimated_duration_ms: 0, // populated when 16.10 wires real timing
-        })
+        }
     }
 
     // ── issue_confirmation_token ─────────────────────────────────────────────
@@ -854,7 +889,7 @@ impl ActivationCoordinator {
 
         // Phase 2a — pre-flight (only PreFlightThenAllOrNothing).
         if matches!(policy, ApplyFailurePolicy::PreFlightThenAllOrNothing) {
-            let pre = self.run_pre_flight(&phase1.sids, &record.rules_json);
+            let pre = self.run_pre_flight(&principal, &phase1.sids, &record.rules_json);
             if !pre.failures.is_empty() {
                 self.audit.emit(ActivationAuditEvent::PreFlightFailed {
                     revision_id: revision_id.as_str().to_string(),
@@ -874,8 +909,14 @@ impl ActivationCoordinator {
             });
         }
 
-        // Phase 2b — apply per SID.
-        let phase2 = self.phase2_apply(&phase1.sids, &record.rules_json);
+        // Phase 2b — apply per SID, re-checking divergence first. A user who
+        // created their OWN revision between phase 1 and here is no longer
+        // inheriting the baseline, and writing it to them now would replace
+        // their policy with somebody else's — the same reasoning
+        // `apply_target_sids` applies when it builds the set, applied again at
+        // the moment it is used.
+        let targets = self.still_inheriting(&principal, &phase1.sids);
+        let phase2 = self.phase2_apply(&targets, &record.rules_json);
 
         match policy {
             ApplyFailurePolicy::AllOrNothing | ApplyFailurePolicy::PreFlightThenAllOrNothing => {
@@ -1094,6 +1135,17 @@ impl ActivationCoordinator {
 
     // ── Phase helpers ────────────────────────────────────────────────────────
 
+    /// The revision id a token's payload was issued for. `None` when the
+    /// payload is not the shape this coordinator writes — treated as "not this
+    /// revision", never as "any revision".
+    fn token_revision_of(payload_json: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(payload_json)
+            .ok()?
+            .get("revision_id")?
+            .as_str()
+            .map(str::to_owned)
+    }
+
     fn phase1_consume_and_mark(
         &self,
         principal: &str,
@@ -1113,7 +1165,16 @@ impl ActivationCoordinator {
                 message: e.to_string(),
             })?;
         match outcome {
-            ConsumeOutcome::Consumed { .. } => {}
+            // A token is issued to activate ONE candidate, and the payload says
+            // which. Without this check any live token of the principal
+            // activated any candidate of theirs — including one the user had
+            // just rejected in the GUI, which is the opposite of what a
+            // confirmation is for.
+            ConsumeOutcome::Consumed { payload_json, .. } => {
+                if Self::token_revision_of(&payload_json).as_deref() != Some(revision_id.as_str()) {
+                    return Err(PolicyError::ConfirmationTokenForOtherRevision);
+                }
+            }
             ConsumeOutcome::Unknown => return Err(PolicyError::ConfirmationTokenUnknown),
             ConsumeOutcome::AlreadyConsumed => {
                 return Err(PolicyError::ConfirmationTokenAlreadyUsed)
@@ -1136,7 +1197,7 @@ impl ActivationCoordinator {
             })?;
         drop(conn);
 
-        let sids = self.apply_target_sids();
+        let sids = self.apply_target_sids(principal);
         let attempt_id = self.ids.new_attempt_id();
         let marker = ApplyAttemptMarker {
             attempt_id: attempt_id.clone(),
@@ -1158,9 +1219,14 @@ impl ActivationCoordinator {
         })
     }
 
-    fn run_pre_flight(&self, sids: &[String], rules_json: &str) -> PreFlightOutcome {
+    fn run_pre_flight(
+        &self,
+        principal: &str,
+        sids: &[String],
+        rules_json: &str,
+    ) -> PreFlightOutcome {
         let registered_now: std::collections::HashSet<String> =
-            self.apply_target_sids().into_iter().collect();
+            self.apply_target_sids(principal).into_iter().collect();
         let mut warnings: Vec<PreFlightWarning> = Vec::new();
         let mut failures: Vec<(String, String)> = Vec::new();
         for sid in sids {
@@ -1194,6 +1260,27 @@ impl ActivationCoordinator {
         PreFlightOutcome { warnings, failures }
     }
 
+    /// The subset of `sids` the baseline may still be written to. Non-baseline
+    /// principals own their own revision, so the set is returned unchanged.
+    fn still_inheriting(&self, principal: &str, sids: &[String]) -> Vec<String> {
+        if principal != nrr_storage::BASELINE_PRINCIPAL {
+            return sids.to_vec();
+        }
+        let kept: Vec<String> = sids
+            .iter()
+            .filter(|sid| matches!(self.current_active_for(sid), Ok(None)))
+            .cloned()
+            .collect();
+        if kept.len() != sids.len() {
+            tracing::info!(
+                target: "nrr::activation",
+                dropped = (sids.len() - kept.len()) as u64,
+                "a user stopped inheriting the baseline between phases — their own revision stands",
+            );
+        }
+        kept
+    }
+
     fn phase2_apply(&self, sids: &[String], rules_json: &str) -> Phase2Outcome {
         let mut succeeded: Vec<String> = Vec::with_capacity(sids.len());
         let mut failed: Vec<(String, String)> = Vec::new();
@@ -1214,9 +1301,68 @@ impl ActivationCoordinator {
         drift: Vec<(String, String)>,
         now: i64,
     ) -> Result<ActivationOutcome, PolicyError> {
-        // SQL TX wrapping mark_apply_succeeded + active_revision_pointer + marker clear.
+        // Re-signing is a REPAIR of our own edit, never a laundering of somebody
+        // else's. `mark_apply_succeeded` rewrites signed columns on both rows,
+        // so their stored HMACs go stale by design and have to be recomputed -
+        // but recomputing over a row that was ALREADY tampered with mints a
+        // valid signature for the tampering, and the row then sails through the
+        // integrity gate, the `trusted` selection and last-known-good.
+        //
+        // The two rows are treated differently on purpose. Activating a
+        // TAMPERED revision is refused outright. The row being superseded may
+        // well be tampered - that is exactly the case the integrity gate is
+        // rolling us out of - so the activation proceeds and its signature is
+        // simply left alone, still failing verification for whoever looks next.
+        let previous_is_tampered = {
+            let conn = self.conn.lock().expect("connection mutex poisoned");
+            let repo = self.revisions_repo(&conn);
+            let verdict = repo.verify_row_hmac(revision_id.as_str()).map_err(|e| {
+                PolicyError::StorageFailure {
+                    operation: "verify_row_hmac",
+                    message: e.to_string(),
+                }
+            })?;
+            if matches!(
+                verdict,
+                Some(nrr_storage::revision_hmac::HmacVerification::Tampered)
+            ) {
+                return Err(PolicyError::StorageFailure {
+                    operation: "verify_row_hmac",
+                    message: format!(
+                        "revision {} failed integrity check; refusing to activate it",
+                        revision_id.as_str()
+                    ),
+                });
+            }
+            match phase1.previous_revision.as_ref() {
+                Some(prev) => matches!(
+                    repo.verify_row_hmac(&prev.revision_id).map_err(|e| {
+                        PolicyError::StorageFailure {
+                            operation: "verify_row_hmac",
+                            message: e.to_string(),
+                        }
+                    })?,
+                    Some(nrr_storage::revision_hmac::HmacVerification::Tampered)
+                ),
+                None => false,
+            }
+        };
+        // The status change, the pointer and both re-signings are ONE commit.
+        // Apart, a crash between them leaves a revision marked active that the
+        // pointer does not name, or rows whose signatures no longer match their
+        // contents - which the integrity gate reads as tampering and answers by
+        // discarding the user's rules. The marker file is cleared after the
+        // commit: a marker left behind describes an attempt that did finish,
+        // which recovery can see and settle, whereas a half-written database
+        // cannot be reasoned about at all.
         {
             let conn = self.conn.lock().expect("connection mutex poisoned");
+            let tx = conn
+                .unchecked_transaction()
+                .map_err(|e| PolicyError::StorageFailure {
+                    operation: "begin_activation_tx",
+                    message: e.to_string(),
+                })?;
             let repo = self.revisions_repo(&conn);
             repo.mark_apply_succeeded_for(
                 principal,
@@ -1255,12 +1401,19 @@ impl ActivationCoordinator {
                     message: e.to_string(),
                 })?;
             if let Some(prev) = phase1.previous_revision.as_ref() {
-                repo.re_sign_row(&prev.revision_id)
-                    .map_err(|e| PolicyError::StorageFailure {
-                        operation: "re_sign_row(superseded)",
-                        message: e.to_string(),
+                if !previous_is_tampered {
+                    repo.re_sign_row(&prev.revision_id).map_err(|e| {
+                        PolicyError::StorageFailure {
+                            operation: "re_sign_row(superseded)",
+                            message: e.to_string(),
+                        }
                     })?;
+                }
             }
+            tx.commit().map_err(|e| PolicyError::StorageFailure {
+                operation: "commit_activation_tx",
+                message: e.to_string(),
+            })?;
         }
         self.marker_store
             .clear()
@@ -1327,17 +1480,38 @@ impl ActivationCoordinator {
             .map(|r| r.rules_json.clone())
             .unwrap_or_else(|| "{}".to_string());
         let mut reverted: Vec<String> = Vec::new();
-        for sid in &phase2.succeeded {
-            if self
-                .dispatcher
-                .revert_for_sid(sid, &previous_rules_json)
-                .is_ok()
-            {
-                reverted.push(sid.clone());
+        let mut revert_failures: Vec<(String, String)> = Vec::new();
+        // Every SID Phase 2 TOUCHED, not just the ones it finished. A SID whose
+        // apply failed may have installed part of its set before failing (the
+        // batch-overflow warning says so in as many words), so leaving it out
+        // of the revert left that partial policy live under a revision the
+        // service has just rejected.
+        let touched = phase2
+            .succeeded
+            .iter()
+            .cloned()
+            .chain(phase2.failed.iter().map(|(sid, _)| sid.clone()));
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for sid in touched.filter(|sid| seen.insert(sid.clone())) {
+            match self.dispatcher.revert_for_sid(&sid, &previous_rules_json) {
+                Ok(()) => reverted.push(sid),
+                // A failed revert is the state that matters most and used to be
+                // discarded by an `is_ok()`: the SID keeps rules from a
+                // rejected revision and nothing anywhere says so.
+                Err(failure) => {
+                    tracing::error!(
+                        target: "nrr::activation",
+                        sid = %failure.sid,
+                        revision_id = %revision_id,
+                        "revert after a failed activation did not succeed; this SID may still                          be enforcing rules from a rejected revision: {}",
+                        failure.message,
+                    );
+                    revert_failures.push((failure.sid, failure.message));
+                }
             }
         }
 
-        let reason = format!(
+        let mut reason = format!(
             "{} SID(s) failed Phase 2: {}",
             phase2.failed.len(),
             phase2
@@ -1347,6 +1521,19 @@ impl ActivationCoordinator {
                 .collect::<Vec<_>>()
                 .join("; ")
         );
+        if !revert_failures.is_empty() {
+            // Recorded on the revision itself: whoever reads why it was
+            // rejected also needs to know the machine was not fully put back.
+            reason.push_str(&format!(
+                "; revert failed for {} SID(s): {}",
+                revert_failures.len(),
+                revert_failures
+                    .iter()
+                    .map(|(s, m)| format!("{s}={m}"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
         {
             let conn = self.conn.lock().expect("connection mutex poisoned");
             let repo = self.revisions_repo(&conn);
@@ -1662,6 +1849,15 @@ impl ActivationCoordinator {
             None => {
                 let now = self.clock.now_secs();
                 let conn = self.conn.lock().expect("connection mutex poisoned");
+                // Same pair, same reason as the activation commit: a rollback
+                // that marks the revision and does not clear the pointer leaves
+                // the pointer naming a revision that is no longer active.
+                let tx = conn
+                    .unchecked_transaction()
+                    .map_err(|e| PolicyError::StorageFailure {
+                        operation: "begin_integrity_tx",
+                        message: e.to_string(),
+                    })?;
                 let repo = self.revisions_repo(&conn);
                 repo.mark_rolled_back_for(principal, &rejected_revision_id, now)
                     .map_err(|e| PolicyError::StorageFailure {
@@ -1673,6 +1869,10 @@ impl ActivationCoordinator {
                         operation: "clear_active_pointer(integrity)",
                         message: e.to_string(),
                     }
+                })?;
+                tx.commit().map_err(|e| PolicyError::StorageFailure {
+                    operation: "commit_integrity_tx",
+                    message: e.to_string(),
                 })?;
                 ActiveIntegrityOutcome::ClearedNoTrustedFallback {
                     rejected_revision_id: rejected_revision_id.clone(),
@@ -1908,6 +2108,7 @@ pub struct ScriptedDispatcher {
     pre_flight_errors: Mutex<BTreeMap<String, DispatchFailure>>,
     apply_log: Mutex<Vec<(String, String)>>,
     revert_log: Mutex<Vec<(String, String)>>,
+    revert_outcomes: Mutex<BTreeMap<String, Vec<Result<(), DispatchFailure>>>>,
 }
 
 impl Default for ScriptedDispatcher {
@@ -1926,6 +2127,7 @@ impl ScriptedDispatcher {
             pre_flight_errors: Mutex::new(BTreeMap::new()),
             apply_log: Mutex::new(Vec::new()),
             revert_log: Mutex::new(Vec::new()),
+            revert_outcomes: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1933,6 +2135,16 @@ impl ScriptedDispatcher {
     /// are drained in FIFO order.
     pub fn queue_apply(&self, sid: &str, outcome: Result<(), DispatchFailure>) {
         self.apply_outcomes
+            .lock()
+            .expect("dispatcher mutex poisoned")
+            .entry(sid.to_string())
+            .or_default()
+            .push(outcome);
+    }
+
+    /// Queue a per-SID `revert_for_sid` outcome, FIFO like `queue_apply`.
+    pub fn queue_revert(&self, sid: &str, outcome: Result<(), DispatchFailure>) {
+        self.revert_outcomes
             .lock()
             .expect("dispatcher mutex poisoned")
             .entry(sid.to_string())
@@ -2032,7 +2244,20 @@ impl RulesApplyDispatcher for ScriptedDispatcher {
             .lock()
             .expect("dispatcher mutex poisoned")
             .push((sid.to_string(), previous_rules_json.to_string()));
-        Ok(())
+        let mut queued = self
+            .revert_outcomes
+            .lock()
+            .expect("dispatcher mutex poisoned");
+        match queued.get_mut(sid).and_then(|q| {
+            if q.is_empty() {
+                None
+            } else {
+                Some(q.remove(0))
+            }
+        }) {
+            Some(outcome) => outcome,
+            None => Ok(()),
+        }
     }
 }
 
@@ -2210,22 +2435,67 @@ mod tests {
         }
     }
 
-    // ── dry_run_apply ─────────────────────────────────────────────────────────
+    // ── dry run ───────────────────────────────────────────────────────────────
 
     #[test]
-    fn dry_run_returns_per_sid_action_plans() {
+    fn dry_run_returns_per_sid_action_plans_without_storing_a_candidate() {
         let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
         fx.registry
             .on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
         fx.registry
             .on_connect("S-1-5-21-B", IpcClientProfile::TrayLightweight);
-        let id = submit(&fx, "h-dry");
-        let summary = fx
-            .coordinator
-            .dry_run_apply(&id, "corr-dr")
-            .expect("dry run");
+        let summary = fx.coordinator.dry_run_rules(
+            nrr_storage::BASELINE_PRINCIPAL,
+            r#"{"schema-version":1,"primary":[],"secondary":[]}"#,
+            "corr-dr",
+        );
         assert_eq!(summary.action_plans.len(), 2);
         assert!(summary.action_plans.iter().all(|p| p.filter_additions == 1));
+        assert!(
+            summary.revision_id.is_none(),
+            "a preview describes rules, not a stored revision"
+        );
+    }
+
+    /// The baseline is written only to users who still inherit it. The set is
+    /// built in phase 1 and used in phase 2, and a user can create their own
+    /// revision in between — writing the baseline to them then would replace
+    /// their policy with somebody else's.
+    #[test]
+    fn a_user_who_diverges_between_phases_keeps_their_own_revision() {
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        fx.registry
+            .on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
+        fx.registry
+            .on_connect("S-1-5-21-B", IpcClientProfile::TrayLightweight);
+        let both = vec!["S-1-5-21-A".to_string(), "S-1-5-21-B".to_string()];
+
+        // Nobody has diverged yet.
+        assert_eq!(
+            fx.coordinator
+                .still_inheriting(nrr_storage::BASELINE_PRINCIPAL, &both),
+            both
+        );
+
+        // B activates a revision of their own.
+        let own = submit_for(&fx, "S-1-5-21-B", "h-own");
+        let token = issue_token(&fx, &own);
+        fx.coordinator
+            .activate(&own, &token, "c")
+            .expect("activate");
+
+        assert_eq!(
+            fx.coordinator
+                .still_inheriting(nrr_storage::BASELINE_PRINCIPAL, &both),
+            vec!["S-1-5-21-A".to_string()],
+            "the baseline is no longer B's to receive"
+        );
+        // A principal applying its OWN revision is unaffected by the check.
+        assert_eq!(
+            fx.coordinator.still_inheriting("S-1-5-21-B", &both),
+            both,
+            "only the baseline defers to a user's own revision"
+        );
     }
 
     // ── token plumbing ────────────────────────────────────────────────────────
@@ -2240,6 +2510,33 @@ mod tests {
             .activate(&id, &bogus, "c")
             .expect_err("must fail");
         assert!(matches!(err, PolicyError::ConfirmationTokenUnknown));
+    }
+
+    /// A confirmation is a confirmation OF SOMETHING. A token issued for one
+    /// candidate used to activate any other candidate of the same principal —
+    /// including one the user had just rejected.
+    #[test]
+    fn a_token_issued_for_one_revision_cannot_activate_another() {
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        let confirmed = submit(&fx, "h-confirmed");
+        let rejected = submit(&fx, "h-rejected");
+        let token = issue_token(&fx, &confirmed);
+
+        let err = fx
+            .coordinator
+            .activate(&rejected, &token, "c")
+            .expect_err("must fail");
+        assert!(matches!(
+            err,
+            PolicyError::ConfirmationTokenForOtherRevision
+        ));
+
+        // The token is spent either way — a misuse does not get a second try.
+        let err = fx
+            .coordinator
+            .activate(&confirmed, &token, "c")
+            .expect_err("must fail");
+        assert!(matches!(err, PolicyError::ConfirmationTokenAlreadyUsed));
     }
 
     #[test]
@@ -2295,6 +2592,141 @@ mod tests {
         assert!(active.is_some());
         // Marker cleared.
         assert!(fx.marker.read().is_none());
+    }
+
+    /// The status change and the pointer are one commit. Apart, a failure
+    /// between them leaves a revision marked Active that the pointer does not
+    /// name — and the integrity gate reads that disagreement as tampering and
+    /// answers by discarding the user's rules.
+    /// Re-signing repairs OUR edit; it must never mint a valid signature for
+    /// somebody else's. Without this the row that tripped the integrity gate
+    /// came back through it clean, and then qualified as `trusted` and as
+    /// last-known-good.
+    #[test]
+    fn a_tampered_revision_is_not_laundered_by_activation() {
+        let key = vec![0x5au8; 32];
+        let fx = build_signed_fixture(ApplyFailurePolicy::AllOrNothing, key.clone());
+        fx.registry
+            .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+        let id = submit(&fx, "h-tamper");
+        let token = issue_token(&fx, &id);
+
+        // Edit a signed column behind the repository's back.
+        fx.conn
+            .lock()
+            .expect("lock")
+            .execute(
+                "UPDATE revisions SET content_hash = 'forged' WHERE revision_id = ?1",
+                rusqlite::params![id.as_str()],
+            )
+            .expect("tamper");
+
+        let outcome = fx.coordinator.activate(&id, &token, "c");
+        assert!(
+            outcome.is_err(),
+            "a tampered revision must not be activated, let alone re-signed",
+        );
+
+        let conn = fx.conn.lock().expect("lock");
+        let repo = nrr_storage::revisions::RevisionsRepository::with_signing_key(&conn, key);
+        assert_eq!(
+            repo.verify_row_hmac(id.as_str()).expect("verify"),
+            Some(nrr_storage::revision_hmac::HmacVerification::Tampered),
+            "and it must still read as tampered afterwards",
+        );
+    }
+
+    #[test]
+    fn a_failed_pointer_write_leaves_no_half_activated_revision() {
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        fx.registry
+            .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+        let id = submit(&fx, "h-atomic");
+        let token = issue_token(&fx, &id);
+
+        // Fail the pointer WRITE only: renaming the table would break the
+        // earlier read in Phase 1 and the activation would never reach the
+        // commit this test is about.
+        fx.conn
+            .lock()
+            .expect("lock")
+            .execute_batch(
+                "CREATE TRIGGER no_pointer_write BEFORE UPDATE ON active_revision_pointer
+                 BEGIN SELECT RAISE(ABORT, 'pointer write refused'); END;
+                 CREATE TRIGGER no_pointer_insert BEFORE INSERT ON active_revision_pointer
+                 BEGIN SELECT RAISE(ABORT, 'pointer write refused'); END;",
+            )
+            .expect("trigger");
+
+        let outcome = fx.coordinator.activate(&id, &token, "c");
+        assert!(outcome.is_err(), "the activation cannot report success");
+
+        fx.conn
+            .lock()
+            .expect("lock")
+            .execute_batch("DROP TRIGGER no_pointer_write; DROP TRIGGER no_pointer_insert;")
+            .expect("drop triggers");
+        let rec = fx.coordinator.load_record(&id).expect("load");
+        assert_eq!(
+            rec.status,
+            RevisionStatus::Candidate,
+            "the status change must have rolled back with the failed pointer write",
+        );
+    }
+
+    #[test]
+    fn a_users_revision_applies_only_to_that_user() {
+        // A revision belongs to one principal. Applying it to every active SID
+        // enforced one user's rules on another user's session — and on an
+        // AllOrNothing failure rolled that second user back to a revision that
+        // was never theirs.
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        fx.registry
+            .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+        fx.registry
+            .on_connect("S-1-B", IpcClientProfile::TrayLightweight);
+        let id = submit_for(&fx, "S-1-A", "h-per-user");
+        let token = issue_token(&fx, &id);
+        fx.coordinator.activate(&id, &token, "c").expect("activate");
+        let applied: Vec<String> = fx
+            .dispatcher
+            .apply_log()
+            .into_iter()
+            .map(|(sid, _)| sid)
+            .collect();
+        assert_eq!(applied, vec!["S-1-A".to_string()]);
+    }
+
+    #[test]
+    fn the_baseline_skips_a_user_who_runs_their_own_revision() {
+        // The baseline is the one principal that spans users — but only those
+        // who have not diverged. A user with an active revision of their own is
+        // running it, and the baseline must not overwrite that.
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        fx.registry
+            .on_connect("S-1-A", IpcClientProfile::TrayLightweight);
+        fx.registry
+            .on_connect("S-1-B", IpcClientProfile::TrayLightweight);
+        let own = submit_for(&fx, "S-1-A", "h-own");
+        let own_token = issue_token(&fx, &own);
+        fx.coordinator
+            .activate(&own, &own_token, "c")
+            .expect("activate own");
+
+        let baseline = submit(&fx, "h-baseline");
+        let token = issue_token(&fx, &baseline);
+        fx.coordinator
+            .activate(&baseline, &token, "c")
+            .expect("activate baseline");
+
+        let applied_baseline: Vec<String> = fx
+            .dispatcher
+            .apply_log()
+            .into_iter()
+            .skip(1)
+            .map(|(sid, _)| sid)
+            .collect();
+        assert_eq!(applied_baseline, vec!["S-1-B".to_string()]);
     }
 
     #[test]
@@ -2357,17 +2789,65 @@ mod tests {
                 ..
             } => {
                 assert_eq!(rejected_revision, id);
-                // S-A succeeded → must be reverted.
-                assert_eq!(reverted_sids, vec!["S-A".to_string()]);
+                // Both are reverted, not just the one that succeeded: a SID
+                // whose apply FAILED may have installed part of its set before
+                // failing, and leaving it out left that partial policy live
+                // under a revision the service has just rejected.
+                assert_eq!(reverted_sids, vec!["S-A".to_string(), "S-B".to_string()],);
             }
             other => panic!("expected RolledBackOnFailure, got {other:?}"),
         }
         let rec = fx.coordinator.load_record(&id).expect("load");
         assert_eq!(rec.status, RevisionStatus::Rejected);
-        // Revert was called.
-        assert_eq!(fx.dispatcher.revert_log().len(), 1);
+        // Revert was called for both.
+        assert_eq!(fx.dispatcher.revert_log().len(), 2);
         // Marker cleared.
         assert!(fx.marker.read().is_none());
+    }
+
+    /// A revert that fails is the state that matters most: the SID keeps rules
+    /// from a revision the service has just rejected. It used to be discarded
+    /// by an `is_ok()` and left no trace anywhere.
+    #[test]
+    fn a_revert_that_fails_is_recorded_on_the_revision() {
+        let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
+        fx.registry
+            .on_connect("S-A", IpcClientProfile::TrayLightweight);
+        fx.registry
+            .on_connect("S-B", IpcClientProfile::TrayLightweight);
+        fx.dispatcher.queue_apply(
+            "S-B",
+            Err(DispatchFailure {
+                sid: "S-B".into(),
+                message: "WFP error".into(),
+            }),
+        );
+        fx.dispatcher.queue_revert(
+            "S-A",
+            Err(DispatchFailure {
+                sid: "S-A".into(),
+                message: "revert refused".into(),
+            }),
+        );
+
+        let id = submit(&fx, "h-revert-fail");
+        let token = issue_token(&fx, &id);
+        let outcome = fx.coordinator.activate(&id, &token, "c").expect("activate");
+        match outcome {
+            ActivationOutcome::RolledBackOnFailure { reverted_sids, .. } => {
+                assert!(
+                    !reverted_sids.contains(&"S-A".to_string()),
+                    "a SID whose revert failed was not reverted",
+                );
+            }
+            other => panic!("expected RolledBackOnFailure, got {other:?}"),
+        }
+        let rec = fx.coordinator.load_record(&id).expect("load");
+        let reason = rec.rejected_reason.unwrap_or_default();
+        assert!(
+            reason.contains("revert failed"),
+            "the rejection reason must say the machine was not fully put back: {reason}",
+        );
     }
 
     #[test]

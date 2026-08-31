@@ -26,10 +26,13 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
-    // Unknown feature or missing profile → true (show it).
+    // Unknown feature or missing profile → true (show it), which is why the
+    // stub above must carry EVERY flag the contract declares — a missing
+    // inversion silently read as "supported" on the very platform that lacks
+    // it. `platform_profile_stub_matches_the_contract` pins the two together.
     function supports(feature) {
         if (!platformProfile || !platformProfile.supports) return true
         return platformProfile.supports[feature] !== false
@@ -92,7 +95,7 @@ ApplicationWindow {
     // launcher's `backend_factory::create_backend()` probe. Shape:
     //   { kind: "connected" | "connecting" | "disconnected"
     //         | "service-stopped" | "service-not-installed"
-    //         | "protocol-mismatch",
+    //         | "protocol-mismatch" | "refused",
     //     lastError?: string,
     //     serverVersion?: int, clientVersion?: int }
     // The banner reads `kind` to decide visibility + colour; the live
@@ -382,6 +385,21 @@ ApplicationWindow {
         // ALL internet is cut, not just routed sites. Non-dismissible — it mirrors
         // a live, deliberately-chosen dangerous setting and clears the moment the
         // user turns it off (or picks the best-effort variant).
+        // The service is up and turned this window away. Nothing here retries
+        // itself, so the notice explains what actually restores the link.
+        if (((backendStatus || {}).kind) === "refused") {
+            out.push({
+                "id": "service-refused",
+                "severity": "warning",
+                "dismissible": false,
+                "title": tr("notifications.service-refused.title",
+                    "The service will not accept this app"),
+                "body": tr("notifications.service-refused.body",
+                    "The background service is running, but it refused a connection from this account. That usually means the service was installed by a different user, or it is already serving as many connections as it allows. Reinstalling the service as an administrator, or signing in as the account that installed it, restores the link.")
+                    + (String((backendStatus || {}).lastError || "") !== ""
+                        ? " (" + String(backendStatus.lastError) + ")" : "")
+            })
+        }
         if (strictKillSwitchActive) {
             out.push({
                 "id": "strict-killswitch",
@@ -965,6 +983,12 @@ ApplicationWindow {
                 return tr(
                     "connection.banner.protocol-mismatch",
                     "Service version mismatch — please update")
+            case "refused":
+                // The service is running and said no — retrying changes
+                // nothing, so the banner asks for the one thing that can.
+                return tr(
+                    "connection.banner.refused",
+                    "The background service refused this connection")
             default:
                 return ""
         }
@@ -1032,6 +1056,7 @@ ApplicationWindow {
     // Exposed for flows/DriftController (drift + merge dialogs it drives).
     property alias driftDetectionDialog: driftDetectionDialog
     property alias mergeReviewDialog: mergeReviewDialog
+    property alias rulesOverlapCleanupDialog: rulesOverlapCleanupDialog
     // The single post-connect "what piled up while the service was stopped"
     // dialog, driven by the window's backlog collector.
     property alias offlineBacklogDialog: offlineBacklogDialog
@@ -1255,6 +1280,109 @@ ApplicationWindow {
         if (id === "settings") return tr("section.settings", "Settings")
         return id
     }
+
+    // ── Overlapping rules ────────────────────────────────────────────────────
+    //
+    // A wildcard rule covers the apex and every subdomain under it, so an
+    // exact rule beneath the same wildcard usually does nothing. The service
+    // used to warn about these on every apply, which is noise on a path the
+    // user did not open for that. They belong here instead: a count on the
+    // rules screen, and a dialog that removes the spare ones once.
+    //
+    // `rules_overlap::find_overlaps` (Rust) decides which pairs are spare —
+    // never QML.
+
+    /// Pairs from the last `local.rules-overlaps` pass.
+    property var rulesOverlapPairs: []
+    property bool _rulesOverlapInFlight: false
+
+    /// Stable key for one pair, as stored in `prefs.rulesOverlapKeepSig`.
+    function overlapPairKey(pair) {
+        if (!pair) return ""
+        return String(pair["apex-route"]) + ":" + String(pair.apex)
+            + ">" + String(pair["covered-route"]) + ":" + String(pair["covered-host"])
+    }
+    function _overlapKeptKeys() {
+        var raw = String((prefs && prefs.rulesOverlapKeepSig) || "")
+        return raw === "" ? [] : raw.split("|")
+    }
+    function overlapPairKept(pair) {
+        return _overlapKeptKeys().indexOf(overlapPairKey(pair)) >= 0
+    }
+    /// Pairs the cleanup would act on: spare, and not already kept on purpose.
+    function overlapActionablePairs() {
+        var kept = _overlapKeptKeys()
+        var out = []
+        for (var i = 0; i < rulesOverlapPairs.length; i += 1) {
+            var pair = rulesOverlapPairs[i]
+            if (!pair || pair.redundant !== true) continue
+            if (kept.indexOf(overlapPairKey(pair)) >= 0) continue
+            out.push(pair)
+        }
+        return out
+    }
+    readonly property int rulesOverlapActionableCount:
+        uiRevision >= 0 ? overlapActionablePairs().length : 0
+
+    /// Remember "leave this pair alone" so the cleanup stops offering it.
+    /// Written straight through: this is a decision, not a buffered setting.
+    function keepOverlapPairs(keys) {
+        var kept = _overlapKeptKeys()
+        for (var i = 0; i < (keys || []).length; i += 1) {
+            if (kept.indexOf(keys[i]) < 0) kept.push(keys[i])
+        }
+        updatePrefs({ rulesOverlapKeepSig: kept.join("|") })
+        emitPrefs()
+    }
+
+    /// Recompute the overlap set from the rules currently on screen.
+    function refreshRulesOverlaps() {
+        if (_rulesOverlapInFlight) return
+        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.rpcRulesOverlaps !== "function") {
+            return
+        }
+        var rulesJson = _buildRulesJsonFromModel()
+        if (!rulesJson) return
+        _rulesOverlapInFlight = true
+        var corr = nrrNativeBridge.rpcRulesOverlaps(rulesJson)
+        rpc.registerRpcCallback(corr, function(ok, payload) {
+            _rulesOverlapInFlight = false
+            rulesOverlapPairs = (ok && payload && payload.pairs) ? payload.pairs : []
+        })
+    }
+
+    /// Delete the covered (exact) rule of each named pair. Ordinary local
+    /// edits — the user applies them through the normal review flow, so a
+    /// cleanup can never change what is enforced behind their back.
+    function removeOverlapPairs(keys) {
+        var wanted = {}
+        for (var i = 0; i < (keys || []).length; i += 1) wanted[keys[i]] = true
+        var victims = {}
+        for (var p = 0; p < rulesOverlapPairs.length; p += 1) {
+            var pair = rulesOverlapPairs[p]
+            if (!wanted[overlapPairKey(pair)]) continue
+            victims[String(pair["covered-route"]) + ":" + String(pair["covered-rule-id"])] = true
+        }
+        var removed = 0
+        for (var r = rulesModel.count - 1; r >= 0; r -= 1) {
+            var row = rulesModel.get(r)
+            var route = (String(row.targetRoute) === "primary") ? "primary" : "secondary"
+            if (victims[route + ":" + String(row.id || "")]) {
+                rulesModel.remove(r)
+                removed += 1
+            }
+        }
+        if (removed > 0) {
+            selectedRule = -1
+            _recomputeRulesDirty()
+            statusLine = tr("status.rules-overlap-removed",
+                "{n} rule(s) removed as already covered. Apply to put the change into effect.")
+                .replace("{n}", String(removed))
+        }
+        refreshRulesOverlaps()
+    }
+
 
     // ── the two "rules changed" states ──────────────────────────────────
     //
@@ -3185,6 +3313,17 @@ ApplicationWindow {
                 // service is still without our binding.
                 if (bridgeAvailable)
                     Qt.callLater(routePolicyController.resyncRouteBindingOnAdapterChange)
+                break
+            case "push-gap":
+                // The client dropped at least one event because this window was
+                // not draining fast enough, so anything derived from pushes may
+                // be behind. Re-read the live state rather than carry on from a
+                // stream with a hole in it.
+                if (bridgeAvailable) {
+                    Qt.callLater(interfacesRolesController.refreshInterfacesFromService)
+                    Qt.callLater(function() { _refreshRulesFromService({ silent: true }) })
+                    _adaptersChangedSnapshotRefreshTimer.restart()
+                }
                 break
             default:
                 console.log("push: unknown event type", type)
@@ -5332,6 +5471,7 @@ ApplicationWindow {
             // fall back to the remembered file when offline, so a user
             // without a running service still sees their rules; drift
             // detection reconciles file-vs-service once the service connects.
+            _forgetStaleFactoryRulesBinding()
             _hydrateRulesOnLaunch()
         }
         // Cold-start check for offline work parked in a previous session.
@@ -5420,16 +5560,7 @@ ApplicationWindow {
     function _hydrateRulesOnLaunch() {
         var kind = String((backendStatus || {}).kind || "")
         if (kind === "connected") {
-            _refreshRulesFromService({ silent: true, onComplete: function(ok) {
-                // The service answered but holds no rules (fresh install, wiped
-                // state DB) — or did not answer at all. Either way the table
-                // would stay empty while a rule set sits selected right above
-                // it, so fall back to the same file hydration an offline start
-                // does. A service that DOES hold rules keeps ownership: this
-                // never overwrites a non-empty revision.
-                if (prefs.autoLoadRulesOnLaunch === false) return
-                if (!rulesModel || rulesModel.count === 0) _runAutoOpenOnLaunch()
-            } })
+            _coldStartRulesFetch()
             return
         }
         // Two kinds mean nobody is going to answer the pipe right now:
@@ -5440,8 +5571,11 @@ ApplicationWindow {
         // "connecting"/"disconnected" — where the service may still answer —
         // defer to the bounded fallback below, which is what keeps a stale file
         // from being diffed against a live revision mid-boot.
+        // A refusal belongs with them: the service is up, but it will not talk
+        // to this window, so waiting for it to answer is waiting for nothing.
         var serviceMayAnswer = (kind !== "service-not-installed"
-            && kind !== "service-stopped")
+            && kind !== "service-stopped"
+            && kind !== "refused")
         if (serviceMayAnswer) {
             if (prefs.autoLoadRulesOnLaunch === false) return
             // Defer the file fallback so we don't diff a stale file against the
@@ -5450,6 +5584,46 @@ ApplicationWindow {
             return
         }
         if (prefs.autoLoadRulesOnLaunch !== false) _runAutoOpenOnLaunch()
+    }
+
+    /// Pull the service's rules at cold start, and decide from the ANSWER —
+    /// never from the model — whether the bound file has to stand in.
+    ///
+    /// Two outcomes look identical in `rulesModel.count` and are not the same
+    /// fact: the service answered "no rules", and nobody asked it. The second
+    /// happens on every launch, because the Qt host's IPC client is still
+    /// coming up when `Component.onCompleted` runs and `_refreshRulesFromService`
+    /// returns `false` without a request. Reading that as "the service holds
+    /// nothing" loaded the bound .txt over a live revision and offered to
+    /// delete from the service every rule the file lagged behind on.
+    /// `_serviceRuleCount` is the authoritative answer (−1 until a fetch lands).
+    function _coldStartRulesFetch() {
+        _refreshRulesFromService({ silent: true, onComplete: function(ok) {
+            if (prefs.autoLoadRulesOnLaunch === false) return
+            if (ok) {
+                // Answered, and it really holds nothing (fresh install, wiped
+                // state DB): the table would sit empty under a selected rule
+                // set, so hydrate from the file the way an offline start does.
+                if (_serviceRuleCount === 0) _runAutoOpenOnLaunch()
+                return
+            }
+            _coldStartRulesRetryTimer.restart()
+        } })
+    }
+
+    // Retry chain for the fetch above. Bounded: a bridge that never comes up
+    // leaves the table empty, which is honest — the 6 s fallback below owns the
+    // genuinely-offline case.
+    Timer {
+        id: _coldStartRulesRetryTimer
+        interval: 1000
+        repeat: false
+        property int tries: 0
+        onTriggered: {
+            if (window._serviceRuleCount >= 0 || tries >= 20) return
+            tries += 1
+            window._coldStartRulesFetch()
+        }
     }
 
     // Bounded fallback for _hydrateRulesOnLaunch: if the
@@ -5484,8 +5658,8 @@ ApplicationWindow {
     ///   5. nothing remembered at all → the rule set the quick-load dropdown is
     ///      pointing at (`defaultRuleSetPathFor`), so a first launch — or one
     ///      whose bindings were lost — shows rules instead of an empty table.
-    /// Demo rules bind no path at all, so they correctly resolve to "" and the
-    /// Source row stays hidden.
+    /// Only when even that resolves to nothing (no set anywhere to name) does
+    /// the file row above the table disappear.
     function rulesSourcePathFor(route) {
         var remembered = _rememberedRulesPathFor(route)
         if (remembered !== "") return remembered
@@ -5495,21 +5669,54 @@ ApplicationWindow {
     /// Steps 1–4 above: a path the user's own actions put on record. Split out
     /// because the "Source:" row needs to tell "a file backs these rules" apart
     /// from "this is what a load would pull in", which step 5 answers.
+    ///
+    /// Once the user keeps a rule-set folder of their own, a path in the tree
+    /// shipped with the app is not one of their actions — it is what the app's
+    /// own hydration put on record back when it still bound the files it read.
+    /// Returning it names a set the user never chose, and because the
+    /// cold-start fallback loads whatever this returns, it eventually puts that
+    /// set on screen over theirs.
     function _rememberedRulesPathFor(route) {
-        return Pure.rememberedRulesPathFor(prefs, route, userPresetsDir)
+        var path = Pure.rememberedRulesPathFor(prefs, route, userPresetsDir)
+        if (path !== "" && userPresetsDir !== "" && isFactoryPresetPath(path)) {
+            return ""
+        }
+        return path
     }
 
-    /// What the "Source:" row shows for `route`. Same answer as
-    /// `rulesSourcePathFor` while a remembered path exists. With nothing
-    /// remembered it names the set that WOULD load only while the table is
-    /// empty: once rules are on screen without a file behind them (the demo
-    /// set, rules typed by hand), naming a file the user is not looking at
-    /// would be a lie — the row stays hidden instead.
-    function rulesSourceDisplayPathFor(route) {
-        var remembered = _rememberedRulesPathFor(route)
-        if (remembered !== "") return remembered
-        if (rulesModel && rulesModel.count > 0) return ""
-        return defaultRuleSetPathFor(route)
+    /// Drop such a binding from prefs instead of only ignoring it above, so the
+    /// stored state stops disagreeing with what the window shows. Runs once per
+    /// launch before hydration; a no-op for everyone whose paths are their own.
+    function _forgetStaleFactoryRulesBinding() {
+        if (userPresetsDir === "") return
+        var patch = {}
+        var routes = [["lastLoadedPathPrimary", "lastSavedPathPrimary"],
+                      ["lastLoadedPathSecondary", "lastSavedPathSecondary"]]
+        for (var i = 0; i < routes.length; i += 1) {
+            for (var k = 0; k < routes[i].length; k += 1) {
+                var key = routes[i][k]
+                if (isFactoryPresetPath(prefs[key])) patch[key] = ""
+            }
+        }
+        if (String(prefs.selectedPresetSet || "").indexOf("bundled:") === 0
+                && _ruleSetEnum().userOwned) {
+            patch.selectedPresetSet = ""
+        }
+        var touched = false
+        for (var p in patch) { touched = true; break }
+        if (!touched) return
+        updatePrefs(patch)
+        emitPrefs()
+    }
+
+    /// Did the user's own load or save put the shown path on record, or is it
+    /// merely the set the quick-load points at? The file row stays visible
+    /// either way — someone who keeps rule files wants to see WHICH ones at a
+    /// glance — so this is what lets it label the two cases apart instead of
+    /// claiming rules came from a file nobody opened.
+    function rulesSourceIsUserBound() {
+        return _rememberedRulesPathFor("primary") !== ""
+            || _rememberedRulesPathFor("secondary") !== ""
     }
 
     /// Enumerated rule sets — the ONE list behind both the quick-load dropdown
@@ -5695,21 +5902,20 @@ ApplicationWindow {
     /// Make the quick-load dropdown name the set whose rules are actually on
     /// screen. Derived from the loaded path when there is one — a remembered
     /// path is the stronger fact, and without this step the dropdown would go
-    /// on showing its default pick while different rules sit below it. Falls
-    /// back to the set the hydration chose when no path was remembered at all.
+    /// on showing its default pick while different rules sit below it.
     /// A choice the user made by hand is never overwritten, and a rules file
-    /// outside every known set leaves the dropdown alone.
+    /// outside every known set leaves the dropdown alone. With no path
+    /// remembered at all this persists NOTHING: the dropdown already shows the
+    /// default pick, and freezing that pick into prefs recorded a choice the
+    /// user never made (it then outlived the hydration and overrode the
+    /// folder they configured later).
     function _rememberHydratedRuleSet() {
         if (String(prefs.selectedPresetSet || "") !== "") return
         var primary = _rememberedRulesPathFor("primary")
         var secondary = _rememberedRulesPathFor("secondary")
-        var idx = -1
-        if (primary !== "" || secondary !== "") {
-            idx = _ruleSetIndexForPath(primary)
-            if (idx < 0) idx = _ruleSetIndexForPath(secondary)
-        } else {
-            idx = defaultRuleSetIndex()
-        }
+        if (primary === "" && secondary === "") return
+        var idx = _ruleSetIndexForPath(primary)
+        if (idx < 0) idx = _ruleSetIndexForPath(secondary)
         var key = ruleSetSelectionKey(idx)
         if (key === "") return
         updatePrefs({ selectedPresetSet: key })
@@ -7083,6 +7289,14 @@ ApplicationWindow {
             if (p.type === "" || p.value === "" || p.route === "") continue
             active.push({ type: p.type, value: p.value, route: p.route })
         }
+        // An empty keep-set deletes every stored comment, and this sweep cannot
+        // tell "the user removed all their rules" from "the table is not filled
+        // yet". Both of its call sites run while the model is legitimately
+        // empty — the cold start, and a refresh that came back with nothing —
+        // so the automatic sweep stands down. Clearing comments after a
+        // deliberate wipe stays available through the Settings button, which
+        // asks for the same GC with the user standing behind it.
+        if (active.length === 0) return
         var corr = nrrNativeBridge.rpcSidecarCommentGc(active)
         rpcTransport.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) {
@@ -7857,6 +8071,19 @@ ApplicationWindow {
         onCancelled: { /* banner stays until resolved */ }
         onConfirmed: function(resolutions) { driftController._applyMerge(resolutions) }
     }
+
+    // Cleanup for exact rules a wildcard already covers. Opened from the rules
+    // screen; the pairs come from `local.rules-overlaps`.
+    RulesOverlapCleanupDialog {
+        id: rulesOverlapCleanupDialog
+        ownerRoot: window
+        onRemoveRequested: function(keys) { window.removeOverlapPairs(keys) }
+        onKeepRequested: function(keys) {
+            window.keepOverlapPairs(keys)
+            rulesOverlapCleanupDialog.selectAllActionable()
+        }
+    }
+
 
     /// Read-only diff of the rules ON SCREEN against the service's active
     /// revision. Shared by the post-connect dialog's "Preview" and any other

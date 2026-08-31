@@ -22,8 +22,9 @@ pub mod service;
 pub use dto::{
     audit_write_status_to_str, AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter,
     CacheHealthCard, ClearLogsRequest, ClearLogsResult, DiagnosticModeStateDto,
-    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
-    SecurityStatusCard, ServiceHealthCard, SetDiagnosticModeRequest,
+    DiagnosticsDataOrigin, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard,
+    SecurityAlertDto, SecurityAlertsView, SecurityStatusCard, ServiceHealthCard,
+    SetDiagnosticModeRequest,
 };
 pub use mock::{MockDiagnosticsFacade, MockScenario};
 pub use pagination::{PageCursor, PageResult, PaginationParams, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE};

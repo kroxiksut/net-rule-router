@@ -230,6 +230,31 @@ impl HealthAggregator {
         }
     }
 
+    /// Seed a component that has not reported yet. The seed exists to move a
+    /// component off `Unknown` (which the derived state maps to `Starting`), so
+    /// it must never overwrite something already said — a `Blocking` recorded
+    /// while a task came up, or a bootstrap `Degraded`, is a verdict, and
+    /// `Diagnostics` in particular is written once and never again.
+    pub fn record_initial(
+        &self,
+        component: HealthComponent,
+        severity: ServiceHealthSeverity,
+        message: impl Into<String>,
+    ) {
+        let now = epoch_secs();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .components
+                .entry(component)
+                .or_insert_with(|| HealthComponentSnapshot {
+                    component,
+                    severity,
+                    message: message.into(),
+                    updated_at_epoch_secs: now,
+                });
+        }
+    }
+
     /// Record a complete bootstrap report. Maps each phase severity to
     /// its component (storage/policy/diagnostics) and records the
     /// worst severity per component so the GUI's storage card reflects
@@ -432,6 +457,43 @@ mod tests {
         // Worst severity is Unknown because no component has reported
         // anything yet.
         assert_eq!(snap.worst_severity, ServiceHealthSeverity::Unknown);
+    }
+
+    #[test]
+    fn a_seed_fills_a_gap_but_never_overwrites_a_verdict() {
+        // Startup seeded `Ok "task spawned"` unconditionally, so a bootstrap
+        // `Degraded` on Diagnostics — the one component nothing writes again —
+        // was lost for the lifetime of the service.
+        let agg = HealthAggregator::new();
+        agg.record(
+            HealthComponent::Diagnostics,
+            ServiceHealthSeverity::Degraded,
+            "log directory not writable",
+        );
+        agg.record_initial(
+            HealthComponent::Diagnostics,
+            ServiceHealthSeverity::Ok,
+            "task spawned",
+        );
+        agg.record_initial(
+            HealthComponent::Ipc,
+            ServiceHealthSeverity::Ok,
+            "task spawned",
+        );
+        let snap = agg.snapshot();
+        let diagnostics = snap
+            .components
+            .iter()
+            .find(|c| c.component == HealthComponent::Diagnostics)
+            .expect("diagnostics component");
+        assert_eq!(diagnostics.severity, ServiceHealthSeverity::Degraded);
+        assert_eq!(diagnostics.message, "log directory not writable");
+        let ipc = snap
+            .components
+            .iter()
+            .find(|c| c.component == HealthComponent::Ipc)
+            .expect("ipc component");
+        assert_eq!(ipc.severity, ServiceHealthSeverity::Ok, "a gap is filled");
     }
 
     #[test]

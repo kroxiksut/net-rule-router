@@ -66,16 +66,29 @@ GroupBox {
         }
         return arr
     }
+    // Only ask while the service is actually reachable. Asking a service that
+    // is not there parked "Could not load the mute list: Service is offline" in
+    // the status line — and nothing cleared it once the service came up, so the
+    // message outlived the condition it described. The red backend banner
+    // already says the service is offline; this surface adds nothing by
+    // repeating it.
+    readonly property bool _serviceReachable:
+        root.bridgeAvailable && !!root.backendStatus
+        && root.backendStatus.kind === "connected"
+
     function _loadBlockNoticeMutes() {
-        if (group._blockNoticeMutesLoading || !root.bridgeAvailable) return
+        if (group._blockNoticeMutesLoading || !group._serviceReachable) return
         var corr = root.rpc.rpcBlockNoticeMutesList()
         if (!corr) return
         group._blockNoticeMutesLoading = true
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             group._blockNoticeMutesLoading = false
             if (!ok) {
-                root.statusLine = root.tr("settings.block-notices.mutes.load-failed",
-                    "Could not load the mute list: ") + String(msg || code || "")
+                // A connection that dropped mid-call is the banner's business,
+                // not ours; anything else is a real failure worth naming.
+                if (String(code) !== "transport-disconnected")
+                    root.statusLine = root.tr("settings.block-notices.mutes.load-failed",
+                        "Could not load the mute list: ") + root.ipcErrorLabel(code)
                 return
             }
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
@@ -88,7 +101,7 @@ GroupBox {
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 root.statusLine = root.tr("settings.block-notices.mutes.remove-failed",
-                    "Could not remove the mute: ") + String(msg || code || "")
+                    "Could not remove the mute: ") + root.ipcErrorLabel(code)
                 return
             }
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
@@ -101,7 +114,7 @@ GroupBox {
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 root.statusLine = root.tr("settings.block-notices.mutes.clear-failed",
-                    "Could not clear the mutes: ") + String(msg || code || "")
+                    "Could not clear the mutes: ") + root.ipcErrorLabel(code)
                 return
             }
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
@@ -116,7 +129,7 @@ GroupBox {
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 root.statusLine = root.tr("settings.block-notices.add.failed",
-                    "Could not add the mute: ") + String(msg || code || "")
+                    "Could not add the mute: ") + root.ipcErrorLabel(code)
                 return
             }
             group._blockNoticeMutes = group._normalizeBlockNoticeMutes((p && p.mutes) || [])
@@ -124,6 +137,14 @@ GroupBox {
         })
     }
     Component.onCompleted: group._loadBlockNoticeMutes()
+    // The panel usually opens before the service answers, so the first attempt
+    // is a no-op; this is what makes the list appear once it does.
+    Connections {
+        target: root
+        function onBackendStatusChanged() {
+            if (group._serviceReachable) group._loadBlockNoticeMutes()
+        }
+    }
 
     function _blockNoticeAddScopeLabel(slug) {
         switch (String(slug)) {

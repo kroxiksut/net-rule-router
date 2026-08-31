@@ -212,6 +212,8 @@ pub mod service {
     pub const STORAGE_UNAVAILABLE: ReasonCode = ReasonCode("service.storage_unavailable");
     /// The IPC endpoint became unavailable.
     pub const IPC_UNAVAILABLE: ReasonCode = ReasonCode("service.ipc_unavailable");
+    /// A privileged IPC request was admitted for execution.
+    pub const IPC_PRIVILEGED_REQUEST: ReasonCode = ReasonCode("service.ipc_privileged_request");
     /// The aggregate service health status changed.
     pub const HEALTH_CHANGED: ReasonCode = ReasonCode("service.health_changed");
 }
@@ -485,6 +487,14 @@ pub fn reason_code_meta(code: ReasonCode) -> Option<ReasonCodeMeta> {
             "diag.service.ipc_unavailable.summary",
             false,
         ),
+        // `audit_required`: this code exists BECAUSE the request is audited -
+        // the router refuses the operation when the record cannot be written.
+        "service.ipc_privileged_request" => (
+            Lvl::Info,
+            Cat::Service,
+            "diag.service.ipc_privileged_request.summary",
+            true,
+        ),
         "service.health_changed" => (
             Lvl::Info,
             Cat::Service,
@@ -588,6 +598,7 @@ pub const ALL_REASON_CODES: &[ReasonCode] = &[
     service::DEGRADED_MODE,
     service::STORAGE_UNAVAILABLE,
     service::IPC_UNAVAILABLE,
+    service::IPC_PRIVILEGED_REQUEST,
     service::HEALTH_CHANGED,
     diagnostics::MODE_ENABLED,
     diagnostics::MODE_DISABLED,

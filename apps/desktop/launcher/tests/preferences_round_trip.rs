@@ -44,6 +44,35 @@ fn payload_with_theme(theme_mode: &str, accessibility_high_contrast: bool) -> St
     serde_json::Value::Object(object).to_string()
 }
 
+/// A payload missing a key must leave that setting ALONE. Nineteen fields used
+/// to be mandatory: one absent key failed the parse outright, and the launcher
+/// then wrote its start-up baseline back over the file — a forgotten key in one
+/// QML build cost the user every setting of that session.
+#[test]
+fn a_payload_missing_a_key_leaves_that_setting_untouched() {
+    let baseline = UiPreferences {
+        theme_mode: ThemeMode::Dark,
+        tooltips_enabled: false,
+        ..Default::default()
+    };
+    // Everything except `themeMode` and `tooltipsEnabled`.
+    let full = payload_with_theme("light", false);
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&full).expect("payload parses");
+    object.remove("themeMode");
+    object.remove("tooltipsEnabled");
+    let partial = serde_json::Value::Object(object).to_string();
+
+    let updated = apply_qt_preferences_payload(&baseline, &partial)
+        .expect("a payload missing a key must still parse");
+    assert_eq!(
+        updated.theme_mode,
+        ThemeMode::Dark,
+        "an absent key is 'not reported', not 'reset to the default'"
+    );
+    assert!(!updated.tooltips_enabled);
+}
+
 #[test]
 fn dark_theme_round_trips_through_payload() {
     let baseline = UiPreferences::default();
@@ -586,15 +615,20 @@ fn a_surface_that_emitted_a_payload_persists_it() {
     assert_eq!(persisted.theme_mode, ThemeMode::Dark);
 }
 
-/// An unusable payload keeps the baseline rather than dropping the write: the
-/// surface did emit, so it is a participant in this session's file.
+/// An unusable payload writes NOTHING. The baseline is what this process read
+/// at start-up, so persisting it would discard whatever the other surface (the
+/// tray, or a window that outlived it) recorded since — a payload we could not
+/// parse is a reason to know less, not a licence to overwrite with an older
+/// picture. The same line of output can be a truncated last line from a killed
+/// host, which is exactly when the file must be left alone.
 #[test]
-fn an_unparsable_payload_falls_back_to_the_baseline() {
+fn an_unparsable_payload_writes_nothing() {
     let baseline = UiPreferences {
         theme_mode: ThemeMode::Dark,
         ..Default::default()
     };
-    let persisted = nrr_launcher::preferences_to_persist(baseline, Some("not-json".to_string()))
-        .expect("an emitted payload must still produce a write");
-    assert_eq!(persisted.theme_mode, ThemeMode::Dark);
+    assert!(
+        nrr_launcher::preferences_to_persist(baseline, Some("not-json".to_string())).is_none(),
+        "a payload that cannot be applied must not trigger a write"
+    );
 }

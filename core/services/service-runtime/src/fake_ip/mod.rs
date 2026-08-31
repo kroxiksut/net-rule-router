@@ -63,9 +63,8 @@ pub use production_ports::{
     RuleBookRouteSelector,
 };
 pub use relay::{
-    FixedRouteSelector, RelayCore, RelayDecision, RelaySession, RouteSelector, SessionTable,
-    StaticUpstreamResolver, UpstreamAddressResolver, DEFAULT_SESSION_CAPACITY,
-    DEFAULT_SESSION_IDLE_MS,
+    FixedRouteSelector, RelayCore, RelayDecision, RouteSelector, StaticUpstreamResolver,
+    UpstreamAddressResolver, DEFAULT_SESSION_IDLE_MS,
 };
 pub use self_heal::{
     probe_and_heal, HealPersistFn, HealVerdict, RuntimeHostExclusions, VpnSelfHealObserver,

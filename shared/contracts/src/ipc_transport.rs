@@ -158,6 +158,13 @@ pub enum IpcOperationClass {
     /// commit *its own* rules. Editing the admin baseline still goes through
     /// [`Self::MutationRequest`] (elevation required).
     UserScopedMutation,
+    /// Erasing data that belongs to the MACHINE rather than to the caller.
+    /// Requires elevation for the plain reason that the caller is deciding for
+    /// everyone: traffic totals come from adapter counters, which carry no user
+    /// dimension at all, so "clear mine" is not a thing the data supports.
+    /// Single-step — there is nothing to dry-run, only something to confirm in
+    /// the UI before asking for rights.
+    MachineScopedAction,
 }
 
 /// Editing the policy every user falls back to. The one operation where a
@@ -169,6 +176,10 @@ pub const ACTION_RECOVER_NETWORK: &str = "netrulerouter.recover-network";
 /// Turning protection off on purpose. Named apart from recovery because an
 /// administrator may well allow one and not the other.
 pub const ACTION_DISABLE_PROTECTION: &str = "netrulerouter.disable-protection";
+/// Wiping data the whole machine shares. Named apart from the three above
+/// because it destroys history rather than changing policy, and an
+/// administrator may well take a different view of the two.
+pub const ACTION_CLEAR_SHARED_DATA: &str = "netrulerouter.clear-shared-data";
 
 impl IpcOperationClass {
     /// Whether this class flows through the single-writer mutation queue.
@@ -182,7 +193,8 @@ impl IpcOperationClass {
             | Self::RecoveryAction
             | Self::SafeDisable
             | Self::UserScopedConfiguration
-            | Self::UserScopedMutation => true,
+            | Self::UserScopedMutation
+            | Self::MachineScopedAction => true,
         }
     }
 
@@ -204,6 +216,7 @@ impl IpcOperationClass {
             Self::MutationRequest | Self::ReviewConfirmation => Some(ACTION_EDIT_BASELINE),
             Self::RecoveryAction => Some(ACTION_RECOVER_NETWORK),
             Self::SafeDisable => Some(ACTION_DISABLE_PROTECTION),
+            Self::MachineScopedAction => Some(ACTION_CLEAR_SHARED_DATA),
             Self::ReadSnapshot
             | Self::DiagnosticQuery
             | Self::DiagnosticAction
@@ -248,6 +261,7 @@ impl IpcOperationClass {
             Self::SafeDisable => "safe-disable",
             Self::UserScopedConfiguration => "user-scoped-configuration",
             Self::UserScopedMutation => "user-scoped-mutation",
+            Self::MachineScopedAction => "machine-scoped-action",
         }
     }
 }
@@ -339,10 +353,8 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         | IpcOperationName::StorageUsageGet
         | IpcOperationName::RoutingPauseGet
         | IpcOperationName::AutostartGet
-        // All read-only diagnostics ops + the export (which writes a derived
-        // artifact but does not mutate domain state).
+        // All read-only diagnostics ops.
         | IpcOperationName::ExplainGet
-        | IpcOperationName::DiagnosticsExportArchive
         | IpcOperationName::ServiceStabilityConfigGet
         // Read-only preset export.
         | IpcOperationName::PresetExportGet
@@ -398,28 +410,37 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // Log/audit retention write, service-global settings class.
         | IpcOperationName::LogRetentionConfigSet
         | IpcOperationName::ServiceStabilityConfigSet => IpcOperationClass::UserScopedConfiguration,
-        // LogsClear is a destructive maintenance op but does not mutate routing
-        // policy or rules — same class as the other settings writes.
-        IpcOperationName::LogsClear => IpcOperationClass::UserScopedConfiguration,
-        // CacheClear clears the rebuildable FQDN/IP cache — same class as the
-        // other GUI-only maintenance / settings writes.
-        IpcOperationName::CacheClear => IpcOperationClass::UserScopedConfiguration,
-        // DiagnosticModeSet toggles an in-memory diagnostic session; a
-        // GUI-only maintenance command, same envelope class.
-        IpcOperationName::DiagnosticModeSet => IpcOperationClass::UserScopedConfiguration,
-        // DoH resolver baseline replace. Machine-wide config write; the
-        // elevation gate lives in the catalog
-        // (`requires_service_mutation_privilege`), the envelope class matches the
-        // other settings writes.
+        // Maintenance of what the service OBSERVED, not of what it enforces:
+        // clearing operational logs, discarding the rebuildable FQDN/IP cache,
+        // toggling an in-memory diagnostic session. Mutating and queued like the
+        // settings writes, but they configure nothing, which is the distinction
+        // `DiagnosticAction` names.
+        IpcOperationName::LogsClear
+        | IpcOperationName::CacheClear
+        | IpcOperationName::DiagnosticModeSet
+        // The export writes a FILE, and at `redaction-level: diagnostics` that
+        // file holds unredacted hostnames, addresses and an audit summary. As a
+        // read it was not audited at all, while `DiagnosticModeSet` — which
+        // lifts the same redaction for on-screen viewers only — was. Same
+        // class: no elevation, no token, but a record that it happened.
+        | IpcOperationName::DiagnosticsExportArchive => IpcOperationClass::DiagnosticAction,
+        // DoH resolver baseline replace. Machine-wide config write kept at the
+        // settings class. NOTE: `requires_service_mutation_privilege` in the
+        // catalog is a declaration, not a gate — nothing reads it at runtime, so
+        // it must not be cited as one.
         IpcOperationName::DohResolversSet => IpcOperationClass::UserScopedConfiguration,
         // Opt-in browser-history seed; a GUI-only maintenance command like
         // CacheClear / DiagnosticModeSet.
         IpcOperationName::SeedFromBrowserHistory => IpcOperationClass::UserScopedConfiguration,
         // Service-global traffic-stats settings write / reset (admin-gated in
         // the catalog); same envelope class as other settings writes.
-        IpcOperationName::TrafficStatsSet | IpcOperationName::TrafficStatsClear => {
-            IpcOperationClass::UserScopedConfiguration
-        }
+        // Traffic-stats settings write. Machine-global, but a settings write, not
+        // a wipe — it stays where the other settings writes are.
+        IpcOperationName::TrafficStatsSet => IpcOperationClass::UserScopedConfiguration,
+        // Wiping the traffic ledger. The numbers come from adapter counters and
+        // carry no user dimension, so this erases everyone's history — and the
+        // caller must hold the rights to decide that for everyone.
+        IpcOperationName::TrafficStatsClear => IpcOperationClass::MachineScopedAction,
         // Probing the caller's own suggestions writes evidence about them, not
         // policy — but it is still a per-SID action the service performs on the
         // caller's behalf, so it travels the same envelope as their other
@@ -458,8 +479,16 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // through the same authoring path AutoRuleCandidatesAccept uses —
         // same per-SID user-configuration class.
         IpcOperationName::BlockNoticeRouteToSecondary => IpcOperationClass::UserScopedConfiguration,
-        // Full reset purges the caller's OWN auxiliary state — per-SID user
-        // configuration, no elevation, same class as BlockNoticeMutesClear.
+        // Full reset purges the caller's OWN state — per-SID user configuration,
+        // no elevation, same class as BlockNoticeMutesClear. NOT only auxiliary
+        // state: with `include-rules-history` it also drops the caller's
+        // revisions, active pointer and unconsumed mutation tokens. That is
+        // audited (the class is mutating) and GUI-only, but it carries no
+        // dry-run token, while editing a SINGLE rule does. Elevation is the
+        // wrong gate to add here: an elevated relay runs under the ADMIN's
+        // identity, so a standard user's reset would purge the wrong principal.
+        // The gate this wants is a confirmation token, which needs the reset
+        // flow to dry-run first.
         IpcOperationName::PrincipalDataPurge => IpcOperationClass::UserScopedConfiguration,
         // A count of other principals, no identities and no writes.
         IpcOperationName::PrincipalDataCount => IpcOperationClass::ReadSnapshot,
@@ -612,12 +641,14 @@ pub fn ipc_endpoint_security_specs() -> &'static [IpcEndpointSecuritySpec] {
 #[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::{
-        ipc_endpoint_security_specs, IpcAclPrincipal, IpcDegradationBehavior,
-        IpcEndpointAccessClass, IpcEndpointName, IpcErrorCode, IpcFailureMode, IpcOperationClass,
-        IpcTransportKind, ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE, ACTION_RECOVER_NETWORK,
-        IPC_ACL_POLICY, IPC_CALLER_IDENTITY_POLICY, IPC_FAILURE_AND_DEGRADATION_POLICY,
-        IPC_TRANSPORT_KIND, SERVICE_ENDPOINT_ADDRESS,
+        fixed_operation_class, ipc_endpoint_security_specs, IpcAclPrincipal,
+        IpcDegradationBehavior, IpcEndpointAccessClass, IpcEndpointName, IpcErrorCode,
+        IpcFailureMode, IpcOperationClass, IpcTransportKind, ACTION_CLEAR_SHARED_DATA,
+        ACTION_DISABLE_PROTECTION, ACTION_EDIT_BASELINE, ACTION_RECOVER_NETWORK, IPC_ACL_POLICY,
+        IPC_CALLER_IDENTITY_POLICY, IPC_FAILURE_AND_DEGRADATION_POLICY, IPC_TRANSPORT_KIND,
+        SERVICE_ENDPOINT_ADDRESS,
     };
+    use crate::ipc::IpcOperationName;
 
     #[test]
     fn transport_kind_matches_the_host_os_mechanism() {
@@ -738,6 +769,55 @@ mod tests {
             );
             assert!(action.len() > crate::product_identity::PRODUCT_NAME_UNIX.len() + 1);
         }
+    }
+
+    /// A class no operation has is a gate nobody passes through: its rules read
+    /// as policy while enforcing nothing, and the next reader has to grep the
+    /// whole catalog to find that out. Payload-dependent classes are excluded —
+    /// they are reached through [`canonical_operation_class`]'s dry-run branch,
+    /// which this table cannot see.
+    #[test]
+    fn every_fixed_class_is_claimed_by_at_least_one_operation() {
+        for class in [
+            IpcOperationClass::ReadSnapshot,
+            IpcOperationClass::DiagnosticQuery,
+            IpcOperationClass::DiagnosticAction,
+            IpcOperationClass::RecoveryAction,
+            IpcOperationClass::SafeDisable,
+            IpcOperationClass::UserScopedConfiguration,
+            IpcOperationClass::MachineScopedAction,
+        ] {
+            assert!(
+                IpcOperationName::ALL
+                    .iter()
+                    .any(|op| fixed_operation_class(*op) == class),
+                "{class:?} is declared but no operation has it",
+            );
+        }
+    }
+
+    /// Wiping the traffic ledger erases what the whole machine did, because the
+    /// numbers come from adapter counters and carry no user dimension — there is
+    /// no "clear only mine" for this data to give. So it asks for rights, and it
+    /// asks under its own name: an administrator may allow erasing shared
+    /// history while still refusing to let policy be edited.
+    #[test]
+    fn clearing_the_shared_traffic_ledger_needs_rights_of_its_own() {
+        let class = fixed_operation_class(IpcOperationName::TrafficStatsClear);
+        assert_eq!(class, IpcOperationClass::MachineScopedAction);
+        assert!(class.requires_elevation());
+        assert_eq!(class.authorization_action(), Some(ACTION_CLEAR_SHARED_DATA));
+        assert!(class.is_mutating(), "the wipe is audited before it happens");
+        assert!(
+            !class.requires_confirmation_token(),
+            "there is nothing to dry-run — the UI confirms, then rights are asked for"
+        );
+        // Writing the settings is not wiping the history, and must not inherit
+        // the prompt.
+        assert!(
+            !fixed_operation_class(IpcOperationName::TrafficStatsSet).requires_elevation(),
+            "a settings write is not a data wipe"
+        );
     }
 
     /// Every class that needs elevation must be askable about; a class that

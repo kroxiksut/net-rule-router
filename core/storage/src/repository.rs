@@ -349,12 +349,15 @@ pub trait RevisionMetadataRepository {
     /// revision is validated and applied.
     fn set_active_revision(&self, revision_id: &RevisionId) -> StorageResult<()>;
 
-    /// Returns the last-known-good revision id, or `None` if not yet set.
+    /// The revision to roll back to: the most recent one that was active and
+    /// got replaced. `None` when nothing has ever been superseded.
+    ///
+    /// Derived from `revisions`, not stored anywhere — which is why this trait
+    /// has no `set_last_known_good`. There used to be one, and nothing in the
+    /// product ever called it, so the recovery flow always found an empty
+    /// table. A fact that can be read off the revision history must not also be
+    /// maintained by hand.
     fn get_last_known_good(&self) -> StorageResult<Option<RevisionId>>;
-
-    /// Promotes a revision to last-known-good.  Called after a revision has
-    /// been running without incident for the configured grace period.
-    fn set_last_known_good(&self, revision_id: &RevisionId) -> StorageResult<()>;
 
     // ── Integrity ─────────────────────────────────────────────────────────────
 

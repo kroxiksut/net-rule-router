@@ -86,6 +86,7 @@ mod tests {
             category: "service".into(),
             kind: "service.started".into(),
             message_key: "diag.service.started.summary".into(),
+            message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
         }

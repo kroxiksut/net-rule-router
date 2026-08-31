@@ -17,7 +17,7 @@ use crate::ipc::{
 /// Stable English message the client logs / displays. Pinned because
 /// downstream tooling may match on it during deprecation tracking.
 pub const STATUS_UPDATES_POLL_DEPRECATION_MESSAGE: &str =
-    "polling deprecated; use status.updates.subscribe (block 16.3 phase D)";
+    "polling deprecated; use status.updates.subscribe";
 
 #[derive(Default)]
 pub struct StatusUpdatesPollHandler;

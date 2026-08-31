@@ -1,5 +1,5 @@
 use nrr_shared::{
-    load_locale_catalog, AppSection, LogLevel, RouteBehaviorMode, RulesEnabledFilter,
+    load_locale_catalog, AppSection, RouteBehaviorMode, RulesEnabledFilter,
     RulesFileChangeBehavior, RulesTypeFilter, RulesViewSort, ThemeMode,
 };
 use std::env;
@@ -48,6 +48,12 @@ pub const SETTINGS_AUTOSAVE_MIN_SECS: u32 = 15;
 pub const ADMIN_AUTO_REVOKE_MIN_MINUTES: u32 = 1;
 pub const ADMIN_AUTO_REVOKE_MAX_MINUTES: u32 = 180;
 pub const ADMIN_AUTO_REVOKE_DEFAULT_MINUTES: u32 = 15;
+/// Bounds and default for [`UiPreferences::tray_notice_opacity_percent`]. SSOT
+/// for the four places that used to spell `40` and `100` out: this parser, the
+/// `apply_over` clamp, the QML binding and the settings SpinBox.
+pub const TRAY_NOTICE_OPACITY_MIN_PERCENT: u16 = 40;
+pub const TRAY_NOTICE_OPACITY_MAX_PERCENT: u16 = 100;
+
 pub const SETTINGS_AUTOSAVE_MAX_SECS: u32 = 600;
 pub const SETTINGS_AUTOSAVE_DEFAULT_SECS: u32 = 60;
 
@@ -214,6 +220,11 @@ pub struct UiPreferences {
     /// signature → notice re-fires). Empty = never dismissed. Device-local UI
     /// state, never exported.
     pub unenforced_apps_ack_signature: String,
+    /// Overlap pairs the user chose to keep, as `route:apex>route:host`
+    /// entries joined with `|`. The rules screen offers to delete an exact
+    /// rule a wildcard already covers; a pair listed here is never offered
+    /// again. Device-local UI state, never exported.
+    pub rules_overlap_keep_signature: String,
     /// Device-local record of the executable the user pointed out as their
     /// VPN in the onboarding dialog. Captured so it can
     /// later be turned into an "Application -> primary route" rule (which the
@@ -332,69 +343,45 @@ pub struct UiPreferences {
     pub service_intent_json: String,
 
     // -------------------------------------------------------------------------
-    // Preview: policy-affecting fields — to be migrated to service-owned state.
+    // Policy-affecting fields. The service owns the authoritative per-SID copy;
+    // these eight are still the GUI's ONLY live store of the same facts.
     //
-    // The five fields below belong to `ActiveConfiguration` in `nrr-domain` and
-    // must be owned by the background service, not the UI runtime. They live here
-    // temporarily during the scaffold phase to support the preview GUI before
-    // real service integration. They will eventually be removed from
-    // `UiPreferences` and managed exclusively through the service-owned revision
-    // store. See `nrr_domain::PolicyOwnershipBoundary` for the full boundary spec.
+    // `InterfacesRolesController.qml` writes them, `RoutePolicyController.qml`
+    // reads them, and the authoritative `route.policy.update` is built out of
+    // what it read. NOTHING seeds them back from `SnapshotInitial.routePolicy`,
+    // so clearing them blanks the interfaces screen while the service keeps
+    // enforcing bindings the user can no longer see.
+    //
+    // They carried `#[deprecated]` markers saying they had already been migrated.
+    // That was not true, and every consumer silenced them with
+    // `#[allow(deprecated)]` — so the attribute warned nobody and told whoever
+    // read it the opposite of the truth. Removed rather than kept: the migration
+    // helper (`launcher::legacy_prefs_migration`) has no production caller, and
+    // wiring one before the reverse seed exists is what the markers invited.
+    //
+    // Order of work: FIRST seed these from the service snapshot, THEN retire
+    // them. See `nrr_domain::PolicyOwnershipBoundary` for the boundary spec.
     // -------------------------------------------------------------------------
-    /// **Migrated to service-owned per-SID storage.**
-    /// Read via IPC `SnapshotInitial.routePolicy.primary.stableId`.
-    /// Kept in struct only for backward-compat deserialisation of older
-    /// `preferences.json` files; the launcher migration flow zeroes it via
-    /// `cleanup_legacy_policy_fields` after successful `RoutePolicyUpdate`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1). \
-                Read via IPC SnapshotInitial.routePolicy.primary.stableId."
-    )]
+    /// The adapter the user picked for the main route. LIVE: the interfaces
+    /// screen writes it and `route.policy.update` is built from it. The service
+    /// holds the same fact per-SID and reports it in
+    /// `SnapshotInitial.routePolicy.primary.stableId`; nothing reconciles the
+    /// two yet, so this side is what the user actually sees.
     pub selected_primary_interface_id: String,
-    /// **Migrated** — display hint only. See `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1)."
-    )]
+    /// Display hint for the id above. See `selected_primary_interface_id`.
     pub selected_primary_interface_name: String,
-    /// **Migrated** — see `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1)."
-    )]
+    /// Whether the user confirmed the main-route role by hand.
     pub primary_role_user_confirmed: bool,
-    /// **Migrated** — see `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1)."
-    )]
-    pub selected_secondary_interface_id: String,
-    /// **Migrated** — display hint only.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1)."
-    )]
-    pub selected_secondary_interface_name: String,
-    /// **Migrated** — see `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID route_bindings (block 16.8.1)."
-    )]
-    pub secondary_role_user_confirmed: bool,
-    /// **Migrated** — see `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID behavior_mode (block 16.8.1)."
-    )]
-    pub route_behavior_mode: RouteBehaviorMode,
-    /// **Migrated** — orthogonal flag (applies on top of any mode), see
+    /// The adapter picked for the additional route. See
     /// `selected_primary_interface_id`.
-    #[deprecated(
-        since = "0.2.0",
-        note = "Migrated to service-owned per-SID secondary_block_policy (block 16.8.1)."
-    )]
-    pub block_secondary_traffic_when_unavailable: bool,
+    pub selected_secondary_interface_id: String,
+    /// Display hint for the id above.
+    pub selected_secondary_interface_name: String,
+    /// Whether the user confirmed the additional-route role by hand.
+    pub secondary_role_user_confirmed: bool,
+    /// Which route unmatched traffic takes. See
+    /// `selected_primary_interface_id`.
+    pub route_behavior_mode: RouteBehaviorMode,
     pub last_opened_section: AppSection,
     /// Preferred sort order for the rules table view. UI preference only — does not
     /// affect the rule file on disk. Persisted per device.
@@ -408,40 +395,6 @@ pub struct UiPreferences {
     /// How the application responds when the external rules file changes on disk.
     /// Persisted per device.
     pub rules_file_change_behavior: RulesFileChangeBehavior,
-    /// **Preview** — will move to a service-owned revision store.
-    ///
-    /// SHA-256 hex hash of the `rules_primary.txt` file at the time it was last
-    /// applied. On startup the service compares this with the current file hash
-    /// to detect changes. Empty string = not recorded yet.
-    pub last_rules_primary_file_hash: String,
-    /// **Preview** — will move to a service-owned revision store.
-    ///
-    /// SHA-256 hex hash of the `rules_secondary.txt` file at the time it was
-    /// last applied. On startup the service compares this with the current file
-    /// hash to detect changes. Empty string = not recorded yet.
-    pub last_rules_secondary_file_hash: String,
-    /// When `true`, the import file picker opens two dialogs — one per route —
-    /// and imports both files as a single pending revision.
-    ///
-    /// Default: `false` (import one route at a time).
-    /// See [`nrr_domain::preset_contract::IMPORT_BOTH_FILES_TOGETHER_DEFAULT`].
-    pub import_both_files_together: bool,
-
-    /// When `true`, Zone rules are evaluated before ExactIp rules in the same
-    /// tier. Default: `false` (ExactIp wins, as the more specific address
-    /// match takes priority over zone-level routing).
-    ///
-    /// Maps to `ZonePriorityPolicy { prefer_ip: !zone_priority_over_ip }` when
-    /// constructing a `DecisionRequest`.
-    pub zone_priority_over_ip: bool,
-    /// Verbosity level for the diagnostic log store and Logs screen.
-    /// Default: [`LogLevel::Info`].
-    pub log_level: LogLevel,
-    /// When `true`, the experimental browser-stub routing path is enabled.
-    /// Populated into `DecisionFeatureFlags::browser_stub_experimental` by the
-    /// service layer before invoking the decision pipeline.
-    /// Default: `false`.
-    pub browser_stub_experimental_enabled: bool,
 
     // Tracks the GUI's "last-known" sync state between the active rules
     // revision (service-owned) and the user's on-disk preset files
@@ -687,6 +640,7 @@ impl Default for UiPreferences {
             diagnostics_archive_session_only: true,
             archive_log_budget_mib: 0,
             unenforced_apps_ack_signature: String::new(),
+            rules_overlap_keep_signature: String::new(),
             confirmed_vpn_exe_path: String::new(),
             confirmed_vpn_exe_paths: String::new(),
             selected_primary_interface_id: String::new(),
@@ -696,7 +650,6 @@ impl Default for UiPreferences {
             selected_secondary_interface_name: String::new(),
             secondary_role_user_confirmed: false,
             route_behavior_mode: RouteBehaviorMode::default_when_secondary_unbound(),
-            block_secondary_traffic_when_unavailable: false,
             // Device-local mirrors of per-SID policy toggles. Defaults match
             // the service DB defaults so a fresh install (or post-wipe seed)
             // starts neutral. Subdomain coverage defaults ON (matches the
@@ -727,12 +680,6 @@ impl Default for UiPreferences {
             rules_enabled_filter: RulesEnabledFilter::default(),
             rules_type_filter: RulesTypeFilter::default(),
             rules_file_change_behavior: RulesFileChangeBehavior::default(),
-            last_rules_primary_file_hash: String::new(),
-            last_rules_secondary_file_hash: String::new(),
-            import_both_files_together: false,
-            zone_priority_over_ip: false,
-            log_level: LogLevel::Info,
-            browser_stub_experimental_enabled: false,
             // File-source state defaults. All None until the user performs
             // their first import / export.
             last_saved_path_primary: None,
@@ -915,6 +862,41 @@ fn preferred_available_language(requested: &str) -> String {
         .unwrap_or_else(|| "en".to_string())
 }
 
+/// What a session got when it opened the preferences store.
+///
+/// The distinction that matters is whether the store may be WRITTEN. `load`
+/// already falls back to the `.bak` copy, so a read that still fails means
+/// neither file could be read — a lock held by a scanner or a profile sync,
+/// not an empty file. Writing through such a store replaces settings that were
+/// merely unavailable with defaults, and the user meets the first-run wizard
+/// and the EULA again.
+pub enum SessionPreferences {
+    /// The file was read; write-through is safe.
+    Writable {
+        store: UiPreferencesStore,
+        preferences: UiPreferences,
+    },
+    /// The file could not be read. Defaults are used for THIS session and
+    /// nothing is written back, so the file survives to be read next time.
+    ReadOnly {
+        preferences: UiPreferences,
+        error: io::Error,
+    },
+}
+
+/// Open `store` for a session: read it, and keep the write handle only if the
+/// read worked. Both shells (GUI and launcher) go through this so the rule
+/// cannot be half-applied in one of them.
+pub fn open_for_session(store: UiPreferencesStore) -> SessionPreferences {
+    match store.load() {
+        Ok(preferences) => SessionPreferences::Writable { store, preferences },
+        Err(error) => SessionPreferences::ReadOnly {
+            preferences: UiPreferences::default(),
+            error,
+        },
+    }
+}
+
 pub struct UiPreferencesStore {
     path: PathBuf,
     legacy_paths: Vec<PathBuf>,
@@ -951,13 +933,39 @@ impl UiPreferencesStore {
     pub fn load(&self) -> io::Result<UiPreferences> {
         self.try_migrate_legacy_file()?;
         match fs::read_to_string(&self.path) {
-            Ok(content) => {
+            Ok(content) if has_preference_lines(&content) => {
                 check_schema_version_compat(&content);
                 Ok(parse_preferences(&content))
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(UiPreferences::default()),
-            Err(error) => Err(error),
+            // The file exists but holds no `key=value` line: a dirty-shutdown
+            // artifact (power cut after the rename committed but before the
+            // data flushed leaves an empty or NUL-filled file). Silently
+            // starting with defaults here is what cost a user their EULA
+            // acceptance and every local setting — recover from the backup.
+            Ok(_) => Ok(self.load_backup().unwrap_or_default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(self.load_backup().unwrap_or_default())
+            }
+            Err(error) => match self.load_backup() {
+                Some(preferences) => Ok(preferences),
+                None => Err(error),
+            },
         }
+    }
+
+    /// The previous good file, kept by [`Self::save`]. `None` when it is
+    /// absent or just as gutted as the primary.
+    fn load_backup(&self) -> Option<UiPreferences> {
+        let content = fs::read_to_string(self.backup_path()).ok()?;
+        if !has_preference_lines(&content) {
+            return None;
+        }
+        check_schema_version_compat(&content);
+        Some(parse_preferences(&content))
+    }
+
+    fn backup_path(&self) -> PathBuf {
+        self.path.with_extension("bak")
     }
 
     pub fn save(&self, preferences: &UiPreferences) -> io::Result<()> {
@@ -973,7 +981,23 @@ impl UiPreferencesStore {
         // nothing.
         let temporary_path = self.path.with_extension("tmp");
         let payload = format_preferences(preferences);
-        fs::write(&temporary_path, payload)?;
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&temporary_path)?;
+            file.write_all(payload.as_bytes())?;
+            // The rename survives a process kill, but not a power cut: the
+            // journal can commit the rename while the data blocks are still
+            // in the write-behind cache, and recovery then produces an empty
+            // file under the final name. Flush the data before the swap.
+            file.sync_all()?;
+        }
+        // Keep the outgoing file as the fallback `load` recovers from — but
+        // never let a gutted primary overwrite a good backup.
+        if let Ok(current) = fs::read_to_string(&self.path) {
+            if has_preference_lines(&current) {
+                let _ = fs::write(self.backup_path(), current);
+            }
+        }
         fs::rename(&temporary_path, &self.path)
     }
 
@@ -1067,6 +1091,17 @@ fn legacy_preference_paths(root: PathBuf) -> Vec<PathBuf> {
 ///
 /// Called by [`UiPreferencesStore::load`] before the full parse pass. Absent
 /// `schema_version` means a legacy v0 file — loaded silently without warning.
+/// Whether `content` carries at least one `key=value` line — what separates a
+/// real preferences file (ours always leads with `schema_version=`, a legacy
+/// one has its settings) from the empty or NUL-filled husk a dirty shutdown
+/// leaves behind.
+fn has_preference_lines(content: &str) -> bool {
+    content.lines().any(|raw| {
+        let line = raw.trim();
+        !line.is_empty() && !line.starts_with('#') && line.contains('=')
+    })
+}
+
 fn check_schema_version_compat(content: &str) {
     for line in content.lines() {
         let line = line.trim();
@@ -1338,6 +1373,11 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "unenforced_apps_ack_signature" => {
                 preferences.unenforced_apps_ack_signature = value.to_string();
             }
+            // Overlap pairs the user asked to keep. Free-form single-line
+            // value; empty is the valid "nothing kept" state.
+            "rules_overlap_keep_signature" => {
+                preferences.rules_overlap_keep_signature = value.to_string();
+            }
             // Confirmed VPN executable path. Free-form single-line value;
             // empty is the valid "not set" state, so no non-empty gate.
             "confirmed_vpn_exe_path" => {
@@ -1376,11 +1416,6 @@ fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.route_behavior_mode = parsed;
                 }
             }
-            "block_secondary_traffic_when_unavailable" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.block_secondary_traffic_when_unavailable = parsed;
-                }
-            }
             "rules_view_sort" => {
                 if let Ok(parsed) = value.parse::<RulesViewSort>() {
                     preferences.rules_view_sort = parsed;
@@ -1389,32 +1424,6 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "rules_file_change_behavior" => {
                 if let Ok(parsed) = value.parse::<RulesFileChangeBehavior>() {
                     preferences.rules_file_change_behavior = parsed;
-                }
-            }
-            "last_rules_primary_file_hash" => {
-                preferences.last_rules_primary_file_hash = value.to_string();
-            }
-            "last_rules_secondary_file_hash" => {
-                preferences.last_rules_secondary_file_hash = value.to_string();
-            }
-            "import_both_files_together" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.import_both_files_together = parsed;
-                }
-            }
-            "zone_priority_over_ip" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.zone_priority_over_ip = parsed;
-                }
-            }
-            "log_level" => {
-                if let Ok(parsed) = value.parse::<LogLevel>() {
-                    preferences.log_level = parsed;
-                }
-            }
-            "browser_stub_experimental_enabled" => {
-                if let Some(parsed) = parse_bool(value) {
-                    preferences.browser_stub_experimental_enabled = parsed;
                 }
             }
             // File-source state. Empty value parses as `None` (the sentinel
@@ -1684,16 +1693,9 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "selected_secondary_interface_name={}\n",
             "secondary_role_user_confirmed={}\n",
             "route_behavior_mode={}\n",
-            "block_secondary_traffic_when_unavailable={}\n",
             "last_opened_section={}\n",
             "rules_view_sort={}\n",
             "rules_file_change_behavior={}\n",
-            "last_rules_primary_file_hash={}\n",
-            "last_rules_secondary_file_hash={}\n",
-            "import_both_files_together={}\n",
-            "zone_priority_over_ip={}\n",
-            "log_level={}\n",
-            "browser_stub_experimental_enabled={}\n",
             "last_saved_path_primary={}\n",
             "last_saved_path_secondary={}\n",
             "auto_open_on_launch_path_primary={}\n",
@@ -1741,6 +1743,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "service_backed_mirror_json={}\n",
             "service_intent_json={}\n",
             "unenforced_apps_ack_signature={}\n",
+            "rules_overlap_keep_signature={}\n",
             "confirmed_vpn_exe_path={}\n",
             "confirmed_vpn_exe_paths={}\n",
             "last_loaded_path_primary={}\n",
@@ -1782,16 +1785,9 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         preferences.selected_secondary_interface_name,
         preferences.secondary_role_user_confirmed,
         preferences.route_behavior_mode,
-        preferences.block_secondary_traffic_when_unavailable,
         preferences.last_opened_section,
         preferences.rules_view_sort,
         preferences.rules_file_change_behavior,
-        preferences.last_rules_primary_file_hash,
-        preferences.last_rules_secondary_file_hash,
-        preferences.import_both_files_together,
-        preferences.zone_priority_over_ip,
-        preferences.log_level,
-        preferences.browser_stub_experimental_enabled,
         optional_string_field(&preferences.last_saved_path_primary),
         optional_string_field(&preferences.last_saved_path_secondary),
         optional_string_field(&preferences.auto_open_on_launch_path_primary),
@@ -1839,6 +1835,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         preferences.service_backed_mirror_json,
         preferences.service_intent_json,
         preferences.unenforced_apps_ack_signature,
+        preferences.rules_overlap_keep_signature,
         preferences.confirmed_vpn_exe_path,
         preferences.confirmed_vpn_exe_paths,
         optional_string_field(&preferences.last_loaded_path_primary),
@@ -1899,9 +1896,16 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Clamped, not rejected. Rejecting made an out-of-range value load as the
+/// DEFAULT, and the default is the maximum — so `20` ("nearly transparent")
+/// came back as 100, fully opaque, the opposite of what was asked. The
+/// write path clamps for exactly this reason; the read path now agrees.
 fn parse_tray_notice_opacity_percent(value: &str) -> Option<u16> {
     let parsed = value.parse::<u16>().ok()?;
-    (40..=100).contains(&parsed).then_some(parsed)
+    Some(parsed.clamp(
+        TRAY_NOTICE_OPACITY_MIN_PERCENT,
+        TRAY_NOTICE_OPACITY_MAX_PERCENT,
+    ))
 }
 
 fn parse_font_scale_percent(value: &str) -> Option<u16> {
@@ -1932,7 +1936,6 @@ fn parse_font_scale_percent(value: &str) -> Option<u16> {
 /// 5. `selected_secondary_interface_name`
 /// 6. `secondary_role_user_confirmed`
 /// 7. `route_behavior_mode`
-/// 8. `block_secondary_traffic_when_unavailable`
 ///
 /// Non-policy UI preferences (theme, language, fonts, route labels,
 /// section selections, rules-view filters, …) are **not** touched.
@@ -1945,14 +1948,13 @@ pub fn cleanup_legacy_policy_fields(prefs: &mut UiPreferences) {
     prefs.selected_secondary_interface_name = String::new();
     prefs.secondary_role_user_confirmed = false;
     prefs.route_behavior_mode = RouteBehaviorMode::default_when_secondary_unbound();
-    prefs.block_secondary_traffic_when_unavailable = false;
 }
 
-/// Snapshot of the eight legacy policy-affecting fields, used by the
+/// Snapshot of the seven legacy policy-affecting fields, used by the
 /// launcher migration flow to decide whether the user has any
 /// pre-16.8 data worth migrating before running cleanup.
 ///
-/// Returns `true` if **any** of the eight fields is set to a non-default
+/// Returns `true` if **any** of the seven fields is set to a non-default
 /// value — i.e. the user previously configured route bindings, behavior
 /// mode, or the secondary-block flag through the legacy GUI path.
 #[allow(deprecated)]
@@ -1964,13 +1966,55 @@ pub fn has_legacy_policy_fields(prefs: &UiPreferences) -> bool {
         || !prefs.selected_secondary_interface_name.is_empty()
         || prefs.secondary_role_user_confirmed
         || prefs.route_behavior_mode != RouteBehaviorMode::default_when_secondary_unbound()
-        || prefs.block_secondary_traffic_when_unavailable
 }
 
 #[cfg(test)]
 #[allow(deprecated)] // Tests exercise the legacy policy fields directly;
                      // new readers should use IPC SnapshotInitial.routePolicy.
 mod tests {
+
+    /// Out of range must land at the nearest bound, not at the default — and
+    /// the default here is the MAXIMUM, so rejecting `20` ("nearly
+    /// transparent") produced 100, fully opaque.
+    #[test]
+    fn an_out_of_range_opacity_clamps_instead_of_reverting_to_the_default() {
+        let load = |raw: &str| {
+            let text = format!(
+                "tray_notice_opacity_percent={raw}
+"
+            );
+            super::parse_preferences(&text).tray_notice_opacity_percent
+        };
+        assert_eq!(load("20"), super::TRAY_NOTICE_OPACITY_MIN_PERCENT);
+        assert_eq!(load("400"), super::TRAY_NOTICE_OPACITY_MAX_PERCENT);
+        assert_eq!(load("55"), 55);
+        // Not a number at all is still a rejection: there is no nearest bound.
+        assert_eq!(
+            load("transparent"),
+            UiPreferences::default().tray_notice_opacity_percent
+        );
+    }
+
+    /// A read that failed after the `.bak` fallback must not hand back a
+    /// writable store: the file was unavailable, not empty, and the next save
+    /// would replace it with defaults.
+    #[test]
+    fn a_failed_read_opens_the_session_read_only() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A DIRECTORY where the preferences file belongs: readable metadata,
+        // unreadable content, on every platform.
+        let path = dir.path().join("prefs.conf");
+        std::fs::create_dir(&path).expect("dir in place of file");
+        let store = UiPreferencesStore::for_path(path);
+        match super::open_for_session(store) {
+            super::SessionPreferences::ReadOnly { preferences, .. } => {
+                assert_eq!(preferences, UiPreferences::default());
+            }
+            super::SessionPreferences::Writable { .. } => {
+                panic!("an unreadable file must not yield a writable store")
+            }
+        }
+    }
     use super::{
         check_schema_version_compat, cleanup_legacy_policy_fields, has_legacy_policy_fields,
         parse_preferences, preferred_available_language, SystemFontFamily, UiPreferences,
@@ -1978,7 +2022,7 @@ mod tests {
         STABLE_PREFERENCES_FILE_NAME,
     };
     use nrr_shared::{
-        AppSection, LogLevel, RouteBehaviorMode, RulesEnabledFilter, RulesFileChangeBehavior,
+        AppSection, RouteBehaviorMode, RulesEnabledFilter, RulesFileChangeBehavior,
         RulesTypeFilter, RulesViewSort, ThemeMode,
     };
     use std::fs;
@@ -2151,19 +2195,12 @@ mod tests {
             selected_secondary_interface_name: "VPN".to_string(),
             secondary_role_user_confirmed: true,
             route_behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            block_secondary_traffic_when_unavailable: true,
             last_opened_section: AppSection::Settings,
             rules_view_sort: RulesViewSort::ByMatchValue,
             // Non-persisted — always resets to default on reload.
             rules_enabled_filter: RulesEnabledFilter::default(),
             rules_type_filter: RulesTypeFilter::default(),
             rules_file_change_behavior: RulesFileChangeBehavior::AutoApply,
-            last_rules_primary_file_hash: "aabbcc".repeat(10).chars().take(64).collect(),
-            last_rules_secondary_file_hash: String::new(),
-            import_both_files_together: true,
-            zone_priority_over_ip: true,
-            log_level: LogLevel::Debug,
-            browser_stub_experimental_enabled: true,
             // File-source state. Mixed Some/None so the round-trip
             // exercises both serialise paths.
             last_saved_path_primary: Some(r"C:\rules_primary.txt".to_string()),
@@ -2246,6 +2283,10 @@ mod tests {
             // Non-empty signature so the round-trip proves the
             // notification-dismiss state persists across GUI restarts.
             unenforced_apps_ack_signature: "2gis.exe|hidemy.name VPN 3.0.exe".to_string(),
+            // Non-empty so the round-trip proves a kept overlap pair survives
+            // a GUI restart.
+            rules_overlap_keep_signature: "secondary:example.com>primary:api.example.com"
+                .to_string(),
             // Non-empty path (with spaces + backslashes) so the round-trip
             // proves the confirmed VPN executable persists.
             confirmed_vpn_exe_path: "C:\\Program Files\\Example VPN\\vpn.exe".to_string(),
@@ -2290,7 +2331,6 @@ mod tests {
             "block_secondary_traffic_when_unavailable=true\n",
             "rules_view_sort=by-match-value\n"
         ));
-        assert!(parsed.block_secondary_traffic_when_unavailable);
         assert_eq!(parsed.rules_view_sort, RulesViewSort::ByMatchValue);
         // Non-persisted filters always reset to default.
         assert_eq!(parsed.rules_enabled_filter, RulesEnabledFilter::default());
@@ -2644,6 +2684,83 @@ service_install_uac_declined_count=1
         (dir, path)
     }
 
+    #[test]
+    fn a_gutted_primary_file_recovers_from_the_backup() {
+        // A power cut can commit the rename while the data blocks are still
+        // unflushed: the primary survives as an empty (or NUL-filled) husk.
+        let (_dir, path) = test_path("gutted.conf");
+        let store = UiPreferencesStore::for_path(path.clone());
+        let expected = UiPreferences {
+            theme_mode: ThemeMode::Light,
+            first_run_completed: true,
+            ..UiPreferences::default()
+        };
+        store.save(&expected).expect("first save");
+        store
+            .save(&expected)
+            .expect("second save writes the backup");
+
+        for husk in ["", "\0\0\0\0", "# NetRuleRouter managed UI preferences\n"] {
+            fs::write(&path, husk).expect("plant the husk");
+            let loaded = store.load().expect("load must recover");
+            assert!(
+                loaded.first_run_completed,
+                "husk {husk:?} must fall back to the backup, not to defaults"
+            );
+            assert_eq!(loaded.theme_mode, ThemeMode::Light);
+        }
+    }
+
+    #[test]
+    fn a_missing_primary_file_recovers_from_the_backup() {
+        let (_dir, path) = test_path("missing.conf");
+        let store = UiPreferencesStore::for_path(path.clone());
+        let expected = UiPreferences {
+            accepted_eula_version: 1,
+            ..UiPreferences::default()
+        };
+        store.save(&expected).expect("first save");
+        store
+            .save(&expected)
+            .expect("second save writes the backup");
+        fs::remove_file(&path).expect("drop the primary");
+
+        let loaded = store.load().expect("load must recover");
+        assert_eq!(loaded.accepted_eula_version, 1);
+    }
+
+    #[test]
+    fn a_gutted_primary_never_overwrites_a_good_backup() {
+        // After the husk was loaded as defaults, the very next save must not
+        // copy the husk over the last good backup.
+        let (_dir, path) = test_path("preserve-bak.conf");
+        let store = UiPreferencesStore::for_path(path.clone());
+        let good = UiPreferences {
+            first_run_completed: true,
+            ..UiPreferences::default()
+        };
+        store.save(&good).expect("first save");
+        store.save(&good).expect("second save writes the backup");
+
+        fs::write(&path, "").expect("plant the husk");
+        store
+            .save(&UiPreferences::default())
+            .expect("save over the husk");
+        let backup = fs::read_to_string(path.with_extension("bak")).expect("backup exists");
+        assert!(
+            backup.contains("first_run_completed=true"),
+            "the good backup must survive a save over a gutted primary"
+        );
+    }
+
+    #[test]
+    fn first_launch_with_no_files_still_defaults() {
+        let (_dir, path) = test_path("fresh.conf");
+        let store = UiPreferencesStore::for_path(path);
+        let loaded = store.load().expect("fresh load");
+        assert!(!loaded.first_run_completed);
+    }
+
     fn test_dir(prefix: &str) -> tempfile::TempDir {
         tempfile::Builder::new()
             .prefix(&format!("nrr-ui-preferences-tests-{prefix}-"))
@@ -2659,7 +2776,6 @@ service_install_uac_declined_count=1
         prefs.selected_secondary_interface_name = "OpenVPN TAP".into();
         prefs.secondary_role_user_confirmed = true;
         prefs.route_behavior_mode = RouteBehaviorMode::StrictSecondaryFailClosed;
-        prefs.block_secondary_traffic_when_unavailable = true;
     }
 
     #[test]
@@ -2679,7 +2795,6 @@ service_install_uac_declined_count=1
             |p| p.selected_secondary_interface_name = "x".into(),
             |p| p.secondary_role_user_confirmed = true,
             |p| p.route_behavior_mode = RouteBehaviorMode::StrictSecondaryFailClosed,
-            |p| p.block_secondary_traffic_when_unavailable = true,
         ] {
             let mut prefs = UiPreferences::default();
             setter(&mut prefs);
@@ -2703,7 +2818,6 @@ service_install_uac_declined_count=1
         prefs.tooltips_enabled = false;
         prefs.last_opened_section = AppSection::Diagnostics;
         prefs.rules_view_sort = RulesViewSort::ByMatchValue;
-        prefs.log_level = LogLevel::Debug;
 
         cleanup_legacy_policy_fields(&mut prefs);
 
@@ -2719,7 +2833,6 @@ service_install_uac_declined_count=1
             prefs.route_behavior_mode,
             RouteBehaviorMode::default_when_secondary_unbound()
         );
-        assert!(!prefs.block_secondary_traffic_when_unavailable);
 
         // UI-only fields preserved.
         assert_eq!(prefs.theme_mode, ThemeMode::Dark);
@@ -2728,7 +2841,6 @@ service_install_uac_declined_count=1
         assert!(!prefs.tooltips_enabled);
         assert_eq!(prefs.last_opened_section, AppSection::Diagnostics);
         assert_eq!(prefs.rules_view_sort, RulesViewSort::ByMatchValue);
-        assert_eq!(prefs.log_level, LogLevel::Debug);
     }
 
     #[test]

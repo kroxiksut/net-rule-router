@@ -24,7 +24,8 @@
 //! append mode.  Acknowledgement / resolution events are new NDJSON lines —
 //! never overwrites of earlier lines.
 
-use std::fs::{File, OpenOptions};
+use super::anchor::{check_tail, AuditChainAnchor, AuditChainAnchorStore, AuditTailIntegrity};
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -107,6 +108,8 @@ struct AuditWriterInner {
     prev_hash: String,
     /// Next sequence number within the current file.
     next_seq: u64,
+    /// Out-of-band record of the last committed event, when configured.
+    anchor: Option<std::sync::Arc<dyn AuditChainAnchorStore>>,
 }
 
 // `expect()`s here are invariants (file open right after `ensure_open`) and
@@ -120,6 +123,7 @@ impl AuditWriterInner {
             current_size: 0,
             prev_hash: AUDIT_CHAIN_GENESIS.to_string(),
             next_seq: 1,
+            anchor: None,
         }
     }
 
@@ -139,19 +143,16 @@ impl AuditWriterInner {
         // Close the old file (implicitly via drop).
         self.current = None;
 
-        let path = next_audit_filename(&self.config.audit_dir);
         std::fs::create_dir_all(&self.config.audit_dir).map_err(|e| {
             DiagnosticsError::AuditWriteFailed {
                 reason: format!("cannot create audit dir: {e}"),
             }
         })?;
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| DiagnosticsError::AuditWriteFailed {
-                reason: format!("cannot open audit file {}: {e}", path.display()),
-            })?;
+        let (file, path) =
+            crate::rotation::open_next_rotation(&self.config.audit_dir, &audit_prefix_today())
+                .map_err(|e| DiagnosticsError::AuditWriteFailed {
+                    reason: format!("cannot open audit file: {e}"),
+                })?;
         self.current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         // prev_hash intentionally NOT reset here — the chain continues
         // across file rotations and service restarts.  Genesis is only set
@@ -187,8 +188,23 @@ impl AuditWriterInner {
             })?;
 
         self.current_size += line_with_newline.len() as u64;
-        self.prev_hash = event_hash;
+        self.prev_hash = event_hash.clone();
         self.next_seq += 1;
+
+        if let Some(anchor) = &self.anchor {
+            let file_name = self
+                .current
+                .as_ref()
+                .and_then(|(_, p)| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_string();
+            anchor.save(&AuditChainAnchor {
+                file_name,
+                seq,
+                event_hash,
+            });
+        }
         Ok(())
     }
 }
@@ -201,6 +217,7 @@ impl AuditWriterInner {
 /// an `AuditSink` is expected.
 pub struct AuditWriter {
     inner: Mutex<AuditWriterInner>,
+    tail_integrity: AuditTailIntegrity,
 }
 
 impl AuditWriter {
@@ -213,13 +230,39 @@ impl AuditWriter {
     /// If no prior audit files exist, the chain starts from
     /// [`AUDIT_CHAIN_GENESIS`].
     pub fn open(config: AuditWriterConfig) -> Self {
-        let (prev_hash, next_seq) = resume_chain_state(&config.audit_dir);
+        Self::open_anchored(config, None)
+    }
+
+    /// Opens the writer with an out-of-band tail anchor.
+    ///
+    /// When the anchor disagrees with what is on disk, the chain resumes from
+    /// the ANCHORED hash rather than the file's current tail: a shortened file
+    /// then fails verification at the seam instead of quietly becoming the new
+    /// truth. Call [`AuditWriter::tail_integrity`] right after opening to
+    /// report the verdict.
+    pub fn open_anchored(
+        config: AuditWriterConfig,
+        anchor: Option<std::sync::Arc<dyn AuditChainAnchorStore>>,
+    ) -> Self {
+        let stored = anchor.as_ref().and_then(|a| a.load());
+        let integrity = check_tail(&config.audit_dir, stored.as_ref());
+        let (mut prev_hash, next_seq) = resume_chain_state(&config.audit_dir);
+        if let (AuditTailIntegrity::Truncated { .. }, Some(stored)) = (&integrity, &stored) {
+            prev_hash = stored.event_hash.clone();
+        }
         let mut inner = AuditWriterInner::new(config);
         inner.prev_hash = prev_hash;
         inner.next_seq = next_seq;
+        inner.anchor = anchor;
         Self {
             inner: Mutex::new(inner),
+            tail_integrity: integrity,
         }
+    }
+
+    /// What the anchor said about the tail when this writer opened.
+    pub fn tail_integrity(&self) -> &AuditTailIntegrity {
+        &self.tail_integrity
     }
 }
 
@@ -266,8 +309,14 @@ fn build_event(
         event_hash: String::new(), // filled below
     };
 
-    // Canonical payload = the full event JSON (without event_hash field).
-    // We use the JSON of the event with an empty event_hash, then hash that.
+    // Canonical payload = the full event JSON with an empty `event_hash`.
+    //
+    // This is a live struct, so ADDING A FIELD to `AuditEvent` changes the
+    // canonical bytes and makes every previously written event unverifiable —
+    // silently, since the hashes still recompute consistently going forward.
+    // `schema_version` is part of the hashed payload but nothing compares it on
+    // read. The golden test below pins the exact bytes so such a change fails
+    // loudly with an explanation instead of rewriting history's verdict.
     let canonical =
         serde_json::to_string(&event).map_err(|e| DiagnosticsError::AuditWriteFailed {
             reason: format!("canonical serialization failed: {e}"),
@@ -302,32 +351,35 @@ pub fn compute_chain_hash(prev_hash: &str, canonical_json: &str) -> String {
 /// `next_seq` is always 1 because seq resets per file (the new session opens
 /// a new file).  The continuity is carried by `prev_hash` alone.
 fn resume_chain_state(audit_dir: &Path) -> (String, u64) {
-    let files = sorted_audit_files(audit_dir);
-    let last_file = match files.last() {
-        None => return (AUDIT_CHAIN_GENESIS.to_string(), 1),
-        Some(p) => p.clone(),
-    };
-
-    // Read the last non-empty line from the last audit file.
-    let Ok(content) = std::fs::read_to_string(&last_file) else {
-        return (AUDIT_CHAIN_GENESIS.to_string(), 1);
-    };
-
-    let last_line = content.lines().rev().find(|l| !l.trim().is_empty());
-
-    let Some(line) = last_line else {
-        return (AUDIT_CHAIN_GENESIS.to_string(), 1);
-    };
-
-    let Ok(event): Result<crate::event::AuditEvent, _> = serde_json::from_str(line) else {
-        return (AUDIT_CHAIN_GENESIS.to_string(), 1);
-    };
-
-    // The new file starts with seq=1; continuity is via prev_hash.
-    (event.event_hash, 1)
+    // Walk back through the files, not just the newest one. A single unreadable
+    // file — an antivirus holding it for a second, a truncated tail — used to
+    // drop the chain to GENESIS, and the next verification then reported a
+    // mismatch nobody caused. The reader has always walked back like this; the
+    // writer, which is the side that PERSISTS the consequence, did not.
+    for path in sorted_audit_files(audit_dir).into_iter().rev() {
+        if let Some(hash) = last_event_hash_in_file(&path) {
+            // The new file starts with seq=1; continuity is via prev_hash.
+            return (hash, 1);
+        }
+    }
+    (AUDIT_CHAIN_GENESIS.to_string(), 1)
 }
 
-/// Returns audit files in the directory sorted lexicographically (= chronologically).
+/// The `event_hash` of the last well-formed event in a file, if any.
+fn last_event_hash_in_file(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    content
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .find_map(|line| {
+            serde_json::from_str::<crate::event::AuditEvent>(line)
+                .ok()
+                .map(|event| event.event_hash)
+        })
+}
+
+/// Returns audit files in the directory in chronological order.
 fn sorted_audit_files(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -342,7 +394,7 @@ fn sorted_audit_files(dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .collect();
-    files.sort();
+    crate::rotation::sort_chronologically(&mut files);
     files
 }
 
@@ -352,17 +404,9 @@ fn sorted_audit_files(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Format: `<dir>/nrr_audit_YYYYMMDD-N.ndjson`
 /// `N` increments if a file for today already exists.
-fn next_audit_filename(dir: &Path) -> PathBuf {
-    let date = local_date_string(SystemTime::now());
-    let mut n = 1u32;
-    loop {
-        let name = format!("nrr_audit_{date}-{n}.ndjson");
-        let path = dir.join(&name);
-        if !path.exists() {
-            return path;
-        }
-        n += 1;
-    }
+/// Prefix of today's audit files, e.g. `nrr_audit_20260830-`.
+fn audit_prefix_today() -> String {
+    format!("nrr_audit_{}-", local_date_string(SystemTime::now()))
 }
 
 /// Converts a `SystemTime` to a `"YYYYMMDD"` string on the LOCAL calendar —
@@ -721,6 +765,69 @@ mod tests {
         assert!(
             event.prev_hash.is_none(),
             "first event in empty dir must have no prev_hash"
+        );
+    }
+
+    #[test]
+    fn the_chain_resumes_from_the_eleventh_file_not_the_ninth() {
+        let dir = tempfile::tempdir().expect("temp");
+        // A lexicographic sort puts `-9` last and the chain forks from there.
+        let line_of = |id: &str| {
+            let (_, event) = build_event(&sample_input(id), 1, AUDIT_CHAIN_GENESIS).expect("event");
+            (
+                serde_json::to_string(&event).expect("serialize")
+                    + "
+",
+                event.event_hash,
+            )
+        };
+        let (stale_line, _) = line_of("stale");
+        let (newest_line, newest_hash) = line_of("newest");
+        std::fs::write(dir.path().join("nrr_audit_20260423-9.ndjson"), stale_line).unwrap();
+        std::fs::write(dir.path().join("nrr_audit_20260423-11.ndjson"), newest_line).unwrap();
+
+        let (prev_hash, next_seq) = resume_chain_state(dir.path());
+        assert_eq!(prev_hash, newest_hash);
+        assert_eq!(next_seq, 1);
+    }
+
+    #[test]
+    fn a_freed_rotation_number_is_never_handed_out_again() {
+        let dir = tempfile::tempdir().expect("temp");
+        let prefix = audit_prefix_today();
+        // Retention deleted `-1` and `-2`; the next file must be `-4`.
+        std::fs::write(dir.path().join(format!("{prefix}3.ndjson")), "").unwrap();
+
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir.path()));
+        writer.append(sample_input("e1")).expect("append");
+
+        let names: Vec<_> = sorted_audit_files(dir.path())
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [format!("{prefix}3.ndjson"), format!("{prefix}4.ndjson")]
+        );
+    }
+
+    #[test]
+    fn the_canonical_payload_bytes_are_pinned() {
+        let (canonical, _) =
+            build_event(&sample_input("evt-golden"), 7, AUDIT_CHAIN_GENESIS).expect("event");
+
+        // Changing this string means every audit event ever written stops
+        // verifying. If a field genuinely has to join `AuditEvent`, the chain
+        // needs a versioned canonical form first — not a new golden value.
+        assert_eq!(
+            canonical,
+            concat!(
+                r#"{"schema_version":1,"seq":7,"event_id":"evt-golden","#,
+                r#""kind":"revision_activated","created_at":1745000000000,"#,
+                r#""actor_kind":"user","actor_id_hash":"hash_abc","#,
+                r#""revision_id":"rev-001","result":"success","#,
+                r#""reason_code":"review.approved","event_hash":""}"#
+            )
         );
     }
 }

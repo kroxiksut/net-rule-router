@@ -20,9 +20,9 @@ use crate::ipc::{
 use crate::ipc_handlers::payloads::{
     ApplyFailurePolicyGetRequest, ApplyFailurePolicySetRequest, AutostartGetRequest,
     AutostartToggleRequest, LogRetentionConfigGetRequest, LogRetentionConfigSetRequest,
-    RetentionSettingsGetRequest, RetentionSettingsSetRequest, RoutingPauseGetRequest,
-    RoutingPauseToggleRequest, StorageUsageGetRequest, TrafficStatsGetRequest,
-    TrafficStatsSetRequest,
+    RetentionSettingsDto, RetentionSettingsGetRequest, RetentionSettingsSetRequest,
+    RoutingPauseGetRequest, RoutingPauseToggleRequest, StorageUsageGetRequest,
+    TrafficStatsGetRequest, TrafficStatsSetRequest,
 };
 use crate::ipc_handlers::providers::{
     ApplyFailurePolicyProvider, ApplyFailurePolicyWriter, AutostartProvider, AutostartWriter,
@@ -80,25 +80,67 @@ impl IpcHandler for RetentionSettingsGetHandler {
     }
 }
 
+/// Retention is one policy for the machine's whole log and audit store, so a
+/// change to it needs an administrator - but saving the settings page
+/// unchanged must not, or the page becomes a UAC prompt for the very users the
+/// restriction applies to. See `machine_scoped`.
 pub struct RetentionSettingsSetHandler {
     writer: Arc<dyn RetentionSettingsWriter>,
+    provider: Arc<dyn RetentionSettingsProvider>,
 }
 
 impl RetentionSettingsSetHandler {
-    pub fn new(writer: Arc<dyn RetentionSettingsWriter>) -> Self {
-        Self { writer }
+    pub fn new(
+        writer: Arc<dyn RetentionSettingsWriter>,
+        provider: Arc<dyn RetentionSettingsProvider>,
+    ) -> Self {
+        Self { writer, provider }
     }
 }
 
 impl IpcHandler for RetentionSettingsSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: RetentionSettingsSetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("settings.retention.set", e))?;
+        if !crate::machine_scoped::machine_scoped_write_allowed(
+            &retention_fields(&req),
+            &retention_fields_of(&self.provider.get()),
+            ctx.caller_is_elevated,
+        ) {
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "The retention policy",
+            ));
+        }
         match self.writer.set(&req) {
             Ok(dto) => serialise("settings.retention.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
         }
     }
+}
+
+/// The fields a caller can actually set, in one comparable tuple. `updated_at`
+/// and `last_cleanup_at` are the service's own bookkeeping and are deliberately
+/// left out - comparing them would make every save look like a change.
+fn retention_fields(req: &RetentionSettingsSetRequest) -> (u32, u32, u32, u32, u32, bool) {
+    (
+        req.superseded_days,
+        req.superseded_count_cap,
+        req.rejected_days,
+        req.rolledback_days,
+        req.rolledback_count_cap,
+        req.pin_lkg,
+    )
+}
+
+fn retention_fields_of(dto: &RetentionSettingsDto) -> (u32, u32, u32, u32, u32, bool) {
+    (
+        dto.superseded_days,
+        dto.superseded_count_cap,
+        dto.rejected_days,
+        dto.rolledback_days,
+        dto.rolledback_count_cap,
+        dto.pin_lkg,
+    )
 }
 
 // ── Log/audit retention config (#20) ─────────────────────────────────────────
@@ -121,20 +163,65 @@ impl IpcHandler for LogRetentionConfigGetHandler {
     }
 }
 
+/// Log and audit retention govern the machine's single log store, so the same
+/// rule as `RetentionSettingsSetHandler` applies: echo freely, change with an
+/// administrator.
 pub struct LogRetentionConfigSetHandler {
     writer: Arc<dyn LogRetentionConfigWriter>,
+    provider: Arc<dyn LogRetentionConfigProvider>,
 }
 
 impl LogRetentionConfigSetHandler {
-    pub fn new(writer: Arc<dyn LogRetentionConfigWriter>) -> Self {
-        Self { writer }
+    pub fn new(
+        writer: Arc<dyn LogRetentionConfigWriter>,
+        provider: Arc<dyn LogRetentionConfigProvider>,
+    ) -> Self {
+        Self { writer, provider }
     }
 }
 
 impl IpcHandler for LogRetentionConfigSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: LogRetentionConfigSetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("settings.log-retention.set", e))?;
+        // The same row drives the SCHEDULED audit pass, so accepting a value
+        // under the floor would let a settings edit erase the audit trail the
+        // product promises no user action can erase. Refused here, not clamped
+        // silently, so the GUI can say why.
+        if req.audit_max_age_days < nrr_diagnostics::MIN_AUDIT_MAX_AGE_DAYS
+            || (req.audit_max_size_bytes > 0
+                && req.audit_max_size_bytes < nrr_diagnostics::MIN_AUDIT_MAX_SIZE_BYTES)
+        {
+            return Err(IpcError {
+                code: IpcErrorCode::PreconditionFailed,
+                message: format!(
+                    "audit retention must keep at least {} days and {} bytes",
+                    nrr_diagnostics::MIN_AUDIT_MAX_AGE_DAYS,
+                    nrr_diagnostics::MIN_AUDIT_MAX_SIZE_BYTES
+                ),
+                diagnostics_id: None,
+            });
+        }
+        let current = self.provider.get();
+        if !crate::machine_scoped::machine_scoped_write_allowed(
+            &(
+                req.log_max_age_days,
+                req.log_max_size_bytes,
+                req.audit_max_age_days,
+                req.audit_max_size_bytes,
+            ),
+            &(
+                current.log_max_age_days,
+                current.log_max_size_bytes,
+                current.audit_max_age_days,
+                current.audit_max_size_bytes,
+            ),
+            ctx.caller_is_elevated,
+        ) {
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "The log and audit retention policy",
+            ));
+        }
         match self.writer.set(&req) {
             Ok(dto) => serialise("settings.log-retention.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -162,13 +249,19 @@ impl IpcHandler for ApplyFailurePolicyGetHandler {
     }
 }
 
+/// Stored as a singleton - `set_by_sid` only records WHO wrote it - so the
+/// policy governs every principal's applies, not just the caller's.
 pub struct ApplyFailurePolicySetHandler {
     writer: Arc<dyn ApplyFailurePolicyWriter>,
+    provider: Arc<dyn ApplyFailurePolicyProvider>,
 }
 
 impl ApplyFailurePolicySetHandler {
-    pub fn new(writer: Arc<dyn ApplyFailurePolicyWriter>) -> Self {
-        Self { writer }
+    pub fn new(
+        writer: Arc<dyn ApplyFailurePolicyWriter>,
+        provider: Arc<dyn ApplyFailurePolicyProvider>,
+    ) -> Self {
+        Self { writer, provider }
     }
 }
 
@@ -176,6 +269,15 @@ impl IpcHandler for ApplyFailurePolicySetHandler {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: ApplyFailurePolicySetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("settings.apply-failure-policy.set", e))?;
+        if !crate::machine_scoped::machine_scoped_write_allowed(
+            &req.policy,
+            &self.provider.get().policy,
+            ctx.caller_is_elevated,
+        ) {
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "The apply-failure policy",
+            ));
+        }
         let sid = if ctx.caller_stored().is_empty() {
             None
         } else {
@@ -362,9 +464,23 @@ impl TrafficStatsSetHandler {
 }
 
 impl IpcHandler for TrafficStatsSetHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: TrafficStatsSetRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| malformed("traffic-stats.set", e))?;
+        // Accounting is machine-wide — the counters come from the adapters, not
+        // from a user — so turning it off or shortening its history is a
+        // decision for everyone. Unchanged saves still pass: the settings page
+        // sends the whole row back whether or not the user touched this part.
+        let current = self.writer.settings().map_err(map_settings_write_error)?;
+        if !crate::machine_scoped::machine_scoped_write_allowed(
+            &req.settings,
+            &current,
+            ctx.caller_is_elevated,
+        ) {
+            return Err(crate::machine_scoped::machine_scoped_refusal(
+                "Traffic statistics",
+            ));
+        }
         match self.writer.set(&req.settings) {
             Ok(dto) => serialise("traffic-stats.set", dto),
             Err(e) => Err(map_settings_write_error(e)),
@@ -502,7 +618,8 @@ mod tests {
     use super::*;
     use crate::ipc::{IpcOperationClass, IPC_PROTOCOL_VERSION};
     use crate::ipc_handlers::payloads::{
-        ApplyFailurePolicyDto, AutostartDto, RetentionSettingsDto, RoutingPauseDto, StorageUsageDto,
+        ApplyFailurePolicyDto, AutostartDto, RetentionSettingsDto, RoutingPauseDto,
+        StorageUsageDto, TrafficStatsSettingsDto,
     };
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
     use std::sync::Mutex;
@@ -516,6 +633,15 @@ mod tests {
         }
     }
 
+    /// An ordinary, non-elevated caller - the everyday case for a settings
+    /// page.
+    fn plain_ctx(sid: &str) -> IpcRequestContext {
+        IpcRequestContext {
+            caller_is_elevated: false,
+            ..ctx(sid)
+        }
+    }
+
     fn req(op: IpcOperationName, payload: serde_json::Value) -> IpcRequestEnvelope {
         IpcRequestEnvelope {
             protocol_version: IPC_PROTOCOL_VERSION,
@@ -526,6 +652,109 @@ mod tests {
             confirmation_token: None,
             payload,
         }
+    }
+
+    // ── Traffic statistics ───────────────────────────────────────────────────
+
+    struct FakeTrafficStats {
+        current: TrafficStatsSettingsDto,
+        written: Mutex<Vec<TrafficStatsSettingsDto>>,
+    }
+
+    impl TrafficStatsWriter for FakeTrafficStats {
+        fn set(
+            &self,
+            settings: &TrafficStatsSettingsDto,
+        ) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
+            self.written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(settings.clone());
+            Ok(settings.clone())
+        }
+        fn clear(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
+            Ok(self.current.clone())
+        }
+        fn settings(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
+            Ok(self.current.clone())
+        }
+    }
+
+    fn traffic_settings(enabled: bool, retention_days: u32) -> TrafficStatsSettingsDto {
+        TrafficStatsSettingsDto {
+            enabled,
+            count_loopback: false,
+            count_virtual: false,
+            retention_days,
+        }
+    }
+
+    fn traffic_handler(
+        current: TrafficStatsSettingsDto,
+    ) -> (TrafficStatsSetHandler, Arc<FakeTrafficStats>) {
+        let fake = Arc::new(FakeTrafficStats {
+            current,
+            written: Mutex::new(Vec::new()),
+        });
+        (TrafficStatsSetHandler::new(fake.clone()), fake)
+    }
+
+    /// Accounting is machine-wide — the counters come from the adapters, not
+    /// from a user — so turning it off or shortening its history decides for
+    /// everyone. But the settings page sends the whole row back on every save,
+    /// and an untouched save must not demand rights it does not need.
+    #[test]
+    fn traffic_settings_refuse_a_change_without_rights_and_allow_an_unchanged_save() {
+        let current = traffic_settings(true, 90);
+
+        let (handler, fake) = traffic_handler(current.clone());
+        let err = handler
+            .handle(
+                &req(
+                    IpcOperationName::TrafficStatsSet,
+                    serde_json::json!({ "settings": traffic_settings(false, 90) }),
+                ),
+                &plain_ctx("S-1-5-21-1-1-1-1001"),
+            )
+            .expect_err("switching accounting off is a decision for the whole machine");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(
+            fake.written
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "a refused write must not reach the store"
+        );
+
+        let (handler, fake) = traffic_handler(current.clone());
+        handler
+            .handle(
+                &req(
+                    IpcOperationName::TrafficStatsSet,
+                    serde_json::json!({ "settings": current }),
+                ),
+                &plain_ctx("S-1-5-21-1-1-1-1001"),
+            )
+            .expect("saving the row back unchanged is the everyday case");
+        assert_eq!(
+            fake.written.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1
+        );
+
+        let (handler, fake) = traffic_handler(traffic_settings(true, 90));
+        handler
+            .handle(
+                &req(
+                    IpcOperationName::TrafficStatsSet,
+                    serde_json::json!({ "settings": traffic_settings(false, 30) }),
+                ),
+                &ctx("S-1-5-21-1-1-1-1001"),
+            )
+            .expect("an administrator may change it");
+        assert_eq!(
+            fake.written.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1
+        );
     }
 
     // ── Retention ────────────────────────────────────────────────────────────
@@ -592,13 +821,89 @@ mod tests {
         }
     }
 
+    /// Retention is one policy for the machine's whole store. A non-elevated
+    /// caller may still save the settings page - clients send the whole row
+    /// back - but not actually change it.
+    #[test]
+    fn retention_change_without_elevation_is_refused_but_an_echo_is_not() {
+        let current = RetentionSettingsDto {
+            superseded_days: 30,
+            superseded_count_cap: 100,
+            rejected_days: 7,
+            rolledback_days: 14,
+            rolledback_count_cap: 20,
+            pin_lkg: true,
+            last_cleanup_at: None,
+            updated_at: 100,
+        };
+        let writer = Arc::new(FakeRetentionWriter {
+            last: Mutex::new(None),
+            force_invalid: false,
+        });
+        let h = RetentionSettingsSetHandler::new(
+            writer.clone(),
+            Arc::new(FakeRetention {
+                dto: current.clone(),
+            }),
+        );
+
+        let echo = serde_json::json!({
+            "superseded-days": 30,
+            "superseded-count-cap": 100,
+            "rejected-days": 7,
+            "rolledback-days": 14,
+            "rolledback-count-cap": 20,
+            "pin-lkg": true,
+        });
+        assert!(
+            h.handle(
+                &req(IpcOperationName::RetentionSettingsSet, echo),
+                &plain_ctx("S"),
+            )
+            .is_ok(),
+            "saving the page unchanged must not need an administrator",
+        );
+
+        let change = serde_json::json!({
+            "superseded-days": 1,
+            "superseded-count-cap": 100,
+            "rejected-days": 7,
+            "rolledback-days": 14,
+            "rolledback-count-cap": 20,
+            "pin-lkg": true,
+        });
+        let err = h
+            .handle(
+                &req(IpcOperationName::RetentionSettingsSet, change),
+                &plain_ctx("S"),
+            )
+            .expect_err("a real change needs an administrator");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+    }
+
     #[test]
     fn retention_set_round_trips() {
         let w = Arc::new(FakeRetentionWriter {
             last: Mutex::new(None),
             force_invalid: false,
         });
-        let h = RetentionSettingsSetHandler::new(w.clone());
+        // The set path now also reads the current value, to tell an actual
+        // change from a settings page saving itself back.
+        let h = RetentionSettingsSetHandler::new(
+            w.clone(),
+            Arc::new(FakeRetention {
+                dto: RetentionSettingsDto {
+                    superseded_days: 30,
+                    superseded_count_cap: 100,
+                    rejected_days: 7,
+                    rolledback_days: 14,
+                    rolledback_count_cap: 20,
+                    pin_lkg: true,
+                    last_cleanup_at: None,
+                    updated_at: 100,
+                },
+            }),
+        );
         let payload = serde_json::json!({
             "superseded-days": 10,
             "superseded-count-cap": 50,
@@ -625,7 +930,21 @@ mod tests {
             last: Mutex::new(None),
             force_invalid: true,
         });
-        let h = RetentionSettingsSetHandler::new(w);
+        let h = RetentionSettingsSetHandler::new(
+            w,
+            Arc::new(FakeRetention {
+                dto: RetentionSettingsDto {
+                    superseded_days: 30,
+                    superseded_count_cap: 100,
+                    rejected_days: 7,
+                    rolledback_days: 14,
+                    rolledback_count_cap: 20,
+                    pin_lkg: true,
+                    last_cleanup_at: None,
+                    updated_at: 100,
+                },
+            }),
+        );
         let payload = serde_json::json!({
             "superseded-days": 1,
             "superseded-count-cap": 1,
@@ -645,7 +964,6 @@ mod tests {
 
     // ── Apply failure policy ─────────────────────────────────────────────────
 
-    #[allow(dead_code)]
     struct FakePolicy {
         dto: ApplyFailurePolicyDto,
     }
@@ -678,7 +996,16 @@ mod tests {
         let w = Arc::new(FakePolicyWriter {
             last: Mutex::new(None),
         });
-        let h = ApplyFailurePolicySetHandler::new(w.clone());
+        let h = ApplyFailurePolicySetHandler::new(
+            w.clone(),
+            Arc::new(FakePolicy {
+                dto: ApplyFailurePolicyDto {
+                    policy: "all-or-nothing".into(),
+                    updated_at: 0,
+                    set_by_sid: None,
+                },
+            }),
+        );
         let payload = serde_json::json!({"policy": "best-effort"});
         let value = h
             .handle(
@@ -698,7 +1025,16 @@ mod tests {
         let w = Arc::new(FakePolicyWriter {
             last: Mutex::new(None),
         });
-        let h = ApplyFailurePolicySetHandler::new(w.clone());
+        let h = ApplyFailurePolicySetHandler::new(
+            w.clone(),
+            Arc::new(FakePolicy {
+                dto: ApplyFailurePolicyDto {
+                    policy: "all-or-nothing".into(),
+                    updated_at: 0,
+                    set_by_sid: None,
+                },
+            }),
+        );
         let payload = serde_json::json!({"policy": "all-or-nothing"});
         let _ = h
             .handle(

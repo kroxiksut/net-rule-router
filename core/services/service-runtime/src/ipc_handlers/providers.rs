@@ -398,6 +398,10 @@ pub trait TrafficStatsWriter: Send + Sync {
     /// Reset all traffic data (daily ledger + session totals + cursors); the
     /// settings are kept. Returns the (unchanged) current settings.
     fn clear(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError>;
+
+    /// The settings as they stand. The write path needs them to tell a genuine
+    /// change from a client sending the whole settings page back untouched.
+    fn settings(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError>;
 }
 
 /// The local networks a principal may keep reachable while the kill-switch

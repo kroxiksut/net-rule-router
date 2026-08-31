@@ -216,12 +216,20 @@ pub fn is_virtual_machine_adapter(info: &AdapterInfo) -> bool {
     if matches!(info.interface_type, InterfaceType::Loopback) {
         return false;
     }
-    let names = format!("{} {}", info.description, info.friendly_name);
+    names_indicate_virtual_machine_network(&info.description, &info.friendly_name)
+}
+
+/// Name-only twin of [`is_virtual_machine_adapter`], for callers that read the
+/// adapter's text straight out of an OS query and never build an [`AdapterInfo`]
+/// — the upstream-DNS enumeration is one. Same rule and same tie-break, so a
+/// second notion of "this is a VM network" cannot drift into existence.
+pub fn names_indicate_virtual_machine_network(description: &str, friendly_name: &str) -> bool {
+    let names = format!("{description} {friendly_name}");
     if text_indicates_vpn_tunnel(&names) {
         return false;
     }
-    description_matches_virtual_software(&info.description)
-        || description_matches_virtual_software(&info.friendly_name)
+    description_matches_virtual_software(description)
+        || description_matches_virtual_software(friendly_name)
 }
 
 // ── AdapterAvailability ───────────────────────────────────────────────────────

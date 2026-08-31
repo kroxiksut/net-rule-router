@@ -188,6 +188,21 @@ impl BootstrapArtifacts {
 /// per-phase report. Never panics: every fallible call is captured into
 /// the report; subsequent phases that depend on a failed predecessor
 /// are emitted as `Skipped`.
+/// Delete a SQLite database together with its WAL sidecars.
+///
+/// Every store here runs in WAL mode, so a database is three files. Removing
+/// only the `.db` leaves `-wal` and `-shm` behind, and the fresh database
+/// created next opens beside a write-ahead log written for the file that no
+/// longer exists — the corruption we were recovering from, carried forward.
+fn remove_sqlite_triplet(db_path: &std::path::Path) {
+    let _ = std::fs::remove_file(db_path);
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = db_path.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+    }
+}
+
 pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
     let mut report = BootstrapReport::default();
     let mut state_store: Option<Arc<SqliteStateStore>> = None;
@@ -290,13 +305,40 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
         let audit_dir = topology.data_dir.join("audit");
         match open_audit(&audit_dir) {
             Ok(w) => {
+                let integrity = w.tail_integrity().clone();
                 audit_writer = Some(Arc::new(w));
-                push(
-                    &mut report,
-                    phases::DIAGNOSTICS_AUDIT,
-                    BootstrapStepStatus::Ok,
-                    "ok",
-                );
+                if let nrr_diagnostics::AuditTailIntegrity::Truncated {
+                    anchor_seq,
+                    found_seq,
+                } = integrity
+                {
+                    // The chain now continues from the anchor, so the gap stays
+                    // visible in the files; say so where an operator will see it.
+                    tracing::error!(
+                        target: "nrr::audit",
+                        anchor_seq,
+                        found_seq = found_seq.unwrap_or(0),
+                        "audit tail is shorter than the anchor — events were removed"
+                    );
+                    push(
+                        &mut report,
+                        phases::DIAGNOSTICS_AUDIT,
+                        BootstrapStepStatus::Degraded,
+                        format!(
+                            "audit tail truncated: anchored seq {anchor_seq}, found {}",
+                            found_seq
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "none".to_string())
+                        ),
+                    );
+                } else {
+                    push(
+                        &mut report,
+                        phases::DIAGNOSTICS_AUDIT,
+                        BootstrapStepStatus::Ok,
+                        "ok",
+                    );
+                }
             }
             Err(msg) => push(
                 &mut report,
@@ -400,11 +442,11 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
             }
             Err(msg) => {
                 if config.allow_cache_rebuild {
-                    // Drop the corrupt file and re-create it from a
+                    // Drop the corrupt database and re-create it from a
                     // fresh migration. The runtime will treat it as an
                     // empty cache, which is functionally correct — the
                     // FQDN/IP cache is rebuildable by design.
-                    let _ = std::fs::remove_file(&topology.cache_db_path);
+                    remove_sqlite_triplet(&topology.cache_db_path);
                     match open_and_migrate_cache(
                         &topology.cache_db_path,
                         &config.freshness_thresholds,
@@ -769,7 +811,11 @@ fn open_and_migrate_cache(
 
 fn open_audit(audit_dir: &Path) -> Result<AuditWriter, String> {
     std::fs::create_dir_all(audit_dir).map_err(|e| format!("create audit dir: {e}"))?;
-    Ok(AuditWriter::open(AuditWriterConfig::new(audit_dir)))
+    let anchor = Arc::new(nrr_diagnostics::FileAnchorStore::in_dir(audit_dir));
+    Ok(AuditWriter::open_anchored(
+        AuditWriterConfig::new(audit_dir),
+        Some(anchor),
+    ))
 }
 
 fn open_logs(logs_dir: &Path) -> Result<LogWriter, String> {
@@ -884,6 +930,45 @@ mod tests {
         let audit_dir = result.topology.data_dir.join("audit");
         assert!(audit_dir.exists(), "audit dir created by early-open");
         assert!(audit_dir.is_dir());
+    }
+
+    #[test]
+    fn a_cache_rebuild_takes_the_wal_sidecars_with_it() {
+        // WAL mode makes a database three files. Deleting only the `.db` left
+        // the fresh one to open beside a write-ahead log written for a file
+        // that no longer exists — the corruption carried forward.
+        let (_dir, cfg) = temp_profile();
+        let first = bootstrap(&cfg);
+        assert!(first.is_ready_to_run());
+        let cache_path = first.topology.cache_db_path.clone();
+        drop(first);
+
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm"]
+            .iter()
+            .map(|suffix| {
+                let mut p = cache_path.as_os_str().to_owned();
+                p.push(suffix);
+                std::path::PathBuf::from(p)
+            })
+            .collect();
+        std::fs::write(&cache_path, b"not a valid sqlite database").expect("overwrite cache");
+        for sidecar in &sidecars {
+            std::fs::write(sidecar, b"stale sidecar").expect("plant sidecar");
+        }
+
+        let second = bootstrap(&cfg);
+        assert!(second.is_ready_to_run(), "report = {:?}", second.report);
+        drop(second);
+
+        for sidecar in &sidecars {
+            let content = std::fs::read(sidecar).unwrap_or_default();
+            assert_ne!(
+                content,
+                b"stale sidecar",
+                "{} survived the rebuild",
+                sidecar.display()
+            );
+        }
     }
 
     #[test]

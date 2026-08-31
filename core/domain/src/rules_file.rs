@@ -6,7 +6,7 @@
 //! comments. Each file follows a sectioned text format:
 //!
 //! ```text
-//! # NetRuleRouter rules file — version 1
+//! # NetRuleRouter rules file — version 4
 //!
 //! --- Zones
 //! corp-network  # internal corporate zone
@@ -35,7 +35,7 @@
 //! A preset file adds optional metadata header comments before the first section:
 //!
 //! ```text
-//! # NetRuleRouter preset — version 1
+//! # NetRuleRouter preset — version 4
 //! # name: Corporate VPN Rules
 //! # description: Routes corporate traffic via VPN
 //! # author: Jane Doe
@@ -465,10 +465,18 @@ pub struct UnknownSection {
 /// When `N` is greater, known sections are still parsed but unrecognised
 /// sections/fields are ignored and [`ParseWarning::UnknownFormatVersion`] is
 /// emitted.
-pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 1;
+///
+/// 4, not 1: versions are cumulative and this build implements 1 (`sections,
+/// comments, disabled rules`), 3 (`+block`) and 4 (`--- Auto`). Version 2 was
+/// reserved for a nested `- destination` syntax that was specified and never
+/// implemented — the number stays retired rather than reused, so a file means
+/// the same thing in every build. While the constant said 1, every valid file
+/// of the format we actually write was greeted with "some rules may be
+/// ignored".
+pub const CURRENT_RULES_FILE_FORMAT_VERSION: u32 = 4;
 
 /// Format version recognised by this build for `# NetRuleRouter preset — version N` headers.
-pub const CURRENT_PRESET_FORMAT_VERSION: u32 = 1;
+pub const CURRENT_PRESET_FORMAT_VERSION: u32 = 4;
 
 /// Optional metadata declared in a preset file's preamble comments.
 ///
@@ -481,7 +489,7 @@ pub const CURRENT_PRESET_FORMAT_VERSION: u32 = 1;
 /// # Metadata key format
 ///
 /// ```text
-/// # NetRuleRouter preset — version 1
+/// # NetRuleRouter preset — version 4
 /// # name: Corporate VPN Rules
 /// # description: Routes corporate traffic via the secondary (VPN) interface
 /// # author: Jane Doe
@@ -625,6 +633,11 @@ fn parse_metadata_kv(line: &str) -> Option<(&str, &str)> {
 }
 
 pub fn parse_rules_file(input: &str) -> ParseOutcome {
+    // A file saved by a Windows editor starts with a BOM. One caller
+    // (`preset_validation`) stripped it before handing the text over and the
+    // others did not, so the same file parsed differently depending on the
+    // route in. Stripped here, once, for every caller and both parsers.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut known: Vec<SectionContent> = Vec::new();
     let mut unknown: Vec<UnknownSection> = Vec::new();
     let mut warnings: Vec<ParseWarning> = Vec::new();
@@ -648,8 +661,14 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
 
         // Section header? Checked first so `--- SectionName` lines are never
         // consumed by the preamble block below.
-        if let Some(name) = trimmed.strip_prefix("--- ") {
-            let name = name.trim();
+        //
+        // Recognised by the SHARED header parser, not by a second reading of
+        // the same spec: this side used to accept a header with leading
+        // whitespace (`  --- IP`) while the GUI's parser did not, so the
+        // service opened a section the GUI kept feeding to the previous one —
+        // and every address after it landed under the wrong heading. The strict
+        // reading is the one the format documents.
+        if let Some(name) = nrr_shared::preset_parser::parse_section_header(line) {
             match RulesFileSection::from_name(name) {
                 Some(section) => {
                     // Merge into existing slot for this section (handles duplicate headers).
@@ -737,8 +756,8 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
         };
 
         let mut entry = if let Some(rest) = trimmed.strip_prefix('#') {
-            // Possibly a disabled rule. The rest (after '#', leading space trimmed)
-            // must be a single word (no whitespace) to qualify as a rule value.
+            // Possibly a disabled rule — `nrr_shared` owns the one predicate
+            // that tells a disabled rule from a prose comment.
             let rest = rest.trim_start();
             if rest.is_empty() || rest.starts_with('#') {
                 // Pure comment line — ignore.
@@ -750,7 +769,17 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
             // disabled blocked rule (`# example.com +block`) is not mistaken
             // for a prose comment.
             let (value, blocked) = extract_rule_flags(value);
-            if value.is_empty() || value.contains(char::is_whitespace) {
+            let rule_type = match &current {
+                Some(Slot::Known(idx)) => {
+                    nrr_shared::preset_parser::classify_section_lenient(known[*idx].section.name())
+                }
+                _ => None,
+            };
+            let is_rule = match rule_type {
+                Some(kind) => nrr_shared::preset_parser::is_disabled_rule_value(kind, &value),
+                None => !value.contains(char::is_whitespace),
+            };
+            if value.is_empty() || !is_rule {
                 // Prose comment like "# this is a note about example.com" — ignore.
                 continue;
             }
@@ -1346,6 +1375,69 @@ pub struct RuleFileCachePolicy;
 
 #[cfg(test)]
 mod tests {
+
+    /// One format, one reading of it. The service side used to accept a header
+    /// with leading whitespace while the GUI side did not, so a file with
+    /// `  --- IP` imported as two different rule sets depending on who read it.
+    #[test]
+    fn both_parsers_agree_on_where_a_section_starts() {
+        let text = "--- Domains
+example.com
+  --- IP
+203.0.113.1
+";
+        let outcome = parse_rules_file(text);
+        // The indented line is NOT a header, so the address after it stays in
+        // Domains and no IP section is opened.
+        assert!(
+            outcome.parsed.entries_for(RulesFileSection::Ip).is_empty(),
+            "an indented header must not open a section"
+        );
+        let shared = nrr_shared::preset_parser::parse_canonical_rules(text);
+        assert!(
+            shared
+                .rules
+                .iter()
+                .all(|r| r.rule_type != nrr_shared::preset_parser::ParsedRuleType::ExactIp),
+            "the GUI parser must reach the same conclusion"
+        );
+    }
+
+    /// An indented disabled rule is still a disabled rule. The GUI parser kept
+    /// leading whitespace, so `  # example.com` was not recognised as one and
+    /// the rule vanished from the list the service was still keeping.
+    #[test]
+    fn both_parsers_keep_an_indented_disabled_rule() {
+        let text = "--- Domains
+  # example.com
+keep.example
+";
+        let outcome = parse_rules_file(text);
+        let entries = outcome.parsed.entries_for(RulesFileSection::Domains);
+        assert_eq!(entries.len(), 2, "the disabled rule is kept: {entries:?}");
+        assert!(entries.iter().any(|e| !e.enabled));
+
+        let shared = nrr_shared::preset_parser::parse_canonical_rules(text);
+        assert_eq!(shared.rules.len(), 2, "the GUI parser must keep it too");
+        assert!(shared.rules.iter().any(|r| !r.enabled));
+    }
+
+    /// A file saved by a Windows editor starts with a BOM. The service strips
+    /// it; the GUI parser did not, so its first section header was invisible
+    /// and every rule under it read as prose.
+    #[test]
+    fn a_leading_bom_does_not_hide_the_first_section() {
+        let text = "\u{feff}--- Domains
+example.com
+";
+        let outcome = parse_rules_file(text);
+        assert_eq!(
+            outcome.parsed.entries_for(RulesFileSection::Domains).len(),
+            1
+        );
+        let shared = nrr_shared::preset_parser::parse_canonical_rules(text);
+        assert_eq!(shared.rules.len(), 1, "the GUI parser must see it too");
+    }
     use super::*;
 
     // ── RulesFileSection ─────────────────────────────────────────────────────
@@ -1826,6 +1918,45 @@ browser.exe   # browser traffic
         assert_eq!(disabled[0].match_value, "powershell.exe");
     }
 
+    /// The toggle in the GUI writes `# <value>` and the file is rewritten from
+    /// the parsed model, so a value dropped here is a rule deleted for good.
+    #[test]
+    fn a_disabled_program_name_with_a_space_survives_the_round_trip() {
+        let file = "--- Windows
+# Adobe Reader.exe
+browser.exe
+";
+        let outcome = parse_rules_file(file);
+        let win = outcome.parsed.entries_for(RulesFileSection::Windows);
+        assert_eq!(win.len(), 2, "{win:?}");
+        assert_eq!(win[0].match_value, "Adobe Reader.exe");
+        assert!(!win[0].enabled);
+    }
+
+    #[test]
+    fn prose_in_a_section_is_still_a_comment() {
+        let file = "--- Windows
+# a note about the browser below
+browser.exe
+";
+        let outcome = parse_rules_file(file);
+        let win = outcome.parsed.entries_for(RulesFileSection::Windows);
+        assert_eq!(win.len(), 1, "{win:?}");
+        assert_eq!(win[0].match_value, "browser.exe");
+    }
+
+    #[test]
+    fn a_multi_word_comment_in_a_domain_section_is_never_a_rule() {
+        let file = "--- Domains
+# see example.com for details
+example.org
+";
+        let outcome = parse_rules_file(file);
+        let dom = outcome.parsed.entries_for(RulesFileSection::Domains);
+        assert_eq!(dom.len(), 1, "{dom:?}");
+        assert_eq!(dom[0].match_value, "example.org");
+    }
+
     #[test]
     fn parse_empty_sections_preserved() {
         let outcome = parse_rules_file(SAMPLE_FILE);
@@ -2000,7 +2131,7 @@ corp.example.com
             &outcome.warnings[0],
             ParseWarning::UnknownFormatVersion {
                 found: 99,
-                supported: 1
+                supported: 4
             }
         ));
     }
@@ -2047,6 +2178,10 @@ corp.example.com
     fn parse_version_header_from_sample_file() {
         let outcome = parse_rules_file(SAMPLE_FILE);
         assert_eq!(outcome.file_format_version, Some(1));
+        assert!(
+            outcome.warnings.is_empty(),
+            "a version-1 file is fully understood by a version-4 build"
+        );
     }
 
     #[test]
@@ -2075,7 +2210,7 @@ corp.example.com
             &outcome.warnings[0],
             ParseWarning::UnknownFormatVersion {
                 found: 99,
-                supported: 1
+                supported: 4
             }
         ));
     }
@@ -2444,7 +2579,7 @@ example.com
         };
         let text = write_rules_file(&parsed, &[], Some(&meta));
         assert!(
-            text.starts_with("# NetRuleRouter preset \u{2014} version 1\n"),
+            text.starts_with("# NetRuleRouter preset \u{2014} version 4\n"),
             "got:\n{text}"
         );
         assert!(text.contains("# name: Corporate VPN\n"));

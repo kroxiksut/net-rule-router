@@ -96,7 +96,9 @@ impl IpcHandler for RollbackHandler {
         } else {
             ctx.caller_stored().to_string()
         };
-        let op_id = self.operation_store.enqueue();
+        let op_id = self
+            .operation_store
+            .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
         let outcome = self
             .executor
             .rollback(&principal, body.target_revision_id.as_deref());

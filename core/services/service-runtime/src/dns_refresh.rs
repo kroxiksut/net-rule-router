@@ -72,6 +72,15 @@ pub struct RefreshSummary {
     pub loopback_pinned: u32,
 }
 
+/// Whether the refresh loop should keep going after this row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TickStep {
+    Continue,
+    /// The resolver cannot work on this platform at all — every remaining row
+    /// would ask it the same question and get the same answer.
+    Stop,
+}
+
 impl RefreshSummary {
     /// `true` when at least one expired hostname was processed (or
     /// attempted). Callers may use this to decide whether to log at
@@ -252,7 +261,9 @@ impl DnsRefreshOrchestrator {
                 summary.skipped = summary.skipped.saturating_add(1);
                 continue;
             }
-            self.refresh_one(&row, now, &mut summary);
+            if self.refresh_one(&row, now, &mut summary) == TickStep::Stop {
+                break;
+            }
         }
 
         // when at least one resolution succeeded
@@ -352,7 +363,12 @@ impl DnsRefreshOrchestrator {
         }
     }
 
-    fn refresh_one(&self, row: &ExpiredHostname, now: SystemTime, summary: &mut RefreshSummary) {
+    fn refresh_one(
+        &self,
+        row: &ExpiredHostname,
+        now: SystemTime,
+        summary: &mut RefreshSummary,
+    ) -> TickStep {
         match self.resolver.resolve_a(&row.canonical_hostname) {
             Ok(mut record) => {
                 // Mode B self-interception: the OS resolver path is redirected
@@ -419,6 +435,10 @@ impl DnsRefreshOrchestrator {
                 summary.skipped = summary.attempted.saturating_sub(
                     summary.succeeded + summary.failed_authoritative + summary.failed_transient,
                 );
+                // The log said "aborting" and the loop carried on: every
+                // remaining row asked the same unsupported resolver and got the
+                // same answer, one log line each.
+                return TickStep::Stop;
             }
             Err(err) => {
                 let authoritative = err.is_authoritative();
@@ -434,6 +454,7 @@ impl DnsRefreshOrchestrator {
                 }
             }
         }
+        TickStep::Continue
     }
 
     fn write_success(&self, record: ResolvedRecord, now: SystemTime) -> bool {

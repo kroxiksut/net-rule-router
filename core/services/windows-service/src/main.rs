@@ -26,6 +26,8 @@ use nrr_service_runtime::service_runtime_orchestration_snapshot;
 #[cfg(windows)]
 mod console_ctrl;
 #[cfg(windows)]
+mod logon_scm;
+#[cfg(windows)]
 mod power_scm;
 #[cfg(windows)]
 mod scm;
@@ -399,8 +401,8 @@ pub(crate) fn read_verbose_logging_flag(state_db_path: &std::path::Path) -> bool
 }
 
 fn print_status_banner() {
-    println!("{}", nrr_application::runtime_boot_banner("service"));
-    println!("{}", nrr_application::runtime_boot_guard_message());
+    println!("{}", nrr_shared::runtime_boot_banner("service"));
+    println!("{}", nrr_shared::runtime_boot_role_message("service"));
     let s = service_runtime_orchestration_snapshot();
     println!(
         "Service orchestration: lifecycle={} bootstrap={} policy={} ipc={} health={} \

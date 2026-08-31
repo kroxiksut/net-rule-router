@@ -323,29 +323,35 @@ pub fn parse_ptr_response(expect_id: u16, ip: Ipv4Addr, packet: &[u8]) -> PtrRes
         return PtrResponseOutcome::Failed(rcode);
     }
     let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
+    let records = read_answer_records(packet, q.question_end, ancount);
+    // Same owner check the A path does: a record is only this answer's if it is
+    // filed under the question's name or something its CNAME chain reaches.
+    // Without it a response could smuggle a PTR under any owner it liked, and
+    // the name it carries is what feeds reverse-DNS learning.
+    let owners = answer_owner_closure(packet, &records, &q.qname);
     let mut names = Vec::new();
-    let mut off = q.question_end;
-    for _ in 0..ancount {
-        let Some(after_name) = skip_encoded_name(packet, off) else {
-            break;
-        };
-        let Some(fixed) = packet.get(after_name..after_name + 10) else {
-            break;
-        };
-        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
-        let rclass = u16::from_be_bytes([fixed[2], fixed[3]]);
-        let rdlen = u16::from_be_bytes([fixed[8], fixed[9]]) as usize;
-        let rdata_start = after_name + 10;
-        if packet.get(rdata_start..rdata_start + rdlen).is_none() {
-            break;
+    let mut off_chain = 0usize;
+    for rr in records
+        .iter()
+        .filter(|r| r.rtype == QTYPE_PTR && r.rclass == CLASS_IN)
+    {
+        if !rr.owner.as_deref().is_some_and(|o| owners.contains(o)) {
+            off_chain += 1;
+            continue;
         }
-        if rtype == QTYPE_PTR && rclass == 1 {
-            // PTR RDATA is a domain name (possibly compressed into earlier bytes).
-            if let Some(name) = decode_name(packet, rdata_start) {
-                names.push(name);
-            }
+        // PTR RDATA is a domain name (possibly compressed into earlier bytes).
+        if let Some(name) = decode_name(packet, rr.rdata_start) {
+            names.push(name);
         }
-        off = rdata_start + rdlen;
+    }
+    if off_chain > 0 {
+        tracing::debug!(
+            target: "nrr::dns-resolver",
+            query = %q.qname,
+            off_chain,
+            kept = names.len(),
+            "dropped PTR records filed under an owner name the question's CNAME chain never reaches",
+        );
     }
     if names.is_empty() {
         return PtrResponseOutcome::NoRecords;
@@ -920,6 +926,49 @@ mod tests {
         match parse_ptr_response(5, ip(93, 184, 216, 34), &resp) {
             PtrResponseOutcome::Names(names) => {
                 assert_eq!(names, vec!["example.com", "www.example.com"]);
+            }
+            other => panic!("expected names, got {other:?}"),
+        }
+    }
+
+    /// A record filed under a name the question never reaches is not this
+    /// answer's. The A path already dropped those; the PTR path took them, and
+    /// the name a PTR carries is what feeds reverse-DNS learning.
+    #[test]
+    fn ptr_response_drops_records_filed_under_a_foreign_owner() {
+        /// Same as `push_ptr_rr` but with an owner name of its own.
+        fn push_foreign_ptr_rr(resp: &mut Vec<u8>, owner: &str, target: &str) {
+            for label in owner.split('.') {
+                resp.push(label.len() as u8);
+                resp.extend_from_slice(label.as_bytes());
+            }
+            resp.push(0);
+            resp.extend_from_slice(&QTYPE_PTR.to_be_bytes());
+            resp.extend_from_slice(&[0x00, 0x01]);
+            resp.extend_from_slice(&3600u32.to_be_bytes());
+            let mut rdata = Vec::new();
+            for label in target.split('.') {
+                rdata.push(label.len() as u8);
+                rdata.extend_from_slice(label.as_bytes());
+            }
+            rdata.push(0);
+            resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            resp.extend_from_slice(&rdata);
+        }
+
+        let addr = ip(93, 184, 216, 34);
+        let mut resp = ptr_response(7, addr, &["example.com"]);
+        // A second answer, filed under an unrelated owner.
+        resp[6..8].copy_from_slice(&2u16.to_be_bytes());
+        push_foreign_ptr_rr(&mut resp, "1.2.3.4.in-addr.arpa", "attacker.example");
+
+        match parse_ptr_response(7, addr, &resp) {
+            PtrResponseOutcome::Names(names) => {
+                assert_eq!(
+                    names,
+                    vec!["example.com"],
+                    "only the record the question owns survives"
+                );
             }
             other => panic!("expected names, got {other:?}"),
         }

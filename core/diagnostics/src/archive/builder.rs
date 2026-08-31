@@ -101,7 +101,18 @@ impl ArchiveBuilder {
         })?;
 
         // Write section files.
-        let sections_written = write_sections(&input, temp_dir.path())?;
+        let mut sections_written = write_sections(&input, temp_dir.path())?;
+        if input
+            .request
+            .all_sections()
+            .contains(&ArchiveSection::RedactionReport)
+        {
+            sections_written.push(write_redaction_report(
+                &input,
+                temp_dir.path(),
+                &sections_written,
+            )?);
+        }
 
         // Build manifest.
         let created_at = SystemTime::now()
@@ -113,15 +124,14 @@ impl ArchiveBuilder {
             schema_version: MANIFEST_SCHEMA_VERSION,
             created_at,
             app_version: input.request.app_version.clone(),
-            redaction_mode: match input.request.redaction_mode {
-                crate::privacy::RedactionMode::Default => "default".into(),
-                crate::privacy::RedactionMode::Diagnostics => "diagnostics".into(),
-                crate::privacy::RedactionMode::DeveloperLocal => "developer_local".into(),
-            },
+            redaction_mode: redaction_mode_slug(input.request.redaction_mode),
             included_sections: sections_written.clone(),
             log_entry_count: input.log_entries.len() as u32,
             audit_entry_count: input.audit_entries.len() as u32,
-            total_size_bytes_approx: 0, // updated after zip
+            // The manifest lives INSIDE the zip, so it cannot state the zip's
+            // own size. What it can state truthfully is the staged content it
+            // describes; the compressed size comes back in `BuildResult`.
+            total_size_bytes_approx: staged_bytes(temp_dir.path()),
             contains_diagnostic_detail: input.request.redaction_mode
                 > crate::privacy::RedactionMode::Default,
             no_backup_guarantee: DiagnosticArchiveManifest::NO_BACKUP_GUARANTEE.to_string(),
@@ -173,6 +183,11 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
     let mut written = Vec::new();
 
     for section in input.request.all_sections() {
+        // The report describes the sections around it, so it is written last,
+        // once there is something to describe.
+        if section == ArchiveSection::RedactionReport {
+            continue;
+        }
         if write_section(input, dir, section)? {
             written.push(section.filename().to_string());
         }
@@ -187,6 +202,8 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
         .as_deref()
         .filter(|t| !t.trim().is_empty())
     {
+        let text =
+            crate::privacy::redact::mask_user_paths_in_text(text, input.request.redaction_mode);
         std::fs::write(dir.join(SERVICE_STDERR_FILENAME), text).map_err(|e| {
             DiagnosticsError::ExportFailed {
                 reason: format!("cannot write {SERVICE_STDERR_FILENAME}: {e}"),
@@ -214,7 +231,11 @@ fn write_section(
             // unpopulated enrichment DTO leaves `health.json` byte-identical
             // to the pre-enrichment shape.
             let mut merged = serde_json::to_value(&input.health).map_err(ser_err)?;
-            let enrichment = serde_json::to_value(&input.health_enrichment).map_err(ser_err)?;
+            let mut enrichment_dto = input.health_enrichment.clone();
+            if let Some(snapshot) = enrichment_dto.adapters_snapshot.as_mut() {
+                redact_adapters_snapshot(snapshot, input.request.redaction_mode);
+            }
+            let enrichment = serde_json::to_value(&enrichment_dto).map_err(ser_err)?;
             if let (serde_json::Value::Object(base), serde_json::Value::Object(extra)) =
                 (&mut merged, enrichment)
             {
@@ -350,24 +371,132 @@ fn write_section(
             write_file(&path, md.as_bytes())?;
         }
         ArchiveSection::RedactionReport => {
-            let report = RedactionReport {
-                redaction_mode: match input.request.redaction_mode {
-                    crate::privacy::RedactionMode::Default => "default".into(),
-                    crate::privacy::RedactionMode::Diagnostics => "diagnostics".into(),
-                    crate::privacy::RedactionMode::DeveloperLocal => "developer_local".into(),
-                },
-                diagnostic_mode_active: input.health.diagnostic_mode.active,
-                hostnames_redacted: 0, // populated by caller in real impl
-                ips_redacted: 0,
-                paths_redacted: 0,
-                excluded_sections: vec![],
-                always_hidden_fields: RedactionReport::always_hidden(),
-            };
-            let json = serde_json::to_string_pretty(&report).map_err(ser_err)?;
-            write_file(&path, json.as_bytes())?;
+            // Written by `write_redaction_report` after the other sections
+            // exist; there is nothing to measure before then.
+            return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Writes `redaction_report.json` from what the staged sections actually
+/// contain.
+///
+/// The counters are measured, not asserted: they count the redaction MARKERS
+/// present in the staged files. A hostname shortened to eTLD+1 leaves no
+/// marker and is therefore not counted — `redaction_mode` is what states that
+/// shortening was applied. Reporting a measured floor beats the flat zeros
+/// this section carried before, which told the reader the opposite of the
+/// truth.
+fn write_redaction_report(
+    input: &ArchiveInput,
+    dir: &Path,
+    sections_written: &[String],
+) -> DiagnosticsResult<String> {
+    let counts = count_markers(dir);
+    let excluded: Vec<String> = ArchiveSection::ALL
+        .iter()
+        .map(|s| s.filename())
+        .filter(|name| {
+            *name != ArchiveSection::RedactionReport.filename()
+                && !sections_written.iter().any(|w| w == name)
+        })
+        .map(|name| name.to_string())
+        .collect();
+
+    let report = RedactionReport {
+        redaction_mode: redaction_mode_slug(input.request.redaction_mode),
+        diagnostic_mode_active: input.health.diagnostic_mode.active,
+        hostnames_redacted: counts.hostnames,
+        ips_redacted: counts.ips,
+        paths_redacted: counts.paths,
+        excluded_sections: excluded,
+        always_hidden_fields: RedactionReport::always_hidden(),
+    };
+    let json = serde_json::to_string_pretty(&report).map_err(ser_err)?;
+    let name = ArchiveSection::RedactionReport.filename();
+    write_file(&dir.join(name), json.as_bytes())?;
+    Ok(name.to_string())
+}
+
+#[derive(Default)]
+struct MarkerCounts {
+    hostnames: u32,
+    ips: u32,
+    paths: u32,
+}
+
+fn count_markers(dir: &Path) -> MarkerCounts {
+    use crate::privacy::redact::{
+        MARKER_MASKED_IPV4, MARKER_MASKED_PATH, MARKER_PRIVATE_IPV4, MARKER_PUBLIC_IPV4,
+        MARKER_REDACTED,
+    };
+
+    let mut counts = MarkerCounts::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return counts;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        counts.hostnames += text.matches(MARKER_REDACTED).count() as u32;
+        counts.ips += (text.matches(MARKER_MASKED_IPV4).count()
+            + text.matches(MARKER_PRIVATE_IPV4).count()
+            + text.matches(MARKER_PUBLIC_IPV4).count()) as u32;
+        counts.paths += text.matches(MARKER_MASKED_PATH).count() as u32;
+    }
+    counts
+}
+
+fn redaction_mode_slug(mode: crate::privacy::RedactionMode) -> String {
+    match mode {
+        crate::privacy::RedactionMode::Default => "default".into(),
+        crate::privacy::RedactionMode::Diagnostics => "diagnostics".into(),
+        crate::privacy::RedactionMode::DeveloperLocal => "developer_local".into(),
+    }
+}
+
+/// Reduces the adapter snapshot embedded in `health.json` to what the chosen
+/// redaction mode allows.
+///
+/// The snapshot carries MAC addresses, local addresses, gateways and DNS
+/// servers, and it went into every default export untouched while the
+/// manifest in the same zip promised no credential-like content. The adapter
+/// redaction helper written for exactly this shape had no production caller.
+fn redact_adapters_snapshot(
+    snapshot: &mut nrr_shared::ipc_payloads::SnapshotInterfacesResponse,
+    mode: crate::privacy::RedactionMode,
+) {
+    use crate::privacy::redact::{redact_adapter_id, redact_ipv4_str};
+
+    if mode.shows_ip() {
+        return;
+    }
+    let hide_addresses = |value: &mut String| {
+        // A field can hold several addresses (`dns_servers` is a joined list);
+        // redact each so one unparseable entry does not leak the rest.
+        *value = value
+            .split(&[',', ' '][..])
+            .filter(|part| !part.is_empty())
+            .map(|part| redact_ipv4_str(part, mode).display_or_marker())
+            .collect::<Vec<_>>()
+            .join(", ");
+    };
+
+    for adapter in &mut snapshot.adapters {
+        adapter.persistent_id =
+            redact_adapter_id(&adapter.persistent_id, Some(&adapter.adapter_name), mode)
+                .display_or_marker();
+        adapter.physical_address = None;
+    }
+    for row in &mut snapshot.rows {
+        row.persistent_id = redact_adapter_id(&row.persistent_id, Some(&row.adapter_name), mode)
+            .display_or_marker();
+        hide_addresses(&mut row.local_ip);
+        hide_addresses(&mut row.gateway);
+        hide_addresses(&mut row.dns_servers);
+    }
 }
 
 fn write_file(path: &Path, content: &[u8]) -> DiagnosticsResult<()> {
@@ -412,7 +541,41 @@ fn local_zip_timestamp() -> zip::DateTime {
     .unwrap_or_else(|_| zip::DateTime::default_for_write())
 }
 
+/// Total uncompressed size of everything staged for the archive.
+fn staged_bytes(dir: &Path) -> u64 {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// Packages `source_dir` into `dest_path`.
+///
+/// Built under a `.part` name and renamed on success: `File::create` truncates
+/// its target up front, so writing straight to `dest_path` meant any failure
+/// mid-build — including hitting the size cap — left the user a truncated,
+/// unopenable zip that archive retention then counted as a good one and
+/// evicted a valid archive to make room for.
 fn write_zip(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<u64> {
+    let partial = dest_path.with_extension("part");
+    match write_zip_into(source_dir, &partial) {
+        Ok(()) => {
+            std::fs::rename(&partial, dest_path).map_err(|e| DiagnosticsError::ExportFailed {
+                reason: format!("cannot publish archive: {e}"),
+            })?;
+            Ok(std::fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            Err(e)
+        }
+    }
+}
+
+fn write_zip_into(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<()> {
     if let Some(parent) = dest_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| DiagnosticsError::ExportFailed {
             reason: format!("cannot create dest dir: {e}"),
@@ -442,12 +605,10 @@ fn write_zip(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<u64> {
         let file_name = entry.file_name();
         let file_name_str = file_name.to_string_lossy();
 
-        let content = std::fs::read(&file_path).map_err(|e| DiagnosticsError::ExportFailed {
-            reason: format!("cannot read {}: {e}", file_path.display()),
-        })?;
-
-        // Enforce max archive size.
-        total_uncompressed += content.len() as u64;
+        // Check the budget against the file's LENGTH before reading it: a guard
+        // that first pulls the oversized file into memory does not guard
+        // against what it names.
+        total_uncompressed += entry.metadata().map(|m| m.len()).unwrap_or(0);
         if total_uncompressed > crate::archive::request::MAX_ARCHIVE_SIZE_BYTES {
             return Err(DiagnosticsError::ExportFailed {
                 reason: format!(
@@ -456,6 +617,10 @@ fn write_zip(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<u64> {
                 ),
             });
         }
+
+        let content = std::fs::read(&file_path).map_err(|e| DiagnosticsError::ExportFailed {
+            reason: format!("cannot read {}: {e}", file_path.display()),
+        })?;
 
         zip.start_file(file_name_str.as_ref(), options)
             .map_err(|e| DiagnosticsError::ExportFailed {
@@ -471,8 +636,7 @@ fn write_zip(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<u64> {
         reason: format!("cannot finalize zip: {e}"),
     })?;
 
-    let size = std::fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0);
-    Ok(size)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -480,8 +644,8 @@ mod tests {
     use super::*;
     use crate::archive::request::DiagnosticArchiveRequest;
     use crate::facade::dto::{
-        CacheHealthCard, DiagnosticModeStateDto, DiagnosticsStatusDto, LogHealthCard,
-        SecurityStatusCard, ServiceHealthCard,
+        CacheHealthCard, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+        LogHealthCard, SecurityStatusCard, ServiceHealthCard,
     };
 
     fn sample_health() -> DiagnosticsStatusDto {
@@ -512,6 +676,7 @@ mod tests {
             },
             diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: false,
+            origin: DiagnosticsDataOrigin::Service,
         }
     }
 
@@ -526,6 +691,7 @@ mod tests {
                 category: "service".into(),
                 kind: "service.started".into(),
                 message_key: "diag.service.started.summary".into(),
+                message: String::new(),
                 has_payload: false,
                 correlation_summary: Vec::new(),
             }],
@@ -700,6 +866,7 @@ mod tests {
                 category: "service".into(),
                 kind: "service.tick".into(),
                 message_key: "diag.service.tick.summary".into(),
+                message: String::new(),
                 has_payload: false,
                 correlation_summary: Vec::new(),
             })
@@ -737,6 +904,7 @@ mod tests {
                 category: "service".into(),
                 kind: "service.tick".into(),
                 message_key: "diag.service.tick.summary".into(),
+                message: String::new(),
                 has_payload: false,
                 correlation_summary: Vec::new(),
             })
@@ -969,5 +1137,180 @@ mod tests {
             result.manifest.no_backup_guarantee.contains("diagnostic"),
             "no_backup_guarantee must mention 'diagnostic'"
         );
+    }
+
+    #[test]
+    fn the_manifest_states_the_size_of_what_it_describes() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("archive.zip");
+        let input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+
+        let result = ArchiveBuilder::build(input, &dest).expect("build");
+        assert!(
+            result.manifest.total_size_bytes_approx > 0,
+            "a manifest that reports zero bytes describes nothing"
+        );
+        assert!(result.size_bytes > 0);
+    }
+
+    #[test]
+    fn a_failed_build_leaves_no_archive_behind() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("archive.zip");
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+        // Captured stderr goes into the archive verbatim; oversize it past the
+        // 50 MiB cap so the build has to abort mid-zip.
+        input.service_stderr =
+            Some("x".repeat(crate::archive::request::MAX_ARCHIVE_SIZE_BYTES as usize + 1024));
+
+        let result = ArchiveBuilder::build(input, &dest);
+        assert!(result.is_err(), "the size cap must stop the export");
+        assert!(
+            !dest.exists(),
+            "a truncated zip must not be left where retention counts it as good"
+        );
+        assert!(
+            !dest.with_extension("part").exists(),
+            "no leftover part file"
+        );
+    }
+
+    #[test]
+    fn the_redaction_report_names_the_sections_that_were_left_out() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("archive.zip");
+        let input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+
+        ArchiveBuilder::build(input, &dest).expect("build");
+
+        let file = std::fs::File::open(&dest).expect("open zip");
+        let mut zip = zip::ZipArchive::new(file).expect("read zip");
+        let mut json = String::new();
+        {
+            use std::io::Read;
+            let mut entry = zip
+                .by_name("redaction_report.json")
+                .expect("report present");
+            entry.read_to_string(&mut json).expect("read report");
+        }
+        let report: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let excluded: Vec<String> = report["excluded_sections"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            excluded.contains(&"audit_chain.ndjson".to_string()),
+            "a default export excludes the raw chain and must say so: {excluded:?}"
+        );
+    }
+
+    #[test]
+    fn captured_stderr_does_not_carry_the_users_name_into_the_archive() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("archive.zip");
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+        input.service_stderr = Some(
+            "panicked at C:QQUsersQQalexeyQQAppDataQQnrr.exe:12"
+                .to_string()
+                .replace("QQ", "\\"),
+        );
+
+        ArchiveBuilder::build(input, &dest).expect("build");
+
+        let text = read_zip_entry(&dest, SERVICE_STDERR_FILENAME);
+        assert!(
+            !text.contains("alexey"),
+            "user name leaked verbatim: {text}"
+        );
+        assert!(
+            text.contains("nrr.exe:12"),
+            "the useful part of the panic must survive: {text}"
+        );
+    }
+
+    #[test]
+    fn a_default_export_does_not_ship_mac_addresses_or_dns_servers() {
+        use nrr_shared::ipc_payloads::{AdapterEntry, InterfaceRowDto, SnapshotInterfacesResponse};
+
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("archive.zip");
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+        let row = InterfaceRowDto {
+            persistent_id: "00-11-22-33-44-55".into(),
+            adapter_name: "Ethernet".into(),
+            windows_name: "Ethernet".into(),
+            interface_description: "Realtek Gaming GbE".into(),
+            interface_type: "ethernet".into(),
+            is_bluetooth_like: false,
+            local_ip: "192.168.1.42".into(),
+            gateway: "192.168.1.1".into(),
+            dns_servers: "8.8.8.8, 1.1.1.1".into(),
+            has_default_route: true,
+            has_forwarding_path: Some(true),
+            availability: "available".into(),
+            selected_role: None,
+            route_state: "not-selected".into(),
+            observed_facts: nrr_shared::ipc_payloads::InterfaceObservedFactsDto {
+                connectivity_state: "online".into(),
+                external_ip_status: "not-checked".into(),
+                external_ip: None,
+                external_probe_attempted: false,
+                external_probe_note: String::new(),
+            },
+            derived_assessment: nrr_shared::ipc_payloads::InterfaceDerivedAssessmentDto {
+                vpn_tunnel_likelihood: "low".into(),
+                virtual_interface_likelihood: "low".into(),
+                service_interface_likelihood: "low".into(),
+                classification: "physical".into(),
+                confidence_percent: 90,
+                heuristic_only: true,
+                signals: Vec::new(),
+            },
+            recommendation: nrr_shared::ipc_payloads::InterfaceRecommendationDto {
+                class: "primary-candidate".into(),
+                confidence: "high".into(),
+                advisory_only: true,
+                summary: String::new(),
+                key_signals: Vec::new(),
+                excluded_alternatives: Vec::new(),
+            },
+        };
+        input.health_enrichment.adapters_snapshot = Some(SnapshotInterfacesResponse {
+            data_source: "windows-live".into(),
+            adapters: vec![AdapterEntry {
+                persistent_id: "00-11-22-33-44-55".into(),
+                adapter_name: "Ethernet".into(),
+                ipv6_if_index: 12,
+                physical_address: Some("00-11-22-33-44-55".into()),
+                windows_name: "Ethernet".into(),
+                interface_description: "Realtek Gaming GbE".into(),
+                interface_type: "ethernet".into(),
+                oper_status: "up".into(),
+            }],
+            secondary: None,
+            rows: vec![row],
+        });
+
+        ArchiveBuilder::build(input, &dest).expect("build");
+
+        let health = read_zip_entry(&dest, "health.json");
+        assert!(
+            !health.contains("00-11-22-33-44-55"),
+            "MAC leaked: {health}"
+        );
+        assert!(!health.contains("192.168.1.42"), "local address leaked");
+        assert!(!health.contains("8.8.8.8"), "DNS server leaked");
+    }
+
+    fn read_zip_entry(archive: &Path, name: &str) -> String {
+        use std::io::Read;
+        let file = std::fs::File::open(archive).expect("open zip");
+        let mut zip = zip::ZipArchive::new(file).expect("read zip");
+        let mut entry = zip.by_name(name).expect("entry present");
+        let mut text = String::new();
+        entry.read_to_string(&mut text).expect("read entry");
+        text
     }
 }

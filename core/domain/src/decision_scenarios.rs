@@ -92,7 +92,7 @@
 //! ✓ Browser stub experimental — KnownProcessName only, disabled by default
 //! ✓ Availability snapshot: secondary=None vs Some(unavailable) distinct
 //! ✓ Explain output: deterministic ordering, privacy tiers, required fields
-//! ✓ UI tasks described: zone_priority_over_ip, log_level, browser_stub_experimental
+//! ✓ UI task described: zone_priority_over_ip (per-principal since state-DB v61)
 
 use nrr_shared::{RouteBehaviorMode, RouteRole};
 

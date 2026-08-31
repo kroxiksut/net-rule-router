@@ -129,7 +129,12 @@ pub fn resolutions_pass_through_resolved(status_output: &str) -> bool {
 /// Read `resolvectl status` to answer [`resolutions_pass_through_resolved`].
 #[must_use]
 pub fn probe_resolver_mode() -> Option<bool> {
-    let output = Command::new("resolvectl").arg("status").output().ok()?;
+    let output = crate::command::output_with_timeout(
+        "resolvectl",
+        &["status"],
+        crate::command::DEFAULT_COMMAND_TIMEOUT,
+    )
+    .ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     Some(resolutions_pass_through_resolved(&text))
 }

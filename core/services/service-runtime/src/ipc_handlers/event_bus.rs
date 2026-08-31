@@ -32,6 +32,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::ipc_handlers::payloads::StatusUpdateEvent;
 
@@ -40,17 +41,38 @@ use crate::ipc_handlers::payloads::StatusUpdateEvent;
 /// don't lose anything, small enough that memory stays trivial.
 pub const EVENT_BUFFER_CAPACITY: usize = 100;
 
+/// Most subscriptions the bus keeps at once. One per live GUI/tray connection
+/// is the normal shape, so this is generous — it exists because a pipe that
+/// dies without its `unsubscribe` leaves its entry behind, and nothing else
+/// ever removed one.
+pub const MAX_SUBSCRIPTIONS: usize = 64;
+
+/// How long a subscription may go untouched before a later `subscribe` sweeps
+/// it. A live client polls far more often than this; anything quieter is a
+/// connection nobody is on the other end of.
+pub const SUBSCRIPTION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+
 /// Buffered event with its assigned monotonic id.
 #[derive(Clone, Debug)]
 pub struct EventEntry {
     pub event_id: u64,
     pub event: StatusUpdateEvent,
+    /// Whose event this is. `None` means it concerns the machine and every
+    /// subscriber may see it; `Some(principal)` means only that principal's
+    /// clients may. Without this a block notice, an auto-rule candidate or the
+    /// additional link's external ADDRESS - all of them facts about one user's
+    /// session - were pushed to every logged-in user's GUI.
+    pub audience: Option<String>,
 }
 
 /// Per-subscriber state tracked by the bus.
 #[derive(Clone, Debug)]
 pub struct SubscriberState {
     pub client_id: String,
+    /// The principal this subscription belongs to, from the connection's peer
+    /// credentials. `None` only where the transport cannot name one, and such a
+    /// subscriber sees machine-wide events only.
+    pub principal: Option<String>,
     /// Lowest `event_id` we still owe this subscriber. Each successful
     /// transport push advances this past the pushed event.
     pub cursor_event_id: u64,
@@ -58,6 +80,9 @@ pub struct SubscriberState {
     /// receives an `Overflow { dropped_count }` frame on its next
     /// successful push (and the counter resets to zero).
     pub dropped_count: u64,
+    /// Last time the transport read or acknowledged anything for this
+    /// subscription. What separates a quiet client from a dead one.
+    pub last_activity: Instant,
 }
 
 /// Outcome of a `subscribe` call. The handler echoes
@@ -99,12 +124,30 @@ impl EventBus {
     /// Assign the next `event_id` and append to the buffer. Returns
     /// the newly-issued id. The transport pump observes this through
     /// [`peek_pending_for`] and pushes it to subscribers.
+    /// Publish an event. An event that names a principal in its own payload is
+    /// routed TO that principal even when published through this machine-wide
+    /// entry point: the payload has already said whose news it is, and letting
+    /// the call site disagree with it is how a user's pause, coverage or tunnel
+    /// ends up on every other session's screen. [`StatusUpdateEvent::addressee`]
+    /// is the single answer both paths read.
     pub fn publish(&self, event: StatusUpdateEvent) -> u64 {
+        let audience = event.addressee().map(str::to_string);
+        self.publish_to(audience, event)
+    }
+
+    /// Publish an event that concerns ONE principal. Only that principal's
+    /// subscribers receive it.
+    pub fn publish_for(&self, principal: impl Into<String>, event: StatusUpdateEvent) -> u64 {
+        self.publish_to(Some(principal.into()), event)
+    }
+
+    fn publish_to(&self, audience: Option<String>, event: StatusUpdateEvent) -> u64 {
         let id = self.next_event_id.fetch_add(1, Ordering::SeqCst);
         let mut buf = self.buffer.lock().expect("event bus buffer poisoned");
         buf.push_back(EventEntry {
             event_id: id,
             event,
+            audience,
         });
         while buf.len() > EVENT_BUFFER_CAPACITY {
             buf.pop_front();
@@ -140,6 +183,17 @@ impl EventBus {
         client_id: String,
         last_seen_event_id: Option<u64>,
     ) -> SubscribeOutcome {
+        self.subscribe_as(client_id, None, last_seen_event_id)
+    }
+
+    /// As [`Self::subscribe`], naming the principal behind the connection so
+    /// per-principal events reach only their own client.
+    pub fn subscribe_as(
+        &self,
+        client_id: String,
+        principal: Option<String>,
+        last_seen_event_id: Option<u64>,
+    ) -> SubscribeOutcome {
         let n = self.sub_id_counter.fetch_add(1, Ordering::Relaxed);
         let sub_id = format!("sub-{n:016x}");
         let head = self.current_event_id();
@@ -162,12 +216,32 @@ impl EventBus {
         };
 
         let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        let now = Instant::now();
+        // One client, one subscription: a GUI that reconnects (or retries the
+        // subscribe) used to leave its previous entry behind forever.
+        subs.retain(|_, sub| sub.client_id != client_id);
+        subs.retain(|_, sub| now.duration_since(sub.last_activity) < SUBSCRIPTION_IDLE_TTL);
+        // Still full: drop the one nobody has touched in the longest time. It is
+        // the likeliest corpse, and refusing the new subscriber instead would
+        // lock a live GUI out because of dead ones.
+        while subs.len() >= MAX_SUBSCRIPTIONS {
+            let Some(stalest) = subs
+                .iter()
+                .min_by_key(|(_, sub)| sub.last_activity)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            subs.remove(&stalest);
+        }
         subs.insert(
             sub_id.clone(),
             SubscriberState {
                 client_id,
+                principal,
                 cursor_event_id: cursor,
                 dropped_count: 0,
+                last_activity: now,
             },
         );
 
@@ -198,16 +272,26 @@ impl EventBus {
         if max_count == 0 {
             return Vec::new();
         }
-        let subs = self.subscribers.lock().expect("subscribers poisoned");
-        let Some(sub) = subs.get(subscription_id) else {
+        let mut subs = self.subscribers.lock().expect("subscribers poisoned");
+        let Some(sub) = subs.get_mut(subscription_id) else {
             return Vec::new();
         };
+        sub.last_activity = Instant::now();
         let cursor = sub.cursor_event_id;
+        let principal = sub.principal.clone();
         drop(subs);
 
         let buf = self.buffer.lock().expect("event bus buffer poisoned");
         buf.iter()
             .filter(|e| e.event_id >= cursor)
+            .filter(|e| match (&e.audience, &principal) {
+                // Machine-wide: everybody sees it.
+                (None, _) => true,
+                // Somebody's own event reaches only them; a subscriber whose
+                // principal the transport could not name sees none of these.
+                (Some(audience), Some(mine)) => audience == mine,
+                (Some(_), None) => false,
+            })
             .take(max_count)
             .cloned()
             .collect()
@@ -220,6 +304,7 @@ impl EventBus {
         let mut subs = self.subscribers.lock().expect("subscribers poisoned");
         if let Some(sub) = subs.get_mut(subscription_id) {
             sub.cursor_event_id = sub.cursor_event_id.max(event_id + 1);
+            sub.last_activity = Instant::now();
         }
     }
 
@@ -259,6 +344,42 @@ impl EventBus {
 
 #[cfg(test)]
 mod tests {
+
+    /// A block notice, an auto-rule offer and the additional link's external
+    /// ADDRESS are facts about ONE user's session. Published on an unscoped bus
+    /// they reached every logged-in user's GUI.
+    #[test]
+    fn a_users_own_event_reaches_only_their_own_subscriber() {
+        let bus = EventBus::new();
+        let alice = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let bob = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+
+        bus.publish_for("S-1-A", health("ok"));
+        bus.publish(health("ok"));
+
+        assert_eq!(
+            bus.peek_pending_for(&alice.subscription_id, 16).len(),
+            2,
+            "her own event plus the machine-wide one",
+        );
+        assert_eq!(
+            bus.peek_pending_for(&bob.subscription_id, 16).len(),
+            1,
+            "only the machine-wide one",
+        );
+    }
+
+    /// A transport that cannot name the principal behind a connection gets the
+    /// machine-wide events and nothing else - the safe end of the ambiguity.
+    #[test]
+    fn an_unnamed_subscriber_sees_only_machine_wide_events() {
+        let bus = EventBus::new();
+        let anon = bus.subscribe("gui".into(), Some(0));
+        bus.publish_for("S-1-A", health("ok"));
+        assert!(bus.peek_pending_for(&anon.subscription_id, 16).is_empty());
+        bus.publish(health("ok"));
+        assert_eq!(bus.peek_pending_for(&anon.subscription_id, 16).len(), 1);
+    }
     use super::*;
 
     fn health(severity: &str) -> StatusUpdateEvent {
@@ -266,6 +387,47 @@ mod tests {
             service_state: "running".into(),
             worst_severity: severity.into(),
         }
+    }
+
+    /// An event that names a principal must reach only that principal, even when
+    /// it goes through the machine-wide entry point. Six of the seventeen event
+    /// kinds carry a SID, and three of them WERE broadcast: a user's pause, their
+    /// enforcement status with its candidate list, and the tunnel they had not
+    /// assigned all went to every session on the machine.
+    #[test]
+    fn an_event_that_names_a_principal_is_routed_to_them_even_via_plain_publish() {
+        let bus = EventBus::new();
+        let mine = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let theirs = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+
+        bus.publish(StatusUpdateEvent::RoutingPauseStateChanged {
+            sid: "S-1-A".to_string(),
+            paused: true,
+        });
+
+        assert_eq!(
+            bus.peek_pending_for(&mine.subscription_id, 16).len(),
+            1,
+            "the user whose pause it is must hear about it"
+        );
+        assert!(
+            bus.peek_pending_for(&theirs.subscription_id, 16).is_empty(),
+            "another session must not learn that this user paused routing"
+        );
+    }
+
+    /// The machine-wide half must keep working — most events genuinely concern
+    /// the whole machine, and routing them per-principal would silence them.
+    #[test]
+    fn an_event_that_names_nobody_still_reaches_everyone() {
+        let bus = EventBus::new();
+        let mine = bus.subscribe_as("gui-a".into(), Some("S-1-A".into()), Some(0));
+        let theirs = bus.subscribe_as("gui-b".into(), Some("S-1-B".into()), Some(0));
+        bus.publish(StatusUpdateEvent::AdaptersChanged {
+            data_source: "test".to_string(),
+        });
+        assert_eq!(bus.peek_pending_for(&mine.subscription_id, 16).len(), 1);
+        assert_eq!(bus.peek_pending_for(&theirs.subscription_id, 16).len(), 1);
     }
 
     #[test]
@@ -389,5 +551,69 @@ mod tests {
         let s = bus.subscribe("client-1".into(), Some(5));
         assert!(!s.gap_detected);
         assert!(bus.peek_pending_for(&s.subscription_id, 16).is_empty());
+    }
+
+    #[test]
+    fn one_client_keeps_one_subscription() {
+        // A GUI that reconnects (or retries the subscribe) used to leave its
+        // previous entry behind, and nothing ever removed it.
+        let bus = EventBus::new();
+        let first = bus.subscribe("gui-a".into(), None);
+        let second = bus.subscribe("gui-a".into(), None);
+        assert_ne!(first.subscription_id, second.subscription_id);
+        assert_eq!(bus.subscriber_count(), 1);
+        bus.publish(health("ok"));
+        assert!(
+            bus.peek_pending_for(&first.subscription_id, 8).is_empty(),
+            "the superseded subscription is gone, not merely quiet"
+        );
+        assert_eq!(bus.peek_pending_for(&second.subscription_id, 8).len(), 1);
+    }
+
+    #[test]
+    fn the_subscription_table_is_bounded() {
+        // Each entry is small, but nothing removed them: a client that dies
+        // without unsubscribing left one behind for the life of the service.
+        let bus = EventBus::new();
+        for n in 0..(MAX_SUBSCRIPTIONS + 10) {
+            bus.subscribe(format!("gui-{n}"), None);
+        }
+        assert!(
+            bus.subscriber_count() <= MAX_SUBSCRIPTIONS,
+            "count = {}",
+            bus.subscriber_count()
+        );
+    }
+
+    #[test]
+    fn a_live_subscriber_survives_the_sweep_a_stale_one_does_not() {
+        let bus = EventBus::new();
+        let live = bus.subscribe("gui-live".into(), None);
+        let stale = bus.subscribe("gui-stale".into(), None);
+        // Age the stale one past the TTL without sleeping. `Instant` cannot
+        // predate the monotonic epoch (boot), so on a machine up for less than
+        // the TTL the aged instant is unrepresentable — skip instead of
+        // failing on host uptime.
+        {
+            let mut subs = bus.subscribers.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = subs.get_mut(&stale.subscription_id).expect("stale entry");
+            let Some(aged) =
+                Instant::now().checked_sub(SUBSCRIPTION_IDLE_TTL + Duration::from_secs(1))
+            else {
+                return;
+            };
+            entry.last_activity = aged;
+        }
+        bus.subscribe("gui-new".into(), None);
+        assert!(
+            bus.peek_pending_for(&stale.subscription_id, 1).is_empty(),
+            "an untouched subscription is swept"
+        );
+        bus.publish(health("ok"));
+        assert_eq!(
+            bus.peek_pending_for(&live.subscription_id, 8).len(),
+            1,
+            "a live one keeps its place"
+        );
     }
 }

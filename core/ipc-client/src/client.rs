@@ -60,12 +60,52 @@ use crate::wire::{read_frame, write_frame};
 /// worker thread. 32 is generous for GUI / Tray traffic.
 const REQUEST_CHANNEL_CAPACITY: usize = 32;
 
+/// Hard ceiling on one response read. Well above the slowest operation the
+/// service admits (a mutation budgets 30 s), so it never cuts a legitimate
+/// answer short — it exists to end the wait when there will BE no answer.
+const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The handshake is a fixed, cheap exchange; anything slower than this is a
+/// pipe that will not serve us.
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── Public client ────────────────────────────────────────────────────────────
 
 /// Sync IPC client. Cheap to clone — internal state lives behind `Arc`.
 #[derive(Clone)]
 pub struct NamedPipeIpcClient {
     inner: Arc<ClientInner>,
+    /// Dropped by the LAST public handle, which is what ends the worker.
+    ///
+    /// Counting `inner` instead never worked: the worker thread holds an
+    /// `Arc<ClientInner>` for its whole life, so the count could not reach one
+    /// and the shutdown in `Drop` never ran — every `start()` left a live
+    /// thread and an open pipe until the process exited. This handle is held
+    /// only by clones of the client, so its count is a count of USERS.
+    #[allow(
+        dead_code,
+        reason = "held for its Drop: ends the worker with the last handle"
+    )]
+    lifetime: Arc<ClientLifetime>,
+}
+
+/// Shuts the worker down when the last client handle goes away.
+struct ClientLifetime {
+    inner: Arc<ClientInner>,
+}
+
+impl Drop for ClientLifetime {
+    fn drop(&mut self) {
+        self.inner.shutdown.store(true, Ordering::SeqCst);
+        // Safe to join: a blocked read watches the same shutdown flag and
+        // cancels its pending I/O, so the worker cannot outlive this call by
+        // more than one wait tick.
+        if let Ok(mut g) = self.inner.worker_handle.lock() {
+            if let Some(h) = g.take() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl NamedPipeIpcClient {
@@ -84,7 +124,10 @@ impl NamedPipeIpcClient {
         if let Ok(mut g) = inner.worker_handle.lock() {
             *g = Some(handle);
         }
-        Self { inner }
+        let lifetime = Arc::new(ClientLifetime {
+            inner: Arc::clone(&inner),
+        });
+        Self { inner, lifetime }
     }
 
     /// Current connection status. Cheap RwLock read.
@@ -118,13 +161,21 @@ impl NamedPipeIpcClient {
         let envelope = build_request_envelope(operation, &request_id, payload);
 
         let (tx, rx) = sync_channel::<RequestResponse>(1);
+        let abandoned = Arc::new(AtomicBool::new(false));
         let pending = PendingRequest {
             envelope,
             response_tx: tx,
+            abandoned: Arc::clone(&abandoned),
         };
 
-        if self.inner.request_tx.try_send(pending).is_err() {
-            return Err(IpcClientError::Disconnected);
+        // A full queue is a busy client, not a dead one: reporting
+        // `Disconnected` painted the "no connection to the service" banner
+        // while the pipe was healthy and a long mutation was simply in front.
+        if let Err(e) = self.inner.request_tx.try_send(pending) {
+            return Err(match e {
+                std::sync::mpsc::TrySendError::Full(_) => IpcClientError::Timeout,
+                std::sync::mpsc::TrySendError::Disconnected(_) => IpcClientError::Disconnected,
+            });
         }
 
         match rx.recv_timeout(timeout) {
@@ -134,7 +185,10 @@ impl NamedPipeIpcClient {
             }
             Ok(RequestResponse::BadResponse(reason)) => Err(IpcClientError::BadResponse { reason }),
             Ok(RequestResponse::Disconnected) => Err(IpcClientError::Disconnected),
-            Err(RecvTimeoutError::Timeout) => Err(IpcClientError::Timeout),
+            Err(RecvTimeoutError::Timeout) => {
+                abandoned.store(true, Ordering::SeqCst);
+                Err(IpcClientError::Timeout)
+            }
             Err(RecvTimeoutError::Disconnected) => Err(IpcClientError::ClientShutdown),
         }
     }
@@ -216,33 +270,26 @@ impl crate::connection::IpcClient for NamedPipeIpcClient {
     }
 }
 
-impl Drop for NamedPipeIpcClient {
-    fn drop(&mut self) {
-        // Only the *last* Arc holder triggers shutdown.
-        if Arc::strong_count(&self.inner) == 1 {
-            self.shutdown();
-            if let Ok(mut g) = self.inner.worker_handle.lock() {
-                if let Some(h) = g.take() {
-                    let _ = h.join();
-                }
-            }
-        }
-    }
-}
-
 // ── Internal types ───────────────────────────────────────────────────────────
 
 struct ClientInner {
     status: RwLock<ConnectionStatus>,
     request_tx: SyncSender<PendingRequest>,
     request_rx: Mutex<Option<Receiver<PendingRequest>>>,
-    shutdown: AtomicBool,
-    force_reconnect: AtomicBool,
+    /// `Arc` rather than a plain flag because the pipe adapter watches it while
+    /// blocked in a read — that is what makes shutdown and "reconnect now"
+    /// take effect on a connection that has gone quiet.
+    shutdown: Arc<AtomicBool>,
+    force_reconnect: Arc<AtomicBool>,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     /// Push channel sender, set once the client subscribes via
     /// [`NamedPipeIpcClient::subscribe_push`]. Push frames seen on the wire
     /// (`request_id == ""`) are forwarded here; if `None`, they are dropped.
     push_tx: Mutex<Option<SyncSender<Value>>>,
+    /// A push frame was dropped because the subscriber's channel was full.
+    /// Cleared by emitting one `push-gap` event, which tells the GUI that what
+    /// it holds may be behind and a re-read is due.
+    push_gap: AtomicBool,
     /// Last successful `ContractNegotiate` response payload (server protocol
     /// + service semver), feeding the GUI's compatibility banner.
     negotiate_info: RwLock<Option<NegotiateInfo>>,
@@ -274,10 +321,11 @@ impl ClientInner {
             }),
             request_tx: tx,
             request_rx: Mutex::new(Some(rx)),
-            shutdown: AtomicBool::new(false),
-            force_reconnect: AtomicBool::new(false),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            force_reconnect: Arc::new(AtomicBool::new(false)),
             worker_handle: Mutex::new(None),
             push_tx: Mutex::new(None),
+            push_gap: AtomicBool::new(false),
             negotiate_info: RwLock::new(None),
             last_subscribe: Mutex::new(None),
             subscription_id: Mutex::new(None),
@@ -295,6 +343,11 @@ impl ClientInner {
 struct PendingRequest {
     envelope: Value,
     response_tx: SyncSender<RequestResponse>,
+    /// Raised by the caller when it stops waiting. A queued request that has
+    /// not been written yet is then dropped instead of being sent later — on a
+    /// new connection, even. That mattered most for mutations: the caller gave
+    /// up, retried, and the service applied the same policy twice.
+    abandoned: Arc<AtomicBool>,
 }
 
 // ── Worker loop ──────────────────────────────────────────────────────────────
@@ -345,6 +398,16 @@ fn worker_loop(inner: Arc<ClientInner>) {
                 wait_for_shutdown_or_force_reconnect(&inner, &request_rx);
                 continue;
             }
+            HandshakeResult::Refused { message } => {
+                transport::close_pipe(pipe.0);
+                inner.set_status(ConnectionStatus::Refused { reason: message });
+                // Deliberately the slow schedule: the service is up and has
+                // already answered. Hammering it re-runs the refusal — and the
+                // audit entry that goes with it — several times a minute.
+                let delay = slow_backoff.next_delay();
+                sleep_observing_shutdown(&inner, delay);
+                continue;
+            }
             HandshakeResult::TransportError(reason) => {
                 transport::close_pipe(pipe.0);
                 inner.set_status(ConnectionStatus::Disconnected {
@@ -358,6 +421,17 @@ fn worker_loop(inner: Arc<ClientInner>) {
 
         // Connected: serve requests until disconnect.
         serve_requests(&inner, &request_rx, pipe);
+
+        // `serve_requests` returns when the connection died. Without a pause
+        // the loop reconnects immediately, so a service that is going down is
+        // met with connect+handshake at full speed — burning its connection
+        // slots and, for a rejecting service, its audit trail. A forced
+        // reconnect asked for by the user still skips the wait: the flag is
+        // consumed by `sleep_observing_shutdown`.
+        if !inner.shutdown.load(Ordering::SeqCst) {
+            let delay = backoff.next_delay();
+            sleep_observing_shutdown(&inner, delay);
+        }
     }
 
     // Drain any remaining pending requests on shutdown.
@@ -377,9 +451,14 @@ fn handle_connect_failure(
     let (status, delay) = match probe {
         ServiceProbe::NotFound => (ConnectionStatus::NotInstalled, slow.next_delay()),
         ServiceProbe::Stopped => (ConnectionStatus::ServiceStopped, slow.next_delay()),
-        ServiceProbe::StartPending | ServiceProbe::StopPending => {
-            (ConnectionStatus::Connecting, Duration::from_millis(500))
-        }
+        // A transition is normally over in a second or two, so the first
+        // retries stay quick — but SCM can sit in `StartPending` indefinitely
+        // when a service is wedged, and a fixed 500 ms poll would keep probing
+        // it twice a second for as long as the machine is up.
+        ServiceProbe::StartPending | ServiceProbe::StopPending => (
+            ConnectionStatus::Connecting,
+            fast.next_delay().max(Duration::from_millis(500)),
+        ),
         ServiceProbe::Running | ServiceProbe::Unknown { .. } => (
             ConnectionStatus::Disconnected {
                 last_error: format!("connect failed (Win32 0x{last_code:08X})"),
@@ -393,7 +472,17 @@ fn handle_connect_failure(
 
 enum HandshakeResult {
     Ok(NegotiateInfo),
-    ProtocolMismatch { server_version: u32 },
+    ProtocolMismatch {
+        server_version: u32,
+    },
+    /// The service answered, and the answer was "no": the caller was refused
+    /// by identity, or every server instance was taken. Distinct from a
+    /// transport failure because retrying at full speed is exactly the wrong
+    /// response — each attempt writes another refusal into the service's audit
+    /// trail.
+    Refused {
+        message: String,
+    },
     TransportError(String),
 }
 
@@ -408,6 +497,9 @@ fn handshake(pipe: &SendableHandle) -> HandshakeResult {
         Ok(io) => io,
         Err(e) => return HandshakeResult::TransportError(e.to_string()),
     };
+    // A handshake that never answers must not hold the worker: the whole point
+    // of this call is to decide quickly whether the pipe is usable.
+    io.set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT));
     if let Err(e) = write_frame(&mut io, &request) {
         return HandshakeResult::TransportError(e.to_string());
     }
@@ -418,6 +510,17 @@ fn handshake(pipe: &SendableHandle) -> HandshakeResult {
 
     // Interpretation of the negotiate frame is transport-neutral — shared with
     // the Unix client via `crate::protocol`. Only the I/O above is per-transport.
+    // A refusal arrives id-less, so the negotiate parser can only call it
+    // "unexpected"; read it here before falling through to that.
+    if crate::protocol::is_server_refusal(&response) {
+        let message = response
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("service refused the connection")
+            .to_string();
+        return HandshakeResult::Refused { message };
+    }
     match interpret_negotiate_response(&response) {
         NegotiateParse::Ok(info) => HandshakeResult::Ok(info),
         NegotiateParse::ProtocolMismatch { server_version } => {
@@ -445,9 +548,22 @@ fn serve_requests(
         }
     };
 
+    // A read must not outlive the caller's patience, and it must end the
+    // moment the client is told to shut down or reconnect — otherwise a
+    // service that accepts a request and goes silent parks this thread for
+    // good, with the status still saying `Connected`.
+    io.set_read_timeout(Some(RESPONSE_READ_TIMEOUT));
+    io.set_abort_flag(Arc::clone(&inner.shutdown));
+
     // A subscription lives and dies with the pipe connection, so the client
     // that owns reconnect owns restoring it — callers subscribe once.
-    replay_subscription(inner, &mut io);
+    if !replay_subscription(inner, &mut io) {
+        inner.set_status(ConnectionStatus::Disconnected {
+            last_error: "resubscribe failed".to_string(),
+        });
+        transport::close_pipe(pipe_handle);
+        return;
+    }
 
     loop {
         if inner.shutdown.load(Ordering::SeqCst) {
@@ -474,8 +590,27 @@ fn serve_requests(
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
+        // The caller may have given up while this sat in the queue. Sending it
+        // now would apply a change nobody is waiting for.
+        if pending.abandoned.load(Ordering::SeqCst) {
+            continue;
+        }
+
         if let Err(e) = write_frame(&mut io, &pending.envelope) {
-            // Transport dead — fail this request and break to reconnect.
+            // Only an I/O failure means the pipe is gone. A refusal by the
+            // codec — an oversized payload, say — never reached the wire, so
+            // the connection is fine and the caller deserves to hear WHAT went
+            // wrong instead of a blanket "disconnected" plus a reconnect that
+            // fixes nothing. `WireError::is_transport_dead` exists for exactly
+            // this split.
+            if !e.is_transport_dead() {
+                let _ = pending
+                    .response_tx
+                    .send(RequestResponse::BadResponse(format!(
+                        "request rejected: {e}"
+                    )));
+                continue;
+            }
             let _ = pending.response_tx.send(RequestResponse::Disconnected);
             inner.set_status(ConnectionStatus::Disconnected {
                 last_error: format!("write failed: {e}"),
@@ -493,6 +628,7 @@ fn serve_requests(
         // envelope we built locally uses `request-id` (see
         // `build_request_envelope`) — read it back with the same key.
         // Fallback to snake_case is defensive for older payload shapes.
+        let request_op = crate::protocol::envelope_operation(&pending.envelope);
         let request_id = pending
             .envelope
             .get("request-id")
@@ -521,11 +657,18 @@ fn serve_requests(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if frame_request_id.is_empty() {
+                // A refusal the server issues before it knows our request id
+                // (connection cap, identity reject, malformed frame) belongs to
+                // the caller waiting right here, not to the push channel.
+                if crate::protocol::is_server_refusal(&frame) {
+                    let _ = pending.response_tx.send(parse_response(&frame, request_op));
+                    break;
+                }
                 route_push_frame(inner, &frame, "inline");
                 continue;
             }
             if frame_request_id == request_id {
-                let parsed = parse_response(&frame);
+                let parsed = parse_response(&frame, request_op);
                 if matches!(parsed, RequestResponse::Ok(_)) {
                     remember_subscription(inner, &pending.envelope);
                     if is_subscribe_envelope(&pending.envelope) {
@@ -640,12 +783,19 @@ fn remember_subscription_id(inner: &Arc<ClientInner>, frame: &Value) {
 
 /// Re-issue the remembered subscription on a freshly opened pipe. Runs before
 /// the dispatch loop so events emitted right after reconnect are not missed.
-fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) {
+/// Re-establish the caller's subscription on a fresh connection.
+///
+/// Returns `false` when the connection must be dropped and retried. Swallowing
+/// the failure (which is what returning unit did) left the worker serving a
+/// pipe that was dead or out of step while the status still said `Connected`,
+/// and the subscriber silently received nothing — the Unix twin already got
+/// this right.
+fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) -> bool {
     let Ok(guard) = inner.last_subscribe.lock() else {
-        return;
+        return true;
     };
     let Some(envelope) = guard.as_ref() else {
-        return;
+        return true;
     };
     let mut replay = envelope.clone();
     let seq = inner.replay_seq.fetch_add(1, Ordering::SeqCst);
@@ -655,16 +805,19 @@ fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) {
 
     if let Err(e) = write_frame(io, &replay) {
         eprintln!("nrr-ipc-client: resubscribe write failed: {e}");
-        return;
+        return !e.is_transport_dead();
     }
     // Read until the matching response arrives; push frames may already be
     // queued ahead of it and must not be discarded.
     loop {
+        if inner.shutdown.load(Ordering::SeqCst) {
+            return false;
+        }
         let frame: Value = match read_frame(io) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("nrr-ipc-client: resubscribe read failed: {e}");
-                return;
+                return false;
             }
         };
         let frame_request_id = frame
@@ -673,6 +826,10 @@ fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if frame_request_id.is_empty() {
+            if crate::protocol::is_server_refusal(&frame) {
+                eprintln!("nrr-ipc-client: resubscribe refused by the service");
+                return false;
+            }
             route_push_frame(inner, &frame, "resubscribe");
             continue;
         }
@@ -692,8 +849,15 @@ fn replay_subscription(inner: &Arc<ClientInner>, io: &mut PipeIo) {
                     .and_then(|g| g.clone())
                     .unwrap_or_else(|| "unknown".to_string())
             );
-            return;
+            return ok;
         }
+        // A frame belonging to some other request: on a single-in-flight pipe
+        // this means the two ends are out of step, and continuing to read on it
+        // would pair later answers with the wrong requests.
+        eprintln!(
+            "nrr-ipc-client: resubscribe saw a foreign request_id={frame_request_id}; reconnecting"
+        );
+        return false;
     }
 }
 
@@ -719,9 +883,22 @@ fn route_push_frame(inner: &Arc<ClientInner>, frame: &Value, source: &str) {
         eprintln!("nrr-ipc-client: push {event_type} discarded — nobody subscribed");
         return;
     };
+    // A dropped frame is a hole in the event stream, and the subscriber has no
+    // way of knowing it. Announce the hole once, so the GUI can re-read the
+    // snapshots it would otherwise keep rendering from stale pushes.
+    if inner.push_gap.swap(false, Ordering::SeqCst) {
+        let gap = serde_json::json!({ "event": { "type": "push-gap" } });
+        if tx.try_send(gap).is_err() {
+            // Still full — keep the debt and try again with the next frame.
+            inner.push_gap.store(true, Ordering::SeqCst);
+        }
+    }
     match tx.try_send(payload) {
         Ok(()) => eprintln!("nrr-ipc-client: push {event_type} delivered (source={source})"),
-        Err(e) => eprintln!("nrr-ipc-client: push {event_type} dropped — channel full ({e})"),
+        Err(e) => {
+            eprintln!("nrr-ipc-client: push {event_type} dropped — channel full ({e})");
+            inner.push_gap.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -848,6 +1025,33 @@ mod tests {
         let started = Instant::now();
         sleep_observing_shutdown(&inner, Duration::from_millis(150));
         assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn dropping_the_last_handle_stops_the_worker() {
+        // `Arc::strong_count(&inner) == 1` was unreachable (the worker holds an
+        // `inner` of its own), so every `start()` leaked a thread and a pipe.
+        let client = NamedPipeIpcClient::start();
+        let inner = Arc::clone(&client.inner);
+        let second = client.clone();
+        drop(client);
+        assert!(
+            !inner.shutdown.load(Ordering::SeqCst),
+            "a surviving handle must keep the worker running"
+        );
+        drop(second);
+        assert!(
+            inner.shutdown.load(Ordering::SeqCst),
+            "worker was told to stop"
+        );
+        assert!(
+            inner
+                .worker_handle
+                .lock()
+                .expect("worker handle lock")
+                .is_none(),
+            "the worker thread was joined"
+        );
     }
 
     #[test]

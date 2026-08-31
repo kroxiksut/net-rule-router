@@ -114,13 +114,37 @@ pub type SharedStdin = Arc<Mutex<ChildStdin>>;
 /// means "executed after it".
 pub fn request_uses_side_channel(line: &str) -> bool {
     match parse_request_line(line) {
-        Some(Ok(req)) => matches!(
-            IpcOperationName::from_slug(&req.operation),
-            Some(IpcOperationName::DiagnosticsExportArchive)
-                | Some(IpcOperationName::ServiceHealthGet)
-        ),
+        Some(Ok(req)) => match IpcOperationName::from_slug(&req.operation) {
+            // The push subscription lives on the connection it was made on, and
+            // the forwarder streams from that client — it must stay on the main
+            // one whatever its class says.
+            Some(IpcOperationName::StatusUpdatesSubscribe)
+            | Some(IpcOperationName::StatusUpdatesPoll) => false,
+            // Classified as a DiagnosticAction for AUDIT (the archive is a
+            // file write), but for transport it is the one long-running
+            // request the side channel exists for: on the main connection a
+            // 30-second build parks every mutation behind it.
+            Some(IpcOperationName::DiagnosticsExportArchive) => true,
+            Some(op) => side_channel_class(op, &req.payload),
+            None => false,
+        },
         _ => false,
     }
+}
+
+/// Reads and diagnostic queries go on the second connection.
+///
+/// A client serves one request at a time per connection, so a mutation with a
+/// 30-second budget parked every health read and every snapshot behind it and
+/// the whole window went to "no connection to the service" — while the service
+/// was fine. The service already lets these two classes bypass its mutation
+/// queue; the second connection is what stops the CLIENT from serialising them.
+fn side_channel_class(op: IpcOperationName, payload: &serde_json::Value) -> bool {
+    matches!(
+        nrr_shared::ipc_transport::canonical_operation_class(op, payload),
+        nrr_shared::ipc_transport::IpcOperationClass::ReadSnapshot
+            | nrr_shared::ipc_transport::IpcOperationClass::DiagnosticQuery
+    )
 }
 
 /// Spawn a worker thread that runs the dispatcher for one parsed
@@ -529,6 +553,41 @@ fn run_push_forwarder(
     }
 }
 
+/// Drop the cached snapshots a just-executed mutation invalidates.
+///
+/// Best-effort and deliberately quiet: a cache that cannot be cleared is a
+/// stale read later, never a failed mutation now.
+fn invalidate_cache_after_mutation(op: IpcOperationName, payload: &serde_json::Value) {
+    let Some(kind) = mutation_kind_to_invalidate(op, payload) else {
+        return;
+    };
+    if let Ok(cache) = nrr_ipc_client::snapshot_cache::FileCache::at_default_location() {
+        let _ = cache.invalidate_for_mutation(kind);
+    }
+}
+
+/// Which mutation just took effect, if any. Split out so the decision is
+/// testable without touching the user's real cache directory.
+fn mutation_kind_to_invalidate(
+    op: IpcOperationName,
+    payload: &serde_json::Value,
+) -> Option<nrr_shared::ipc_payloads::MutationKind> {
+    if op != IpcOperationName::MutationSubmit {
+        return None;
+    }
+    // A dry run changes nothing; only the confirm pass does.
+    if payload
+        .get("dry-run")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    payload
+        .get("mutation-kind")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+}
+
 fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherRpcResponse {
     let op = match IpcOperationName::from_slug(&req.operation) {
         Some(op) => op,
@@ -550,6 +609,11 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
     let timeout = ipc_operation_timeout(op);
     match client.call(op, req.payload.clone(), timeout) {
         Ok(value) => {
+            // Mutations travel this path, not the facade's, so the facade's
+            // cache invalidation never ran: the snapshot files kept answering
+            // with pre-edit policy for as long as their TTL allowed. Drop the
+            // entries a successful mutation makes wrong, right here.
+            invalidate_cache_after_mutation(op, &req.payload);
             // A finished diagnostic archive is copied from the service's
             // ProgramData dir into the user's own
             // %TEMP%\NetRuleRouter (with the GUI-side launcher logs appended)
@@ -830,6 +894,35 @@ mod tests {
     }
 
     #[test]
+    fn a_confirmed_rules_update_invalidates_the_cached_snapshots() {
+        use nrr_shared::ipc_payloads::MutationKind;
+        let payload = serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false });
+        assert_eq!(
+            mutation_kind_to_invalidate(IpcOperationName::MutationSubmit, &payload),
+            Some(MutationKind::RulesUpdate)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_invalidates_nothing() {
+        // It changed nothing; dropping the cache would only cost a re-fetch.
+        let payload = serde_json::json!({ "mutation-kind": "rules-update", "dry-run": true });
+        assert_eq!(
+            mutation_kind_to_invalidate(IpcOperationName::MutationSubmit, &payload),
+            None
+        );
+    }
+
+    #[test]
+    fn a_read_operation_invalidates_nothing() {
+        let payload = serde_json::json!({});
+        assert_eq!(
+            mutation_kind_to_invalidate(IpcOperationName::RulesList, &payload),
+            None
+        );
+    }
+
+    #[test]
     fn handle_request_unknown_operation_returns_error() {
         let client = ScriptedClient::new(ScriptedOutcome::Ok(serde_json::json!({})));
         let req = LauncherRpcRequest {
@@ -955,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn request_uses_side_channel_covers_health_and_export_only() {
+    fn request_uses_side_channel_covers_reads_but_never_mutations_or_subscribe() {
         use nrr_shared::launcher_rpc::encode_request_line;
 
         let side_ops = [
@@ -976,16 +1069,47 @@ mod tests {
             );
         }
 
-        // A representative main-channel op — must NOT be routed to the side
-        // channel (mutations and the frequent snapshot/rules reads keep
-        // strict ordering on the primary connection).
+        // Reads go there too now: one connection serves one request at a
+        // time, so a long mutation used to park every health read behind it.
+        for op in [
+            IpcOperationName::RulesList,
+            IpcOperationName::SnapshotInitialGet,
+            IpcOperationName::SnapshotInterfacesGet,
+        ] {
+            let req = LauncherRpcRequest {
+                correlation_id: format!("c-{}", op.slug()),
+                operation: op.slug().to_string(),
+                payload: serde_json::json!({}),
+            };
+            let line = encode_request_line(&req).unwrap();
+            assert!(
+                request_uses_side_channel(&line),
+                "{} is a read and belongs on the side channel",
+                op.slug()
+            );
+        }
+
+        // Mutations keep strict ordering on the primary connection.
         let main_req = LauncherRpcRequest {
             correlation_id: "c-main".into(),
-            operation: IpcOperationName::RulesList.slug().to_string(),
-            payload: serde_json::json!({}),
+            operation: IpcOperationName::MutationSubmit.slug().to_string(),
+            payload: serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false }),
         };
         let main_line = encode_request_line(&main_req).unwrap();
         assert!(!request_uses_side_channel(&main_line));
+
+        // The subscription must stay where its push stream is, whatever its
+        // class says: the forwarder streams from THAT client.
+        let sub_req = LauncherRpcRequest {
+            correlation_id: "c-sub".into(),
+            operation: IpcOperationName::StatusUpdatesSubscribe.slug().to_string(),
+            payload: serde_json::json!({}),
+        };
+        let sub_line = encode_request_line(&sub_req).unwrap();
+        assert!(
+            !request_uses_side_channel(&sub_line),
+            "the subscribe call must stay on the connection that carries pushes"
+        );
     }
 
     #[test]

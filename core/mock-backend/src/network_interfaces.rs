@@ -22,11 +22,11 @@ use nrr_shared::{
 };
 
 pub const INTERFACES_PREVIEW_NOTICE: &str =
-    "Preview/setup mode: selecting interfaces in block 2 does not apply routing policy.";
+    "Preview/setup mode: selecting interfaces here does not apply routing policy.";
 pub const INTERFACES_ROLE_EXPLANATION: &str =
     "Primary route is the default preferred interface; secondary route is the fallback route.";
 pub const INTERFACES_DATA_SCOPE_NOTE: &str =
-    "Interface metadata is real where available in block 2; routing-policy availability checks are placeholders until block 5.";
+    "Interface metadata is real where available; routing-policy availability checks are placeholders in preview mode.";
 pub const RECOMMENDATION_ADVISORY_NOTE: &str =
     "Recommendations are advisory-only and never auto-assign primary/secondary roles.";
 pub const ADAPTER_CHECKS_INTEGRATION_NOTE: &str =
@@ -164,9 +164,30 @@ fn build_preview_snapshot(
 pub fn interface_diagnostics_checks_snapshot(
     request: RouteSelectionRequest,
 ) -> InterfaceDiagnosticsChecksSnapshot {
-    let snapshot = interfaces_routes_preview_snapshot(request);
-    let rows = snapshot
-        .rows
+    interface_diagnostics_checks_from(&interfaces_routes_preview_snapshot(request))
+}
+
+/// Derives the per-adapter checks from an ALREADY-TAKEN interfaces snapshot.
+///
+/// Every check reads only the row it is given, so a caller that already holds a
+/// snapshot must not enumerate the adapters again: on Windows one snapshot is
+/// two `GetAdaptersAddresses` plus `GetIpForwardTable` plus `GetAdaptersInfo`,
+/// and taking a second one also means the rows and the checks describe two
+/// DIFFERENT moments — a tunnel that came up in between showed as present in
+/// one list and absent in the other.
+pub fn interface_diagnostics_checks_from(
+    snapshot: &InterfacesRoutesPreviewSnapshot,
+) -> InterfaceDiagnosticsChecksSnapshot {
+    interface_diagnostics_checks_from_rows(snapshot.data_source, &snapshot.rows)
+}
+
+/// Same derivation over an explicit row set, for a caller that has to narrow
+/// the rows first (the desktop hides Bluetooth-like adapters unless asked).
+pub fn interface_diagnostics_checks_from_rows(
+    data_source: InterfacesDataSource,
+    rows: &[InterfaceRouteRow],
+) -> InterfaceDiagnosticsChecksSnapshot {
+    let rows = rows
         .iter()
         .map(|row| InterfaceDiagnosticsChecksRow {
             persistent_id: row.persistent_id.clone(),
@@ -176,7 +197,7 @@ pub fn interface_diagnostics_checks_snapshot(
         .collect::<Vec<_>>();
 
     InterfaceDiagnosticsChecksSnapshot {
-        data_source: snapshot.data_source,
+        data_source,
         integration_note: ADAPTER_CHECKS_INTEGRATION_NOTE,
         rows,
     }
@@ -426,6 +447,14 @@ fn build_role_assignment_advisory(
     }
 }
 
+/// Re-derivations of what the row already says — no packet is sent from here.
+///
+/// The wording matters because these strings reach the user verbatim: they used
+/// to claim a check had been performed ("connectivity check indicates…",
+/// `Timeout` for a timeout that never happened), so an adapter plugged into a
+/// switch with a dead uplink collected a green tick. Each explanation now says
+/// what it is actually based on — the interface's reported state — and the
+/// statuses no longer invent an outcome the code did not observe.
 fn evaluate_adapter_checks(row: &InterfaceRouteRow) -> Vec<AdapterCheckResult> {
     vec![
         evaluate_check_route(row),
@@ -446,17 +475,17 @@ fn evaluate_check_route(row: &InterfaceRouteRow) -> AdapterCheckResult {
     ) {
         (
             AdapterCheckResultStatus::Timeout,
-            "Route verification timed out while connectivity state is timeout.",
+            "The adapter reports a connectivity timeout, so its route cannot be judged.",
         )
     } else if row.has_default_route && row.gateway != "-" {
         (
             AdapterCheckResultStatus::Success,
-            "Route metadata looks healthy (default route and gateway are present).",
+            "The adapter reports a default route and a gateway.",
         )
     } else {
         (
             AdapterCheckResultStatus::Degraded,
-            "Route metadata is partial (missing default route or gateway).",
+            "The adapter reports no default route, or no gateway.",
         )
     };
 
@@ -471,27 +500,29 @@ fn evaluate_check_route(row: &InterfaceRouteRow) -> AdapterCheckResult {
 
 fn evaluate_show_external_ip(row: &InterfaceRouteRow) -> AdapterCheckResult {
     let (status, explanation) = match row.observed_facts.external_ip_status {
-        ExternalIpStatus::Resolved => (
-            AdapterCheckResultStatus::Success,
-            format!(
-                "External IP is resolved: {}.",
-                row.observed_facts
-                    .external_ip
-                    .as_deref()
-                    .unwrap_or("unknown")
+        // `Resolved` with no address is not a success — it is a row that says
+        // one thing and carries another. It used to print "resolved: unknown".
+        ExternalIpStatus::Resolved => match row.observed_facts.external_ip.as_deref() {
+            Some(ip) => (
+                AdapterCheckResultStatus::Success,
+                format!("The adapter reports an external address: {ip}."),
             ),
-        ),
+            None => (
+                AdapterCheckResultStatus::Degraded,
+                "The adapter reports a resolved external address but carries none.".to_string(),
+            ),
+        },
         ExternalIpStatus::NotChecked => (
             AdapterCheckResultStatus::Degraded,
-            "External IP was not checked in this snapshot.".to_string(),
+            "No external address has been looked up for this adapter.".to_string(),
         ),
         ExternalIpStatus::CheckFailed | ExternalIpStatus::RateLimited => (
             AdapterCheckResultStatus::Degraded,
-            "External IP check completed with recoverable issues.".to_string(),
+            "The last external-address lookup did not finish.".to_string(),
         ),
         ExternalIpStatus::Blocked => (
             AdapterCheckResultStatus::Unavailable,
-            "External IP check is blocked in current environment.".to_string(),
+            "External-address lookups are blocked in this environment.".to_string(),
         ),
     };
 
@@ -508,19 +539,19 @@ fn evaluate_check_internet_availability(row: &InterfaceRouteRow) -> AdapterCheck
     let (status, explanation) = match row.observed_facts.connectivity_state {
         ConnectivityState::Available => (
             AdapterCheckResultStatus::Success,
-            "Connectivity check indicates internet is available via this adapter.".to_string(),
+            "The adapter reports a usable connection.".to_string(),
         ),
         ConnectivityState::Degraded | ConnectivityState::Unknown => (
             AdapterCheckResultStatus::Degraded,
-            "Connectivity is uncertain/degraded; user confirmation is recommended.".to_string(),
+            "The adapter reports an uncertain connection; confirm it yourself.".to_string(),
         ),
         ConnectivityState::Unavailable => (
             AdapterCheckResultStatus::Unavailable,
-            "Connectivity check indicates internet is unavailable via this adapter.".to_string(),
+            "The adapter reports no usable connection.".to_string(),
         ),
         ConnectivityState::Timeout => (
             AdapterCheckResultStatus::Timeout,
-            "Connectivity check timed out before a definitive result.".to_string(),
+            "The adapter reports a connectivity timeout.".to_string(),
         ),
     };
 
@@ -869,8 +900,8 @@ fn recommendation_summary_for_class(class: RecommendationClass) -> String {
 mod tests {
     use super::{
         assign_preview_roles, assign_recommendations, decorate_interface_rows, fallback_rows,
-        interface_diagnostics_checks_snapshot, interfaces_routes_preview_snapshot,
-        InterfaceRouteRow, RouteSelectionRequest,
+        interface_diagnostics_checks_from, interface_diagnostics_checks_snapshot,
+        interfaces_routes_preview_snapshot, InterfaceRouteRow, RouteSelectionRequest,
     };
     use nrr_shared::{ConnectivityState, RouteBehaviorMode, RouteRole, RouteSelectionState};
 
@@ -1027,9 +1058,11 @@ mod tests {
             ethernet.observed_facts.connectivity_state,
             ConnectivityState::Available
         );
+        // No probe runs in a placeholder dataset, so neither row may claim a
+        // resolved external address.
         assert_eq!(
             ethernet.observed_facts.external_ip_status,
-            nrr_shared::ExternalIpStatus::Resolved
+            nrr_shared::ExternalIpStatus::NotChecked
         );
         assert_eq!(
             vpn.observed_facts.connectivity_state,
@@ -1334,5 +1367,21 @@ mod tests {
         rows.iter()
             .find(|row| row.windows_name == name)
             .unwrap_or_else(|| panic!("row '{name}' not found"))
+    }
+
+    #[test]
+    fn the_checks_describe_the_rows_they_were_given() {
+        // The regression this guards: the checks used to come from a SECOND
+        // enumeration, so a tunnel appearing between the two calls showed in
+        // one list and not the other.
+        let snapshot = interfaces_routes_preview_snapshot(RouteSelectionRequest::default());
+        let derived = interface_diagnostics_checks_from(&snapshot);
+
+        assert_eq!(derived.rows.len(), snapshot.rows.len());
+        for (checks, row) in derived.rows.iter().zip(snapshot.rows.iter()) {
+            assert_eq!(checks.persistent_id, row.persistent_id);
+            assert_eq!(checks.windows_name, row.windows_name);
+        }
+        assert_eq!(derived.data_source, snapshot.data_source);
     }
 }

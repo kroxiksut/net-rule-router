@@ -168,12 +168,18 @@ impl SidecarDb {
     /// Delete every comment whose signature is not in
     /// `active_signatures`. Returns the number of rows removed.
     ///
-    /// Called once at GUI startup after `rulesModel` finishes loading
-    /// from the service snapshot. The sweep is bounded by the number
-    /// of rows actually in `rule_metadata` (almost always small) so we
-    /// scan the table fully rather than building a parameterised
-    /// `NOT IN (...)` query which has a SQLite parameter-count cap of
-    /// 32766.
+    /// An EMPTY `active_signatures` therefore deletes everything, and that is
+    /// the intended primitive: "the user removed all their rules, clear the
+    /// comments too". It is only ever correct with the user standing behind it.
+    /// A caller that might be holding a rules list which is merely NOT LOADED
+    /// YET must not call this — the GUI's automatic sweep stands down on an
+    /// empty model for exactly that reason, and its cold-start call once wiped
+    /// a live comment.
+    ///
+    /// The sweep is bounded by the number of rows actually in `rule_metadata`
+    /// (almost always small) so we scan the table fully rather than building a
+    /// parameterised `NOT IN (...)` query which has a SQLite parameter-count
+    /// cap of 32766.
     pub fn gc_orphans(&self, active_signatures: &[RuleSignature]) -> SidecarResult<usize> {
         let active: HashSet<&str> = active_signatures.iter().map(|s| s.as_str()).collect();
         let mut conn = self.conn_mut();

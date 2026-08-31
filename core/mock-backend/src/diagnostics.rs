@@ -8,8 +8,8 @@
 //! implementation via IPC.
 
 pub use nrr_diagnostics::facade::{
-    DiagnosticModeStateDto, DiagnosticsFacade, DiagnosticsStatusDto, MockDiagnosticsFacade,
-    MockScenario, SecurityAlertDto,
+    DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsFacade, DiagnosticsStatusDto,
+    MockDiagnosticsFacade, MockScenario, SecurityAlertDto, SecurityAlertsView,
 };
 
 /// Returns the default mock facade (healthy scenario) for preview mode.
@@ -29,10 +29,12 @@ pub fn preview_diagnostics_status() -> DiagnosticsStatusDto {
 ///
 /// Uses the `Healthy` scenario (empty list). For alert-rich scenarios, build
 /// a [`MockDiagnosticsFacade`] with [`MockScenario::ActiveTamperAlert`].
-pub fn preview_active_security_alerts() -> Vec<SecurityAlertDto> {
-    MockDiagnosticsFacade::healthy()
-        .list_active_alerts()
-        .unwrap_or_default()
+pub fn preview_active_security_alerts() -> SecurityAlertsView {
+    SecurityAlertsView::fresh(
+        MockDiagnosticsFacade::healthy()
+            .list_active_alerts()
+            .unwrap_or_default(),
+    )
 }
 
 #[cfg(test)]
@@ -44,6 +46,7 @@ mod tests {
         let status = preview_diagnostics_status();
         assert!(status.overall_healthy);
         assert!(!status.stale);
+        assert_eq!(status.origin, DiagnosticsDataOrigin::Preview);
         assert_eq!(status.service_health.state, "running");
         assert!(status.security_status.audit_chain_ok);
         assert_eq!(status.security_status.active_alert_count, 0);
@@ -55,7 +58,8 @@ mod tests {
     #[test]
     fn preview_active_security_alerts_healthy_is_empty() {
         let alerts = preview_active_security_alerts();
-        assert!(alerts.is_empty());
+        assert!(alerts.alerts.is_empty());
+        assert!(!alerts.stale);
     }
 
     #[test]

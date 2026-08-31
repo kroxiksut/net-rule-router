@@ -101,10 +101,27 @@ struct Entry {
 /// `mut-tok-<hex>`; the prefix is opaque to clients.
 static TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// The token IS the authority for the confirm phase, so it must not be
+/// derivable from another one. The old suffix was `Instant::now().elapsed()`,
+/// which is a handful of nanoseconds by construction — in practice the token
+/// was the counter. Same CSPRNG the coordinator's confirmation tokens use, with
+/// the same reasoning about its fallback: a mutation that cannot be confirmed
+/// at all is worse than a token that is merely hard to guess, and the token
+/// stays single-use, principal-scoped and short-lived either way.
 fn next_token() -> String {
     let n = TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = Instant::now().elapsed().subsec_nanos();
-    format!("mut-tok-{n:016x}{nanos:08x}")
+    let mut bytes = [0u8; 16];
+    let suffix: String = match getrandom::fill(&mut bytes) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!(
+            "{:032x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ),
+    };
+    format!("mut-tok-{n:016x}{suffix}")
 }
 
 // State is `Mutex`-guarded; `lock().expect(...)` propagates poisoning (a prior
@@ -181,6 +198,28 @@ mod tests {
         let t2 = s.issue(payload(), now + DEFAULT_MUTATION_TOKEN_TTL);
         assert_ne!(t1, t2);
         assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn tokens_are_not_derivable_from_each_other() {
+        // The suffix used to be `Instant::now().elapsed()` — nanoseconds from a
+        // freshly taken instant, i.e. a near-constant. Seeing one token then
+        // told you the next.
+        let store = MutationTokenStore::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let first = store.issue(payload(), deadline);
+        let second = store.issue(payload(), deadline);
+        let suffix = |t: &str| t.trim_start_matches("mut-tok-")[16..].to_string();
+        assert_ne!(
+            suffix(&first),
+            suffix(&second),
+            "the random half must actually differ"
+        );
+        assert!(
+            suffix(&first).len() >= 32,
+            "128 bits, hex-encoded: {}",
+            suffix(&first)
+        );
     }
 
     #[test]

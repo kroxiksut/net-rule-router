@@ -19,9 +19,9 @@
 //! that pass the filter are serialised and written.  Events rejected by the
 //! filter are **not** counted as dropped.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -135,9 +135,9 @@ impl LogWriterInner {
 
     fn rotate(&mut self) -> std::io::Result<()> {
         self.current = None;
-        let path = next_log_filename(&self.config.logs_dir);
         std::fs::create_dir_all(&self.config.logs_dir)?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let (file, path) =
+            crate::rotation::open_next_rotation(&self.config.logs_dir, &log_prefix_today())?;
         self.current_size = file.metadata().map(|m| m.len()).unwrap_or(0);
         self.current = Some((file, path));
         self.last_presence_probe = Some(Instant::now());
@@ -244,17 +244,12 @@ impl DiagnosticsSink for LogWriter {
 
 // ── Filename policy ───────────────────────────────────────────────────────────
 
-fn next_log_filename(dir: &Path) -> PathBuf {
-    let date = local_date_string(std::time::SystemTime::now());
-    let mut n = 1u32;
-    loop {
-        let name = format!("nrr_service_{date}-{n}.ndjson");
-        let path = dir.join(&name);
-        if !path.exists() {
-            return path;
-        }
-        n += 1;
-    }
+/// Prefix of today's log files, e.g. `nrr_service_20260830-`.
+fn log_prefix_today() -> String {
+    format!(
+        "nrr_service_{}-",
+        local_date_string(std::time::SystemTime::now())
+    )
 }
 
 #[cfg(test)]
@@ -403,21 +398,23 @@ mod tests {
     }
 
     #[test]
-    fn log_writer_default_mode_filters_decision_category() {
-        // Decision events are rate-limited in Default mode; first few pass.
-        // But the category itself needs to pass the filter too.
+    fn log_writer_default_mode_keeps_a_decision_event() {
+        // The routing decision path IS operational evidence — an acceptance run
+        // reads exactly these lines. Default mode used to drop the whole
+        // category because it was missing from an allow-list.
         let dir = tempfile::tempdir().expect("temp");
         let writer = LogWriter::open(LogWriterConfig::new(dir.path()));
-        // Decision is in RATE_LIMITED_CATEGORIES and not in default allowlist
-        // (it goes through rate limiting logic, but is NOT in default allowlist).
-        // Let's verify: Decision is NOT in is_default_allowed().
-        // Looking at filter.rs: is_default_allowed only allows Service, Security, Apply, Integrity, Diagnostics.
-        // Decision is rate-limited but it's NOT in the allowlist either — so it's blocked.
         writer.emit(decision_event("d1"));
-        let count = std::fs::read_dir(dir.path()).unwrap().count();
-        assert_eq!(
-            count, 0,
-            "decision event filtered in default mode (not in allowlist)"
+        drop(writer);
+
+        let written = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .any(|text| text.contains("\"event_id\":\"d1\""));
+        assert!(
+            written,
+            "a decision event must reach the log in Default mode"
         );
     }
 
@@ -499,6 +496,21 @@ mod tests {
             writer.dropped_count(),
             0,
             "filtered events must not increment dropped count"
+        );
+    }
+
+    #[test]
+    fn a_freed_rotation_number_is_never_handed_out_again() {
+        let dir = tempfile::tempdir().expect("temp");
+        let prefix = log_prefix_today();
+        std::fs::write(dir.path().join(format!("{prefix}3.ndjson")), "").unwrap();
+
+        let writer = LogWriter::open(LogWriterConfig::new(dir.path()));
+        writer.emit(info_event("after retention"));
+
+        assert!(
+            dir.path().join(format!("{prefix}4.ndjson")).exists(),
+            "the next file must continue past the highest index, not reuse a freed one"
         );
     }
 }

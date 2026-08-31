@@ -25,7 +25,6 @@ pub mod block8_outputs;
 // owns the mute rules, so every surface answers "show this?" the same way.
 pub mod block_notice;
 pub mod canonical;
-pub mod change_event;
 // Co-activity companion affinity: learns which hostnames accompany a rule host
 // so the application can propose routing them the same way. Pure and lazy —
 // see the module docs for the "never on the data path" contract.

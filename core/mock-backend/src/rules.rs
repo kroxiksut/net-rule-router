@@ -1,16 +1,12 @@
-use nrr_domain::{
-    canonical::{CanonicalProfile, CanonicalRuleBook},
-    import::{process_import, ImportRequest, ImportResult, ImportTrigger},
-    revision::{ContentHash, RevisionActor, RevisionId, RevisionSeq, UnixTimestamp},
-    AdapterIdentity, BindingSource, RouteBehaviorMode, RouteBinding, RouteRole as DomainRouteRole,
-};
 use nrr_shared::{
     FreeRuleListType, FreeRuleType, RouteRole, RuleFormFieldId, RuleScenario, RulesEnabledFilter,
     RulesFileChangeBehavior, RulesTypeFilter, RulesViewSort,
 };
 
+/// Shown only by the preview (mock) backend — the service-backed path takes its
+/// notice from the locale catalogue. No block numbers in shipped strings.
 pub const RULES_PREVIEW_NOTICE: &str =
-    "Rules UI is in preview mode in block 2: real validation and policy apply are connected later.";
+    "Preview mode: rules are not validated or applied until the background service is running.";
 
 const SUPPORTED_FREE_RULE_TYPES: [FreeRuleType; 4] = [
     FreeRuleType::Application,
@@ -340,61 +336,6 @@ fn build_rows(
     }
 
     rows
-}
-
-fn mock_active_content_hash() -> ContentHash {
-    ContentHash::from_bytes([0xAB; 32])
-}
-
-fn mock_canonical_profile() -> CanonicalProfile {
-    CanonicalProfile {
-        primary: RouteBinding {
-            role: DomainRouteRole::Primary,
-            adapter: AdapterIdentity {
-                stable_id: "adapter-aa:bb:cc:dd:ee:01-1".to_string(),
-                display_name: "Primary (mock)".to_string(),
-            },
-            source: BindingSource::UserAssigned,
-        },
-        secondary: Some(RouteBinding {
-            role: DomainRouteRole::Secondary,
-            adapter: AdapterIdentity {
-                stable_id: "adapter-ff:ee:dd:cc:bb:02-2".to_string(),
-                display_name: "Secondary (mock)".to_string(),
-            },
-            source: BindingSource::UserAssigned,
-        }),
-        behavior_mode: RouteBehaviorMode::StrictSecondaryFailClosed,
-        rule_book: CanonicalRuleBook::default(),
-    }
-}
-
-/// Simulates a controlled import for UI preview purposes.
-///
-/// Pass `same_content = true` to exercise the no-change path;
-/// `false` to produce a `PendingReview` result.
-#[allow(clippy::expect_used)]
-pub fn simulate_import(trigger: ImportTrigger, same_content: bool) -> ImportResult {
-    let active_hash = mock_active_content_hash();
-    let content_hash = if same_content {
-        active_hash.clone()
-    } else {
-        ContentHash::from_bytes([0xCD; 32])
-    };
-    let request = ImportRequest {
-        revision_id: RevisionId::from_prefixed_string("rev-mock-import-preview-001".to_string())
-            .expect("valid mock revision id"),
-        seq: RevisionSeq::FIRST,
-        source_path: r"C:\Users\user\Documents\rules_primary.txt".to_string(),
-        file_hash: ContentHash::from_bytes([0xDE; 32]),
-        content_hash,
-        acquired_at: UnixTimestamp::from_secs(1_700_000_000),
-        trigger,
-        actor: RevisionActor::LocalUser,
-        content: mock_canonical_profile(),
-        displaces_pending_id: None,
-    };
-    process_import(request, Some(&active_hash), None)
 }
 
 fn row_matches_query(row: &RuleRowPreview, query: &str) -> bool {

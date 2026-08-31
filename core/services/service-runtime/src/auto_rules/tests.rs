@@ -822,6 +822,35 @@ fn engine_over(pending_store: Arc<InMemoryPendingStore>, now: SystemTime) -> Aut
 }
 
 #[test]
+fn a_suggestion_the_rules_already_cover_is_withdrawn() {
+    // The address the user accepted went on standing in the inbox with nothing
+    // left to approve. An address becomes covered in ways this engine never
+    // observes — a rule typed by hand, a preset import, a revision another
+    // session activated — so the parked set is re-checked against the live rule
+    // book on every read, not only when the offer was made.
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    assert_eq!(f.engine.tick(SID, later()).parked, 1);
+    assert_eq!(
+        f.engine.candidates(SID).len(),
+        1,
+        "offer stands while uncovered"
+    );
+
+    f.rules.also_route(&["cdn.example"]);
+    assert!(
+        f.engine.candidates(SID).is_empty(),
+        "an address a rule already covers must not stand as an offer",
+    );
+    // And it leaves the parked set, so the count the tray badge reads follows.
+    assert_eq!(
+        f.engine.tick(SID, later()).pending,
+        0,
+        "the withdrawn offer must stop being counted",
+    );
+}
+
+#[test]
 fn a_pending_suggestion_survives_a_service_restart() {
     let store = Arc::new(InMemoryPendingStore::new());
     let f = fixture_with_pending_store(AutoRulesMode::Suggest, Arc::clone(&store));
@@ -1457,7 +1486,7 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
         SystemTime::UNIX_EPOCH,
     )
     .with_event_bus(Arc::clone(&bus));
-    let sub = bus.subscribe("client".into(), None);
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
     two_visits(&engine, &["cdn.example", "assets.example"]);
     engine.note_primary_health(SID, "cdn.example", PrimaryHealthEvent::Completed);
@@ -1509,7 +1538,7 @@ fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
     )
     .with_event_bus(Arc::clone(&bus))
     .with_refusing_anchors(Arc::new(|_sid: &str| vec!["site.example".to_string()]));
-    let sub = bus.subscribe("client".into(), None);
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
     // A third-party neighbour that answers on the main route: normally quietened.
     two_visits(&engine, &["cdn.example"]);
@@ -1544,7 +1573,7 @@ fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
         let up = Arc::clone(&up);
         Arc::new(move |_sid: &str| up.load(Ordering::Relaxed))
     });
-    let sub = bus.subscribe("client".into(), None);
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
     two_visits(&engine, &["assets.site.example"]);
     let while_down = engine.tick(SID, later());
@@ -1580,7 +1609,7 @@ fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
         SystemTime::UNIX_EPOCH,
     )
     .with_event_bus(Arc::clone(&bus));
-    let sub = bus.subscribe("client".into(), None);
+    let sub = bus.subscribe_as("client".into(), Some(SID.to_string()), None);
 
     // Same registrable domain as the anchor `site.example` → brand-related.
     two_visits(&engine, &["assets.site.example"]);

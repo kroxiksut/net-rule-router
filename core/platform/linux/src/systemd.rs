@@ -10,7 +10,9 @@
 //!    daemon's own readiness signal (the Linux equivalent of reporting
 //!    `SERVICE_RUNNING` to SCM only after bootstrap completes). The unit's
 //!    `RuntimeDirectory=netrulerouter` / `StateDirectory=netrulerouter`
-//!    directives create the `0700` directories the daemon needs: the IPC
+//!    directives create the directories the daemon needs (state and logs at
+//!    `0700`, the runtime dir traversable so a user GUI can reach the socket,
+//!    whose own mode is the gate): the IPC
 //!    socket under `/run/netrulerouter/` and the DB-MAC key under
 //!    `/var/lib/netrulerouter/`.
 //!
@@ -150,12 +152,19 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     if let Some(sec) = cfg.watchdog_sec {
         s.push_str(&format!("WatchdogSec={sec}\n"));
     }
-    // Create /run/netrulerouter and /var/lib/netrulerouter at 0700, owned by the
-    // service. These are the canonical IPC-socket and DB-MAC-key homes;
-    // systemd manages their lifecycle so the daemon never
-    // has to mkdir/chmod them itself.
+    // /run/netrulerouter holds the IPC socket, which an ORDINARY user's GUI has
+    // to reach: the daemon runs as root, the user does not, and 0700 on a
+    // root-owned directory means nobody but root can even traverse it. So the
+    // directory is traversable and the socket ITSELF is the permission surface
+    // (the server chmods it at bind). Reaching the socket is not authority:
+    // identity comes from SO_PEERCRED as `unix:uid:<n>`, rules are per
+    // principal, and privileged operations still go through polkit.
+    //
+    // /var/lib and /var/log stay 0700 - the MAC key and the logs, which
+    // nothing outside the daemon reads.
     s.push_str(&format!("RuntimeDirectory={RUNTIME_STATE_DIR}\n"));
-    s.push_str("RuntimeDirectoryMode=0700\n");
+    s.push_str("RuntimeDirectoryMode=0755\n");
+
     s.push_str(&format!("StateDirectory={RUNTIME_STATE_DIR}\n"));
     s.push_str("StateDirectoryMode=0700\n");
     // Create /var/log/netrulerouter at 0700, owned by the service. This is the
@@ -643,12 +652,14 @@ mod tests {
     }
 
     #[test]
-    fn unit_provisions_runtime_and_state_dirs_at_0700() {
-        // These tie into the IPC socket (/run/netrulerouter) and the
-        // DB-MAC key (/var/lib/netrulerouter).
+    fn the_runtime_dir_is_traversable_and_the_state_dir_is_not() {
+        // The runtime dir holds the IPC socket an ordinary user's GUI must
+        // reach; the daemon is root, so 0700 there locks out every client the
+        // product has. The socket's own mode is the gate instead. The state dir
+        // holds the DB-MAC key and stays closed.
         let unit = render_service_unit(&sample_config());
         assert!(unit.contains("RuntimeDirectory=netrulerouter"));
-        assert!(unit.contains("RuntimeDirectoryMode=0700"));
+        assert!(unit.contains("RuntimeDirectoryMode=0755"));
         assert!(unit.contains("StateDirectory=netrulerouter"));
         assert!(unit.contains("StateDirectoryMode=0700"));
     }

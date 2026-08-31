@@ -351,7 +351,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unparsable_payload_still_persists_the_baseline() {
+    fn an_unparsable_payload_writes_nothing() {
+        // The baseline is what THIS process read at start-up, and the file is
+        // shared with the other surface. Persisting the baseline over a payload
+        // we could not parse would overwrite whatever that surface saved since
+        // — knowing less is never a reason to write an older picture.
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("ui-preferences.json");
         let base = UiPreferences {
@@ -363,8 +367,7 @@ mod tests {
         writer.observe("not-json", Instant::now());
         writer.flush();
 
-        assert_eq!(writer.writes, 1);
-        let reloaded = UiPreferencesStore::for_path(path).load().expect("reload");
-        assert_eq!(reloaded.theme_mode, ThemeMode::Dark);
+        assert_eq!(writer.writes, 0);
+        assert!(!path.exists(), "nothing may reach the shared file");
     }
 }

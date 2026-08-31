@@ -345,6 +345,12 @@ fn collect_block_16_12_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSign
     }
 }
 
+/// `DefaultBehaviorChanged` and `UnstableInterfaceBinding` describe a change to
+/// the ROUTE POLICY (mode, adapter binding), and the only path that scores risk
+/// today is the rules-candidate one, where both sides of the diff necessarily
+/// carry the same policy. They stay in the catalogue because the diff type
+/// carries the fields and a policy-scoring path would produce them unchanged —
+/// but nothing emits them yet.
 fn collect_content_signals(diff: &StructuralDiff, signals: &mut Vec<RiskSignal>) {
     if diff.behavior_mode_changed {
         signals.push(RiskSignal::DefaultBehaviorChanged);
@@ -841,6 +847,48 @@ mod tests {
             vec![
                 fqdn_rule("r-apex", "example.com"),
                 suffix_rule("r-suffix", "example.com"),
+            ],
+            vec![],
+        );
+        let diff = compute_diff(Some(&prev), &next);
+        assert_eq!(diff.overlapping_apexes, vec!["example.com".to_string()]);
+    }
+
+    #[test]
+    fn overlapping_rules_stays_quiet_when_the_change_does_not_touch_the_pair() {
+        // The overlap is already applied and this edit is about something
+        // else — the review screen must not warn about it again.
+        let prev = make_profile(
+            vec![
+                fqdn_rule("r-apex", "example.com"),
+                suffix_rule("r-suffix", "example.com"),
+            ],
+            vec![],
+        );
+        let next = make_profile(
+            vec![
+                fqdn_rule("r-apex", "example.com"),
+                suffix_rule("r-suffix", "example.com"),
+                fqdn_rule("r-new", "unrelated.org"),
+            ],
+            vec![],
+        );
+        let diff = compute_diff(Some(&prev), &next);
+        assert!(diff.overlapping_apexes.is_empty());
+        let assessment = score_candidate(&diff, &import_source());
+        assert!(!assessment
+            .signals
+            .iter()
+            .any(|s| matches!(s, RiskSignal::OverlappingRules { .. })));
+    }
+
+    #[test]
+    fn overlapping_rules_fires_when_the_change_creates_the_pair() {
+        let prev = make_profile(vec![suffix_rule("r-suffix", "example.com")], vec![]);
+        let next = make_profile(
+            vec![
+                suffix_rule("r-suffix", "example.com"),
+                fqdn_rule("r-apex", "api.example.com"),
             ],
             vec![],
         );

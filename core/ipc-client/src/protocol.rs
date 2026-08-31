@@ -161,6 +161,21 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // An `ok` handshake still has to agree on a protocol. The field that
+        // says so is `negotiated-protocol` — the server may run a newer
+        // version and still agree to speak ours, which is the whole point of
+        // negotiating. Disagreement (or a missing field, which decodes as 0)
+        // is what raises the "update one of the two" banner, instead of a
+        // silent stream of failures later.
+        let negotiated = payload
+            .get("negotiated-protocol")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        if negotiated != CLIENT_PROTOCOL_VERSION {
+            return NegotiateParse::ProtocolMismatch {
+                server_version: server_protocol,
+            };
+        }
         return NegotiateParse::Ok(NegotiateInfo {
             server_protocol,
             service_version,
@@ -168,8 +183,15 @@ pub(crate) fn interpret_negotiate_response(response: &Value) -> NegotiateParse {
         });
     }
     // Server may have responded with an InvalidVersion error; surface that.
+    // The code is decoded through `IpcErrorCode` rather than compared with a
+    // hand-written literal: the enum is `rename_all = "snake_case"`, so the
+    // spelling that reads right here (`"InvalidVersion"`) never arrives, and
+    // the whole protocol-mismatch path was dead while looking correct.
     if let Some(err) = response.get("error") {
-        if err.get("code").and_then(|v| v.as_str()) == Some("InvalidVersion") {
+        let code = err.get("code").and_then(|v| {
+            serde_json::from_value::<nrr_shared::ipc_transport::IpcErrorCode>(v.clone()).ok()
+        });
+        if code == Some(nrr_shared::ipc_transport::IpcErrorCode::InvalidVersion) {
             // Best-effort: try to extract server version from message
             // (format documented as "client speaks vN, service speaks vM").
             let msg = err
@@ -194,7 +216,12 @@ pub(crate) fn parse_server_version_from_message(msg: &str) -> Option<u32> {
 }
 
 /// Parse a response envelope frame into a [`RequestResponse`].
-pub(crate) fn parse_response(response: &Value) -> RequestResponse {
+///
+/// `op` is the operation the caller sent — the response envelope does not echo
+/// it. Stamping every server error as `ContractNegotiate` (which is what this
+/// did) made a failed rules update read, in logs and in `Display`, as a failed
+/// handshake.
+pub(crate) fn parse_response(response: &Value, op: IpcOperationName) -> RequestResponse {
     let ok = response
         .get("ok")
         .and_then(|v| v.as_bool())
@@ -219,18 +246,35 @@ pub(crate) fn parse_response(response: &Value) -> RequestResponse {
                 serde_json::from_value::<nrr_shared::ipc_transport::IpcErrorCode>(v.clone()).ok()
             })
             .unwrap_or(nrr_shared::ipc_transport::IpcErrorCode::Internal);
-        // The original IpcOperationName isn't echoed in the response; we
-        // surface a placeholder. Callers can always inspect the request_id
-        // <-> operation mapping themselves.
-        return RequestResponse::ServerError {
-            op: IpcOperationName::ContractNegotiate,
-            code,
-            message,
-        };
+        return RequestResponse::ServerError { op, code, message };
     }
     RequestResponse::BadResponse(format!(
         "response has neither ok=true nor error: {response}"
     ))
+}
+
+/// The operation an outgoing envelope carries, for attributing the answer to
+/// it. Falls back to the handshake only when the envelope is unreadable, which
+/// cannot happen for envelopes this crate builds.
+pub(crate) fn envelope_operation(envelope: &Value) -> IpcOperationName {
+    envelope
+        .get("operation")
+        .and_then(|v| v.as_str())
+        .and_then(IpcOperationName::from_slug)
+        .unwrap_or(IpcOperationName::ContractNegotiate)
+}
+
+/// Is this an id-less frame the server sent to REFUSE us rather than a push?
+///
+/// Three server paths answer before they have read (or could parse) the
+/// request, so the envelope carries no `request-id`: the connection cap, the
+/// identity reject, and a malformed frame. Routing those to the push channel
+/// threw the typed error away and left the caller waiting for a reply that was
+/// never coming — the failure then surfaced as a bare `Disconnected` once the
+/// server closed the pipe. A push always carries `ok: true`; a refusal carries
+/// `ok: false` and an `error` body, which is what this tells apart.
+pub(crate) fn is_server_refusal(frame: &Value) -> bool {
+    frame.get("ok").and_then(|v| v.as_bool()) == Some(false) && frame.get("error").is_some()
 }
 
 pub(crate) fn new_request_serial() -> u64 {
@@ -243,9 +287,10 @@ pub(crate) fn new_request_serial() -> u64 {
 /// (`nrr_shared::ipc_transport::canonical_operation_class`).
 ///
 /// The client used to carry its own copy of this table, which made the label on
-/// the wire an independent opinion; the service now derives the class itself, so
-/// a divergent copy here could only ever produce a warning and a confusing
-/// envelope. One declaration, both sides.
+/// the wire an independent opinion. The service derives the class itself and
+/// REFUSES an envelope whose declared class is not the operation's own — a
+/// divergent label is something our client cannot produce, so it marks a caller
+/// that is not us. One declaration, both sides.
 pub(crate) fn operation_class_slug_for_call(op: IpcOperationName, payload: &Value) -> &'static str {
     nrr_shared::ipc_transport::canonical_operation_class(op, payload).slug()
 }
@@ -271,9 +316,10 @@ mod tests {
 
     #[test]
     fn product_impact_disable_dry_run_uses_read_snapshot_class() {
-        // Dry-run phase must surface the `read-snapshot` envelope class so
-        // the server handler (which strictly checks `operation_class`)
-        // accepts the dry-run pass.
+        // The dry-run pass is classified read-only because it MINTS the token
+        // the confirm pass must carry. The service derives the same class and
+        // refuses an envelope that says otherwise, so this is not cosmetic:
+        // getting it wrong here makes the call unanswerable.
         let env = build_request_envelope(
             IpcOperationName::ProductImpactDisableTemporary,
             "req-d1",
@@ -340,6 +386,7 @@ mod tests {
             "ok": true,
             "payload": {
                 "server-version": 1,
+                "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
                 "service-version": "0.1.0",
                 "session-id": "sess-9",
             }
@@ -355,11 +402,53 @@ mod tests {
     }
 
     #[test]
+    fn an_ok_handshake_that_agrees_on_another_protocol_is_a_mismatch() {
+        // A newer service may still agree to speak our version — that is what
+        // `negotiated-protocol` says. When it does not, accepting the frame
+        // hid the incompatibility until the first real call failed.
+        let r = serde_json::json!({
+            "ok": true,
+            "payload": {
+                "server-version": 4,
+                "negotiated-protocol": 4,
+                "service-version": "9.9.9",
+                "session-id": "sess-1",
+            }
+        });
+        match interpret_negotiate_response(&r) {
+            NegotiateParse::ProtocolMismatch { server_version } => assert_eq!(server_version, 4),
+            _ => panic!("expected ProtocolMismatch"),
+        }
+    }
+
+    #[test]
+    fn a_newer_service_that_speaks_our_protocol_is_accepted() {
+        let r = serde_json::json!({
+            "ok": true,
+            "payload": {
+                "server-version": 4,
+                "negotiated-protocol": CLIENT_PROTOCOL_VERSION,
+                "service-version": "9.9.9",
+                "session-id": "sess-2",
+            }
+        });
+        assert!(matches!(
+            interpret_negotiate_response(&r),
+            NegotiateParse::Ok(_)
+        ));
+    }
+
+    #[test]
     fn interpret_negotiate_version_mismatch() {
+        // Built from the enum, not from a literal: a test that spells the code
+        // by hand agrees with whatever the client believes and proves nothing
+        // about what the service sends.
         let r = serde_json::json!({
             "ok": false,
             "error": {
-                "code": "InvalidVersion",
+                "code": serde_json::to_value(
+                    nrr_shared::ipc_transport::IpcErrorCode::InvalidVersion)
+                    .expect("error code serialises"),
                 "message": "client speaks v1, service speaks v4",
             }
         });
@@ -367,6 +456,26 @@ mod tests {
             NegotiateParse::ProtocolMismatch { server_version } => assert_eq!(server_version, 4),
             _ => panic!("expected ProtocolMismatch"),
         }
+    }
+
+    #[test]
+    fn an_id_less_error_frame_is_a_refusal_not_a_push() {
+        let refusal = serde_json::json!({
+            "request-id": "",
+            "ok": false,
+            "error": { "code": "forbidden", "message": "client rejected" }
+        });
+        assert!(is_server_refusal(&refusal));
+    }
+
+    #[test]
+    fn an_id_less_ok_frame_is_a_push() {
+        let push = serde_json::json!({
+            "request-id": "",
+            "ok": true,
+            "payload": { "event": { "type": "adapters-changed" } }
+        });
+        assert!(!is_server_refusal(&push));
     }
 
     #[test]
@@ -384,7 +493,7 @@ mod tests {
             "ok": true,
             "payload": { "x": 42 }
         });
-        match parse_response(&r) {
+        match parse_response(&r, IpcOperationName::RulesList) {
             RequestResponse::Ok(p) => assert_eq!(p["x"], 42),
             other => panic!("expected Ok, got {:?}", debug_response(&other)),
         }
@@ -398,7 +507,7 @@ mod tests {
             "ok": false,
             "error": { "code": "forbidden", "message": "no admin" }
         });
-        match parse_response(&r) {
+        match parse_response(&r, IpcOperationName::RulesList) {
             RequestResponse::ServerError { code, message, .. } => {
                 assert_eq!(message, "no admin");
                 assert_eq!(code, nrr_shared::ipc_transport::IpcErrorCode::Forbidden);
@@ -415,7 +524,7 @@ mod tests {
             "ok": false,
             "error": { "code": "future-code", "message": "huh" }
         });
-        match parse_response(&r) {
+        match parse_response(&r, IpcOperationName::RulesList) {
             RequestResponse::ServerError { code, message, .. } => {
                 assert_eq!(code, nrr_shared::ipc_transport::IpcErrorCode::Internal);
                 assert_eq!(message, "huh");
@@ -428,7 +537,7 @@ mod tests {
     fn parse_response_bad_returns_bad_response() {
         let r = serde_json::json!({ "ok": false });
         assert!(matches!(
-            parse_response(&r),
+            parse_response(&r, IpcOperationName::RulesList),
             RequestResponse::BadResponse(_)
         ));
     }

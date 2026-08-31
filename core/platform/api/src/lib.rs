@@ -38,6 +38,11 @@ pub mod dns_redirect;
 // re-exported until a lowering path consumes it, so it stays inert until wired
 // in.
 pub mod enforcement;
+// Re-run one command with administrator rights and wait for it. The mechanisms
+// differ in a way callers cannot ignore — UAC starts a process that does NOT
+// get the caller's console, `pkexec` keeps it — so the port states which of the
+// two it is rather than pretending they are the same.
+pub mod elevation;
 pub mod error;
 // Per-adapter external (reflexive) address discovery over STUN. Portable as
 // written — the transport is `std::net` and the codec is pure bytes — so there
@@ -59,6 +64,10 @@ pub mod interface_traffic;
 // LOCAL day; only the OS knows the machine's time zone.
 pub mod key_store;
 pub mod local_time;
+// Interactive sign-in port: policy is per-principal, so anything enforcing on a
+// user's behalf waits for one — event-driven, because the sign-in happens
+// inside the logon phase where an early arm costs the user a frozen screen.
+pub mod logon_session;
 pub mod network_change;
 // Make a directory reachable by name from the user's shell (the administrative
 // console's directory on PATH). The decision — is it already there, what does
@@ -91,11 +100,14 @@ pub mod service_control;
 // object on Windows, an abstract socket on Linux — anything the user cannot
 // delete and the OS releases when the owner dies.
 pub mod single_instance;
-pub mod snapshot;
 pub mod strategy;
 // The host's operator log (Windows event log; the journal on Linux, which needs
 // no implementation because stdout already lands there).
 pub mod system_event_log;
+// The host's light/dark preference. A port because the probe is OS mechanism:
+// the one real implementation used to live under `cfg(windows)` inside a
+// neutral UI crate, so every other OS was told "light".
+pub mod system_theme;
 // Attribution + provenance of the third-party binaries we ship (today:
 // WireGuard LLC's signed `wintun.dll` on Windows). Neutral descriptors +
 // verdict derivation; the hashing/signature MECHANISM is per-OS.
@@ -151,10 +163,7 @@ pub use dns::{
 pub use dns_observe::{DnsObservation, DnsObservationSource, MockDnsObservationSource};
 pub use error::{ErrorClass, PlatformError};
 pub use external_ip::{probe_external_ipv4_batch, ExternalIpProbeOutcome};
-pub use fail_closed::{
-    compute_block_filters, compute_unblock_filter_ids, fail_closed_filter_id,
-    is_exempt_from_blocking, BlockReason, FailClosedPlan, FailClosedRuleSpec,
-};
+pub use fail_closed::{is_exempt_from_blocking, BlockReason};
 pub use fake_ip::{
     FakeIpAllocator, FakeIpBinding, FakeIpError, FakeIpPoolConfig, FakeIpScope, FakeIpVerdict,
     FlowOwnerLookup, MockFlowOwnerLookup, MockTunAdapter, NoopFlowOwnerLookup, NoopTunAdapter,
@@ -184,10 +193,6 @@ pub use path_registration::{
 pub use power::{
     NoopPowerEventObserver, PowerEvent, PowerEventCallback, PowerEventObserver,
     PowerEventSubscription,
-};
-pub use snapshot::{
-    compute_action_plan, compute_snapshot_hash, DesiredPlatformState, PlatformStateSnapshot,
-    RoutingStateSnapshot, WfpFilterSnapshot, SNAPSHOT_SCHEMA_VERSION,
 };
 pub use strategy::{is_ipv6_address, rule_strategy, RuleImplementationStrategy};
 pub use third_party::{

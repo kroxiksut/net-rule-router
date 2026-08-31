@@ -542,8 +542,10 @@ mod tests {
             .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, true)
             .expect("export");
         assert!(
-            out.file_bytes_utf8
-                .starts_with("# NetRuleRouter preset \u{2014} version 1\n"),
+            out.file_bytes_utf8.starts_with(&format!(
+                "# NetRuleRouter preset \u{2014} version {}\n",
+                nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION
+            )),
             "missing preset header; got:\n{}",
             out.file_bytes_utf8
         );

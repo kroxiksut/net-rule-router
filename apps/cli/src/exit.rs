@@ -23,6 +23,12 @@ pub const UNSUPPORTED: u8 = 6;
 /// The operation was refused because it was not confirmed. Distinct from
 /// USAGE: the command was spelled correctly and would have run.
 pub const NOT_CONFIRMED: u8 = 7;
+/// The operation needed administrator rights, they were asked for, and the
+/// request was refused — a dismissed UAC prompt, or a polkit denial. Distinct
+/// from both NEEDS_PRIVILEGE (nothing was asked) and FAILED (the operation ran
+/// and did not work): nothing was attempted, and a wrapper script retrying with
+/// a different mechanism needs to tell those apart.
+pub const ELEVATION_DECLINED: u8 = 8;
 
 /// Map a control-port failure onto its exit code.
 pub fn for_error(err: &ServiceControlError) -> u8 {
@@ -50,6 +56,7 @@ mod tests {
             NOT_RESPONDING,
             UNSUPPORTED,
             NOT_CONFIRMED,
+            ELEVATION_DECLINED,
         ];
         let mut sorted = codes.to_vec();
         sorted.sort_unstable();
@@ -82,6 +89,17 @@ mod tests {
         // "you meant this but did not confirm" from "you typed it wrong".
         assert_ne!(NOT_CONFIRMED, USAGE);
         assert_ne!(NOT_CONFIRMED, FAILED);
+    }
+
+    #[test]
+    fn refusing_to_elevate_is_neither_a_failure_nor_a_missing_privilege() {
+        // Three different things a caller acts on differently: "you must
+        // elevate" (3, nothing was asked), "you were asked and said no" (8,
+        // nothing ran), "it ran and failed" (1). Folding the middle one into
+        // either neighbour loses the only case where retrying makes sense.
+        assert_ne!(ELEVATION_DECLINED, NEEDS_PRIVILEGE);
+        assert_ne!(ELEVATION_DECLINED, FAILED);
+        assert_ne!(ELEVATION_DECLINED, SUCCESS);
     }
 
     #[test]

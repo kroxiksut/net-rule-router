@@ -550,7 +550,9 @@ fn probe_service(registration: &Registration) -> Option<ServiceAnswer> {
                 });
             }
             nrr_ipc_client::ConnectionStatus::NotInstalled
-            | nrr_ipc_client::ConnectionStatus::ServiceStopped => {
+            | nrr_ipc_client::ConnectionStatus::ServiceStopped
+            // A refusal is an answer, and waiting out the budget cannot change it.
+            | nrr_ipc_client::ConnectionStatus::Refused { .. } => {
                 return Some(ServiceAnswer::Silent)
             }
             _ => {}

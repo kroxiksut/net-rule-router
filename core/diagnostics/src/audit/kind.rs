@@ -32,6 +32,10 @@ pub enum AuditEventKind {
     IntegrityFailureDetected,
     /// A recovery action was requested by the operator or service.
     RecoveryActionRequested,
+    /// A privileged (state-changing) IPC request was ADMITTED - recorded
+    /// before the handler runs, so the trail carries the attempt even when the
+    /// handler then fails or the service dies mid-apply.
+    PrivilegedRequestAdmitted,
     /// A `revisions` row failed its `row_hmac`
     /// verification at service load (external DB tampering or a key
     /// rotation without re-signing). Routing keeps running; this is a
@@ -67,6 +71,7 @@ impl AuditEventKind {
             Self::TamperAlertAcknowledged => "tamper_alert_acknowledged",
             Self::IntegrityFailureDetected => "integrity_failure_detected",
             Self::RecoveryActionRequested => "recovery_action_requested",
+            Self::PrivilegedRequestAdmitted => "privileged_request_admitted",
             Self::DbTamperDetected => "db_tamper_detected",
             Self::KeyResetWithExistingData => "key_reset_with_existing_data",
             Self::UntrustedRevisionRejected => "untrusted_revision_rejected",
@@ -87,6 +92,7 @@ impl AuditEventKind {
             "tamper_alert_acknowledged" => Some(Self::TamperAlertAcknowledged),
             "integrity_failure_detected" => Some(Self::IntegrityFailureDetected),
             "recovery_action_requested" => Some(Self::RecoveryActionRequested),
+            "privileged_request_admitted" => Some(Self::PrivilegedRequestAdmitted),
             "db_tamper_detected" => Some(Self::DbTamperDetected),
             "key_reset_with_existing_data" => Some(Self::KeyResetWithExistingData),
             "untrusted_revision_rejected" => Some(Self::UntrustedRevisionRejected),

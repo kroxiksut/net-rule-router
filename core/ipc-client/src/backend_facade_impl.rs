@@ -39,7 +39,7 @@
 //! | Connected, response timeout      | Read cache; if fresh return it tagged stale; else fallback |
 //! | Connected, server error          | Propagate as fallback (no cache lookup)       |
 //! | Disconnected, cache fresh        | Return cached payload tagged `stale=true`     |
-//! | Disconnected, cache stale/missing| Fallback to mock (last-resort empty data)     |
+//! | Disconnected, cache stale/missing| Explicit "unknown" answer, never preview data |
 //!
 //! Mutations (none on this trait yet) will *not* consult the cache; per
 //! spec, mutation requests on a disconnected pipe must surface
@@ -61,7 +61,7 @@ use crate::connection::{ConnectionStatus, IpcClient, IpcClientError};
 use crate::snapshot_cache::{CacheKey, FileCache};
 use nrr_application::backend_facade::UiPreferences;
 use nrr_application::backend_facade::{
-    diagnostics::{DiagnosticsStatusDto, SecurityAlertDto},
+    diagnostics::{DiagnosticsStatusDto, SecurityAlertsView},
     logs::{
         AuditEntryDto, AuditEntryFilter, LogEntryDto, LogEntryFilter, PageResult, PaginationParams,
     },
@@ -367,9 +367,20 @@ impl IpcBackendFacade {
         let (raw, stale) = self.call_with_cache(op, payload, cache_key)?;
         match serde_json::from_value::<R>(raw) {
             Ok(typed) => Ok((typed, stale)),
-            Err(e) => Err(IpcClientError::BadResponse {
-                reason: format!("response for {} did not match schema: {e}", op.slug()),
-            }),
+            Err(e) => {
+                // A cached payload that no longer fits its type is a cache
+                // written by an older shape. The fingerprint catches most of
+                // those; this catches the rest, and keeps the bad entry from
+                // failing every read until its TTL runs out.
+                if stale {
+                    if let Some(key) = cache_key {
+                        let _ = self.cache.invalidate(key);
+                    }
+                }
+                Err(IpcClientError::BadResponse {
+                    reason: format!("response for {} did not match schema: {e}", op.slug()),
+                })
+            }
         }
     }
 }
@@ -392,6 +403,7 @@ fn map_connection_status(s: ConnectionStatus) -> BackendConnectionStatus {
             server_version,
             client_version,
         },
+        ConnectionStatus::Refused { reason } => BackendConnectionStatus::Refused { reason },
     }
 }
 
@@ -437,10 +449,9 @@ impl BackendFacade for IpcBackendFacade {
                 }
                 status
             }
-            // Last-resort fallback: a placeholder mock snapshot.
-            // The user-visible cue here is the `stale=true` rendering
-            // path that the GUI already supports for mock data.
-            Err(_) => self.fallback.diagnostics_status_snapshot(),
+            // A failed call is not an answer: hand out the "unknown"
+            // snapshot, never the preview one, which reads as healthy.
+            Err(_) => DiagnosticsStatusDto::unavailable(),
         }
     }
 
@@ -453,9 +464,17 @@ impl BackendFacade for IpcBackendFacade {
             filter: filter.clone(),
             pagination: pagination.clone(),
         };
+        // An empty page must never mean "the query failed": three of the four
+        // failure branches of this method already say `stale`, and a caller
+        // that reads one honest "nothing to show" among them cannot tell which
+        // it got.
         let payload = match serde_json::to_value(&req) {
             Ok(v) => v,
-            Err(_) => return PageResult::empty(),
+            Err(_) => {
+                let mut p = PageResult::empty();
+                p.stale = true;
+                return p;
+            }
         };
         // Logs are query-shaped per (filter, pagination) — not cached.
         match self.client.call(
@@ -485,9 +504,17 @@ impl BackendFacade for IpcBackendFacade {
             filter: filter.clone(),
             pagination: pagination.clone(),
         };
+        // An empty page must never mean "the query failed": three of the four
+        // failure branches of this method already say `stale`, and a caller
+        // that reads one honest "nothing to show" among them cannot tell which
+        // it got.
         let payload = match serde_json::to_value(&req) {
             Ok(v) => v,
-            Err(_) => return PageResult::empty(),
+            Err(_) => {
+                let mut p = PageResult::empty();
+                p.stale = true;
+                return p;
+            }
         };
         match self.client.call(
             IpcOperationName::AuditList,
@@ -507,21 +534,30 @@ impl BackendFacade for IpcBackendFacade {
         }
     }
 
-    fn list_security_alerts(&self, state_filter: Option<&str>) -> Vec<SecurityAlertDto> {
+    fn list_security_alerts(&self, state_filter: Option<&str>) -> SecurityAlertsView {
         let req = SecurityAlertsRequest {
             state_filter: state_filter.map(str::to_string),
         };
         let payload = match serde_json::to_value(&req) {
             Ok(v) => v,
-            Err(_) => return Vec::new(),
+            Err(_) => return SecurityAlertsView::unavailable(),
         };
+        // One cache key cannot stand for every filter: a filtered read would
+        // overwrite the unfiltered entry and then be served back as the whole
+        // list. Only the unfiltered read is cached; a filtered one is a query,
+        // and queries go to the service.
+        let cache_key = state_filter.is_none().then_some(CacheKey::SecurityAlerts);
         match self.call_typed::<SecurityAlertsResponse>(
             IpcOperationName::SecurityAlertsList,
             payload,
-            Some(CacheKey::SecurityAlerts),
+            cache_key,
         ) {
-            Ok((resp, _stale)) => resp.alerts,
-            Err(_) => Vec::new(),
+            Ok((resp, stale)) => SecurityAlertsView {
+                alerts: resp.alerts,
+                stale,
+            },
+            // "No alerts" and "could not ask" must not look alike.
+            Err(_) => SecurityAlertsView::unavailable(),
         }
     }
 
@@ -568,7 +604,20 @@ impl BackendFacade for IpcBackendFacade {
             json!(SnapshotInterfacesRequest::default()),
             Some(CacheKey::SnapshotInterfaces),
         ) {
-            Ok((resp, _stale)) if !resp.rows.is_empty() => {
+            // A cached adapter list is a list of adapters that existed an hour
+            // ago. Rendered as live it invites the user to bind a route to one
+            // that is gone, so prefer a local enumeration — but only where the
+            // fallback actually enumerates: on a host where it answers with the
+            // preview mock, the cache is still the better of the two.
+            Ok((resp, stale)) if !resp.rows.is_empty() => {
+                if stale {
+                    let live = self.fallback.interfaces_snapshot(request.clone());
+                    if live.data_source
+                        != nrr_application::mock_backend::network_interfaces::InterfacesDataSource::FallbackMock
+                    {
+                        return live;
+                    }
+                }
                 let rows = resp
                     .rows
                     .iter()
@@ -584,12 +633,14 @@ impl BackendFacade for IpcBackendFacade {
         &self,
         request: RouteSelectionRequest,
     ) -> InterfaceDiagnosticsChecksSnapshot {
-        // No dedicated wire op for the checks snapshot today; the data
-        // comes from the same SnapshotInterfacesGet payload. Cache is
-        // already warmed by `interfaces_snapshot` above when the GUI
-        // renders both panes in the same screen.
-        // TODO: derive checks rows from AdapterEntry[].
-        self.fallback.interface_checks_snapshot(request)
+        // Derived from the SAME rows `interfaces_snapshot` serves, not from a
+        // second local enumeration: every check reads only its own row, and the
+        // two panes describing two different moments is how a tunnel that came
+        // up in between showed as present in one and absent in the other.
+        let snapshot = self.interfaces_snapshot(request);
+        nrr_application::mock_backend::network_interfaces::interface_diagnostics_checks_from(
+            &snapshot,
+        )
     }
 
     fn rules_snapshot(&self, request: RulesScreenRequest) -> RulesScreenPreviewSnapshot {

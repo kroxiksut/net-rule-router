@@ -75,17 +75,18 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_NONE, OPEN_EXISTING};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_MESSAGE,
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
-use windows::Win32::System::Threading::CreateEventW;
-use windows::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use nrr_service_runtime::ipc_push::{
     extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
@@ -98,7 +99,7 @@ use nrr_service_runtime::{
 
 use crate::named_pipe_acl::PipeSecurityAttributes;
 use crate::named_pipe_identity::{classify_pipe_client, ClientRejectReason};
-use nrr_ipc_client::wire::{read_frame, write_frame, WireError};
+use nrr_shared::ipc_wire::{read_frame, write_frame, WireError};
 
 /// Canonical pipe path. Derived from the cross-OS endpoint SSOT in
 /// `nrr-shared::ipc_transport` (block 19.2) so the server and the client
@@ -114,6 +115,18 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 /// Pipe in/out buffer size (bytes). Smaller than max message because
 /// `PIPE_TYPE_MESSAGE` will fragment on the wire as needed.
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
+
+/// How long a freshly connected client may stay silent before the slot is
+/// taken back. Generous — a GUI starting on a cold machine is slower than one
+/// might think — but finite, which is the whole point. Mirrors the AF_UNIX
+/// server's window; the two transports must not disagree on how patient the
+/// service is.
+const FIRST_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long one push frame may take to reach a subscriber. A client that
+/// stopped reading must not park the worker thread that serves it: past this
+/// window the subscription is dropped and the connection slot freed.
+const PUSH_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `HANDLE` newtype that is `Send` so we can move pipe handles into
 /// worker threads. The underlying handle is exclusively owned by one
@@ -374,11 +387,15 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
         let worker_shutdown_clone = Arc::clone(&self.worker_shutdown);
         let registry_clone = self.active_sids.clone();
         let event_bus_clone = self.event_bus.clone();
-        self.active_count.fetch_add(1, Ordering::SeqCst);
+        // The slot is a GUARD, not a pair of counter writes: a panic in
+        // dispatch unwinds past a trailing `fetch_sub` and leaks the slot, and
+        // thirty-two of those close the transport for good.
+        let slot = nrr_service_runtime::connection_slot::ConnectionSlot::claim(active_clone);
         let pipe_send = SendableHandle(pipe);
         let spawn_result = thread::Builder::new()
             .name("nrr-ipc-worker".into())
             .spawn(move || {
+                let _slot = slot;
                 handle_connection(
                     pipe_send,
                     router_clone,
@@ -387,7 +404,6 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
                     registry_clone,
                     event_bus_clone,
                 );
-                active_clone.fetch_sub(1, Ordering::SeqCst);
             });
 
         match spawn_result {
@@ -400,7 +416,8 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
                 AcceptOutcome::Connected
             }
             Err(e) => {
-                self.active_count.fetch_sub(1, Ordering::SeqCst);
+                // The guard was moved into the closure that failed to spawn, so
+                // it has already released the slot.
                 send_busy_close(pipe);
                 AcceptOutcome::Err(AcceptError {
                     category: AcceptErrorCategory::WorkerSpawn,
@@ -445,6 +462,10 @@ impl IpcAcceptor for WindowsNamedPipeAcceptor {
                 let _ = h.join();
             }
         }
+    }
+
+    fn active_connections(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
     }
 }
 
@@ -491,6 +512,7 @@ fn send_busy_close(pipe: HANDLE) {
 
 fn write_busy_response(pipe: HANDLE) -> Result<(), WireError> {
     let mut writer = PipeIo::new(pipe).map_err(WireError::Io)?;
+    writer.set_timeout(Some(PUSH_WRITE_TIMEOUT));
     let env = IpcResponseEnvelope {
         request_id: String::new(),
         correlation_id: String::new(),
@@ -570,7 +592,16 @@ fn handle_connection(
         .ok();
 
     let mut writer = match PipeIo::new(pipe) {
-        Ok(w) => w,
+        Ok(mut w) => {
+            // Bound every write to this client, responses as well as push
+            // frames. A peer that stopped reading is indistinguishable from a
+            // slow one until the window expires, and an unbounded write parks
+            // the worker thread — with it, one of the 32 connection slots — for
+            // as long as that peer cares to sulk. Past the window the write
+            // fails, the loop breaks, and teardown drops the subscription.
+            w.set_timeout(Some(PUSH_WRITE_TIMEOUT));
+            w
+        }
         Err(e) => {
             tracing::warn!(target: "nrr::ipc", error = %e, "writer setup failed, dropping connection");
             close_pipe(pipe);
@@ -679,9 +710,35 @@ fn handle_connection(
         );
     }
 
-    close_pipe(pipe);
-    drop(reader_handle); // detached; reader thread exits when pipe closes
-                         // _registry_guard drops here → on_disconnect.
+    // Disconnect, cancel, JOIN, and only then close.
+    //
+    // The reader may be parked in an overlapped `ReadFile` on this handle.
+    // Closing it underneath and walking away leaves that thread reading a handle
+    // VALUE the next `CreateNamedPipeW` is free to reuse — a live reader on
+    // someone else's kernel object. So the reader has to be joined; the ordering
+    // is what makes that join finite.
+    //
+    // `DisconnectNamedPipe` comes FIRST because `CancelIoEx` alone only kills
+    // what is pending RIGHT NOW: the reader could submit a fresh read in the
+    // window between the cancel and the join, and that read — past the
+    // first-frame window, so unbounded — would never return. A disconnected
+    // instance fails a read immediately instead of parking it, which closes the
+    // window. `CancelIoEx` then releases whatever was already in flight.
+    //
+    // SAFETY: `pipe` is still open and owned here — that is precisely why the
+    // close comes last, after the only other thread that touches it has exited.
+    unsafe {
+        let _ = DisconnectNamedPipe(pipe);
+        let _ = CancelIoEx(pipe, None);
+    }
+    if let Some(reader) = reader_handle {
+        let _ = reader.join();
+    }
+    // SAFETY: the reader has exited, so nothing else holds this handle.
+    unsafe {
+        let _ = CloseHandle(pipe);
+    }
+    // _registry_guard drops here → on_disconnect.
 }
 
 /// Message types from the reader sub-thread to the main connection loop.
@@ -705,21 +762,31 @@ fn run_reader_loop(pipe: SendableHandle, reader_tx: std::sync::mpsc::SyncSender<
             return;
         }
     };
+    // Idle window for the FIRST frame only. A connection that says nothing holds
+    // one of 32 slots for as long as it likes, and 32 silent connections make
+    // the service unreachable without a single malformed byte. After the first
+    // frame the window comes off: a subscriber legitimately sits quiet for hours
+    // waiting to be pushed to, and cutting it would break the very thing the
+    // connection is for.
+    io.set_timeout(Some(FIRST_FRAME_IDLE_TIMEOUT));
+    let mut first = true;
     loop {
-        match read_frame::<_, IpcRequestEnvelope>(&mut io) {
-            Ok(req) => {
-                if reader_tx.send(ReaderMsg::Request(req)).is_err() {
-                    break;
-                }
-            }
-            Err(e) if e.is_transport_dead() => {
-                let _ = reader_tx.send(ReaderMsg::Closed);
-                break;
-            }
-            Err(_) => {
-                let _ = reader_tx.send(ReaderMsg::Malformed);
-                break;
-            }
+        let msg = match read_frame::<_, IpcRequestEnvelope>(&mut io) {
+            Ok(req) => ReaderMsg::Request(req),
+            Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
+            // Nothing arrived in the window — a read that timed out reaches us
+            // as a broken frame. Treat it as a client that never introduced
+            // itself and give the slot back, rather than as a protocol offence.
+            Err(_) if first => ReaderMsg::Closed,
+            Err(_) => ReaderMsg::Malformed,
+        };
+        if first {
+            first = false;
+            io.set_timeout(None);
+        }
+        let terminal = !matches!(msg, ReaderMsg::Request(_));
+        if reader_tx.send(msg).is_err() || terminal {
+            break;
         }
     }
 }
@@ -757,6 +824,7 @@ impl Drop for ActiveSidConnectionGuard {
 
 fn write_reject_response(pipe: HANDLE, reason: &ClientRejectReason) -> Result<(), WireError> {
     let mut io = PipeIo::new(pipe).map_err(WireError::Io)?;
+    io.set_timeout(Some(PUSH_WRITE_TIMEOUT));
     let env = IpcResponseEnvelope {
         request_id: String::new(),
         correlation_id: String::new(),
@@ -793,6 +861,10 @@ fn close_pipe(pipe: HANDLE) {
 struct PipeIo {
     pipe: HANDLE,
     event: HANDLE,
+    /// Deadline for a single I/O. `None` waits as long as it takes — correct for
+    /// a subscriber that legitimately sits quiet for hours, wrong for a client
+    /// that has stopped reading.
+    timeout: Option<Duration>,
 }
 
 impl PipeIo {
@@ -805,7 +877,55 @@ impl PipeIo {
         if event.is_invalid() {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(Self { pipe, event })
+        Ok(Self {
+            pipe,
+            event,
+            timeout: None,
+        })
+    }
+
+    fn set_timeout(&mut self, timeout: Option<Duration>) {
+        self.timeout = timeout;
+    }
+
+    /// Wait for the pending operation to finish, giving up after `self.timeout`.
+    ///
+    /// A named pipe has no `set_read_timeout`, so the window is enforced by
+    /// waiting on the operation's own event and cancelling what has not
+    /// completed. The reap after `CancelIoEx` is NOT optional and NOT a
+    /// courtesy: until the kernel reports the operation finished it may still
+    /// write into `overlapped` and the caller's buffer, both of which live on a
+    /// stack frame that is about to go away.
+    fn await_overlapped(
+        &self,
+        overlapped: &mut OVERLAPPED,
+        transferred: &mut u32,
+    ) -> std::io::Result<()> {
+        let Some(timeout) = self.timeout else {
+            // SAFETY: the operation is pending on `overlapped`, which outlives
+            // this call; blocking here is what keeps that true.
+            return unsafe { GetOverlappedResult(self.pipe, overlapped, transferred, true) }
+                .map_err(|e| std::io::Error::from_raw_os_error(e.code().0));
+        };
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: `self.event` is this PipeIo's own auto-reset event, set as
+        // `overlapped.hEvent` by the caller before submitting the I/O.
+        let waited = unsafe { WaitForSingleObject(self.event, millis) };
+        if waited == WAIT_OBJECT_0 {
+            // SAFETY: the event is signalled, so the operation has completed.
+            return unsafe { GetOverlappedResult(self.pipe, overlapped, transferred, false) }
+                .map_err(|e| std::io::Error::from_raw_os_error(e.code().0));
+        }
+        // SAFETY: cancels only this operation on this handle, then blocks until
+        // the kernel is done with `overlapped` — see the note above.
+        unsafe {
+            let _ = CancelIoEx(self.pipe, Some(&*overlapped));
+            let _ = GetOverlappedResult(self.pipe, overlapped, transferred, true);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "named pipe I/O exceeded its window",
+        ))
     }
 }
 
@@ -853,10 +973,7 @@ impl Read for PipeIo {
                 let last = unsafe { windows::Win32::Foundation::GetLastError().0 };
                 // ERROR_IO_PENDING (997) — wait for completion.
                 if last == 997 {
-                    unsafe {
-                        GetOverlappedResult(self.pipe, &overlapped, &mut bytes_read, true)
-                            .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-                    }
+                    self.await_overlapped(&mut overlapped, &mut bytes_read)?;
                     Ok(bytes_read as usize)
                 } else {
                     Err(std::io::Error::from_raw_os_error(last as i32))
@@ -885,10 +1002,7 @@ impl Write for PipeIo {
             Err(_) => {
                 let last = unsafe { windows::Win32::Foundation::GetLastError().0 };
                 if last == 997 {
-                    unsafe {
-                        GetOverlappedResult(self.pipe, &overlapped, &mut bytes_written, true)
-                            .map_err(|e| std::io::Error::from_raw_os_error(e.code().0))?;
-                    }
+                    self.await_overlapped(&mut overlapped, &mut bytes_written)?;
                     Ok(bytes_written as usize)
                 } else {
                     Err(std::io::Error::from_raw_os_error(last as i32))
@@ -1107,6 +1221,101 @@ mod tests {
                 }
                 Err(e) => return Err(e),
             }
+        }
+    }
+
+    /// A private overlapped pipe pair, so the deadline can be exercised without
+    /// the connection worker's identity check writing a frame first.
+    fn overlapped_pipe_pair(suffix: &str) -> (HANDLE, HANDLE) {
+        let name = format!(
+            r"\\.\pipe\NetRuleRouter\test-{suffix}-{}",
+            std::process::id()
+        );
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is null-terminated UTF-16 and outlives the call; a null
+        // security pointer means the default DACL, which is this user only.
+        let server = unsafe {
+            CreateNamedPipeW(
+                PCWSTR(wide.as_ptr()),
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1,
+                PIPE_BUFFER_SIZE,
+                PIPE_BUFFER_SIZE,
+                0,
+                None,
+            )
+        };
+        assert!(!server.is_invalid(), "test pipe created");
+        // SAFETY: same name, opened while the instance above is listening.
+        let client = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_NONE,
+                None,
+                OPEN_EXISTING,
+                windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
+                HANDLE::default(),
+            )
+        }
+        .expect("test client connects");
+        (server, client)
+    }
+
+    /// The deadline exists so a peer that stops talking cannot park a worker
+    /// thread — and with it one of the 32 connection slots — indefinitely.
+    ///
+    /// The second half is the part worth pinning: after a timeout the cancelled
+    /// read must have been REAPED, not merely abandoned. An abandoned overlapped
+    /// read leaves the kernel free to write into a stack frame that is already
+    /// gone, and the only cheap observable proof that it did not is that the
+    /// handle still behaves.
+    #[test]
+    fn a_read_past_its_deadline_gives_up_and_leaves_the_handle_usable() {
+        let (server, client) = overlapped_pipe_pair("deadline");
+        let mut io = PipeIo::new(server).expect("server io");
+        io.set_timeout(Some(Duration::from_millis(150)));
+
+        let started = Instant::now();
+        let mut buf = [0u8; 32];
+        let err = io.read(&mut buf).expect_err("nothing was ever sent");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read returned on its own deadline, not on some other event"
+        );
+
+        // Same handle, now with data waiting: the cancelled read left nothing behind.
+        let mut peer = PipeIo::new(client).expect("client io");
+        peer.write_all(b"ping").expect("client writes");
+        io.set_timeout(Some(Duration::from_secs(5)));
+        let read = io.read(&mut buf).expect("the handle still reads");
+        assert_eq!(&buf[..read], b"ping");
+
+        // SAFETY: both handles are owned by this test.
+        unsafe {
+            let _ = CloseHandle(client);
+            let _ = CloseHandle(server);
+        }
+    }
+
+    /// With no deadline the wait is unbounded — that is the correct behaviour
+    /// for a subscriber sitting quiet for hours, and the reason the window is
+    /// opt-in rather than always on.
+    #[test]
+    fn a_pipe_without_a_deadline_does_not_time_out() {
+        let (server, client) = overlapped_pipe_pair("no-deadline");
+        let mut io = PipeIo::new(server).expect("server io");
+        let mut peer = PipeIo::new(client).expect("client io");
+        peer.write_all(b"pong").expect("client writes");
+        let mut buf = [0u8; 32];
+        let read = io.read(&mut buf).expect("read without a deadline");
+        assert_eq!(&buf[..read], b"pong");
+        // SAFETY: both handles are owned by this test.
+        unsafe {
+            let _ = CloseHandle(client);
+            let _ = CloseHandle(server);
         }
     }
 

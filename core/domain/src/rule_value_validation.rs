@@ -258,7 +258,7 @@ fn validate_zone(value: &str) -> RuleValueValidation {
 /// A naive per-`char` `is_alphanumeric` check would reject
 /// Tamil/Devanagari/Arabic labels: their vowel signs and virama are combining
 /// marks (Unicode categories Mn/Mc), not alphanumerics.
-fn is_valid_hostname(host: &str) -> bool {
+pub(crate) fn is_valid_hostname(host: &str) -> bool {
     if host.is_ascii() {
         host.split('.').all(is_valid_ascii_dns_label)
     } else {

@@ -113,8 +113,8 @@ pub fn run_server_loop_for_test(
     client_profile: nrr_shared::ipc::IpcClientProfile,
     caller_is_elevated: bool,
 ) {
-    use nrr_ipc_client::wire::{read_frame, write_frame};
     use nrr_service_runtime::{IpcRequestContext, IpcRequestEnvelope};
+    use nrr_shared::ipc_wire::{read_frame, write_frame};
 
     while let Ok(request) = read_frame::<_, IpcRequestEnvelope>(&mut server_end) {
         let ctx = IpcRequestContext {
@@ -201,13 +201,13 @@ mod tests {
 
     // ── End-to-end: client → wire → router → wire → client ────────────────
 
-    use nrr_ipc_client::wire::{read_frame, write_frame};
     use nrr_service_runtime::{
         HandlerOutcome, IpcAuditEmitter, IpcHandler, IpcHandlerRegistry, IpcOperationClass,
         IpcRequestContext, IpcRequestEnvelope, IpcResponseEnvelope, IpcRouter, NoopIpcAuditEmitter,
         IPC_PROTOCOL_VERSION,
     };
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
+    use nrr_shared::ipc_wire::{read_frame, write_frame};
     use std::sync::Arc;
 
     struct EchoHandler;

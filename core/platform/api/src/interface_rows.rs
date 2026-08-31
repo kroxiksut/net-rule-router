@@ -420,11 +420,15 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
         "192.168.1.20",
         "192.168.1.1",
     );
-    ethernet_observed.external_ip_status = ExternalIpStatus::Resolved;
-    ethernet_observed.external_ip = Some("203.0.113.10".to_string());
-    ethernet_observed.external_probe_attempted = true;
+    // NOT `Resolved`: this dataset is a placeholder, and no probe ran. Claiming
+    // a resolved external address made the adapter-check panel print an invented
+    // one ("203.0.113.10") as the result of a successful lookup — the live path
+    // never produces `Resolved` without an actual probe.
+    ethernet_observed.external_ip_status = ExternalIpStatus::NotChecked;
+    ethernet_observed.external_ip = None;
+    ethernet_observed.external_probe_attempted = false;
     ethernet_observed.external_probe_note =
-        "External probe succeeded in deterministic fallback dataset.".to_string();
+        "No external probe runs in the deterministic fallback dataset.".to_string();
     let ethernet_derived = build_derived_assessment(
         "Ethernet",
         "Ethernet",
@@ -989,13 +993,14 @@ mod tests {
         assert_eq!(dto.availability, "available");
         assert_eq!(dto.route_state, "not-selected");
         assert_eq!(dto.selected_role, None);
-        assert_eq!(dto.observed_facts.external_ip_status, "resolved");
+        // The placeholder dataset runs no probe, so it must not claim one.
+        assert_eq!(dto.observed_facts.external_ip_status, "not-checked");
         assert_eq!(dto.derived_assessment.classification, "regular-interface");
         // kebab-case wire round-trip preserves the nested shape.
         let json = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(json["windows-name"], "Ethernet");
         assert_eq!(json["has-default-route"], true);
-        assert_eq!(json["observed-facts"]["external-ip-status"], "resolved");
+        assert_eq!(json["observed-facts"]["external-ip-status"], "not-checked");
         assert_eq!(
             json["derived-assessment"]["vpn-tunnel-likelihood"],
             "unlikely"

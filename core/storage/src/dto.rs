@@ -278,6 +278,13 @@ pub struct CacheResetSummary {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IntegrityCheckResult {
     Ok,
+    /// Everything verified, but there is no revision to roll back TO: the
+    /// active one is the only one there has ever been. Not a failure — a first
+    /// start looks exactly like this — yet the caller cannot promise a
+    /// fallback, and `Ok` gave it no way to tell the two apart (see
+    /// [`crate::error::IntegrityFailureKind::MissingLastKnownGood`], which
+    /// existed with nothing able to produce it).
+    OkNoRollbackTarget,
     /// `nrr_fqdn_ip_cache.db` is corrupt — can be rebuilt without user action.
     CacheCorruptRebuildable,
     /// `nrr_service_state.db` integrity failed — must fall back to LKG.

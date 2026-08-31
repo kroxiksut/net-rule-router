@@ -121,6 +121,11 @@ pub struct MockWindowsApi {
     pub adapter_infos: Mutex<Vec<crate::adapters::AdapterInfo>>,
     /// If `Some`, all mutable calls return this error.
     pub force_error: Mutex<Option<PlatformError>>,
+    /// Makes the route-table READ fail with a transient error carrying this
+    /// detail. Separate from `force_error`, which covers mutations: a caller
+    /// that treats an unreadable table as an empty one is a distinct failure,
+    /// and it needs its own switch to exercise.
+    pub fail_route_table_read: Mutex<Option<String>>,
     /// Filter ids (raw) whose `wfp_filter_add` returns
     /// `FWP_E_CONDITION_NOT_FOUND` (an un-materializable filter) — used to
     /// exercise the best-effort / strict apply policies selectively.
@@ -148,6 +153,7 @@ impl MockWindowsApi {
             wfp_filters: Mutex::new(Vec::new()),
             adapter_infos: Mutex::new(Vec::new()),
             force_error: Mutex::new(None),
+            fail_route_table_read: Mutex::new(None),
             fail_add_ids: Mutex::new(std::collections::HashSet::new()),
             fail_add_win32: Mutex::new(None),
             next_engine_token: Mutex::new(1),
@@ -187,6 +193,10 @@ impl MockWindowsApi {
 
     pub fn set_adapter_infos(&self, infos: Vec<crate::adapters::AdapterInfo>) {
         *self.adapter_infos.lock().unwrap() = infos;
+    }
+
+    pub fn set_route_table_read_error(&self, detail: Option<&str>) {
+        *self.fail_route_table_read.lock().unwrap() = detail.map(str::to_owned);
     }
 
     pub fn set_force_error(&self, err: Option<PlatformError>) {
@@ -244,6 +254,12 @@ impl Default for MockWindowsApi {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl RouteTablePort for MockWindowsApi {
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
+        if let Some(detail) = &*self.fail_route_table_read.lock().unwrap() {
+            return Err(PlatformError::Transient {
+                operation: "GetIpForwardTable2",
+                detail: detail.clone(),
+            });
+        }
         Ok(self.route_table.lock().unwrap().clone())
     }
 
@@ -343,6 +359,22 @@ impl WfpEnginePort for MockWindowsApi {
                 message: "Win32 error 0x80320002".to_string(),
             });
         }
+        // The engine keys filters by id, so a second add of the same one is a
+        // conflict, not a second filter. Without this the mock happily held two
+        // records under one id and every "as many live filters as we accounted
+        // for" assertion became untrustworthy: a mismatch could be the mock's
+        // own doing. `execute_batch` treats this code as an idempotent success,
+        // which is exactly the behaviour worth exercising.
+        {
+            let filters = self.wfp_filters.lock().unwrap();
+            if filters.iter().any(|f| f.id == id) {
+                return Err(PlatformError::Win32 {
+                    operation: "FwpmFilterAdd0",
+                    code: crate::error::win32_codes::FWP_E_ALREADY_EXISTS,
+                    message: "Win32 error 0x80320009".to_string(),
+                });
+            }
+        }
         self.wfp_filters.lock().unwrap().push(WfpFilterRecord {
             id,
             layer: spec.layer,
@@ -437,6 +469,32 @@ mod tests {
         api.wfp_filter_delete(&token, id).unwrap();
         assert!(api.wfp_enumerate_our_filters(&token).unwrap().is_empty());
         api.wfp_engine_close(token).unwrap();
+    }
+
+    #[test]
+    fn mock_wfp_filter_add_refuses_a_duplicate_id_like_the_engine() {
+        // Without this the mock held two records under one id, and any "as many
+        // live filters as we accounted for" assertion could fail (or pass) for
+        // the mock's own reasons rather than the code's.
+        let api = MockWindowsApi::new();
+        let token = api.wfp_engine_open().expect("engine");
+        let spec = sample_spec();
+        api.wfp_filter_add(&token, &spec).expect("first add");
+        let again = api.wfp_filter_add(&token, &spec);
+        match again {
+            Err(PlatformError::Win32 { code, .. }) => {
+                assert_eq!(code, crate::error::win32_codes::FWP_E_ALREADY_EXISTS);
+            }
+            other => panic!("expected FWP_E_ALREADY_EXISTS, got {other:?}"),
+        }
+        assert_eq!(
+            api.wfp_enumerate_our_filters(&token)
+                .expect("enumerate")
+                .len(),
+            1,
+            "one id, one filter"
+        );
+        api.wfp_engine_close(token).expect("close");
     }
 
     #[test]

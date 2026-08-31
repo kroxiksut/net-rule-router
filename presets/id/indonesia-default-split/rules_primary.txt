@@ -8,30 +8,26 @@
 id              # Republic of Indonesia (.id)
 
 --- Domains
-# Indonesia telecom and public ecosystem
-*.telkomsel.com
-*.indosatooredoo.com
-*.xl.co.id
-*.smartfren.com
-*.kominfo.go.id
+*.telkomsel.com  # Indonesia telecom and public ecosystem
+*.indosatooredoo.com  # Indonesia telecom and public ecosystem
+*.xl.co.id  # Indonesia telecom and public ecosystem
+*.smartfren.com  # Indonesia telecom and public ecosystem
+*.kominfo.go.id  # Indonesia telecom and public ecosystem
 
-# Local digital ecosystem
-*.go-jek.com
-*.gojek.com
-*.tokopedia.com
-*.bukalapak.com
-*.blibli.com
+*.go-jek.com  # Local digital ecosystem
+*.gojek.com  # Local digital ecosystem
+*.tokopedia.com  # Local digital ecosystem
+*.bukalapak.com  # Local digital ecosystem
+*.blibli.com  # Local digital ecosystem
 
-# Google services stay on the main route; the AI hosts are routed separately
-*.google.com
+*.google.com  # Google services stay on the main route; the AI hosts are routed separately
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-# Local/region-oriented desktop apps (examples)
-Gojek*.exe
-Tokopedia*.exe
+Gojek*.exe  # Local/region-oriented desktop apps (examples)
+Tokopedia*.exe  # Local/region-oriented desktop apps (examples)
 
 --- Linux
 # (reserved - not applied on Windows)

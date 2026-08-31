@@ -9,6 +9,21 @@ use nrr_platform_api::service_control::ServiceStartMode;
 
 use crate::verbs::{self, VerbSpec};
 
+/// One validated invocation: what to do, and whether the user asked for
+/// administrator rights up front.
+///
+/// Elevation is not part of [`Command`] on purpose. It says nothing about WHAT
+/// to do — it answers "and if that turns out to need rights you do not have".
+/// Keeping it out is what lets the elevated re-run be built from the command
+/// alone (`elevate::canonical_argv`), with no way to carry the request onward
+/// into a second prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    pub command: Command,
+    /// `--elevate` was given.
+    pub elevate: bool,
+}
+
 /// A parsed, validated command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -123,10 +138,13 @@ struct ParsedFlag {
     value: Option<String>,
 }
 
-/// Parse argv (without the executable name) into a command.
-pub fn parse(args: &[String]) -> Result<Command, ParseError> {
+/// Parse argv (without the executable name) into an invocation.
+pub fn parse(args: &[String]) -> Result<Invocation, ParseError> {
     let Some(first) = args.first() else {
-        return Ok(Command::Help);
+        return Ok(Invocation {
+            command: Command::Help,
+            elevate: false,
+        });
     };
 
     // Leading dashes and case are normalised so `--status`, `status` and
@@ -134,7 +152,10 @@ pub fn parse(args: &[String]) -> Result<Command, ParseError> {
     // entrypoints already grant.
     let verb_word = first.trim_start_matches('-').to_ascii_lowercase();
     if verb_word.is_empty() || verb_word == "h" {
-        return Ok(Command::Help);
+        return Ok(Invocation {
+            command: Command::Help,
+            elevate: false,
+        });
     }
     let Some(spec) = verbs::find(&verb_word) else {
         return Err(ParseError::UnknownVerb { verb: verb_word });
@@ -161,7 +182,10 @@ pub fn parse(args: &[String]) -> Result<Command, ParseError> {
     };
 
     let flags = collect_flags(spec, rest)?;
-    build(&spelling, spec, &flags)
+    Ok(Invocation {
+        command: build(&spelling, spec, &flags)?,
+        elevate: flag(&flags, verbs::ELEVATE_FLAG.name).is_some(),
+    })
 }
 
 /// Split the remaining arguments into flags, rejecting anything the verb does
@@ -280,9 +304,88 @@ fn build(
 mod tests {
     use super::*;
 
+    /// The command an argv parses to, for the tests that are about the command
+    /// and not about how it was asked for.
     fn p(args: &[&str]) -> Result<Command, ParseError> {
+        inv(args).map(|invocation| invocation.command)
+    }
+
+    fn inv(args: &[&str]) -> Result<Invocation, ParseError> {
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse(&owned)
+    }
+
+    #[test]
+    fn elevation_is_off_unless_asked_for_and_is_not_part_of_the_command() {
+        // Two properties in one place because they are the same decision: the
+        // request travels beside the command, so `stop` and `stop --elevate`
+        // are the same thing to do, differing only in what may be asked of the
+        // user on the way.
+        assert_eq!(
+            inv(&["stop"]),
+            Ok(Invocation {
+                command: Command::Stop,
+                elevate: false
+            })
+        );
+        assert_eq!(
+            inv(&["stop", "--elevate"]),
+            Ok(Invocation {
+                command: Command::Stop,
+                elevate: true
+            })
+        );
+    }
+
+    #[test]
+    fn elevation_combines_with_a_verbs_own_flags() {
+        assert_eq!(
+            inv(&["uninstall", "--purge", "--elevate"]),
+            Ok(Invocation {
+                command: Command::Uninstall { purge: true },
+                elevate: true
+            })
+        );
+        assert_eq!(
+            inv(&["install", "--elevate", "--start-mode=on-demand"]),
+            Ok(Invocation {
+                command: Command::Install {
+                    start_mode: ServiceStartMode::OnAppLaunch
+                },
+                elevate: true
+            })
+        );
+    }
+
+    #[test]
+    fn a_verb_that_never_needs_rights_rejects_the_elevation_flag() {
+        // The table says which verbs can ask for privilege; the parser enforces
+        // it, so `status --elevate` is a usage error rather than a no-op.
+        assert_eq!(
+            p(&["status", "--elevate"]),
+            Err(ParseError::UnknownFlag {
+                verb: "status",
+                flag: "elevate".to_string()
+            })
+        );
+        assert_eq!(
+            p(&["diag", "doctor", "--elevate"]),
+            Err(ParseError::UnknownFlag {
+                verb: "doctor",
+                flag: "elevate".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn the_elevation_flag_takes_no_value() {
+        assert_eq!(
+            p(&["stop", "--elevate=yes"]),
+            Err(ParseError::UnexpectedValue {
+                verb: "stop",
+                flag: "elevate"
+            })
+        );
     }
 
     #[test]

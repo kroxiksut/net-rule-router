@@ -358,6 +358,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSource::UserAssigned,
         };
         seed_bindings(&conn, "S-1-5-21-test", &record);

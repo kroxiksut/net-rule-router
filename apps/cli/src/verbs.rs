@@ -15,9 +15,11 @@
 pub enum Privilege {
     /// Runs as any user.
     Any,
-    /// Requires an elevated / root console. The console never elevates itself:
-    /// it reports what is needed and exits, so a script cannot silently gain
-    /// privilege by invoking it.
+    /// Requires an elevated / root console. The console never elevates on its
+    /// own: it reports what is needed and exits, so a script cannot gain
+    /// privilege by invoking it. Elevation happens only when the user asks —
+    /// with `--elevate`, or by answering the question an interactive console
+    /// puts to them. See [`ELEVATE_FLAG`].
     Administrator,
 }
 
@@ -74,6 +76,15 @@ const TAIL_FLAG: FlagSpec = FlagSpec {
     summary: "how many of the newest lines to print (default 50)",
 };
 
+/// Offered by every verb that needs administrator rights, and by no other: a
+/// verb that runs as any user has nothing to elevate for, and declaring the flag
+/// there would advertise a privilege it never needs.
+pub const ELEVATE_FLAG: FlagSpec = FlagSpec {
+    name: "elevate",
+    value: None,
+    summary: "if it turns out to need administrator rights, ask for them and run it again",
+};
+
 /// Subverbs of `diag`. The group exists because diagnostics is the part of
 /// this console that keeps growing; the lifecycle above does not.
 const DIAG_SUBVERBS: &[VerbSpec] = &[
@@ -105,35 +116,35 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "install",
         summary: "Register the service with the operating system",
-        flags: &[START_MODE_FLAG],
+        flags: &[START_MODE_FLAG, ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
     VerbSpec {
         name: "uninstall",
         summary: "Deregister the service",
-        flags: &[PURGE_FLAG],
+        flags: &[PURGE_FLAG, ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
     VerbSpec {
         name: "start",
         summary: "Start the service",
-        flags: &[],
+        flags: &[ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
     VerbSpec {
         name: "stop",
         summary: "Stop the service",
-        flags: &[],
+        flags: &[ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
     VerbSpec {
         name: "restart",
         summary: "Stop then start the service",
-        flags: &[],
+        flags: &[ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
@@ -143,7 +154,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "reinstall",
         summary: "Re-register the service from this directory and start it",
-        flags: &[],
+        flags: &[ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
@@ -164,7 +175,7 @@ pub static VERBS: &[VerbSpec] = &[
     VerbSpec {
         name: "reset-network",
         summary: "Remove network state a crashed service left behind",
-        flags: &[CONFIRM_FLAG],
+        flags: &[CONFIRM_FLAG, ELEVATE_FLAG],
         privilege: Privilege::Administrator,
         subverbs: &[],
     },
@@ -416,6 +427,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn exactly_the_verbs_that_need_administrator_offer_to_ask_for_it() {
+        // Both directions matter. A privileged verb without the flag leaves the
+        // user retyping the command in another console — the thing this exists
+        // to remove. An unprivileged verb WITH it advertises a prompt that would
+        // never appear, and a console that offers elevation it does not need is
+        // how people learn to grant it without reading.
+        for verb in all_specs() {
+            let offers = verb.flags.iter().any(|f| f.name == ELEVATE_FLAG.name);
+            match verb.privilege {
+                Privilege::Administrator => assert!(
+                    offers,
+                    "`{}` needs administrator rights but cannot ask for them",
+                    verb.name
+                ),
+                Privilege::Any => assert!(
+                    !offers,
+                    "`{}` runs as any user and must not offer elevation",
+                    verb.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn help_says_which_verbs_can_ask_for_rights() {
+        let help = render_help("nrr-cli");
+        assert!(
+            help.contains("--elevate"),
+            "the elevation flag must be discoverable from help alone"
+        );
     }
 
     #[test]

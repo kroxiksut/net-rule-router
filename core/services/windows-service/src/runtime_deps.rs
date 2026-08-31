@@ -68,11 +68,6 @@ use rusqlite::Connection;
 
 use crate::named_pipe_server::WindowsNamedPipeServer;
 
-/// `MutationQueue` slot count. The queue serialises privileged mutations
-/// (`Apply`, `Rollback`, `SafeDisable`); 32 covers the GUI's worst-case
-/// burst of mass-toggle clicks comfortably without hoarding memory.
-pub(crate) const MUTATION_QUEUE_CAPACITY: usize = 32;
-
 /// Adapter-monitor debounce, in milliseconds. Matches block-15.x default;
 /// short enough that a Wi-Fi flicker resolves before the GUI render
 /// settles, long enough to avoid double-firing on a normal cable plug.
@@ -131,6 +126,10 @@ pub(crate) fn build_supervised_runtime_deps(
     // "Verbose service logging" Save takes effect live, no service restart.
     verbosity_handle: Option<TracingVerbosityHandle>,
 ) -> SupervisedRuntimeDeps {
+    // Bound here, not inline at the IPC surface, so the housekeeping tick can
+    // collect expired dry-run tokens: a dry-run needs no elevation, skips the
+    // mutation queue and parks its payload here until confirmed or expired.
+    let mutation_tokens = Arc::new(MutationTokenStore::new());
     // ── Shared HealthAggregator ────────────────────────────────────────
     // Constructed once at the top of the function so that:
     //   * `IpcHandlerDeps.health` (read-side, accessed via the IPC
@@ -332,6 +331,17 @@ pub(crate) fn build_supervised_runtime_deps(
     // Shared block-all posture flag, same writer/reader split.
     let block_all_posture =
         nrr_service_runtime::app_enforcement_status::BlockAllPostureStatus::new();
+    // Shared "guard blocking, additional link unresolved" flag. Wider than the
+    // block-all one above and read by the two places that must not treat a rule
+    // host as covered while it is armed: the DNS handler and the rule-hostname
+    // seeder. Created here because the seeder is built before the orchestrator
+    // that writes it.
+    let fail_closed_posture =
+        nrr_service_runtime::app_enforcement_status::FailClosedPostureStatus::new();
+    let seed_leak_guard: Arc<dyn nrr_service_runtime::dns_resolver::LeakGuardPosture> = {
+        let posture = fail_closed_posture.clone();
+        Arc::new(move || posture.armed())
+    };
     // Reactive VPN-endpoint learning — bounded, session-scoped, role-verified
     // server IPs (see `nrr_service_runtime::vpn_endpoint_learning`) plus the
     // kill-switch/fail-closed Block-id registry that role-verifies a drop
@@ -726,7 +736,11 @@ pub(crate) fn build_supervised_runtime_deps(
                         Arc::clone(cache_arc),
                         Arc::clone(&fqdn_cache),
                         Arc::clone(&rules_provider),
-                    ),
+                    )
+                    // While the guard blocks an unresolved link, a rule host
+                    // with no cached address is an unprotected one — retry in
+                    // seconds instead of minutes until it has one.
+                    .with_leak_guard_posture(Arc::clone(&seed_leak_guard)),
                 );
                 // Carry the destinations of applications routed over the
                 // additional link across restarts. An application rule is
@@ -1073,6 +1087,13 @@ pub(crate) fn build_supervised_runtime_deps(
                         // Publish the block-all posture for the GUI
                         // "leak protection is blocking unknown traffic" banner.
                         .with_block_all_posture_status(block_all_posture.clone())
+                        // Publish the wider fail-closed posture the DNS handler
+                        // and the seeder key on.
+                        .with_fail_closed_posture_status(fail_closed_posture.clone())
+                        // Tell the OTHER logged-in principals when somebody
+                        // arms a cut the WFP packet layers cannot scope to one
+                        // user — their ICMP and IPv6 go with it.
+                        .with_events(Arc::clone(&event_bus))
                         .with_filter_ledger(Arc::clone(&filter_ledger))
                         // Flush the OS resolver cache
                         // on the fail-closed block-all arming edge so names the
@@ -1807,7 +1828,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     Arc::new(nrr_service_runtime::NoopMutationExecutor) as Arc<dyn MutationExecutor>
                 }
             },
-            Arc::new(MutationTokenStore::new()),
+            Arc::clone(&mutation_tokens),
             Arc::new(OperationStatusStore::default()),
             Arc::clone(&event_bus),
             Arc::new(ProductionRoutePolicyProvider::new(Arc::clone(conn)))
@@ -2336,11 +2357,21 @@ pub(crate) fn build_supervised_runtime_deps(
     // registry stays empty — the supervisor will not transition to
     // `Running` because bootstrap was Blocking.
 
-    let audit: Arc<dyn IpcAuditEmitter> = Arc::new(NoopIpcAuditEmitter);
+    // The router refuses a privileged mutation whose audit record cannot be
+    // written. With the no-op emitter that safeguard could never fire and the
+    // trail was empty; wired to the real writer it does both jobs.
+    let audit: Arc<dyn IpcAuditEmitter> = match artifacts.audit_writer.as_ref() {
+        Some(writer) => Arc::new(
+            nrr_service_runtime::production_ipc_audit::ProductionIpcAuditEmitter::new(Arc::clone(
+                writer,
+            )),
+        ),
+        None => Arc::new(NoopIpcAuditEmitter),
+    };
     let router = Arc::new(IpcRouter::new(
         registry,
         Arc::clone(&audit),
-        MUTATION_QUEUE_CAPACITY,
+        nrr_service_runtime::ipc::MUTATION_QUEUE_CAPACITY,
     ));
     // The pipe server MUST share the SAME
     // `ActiveSidRegistry` the route coordinator + WFP orchestrator read. With
@@ -2990,6 +3021,14 @@ pub(crate) fn build_supervised_runtime_deps(
             let orch = Arc::clone(orch);
             Arc::new(move || orch.any_block_all_armed()) as Arc<dyn Fn() -> bool + Send + Sync>
         });
+    // The answer gate keys on the WIDER posture: with the default per-IP guard
+    // the block-all latch stays disarmed while the additional link is
+    // unresolved and rule destinations are very much being blocked.
+    let fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>> =
+        per_sid_orchestrator.as_ref().map(|orch| {
+            let orch = Arc::clone(orch);
+            Arc::new(move || orch.any_fail_closed_armed()) as Arc<dyn Fn() -> bool + Send + Sync>
+        });
     // A hostname's fake address is its stable identity across restarts: seed
     // the allocator from the persisted bindings and mirror every later change
     // back. Without this the in-memory allocator re-deals the same indices to
@@ -3185,11 +3224,22 @@ pub(crate) fn build_supervised_runtime_deps(
         route_recompute_hook.as_ref(),
         known_direct_registry.as_ref(),
         block_all_armed,
+        fail_closed_armed,
         Some(Arc::clone(&fake_ip_assembly)),
         Some(Arc::clone(&fake_ip_running)),
         fake_ip_secondary_ready,
         dns_egress_policy,
         auto_rules_engine.clone(),
+        Some({
+            // A connected tray proves a session; on a cold boot none is running
+            // yet, so the console session is what answers first.
+            let reg = Arc::clone(&sid_registry);
+            Arc::new(move || {
+                !reg.active_sids().is_empty()
+                    || nrr_platform_windows::win32_ffi::console_session::active_console_user_sid()
+                        .is_some()
+            }) as Arc<dyn Fn() -> bool + Send + Sync>
+        }),
     ) {
         dns_resolver_controller.set_factory(factory);
     }
@@ -3348,6 +3398,7 @@ pub(crate) fn build_supervised_runtime_deps(
         ipc_server,
         adapter_monitor,
         operation_results,
+        mutation_tokens: Some(mutation_tokens),
         stability: stability_config,
         // Audit files share `logs_dir`; clone before `logs_dir` moves.
         audit_dir: logs_dir.clone(),
@@ -3384,6 +3435,7 @@ pub(crate) fn build_supervised_runtime_deps(
         // Under SCM this is the OS wake notification; in console mode nothing
         // dispatches into it and the watchdog tick carries the recovery alone.
         power_event_observer: Some(Arc::new(crate::power_scm::ScmPowerEventObserver)),
+        logon_session_observer: Some(Arc::new(crate::logon_scm::ScmLogonSessionObserver)),
         rebind_requests: Some(rebind_requests),
         secondary_liveness_hook,
         secondary_external_address,
@@ -4894,6 +4946,10 @@ fn build_dns_resolver_factory(
     // gate off, everything else about Mode B unchanged.
     known_direct: Option<&Arc<nrr_service_runtime::known_direct::KnownDirectRegistry>>,
     block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    // "Is the guard blocking an unresolved additional link?" — wider than
+    // `block_all_armed`, which the default per-IP posture leaves disarmed.
+    // Absent keeps the historic fail-open on a missed reconcile deadline.
+    fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     // The shared fake-IP assembly + the "stack running?"
     // gate. Both absent leaves Mode B exactly as before fake-IP.
     fake_assembly: Option<Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>>,
@@ -4907,6 +4963,8 @@ fn build_dns_resolver_factory(
     // Parked companion suggestions. Absent leaves the collateral rescue
     // unvetoed, exactly as before the port existed.
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    // "Is anyone signed in?" Absent leaves the arm ungated (test profiles).
+    signed_in: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverFactory> {
     let settings_conn = Arc::clone(settings_conn?);
     let cache = Arc::clone(cache_store?);
@@ -4922,11 +4980,13 @@ fn build_dns_resolver_factory(
                 &hook,
                 known_direct.as_ref(),
                 block_all_armed.clone(),
+                fail_closed_armed.clone(),
                 fake_assembly.as_ref(),
                 fake_ip_running.clone(),
                 fake_ip_secondary_ready.clone(),
                 egress.clone(),
                 auto_rules.clone(),
+                signed_in.as_ref(),
             )
         });
     Some(factory)
@@ -5353,11 +5413,14 @@ fn build_dns_resolver_instance(
     hook: &nrr_service_runtime::supervised_runtime::RouteRecomputeHook,
     known_direct: Option<&Arc<nrr_service_runtime::known_direct::KnownDirectRegistry>>,
     block_all_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    fail_closed_armed: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fake_assembly: Option<&Arc<nrr_service_runtime::fake_ip::FakeIpAssembly>>,
     fake_ip_running: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     fake_ip_secondary_ready: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     egress: Option<Arc<dyn nrr_service_runtime::dns_egress::DnsEgressPolicy>>,
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    // "Is anyone signed in?" Absent leaves the arm ungated (test profiles).
+    signed_in: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverService> {
     use nrr_platform_windows::dns_redirect::{
         NrptDnsRedirect, PowerShellRunner, SystemDnsRedirectPort,
@@ -5368,6 +5431,26 @@ fn build_dns_resolver_instance(
     };
     use nrr_service_runtime::dns_resolver_service::DnsResolverService;
     use std::time::Duration;
+
+    // Mode B applies the ACTIVE user's rules; with nobody signed in there are
+    // none, and the resolver would be a plain forwarder bought at the price of
+    // rewriting machine-wide name resolution — inside the logon phase, where
+    // that costs the user a frozen screen while the OS resolves through a
+    // listener still coming up. The sign-in event re-arms.
+    //
+    // The question is "is anyone signed in", NOT "who do we route for":
+    // `effective_routing_sid` answers `None` under an app-driven scope with no
+    // tray even though a user is right there, and gating on it would leave Mode
+    // B off for the whole session.
+    if let Some(signed_in) = signed_in.as_ref() {
+        if !signed_in() {
+            tracing::info!(
+                target: "nrr::dns-resolver",
+                "Mode B: no signed-in user yet — staying reactive until sign-in",
+            );
+            return None;
+        }
+    }
 
     // Settle the real upstream DNS BEFORE redirecting: once NRPT points the
     // whole machine at our listener, an upstream that does not answer takes
@@ -5459,6 +5542,12 @@ fn build_dns_resolver_instance(
     )
     .with_upstream_pool(Arc::clone(&upstream_pool))
     .with_direct_answer_steering(secondary_owned);
+    // Withhold a rule-host answer whose enforcement missed its deadline while
+    // the guard is blocking an unresolved link — handing it over is the leak
+    // the guard exists to prevent.
+    if let Some(armed) = fail_closed_armed {
+        listener = listener.with_leak_guard_posture(Arc::new(move || armed()));
+    }
     // When the shared fake-IP assembly is present,
     // answer scope rule hosts with virtual addresses (gated on the relay
     // actually running — no stack → real path), and under the armed block-all

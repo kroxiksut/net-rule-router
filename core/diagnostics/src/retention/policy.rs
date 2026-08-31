@@ -27,6 +27,17 @@ pub const DEFAULT_AUDIT_MAX_AGE_DAYS: u32 = 365;
 /// Default max total size for audit NDJSON (50 MiB).
 pub const DEFAULT_AUDIT_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Floor under the user-settable audit age, in days.
+///
+/// The product promises the audit trail is not erased by user action. That
+/// promise was held only by the GUI not calling the cleanup job: the same
+/// settings row the user edits feeds the SCHEDULED audit pass, so "1 day"
+/// quietly erased the trail on the service's own timer. The user may raise
+/// these; they cannot lower them past the floor.
+pub const MIN_AUDIT_MAX_AGE_DAYS: u32 = 30;
+/// Floor under the user-settable audit size budget (10 MiB).
+pub const MIN_AUDIT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+
 // ── LogRetentionPolicy ────────────────────────────────────────────────────────
 
 /// Retention policy for operational NDJSON logs.
@@ -77,6 +88,24 @@ pub struct AuditRetentionPolicy {
     pub max_age_days: u32,
     /// Delete oldest audit files when total size exceeds this limit (bytes).
     pub max_total_size_bytes: u64,
+}
+
+impl AuditRetentionPolicy {
+    /// Raises anything below the floor. Applied where the pass runs, so no
+    /// caller can route around it.
+    #[must_use]
+    pub fn clamped(&self) -> Self {
+        Self {
+            max_age_days: self.max_age_days.max(MIN_AUDIT_MAX_AGE_DAYS),
+            // Zero keeps its meaning of "no size cap" — a floor on a disabled
+            // cap would turn "keep everything" into "keep 10 MiB".
+            max_total_size_bytes: if self.max_total_size_bytes == 0 {
+                0
+            } else {
+                self.max_total_size_bytes.max(MIN_AUDIT_MAX_SIZE_BYTES)
+            },
+        }
+    }
 }
 
 impl Default for AuditRetentionPolicy {
