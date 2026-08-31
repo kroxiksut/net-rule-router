@@ -10,6 +10,8 @@
 //!
 //! | Slug                            | Description                                                       |
 //! |---------------------------------|-------------------------------------------------------------------|
+//! | `local.rules-overlaps`          | Rules cleanup — every exact rule a wildcard already covers,       |
+//! |                                 | via `nrr_shared::rules_overlap::find_overlaps`.                    |
 //! | `local.canonical-rules-hash`    | Drift detection — canonicalise rules-json via                     |
 //! |                                 | `nrr_shared::rules_json::to_canonical_string` and SHA-256 the     |
 //! |                                 | result. GUI hashes file / rulesModel / service-baseline through   |
@@ -88,6 +90,7 @@ pub fn handle_local_request(
 ) -> LocalHandlerResult {
     match operation {
         "local.canonical-rules-hash" => handle_canonical_rules_hash(payload),
+        "local.rules-overlaps" => handle_rules_overlaps(payload),
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
@@ -324,6 +327,23 @@ fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
     Ok(json!({
         "hash": hex,
         "canonical-bytes": canonical.len(),
+    }))
+}
+
+/// Every exact rule already covered by a wildcard rule, so the rules screen
+/// can offer the redundant ones for removal. Local because it is a pure
+/// function of the rules the window already holds — asking the service would
+/// answer about the APPLIED set, not the one on screen.
+fn handle_rules_overlaps(payload: &Value) -> LocalHandlerResult {
+    let rules_json = payload
+        .get("rules-json")
+        .and_then(Value::as_str)
+        .ok_or(LocalHandlerError::MissingField("rules-json"))?;
+    let dto: CanonicalRulesJsonV1 = serde_json::from_str(rules_json)?;
+    let pairs = nrr_shared::rules_overlap::find_overlaps(&dto);
+    Ok(json!({
+        "pairs": pairs,
+        "redundant-count": pairs.iter().filter(|p| p.redundant).count(),
     }))
 }
 

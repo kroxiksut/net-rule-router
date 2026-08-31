@@ -439,7 +439,7 @@ pub fn compute_diff(
     let next_total_rules =
         (candidate.rule_book.primary.len() + candidate.rule_book.secondary.len()) as u32;
 
-    let overlapping_apexes = collect_overlapping_apexes(candidate);
+    let overlapping_apexes = collect_overlapping_apexes(candidate, &rule_changes);
 
     StructuralDiff {
         binding_changed,
@@ -461,7 +461,14 @@ pub fn compute_diff(
 /// subsume the ExactFqdn, but the engine evaluates ExactFqdn first
 /// (tier 1) and the two may route different ways if they live in
 /// different sets.
-fn collect_overlapping_apexes(candidate: &CanonicalProfile) -> Vec<String> {
+///
+/// Only overlaps THIS change touches are reported. Scoring the whole
+/// candidate meant a set that already carried an overlap raised the same
+/// signal on every later apply — including applies whose diff was empty —
+/// so the review screen warned about something the user was not doing.
+/// A standing overlap belongs to the rules screen's cleanup, not to the
+/// path of an unrelated edit.
+fn collect_overlapping_apexes(candidate: &CanonicalProfile, changes: &[RuleChange]) -> Vec<String> {
     use crate::canonical::CanonicalAddressMatch;
     use std::collections::BTreeSet;
 
@@ -481,11 +488,33 @@ fn collect_overlapping_apexes(candidate: &CanonicalProfile) -> Vec<String> {
         }
     }
 
+    // Hostnames the candidate side of this change carries. `Removed` is absent
+    // on purpose: dropping one half of a pair ends an overlap, it never opens
+    // one.
+    let mut touched: BTreeSet<&str> = BTreeSet::new();
+    for change in changes {
+        let rule = match change {
+            RuleChange::Added { rule, .. } | RuleChange::Retargeted { rule, .. } => rule,
+            RuleChange::Modified { next, .. } => next,
+            RuleChange::Removed { .. } => continue,
+        };
+        match rule.address_match.as_ref() {
+            Some(CanonicalAddressMatch::SuffixDomain(label)) => {
+                touched.insert(label.as_str());
+            }
+            Some(CanonicalAddressMatch::ExactFqdn(host)) => {
+                touched.insert(host.as_str());
+            }
+            _ => {}
+        }
+    }
+
     let mut overlapping: BTreeSet<String> = BTreeSet::new();
     for apex in &suffix_apexes {
         let dotted_suffix = format!(".{apex}");
         for host in &exact_fqdns {
-            if host == apex || host.ends_with(&dotted_suffix) {
+            let pairs = host == apex || host.ends_with(&dotted_suffix);
+            if pairs && (touched.contains(apex.as_str()) || touched.contains(host.as_str())) {
                 overlapping.insert(apex.clone());
                 break;
             }

@@ -1,8 +1,12 @@
-//! Explain mode presentation layer.
+//! Explain mode presentation layer: the [`ExplainResponse`] DTO the routing
+//! check answers with.
 //!
-//! Converts `DecisionExplain` (from the rule engine) and
-//! `LookupExplainSummary` (from the cache layer) into a
-//! GUI-ready [`ExplainResponse`] DTO.
+//! It used to also carry a mapper from `DecisionExplain` (the rule engine's
+//! trace) plus its own key namespace. Both were unreachable — the engine entry
+//! point that produces `DecisionExplain` is not called in production, the
+//! historical-decision query has no snapshot store to read, and the synthetic
+//! query builds its response directly — and the keys did not match the locale
+//! files anyway, so wiring them up would have shown untranslated text.
 //!
 //! # Two explain scenarios
 //!
@@ -21,13 +25,9 @@
 //! | `Diagnostics`  | Diagnostic mode  | + IP, TTL, warnings, uncertainty markers   |
 //! | `DeveloperTrace`| Dev/test only   | + full process path, correlation details   |
 
-pub mod keys;
-pub mod mapper;
 pub mod query;
 pub mod response;
 
-pub use keys::*;
-pub use mapper::map_explain;
 pub use query::{ExplainDataAvailability, ExplainQuery, ExplainQueryKind, RuntimeInputSample};
 pub use response::{
     ExplainAvailabilitySection, ExplainCorrelationSection, ExplainFinalActionSection,

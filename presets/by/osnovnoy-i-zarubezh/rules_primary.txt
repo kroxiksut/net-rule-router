@@ -11,46 +11,40 @@ ru              # Российская Федерация (.ru)
 рф              # Российская Федерация (.рф, Punycode xn--p1ai)
 
 --- Domains
-# Regional services commonly used in Belarus
-*.vk.com
-*.vk.cc
-*.vk.me
-*.userapi.com
-*.vkuser.net
-*.vkuseraudio.net
+*.vk.com  # Regional services commonly used in Belarus
+*.vk.cc  # Regional services commonly used in Belarus
+*.vk.me  # Regional services commonly used in Belarus
+*.userapi.com  # Regional services commonly used in Belarus
+*.vkuser.net  # Regional services commonly used in Belarus
+*.vkuseraudio.net  # Regional services commonly used in Belarus
 
 *.my.com
 *.icq.com
 *.ok.com
 
-# Yandex and related infrastructure on global TLDs
-*.yandex.com
-*.yandex.net
-*.yastatic.net
-*.yandexcloud.net
-*.ya.cc
+*.yandex.com  # Yandex and related infrastructure on global TLDs
+*.yandex.net  # Yandex and related infrastructure on global TLDs
+*.yastatic.net  # Yandex and related infrastructure on global TLDs
+*.yandexcloud.net  # Yandex and related infrastructure on global TLDs
+*.ya.cc  # Yandex and related infrastructure on global TLDs
 
-# Belarus and regional ecosystems using global domains
-*.2gis.com
-*.avito.com
-*.ozon.com
+*.2gis.com  # Belarus and regional ecosystems using global domains
+*.avito.com  # Belarus and regional ecosystems using global domains
+*.ozon.com  # Belarus and regional ecosystems using global domains
 
-# Security and utility services on global TLDs
-*.kaspersky.com
-*.drweb.com
+*.kaspersky.com  # Security and utility services on global TLDs
+*.drweb.com  # Security and utility services on global TLDs
 
-# Google services stay on the main route; the AI hosts are routed separately
-*.google.com
+*.google.com  # Google services stay on the main route; the AI hosts are routed separately
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-# Direct route preferred for local/regional desktop apps
-YandexDis*.exe
-DiskO*.exe
-Cloud.exe
-mail.ru_cloud*.exe
+YandexDis*.exe  # Direct route preferred for local/regional desktop apps
+DiskO*.exe  # Direct route preferred for local/regional desktop apps
+Cloud.exe  # Direct route preferred for local/regional desktop apps
+mail.ru_cloud*.exe  # Direct route preferred for local/regional desktop apps
 
 vk.exe
 vkteams.exe

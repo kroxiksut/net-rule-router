@@ -56,6 +56,26 @@ pub fn canonical_glob_process_pattern(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
+/// The key BOTH sides of an application match are reduced to: file name, lower
+/// case, without the `.exe` spelling.
+///
+/// The suffix is how Windows spells a program, not part of its identity: the
+/// same browser is `firefox` in `/proc/<pid>/exe` and `firefox.exe` in a rule
+/// canonicalised by [`canonical_exact_process_name`]. Fold it on both sides and
+/// the rule matches on either OS; append it on one side only — as the rule
+/// store does — and a Linux rule can never match, while a Windows glob that
+/// does not end in `.exe` (`*torrent`) never matches either.
+pub fn app_match_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+    let lowered = name.to_ascii_lowercase();
+    match lowered.strip_suffix(".exe") {
+        // `.exe` alone is a file name, not a suffix on one.
+        Some(stem) if !stem.is_empty() => stem.to_string(),
+        _ => lowered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +113,33 @@ mod tests {
         let (twice, changes) = canonical_exact_process_name(&once);
         assert_eq!(once, twice);
         assert_eq!(changes, ExactNameChanges::default());
+    }
+
+    #[test]
+    fn a_rule_and_a_linux_process_reduce_to_the_same_key() {
+        let rule = canonical_exact_process_name("Firefox").0; // "firefox.exe"
+        assert_eq!(app_match_key(&rule), app_match_key("/usr/bin/firefox"));
+    }
+
+    #[test]
+    fn a_rule_and_a_windows_process_reduce_to_the_same_key() {
+        let rule = canonical_exact_process_name("Firefox").0;
+        assert_eq!(
+            app_match_key(&rule),
+            app_match_key("C:PATHFirefox.exe".replace("PATH", r"\").as_str())
+        );
+    }
+
+    #[test]
+    fn a_glob_without_the_suffix_still_names_a_windows_process() {
+        let pattern = canonical_glob_process_pattern("*Torrent");
+        let observed = app_match_key("C:PATHqBittorrent.exe".replace("PATH", r"\").as_str());
+        assert_eq!(observed, "qbittorrent");
+        assert!(observed.ends_with(pattern.trim_start_matches('*')));
+    }
+
+    #[test]
+    fn a_name_that_is_only_the_suffix_keeps_it() {
+        assert_eq!(app_match_key(".exe"), ".exe");
     }
 }

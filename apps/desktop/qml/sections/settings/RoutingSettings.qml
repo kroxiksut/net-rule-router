@@ -27,6 +27,7 @@ ColumnLayout {
     // subdomains, and the widening only ever adds coverage towards the route
     // the rule already names. Read from the live per-SID policy on mount.
     property bool includeSubdomains: true
+    property bool zonePriorityOverIp: false
     // How a SHARED secondary IP (an address a routed domain
     // shares with other sites) is handled. Slug: majority-of-ip (default) |
     // majority-of-rules | any-rule-domain. Read from the live per-SID policy.
@@ -72,6 +73,7 @@ ColumnLayout {
     // Cut IPv6 while protection is on. ON by default: Free pins IPv4 only, so a
     // host with an AAAA record would otherwise keep an uncovered way out.
     property bool blockIpv6WhenProtected: true
+    property bool localNetworksAutoAccept: false
     // Enforcement mechanism: "reactive" (Mode A,
     // default — the existing reactive kill-switch) vs "resolver" (Mode B — a
     // local DNS resolver that enforces BEFORE the app connects). Global service
@@ -115,6 +117,12 @@ ColumnLayout {
     // Snapshot is the SSOT (no prefs mirror). Defaults ON: a MISSING field in a
     // reply means "on", so every read must test `!== false`, never `=== true`.
     property bool dnsFastAnswers: true
+    // Second source of suggested addresses: a host the service judges to be cut
+    // by the provider (rather than genuinely unreachable) is offered for the
+    // additional route. `isp-block-candidates-enabled` on the service-stability
+    // config — global, not per-user. Defaults ON, so a MISSING field in a reply
+    // means "on" and every read must test `!== false`.
+    property bool ispBlockCandidates: true
     // Gates the five manual-tuning toggles above (DNS through the tunnel,
     // fast DNS answers, fake-IP, its UDP relay and instant-reset) behind the
     // "Detailed mode" switch in Experimental settings. Off by default: the
@@ -258,7 +266,7 @@ ColumnLayout {
         if (!corr || corr === "") return
         root.rpc.registerRpcCallback(corr, function(ok, response, code, msg) {
             if (!ok) {
-                panel.localNetworkError = String(msg || code || "")
+                panel.localNetworkError = root.ipcErrorLabel(code)
                 return
             }
             panel.localNetworks = (response || {}).networks || []
@@ -368,7 +376,8 @@ ColumnLayout {
         "doh-lockdown-enabled", "doh-lockdown-scope", "kill-switch-strict-shared-ips",
         "auto-rules-mode", "auto-rules-eager-delivery-names",
         "primary-probe-auto", "primary-probe-timeout-ms", "primary-probe-max-targets",
-        "primary-probe-repeat-secs", "block-ipv6-when-protected"
+        "primary-probe-repeat-secs", "block-ipv6-when-protected",
+        "local-networks-auto-accept"
     ]
 
     /// Copy the subset of `cur` this panel mirrors into the display mirror.
@@ -467,6 +476,8 @@ ColumnLayout {
             (root.prefs.routeKillSwitchProtocols === undefined)
                 ? root.routePolicyDefault("kill-switch-protocols")
                 : ((root.prefs.routeKillSwitchProtocols | 0) & 0x7F))
+        panel.zonePriorityOverIp = _offlineRoutePolicyPick(parked, mirror, "zone-priority-over-ip",
+            root.routePolicyDefault("zone-priority-over-ip"))
         panel.includeSubdomains = _offlineRoutePolicyPick(parked, mirror, "include-subdomains",
             _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains))
         panel.sharedIpPolicy = _offlineRoutePolicyPick(parked, mirror, "shared-ip-policy",
@@ -519,6 +530,8 @@ ColumnLayout {
             "primary-probe-repeat-secs", root.routePolicyDefault("primary-probe-repeat-secs"))
         panel.blockIpv6WhenProtected = _offlineRoutePolicyPick(parked, mirror,
             "block-ipv6-when-protected", root.routePolicyDefault("block-ipv6-when-protected"))
+        panel.localNetworksAutoAccept = _offlineRoutePolicyPick(parked, mirror,
+            "local-networks-auto-accept", root.routePolicyDefault("local-networks-auto-accept"))
     }
 
     function _loadKillSwitchPosture() {
@@ -548,6 +561,7 @@ ColumnLayout {
             panel.ksFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
             panel.ksProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
             panel.includeSubdomains = root._routePolicyEffective(cur, "include-subdomains")
+            panel.zonePriorityOverIp = root._routePolicyEffective(cur, "zone-priority-over-ip")
             panel.sharedIpPolicy = root._routePolicyEffective(cur, "shared-ip-policy")
             panel.ksBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
             panel.killSwitchEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
@@ -570,6 +584,8 @@ ColumnLayout {
                 root._routePolicyEffective(cur, "primary-probe-repeat-secs")
             panel.blockIpv6WhenProtected =
                 root._routePolicyEffective(cur, "block-ipv6-when-protected")
+            panel.localNetworksAutoAccept =
+                root._routePolicyEffective(cur, "local-networks-auto-accept")
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back.
             panel._rememberRoutePolicy(cur)
@@ -745,6 +761,8 @@ ColumnLayout {
             "fake-ip-instant-rst", panel.fakeIpInstantRst)
         panel.dnsViaSecondary = _offlineStabilityPick(pendingSt, mirrorSt,
             "dns-via-secondary", panel.dnsViaSecondary)
+        panel.ispBlockCandidates = _offlineStabilityPick(pendingSt, mirrorSt,
+            "isp-block-candidates-enabled", panel.ispBlockCandidates)
         panel.dnsFastAnswers = _offlineStabilityPick(pendingSt, mirrorSt,
             "dns-fast-answers", panel.dnsFastAnswers)
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
@@ -787,11 +805,16 @@ ColumnLayout {
                 "dns-via-secondary", (payload && payload["dns-via-secondary"]) === true)
             panel.dnsFastAnswers = panel._livePick(payload, stillParked,
                 "dns-fast-answers", !payload || payload["dns-fast-answers"] !== false)
+            // Defaults ON, so an absent field must read as `true`.
+            panel.ispBlockCandidates = panel._livePick(payload, stillParked,
+                "isp-block-candidates-enabled",
+                !payload || payload["isp-block-candidates-enabled"] !== false)
             // A live read always wins — and refreshes the display mirror the
             // service-stopped seed reads back.
             panel._rememberStability(payload,
                 ["enforcement-mode", "fake-ip-enabled", "fake-ip-udp-relay",
-                 "fake-ip-instant-rst", "dns-via-secondary", "dns-fast-answers"])
+                 "fake-ip-instant-rst", "dns-via-secondary", "dns-fast-answers",
+                 "isp-block-candidates-enabled"])
             // The prefs copy of the mode is NOT updated from a read any more.
             // Doing so turned a service default into a user setting: a wiped
             // state DB answered "reactive", the panel wrote that into prefs,
@@ -832,9 +855,14 @@ ColumnLayout {
                 "dns-via-secondary", (payload && payload["dns-via-secondary"]) === true)
             panel.dnsFastAnswers = panel._livePick(payload, stillParked,
                 "dns-fast-answers", !payload || payload["dns-fast-answers"] !== false)
+            // Defaults ON, so an absent field must read as `true`.
+            panel.ispBlockCandidates = panel._livePick(payload, stillParked,
+                "isp-block-candidates-enabled",
+                !payload || payload["isp-block-candidates-enabled"] !== false)
             panel._rememberStability(payload,
                 ["enforcement-mode", "fake-ip-enabled", "fake-ip-udp-relay",
-                 "fake-ip-instant-rst", "dns-via-secondary", "dns-fast-answers"])
+                 "fake-ip-instant-rst", "dns-via-secondary", "dns-fast-answers",
+                 "isp-block-candidates-enabled"])
             // The administrator rule-edit lock rides the same DTO; the window
             // owns it (the Rules section reads it), this panel only draws the
             // switch, so re-sync it from every read that lands here.
@@ -1120,6 +1148,45 @@ ColumnLayout {
             // service does not hold - re-sync from the live config.
             panel._refreshEnforcementModeFromService()
         }, "user:dns-via-secondary")
+    }
+
+    // Read-modify-write the WHOLE service-stability config, mutating ONLY
+    // isp-block-candidates-enabled. Same offline-park discipline and the same
+    // echo check as the toggles above: the value the service reports back wins
+    // over the one that was asked for.
+    function _applyIspBlockCandidates(want) {
+        var v = (want === true)
+        if (typeof root._routingBackendConnected === "function"
+                && !root._routingBackendConnected()) {
+            panel.ispBlockCandidates = v
+            root._recordOfflineRoutingIntent("stability",
+                "isp-block-candidates-enabled", v)
+            return
+        }
+        root.applyServiceStabilityPatch({ "isp-block-candidates-enabled": v },
+                function(ok, code, payload) {
+            if (ok) {
+                if (payload && payload["isp-block-candidates-enabled"] !== undefined
+                        && (payload["isp-block-candidates-enabled"] === true) !== v) {
+                    panel._refreshEnforcementModeFromService()
+                    root.statusLine = root.tr("status.setting-not-applied",
+                        "The background service did not apply this change — the switch "
+                        + "was reset to what the service actually holds.")
+                    return
+                }
+                panel.ispBlockCandidates = v
+                root.statusLine = v
+                    ? root.tr("status.isp-block-candidates-on",
+                        "ISP block-page rule suggestions are on.")
+                    : root.tr("status.isp-block-candidates-off",
+                        "ISP block-page rule suggestions are off.")
+                return
+            }
+            root.statusLine = root.tr("status.isp-block-candidates-failed",
+                "Could not change the ISP block-page rule suggestions setting: ")
+                + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(code) : code)
+            panel._refreshEnforcementModeFromService()
+        }, "user:isp-block-candidates-enabled")
     }
 
     // Read-modify-write the WHOLE service-stability config, mutating ONLY
@@ -1657,6 +1724,37 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing-behavior.include-subdomains.note",
                     "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only.")
+            }
+            CheckBox {
+                id: zonePriorityCheck
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                checked: panel.zonePriorityOverIp
+                text: root.tr("settings.routing-behavior.zone-priority.label",
+                    "Let a zone rule win over an exact address rule")
+                contentItem: Label {
+                    text: zonePriorityCheck.text
+                    leftPadding: zonePriorityCheck.indicator.width + zonePriorityCheck.spacing
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onToggled: {
+                    panel.zonePriorityOverIp = checked
+                    if (typeof root.routePolicyController.applyZonePriorityOverIp === "function")
+                        root.routePolicyController.applyZonePriorityOverIp(checked)
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingSm
+                visible: root.routingDefaultRouteDetailsExpanded
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                font.pixelSize: root.uiTheme.baseFontSizePx - 1
+                text: root.tr("settings.routing-behavior.zone-priority.note",
+                    "Off by default: when a whole zone (say “.ru”) goes one way and a single address inside it goes another, the single address wins, because it is the more specific of the two. Turn this on to make the zone win instead — useful when the zone is the decision you care about and the address rule was only meant as a hint.")
             }
         }
     }
@@ -3110,6 +3208,25 @@ ColumnLayout {
                     "While leak protection is on, only these local networks stay reachable. Traffic to them never leaves this computer.")
             }
 
+            // The banner's "Stop asking" lives here too, so it can be undone
+            // from the same place the networks are listed.
+            CheckBox {
+                Layout.fillWidth: true
+                checked: panel.localNetworksAutoAccept
+                text: root.tr("settings.routing.local-networks.auto-accept",
+                    "Keep newly found local networks reachable without asking")
+                Accessible.name: text
+                onToggled: root.routePolicyController.applyLocalNetworksAutoAccept(checked)
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.tr("settings.routing.local-networks.auto-accept-hint",
+                    "A hypervisor, WSL or a second VPN adds a network of its own over time. With this on they stay reachable and no question is shown; every network is still listed below and any of them can be refused.")
+            }
+
             Repeater {
                 model: panel.localNetworks
                 delegate: RowLayout {
@@ -3283,6 +3400,27 @@ ColumnLayout {
                 color: root.mutedTextColor
                 text: root.tr("settings.routing.primary-probe.description",
                     "One short connection attempt per address, from the main connection. It answers whether the address is reachable there — not whether the site works there.")
+            }
+            // The other source of suggestions: not "what does a site I already
+            // route pull in", but "this site does not open at all".
+            CheckBox {
+                id: ispBlockCandidatesCheck
+                Layout.fillWidth: true
+                text: root.tr("settings.routing.isp-block-candidates.label",
+                    "Suggest sites your provider blocks")
+                checked: panel.ispBlockCandidates
+                onToggled: panel._applyIspBlockCandidates(checked)
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                Layout.leftMargin: root.uiTheme.spacingMd
+                wrapMode: Text.WordWrap
+                color: root.mutedTextColor
+                text: root.tr("settings.routing.isp-block-candidates.description",
+                    "When a site stops opening on the main connection and that looks like a block rather than the site being down, it is offered as a suggestion to move to the additional route. You still decide — nothing is added on its own.")
             }
             ThemedButton {
                 theme: root.uiTheme

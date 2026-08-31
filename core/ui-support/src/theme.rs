@@ -1,12 +1,26 @@
+use nrr_platform_api::system_theme::{SystemAppearance, SystemThemePort};
 use nrr_shared::ThemeMode;
 use std::env;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-use std::process::Command;
 
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// The probe this process should use, if it has one wired.
+///
+/// A UI crate cannot name an OS implementation without dragging that OS into
+/// every build, so the surfaces install theirs at startup through
+/// [`install_system_theme_port`]. Nothing installed = the question cannot be
+/// answered, which is reported as such.
+static SYSTEM_THEME_PORT: std::sync::OnceLock<Box<dyn SystemThemePort>> =
+    std::sync::OnceLock::new();
+
+/// Installs the process-wide system-theme probe. The first call wins; later
+/// ones are ignored, so a test that sets its own is not overwritten by a
+/// surface initialising afterwards.
+pub fn install_system_theme_port(port: Box<dyn SystemThemePort>) {
+    let _ = SYSTEM_THEME_PORT.set(port);
+}
+
+fn system_theme_port() -> Option<&'static dyn SystemThemePort> {
+    SYSTEM_THEME_PORT.get().map(|port| &**port)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemThemeMode {
@@ -32,7 +46,17 @@ pub struct ThemeResolution {
 }
 
 pub fn resolve_theme(selected_mode: ThemeMode) -> ThemeResolution {
-    let (system_mode, system_mode_detected) = detect_system_theme_mode();
+    resolve_theme_with(selected_mode, system_theme_port())
+}
+
+/// Same resolution against an explicit probe. The probe is OS mechanism and
+/// lives behind [`SystemThemePort`]; this crate stays neutral and only decides
+/// what the answer MEANS.
+pub fn resolve_theme_with(
+    selected_mode: ThemeMode,
+    port: Option<&dyn SystemThemePort>,
+) -> ThemeResolution {
+    let (system_mode, system_mode_detected) = detect_system_theme_mode(port);
     let effective_mode = match selected_mode {
         ThemeMode::Light => ThemeMode::Light,
         ThemeMode::Dark => ThemeMode::Dark,
@@ -51,40 +75,17 @@ pub fn resolve_theme(selected_mode: ThemeMode) -> ThemeResolution {
     }
 }
 
-fn detect_system_theme_mode() -> (SystemThemeMode, bool) {
+fn detect_system_theme_mode(port: Option<&dyn SystemThemePort>) -> (SystemThemeMode, bool) {
     if let Some(from_env) = parse_system_theme_hint(env::var("NRR_SYSTEM_THEME").ok().as_deref()) {
         return (from_env, true);
     }
-
-    #[cfg(windows)]
-    {
-        if let Ok(output) = Command::new("powershell")
-            .args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "(Get-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize' -Name AppsUseLightTheme -ErrorAction Stop).AppsUseLightTheme",
-            ])
-            // Console-subsystem child of a GUI-subsystem launcher would otherwise
-            // briefly show a PowerShell-blue console window.
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let value = String::from_utf8_lossy(&output.stdout);
-                let normalized = value.trim();
-                if normalized == "0" {
-                    return (SystemThemeMode::Dark, true);
-                }
-                if normalized == "1" {
-                    return (SystemThemeMode::Light, true);
-                }
-            }
-        }
+    match port.and_then(SystemThemePort::detect) {
+        Some(SystemAppearance::Dark) => (SystemThemeMode::Dark, true),
+        Some(SystemAppearance::Light) => (SystemThemeMode::Light, true),
+        // Fail-safe fallback, and `system_mode_detected = false` is how the
+        // caller is told it IS a fallback rather than an observation.
+        None => (SystemThemeMode::Light, false),
     }
-
-    // Fail-safe fallback for unknown platform or detection failure.
-    (SystemThemeMode::Light, false)
 }
 
 fn parse_system_theme_hint(value: Option<&str>) -> Option<SystemThemeMode> {
@@ -124,5 +125,40 @@ mod tests {
             resolved.effective_mode,
             ThemeMode::Light | ThemeMode::Dark
         ));
+    }
+
+    #[test]
+    fn an_undetectable_system_is_told_apart_from_a_light_one() {
+        use nrr_platform_api::system_theme::{
+            SystemAppearance, SystemThemePort, UnknownSystemTheme,
+        };
+
+        struct AlwaysDark;
+        impl SystemThemePort for AlwaysDark {
+            fn detect(&self) -> Option<SystemAppearance> {
+                Some(SystemAppearance::Dark)
+            }
+        }
+
+        // The env hint short-circuits the probe, so it must be absent here.
+        std::env::remove_var("NRR_SYSTEM_THEME");
+
+        let unknown = super::resolve_theme_with(ThemeMode::System, Some(&UnknownSystemTheme));
+        assert_eq!(unknown.effective_mode, ThemeMode::Light);
+        assert!(
+            !unknown.system_mode_detected,
+            "a fail-safe guess must not be reported as an observation"
+        );
+
+        let dark = super::resolve_theme_with(ThemeMode::System, Some(&AlwaysDark));
+        assert_eq!(dark.effective_mode, ThemeMode::Dark);
+        assert!(dark.system_mode_detected);
+    }
+
+    #[test]
+    fn with_no_port_installed_nothing_is_claimed() {
+        std::env::remove_var("NRR_SYSTEM_THEME");
+        let resolved = super::resolve_theme_with(ThemeMode::System, None);
+        assert!(!resolved.system_mode_detected);
     }
 }

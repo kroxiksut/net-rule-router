@@ -54,6 +54,11 @@ pub enum ConnectionStatus {
         server_version: u32,
         client_version: u32,
     },
+    /// The service answered the handshake with a refusal — the caller is not
+    /// one it serves, or it had no free connection slot. Distinct from
+    /// `Disconnected` because retrying changes nothing: the service is up and
+    /// has already given its answer, so this needs the user, not a backoff.
+    Refused { reason: String },
 }
 
 impl ConnectionStatus {
@@ -73,7 +78,10 @@ impl ConnectionStatus {
     pub fn requires_user_action(&self) -> bool {
         matches!(
             self,
-            Self::NotInstalled | Self::ServiceStopped | Self::ProtocolMismatch { .. }
+            Self::NotInstalled
+                | Self::ServiceStopped
+                | Self::ProtocolMismatch { .. }
+                | Self::Refused { .. }
         )
     }
 }

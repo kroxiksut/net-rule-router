@@ -53,6 +53,7 @@ youtu.be
 *.line.me
 *.linkedin.com
 *.mattermost.com
+*.medium.com
 *.messenger.com
 *.midjourney.com
 *.mistral.ai
@@ -105,18 +106,16 @@ youtu.be
 *.z.ai
 *.zoom.us
 
-# Torrent trackers
-*.rutracker.org
-*.rutracker.cc
+*.rutracker.org  # Torrent trackers
+*.rutracker.cc  # Torrent trackers
 
-# Developer and IT services measured as unreachable from this country
-*.coursera.org
-*.gitlab.com
-*.intel.com
-*.mongodb.com
-*.notion.so
-*.releases.hashicorp.com
-*.sentry.io
+*.coursera.org  # Developer and IT services measured as unreachable from this country
+*.gitlab.com  # Developer and IT services measured as unreachable from this country
+*.intel.com  # Developer and IT services measured as unreachable from this country
+*.mongodb.com  # Developer and IT services measured as unreachable from this country
+*.notion.so  # Developer and IT services measured as unreachable from this country
+*.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
+*.sentry.io  # Developer and IT services measured as unreachable from this country
 
 --- Windows
 Cursor.exe

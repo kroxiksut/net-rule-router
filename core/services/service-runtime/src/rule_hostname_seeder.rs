@@ -84,6 +84,17 @@ const SEED_RESOLVE_ATTEMPTS: usize = 3;
 /// First wait after a hostname fails to resolve, before it is tried again.
 const SEED_RETRY_BACKOFF_MIN: Duration = Duration::from_secs(60);
 
+/// Retry pacing while the leak guard is BLOCKING with the additional link
+/// unresolved. A rule host with no known address has no protection at all in
+/// that state — the guard can only block addresses it knows, so every second of
+/// backoff is a second the rule is unenforced and the host reachable over the
+/// main link. The pacing above is tuned for the calm case, where a name that
+/// will not resolve costs a query for nothing; here the same patience is what
+/// leaves the hole open, so the wait drops to seconds and stops escalating
+/// early. Both revert the moment the link resolves.
+const SEED_RETRY_BACKOFF_MIN_UNPROTECTED: Duration = Duration::from_secs(5);
+const SEED_RETRY_BACKOFF_MAX_UNPROTECTED: Duration = Duration::from_secs(60);
+
 /// Ceiling for the retry wait. A rule may legitimately name a host that has no
 /// address at all (a bare apex used only as a suffix, a service that is gone);
 /// re-checking such a name every few minutes costs a query and a log line for
@@ -156,6 +167,10 @@ pub struct RuleHostnameSeeder {
     /// multiplying upstream query load and racing the retry backoff. A pass
     /// that finds another one in flight returns immediately (the running pass
     /// covers the same derived hostname set; the next tick retries anyway).
+    /// Whether the leak guard is blocking with the additional link unresolved.
+    /// Drives the retry pacing (see [`SEED_RETRY_BACKOFF_MIN_UNPROTECTED`]).
+    /// `None` (default) reports "not blocking" and keeps the calm pacing.
+    leak_guard: Option<Arc<dyn crate::dns_resolver::LeakGuardPosture>>,
     pass_gate: Mutex<()>,
 }
 
@@ -172,6 +187,7 @@ impl RuleHostnameSeeder {
             fqdn_lookup,
             rules_provider,
             loopback_warned: Mutex::new(HashSet::new()),
+            leak_guard: None,
             retry_after: Mutex::new(HashMap::new()),
             apex_negatives: Mutex::new(HashMap::new()),
             previous_hostnames: Mutex::new(HashMap::new()),
@@ -179,12 +195,41 @@ impl RuleHostnameSeeder {
         }
     }
 
+    /// Read the live leak-guard posture, so retry pacing tightens exactly while
+    /// an unresolved rule host is also an unprotected one.
+    #[must_use]
+    pub fn with_leak_guard_posture(
+        mut self,
+        posture: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
+    ) -> Self {
+        self.leak_guard = Some(posture);
+        self
+    }
+
+    /// Is the guard blocking right now? A latch read; `false` when unwired.
+    fn unprotected(&self) -> bool {
+        self.leak_guard.as_ref().is_some_and(|g| g.blocking())
+    }
+
     /// `true` while `host` is inside its post-failure wait.
     fn retry_suppressed(&self, host: &str) -> bool {
         let guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
-        guard
-            .get(host)
-            .is_some_and(|(due, _)| Instant::now() < *due)
+        let Some((due, wait)) = guard.get(host) else {
+            return false;
+        };
+        // A wait scheduled while everything was calm can be minutes long, and
+        // the guard usually arms in the middle of one (the tunnel drops, or the
+        // link is not up yet at logon). Honouring it as scheduled would leave
+        // the host unprotected for the rest of that wait, so an escalated wait
+        // is re-read against the shorter ceiling rather than re-scheduled —
+        // the entry keeps its own pacing for when the guard disarms.
+        let capped = if self.unprotected() {
+            (*wait).min(SEED_RETRY_BACKOFF_MAX_UNPROTECTED)
+        } else {
+            *wait
+        };
+        let effective_due = due.checked_sub(*wait - capped).unwrap_or(*due);
+        Instant::now() < effective_due
     }
 
     /// Record a failed resolution and schedule the next attempt, doubling the
@@ -200,10 +245,18 @@ impl RuleHostnameSeeder {
     fn note_resolve_failed(&self, host: &str) -> Duration {
         let mut guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
         let now = Instant::now();
+        let (min_wait, max_wait) = if self.unprotected() {
+            (
+                SEED_RETRY_BACKOFF_MIN_UNPROTECTED,
+                SEED_RETRY_BACKOFF_MAX_UNPROTECTED,
+            )
+        } else {
+            (SEED_RETRY_BACKOFF_MIN, SEED_RETRY_BACKOFF_MAX)
+        };
         let next_wait = match guard.get(host) {
             Some((due, wait)) if now < *due => return *wait,
-            Some((_, wait)) => (*wait * 2).min(SEED_RETRY_BACKOFF_MAX),
-            None => SEED_RETRY_BACKOFF_MIN,
+            Some((_, wait)) => (*wait * 2).min(max_wait),
+            None => min_wait,
         };
         guard.insert(host.to_string(), (now + next_wait, next_wait));
         next_wait
@@ -223,6 +276,25 @@ impl RuleHostnameSeeder {
             ),
         );
         SEED_RETRY_BACKOFF_MIN
+    }
+
+    /// Schedule `host`'s retry gate as if the wait had started `elapsed` ago,
+    /// so a test can observe a long wait mid-flight without sleeping.
+    #[cfg(test)]
+    fn schedule_retry_for_test(&self, host: &str, wait: Duration, elapsed: Duration) {
+        let mut guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
+        let due = Instant::now() + (wait - elapsed);
+        guard.insert(host.to_string(), (due, wait));
+    }
+
+    /// Let `host`'s current wait fall due without changing what it escalated
+    /// to, so a test can walk the backoff without sleeping through it.
+    #[cfg(test)]
+    fn expire_retry_gate_for_test(&self, host: &str) {
+        let mut guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((due, _)) = guard.get_mut(host) {
+            *due = Instant::now();
+        }
     }
 
     /// Drop `host`'s retry gate — it resolved, so the next failure starts the
@@ -590,6 +662,7 @@ mod tests {
     use nrr_domain::{RouteBehaviorMode, RuleId};
     use nrr_platform_api::dns::{MockDnsResolver, ResolvedRecord};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use nrr_domain::decision_lookup::FreshnessThresholds;
     use nrr_storage::store::SqliteCacheStore;
@@ -1005,6 +1078,89 @@ mod tests {
         let third = s.seed_for_principal("S-A", SystemTime::now());
         assert_eq!(third.failed, 1);
         assert!(resolver.observed_queries().len() > queries_after_first);
+    }
+
+    /// While the guard blocks an unresolved link, an unresolvable rule host is
+    /// also an UNPROTECTED one: the guard can only block addresses it knows.
+    /// The calm minute of patience is what kept the hole open at logon
+    /// (HW-0830: chatgpt.com unprotected for the full 65 s backoff), so the
+    /// pacing drops to seconds and stops escalating early.
+    #[test]
+    fn the_backoff_tightens_while_the_guard_is_blocking() {
+        let resolver = Arc::new(MockDnsResolver::new());
+        let (cache, lookup) = in_memory_cache();
+        let rules = Arc::new(FakeRules::new(empty(), empty()));
+        let blocking = Arc::new(AtomicBool::new(true));
+        let s = {
+            let flag = Arc::clone(&blocking);
+            seeder(resolver, cache, lookup, rules)
+                .with_leak_guard_posture(Arc::new(move || flag.load(Ordering::Relaxed)))
+        };
+
+        assert_eq!(
+            s.note_resolve_failed("cold.example.com"),
+            SEED_RETRY_BACKOFF_MIN_UNPROTECTED,
+        );
+        // Escalation stops early too — a name that will not resolve must still
+        // be re-tried within the minute while it has no protection.
+        s.clear_resolve_failed("cold.example.com");
+        let mut wait = s.note_resolve_failed("cold.example.com");
+        for _ in 0..8 {
+            s.expire_retry_gate_for_test("cold.example.com");
+            wait = s.note_resolve_failed("cold.example.com");
+        }
+        assert_eq!(wait, SEED_RETRY_BACKOFF_MAX_UNPROTECTED);
+
+        // Calm pacing returns with the link.
+        blocking.store(false, Ordering::Relaxed);
+        s.clear_resolve_failed("calm.example.com");
+        assert_eq!(
+            s.note_resolve_failed("calm.example.com"),
+            SEED_RETRY_BACKOFF_MIN,
+        );
+    }
+
+    /// The guard usually arms in the MIDDLE of a long wait (the tunnel drops,
+    /// or the link is not up yet at logon). Honouring that wait as scheduled
+    /// would leave the host unprotected for the rest of it, so an escalated
+    /// wait is re-read against the shorter ceiling instead.
+    #[test]
+    fn an_escalated_wait_is_re_read_against_the_shorter_ceiling_once_the_guard_arms() {
+        let resolver = Arc::new(MockDnsResolver::new());
+        let (cache, lookup) = in_memory_cache();
+        let rules = Arc::new(FakeRules::new(empty(), empty()));
+        let blocking = Arc::new(AtomicBool::new(false));
+        let s = {
+            let flag = Arc::clone(&blocking);
+            seeder(resolver, cache, lookup, rules)
+                .with_leak_guard_posture(Arc::new(move || flag.load(Ordering::Relaxed)))
+        };
+
+        // A ceiling-length wait, five minutes into its run.
+        s.schedule_retry_for_test(
+            "stale.example.com",
+            SEED_RETRY_BACKOFF_MAX,
+            Duration::from_secs(300),
+        );
+        assert!(
+            s.retry_suppressed("stale.example.com"),
+            "the calm wait holds while the link is fine"
+        );
+
+        blocking.store(true, Ordering::Relaxed);
+        assert!(
+            !s.retry_suppressed("stale.example.com"),
+            "under the guard only the first minute of that wait may suppress a retry, and it is spent"
+        );
+
+        // A wait that is still inside the guarded ceiling keeps holding — the
+        // tightening is a ceiling, not a reset.
+        s.schedule_retry_for_test(
+            "fresh.example.com",
+            SEED_RETRY_BACKOFF_MAX,
+            Duration::from_secs(5),
+        );
+        assert!(s.retry_suppressed("fresh.example.com"));
     }
 
     #[test]

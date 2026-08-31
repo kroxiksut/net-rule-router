@@ -102,7 +102,7 @@ pub struct KillSwitchResolution {
 /// Base weight of the kill-switch **Permit** half. Above
 /// `BASE_PRIMARY` (`0x0020_0000`) so the egress-conditional permit
 /// outranks the plain rule permit for the same destination.
-const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
+pub(crate) const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
 /// Base weight of the kill-switch **Block** half. Above the rule bands
 /// but below the kill-switch permit, so the permit wins while the secondary
 /// adapter is up and the block wins the instant it is not.
@@ -114,7 +114,46 @@ const KILLSWITCH_BLOCK_BASE: u64 = 0x0030_0000;
 /// overflowing into the block band. The practical destination set
 /// (resolved rule IPs / FQDN-cache fan-out) is far smaller; anything
 /// beyond the cap is dropped rather than allowed to collide weights.
-pub const KILLSWITCH_MAX_DESTINATIONS: usize = 0x000F_FFFF;
+pub const KILLSWITCH_MAX_DESTINATIONS: usize = 0x000D_FFFF;
+
+// Compile-time guard: a per-destination permit (`KILLSWITCH_PERMIT_BASE + idx`)
+// must stay BELOW the fake-pool permit that is meant to outrank all of them,
+// and the whole permit band must stay inside its own 0x0010_0000 window. The
+// cap used to be 0x000F_FFFF — past 0x000E_0000 destinations a per-destination
+// permit would have tied with, then passed, the fake-pool permit. Unreachable
+// in practice, and exactly the kind of latent weight collision this file has
+// been bitten by before.
+const _: () = {
+    assert!(
+        (KILLSWITCH_MAX_DESTINATIONS as u64) < FAKEIP_POOL_PERMIT_BASE - KILLSWITCH_PERMIT_BASE
+    );
+    assert!((KILLSWITCH_MAX_DESTINATIONS as u64) < CATCHALL_EXEMPT_BASE - KILLSWITCH_PERMIT_BASE);
+    assert!((KILLSWITCH_MAX_DESTINATIONS as u64) < KILLSWITCH_PERMIT_BASE - KILLSWITCH_BLOCK_BASE);
+};
+
+/// Weight of the per-app kill-switch / fail-closed **Block** filters. Like
+/// [`CATCHALL_BLOCK_WEIGHT`], deliberately BETWEEN the secondary rule band and
+/// the primary rule band (`wfp_codegen::BASE_PRIMARY = 0x0020_0000`):
+///
+/// - a primary rule's own permit outranks it, so an address the main link's
+///   rules name keeps working for the pinned app in EVERY posture — tunnel up,
+///   down, or unresolved. This replaced the capped per-(app, address) rescue
+///   permits, which stopped at 64 addresses while the arbiter named hundreds:
+///   every main-link site past the cap died for the app the moment the tunnel
+///   dropped;
+/// - every secondary-band permit (the app's own unconditional per-process
+///   permit, the observed-IP `/32` mirrors) loses to it — the point of the pin.
+///
+/// Same accepted latency as the catch-all: a secondary rule at position ≥ 3072
+/// would climb past this weight, and positions that far down decide nothing.
+pub(crate) const APP_KILLSWITCH_BLOCK_BASE: u64 = 0x001C_0000;
+/// Cap on per-app kill-switch / fail-closed entries — keeps `+ idx` inside the
+/// `0x001C_0000..0x0020_0000` window so an app block can never climb into the
+/// primary rule band and outrank the very permits it must lose to.
+pub(crate) const APP_KILLSWITCH_MAX_APPS: usize = 0x0003_FFFF;
+const _: () = assert!(
+    APP_KILLSWITCH_BLOCK_BASE + (APP_KILLSWITCH_MAX_APPS as u64) < crate::wfp_codegen::BASE_PRIMARY
+);
 
 /// The pseudo-`role` slug stamped into kill-switch filter ids so they
 /// never collide with rule-driven filters (which use `primary` /
@@ -218,8 +257,10 @@ impl KillSwitchProtocols {
         self.tcp || self.udp || self.icmp || self.igmp || self.gre || self.esp || self.other
     }
 
-    /// Any TCP/UDP selected → emit an ALE-layer block.
-    fn wants_ale_block(self) -> bool {
+    /// Any TCP/UDP selected → emit an ALE-layer block. `pub(crate)` — the
+    /// orchestrator gates the app-covered pin exclusion on the app pair being
+    /// armable at all.
+    pub(crate) fn wants_ale_block(self) -> bool {
         self.tcp || self.udp
     }
 
@@ -280,7 +321,7 @@ const CATCHALL_EXEMPT_BASE: u64 = 0x0050_0000;
 /// every other filter (including the catch-all exemptions) and can never share
 /// a weight with them. `+ idx` (idx < `KILLSWITCH_MAX_DESTINATIONS`) stays below
 /// the next `0x0010_0000` band, so it cannot bleed into any other band.
-const APP_EXEMPT_BASE: u64 = 0x0060_0000;
+pub(crate) const APP_EXEMPT_BASE: u64 = 0x0060_0000;
 // Compile-time guard: the primary-app exempt band must sit above the catch-all
 // exemption band so a user's primary-routed app permit outranks everything —
 // blocks AND the other exemptions.
@@ -501,17 +542,19 @@ fn block_off_secondary(sid: &str, ip: Ipv4Addr, idx: u64) -> WfpFilterSpec {
 /// Per-**app** leak-proof kill-switch. A secondary-routed application rule
 /// installs an unconditional per-process Permit (wfp_codegen slot 0, no
 /// interface condition) that routes ALL the app's traffic via the secondary.
-/// Its *observed* destination `/32`s already get per-destination kill-switch
-/// pairs, but the app's UN-observed destinations would still egress the primary
-/// NIC if the secondary adapter dropped. This pins each protected app to the secondary LUID
-/// with the same egress-conditional Permit/Block pair the per-destination
-/// kill-switch uses — keyed on the app id (`ALE_APP_ID`) instead of a remote IP.
+/// This pins each protected app to the secondary LUID with the same
+/// egress-conditional Permit/Block pair the per-destination kill-switch uses —
+/// keyed on the app id (`ALE_APP_ID`) instead of a remote IP. The pair is the
+/// app's WHOLE guard: its observed destinations deliberately get no
+/// per-destination pairs of their own (~12 standing filters per address turned
+/// hours of P2P peer churn into a thousands-strong BFE-resident set).
 ///
 /// ALE connect layer only: `ALE_APP_ID` is not exposed at the packet layer, so
-/// ICMP from a specific process cannot be egress-gated per-app (the app's
-/// observed-destination `/32`s carry their own packet-layer pairs). Fails OPEN
-/// on a zero LUID, exactly like [`kill_switch_filters`]. Emits nothing unless a
-/// TCP/UDP protocol is selected (the ALE pair is protocol-agnostic).
+/// ICMP from a specific process cannot be egress-gated per-app — an accepted
+/// gap: the app's own protocols are TCP/UDP, and another process's ICMP to an
+/// observed address is not this rule's traffic. Fails OPEN on a zero LUID,
+/// exactly like [`kill_switch_filters`]. Emits nothing unless a TCP/UDP
+/// protocol is selected (the ALE pair is protocol-agnostic).
 pub fn app_kill_switch_filters(
     sid: &str,
     app_patterns: &[String],
@@ -524,11 +567,15 @@ pub fn app_kill_switch_filters(
     let mut filters = Vec::new();
     for (idx, pattern) in app_patterns
         .iter()
-        .take(KILLSWITCH_MAX_DESTINATIONS)
+        .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
     {
         let idx = idx as u64;
         filters.push(permit_app_via_secondary(sid, pattern, secondary_luid, idx));
+        // An address a MAIN-LINK rule names is not this app's to cut: the block
+        // sits BELOW the primary rule band, so the primary rules' own permits
+        // outrank it for every address they name — uncapped, unlike the old
+        // per-(app, address) rescue permits this ordering replaced.
         filters.push(block_app_off_secondary(sid, pattern, idx));
     }
     filters
@@ -568,15 +615,27 @@ fn permit_app_via_secondary(
 
 /// Per-app `Block` half: drop `pattern`'s process whenever its egress-
 /// conditional permit does not match (secondary adapter down / off-tunnel fallback). Above
-/// the per-process Permit's secondary band, below the app permit.
+/// the per-process Permit's secondary band, below the primary rule band and the
+/// app permit — see [`APP_KILLSWITCH_BLOCK_BASE`].
+///
+/// The id folds a band tag for the same reason the permit folds its LUID: a
+/// WFP filter is immutable by key and the add-only install swallows a
+/// duplicate id, so a weight change under the OLD id would leave the stale
+/// higher-weight block alive across an upgrade.
 fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
         remote_ip: None,
         remote_port: None,
-        weight: KILLSWITCH_BLOCK_BASE + idx,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-app-block", pattern),
+        weight: APP_KILLSWITCH_BLOCK_BASE + idx,
+        id: filter_id_for(
+            sid,
+            KILLSWITCH_ROLE,
+            "sub-main-band",
+            "ks-app-block",
+            pattern,
+        ),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,
@@ -674,6 +733,114 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
 
 // ── Catch-all kill-switch (mode B) ──────────────────────────────────────────
 
+/// The exemptions that must accompany the Strict-mode default block when the
+/// leak-guard is OFF.
+///
+/// The default block is part of the MODE (everything not named by a rule is
+/// dropped), not part of the guard, so it is emitted whenever the mode is
+/// Strict. Its exemptions, though, were emitted only inside the guard's own
+/// branch: turning the kill-switch off left a bare block-all scoped to the SID
+/// with no loopback, no LAN, no DHCP and no way to reach the VPN server - the
+/// user asked to stop protecting against leaks and got their machine cut off
+/// instead.
+#[must_use]
+pub fn default_block_exemptions(
+    sid: &str,
+    exemptions: &FailClosedExemptions,
+) -> Vec<WfpFilterSpec> {
+    let mut weight = CATCHALL_EXEMPT_BASE;
+    let mut out = base_ale_exemptions(sid, &exemptions.bootstrap_server_ips, &mut weight);
+    for (net, prefix) in &exemptions.local_subnets {
+        out.push(exempt_subnet(sid, *net, *prefix, weight));
+        weight += 1;
+    }
+    out
+}
+
+/// The exemptions BOTH block-everything postures carry, in one place.
+///
+/// The catch-all (tunnel up, everything off-tunnel dropped) and the fail-closed
+/// block-all (tunnel gone) are different postures with the same floor: cut
+/// these and the machine loses local IPC, DHCP, name resolution on the LAN and
+/// the tunnel's own handshake. They were written out twice, and a fix to one
+/// list was a fix to one posture.
+///
+/// `weight` is advanced past what was emitted, so a caller can continue its own
+/// numbering after the shared block.
+fn base_ale_exemptions(
+    sid: &str,
+    bootstrap_server_ips: &[Ipv4Addr],
+    weight: &mut u64,
+) -> Vec<WfpFilterSpec> {
+    let mut out = Vec::new();
+    // Loopback (local IPC, the GUI-service pipe, DNS stub resolvers).
+    out.push(exempt_subnet(sid, Ipv4Addr::new(127, 0, 0, 0), 8, *weight));
+    *weight += 1;
+    // Link-local / APIPA.
+    out.push(exempt_subnet(
+        sid,
+        Ipv4Addr::new(169, 254, 0, 0),
+        16,
+        *weight,
+    ));
+    *weight += 1;
+    // Limited broadcast (DHCP discover/request).
+    out.push(exempt_host(sid, Ipv4Addr::BROADCAST, *weight));
+    *weight += 1;
+    // The local network control block (mDNS/LLMNR/IGMP).
+    out.push(exempt_subnet(sid, V4_LOCAL_NETWORK_CONTROL, 24, *weight));
+    *weight += 1;
+    // Known VPN server(s), so the tunnel can (re)establish.
+    for ip in bootstrap_server_ips {
+        out.push(exempt_host(sid, *ip, *weight));
+        *weight += 1;
+    }
+    out
+}
+
+/// Packet-layer twin of [`base_ale_exemptions`]. The named-protocol blocks live
+/// at `OUTBOUND_TRANSPORT_V4`, which has no `IP_PROTOCOL` condition at the
+/// packet layer, so that layer needs its own copy of the same floor.
+fn base_packet_exemptions(
+    sid: &str,
+    layer: WfpLayerKey,
+    bootstrap_server_ips: &[Ipv4Addr],
+    weight: &mut u64,
+) -> Vec<WfpFilterSpec> {
+    let mut out = Vec::new();
+    out.push(packet_exempt_subnet(
+        sid,
+        layer,
+        Ipv4Addr::new(127, 0, 0, 0),
+        8,
+        *weight,
+    ));
+    *weight += 1;
+    out.push(packet_exempt_subnet(
+        sid,
+        layer,
+        Ipv4Addr::new(169, 254, 0, 0),
+        16,
+        *weight,
+    ));
+    *weight += 1;
+    out.push(packet_exempt_host(sid, layer, Ipv4Addr::BROADCAST, *weight));
+    *weight += 1;
+    out.push(packet_exempt_subnet(
+        sid,
+        layer,
+        V4_LOCAL_NETWORK_CONTROL,
+        24,
+        *weight,
+    ));
+    *weight += 1;
+    for ip in bootstrap_server_ips {
+        out.push(packet_exempt_host(sid, layer, *ip, *weight));
+        *weight += 1;
+    }
+    out
+}
+
 /// Build the **catch-all** kill-switch filter set for mode B
 /// (everything-via-secondary). When the secondary adapter is up, all traffic egresses the
 /// tunnel and is permitted; when it drops, the catch-all block drops
@@ -703,6 +870,7 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
 pub fn catch_all_kill_switch_filters(
     sid: &str,
     resolution: &KillSwitchResolution,
+    exemptions: &FailClosedExemptions,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
     if resolution.secondary_luid == 0
@@ -718,36 +886,41 @@ pub fn catch_all_kill_switch_filters(
     // #1 — permit everything that egresses via the secondary adapter.
     filters.push(exempt_egress(sid, resolution.secondary_luid, weight));
     weight += 1;
-    // #2 — loopback (local IPC, the GUI↔service pipe, DNS stub resolvers).
-    filters.push(exempt_subnet(sid, Ipv4Addr::new(127, 0, 0, 0), 8, weight));
-    weight += 1;
-    // #3 — link-local / APIPA.
-    filters.push(exempt_subnet(
+    // The floor both postures share.
+    filters.extend(base_ale_exemptions(
         sid,
-        Ipv4Addr::new(169, 254, 0, 0),
-        16,
-        weight,
+        &resolution.bootstrap_server_ips,
+        &mut weight,
     ));
-    weight += 1;
-    // #6 — limited broadcast (DHCP discover/request).
-    filters.push(exempt_host(sid, Ipv4Addr::BROADCAST, weight));
-    weight += 1;
-    // #7 — the local network control block (mDNS/LLMNR/IGMP).
-    filters.push(exempt_subnet(sid, V4_LOCAL_NETWORK_CONTROL, 24, weight));
-    weight += 1;
-    // #4 — the VPN server(s), so the tunnel can (re)establish.
-    for ip in &resolution.bootstrap_server_ips {
-        filters.push(exempt_host(sid, *ip, weight));
-        weight += 1;
-    }
     // #5 — the primary interface's connected subnets (LAN, DHCP unicast,
     // local router/DNS).
     for (net, prefix) in &resolution.local_subnets {
         filters.push(exempt_subnet(sid, *net, *prefix, weight));
         weight += 1;
     }
+    // Hosts known to be reached directly - in these modes those are the
+    // main-link carve-outs. The fail-closed twin has always spared them; the
+    // catch-all cut them, so a destination the user positively routed over the
+    // main link died the moment the tunnel came UP.
+    for ip in exemptions
+        .known_direct_ips
+        .iter()
+        .copied()
+        .filter(|ip| !is_exempt_from_blocking(*ip))
+        .take(KILLSWITCH_MAX_DESTINATIONS)
+    {
+        filters.push(exempt_direct_host(sid, ip, weight));
+        weight += 1;
+    }
     // The catch-all block — everything else this user sends off-tunnel.
-    filters.push(catch_all_block(sid));
+    // Gated on the protocol mask exactly like its fail-closed twin: with both
+    // TCP and UDP unticked this block used to install anyway and cut them,
+    // so the checkboxes did nothing in mode B. Narrowed to the single selected
+    // protocol when only one is ticked — the ALE layer carries a protocol
+    // condition (the packet layers do not).
+    if protocols.wants_ale_block() {
+        filters.push(catch_all_block(sid, protocols.ale_protocol()));
+    }
 
     // ── Transport layer (ICMP/IGMP/GRE/ESP — incl. ping) ──
     // The ALE catch-all above only sees TCP/UDP
@@ -773,38 +946,37 @@ pub fn catch_all_kill_switch_filters(
             pw,
         ));
         pw += 1;
-        filters.push(packet_exempt_subnet(
+        filters.extend(base_packet_exemptions(
             sid,
             TR,
-            Ipv4Addr::new(127, 0, 0, 0),
-            8,
-            pw,
+            &resolution.bootstrap_server_ips,
+            &mut pw,
         ));
-        pw += 1;
-        filters.push(packet_exempt_subnet(
-            sid,
-            TR,
-            Ipv4Addr::new(169, 254, 0, 0),
-            16,
-            pw,
-        ));
-        pw += 1;
-        filters.push(packet_exempt_host(sid, TR, Ipv4Addr::BROADCAST, pw));
-        pw += 1;
-        filters.push(packet_exempt_subnet(
-            sid,
-            TR,
-            V4_LOCAL_NETWORK_CONTROL,
-            24,
-            pw,
-        ));
-        pw += 1;
-        for ip in &resolution.bootstrap_server_ips {
-            filters.push(packet_exempt_host(sid, TR, *ip, pw));
-            pw += 1;
-        }
         for (net, prefix) in &resolution.local_subnets {
             filters.push(packet_exempt_subnet(sid, TR, *net, *prefix, pw));
+            pw += 1;
+        }
+        // Ping/ICMP to a host the main link's own rules name. TCP/UDP already
+        // escapes at the ALE layer via the rule permit; without this the packet
+        // layer cut ping to a destination the user explicitly carved out.
+        for ip in exemptions
+            .primary_dest_ips
+            .iter()
+            .copied()
+            .filter(|ip| !is_exempt_from_blocking(*ip))
+            .take(KILLSWITCH_MAX_DESTINATIONS)
+        {
+            filters.push(packet_permit_primary_host(sid, TR, ip, pw));
+            pw += 1;
+        }
+        for ip in exemptions
+            .known_direct_ips
+            .iter()
+            .copied()
+            .filter(|ip| !is_exempt_from_blocking(*ip))
+            .take(KILLSWITCH_MAX_DESTINATIONS)
+        {
+            filters.push(packet_permit_direct_host(sid, TR, ip, pw));
             pw += 1;
         }
         filters.extend(packet_protocol_blocks(sid, None, protocols, 0));
@@ -815,7 +987,7 @@ pub fn catch_all_kill_switch_filters(
     // link-local and link-local multicast), independent of the V4 protocol
     // mask above. Selective per-IP
     // V6 needs AAAA, which is not done; the catch-all closes the IPv6 leak.
-    filters.extend(catch_all_v6_filters(sid));
+    filters.extend(catch_all_v6_filters(sid, exemptions.secondary_luid));
 
     filters
 }
@@ -1057,20 +1229,27 @@ fn exempt_dns_over_primary(sid: &str, base_weight: u64) -> Vec<WfpFilterSpec> {
 
 /// The catch-all block: drop every off-tunnel flow this user makes that no
 /// higher-weight exemption or primary-rule permit covered.
-fn catch_all_block(sid: &str) -> WfpFilterSpec {
+fn catch_all_block(sid: &str, ip_protocol: Option<u8>) -> WfpFilterSpec {
+    let proto_seg = match ip_protocol {
+        Some(p) => format!("proto-{p}"),
+        None => String::new(),
+    };
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
         remote_ip: None,
         remote_port: None,
         weight: CATCHALL_BLOCK_WEIGHT,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-block", "block-all"),
+        // The protocol is part of the id: a filter is immutable by key, and the
+        // key is a pure function of the id, so a mask change must produce a
+        // DIFFERENT filter rather than silently leave the old one installed.
+        id: filter_id_for(sid, KILLSWITCH_ROLE, &proto_seg, "ks-ca-block", "block-all"),
         user_sid: Some(sid.to_string()),
         app_pattern: None,
         local_interface_luid: None,
         remote_subnet: None,
         remote_subnet_v6: None,
-        ip_protocol: None,
+        ip_protocol,
     }
 }
 
@@ -1113,8 +1292,22 @@ const V6_LINK_LOCAL_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0
 /// exposes `ALE_USER_ID`); packet-layer filters carry `user_sid = None` (no ALE
 /// id there — the same caveat as the V4 packet layer). Distinct id seeds per
 /// (layer, target) so every filter gets a unique UUID.
-pub fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
-    vec![
+pub fn catch_all_v6_filters(sid: &str, secondary_luid: u64) -> Vec<WfpFilterSpec> {
+    let mut out = Vec::new();
+    // Anything leaving through the tunnel survives the cut. Without this the v6
+    // block-all was absolute, and a tunnel whose endpoint is a v6 address could
+    // not reconnect from any user - the deadlock the v4 half is careful to
+    // avoid via the server exemption. `0` means the tunnel is unresolved and
+    // there is no egress to permit.
+    if secondary_luid != 0 {
+        for layer in [
+            WfpLayerKey::AleAuthConnectV6,
+            WfpLayerKey::OutboundIpPacketV6,
+        ] {
+            out.push(egress_permit_v6(sid, layer, secondary_luid));
+        }
+    }
+    out.extend([
         // ── V6 ALE connect layer (TCP/UDP over IPv6) ──
         exempt_subnet_v6(
             sid,
@@ -1161,7 +1354,44 @@ pub fn catch_all_v6_filters(sid: &str) -> Vec<WfpFilterSpec> {
             PACKET_EXEMPT_BASE + 2,
         ),
         block_all_v6(sid, WfpLayerKey::OutboundIpPacketV6),
-    ]
+    ]);
+    out
+}
+
+/// Permit for traffic egressing the tunnel, on a v6 layer.
+fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFilterSpec {
+    let is_packet = matches!(layer, WfpLayerKey::OutboundIpPacketV6);
+    WfpFilterSpec {
+        layer,
+        action: WfpAction::Permit,
+        remote_ip: None,
+        remote_port: None,
+        // Above the exemption band so it outranks every block on this layer.
+        weight: CATCHALL_EXEMPT_BASE + 100,
+        id: filter_id_for(
+            sid,
+            KILLSWITCH_ROLE,
+            &permit_luid_seg(secondary_luid),
+            if is_packet {
+                "ks-ca-egress-v6-pkt"
+            } else {
+                "ks-ca-egress-v6-ale"
+            },
+            "secondary",
+        ),
+        // The packet layer carries no ALE_USER_ID condition, so a v6 permit
+        // there is machine-wide - as is the block it outranks.
+        user_sid: if is_packet {
+            None
+        } else {
+            Some(sid.to_string())
+        },
+        app_pattern: None,
+        local_interface_luid: Some(secondary_luid),
+        remote_subnet: None,
+        remote_subnet_v6: None,
+        ip_protocol: None,
+    }
 }
 
 /// IPv6 exemption permit for a remote subnet (loopback / link-local) at the
@@ -1280,6 +1510,11 @@ pub struct FailClosedExemptions {
     /// (habr.com, HW-0721) dies with the tunnel it never used. The caller has
     /// already subtracted anything secondary-destined.
     pub known_direct_ips: Vec<Ipv4Addr>,
+    /// LUID of the tunnel, so traffic leaving THROUGH it survives a cut. `0`
+    /// when the tunnel is unresolved and there is no egress to permit. Carried
+    /// here rather than passed alongside because it answers the same question
+    /// as every other field: what may still leave.
+    pub secondary_luid: u64,
     /// The secondary tunnel next-hop(s) the liveness probe pings. The probe's
     /// verdict is what DISARMS this very block-all, and its ICMP echo is
     /// kernel-originated — it carries no app-id, so no process exemption can
@@ -1346,14 +1581,17 @@ pub fn fail_closed_block_apps(
     }
     app_patterns
         .iter()
-        .take(KILLSWITCH_MAX_DESTINATIONS)
+        .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
-        .map(|(idx, pattern)| ale_block_app(sid, pattern, KILLSWITCH_BLOCK_BASE + idx as u64))
+        .map(|(idx, pattern)| ale_block_app(sid, pattern, APP_KILLSWITCH_BLOCK_BASE + idx as u64))
         .collect()
 }
 
 /// ALE-layer block keyed on an app id (mirrors [`ale_block`] for the per-app
-/// fail-closed path). Protocol-agnostic (covers TCP+UDP).
+/// fail-closed path). Protocol-agnostic (covers TCP+UDP). Sits below the
+/// primary rule band ([`APP_KILLSWITCH_BLOCK_BASE`]) so main-named addresses
+/// keep working for the app even with the tunnel unresolved; the id folds the
+/// band tag for the same upgrade reason as [`block_app_off_secondary`].
 fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
@@ -1361,7 +1599,13 @@ fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
         remote_ip: None,
         remote_port: None,
         weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-app-fc-block", pattern),
+        id: filter_id_for(
+            sid,
+            KILLSWITCH_ROLE,
+            "sub-main-band",
+            "ks-app-fc-block",
+            pattern,
+        ),
         user_sid: Some(sid.to_string()),
         app_pattern: Some(pattern.to_string()),
         local_interface_luid: None,
@@ -1396,28 +1640,11 @@ pub fn fail_closed_block_all_filters(
     let mut weight = CATCHALL_EXEMPT_BASE;
 
     // ── ALE connect layer exemptions (TCP/UDP) ──
-    // Loopback (local IPC, the GUI↔service pipe, DNS stub resolvers).
-    filters.push(exempt_subnet(sid, Ipv4Addr::new(127, 0, 0, 0), 8, weight));
-    weight += 1;
-    // Link-local / APIPA.
-    filters.push(exempt_subnet(
+    filters.extend(base_ale_exemptions(
         sid,
-        Ipv4Addr::new(169, 254, 0, 0),
-        16,
-        weight,
+        &exemptions.bootstrap_server_ips,
+        &mut weight,
     ));
-    weight += 1;
-    // Limited broadcast (DHCP discover/request).
-    filters.push(exempt_host(sid, Ipv4Addr::BROADCAST, weight));
-    weight += 1;
-    // The local network control block (mDNS/LLMNR/IGMP).
-    filters.push(exempt_subnet(sid, V4_LOCAL_NETWORK_CONTROL, 24, weight));
-    weight += 1;
-    // Known VPN server(s), so the tunnel can (re)establish.
-    for ip in &exemptions.bootstrap_server_ips {
-        filters.push(exempt_host(sid, *ip, weight));
-        weight += 1;
-    }
     // Liveness-probe target(s): the tunnel next-hop the probe must keep
     // reaching, or its DEAD verdict can never flip back and this block-all
     // never disarms (see `FailClosedExemptions::probe_target_ips`).
@@ -1468,36 +1695,12 @@ pub fn fail_closed_block_all_filters(
     if protocols.wants_packet_layer() {
         const TR: WfpLayerKey = WfpLayerKey::OutboundTransportV4;
         let mut pw = PACKET_EXEMPT_BASE;
-        filters.push(packet_exempt_subnet(
+        filters.extend(base_packet_exemptions(
             sid,
             TR,
-            Ipv4Addr::new(127, 0, 0, 0),
-            8,
-            pw,
+            &exemptions.bootstrap_server_ips,
+            &mut pw,
         ));
-        pw += 1;
-        filters.push(packet_exempt_subnet(
-            sid,
-            TR,
-            Ipv4Addr::new(169, 254, 0, 0),
-            16,
-            pw,
-        ));
-        pw += 1;
-        filters.push(packet_exempt_host(sid, TR, Ipv4Addr::BROADCAST, pw));
-        pw += 1;
-        filters.push(packet_exempt_subnet(
-            sid,
-            TR,
-            V4_LOCAL_NETWORK_CONTROL,
-            24,
-            pw,
-        ));
-        pw += 1;
-        for ip in &exemptions.bootstrap_server_ips {
-            filters.push(packet_exempt_host(sid, TR, *ip, pw));
-            pw += 1;
-        }
         // Packet-layer twin of the probe-target ALE exempt above — this is the
         // layer whose named ICMP block would otherwise eat the probe's echo.
         for ip in &exemptions.probe_target_ips {
@@ -1546,7 +1749,7 @@ pub fn fail_closed_block_all_filters(
     // The secondary is gone, so cut ALL outbound IPv6 too (except loopback,
     // link-local and link-local multicast), independent of the V4 protocol
     // mask above.
-    filters.extend(catch_all_v6_filters(sid));
+    filters.extend(catch_all_v6_filters(sid, exemptions.secondary_luid));
 
     filters
 }
@@ -1888,6 +2091,71 @@ fn packet_egress_pairs(
 
 #[cfg(test)]
 mod tests {
+
+    /// A tunnel whose endpoint is a v6 address has to be able to reconnect
+    /// through the very cut that protects it. The v4 half does this with the
+    /// server exemption; the v6 half had nothing at all, so the block was
+    /// absolute and the client could not come back from any user.
+    #[test]
+    fn the_v6_cut_still_lets_the_tunnel_itself_out() {
+        const LUID: u64 = 0x1234_5678;
+        let out = catch_all_v6_filters("S", LUID);
+        for layer in [
+            WfpLayerKey::AleAuthConnectV6,
+            WfpLayerKey::OutboundIpPacketV6,
+        ] {
+            assert!(
+                out.iter().any(|f| f.layer == layer
+                    && f.action == WfpAction::Permit
+                    && f.local_interface_luid == Some(LUID)),
+                "{layer:?}: no egress permit through the tunnel",
+            );
+        }
+        // An unresolved tunnel has no egress to permit - and must not turn the
+        // cut into a permit-everything by accident.
+        let unresolved = catch_all_v6_filters("S", 0);
+        assert!(unresolved.iter().all(|f| f.local_interface_luid.is_none()));
+        assert!(unresolved.iter().any(|f| f.action == WfpAction::Block));
+    }
+
+    /// The two block-everything postures must spare the same things. The
+    /// catch-all (tunnel UP, everything off-tunnel dropped) used to carry a
+    /// smaller exemption set than the fail-closed block-all (tunnel gone), so a
+    /// host the user carved out onto the main link answered while the tunnel
+    /// was DOWN and stopped answering when it came up.
+    #[test]
+    fn the_catch_all_spares_what_its_twin_spares() {
+        let direct = Ipv4Addr::new(203, 0, 113, 40);
+        let primary = Ipv4Addr::new(198, 51, 100, 50);
+        let exemptions = FailClosedExemptions {
+            bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+            local_subnets: Vec::new(),
+            primary_dest_ips: vec![primary],
+            allow_dns_over_primary: false,
+            known_direct_ips: vec![direct],
+            probe_target_ips: Vec::new(),
+            secondary_luid: 0,
+        };
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &exemptions,
+            KillSwitchProtocols::ALL,
+        );
+
+        assert!(
+            out.iter().any(|f| f.remote_ip == Some(direct)
+                && f.action == WfpAction::Permit
+                && f.layer == WfpLayerKey::AleAuthConnectV4),
+            "a known-direct host must keep its connect-layer permit",
+        );
+        assert!(
+            out.iter().any(|f| f.remote_ip == Some(primary)
+                && f.action == WfpAction::Permit
+                && f.layer == WfpLayerKey::OutboundTransportV4),
+            "ping to a main-link host must survive the packet-layer block",
+        );
+    }
     use super::*;
 
     /// Weight of the top rule band in [`crate::wfp_codegen`]
@@ -2088,6 +2356,35 @@ mod tests {
 
     // ── Per-app kill-switch ────────────────────────────────────
 
+    /// The 23.08 shape: one app routed over the tunnel, the tunnel drops, and
+    /// the per-process block (which carries no destination condition) takes
+    /// down sites the user had explicitly put on the MAIN link. The guard is
+    /// the block's BAND: below the primary rule band, so every primary rule's
+    /// own permit outranks it — uncapped, unlike the 64-entry rescue permits
+    /// this ordering replaced (a live session named 521 addresses, rescued 64).
+    #[test]
+    fn an_app_block_loses_to_every_primary_rule_permit() {
+        let out = app_kill_switch_filters(
+            "S",
+            &["claude.exe".to_string()],
+            LUID,
+            KillSwitchProtocols::ALL,
+        );
+        let block = out
+            .iter()
+            .find(|f| f.action == WfpAction::Block)
+            .expect("the app block exists");
+        assert!(
+            block.weight < RULE_PRIMARY_BAND,
+            "the app block must lose to primary rule permits ({:#x})",
+            block.weight
+        );
+        // The fail-closed twin makes the same promise while the link is
+        // unresolved.
+        let fc = fail_closed_block_apps("S", &["claude.exe".to_string()], KillSwitchProtocols::ALL);
+        assert!(fc.iter().all(|f| f.weight < RULE_PRIMARY_BAND));
+    }
+
     #[test]
     fn app_kill_switch_emits_ale_pair_pinned_to_app_and_luid() {
         let out = app_kill_switch_filters(
@@ -2120,8 +2417,8 @@ mod tests {
         );
         assert!(permit.weight > block.weight, "permit must outrank block");
         assert!(
-            block.weight > RULE_PRIMARY_BAND,
-            "app block must outrank the rule bands (and the per-process Permit)"
+            block.weight >= APP_KILLSWITCH_BLOCK_BASE && block.weight < RULE_PRIMARY_BAND,
+            "app block must outrank the secondary band (the per-process Permit) but lose to primary rule permits"
         );
     }
 
@@ -2402,6 +2699,7 @@ mod tests {
             allow_dns_over_primary: true,
             known_direct_ips: vec![ip(178, 248, 237, 68)],
             probe_target_ips: vec![ip(10, 91, 192, 1)],
+            secondary_luid: 0,
         };
         let mut all = Vec::new();
         all.extend(kill_switch_filters(
@@ -2419,6 +2717,7 @@ mod tests {
         all.extend(catch_all_kill_switch_filters(
             sid,
             &full_resolution(),
+            &FailClosedExemptions::default(),
             KillSwitchProtocols::ALL,
         ));
         all.extend(fail_closed_block_destinations(
@@ -2445,7 +2744,13 @@ mod tests {
     fn catch_all_disabled_on_zero_luid() {
         let mut r = full_resolution();
         r.secondary_luid = 0;
-        assert!(catch_all_kill_switch_filters("S", &r, KillSwitchProtocols::ALL).is_empty());
+        assert!(catch_all_kill_switch_filters(
+            "S",
+            &r,
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL
+        )
+        .is_empty());
     }
 
     #[test]
@@ -2453,7 +2758,13 @@ mod tests {
         let mut r = full_resolution();
         r.bootstrap_server_ips.clear();
         assert!(
-            catch_all_kill_switch_filters("S", &r, KillSwitchProtocols::ALL).is_empty(),
+            catch_all_kill_switch_filters(
+                "S",
+                &r,
+                &FailClosedExemptions::default(),
+                KillSwitchProtocols::ALL
+            )
+            .is_empty(),
             "no server exemption → don't arm (avoid trapping the tunnel's reconnect)"
         );
     }
@@ -2462,14 +2773,25 @@ mod tests {
     fn catch_all_disabled_when_no_protocol_selected() {
         let empty = KillSwitchProtocols::from_bits(0);
         assert!(
-            catch_all_kill_switch_filters("S", &full_resolution(), empty).is_empty(),
+            catch_all_kill_switch_filters(
+                "S",
+                &full_resolution(),
+                &FailClosedExemptions::default(),
+                empty
+            )
+            .is_empty(),
             "an empty protocol mask arms no block"
         );
     }
 
     #[test]
     fn catch_all_emits_exemptions_and_block() {
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         // ALE layer: egress + loopback + link-local + broadcast +
         //   local-network-control + 1 server + 1 subnet + block = 8.
         let ale: Vec<_> = out
@@ -2538,7 +2860,12 @@ mod tests {
 
     #[test]
     fn catch_all_covers_icmp_at_packet_layer() {
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         // A packet-layer block with no destination scope drops ICMP/ping the
         // instant the secondary adapter drops; a packet-layer egress permit keeps it flowing
         // while the tunnel is up. This is the 0704 P2 fix for the mode-B ping
@@ -2564,7 +2891,12 @@ mod tests {
     #[test]
     fn catch_all_no_packet_layer_when_only_tcp_udp_selected() {
         let tcp_udp = KillSwitchProtocols::from_bits(0x03); // tcp + udp only
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), tcp_udp);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            tcp_udp,
+        );
         assert!(
             out.iter()
                 .all(|f| f.layer != WfpLayerKey::OutboundTransportV4),
@@ -2574,8 +2906,70 @@ mod tests {
     }
 
     #[test]
+    fn the_catch_all_respects_the_protocol_mask_like_its_fail_closed_twin() {
+        // With TCP and UDP both unticked the mode-B catch-all installed its ALE
+        // block anyway: the checkboxes did nothing, while the same choice in the
+        // fail-closed path was honoured.
+        let resolution = full_resolution();
+        let exemptions = FailClosedExemptions::default();
+        let icmp_only = KillSwitchProtocols {
+            tcp: false,
+            udp: false,
+            icmp: true,
+            igmp: false,
+            gre: false,
+            esp: false,
+            other: false,
+        };
+        let out = catch_all_kill_switch_filters("S-1-5-21-A", &resolution, &exemptions, icmp_only);
+        assert!(
+            !out.iter().any(|f| f.layer == WfpLayerKey::AleAuthConnectV4
+                && f.action == WfpAction::Block
+                && f.remote_ip.is_none()
+                && f.remote_subnet.is_none()),
+            "no ALE block-all may install when neither TCP nor UDP is selected"
+        );
+        assert!(
+            out.iter().any(
+                |f| f.layer == WfpLayerKey::OutboundTransportV4 && f.action == WfpAction::Block
+            ),
+            "the packet-layer protocols the user DID select still block"
+        );
+
+        let tcp_only = KillSwitchProtocols {
+            tcp: true,
+            udp: false,
+            icmp: false,
+            igmp: false,
+            gre: false,
+            esp: false,
+            other: false,
+        };
+        let out = catch_all_kill_switch_filters("S-1-5-21-A", &resolution, &exemptions, tcp_only);
+        let block_all = out
+            .iter()
+            .find(|f| {
+                f.layer == WfpLayerKey::AleAuthConnectV4
+                    && f.action == WfpAction::Block
+                    && f.remote_ip.is_none()
+                    && f.remote_subnet.is_none()
+            })
+            .expect("TCP selected → an ALE block-all");
+        assert_eq!(
+            block_all.ip_protocol,
+            Some(PROTO_TCP),
+            "one protocol selected narrows the block; the ALE layer carries that condition"
+        );
+    }
+
+    #[test]
     fn catch_all_block_weight_sits_between_secondary_and_primary_bands() {
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         let ale: Vec<_> = out
             .iter()
             .filter(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
@@ -2597,7 +2991,12 @@ mod tests {
 
     #[test]
     fn catch_all_block_is_unconditional_on_destination() {
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         let block = out
             .iter()
             .find(|f| f.action == WfpAction::Block && f.layer == WfpLayerKey::AleAuthConnectV4)
@@ -2617,6 +3016,7 @@ mod tests {
         let out = catch_all_kill_switch_filters(
             "S-1-5-21-Z",
             &full_resolution(),
+            &FailClosedExemptions::default(),
             KillSwitchProtocols::ALL,
         );
         for f in &out {
@@ -2635,8 +3035,18 @@ mod tests {
 
     #[test]
     fn catch_all_ids_deterministic_and_distinct() {
-        let a = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
-        let b = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let a = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
+        let b = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         let ids_a: Vec<u64> = a.iter().map(|f| f.id.raw).collect();
         let ids_b: Vec<u64> = b.iter().map(|f| f.id.raw).collect();
         assert_eq!(ids_a, ids_b, "same inputs → identical ids");
@@ -3106,7 +3516,12 @@ mod tests {
 
     #[test]
     fn catch_all_emits_v6_exemptions_and_block_all_at_both_v6_layers() {
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         for layer in [
             WfpLayerKey::AleAuthConnectV6,
             WfpLayerKey::OutboundIpPacketV6,
@@ -3157,7 +3572,12 @@ mod tests {
         // IPv6 coverage is orthogonal to the V4 protocol mask — the catch-all
         // cuts all IPv6 whenever it fires.
         let tcp_udp = KillSwitchProtocols::from_bits(0x03);
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), tcp_udp);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            tcp_udp,
+        );
         assert_eq!(
             v6_filters(&out).len(),
             8,
@@ -3201,7 +3621,7 @@ mod tests {
             "S",
             &["a.exe".to_string()],
             LUID,
-            KillSwitchProtocols::ALL
+            KillSwitchProtocols::ALL,
         ))
         .is_empty());
         assert!(v6_filters(&fail_closed_block_apps(
@@ -3216,7 +3636,12 @@ mod tests {
     fn v6_filter_ids_are_distinct_across_layers_and_targets() {
         // The id seed excludes the layer, so ALE/packet twins rely on distinct
         // kind tags. Assert every V6 filter id is unique within a catch-all.
-        let out = catch_all_kill_switch_filters("S", &full_resolution(), KillSwitchProtocols::ALL);
+        let out = catch_all_kill_switch_filters(
+            "S",
+            &full_resolution(),
+            &FailClosedExemptions::default(),
+            KillSwitchProtocols::ALL,
+        );
         let ids: Vec<u64> = v6_filters(&out).iter().map(|f| f.id.raw).collect();
         let unique: std::collections::HashSet<u64> = ids.iter().copied().collect();
         assert_eq!(unique.len(), ids.len(), "all V6 filter ids must differ");

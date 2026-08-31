@@ -212,6 +212,33 @@ fn open_netlink_socket() -> Result<libc::c_int, PlatformError> {
             detail,
         });
     }
+    // A bigger receive buffer, and no ENOBUFS at all if the kernel honours it.
+    //
+    // A VPN coming up emits dozens of link/address/route messages at once —
+    // routine, not exceptional — and the default buffer overflows. The reader
+    // used to treat that as a fatal read error and exit, silently, taking
+    // event-driven enforcement with it and leaving only the timer tick.
+    let want_bytes: libc::c_int = 1024 * 1024;
+    // SAFETY: both options take an int by pointer with its own size; failure is
+    // tolerated (older kernels lack NETLINK_NO_ENOBUFS), so the return is only
+    // inspected for logging.
+    unsafe {
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(want_bytes).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+        let no_enobufs: libc::c_int = 1;
+        let _ = libc::setsockopt(
+            fd,
+            libc::SOL_NETLINK,
+            libc::NETLINK_NO_ENOBUFS,
+            std::ptr::addr_of!(no_enobufs).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
     Ok(fd)
 }
 
@@ -238,7 +265,10 @@ fn read_until_woken(
     wake_reader: libc::c_int,
     on_change: NetworkChangeCallback,
 ) {
-    let mut buffer = [0u8; 8192];
+    // One datagram at a time, but a netlink message carrying a full route dump
+    // is larger than the 8 KiB this used to allow, and a short buffer truncates
+    // rather than splits.
+    let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let mut fds = [
             libc::pollfd {
@@ -260,6 +290,11 @@ fn read_until_woken(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            tracing::warn!(
+                target: "nrr::adapters",
+                error = %error,
+                "rtnetlink poll failed; the reader is retiring",
+            );
             return;
         }
         // Retirement wins over a pending change: the caller is going away and
@@ -284,6 +319,25 @@ fn read_until_woken(
             if error.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
+            // An overflow means messages were LOST, not that the socket is
+            // done: the kernel drops what did not fit and the next read
+            // succeeds. Treat the loss as a change — something moved, we just
+            // do not know what — and keep reading. Exiting here killed the
+            // 0.65 s event-driven pass for the rest of the service's life,
+            // without a line in the log to say so.
+            if error.raw_os_error() == Some(libc::ENOBUFS) {
+                tracing::warn!(
+                    target: "nrr::adapters",
+                    "rtnetlink overflowed; some change messages were lost — re-reading state",
+                );
+                on_change();
+                continue;
+            }
+            tracing::warn!(
+                target: "nrr::adapters",
+                error = %error,
+                "rtnetlink reader stopped; only the timer tick remains",
+            );
             return;
         }
         if carries_topology_change(&buffer[..read as usize]) {

@@ -216,6 +216,7 @@ struct DiagnosticTally {
     app_rule_unobserved: usize,
     app_rule_dest_claimed_by_main_link: usize,
     app_rule_dest_used_by_other_process: usize,
+    address_claimed_by_main_link: usize,
     primary_exceptions_unavailable: usize,
 }
 
@@ -237,6 +238,7 @@ fn diagnostic_tally(
             D::AppRuleDestinationUsedByOtherProcess { .. } => {
                 t.app_rule_dest_used_by_other_process += 1
             }
+            D::AddressClaimedByMainLink { count, .. } => t.address_claimed_by_main_link += count,
             D::PrimaryExceptionsUnavailable => t.primary_exceptions_unavailable += 1,
         }
     }
@@ -512,6 +514,12 @@ pub struct SecondaryRouteCoordinator {
     /// reconnect through the kill-switch instead of deadlocking. Refreshed
     /// whenever the live route table yields a non-empty set.
     server_ip_cache: Mutex<HashMap<u32, Vec<Ipv4Addr>>>,
+    /// Last-known connected subnets of the main link, per its interface index.
+    /// Enumerating the route table can fail, and an EMPTY answer is not the
+    /// same fact as "this machine has no LAN": armed on an empty set, the
+    /// block-all cuts the local network, the printers and DHCP, and says
+    /// nothing about it. Refreshed whenever the live table answers.
+    local_subnet_cache: Mutex<HashMap<u32, Vec<(Ipv4Addr, u8)>>>,
     /// dedup state for the stale-binding
     /// auto-heal WARN. The heal re-fires on every reconcile while the stored
     /// GUID stays stale (e.g. the user runs a VPN whose adapter was reinstalled
@@ -641,6 +649,7 @@ impl SecondaryRouteCoordinator {
             fqdn_cache,
             next_hop_cache: Mutex::new(HashMap::new()),
             server_ip_cache: Mutex::new(HashMap::new()),
+            local_subnet_cache: Mutex::new(HashMap::new()),
             heal_logged: Mutex::new(HashMap::new()),
             not_found_logged: Mutex::new(HashMap::new()),
             not_usable_logged: Mutex::new(HashMap::new()),
@@ -1053,7 +1062,22 @@ impl SecondaryRouteCoordinator {
                 return None;
             }
         };
-        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        // An unreadable route table is not an empty one. Arming on the empty
+        // reading gives a kill-switch with no LAN, no DHCP and no printers
+        // exempted — and nothing in the log to say why. Same posture as the
+        // LUID failure above: stay off and let the next tick try again.
+        let routes = match self.api.get_ip_forward_table() {
+            Ok(routes) => routes,
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::route-coordinator",
+                    sid = %sid,
+                    "kill-switch: route table could not be read, so the local-network exemptions are unknown; staying off (fail-open): {e:?}",
+                );
+                return None;
+            }
+        };
+        let routes = self.stamped_with_ownership(routes);
         let primary_gateway = resolution.primary.map(|p| p.gateway);
         let mut server_ips =
             bootstrap_server_ips(&routes, secondary.interface_index, primary_gateway);
@@ -1118,11 +1142,45 @@ impl SecondaryRouteCoordinator {
     /// cached VPN-server IPs (best-effort) so the tunnel can reconnect.
     pub fn fail_closed_exemptions(&self, sid: &str) -> FailClosedExemptions {
         let resolution = self.resolve(sid);
-        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        // Unlike the kill-switch path this one cannot decline: the block-all is
+        // armed either way. So an unreadable table falls back to the last
+        // subnets this link was seen with — the same reasoning as the VPN-server
+        // cache below. A stale LAN exemption permits a little more; an empty one
+        // cuts the user's own network with nothing in the log.
+        let (routes, table_read) = match self.api.get_ip_forward_table() {
+            Ok(routes) => (routes, true),
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::route-coordinator",
+                    sid = %sid,
+                    "fail-closed: route table could not be read; falling back to the last known local subnets: {e:?}",
+                );
+                (Vec::new(), false)
+            }
+        };
         let mut local_subnets = resolution
             .primary
             .map(|p| primary_local_subnets(&routes, p.interface_index))
             .unwrap_or_default();
+        if let Some(primary) = resolution.primary {
+            let mut cache = self
+                .local_subnet_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if table_read && !local_subnets.is_empty() {
+                cache.insert(primary.interface_index, local_subnets.clone());
+            } else if local_subnets.is_empty() {
+                if let Some(cached) = cache.get(&primary.interface_index) {
+                    local_subnets = cached.clone();
+                    tracing::info!(
+                        target: "nrr::route-coordinator",
+                        sid = %sid,
+                        subnets = local_subnets.len(),
+                        "fail-closed: using the last known local subnets so the block-all keeps LAN reachable",
+                    );
+                }
+            }
+        }
         self.apply_local_network_policy(
             sid,
             &routes,
@@ -1198,6 +1256,9 @@ impl SecondaryRouteCoordinator {
             // the orchestrator fills known-direct IPs at the block-all
             // call site (it owns the registry and the secondary-dest subtraction).
             known_direct_ips: Vec::new(),
+            // the orchestrator resolves the tunnel and fills this at the
+            // block-all call site; the resolver has no LUID context.
+            secondary_luid: 0,
             probe_target_ips,
         }
     }
@@ -1431,7 +1492,19 @@ impl SecondaryRouteCoordinator {
         let Some(secondary) = self.resolve(sid).secondary else {
             return Vec::new();
         };
-        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        let routes = match self.api.get_ip_forward_table() {
+            Ok(routes) => routes,
+            Err(e) => {
+                // Silence here reads downstream as "this link has no local
+                // networks", which is a different statement entirely.
+                tracing::warn!(
+                    target: "nrr::route-coordinator",
+                    sid = %sid,
+                    "route table could not be read; reporting no local networks for the additional link: {e:?}",
+                );
+                return Vec::new();
+            }
+        };
         primary_local_subnets(&routes, secondary.interface_index)
             .into_iter()
             .filter_map(|(net, prefix)| Ipv4Network::new(net, prefix))
@@ -1445,7 +1518,20 @@ impl SecondaryRouteCoordinator {
     /// and what the enforcement exempts are derived from one enumeration.
     pub fn discovered_local_networks(&self, sid: &str) -> Vec<(Ipv4Network, String, bool)> {
         let resolution = self.resolve(sid);
-        let routes = self.api.get_ip_forward_table().unwrap_or_default();
+        let routes = match self.api.get_ip_forward_table() {
+            Ok(routes) => routes,
+            Err(e) => {
+                // The settings screen lists exactly this, so an empty answer is
+                // an empty screen. Say why rather than showing the user a
+                // machine that appears to have no local networks.
+                tracing::warn!(
+                    target: "nrr::route-coordinator",
+                    sid = %sid,
+                    "route table could not be read; the local-networks screen will show nothing: {e:?}",
+                );
+                return Vec::new();
+            }
+        };
         let Ok(adapters) = self.api.get_adapter_infos() else {
             return Vec::new();
         };
@@ -1497,6 +1583,24 @@ impl SecondaryRouteCoordinator {
     /// themselves is added (a hypervisor in NAT mode creates no host interface,
     /// so nothing here can discover it), and a network they refused is removed
     /// even if it was discovered automatically.
+    /// Mark the rows the reconciler knows are ours.
+    ///
+    /// The route-table FFI cannot tell — it reports `is_ours = false` for
+    /// everything — and the classifier's very first question is exactly that.
+    /// Without the stamp our own mode-B exception routes (a `/32` pulled back
+    /// to the primary NIC, so via the primary gateway) look precisely like a
+    /// VPN's bootstrap host route: they were collected as "VPN server IPs",
+    /// exempted from the block-all forever, and cached under the secondary's
+    /// ifindex so they outlived the rules that created them.
+    fn stamped_with_ownership(&self, mut routes: Vec<RouteEntry>) -> Vec<RouteEntry> {
+        for route in &mut routes {
+            if !route.is_ours && self.reconciler.owns(route) {
+                route.is_ours = true;
+            }
+        }
+        routes
+    }
+
     fn apply_local_network_policy(
         &self,
         sid: &str,
@@ -1589,7 +1693,8 @@ impl SecondaryRouteCoordinator {
             }
             seen.insert(key, now);
         }
-        bus.publish(
+        bus.publish_for(
+            sid,
             nrr_shared::ipc_payloads::StatusUpdateEvent::UnassignedTunnelDetected {
                 sid: sid.to_string(),
                 adapter_name: name,
@@ -1622,7 +1727,8 @@ impl SecondaryRouteCoordinator {
             }
             seen.insert(key, fingerprint);
         }
-        bus.publish(
+        bus.publish_for(
+            sid,
             nrr_shared::ipc_payloads::StatusUpdateEvent::EnforcementStatusChanged {
                 sid: sid.to_string(),
                 status: status.to_string(),
@@ -1980,10 +2086,23 @@ impl SecondaryRouteCoordinator {
             };
             match self.resolve_binding_target(sid, binding, &infos, "secondary") {
                 Some(t) => {
-                    self.probed_ifindex
+                    // A tunnel adapter that is recreated comes back under a NEW
+                    // ifindex, and the liveness window is keyed by index. Left
+                    // alone, the old index keeps whatever it had accumulated
+                    // (nobody probes it again to clear it), and — worse — the
+                    // new index may be one an unrelated adapter already filled
+                    // with failures, which would declare a healthy tunnel dead
+                    // on its first probe. Same reasoning as the `None` arm
+                    // below: a different interface must re-prove its baseline.
+                    let replaced = self
+                        .probed_ifindex
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(sid.clone(), t.interface_index);
+                    if let Some(old) = replaced.filter(|old| *old != t.interface_index) {
+                        self.liveness.forget(old);
+                        self.liveness.forget(t.interface_index);
+                    }
                     let reachable = probe.is_reachable(t.gateway, LIVENESS_PROBE_TIMEOUT);
                     self.liveness
                         .record(t.interface_index, reachable, Instant::now());
@@ -2050,11 +2169,18 @@ impl SecondaryRouteCoordinator {
         // shared-IP denylist from the same enforcement rule
         // book + live cache, keyed on this SID's policy, so the route table and
         // the WFP set decline the same shared IPs.
-        let shared_ip_policy = self
-            .route_source
-            .load_for_sid(sid)
+        let stored_policy = self.route_source.load_for_sid(sid);
+        let shared_ip_policy = stored_policy
+            .as_ref()
             .map(|p| p.shared_ip_policy)
             .unwrap_or_default();
+        // Zone-vs-exact-address order comes from the same stored policy: the
+        // routes and the filters must arbitrate one address identically.
+        let zone_order = crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+            stored_policy
+                .as_ref()
+                .is_some_and(|p| p.zone_priority_over_ip),
+        );
         let denied = crate::secondary_ip_policy::secondary_ip_denylist(
             &snapshot.rule_book.secondary,
             self.fqdn_cache.as_ref(),
@@ -2068,6 +2194,7 @@ impl SecondaryRouteCoordinator {
             self.fqdn_cache.as_ref(),
             self.app_observations.as_ref(),
             &denied,
+            zone_order,
         );
         // DNS-over-secondary — the route half of the setting. Emitted here, not
         // in `generate_routes`, because it is not derived from the rule book:
@@ -2124,6 +2251,7 @@ impl SecondaryRouteCoordinator {
                 app_rule_unobserved = tally.app_rule_unobserved,
                 app_rule_dest_claimed_by_main_link = tally.app_rule_dest_claimed_by_main_link,
                 app_rule_dest_used_by_other_process = tally.app_rule_dest_used_by_other_process,
+                address_claimed_by_main_link = tally.address_claimed_by_main_link,
                 primary_exceptions_unavailable = tally.primary_exceptions_unavailable,
                 "route codegen produced diagnostics",
             );
@@ -2258,10 +2386,12 @@ impl SecondaryRouteCoordinator {
         let orphans: Vec<RouteEntry> = table
             .into_iter()
             .filter(|r| {
-                // Both owned shapes ride SECONDARY_ROUTE_METRIC: the `/32`
-                // secondary host routes and the `/2` mode-A counter-overlay.
+                // Shape asked of the codegen, never restated here: a mode that
+                // grows a shape this list does not know leaves those routes
+                // unadopted after a crash, pointing traffic at a dead tunnel
+                // with nothing left to reclaim them.
                 r.metric == crate::route_codegen::SECONDARY_ROUTE_METRIC
-                    && (r.prefix_length == 32 || r.prefix_length == 2)
+                    && crate::route_codegen::is_owned_prefix_length(r.prefix_length)
             })
             .map(|mut r| {
                 r.is_ours = true;
@@ -2329,7 +2459,17 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
         let relevant = match self.route_coord.effective_routing_sid(&active).as_deref() {
             Some(eff) => {
                 eff == sid
-                    || (active.is_empty() && sid == nrr_domain::user_principal::BASELINE_PRINCIPAL)
+                    // The shared baseline is read THROUGH by every user who has
+                    // not diverged from it, so editing it changes what we
+                    // enforce for whoever we enforce for — with a tray
+                    // connected exactly as much as without one. Gating this on
+                    // an empty registry meant an admin's baseline edit reached
+                    // the filters and stopped at the route table for as long as
+                    // a tray was up. Deciding here whether the effective
+                    // principal still inherits would mean re-deriving their
+                    // revision; the recompute is a diff and costs one no-op
+                    // pass when they do not.
+                    || sid == nrr_domain::user_principal::BASELINE_PRINCIPAL
             }
             None => false,
         };
@@ -2561,6 +2701,8 @@ mod tests {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: true,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
             })
         }
     }
@@ -2721,6 +2863,48 @@ mod tests {
         assert!(
             !tracker.in_failing_run(60),
             "an unprobeable binding must forget the stale failing run"
+        );
+    }
+
+    #[test]
+    fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_ifindex() {
+        // A recreated tunnel adapter keeps its NAME and gets a NEW ifindex, and
+        // the liveness window is keyed by index. Left alone the old index keeps
+        // its failing run forever (nothing probes it again), and the new index
+        // inherits whatever an unrelated adapter left there — which would
+        // declare a healthy tunnel dead on its first probe.
+        let sid = "S-1-5-21-A";
+        let api = Arc::new(MockWindowsApi::new());
+        let vpn = adapter("hidemyvpn", 60, true, true, Some([10, 88, 0, 1]));
+        let vpn_id = vpn.stable_id();
+        api.set_adapter_infos(vec![vpn]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary(sid, &vpn_id);
+        let tracker = Arc::new(SecondaryLivenessTracker::new(10));
+        let probe = Arc::new(nrr_platform_api::reachability::MockReachabilityProbe::new(
+            false,
+        ));
+        let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy)
+            .with_liveness_probe(Arc::clone(&tracker), probe);
+        let sids = vec![sid.to_string()];
+        coord.probe_active_secondaries(&sids);
+        assert!(tracker.in_failing_run(60), "a failed probe starts a run");
+
+        // Same adapter name, new ifindex — and the new index already carries a
+        // failing run from whoever held it before.
+        tracker.record(61, false, Instant::now());
+        assert!(tracker.in_failing_run(61));
+        api.set_adapter_infos(vec![adapter(
+            "hidemyvpn",
+            61,
+            true,
+            true,
+            Some([10, 88, 0, 1]),
+        )]);
+        coord.probe_active_secondaries(&sids);
+        assert!(
+            !tracker.in_failing_run(60),
+            "the abandoned index must not keep a run nobody will ever clear"
         );
     }
 
@@ -3004,7 +3188,11 @@ mod tests {
         policy.bind_secondary_named("S-AMBIG", "win-adapter:{gone}", "vpn adapter");
 
         let bus = Arc::new(EventBus::new());
-        let sub = bus.subscribe("test".into(), None).subscription_id;
+        // The notice names this SID, so it is delivered to that principal;
+        // an unnamed subscriber is shown machine-wide events only.
+        let sub = bus
+            .subscribe_as("test".into(), Some("S-AMBIG".into()), None)
+            .subscription_id;
         let coord = coordinator_with_policy(
             Arc::clone(&api),
             Arc::new(FakeRules::new()),
@@ -3055,7 +3243,11 @@ mod tests {
         policy.bind_secondary_named("S-OK", "win-adapter:nic", "desc nic");
 
         let bus = Arc::new(EventBus::new());
-        let sub = bus.subscribe("test".into(), None).subscription_id;
+        // The notice names this SID, so it is delivered to that principal;
+        // an unnamed subscriber is shown machine-wide events only.
+        let sub = bus
+            .subscribe_as("test".into(), Some("S-OK".into()), None)
+            .subscription_id;
         let coord = coordinator_with_policy(
             Arc::clone(&api),
             Arc::new(FakeRules::new()),
@@ -3208,6 +3400,62 @@ mod tests {
         let delta = coord.recompute_for("S-IVANOV", &res(None)).unwrap();
         assert_eq!(delta.removed, 1);
         assert!(table_dests(&api).is_empty());
+    }
+
+    /// An admin edits the shared baseline while the user has a tray connected.
+    /// The user has not diverged, so the baseline IS their rule book — and the
+    /// route half must follow, not wait for the periodic safety recompute.
+    #[test]
+    fn a_baseline_edit_re_drives_routes_with_a_tray_connected() {
+        use crate::ipc_handlers::providers::RoutePolicyApplyTrigger;
+
+        #[derive(Default)]
+        struct CountingInner(std::sync::atomic::AtomicUsize);
+        impl RoutePolicyApplyTrigger for CountingInner {
+            fn on_policy_changed(&self, _sid: &str) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let api = Arc::new(MockWindowsApi::new());
+        let live = adapter("vpn", 7, true, true, Some([10, 0, 0, 1]));
+        let bind_id = format!("win-adapter:{}", live.adapter_name);
+        api.set_adapter_infos(vec![live]);
+        let rules = Arc::new(FakeRules::new());
+        rules.set_secondary(
+            "S-IVANOV",
+            CanonicalRuleSet::from_rules(vec![ip_rule("r1", 1, 1, 1, 1)]),
+        );
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary("S-IVANOV", &bind_id);
+        let coord = Arc::new(coordinator_with_policy(
+            Arc::clone(&api),
+            Arc::clone(&rules),
+            policy,
+        ));
+
+        // A tray is connected: the registry is NOT empty.
+        let registry = Arc::new(crate::active_sid_registry::ActiveSidRegistry::new());
+        registry.on_connect(
+            "S-IVANOV",
+            nrr_shared::ipc::IpcClientProfile::TrayLightweight,
+        );
+        assert!(!registry.active_sids().is_empty());
+
+        let inner = Arc::new(CountingInner::default());
+        let trigger = RouteAndFilterApplyTrigger::new(
+            Arc::clone(&inner) as Arc<dyn RoutePolicyApplyTrigger>,
+            Arc::clone(&coord),
+            registry,
+        );
+        trigger.on_policy_changed(nrr_domain::user_principal::BASELINE_PRINCIPAL);
+
+        assert_eq!(
+            table_dests(&api),
+            HashSet::from([Ipv4Addr::new(1, 1, 1, 1)]),
+            "the baseline edit must reach the route table, not stop at the filters"
+        );
+        assert_eq!(inner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3709,6 +3957,117 @@ mod tests {
         );
         assert_eq!(ex.bootstrap_server_ips, vec![Ipv4Addr::new(203, 0, 113, 7)]);
         assert_eq!(ex.local_subnets, vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]);
+    }
+
+    /// Mode B pulls primary-bound rules back to the primary NIC as `/32`
+    /// exceptions — which is byte-for-byte the shape of a VPN bootstrap host
+    /// route. Collected as "server IPs" they were exempted from the block-all
+    /// permanently, and cached, so they outlived the rule that made them.
+    #[test]
+    fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
+        let api = Arc::new(MockWindowsApi::new());
+        let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+        let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+        let vpn_id = vpn.stable_id();
+        let eth_id = eth.stable_id();
+        api.set_adapter_infos(vec![vpn, eth]);
+        let ours = route_entry([198, 51, 100, 5], 32, [192, 168, 1, 1], 12, 5);
+        api.set_route_table(vec![
+            route_entry([203, 0, 113, 7], 32, [192, 168, 1, 1], 12, 5), // the real bootstrap route
+            ours.clone(),                                               // our mode-B exception
+            route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+            route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
+        ]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_primary("S-IVANOV", &eth_id);
+        policy.bind_secondary("S-IVANOV", &vpn_id);
+        let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
+
+        let before = coord
+            .kill_switch_exemptions("S-IVANOV")
+            .expect("exemptions resolve");
+        assert!(
+            before
+                .bootstrap_server_ips
+                .contains(&Ipv4Addr::new(198, 51, 100, 5)),
+            "fixture check: unowned, it looks like a server IP"
+        );
+
+        coord.reconciler.adopt_owned(vec![ours]);
+        let after = coord
+            .kill_switch_exemptions("S-IVANOV")
+            .expect("exemptions resolve");
+        assert_eq!(
+            after.bootstrap_server_ips,
+            vec![Ipv4Addr::new(203, 0, 113, 7)],
+            "our own route must not become a permanent hole in the block-all"
+        );
+    }
+
+    /// An empty route table and an unreadable one used to be the same value.
+    /// Armed on the empty reading, the kill-switch exempts no LAN, no DHCP and
+    /// no printers — and says nothing about why.
+    #[test]
+    fn an_unreadable_route_table_keeps_the_kill_switch_off() {
+        let api = Arc::new(MockWindowsApi::new());
+        let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+        let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+        let vpn_id = vpn.stable_id();
+        let eth_id = eth.stable_id();
+        api.set_adapter_infos(vec![vpn, eth]);
+        api.set_route_table(vec![
+            route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+            route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
+        ]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_primary("S-IVANOV", &eth_id);
+        policy.bind_secondary("S-IVANOV", &vpn_id);
+        let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
+        assert!(
+            coord.kill_switch_exemptions("S-IVANOV").is_some(),
+            "the fixture itself must resolve"
+        );
+
+        api.set_route_table_read_error(Some("enumeration failed"));
+        assert!(
+            coord.kill_switch_exemptions("S-IVANOV").is_none(),
+            "an unknown set of local subnets must not arm a kill-switch"
+        );
+    }
+
+    /// The fail-closed path cannot decline — the block-all is armed either way —
+    /// so it falls back to what the link was last seen with rather than cutting
+    /// the user's own network.
+    #[test]
+    fn fail_closed_falls_back_to_the_last_known_local_subnets() {
+        let api = Arc::new(MockWindowsApi::new());
+        let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+        let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
+        let vpn_id = vpn.stable_id();
+        let eth_id = eth.stable_id();
+        api.set_adapter_infos(vec![vpn, eth]);
+        api.set_route_table(vec![
+            route_entry([192, 168, 1, 0], 24, [0, 0, 0, 0], 12, 5),
+            route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
+        ]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_primary("S-IVANOV", &eth_id);
+        policy.bind_secondary("S-IVANOV", &vpn_id);
+        let coord = coordinator_with_policy(Arc::clone(&api), Arc::new(FakeRules::new()), policy);
+
+        let warm = coord.fail_closed_exemptions("S-IVANOV");
+        assert_eq!(
+            warm.local_subnets,
+            vec![(Ipv4Addr::new(192, 168, 1, 0), 24)]
+        );
+
+        api.set_route_table_read_error(Some("enumeration failed"));
+        let degraded = coord.fail_closed_exemptions("S-IVANOV");
+        assert_eq!(
+            degraded.local_subnets,
+            vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+            "the block-all must keep the LAN it knew about"
+        );
     }
 
     #[test]

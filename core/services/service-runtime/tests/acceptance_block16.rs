@@ -128,6 +128,7 @@ use nrr_service_runtime::{
     decide_recovery, ApplyAttemptMarker, ApplyPhase, RecoveryDecision, StartupRecoveryState,
 };
 use nrr_shared::ipc::{ipc_operation_catalog, IpcInteractionClass, IpcOperationName};
+use nrr_shared::ipc_transport::canonical_operation_class;
 use std::collections::HashSet;
 
 // ── Gate 1: catalog consistency ──────────────────────────────────────────────
@@ -215,6 +216,77 @@ fn block16_mutation_submit_is_classified_as_command() {
 // `core/ipc-client/src/snapshot_cache.rs` for the enum-shape assertion.
 
 // ── Gate 4: unauthorized client rejected by mutation gate ────────────────────
+
+/// Operations whose write is gated INSIDE the handler, by value, rather than by
+/// the envelope class: `machine_scoped_write_allowed` lets an unelevated caller
+/// save the row back unchanged — which is what a settings page does on every
+/// save — and demands rights only for an actual change.
+///
+/// Maintained by hand, and that is the point. A handler-level check is invisible
+/// from the catalog, so this list is the only thing that lets
+/// `requires_service_mutation_privilege` mean something: a new carrier with no
+/// gate at all breaks the test below instead of quietly shipping.
+const VALUE_GATED_OPERATIONS: &[IpcOperationName] = &[
+    IpcOperationName::DohResolversSet,
+    IpcOperationName::RetentionSettingsSet,
+    IpcOperationName::LogRetentionConfigSet,
+    IpcOperationName::ApplyFailurePolicySet,
+    IpcOperationName::ServiceStabilityConfigSet,
+    IpcOperationName::TrafficStatsSet,
+];
+
+/// Every operation the catalog marks as needing service-mutation privilege must
+/// ACTUALLY be gated — one of the only two ways this codebase gates such a write.
+///
+/// The flag itself enforces nothing; nothing reads it at runtime. Before this
+/// test it was a label that READ like a control, and one operation
+/// (`traffic-stats.set`) sat behind it with no gate at all while three comments
+/// cited it as the admin gate. The pairing below is what turns the declaration
+/// into a claim that can fail.
+#[test]
+fn every_privileged_operation_is_actually_gated() {
+    let empty = serde_json::Value::Null;
+    for spec in ipc_operation_catalog().iter() {
+        if !spec.requires_service_mutation_privilege {
+            continue;
+        }
+        let class_gated = canonical_operation_class(spec.name, &empty).requires_elevation();
+        let value_gated = VALUE_GATED_OPERATIONS.contains(&spec.name);
+        assert!(
+            class_gated || value_gated,
+            "{} claims service-mutation privilege but nothing gates it. Its class does not require elevation and it is not in VALUE_GATED_OPERATIONS. Either gate the handler with `machine_scoped_write_allowed` and list it there, or give it a class that requires elevation.",
+            spec.name.slug()
+        );
+        assert!(
+            !(class_gated && value_gated),
+            "{} is gated twice, by class AND by value. Pick one: a class that already refuses an unelevated caller makes the in-handler value check dead code.",
+            spec.name.slug()
+        );
+    }
+}
+
+/// The list above must not rot. An entry that lost the flag, or that has since
+/// been given an elevation-gated class, is stale and hides the next real gap.
+#[test]
+fn the_value_gated_list_has_no_stale_entries() {
+    let empty = serde_json::Value::Null;
+    for op in VALUE_GATED_OPERATIONS {
+        let spec = ipc_operation_catalog()
+            .iter()
+            .find(|s| s.name == *op)
+            .unwrap_or_else(|| panic!("{} is not in the catalog at all", op.slug()));
+        assert!(
+            spec.requires_service_mutation_privilege,
+            "{} no longer claims service-mutation privilege — drop it from the list",
+            op.slug()
+        );
+        assert!(
+            !canonical_operation_class(*op, &empty).requires_elevation(),
+            "{} is now gated by its class — drop it from the list, the value check is dead",
+            op.slug()
+        );
+    }
+}
 
 /// `IpcOperationClass::MutationRequest` (and its kin) must reject when
 /// the client profile is not the elevated GUI. Covered in depth by

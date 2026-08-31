@@ -39,7 +39,7 @@ impl StatusUpdatesSubscribeHandler {
 }
 
 impl IpcHandler for StatusUpdatesSubscribeHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let body: StatusUpdatesSubscribeRequest = serde_json::from_value(request.payload.clone())
             .map_err(|e| IpcError {
             code: IpcErrorCode::MalformedRequest,
@@ -55,7 +55,18 @@ impl IpcHandler for StatusUpdatesSubscribeHandler {
             });
         }
 
-        let outcome = self.bus.subscribe(body.client_id, body.last_seen_event_id);
+        // The principal comes from the connection, never from the payload: a
+        // subscription decides which per-principal events this client is shown,
+        // so letting the caller name it would let anyone read another user's
+        // block notices, auto-rule offers and the additional link's external
+        // address.
+        let principal = match ctx.caller_stored() {
+            "" => None,
+            sid => Some(sid.to_owned()),
+        };
+        let outcome = self
+            .bus
+            .subscribe_as(body.client_id, principal, body.last_seen_event_id);
         let resp = StatusUpdatesSubscribeResponse {
             subscription_id: outcome.subscription_id,
             current_event_id: outcome.current_event_id,

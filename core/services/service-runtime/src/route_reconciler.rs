@@ -252,6 +252,25 @@ impl SecondaryRouteReconciler {
         *owned = routes;
     }
 
+    /// Is this table row one of ours? Compared by destination, prefix and
+    /// interface — the identity the OS table exposes; metric and flags are not
+    /// part of it because the OS may report them differently from what we asked.
+    ///
+    /// The FFI reports `is_ours = false` for every row it enumerates (it cannot
+    /// know), so a caller that classifies a raw table needs this to stamp the
+    /// field before deriving anything from ownership.
+    pub fn owns(&self, route: &RouteEntry) -> bool {
+        self.owned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|our| {
+                our.destination == route.destination
+                    && our.prefix_length == route.prefix_length
+                    && our.interface_index == route.interface_index
+            })
+    }
+
     /// Number of routes currently owned.
     pub fn owned_count(&self) -> usize {
         self.owned.lock().unwrap_or_else(|p| p.into_inner()).len()
@@ -262,8 +281,20 @@ impl SecondaryRouteReconciler {
     /// error the partial changes are rolled back and the owned set is left
     /// unchanged.
     pub fn reconcile(&self, desired: &[RouteEntry]) -> Result<RouteReconcileDelta, PlatformError> {
-        let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        self.reconcile_owned(desired, owned)
+    }
 
+    /// The body of [`Self::reconcile`], entered with the owned-set lock ALREADY
+    /// held. Callers that derive `desired` FROM the owned set must hold the lock
+    /// across both steps: releasing it in between lets a concurrent reconcile
+    /// change what is owned, and the derived set then deletes routes it never
+    /// looked at (see [`Self::retain_secondary_hosts`]).
+    fn reconcile_owned(
+        &self,
+        desired: &[RouteEntry],
+        mut owned: std::sync::MutexGuard<'_, Vec<RouteEntry>>,
+    ) -> Result<RouteReconcileDelta, PlatformError> {
         let desired_keys: HashSet<RouteKey> = desired.iter().map(route_key).collect();
         let owned_keys: HashSet<RouteKey> = owned.iter().map(route_key).collect();
 
@@ -293,15 +324,36 @@ impl SecondaryRouteReconciler {
         let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
         match tx.execute(&actions) {
             Ok(()) => {
+                // Claim what we ACTUALLY added, plus what we already owned and
+                // still want. A conflicting add reports success without adding
+                // anything - the route belongs to somebody else, typically a
+                // redirect VPN's own overlay - and claiming the whole desired
+                // set would adopt it and delete it on a later pass, which is
+                // exactly what destabilises the VPN client.
+                let landed = tx.added_routes();
                 tx.finalize();
-                *owned = desired.to_vec();
+                *owned = desired
+                    .iter()
+                    .filter(|d| {
+                        landed.iter().any(|l| route_key(l) == route_key(d))
+                            || owned.iter().any(|o| route_key(o) == route_key(d))
+                    })
+                    .cloned()
+                    .collect();
                 Ok(RouteReconcileDelta { added, removed })
             }
             Err(e) => {
                 // Best-effort undo of the actions that landed before the
-                // failure; leave `owned` untouched so the next reconcile
-                // retries the full diff.
+                // failure. What the table holds afterwards is not knowable from
+                // here - the rollback is best-effort too - so we stop claiming
+                // anything: the next reconcile re-derives the full desired set
+                // and re-adds it (an add of a route that is already there is
+                // idempotent). Keeping the old claim was worse: a route the
+                // rollback did delete stayed listed as ours, the next diff saw
+                // no work to do, and the rule silently stopped working until a
+                // restart.
                 let _ = tx.rollback();
+                owned.clear();
                 Err(e)
             }
         }
@@ -323,15 +375,16 @@ impl SecondaryRouteReconciler {
     /// traffic is not forced through the tunnel). Equivalent to
     /// `reconcile(owned.filter(|r| r.prefix_length == 32))`.
     pub fn retain_secondary_hosts(&self) -> Result<RouteReconcileDelta, PlatformError> {
-        let keep: Vec<RouteEntry> = {
-            let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
-            owned
-                .iter()
-                .filter(|r| r.prefix_length == 32)
-                .cloned()
-                .collect()
-        };
-        self.reconcile(&keep)
+        // One lock across derive AND apply: `keep` IS the owned set minus the
+        // overlays, so a reconcile slipping in between would have its routes
+        // deleted by a `desired` that predates them.
+        let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        let keep: Vec<RouteEntry> = owned
+            .iter()
+            .filter(|r| r.prefix_length == 32)
+            .cloned()
+            .collect();
+        self.reconcile_owned(&keep, owned)
     }
 
     /// strip the VPN client's own
@@ -425,6 +478,67 @@ mod tests {
             .iter()
             .map(|r| r.destination)
             .collect()
+    }
+
+    /// A route table where one destination is already occupied by somebody
+    /// else - the shape a redirect VPN's own overlay makes.
+    struct ForeignRouteApi {
+        inner: MockWindowsApi,
+        taken: Ipv4Addr,
+    }
+
+    impl RouteTablePort for ForeignRouteApi {
+        fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError> {
+            self.inner.get_ip_forward_table()
+        }
+        fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            if entry.destination == self.taken {
+                return Err(PlatformError::Win32 {
+                    operation: "CreateIpForwardEntry2",
+                    code: nrr_platform_api::error::win32_codes::ERROR_OBJECT_ALREADY_EXISTS,
+                    message: "route already exists".into(),
+                });
+            }
+            self.inner.create_ip_forward_entry(entry)
+        }
+        fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
+            self.inner.delete_ip_forward_entry(entry)
+        }
+        fn get_adapter_infos(&self) -> Result<Vec<nrr_platform_api::AdapterInfo>, PlatformError> {
+            self.inner.get_adapter_infos()
+        }
+        fn interface_luid_for_index(&self, index: u32) -> Result<u64, PlatformError> {
+            self.inner.interface_luid_for_index(index)
+        }
+    }
+
+    /// A conflicting add means the route is somebody ELSE'S - a redirect VPN's
+    /// own `/1` overlay is the usual one. Treating the whole desired set as
+    /// ours afterwards adopted that route, and the next pass that no longer
+    /// wanted it DELETED it, which is precisely what destabilises the VPN
+    /// client we were careful not to touch.
+    #[test]
+    fn a_route_we_did_not_add_is_never_claimed_as_ours() {
+        let taken = Ipv4Addr::new(1, 1, 1, 1);
+        let api = Arc::new(ForeignRouteApi {
+            inner: MockWindowsApi::new(),
+            taken,
+        });
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        let desired = vec![
+            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
+            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+        ];
+        rec.reconcile(&desired).expect("conflict is not a failure");
+        assert_eq!(
+            rec.owned_count(),
+            1,
+            "only the route we actually added is ours",
+        );
+
+        // The next pass wants neither. Ours goes; the foreign one is left alone.
+        rec.reconcile(&[]).expect("second reconcile");
+        assert_eq!(rec.owned_count(), 0);
     }
 
     #[test]

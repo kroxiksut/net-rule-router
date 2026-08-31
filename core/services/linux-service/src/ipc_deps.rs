@@ -46,11 +46,22 @@ use nrr_service_runtime::production_settings::{
 use nrr_service_runtime::routing_pause::{
     NoopRoutingPauseAudit, PauseDispatcher, RoutingPauseCoordinator,
 };
-use nrr_service_runtime::{ActiveSidRegistry, NoopIpcAuditEmitter};
+use nrr_service_runtime::{
+    ActiveSidRegistry, IpcAuditEmitter, MutationTokenStore, NoopIpcAuditEmitter,
+};
 
 /// Everything the daemon needs to answer the full IPC surface.
 pub(crate) struct IpcSurface {
     pub deps: Arc<IpcHandlerDeps>,
+    /// The dry-run token store the surface actually uses. Handed back so the
+    /// housekeeping tick can collect expired tokens: a dry-run needs no
+    /// elevation and skips the mutation queue, so its payload parks here until
+    /// confirmed or expired, and nothing else would ever sweep it.
+    pub mutation_tokens: Arc<MutationTokenStore>,
+    /// The audit emitter the router must share with the handlers. The router
+    /// refuses a privileged mutation whose record cannot be written; with a
+    /// no-op emitter that safeguard can never fire.
+    pub audit: Arc<dyn IpcAuditEmitter>,
 }
 
 /// Turns an approved revision into kernel state by running one enforcement pass.
@@ -144,6 +155,27 @@ impl PauseDispatcher for UnsupportedPauseDispatcher {
     }
 }
 
+/// The IPC audit emitter this daemon serves with: the real one when there is a
+/// writer to record into, the no-op when there is not.
+///
+/// The choice is load-bearing rather than cosmetic. The router REFUSES a
+/// privileged mutation whose audit record cannot be written — an operation that
+/// cannot be accounted for does not happen — so with the no-op that safeguard
+/// can never fire, and the trail stays empty while everything looks healthy.
+/// Bootstrap has already reported why a writer is missing, so this stays quiet.
+fn ipc_audit_emitter(
+    audit_writer: Option<&Arc<nrr_diagnostics::AuditWriter>>,
+) -> Arc<dyn IpcAuditEmitter> {
+    match audit_writer {
+        Some(writer) => Arc::new(
+            nrr_service_runtime::production_ipc_audit::ProductionIpcAuditEmitter::new(Arc::clone(
+                writer,
+            )),
+        ),
+        None => Arc::new(NoopIpcAuditEmitter),
+    }
+}
+
 /// Assemble the full IPC surface over the open state database.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_ipc_surface(
@@ -167,6 +199,10 @@ pub(crate) fn build_ipc_surface(
     // outside the data root.
     let usage_logs_dir = logs_dir.clone();
     let ids = Arc::new(ProductionIdGenerator::new());
+    // Bound here rather than inline at the call below, so the caller can hand it
+    // to the housekeeping tick — the same wiring the Windows surface has.
+    let mutation_tokens: Arc<MutationTokenStore> = Arc::default();
+    let audit = ipc_audit_emitter(audit_writer.as_ref());
     let alerts_repo = Arc::new(ProductionSecurityAlertsRepository::new(Arc::clone(
         &state_conn,
     )));
@@ -221,7 +257,7 @@ pub(crate) fn build_ipc_surface(
     let autostart_helper = Arc::new(nrr_platform_api::autostart::AutostartHelper::new(registry));
 
     let deps = IpcHandlerDeps::new(
-        Arc::new(NoopIpcAuditEmitter),
+        Arc::clone(&audit),
         health,
         Arc::new(CoordinatorPolicyManager::new(
             Arc::clone(&coordinator),
@@ -242,7 +278,7 @@ pub(crate) fn build_ipc_surface(
         // the executor covers the other mutation kinds and none of them are
         // wired here yet, so it refuses rather than reports success.
         Arc::new(NoopMutationExecutor),
-        Arc::default(),
+        Arc::clone(&mutation_tokens),
         Arc::default(),
         Arc::clone(&event_bus),
         Arc::new(ProductionRoutePolicyProvider::new(Arc::clone(&state_conn))),
@@ -292,6 +328,8 @@ pub(crate) fn build_ipc_surface(
 
     IpcSurface {
         deps: Arc::new(deps),
+        mutation_tokens,
+        audit,
     }
 }
 
@@ -303,4 +341,66 @@ fn default_autostart_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("/etc/xdg"))
         .join("autostart")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrr_service_runtime::{IpcRequestContext, IpcRequestEnvelope};
+
+    fn envelope() -> IpcRequestEnvelope {
+        IpcRequestEnvelope {
+            protocol_version: nrr_service_runtime::IPC_PROTOCOL_VERSION,
+            request_id: "r-1".into(),
+            correlation_id: None,
+            operation: nrr_shared::ipc::IpcOperationName::MutationSubmit,
+            operation_class: nrr_service_runtime::ipc::IpcOperationClass::MutationRequest,
+            confirmation_token: Some("tok".into()),
+            payload: serde_json::json!({ "mutation-kind": "rules-update" }),
+        }
+    }
+
+    fn ctx() -> IpcRequestContext {
+        IpcRequestContext {
+            client_profile: nrr_shared::ipc::IpcClientProfile::GuiInteractive,
+            caller_is_elevated: true,
+            caller_principal: None,
+            caller_pid: None,
+        }
+    }
+
+    /// With a writer the daemon must record for real. The router refuses a
+    /// privileged mutation whose record cannot be written, and that refusal is
+    /// the only thing standing between "audited" and "silently unaudited" — so
+    /// the wiring is checked by what reaches the disk, not by what was passed.
+    #[test]
+    fn a_writer_gives_an_emitter_that_actually_records() {
+        let dir = std::env::temp_dir().join(format!("nrr-ipc-audit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp audit dir");
+
+        let writer = Arc::new(nrr_diagnostics::AuditWriter::open(
+            nrr_diagnostics::AuditWriterConfig::new(dir.clone()),
+        ));
+        ipc_audit_emitter(Some(&writer))
+            .record_request(&envelope(), &ctx())
+            .expect("the record is written");
+
+        let wrote_something = std::fs::read_dir(&dir)
+            .expect("read temp audit dir")
+            .filter_map(Result::ok)
+            .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false));
+        assert!(wrote_something, "an audit record must reach the trail");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without a writer the emitter must still SUCCEED, not fail: reporting an
+    /// error here would make the router refuse every privileged mutation on a
+    /// daemon whose audit storage is merely unavailable.
+    #[test]
+    fn no_writer_gives_a_silent_emitter_that_does_not_refuse() {
+        ipc_audit_emitter(None)
+            .record_request(&envelope(), &ctx())
+            .expect("the no-op reports success");
+    }
 }

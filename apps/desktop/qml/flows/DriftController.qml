@@ -43,13 +43,44 @@ QtObject {
     /// `rules.merge-preview` pass under the user's policy, and populates the
     /// dialog buckets. Conflicts default to the file-provisional side (Union).
     function _openMergeDialog() {
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.readFileBytes !== "function"
-                || typeof nrrNativeBridge.rpcRulesMergePreview !== "function"
-                || typeof nrrNativeBridge.decodeBase64Utf8 !== "function") {
+        if (!_mergeBridgeReady()) {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
             return
         }
+        root.mergeReviewDialog.policy = _mergePolicy()
+        root.mergeReviewDialog.mergeResult = null
+        root.mergeReviewDialog.picks = ({})
+        root.mergeReviewDialog.errorText = ""
+        root.mergeReviewDialog.loading = true
+        root.mergeReviewDialog.open()
+        _fetchMergePreview([], function(res, code) {
+            root.mergeReviewDialog.loading = false
+            if (!res) {
+                root.mergeReviewDialog.errorText =
+                    root.tr("dialog.merge.error", "Could not build the merge preview.")
+                    + (code ? (" (" + root.ipcErrorLabel(code) + ")") : "")
+                return
+            }
+            _fillMergeDialog(res)
+        })
+    }
+
+    function _mergeBridgeReady() {
+        return typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+            && typeof nrrNativeBridge.readFileBytes === "function"
+            && typeof nrrNativeBridge.rpcRulesMergePreview === "function"
+            && typeof nrrNativeBridge.decodeBase64Utf8 === "function"
+    }
+
+    function _mergePolicy() {
+        return String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
+    }
+
+    /// Read both bound files into `root._merge*Text` and run one
+    /// `rules.merge-preview` pass. `done(result, errorCode)` — `result` is
+    /// null on failure. Split out of `_openMergeDialog` so the same pass can
+    /// answer "does merging change anything at all" before any dialog opens.
+    function _fetchMergePreview(resolutions, done) {
         var primaryPath = String(root.prefs.lastSavedPathPrimary || "")
         var secondaryPath = String(root.prefs.lastSavedPathSecondary || "")
         var primB64 = primaryPath
@@ -58,33 +89,24 @@ QtObject {
             ? String(nrrNativeBridge.readFileBytes(secondaryPath) || "") : ""
         root._mergePrimaryText = primB64 ? nrrNativeBridge.decodeBase64Utf8(primB64) : ""
         root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
-        var policy = String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
-        root.mergeReviewDialog.policy = policy
-        root.mergeReviewDialog.mergeResult = null
-        root.mergeReviewDialog.picks = ({})
-        root.mergeReviewDialog.errorText = ""
-        root.mergeReviewDialog.loading = true
-        root.mergeReviewDialog.open()
         var corr = nrrNativeBridge.rpcRulesMergePreview(
-            root._mergePrimaryText, root._mergeSecondaryText, policy, [])
+            root._mergePrimaryText, root._mergeSecondaryText,
+            _mergePolicy(), resolutions || [])
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
-            root.mergeReviewDialog.loading = false
-            if (!ok || !p || !p.result) {
-                root.mergeReviewDialog.errorText =
-                    root.tr("dialog.merge.error", "Could not build the merge preview.")
-                    + (code ? (" (" + root.ipcErrorLabel(code) + ")") : "")
-                return
-            }
-            var res = p.result
-            root.mergeReviewDialog.mergeResult = res
-            // Default each conflict pick to the file-provisional side (Union).
-            var picks = {}
-            var cs = res.conflicts || []
-            for (var i = 0; i < cs.length; i += 1) {
-                picks[cs[i]["identity-key"]] = "file"
-            }
-            root.mergeReviewDialog.picks = picks
+            done((ok && p && p.result) ? p.result : null, code)
         })
+    }
+
+    function _fillMergeDialog(res) {
+        root.mergeReviewDialog.policy = _mergePolicy()
+        root.mergeReviewDialog.mergeResult = res
+        // Default each conflict pick to the file-provisional side (Union).
+        var picks = {}
+        var cs = res.conflicts || []
+        for (var i = 0; i < cs.length; i += 1) {
+            picks[cs[i]["identity-key"]] = "file"
+        }
+        root.mergeReviewDialog.picks = picks
     }
 
     /// Confirm the merge: re-run `rules.merge-preview` with the
@@ -214,6 +236,15 @@ QtObject {
     /// the live revision → ReviewDiffDialog in read-only mode), so the
     /// added/removed/changed entries are computed server-side, not faked.
     function _driftShowDiff() {
+        // The dry-run below compares the WINDOW with the service. When the
+        // divergence is between the file and the window, those two agree and
+        // every bucket comes back empty — a diff screen that proves nothing
+        // and reads as "the warning was a lie". Send that case to the
+        // comparison that covers the pair which actually differs.
+        if (!_driftHasGuiVsServiceMismatch()) {
+            _driftOpenComparison()
+            return
+        }
         if (!root.bridgeAvailable) {
             root.statusLine = root.tr("status.bridge-unavailable",
                 "Native bridge unavailable")
@@ -229,6 +260,16 @@ QtObject {
             contentHash = "client-stub-" + String(Date.now())
         }
         root._openPendingApplyPreview(rulesJson, contentHash)
+    }
+
+    /// Is either route's mismatch one the window-vs-service diff can show?
+    function _driftHasGuiVsServiceMismatch() {
+        var isGuiVsService = function(details) {
+            var m = String((details || {}).mismatch || "none")
+            return m === "gui-vs-service" || m === "all-three-differ"
+        }
+        return isGuiVsService(root._driftDetailsPrimary)
+            || isGuiVsService(root._driftDetailsSecondary)
     }
 
     /// Does a service-computed review summary say "nothing about the rules
@@ -679,11 +720,171 @@ QtObject {
         }
         if (mismatchP === "file-vs-service" || mismatchS === "file-vs-service"
                 || mismatchP === "file-vs-gui" || mismatchS === "file-vs-gui") {
-            _openMergeDialog()
+            _openMergeUnlessPointless()
             return
         }
         root.statusLine = root.tr("status.drift-none-after-compare",
             "Compared with the service: the rules match. Nothing to apply.")
+    }
+
+    /// A file leg can differ from the window's while describing exactly the
+    /// same routing — a rule spelled one way in the file and another in the
+    /// table, an entry the canonicalizer folds away. Merging then produces the
+    /// rules that are already applied, and putting a comparison screen with
+    /// "only in the file" rows in front of the user is a scare over nothing:
+    /// what it offers to change, changes nothing.
+    ///
+    /// So the merge is run first and its result compared with the window's own
+    /// rules. Equal → converge the file quietly and leave one notice behind.
+    /// Different → the screen is warranted, and it opens on the pass already
+    /// fetched rather than paying for a second one.
+    function _openMergeUnlessPointless() {
+        if (!_mergeBridgeReady()) {
+            root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
+            return
+        }
+        _fetchMergePreview([], function(res, code) {
+            if (!res) {
+                // Cannot tell — show the screen rather than swallow a real
+                // divergence.
+                _openMergeDialog()
+                return
+            }
+            var mergedJson = String(res["merged-rules-json"] || "")
+            var guiJson = root._buildRulesJsonFromModel()
+            if (mergedJson === "" || !guiJson) {
+                _showMergeDialogWith(res)
+                return
+            }
+            _driftHashRulesJson(mergedJson, function(mergedHash) {
+                _driftHashRulesJson(guiJson, function(guiHash) {
+                    var equivalent = mergedHash !== "" && mergedHash === guiHash
+                    // Record what was compared BEFORE acting on it: converging
+                    // rewrites the bound file, and with it the only copy of the
+                    // input that produced this verdict.
+                    _writeDriftDiagnostics(res, mergedJson, guiJson,
+                        mergedHash, guiHash, equivalent)
+                    if (equivalent) {
+                        _convergeFilesQuietly()
+                        return
+                    }
+                    _showMergeDialogWith(res)
+                })
+            })
+        })
+    }
+
+    /// Leave a record of one file-vs-window comparison next to the launcher
+    /// logs, keeping the previous one as `.prev`.
+    ///
+    /// The interesting case is the quiet one: merging produced exactly the
+    /// rules already on screen, so nothing changes and the evidence would
+    /// otherwise be overwritten within the second. Everything here is the
+    /// user's own data staying on the user's own machine, in the folder the
+    /// launcher already writes its logs to.
+    function _writeDriftDiagnostics(res, mergedJson, guiJson, mergedHash, guiHash, equivalent) {
+        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
+                || typeof nrrNativeBridge.runtimeDiagnosticsPath !== "function"
+                || typeof nrrNativeBridge.writeTextFile !== "function") {
+            return
+        }
+        var path = String(nrrNativeBridge.runtimeDiagnosticsPath("rules-drift.json") || "")
+        if (path === "") return
+        // Keep one generation back: the same divergence often repeats, and the
+        // FIRST occurrence is the one with the untouched file.
+        if (typeof nrrNativeBridge.readFileBytes === "function") {
+            var prevB64 = String(nrrNativeBridge.readFileBytes(path) || "")
+            if (prevB64 !== "") {
+                var prevPath = String(
+                    nrrNativeBridge.runtimeDiagnosticsPath("rules-drift.prev.json") || "")
+                if (prevPath !== "") {
+                    nrrNativeBridge.writeTextFile(prevPath, root._b64ToUtf8(prevB64))
+                }
+            }
+        }
+        var record = {
+            "captured-at": new Date().toISOString(),
+            "equivalent": !!equivalent,
+            "mismatch": {
+                "primary": String((root._driftDetailsPrimary || {}).mismatch || "none"),
+                "secondary": String((root._driftDetailsSecondary || {}).mismatch || "none")
+            },
+            "hashes": {
+                "file-primary": String(root._driftFileHashPrimary || ""),
+                "file-secondary": String(root._driftFileHashSecondary || ""),
+                "gui-primary": String(root._driftGuiHashPrimary || ""),
+                "gui-secondary": String(root._driftGuiHashSecondary || ""),
+                "service-primary": String(root._driftServiceHashPrimary || ""),
+                "service-secondary": String(root._driftServiceHashSecondary || ""),
+                "merged": String(mergedHash || ""),
+                "gui-whole-book": String(guiHash || "")
+            },
+            "paths": {
+                "primary": String(root.prefs.lastSavedPathPrimary || ""),
+                "secondary": String(root.prefs.lastSavedPathSecondary || "")
+            },
+            "merge-buckets": {
+                "file-only": (res && res["file-only"]) || [],
+                "service-only": (res && res["service-only"]) || [],
+                "conflicts": (res && res.conflicts) || []
+            },
+            "file-text": {
+                "primary": String(root._mergePrimaryText || ""),
+                "secondary": String(root._mergeSecondaryText || "")
+            },
+            "gui-rules-json": String(guiJson || ""),
+            "merged-rules-json": String(mergedJson || "")
+        }
+        var text = ""
+        try {
+            text = JSON.stringify(record, null, 2)
+        } catch (err) {
+            console.log("drift diagnostics: serialize failed:", err)
+            return
+        }
+        // The bridge caps a write at 1 MiB. A rule book that large would lose
+        // the copies but keep the verdict, which is the part that cannot be
+        // reconstructed later.
+        if (text.length > 1000000) {
+            record["file-text"] = { "primary": "(omitted: too large)", "secondary": "" }
+            record["gui-rules-json"] = "(omitted: too large)"
+            record["merged-rules-json"] = "(omitted: too large)"
+            text = JSON.stringify(record, null, 2)
+        }
+        if (nrrNativeBridge.writeTextFile(path, text)) {
+            console.log("drift diagnostics written:", path, "equivalent=" + equivalent)
+        }
+    }
+
+    function _showMergeDialogWith(res) {
+        root.mergeReviewDialog.errorText = ""
+        root.mergeReviewDialog.loading = false
+        _fillMergeDialog(res)
+        root.mergeReviewDialog.open()
+    }
+
+    /// The file says the same thing the window does. Rewrite it from the
+    /// window (a content-compare per route, so a file that already matches is
+    /// not touched), then re-run the comparison so the banner clears on the
+    /// facts rather than on a suppression flag.
+    function _convergeFilesQuietly() {
+        root.boundFilesController._writeBoundFiles(false, function() {
+            // Drop the mtime cache only once the write is on disk — a recheck
+            // racing it would re-read the old bytes and raise the banner again.
+            root._driftFileCachedPathPrimary = ""
+            root._driftFileCachedPathSecondary = ""
+            _driftRecheckNow(false)
+        }, true)
+        root._addPushNotice({
+            "id": "rules-file-converged:" + _driftPairKey(),
+            "kind": "rules-file-converged",
+            "severity": "info",
+            "dismissible": true,
+            "title": root.tr("notifications.rules-file-converged.title",
+                "Your rules file was brought up to date"),
+            "body": root.tr("notifications.rules-file-converged.body",
+                "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed.")
+        })
     }
 
     /// Periodic poll entry. Re-fetches file legs (mtime-cached) and

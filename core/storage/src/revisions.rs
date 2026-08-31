@@ -155,6 +155,15 @@ pub struct RevisionsRepository<'c> {
     signing_key: Option<Vec<u8>>,
 }
 
+/// What a bulk re-sign did. `adopted_tampered` names the rows whose stored
+/// signature did NOT match before being replaced — the ones where re-signing
+/// legitimised an edit nobody here made.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReSignReport {
+    pub re_signed: usize,
+    pub adopted_tampered: Vec<String>,
+}
+
 impl<'c> RevisionsRepository<'c> {
     pub fn new(conn: &'c Connection) -> Self {
         Self {
@@ -360,15 +369,29 @@ impl<'c> RevisionsRepository<'c> {
     /// UPDATE that changes a signed column and by
     /// the ack-flow re-signing helper. No-op when the repository
     /// has no signing key (back-compat).
-    pub fn re_sign_row(&self, revision_id: &str) -> StorageResult<()> {
+    /// Returns what the signature said BEFORE it was replaced, so the caller
+    /// can tell a repair from an adoption.
+    ///
+    /// Re-signing is normally a repair: the writer just edited signed columns
+    /// itself and the stored HMAC is stale by construction. Over a row that was
+    /// TAMPERED with, the very same call mints a valid signature for somebody
+    /// else's edit — the tamper detector silently undone by its own repair
+    /// path. Nothing here refuses to do it (the ack flow legitimately means
+    /// "I have reviewed this and accept it"), but the verdict is no longer
+    /// thrown away, so an adoption can be logged and audited as one.
+    pub fn re_sign_row(
+        &self,
+        revision_id: &str,
+    ) -> StorageResult<Option<crate::revision_hmac::HmacVerification>> {
         let Some(key) = self.key() else {
-            return Ok(());
+            return Ok(None);
         };
-        let Some((principal, record, _stored)) = self.row_with_principal_and_hmac(revision_id)?
+        let Some((principal, record, stored)) = self.row_with_principal_and_hmac(revision_id)?
         else {
-            return Ok(());
+            return Ok(None);
         };
         let fields = record_to_row_fields(&principal, &record);
+        let before = crate::revision_hmac::verify(&fields, &stored, key);
         let hmac = crate::revision_hmac::compute_hmac(&fields, key).to_vec();
         self.conn
             .execute(
@@ -376,7 +399,7 @@ impl<'c> RevisionsRepository<'c> {
                 params![hmac, revision_id],
             )
             .map_err(|e| StorageError::Internal(format!("revisions re_sign_row: {e}")))?;
-        Ok(())
+        Ok(Some(before))
     }
 
     /// Walk every row in `revisions` and rewrite `row_hmac` with a
@@ -388,9 +411,9 @@ impl<'c> RevisionsRepository<'c> {
     ///
     /// Returns the number of rows re-signed. No-op when the
     /// repository has no signing key (and returns 0).
-    pub fn re_sign_all(&self) -> StorageResult<usize> {
+    pub fn re_sign_all(&self) -> StorageResult<ReSignReport> {
         if self.key().is_none() {
-            return Ok(0);
+            return Ok(ReSignReport::default());
         }
         let mut stmt = self
             .conn
@@ -402,12 +425,20 @@ impl<'c> RevisionsRepository<'c> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| StorageError::Internal(format!("revisions re_sign_all collect: {e}")))?;
         drop(stmt);
-        let mut signed = 0usize;
+        let mut report = ReSignReport::default();
         for id in &ids {
-            self.re_sign_row(id)?;
-            signed += 1;
+            let before = self.re_sign_row(id)?;
+            report.re_signed += 1;
+            if matches!(
+                before,
+                Some(crate::revision_hmac::HmacVerification::Tampered)
+            ) {
+                // Adopted, not repaired: this row did not match its signature
+                // before we wrote a new one. The caller has to say so out loud.
+                report.adopted_tampered.push(id.clone());
+            }
         }
-        Ok(signed)
+        Ok(report)
     }
 
     /// Total number of rows in `revisions`. The tamper bootstrap uses
@@ -2100,7 +2131,7 @@ mod tests {
             );
         }
         // Re-sign all in one pass …
-        assert_eq!(with_key.re_sign_all().expect("re-sign-all"), 3);
+        assert_eq!(with_key.re_sign_all().expect("re-sign-all").re_signed, 3);
         // … and every row is now Verified.
         for i in 0..3 {
             assert_eq!(
@@ -2119,7 +2150,7 @@ mod tests {
         let repo = RevisionsRepository::new(&conn);
         repo.insert_candidate(&sample_record("rev-noop", "h-noop"))
             .expect("insert");
-        assert_eq!(repo.re_sign_all().expect("re-sign-all"), 0);
+        assert_eq!(repo.re_sign_all().expect("re-sign-all").re_signed, 0);
     }
 
     #[test]

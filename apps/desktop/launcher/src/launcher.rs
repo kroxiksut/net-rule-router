@@ -24,10 +24,10 @@ use nrr_desktop_gui::ui_surface::{
 };
 use nrr_desktop_tray::write_qt_tray_context_file;
 use nrr_shared::{gui_shell_v1, AppSection};
-use nrr_ui_support::first_run::first_run_flow_snapshot;
+use nrr_ui_support::first_run::{first_run_flow_snapshot, resolve_entry_section_for_first_run};
 use nrr_ui_support::theme::resolve_theme;
 use nrr_ui_support::tray::{tray_runtime_snapshot, TrayServiceLink};
-use nrr_ui_support::ui_preferences::{UiPreferences, UiPreferencesStore};
+use nrr_ui_support::ui_preferences::{SessionPreferences, UiPreferences, UiPreferencesStore};
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -192,6 +192,7 @@ pub fn run(config: LauncherConfig) -> ExitCode {
         return nrr_broker::run_broker_server(broker_args);
     }
 
+    install_system_theme_port();
     cleanup_temp_leftovers();
     // Once-a-day GitHub release check, main GUI only (the tray rides the
     // same cache). Detached background thread: never blocks launch, 5 s
@@ -214,6 +215,16 @@ pub fn run(config: LauncherConfig) -> ExitCode {
             SecondaryOutcome::TakeOver => {
                 match SingleInstanceGuard::reclaim(config.single_instance_key) {
                     Ok(guard) => run_primary(&config, store, preferences, launch_request, guard),
+                    Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                        // The owner is alive and still holds the OS claim; it is
+                        // busy, not gone. A second primary here would be worse
+                        // than no window.
+                        eprintln!(
+                            "nrr-launcher: {} is already running but did not answer;                              not starting a second instance",
+                            config.single_instance_key
+                        );
+                        ExitCode::FAILURE
+                    }
                     Err(error) => {
                         eprintln!(
                             "nrr-launcher: could not reclaim the single-instance lock: {error}"
@@ -507,8 +518,12 @@ fn run_primary(
         // keeps the loop out of that branch and would otherwise starve a write
         // that is already due.
         prefs_writer.flush_if_due(Instant::now());
-        if let Some(idx) = line.find(PREFS_MARKER) {
-            let value = line[idx + PREFS_MARKER.len()..].trim();
+        // Anchored, like the RPC marker one file over. Searching anywhere in
+        // the line meant any output that merely CONTAINED the marker — a rule
+        // name echoed by a `console.log`, a truncated last line from a killed
+        // host — was read as a preferences snapshot.
+        if let Some(rest) = line.strip_prefix(PREFS_MARKER) {
+            let value = rest.trim();
             if !value.is_empty() {
                 // The archive path needs one field of this payload and must not
                 // race the debounced file write for it, so it gets an in-memory
@@ -604,6 +619,15 @@ fn run_primary(
 /// How long a duplicate launch waits for the primary to consume the activation
 /// file. The host polls it at 350 ms, so this is many chances to be seen.
 const ACTIVATION_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The same wait when the recorded owner process IS alive.
+///
+/// A primary only starts reading the activation file once its Qt host is up,
+/// and a cold start spends seconds before that — longer than the short budget
+/// above on its own. A double click on the shortcut therefore declared the
+/// owner unresponsive while it was merely starting, and took the lock over: two
+/// windows, two writers over one preferences file, two RPC dispatchers.
+const ACTIVATION_ACK_TIMEOUT_OWNER_ALIVE: Duration = Duration::from_secs(30);
 const ACTIVATION_ACK_POLL: Duration = Duration::from_millis(100);
 
 fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryOutcome {
@@ -648,8 +672,9 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
     // the file, and the click silently does nothing — so wait for the file to
     // disappear and report which of the two happened.
     let activation_path = default_activation_request_path();
+    let budget = activation_ack_budget(config.single_instance_key);
     let waited_from = Instant::now();
-    while waited_from.elapsed() < ACTIVATION_ACK_TIMEOUT {
+    while waited_from.elapsed() < budget {
         if !activation_path.exists() {
             diag_log(
                 tag,
@@ -668,7 +693,7 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
         &format!(
             "NRR_LAUNCHER[secondary] activation NOT consumed within {} ms — \
              the lock holder cannot show a window; taking the lock over",
-            ACTIVATION_ACK_TIMEOUT.as_millis()
+            budget.as_millis()
         ),
     );
     // Our own request would otherwise be replayed by the GUI we are about to
@@ -677,16 +702,47 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
     SecondaryOutcome::TakeOver
 }
 
+/// Wires the OS light/dark probe into `nrr-ui-support`, which is neutral and
+/// must not name an OS itself. Without this the theme resolver answers
+/// "undetected", and the GUI shows its fail-safe light theme knowing that is
+/// what it is.
+fn install_system_theme_port() {
+    #[cfg(windows)]
+    nrr_ui_support::theme::install_system_theme_port(Box::new(
+        nrr_platform_windows::system_theme::WindowsSystemTheme,
+    ));
+    #[cfg(target_os = "linux")]
+    nrr_ui_support::theme::install_system_theme_port(Box::new(
+        nrr_platform_linux::system_theme::LinuxSystemTheme,
+    ));
+}
+
+/// How long to wait for the primary to answer, decided by whether it is still
+/// there to answer at all.
+fn activation_ack_budget(instance_key: &str) -> Duration {
+    let lock_path =
+        nrr_platform_api::paths::user_runtime_dir().join(format!("{instance_key}.lock"));
+    let owner_alive = fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|content| parse_pid_from_lock_content(&content))
+        .is_some_and(is_process_alive);
+    if owner_alive {
+        ACTIVATION_ACK_TIMEOUT_OWNER_ALIVE
+    } else {
+        ACTIVATION_ACK_TIMEOUT
+    }
+}
+
 /// Path the C++ Qt host polls via `takePendingGuiRequest`.
 pub fn default_activation_request_path() -> PathBuf {
     nrr_platform_api::paths::user_runtime_dir().join("gui-activation.json")
 }
 
 pub fn write_activation_request_to_default_path(request: &LaunchRequest) -> io::Result<()> {
+    // Through the guarded creator: the activation file is DISPATCHED as intent,
+    // so the directory it lands in must be ours alone.
+    nrr_platform_api::paths::ensure_user_runtime_dir()?;
     let path = default_activation_request_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     write_activation_request(request, &path)
 }
 
@@ -753,7 +809,18 @@ fn emit_main_gui_context(
 ) -> Result<PathBuf, String> {
     let shell = gui_shell_v1();
 
-    let section_to_open = cold_start_section(request, preferences);
+    let requested_section = cold_start_section(request, preferences);
+    // The first-run gate applies to the section a cold start OPENS, not just to
+    // actions taken later: opening Rules before the wizard is finished shows a
+    // surface whose prerequisites (an adapter binding) do not exist yet. The
+    // launcher used to skip the gate entirely — it was live only in the console
+    // shell — so the redirect the model promises never happened in the shipped
+    // application.
+    let (section_to_open, _availability) = resolve_entry_section_for_first_run(
+        &shell,
+        requested_section,
+        preferences.first_run_completed,
+    );
 
     let first_run = first_run_flow_snapshot(&shell, preferences.first_run_completed, None);
 
@@ -813,12 +880,22 @@ pub fn cold_start_section(request: &LaunchRequest, preferences: &UiPreferences) 
     }
 }
 
+/// A path for one run's context file, inside the coordination directory.
+///
+/// Not the shared temp root: on Unix that is `/tmp`, writable by every local
+/// user, and this file carries the user's settings into the Qt host. Falls back
+/// to the temp root only when the guarded directory cannot be prepared, which
+/// is also the case where the launcher is about to fail anyway.
 fn generate_temp_path(prefix: &str) -> PathBuf {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    env::temp_dir().join(format!("{prefix}-{}-{timestamp}.json", std::process::id()))
+    let name = format!("{prefix}-{}-{timestamp}.json", std::process::id());
+    match nrr_platform_api::paths::ensure_user_runtime_dir() {
+        Ok(dir) => dir.join(name),
+        Err(_) => env::temp_dir().join(name),
+    }
 }
 
 /// Sweep `%TEMP%` for stale `nrr-*-context-*.json` files left behind when a
@@ -829,9 +906,11 @@ fn generate_temp_path(prefix: &str) -> PathBuf {
 /// startup so `%TEMP%` does not grow unbounded over time.
 fn cleanup_temp_leftovers() {
     const LEFTOVER_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-    let temp_dir = env::temp_dir();
+    let Ok(dir) = nrr_platform_api::paths::ensure_user_runtime_dir() else {
+        return;
+    };
     let now = std::time::SystemTime::now();
-    let Ok(entries) = fs::read_dir(&temp_dir) else {
+    let Ok(entries) = fs::read_dir(&dir) else {
         return;
     };
     for entry in entries.flatten() {
@@ -859,16 +938,19 @@ fn cleanup_temp_leftovers() {
 
 fn load_preferences_with_fallback() -> (Option<UiPreferencesStore>, UiPreferences) {
     match UiPreferencesStore::managed_local() {
-        Ok(store) => match store.load() {
-            Ok(preferences) => (Some(store), preferences),
-            Err(error) => {
-                eprintln!(
-                    "nrr-launcher: failed to load UI preferences from {}: {error}",
-                    store.path().display()
-                );
-                (Some(store), UiPreferences::default())
+        Ok(store) => {
+            let path = store.path().to_path_buf();
+            match nrr_ui_support::ui_preferences::open_for_session(store) {
+                SessionPreferences::Writable { store, preferences } => (Some(store), preferences),
+                SessionPreferences::ReadOnly { preferences, error } => {
+                    eprintln!(
+                        "nrr-launcher: failed to load UI preferences from {}: {error}                          — running read-only this session so the file is not overwritten",
+                        path.display()
+                    );
+                    (None, preferences)
+                }
             }
-        },
+        }
         Err(error) => {
             eprintln!(
                 "nrr-launcher: failed to initialise managed UI preferences storage, \
@@ -898,9 +980,11 @@ pub fn preferences_to_persist(
         Ok(updated) => Some(updated),
         Err(error) => {
             eprintln!("nrr-launcher: failed to apply prefs payload: {error}");
-            // The payload is unusable, but the surface still emitted one, so
-            // the baseline it started from is the honest thing to keep.
-            Some(base)
+            // Nothing is written. The baseline is what THIS process read at
+            // start-up, so persisting it discards whatever the other surface
+            // recorded since — a payload we could not parse is a reason to know
+            // less, never a reason to overwrite with an older picture.
+            None
         }
     }
 }
@@ -1104,8 +1188,7 @@ fn os_single_instance_port(
 
 impl SingleInstanceGuard {
     pub fn acquire(instance_key: &str) -> io::Result<Option<Self>> {
-        let lock_directory = nrr_platform_api::paths::user_runtime_dir();
-        fs::create_dir_all(&lock_directory)?;
+        let lock_directory = nrr_platform_api::paths::ensure_user_runtime_dir()?;
 
         let lock_path = lock_directory.join(format!("{instance_key}.lock"));
 
@@ -1177,20 +1260,29 @@ impl SingleInstanceGuard {
     /// is on disk and claim it. Only the duplicate-launch path calls this, after
     /// the recorded owner failed to answer an activation request.
     pub fn reclaim(instance_key: &str) -> io::Result<Self> {
-        let lock_directory = nrr_platform_api::paths::user_runtime_dir();
-        fs::create_dir_all(&lock_directory)?;
+        let lock_directory = nrr_platform_api::paths::ensure_user_runtime_dir()?;
         let lock_path = lock_directory.join(format!("{instance_key}.lock"));
         match fs::remove_file(&lock_path) {
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
-        // Take the OS claim if the previous owner has since exited. If it has
-        // not, proceed anyway: the point of a takeover is that the owner proved
-        // it cannot show a window, and a second window beats none.
+        // The OS claim is the takeover's PRECONDITION, not a nicety. Proceeding
+        // without it starts a second primary beside a live one: two writers over
+        // one preferences file, two RPC dispatchers, two UAC prompts — and,
+        // because the newcomer holds no claim, every later launch becomes
+        // another primary too, so single-instance stays broken for the session.
+        // A window we cannot open is a smaller harm than a session we cannot
+        // trust.
         let os_claim = os_single_instance_port()
             .and_then(|port| port.claim(instance_key).ok())
             .flatten();
+        if os_claim.is_none() && os_single_instance_port().is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "the running instance still holds the single-instance claim",
+            ));
+        }
         let mut lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1456,5 +1548,42 @@ mod tests {
         assert_eq!(parse_tasklist_csv_line("INFO: No tasks are running."), None);
         assert_eq!(parse_tasklist_csv_line(""), None);
         assert_eq!(parse_tasklist_csv_line("\"OnlyOneField\""), None);
+    }
+
+    #[test]
+    fn a_live_owner_earns_the_long_activation_wait() {
+        // Our own pid stands in for a primary that exists but has not reached
+        // the point of reading the activation file yet.
+        let key = format!("nrr-test-live-owner-{}", std::process::id());
+        let dir = nrr_platform_api::paths::user_runtime_dir();
+        std::fs::create_dir_all(&dir).expect("runtime dir");
+        let lock = dir.join(format!("{key}.lock"));
+        std::fs::write(
+            &lock,
+            format!(
+                "pid={}
+",
+                std::process::id()
+            ),
+        )
+        .expect("write lock");
+
+        assert_eq!(
+            super::activation_ack_budget(&key),
+            super::ACTIVATION_ACK_TIMEOUT_OWNER_ALIVE,
+            "a starting primary must not be declared unresponsive"
+        );
+
+        std::fs::write(
+            &lock, "pid=1
+",
+        )
+        .expect("write lock");
+        // Pid 1 is the system idle process on Windows and init on Linux — never
+        // our launcher, so the owner counts as gone.
+        let dead_owner = super::activation_ack_budget(&key);
+        assert!(dead_owner <= super::ACTIVATION_ACK_TIMEOUT_OWNER_ALIVE);
+
+        let _ = std::fs::remove_file(&lock);
     }
 }

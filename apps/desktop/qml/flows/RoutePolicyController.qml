@@ -39,6 +39,24 @@ QtObject {
         }
         var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
         root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            // The write below is a FULL replacement built on top of what was
+            // just read. A failed read (a timeout answers ok=false, payload
+            // null) left `cur` empty, so the request was assembled from
+            // ROUTE_POLICY_FIELD_DEFAULTS — and those turn the kill switch,
+            // block-all and the DoH lockdown OFF. Any toggle in Routing could
+            // therefore disarm leak protection because one read timed out. The
+            // decision is parked instead, exactly like one made while the
+            // service is down: it is still what the user asked for.
+            if (!ok || !p) {
+                root._recordOfflineRoutingIntent("route-policy", key, value)
+                var readCode = String(code || "")
+                var readLabel = (typeof root.ipcErrorLabel === "function")
+                    ? root.ipcErrorLabel(readCode) : readCode
+                root.statusLine = root.tr("status.route-policy-read-failed",
+                    "Could not read the current routing policy, so nothing was "
+                    + "changed. The setting is saved and will be sent again: ") + readLabel
+                return
+            }
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
             var req = root._buildFullRoutePolicyReq(cur)
             req[key] = value
@@ -274,6 +292,54 @@ QtObject {
                 "Administrator approval was declined; leak protection was not changed."),
             failPrefix: root.tr("status.kill-switch-failed",
                 "Could not update leak protection: ")
+        })
+    }
+
+    /// "Stop asking about local networks I have not seen before." Off by
+    /// default: keeping a segment reachable is a hole the user should open
+    /// knowingly. It silences the QUESTION, not the record — every network is
+    /// still listed in Settings and any of them can be refused there, and
+    /// turning this back off asks again.
+    /// Zone-vs-exact-address order (the rule model's tier 3). The engine has
+    /// always taken it as a parameter; nothing supplied one until the setting
+    /// was stored per user.
+    function applyZonePriorityOverIp(enabled) {
+        var want = enabled === true
+        _applyRoutePolicyKey("zone-priority-over-ip", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ zonePriorityOverIp: v })
+            },
+            ok: want
+                ? root.tr("status.zone-priority-on",
+                    "A zone rule now wins over an exact address rule inside it.")
+                : root.tr("status.zone-priority-off",
+                    "An exact address rule now wins over the zone it sits in."),
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not saved."),
+            failPrefix: root.tr("status.route-policy-failed",
+                "Could not save the setting to the service: ")
+        })
+    }
+
+    function applyLocalNetworksAutoAccept(enabled) {
+        var want = enabled === true
+        _applyRoutePolicyKey("local-networks-auto-accept", want, {
+            onApplied: function(v) {
+                root.updateRoutingState({ localNetworksAutoAccept: v })
+                if (v) {
+                    root.pendingLocalNetworks = []
+                    root.uiRevision += 1
+                }
+            },
+            ok: want
+                ? root.tr("status.local-network-auto-accept-on",
+                    "New local networks stay reachable without asking. You can still refuse any of them in Settings.")
+                : root.tr("status.local-network-auto-accept-off",
+                    "You will be asked about each new local network again."),
+            uac: root.tr("status.kill-switch-uac-declined",
+                "Administrator approval was declined; leak protection was not changed."),
+            failPrefix: root.tr("status.local-network-offer-failed",
+                "Could not save the answer; it will be asked again.")
         })
     }
 

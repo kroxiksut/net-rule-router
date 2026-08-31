@@ -10,51 +10,44 @@ cn              # КНР / People's Republic of China (.cn)
 中國             # China traditional (.中國, Punycode xn--fiqz9s)
 
 --- Domains
-# Core Chinese ecosystem
-*.qq.com
-*.wechat.com
-*.weixin.qq.com
-*.qpic.cn
+*.qq.com  # Core Chinese ecosystem
+*.wechat.com  # Core Chinese ecosystem
+*.weixin.qq.com  # Core Chinese ecosystem
+*.qpic.cn  # Core Chinese ecosystem
 
-# Tencent products
-*.tencent.com
-*.wegame.com
+*.tencent.com  # Tencent products
+*.wegame.com  # Tencent products
 
-# Alibaba ecosystem
-*.alibaba.com
-*.taobao.com
-*.tmall.com
-*.alipay.com
-*.aliexpress.com
+*.alibaba.com  # Alibaba ecosystem
+*.taobao.com  # Alibaba ecosystem
+*.tmall.com  # Alibaba ecosystem
+*.alipay.com  # Alibaba ecosystem
+*.aliexpress.com  # Alibaba ecosystem
 
-# Baidu ecosystem
-*.baidu.com
-*.bdimg.com
+*.baidu.com  # Baidu ecosystem
+*.bdimg.com  # Baidu ecosystem
 
-# ByteDance / Douyin ecosystem
-*.douyin.com
-*.ixigua.com
-*.bytedance.com
+*.douyin.com  # ByteDance / Douyin ecosystem
+*.ixigua.com  # ByteDance / Douyin ecosystem
+*.bytedance.com  # ByteDance / Douyin ecosystem
 
-# Other major domestic platforms
-*.bilibili.com
-*.bilibili.tv
-*.jd.com
-*.xiaomi.com
-*.huawei.com
+*.bilibili.com  # Other major domestic platforms
+*.bilibili.tv  # Other major domestic platforms
+*.jd.com  # Other major domestic platforms
+*.xiaomi.com  # Other major domestic platforms
+*.huawei.com  # Other major domestic platforms
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-# Common domestic apps (best-effort process names)
-WeChat.exe
-QQ.exe
-TIM.exe
-TencentMeeting.exe
-WeGame.exe
-AliWangWang.exe
-DingTalk.exe
+WeChat.exe  # Common domestic apps (best-effort process names)
+QQ.exe  # Common domestic apps (best-effort process names)
+TIM.exe  # Common domestic apps (best-effort process names)
+TencentMeeting.exe  # Common domestic apps (best-effort process names)
+WeGame.exe  # Common domestic apps (best-effort process names)
+AliWangWang.exe  # Common domestic apps (best-effort process names)
+DingTalk.exe  # Common domestic apps (best-effort process names)
 
 --- Linux
 # (reserved - not applied on Windows)

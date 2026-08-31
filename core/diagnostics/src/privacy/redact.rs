@@ -116,8 +116,15 @@ fn extract_etld1(hostname: &str) -> Option<String> {
     if hostname.is_empty() {
         return None;
     }
-    // Reject bare IPs.
-    if hostname.parse::<Ipv4Addr>().is_ok() {
+    // Reject bare IPs — v6 as well as v4. A v6 literal has no dots, so it used
+    // to fall through to the single-label branch below and be returned WHOLE by
+    // the very function meant to shorten it. A bracketed literal (`[::1]`) is
+    // the URL spelling of the same thing.
+    let unbracketed = hostname
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(hostname);
+    if unbracketed.parse::<std::net::IpAddr>().is_ok() {
         return None;
     }
     let labels: Vec<&str> = hostname.split('.').collect();
@@ -196,6 +203,42 @@ pub fn redact_process_path(path: &str, mode: RedactionMode) -> Redacted<String> 
     }
 }
 
+/// Masks user-name segments in every path-like token of a free-text blob.
+///
+/// Captured stderr is the one section that is copied verbatim — a panic
+/// message carries `C:\Users\<name>\...` and the archive's own manifest
+/// promises no credential-like content. Filename-only reduction would gut a
+/// backtrace, so the username is masked and the rest of the path survives.
+/// `DeveloperLocal` keeps the text byte-for-byte.
+#[must_use]
+pub fn mask_user_paths_in_text(text: &str, mode: RedactionMode) -> String {
+    if mode.shows_full_path() {
+        return text.to_string();
+    }
+    let is_boundary =
+        |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '(' | ')');
+    let mut out = String::with_capacity(text.len());
+    let mut token = String::new();
+    let flush = |token: &mut String, out: &mut String| {
+        if token.contains('\\') || token.contains('/') {
+            out.push_str(&mask_path_username(token));
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in text.chars() {
+        if is_boundary(c) {
+            flush(&mut token, &mut out);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut token, &mut out);
+    out
+}
+
 /// Extracts the filename (last path component) from a Windows or Unix path.
 fn extract_filename(path: &str) -> Option<String> {
     // Try Windows-style separator first, then Unix.
@@ -209,28 +252,45 @@ fn extract_filename(path: &str) -> Option<String> {
 
 /// Replaces the username/home directory segment in a path with `<masked-user>`.
 ///
-/// Handles common Windows patterns:
-/// - `C:\Users\username\...` → `C:\Users\<masked-user>\...`
-/// - `C:\Documents and Settings\username\...` → `C:\Documents and Settings\<masked-user>\...`
+/// Matched by the home-directory MARKER segment, not by a whole prefix on one
+/// drive: the two hard-coded `C:` prefixes let `D:\Users\john`, `/home/john` and
+/// `\\server\home\john` through with the name intact — into the archive that gets
+/// sent to support, on the platform this product is going cross to.
 fn mask_path_username(path: &str) -> String {
-    // Case-insensitive match for Windows Users dir.
-    let lower = path.to_ascii_lowercase();
-    for prefix in &[r"c:\users\", r"c:\documents and settings\"] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            // Find the next separator to locate the username segment end.
-            let sep_pos = rest.find(['\\', '/']);
-            let prefix_len = prefix.len();
-            return match sep_pos {
-                Some(pos) => format!(
-                    "{}<masked-user>{}",
-                    &path[..prefix_len],
-                    &path[prefix_len + pos..]
-                ),
-                None => format!("{}<masked-user>", &path[..prefix_len]),
-            };
+    /// Segments after which the NEXT segment is a user name.
+    const HOME_MARKERS: &[&str] = &["users", "documents and settings", "home"];
+    let is_sep = |c: char| c == '\\' || c == '/';
+    // Walk the segments, keeping byte offsets so the original spelling (drive
+    // letter, separator flavour, case) survives verbatim around the mask.
+    let mut start = 0usize;
+    let mut previous: Option<&str> = None;
+    let mut out = String::with_capacity(path.len());
+    let mut last_copied = 0usize;
+    let is_marker = |seg: &str| HOME_MARKERS.contains(&seg.to_ascii_lowercase().as_str());
+    for (idx, ch) in path.char_indices() {
+        if !is_sep(ch) {
+            continue;
         }
+        let segment = &path[start..idx];
+        if previous.is_some_and(is_marker) && !segment.is_empty() {
+            out.push_str(&path[last_copied..start]);
+            out.push_str("<masked-user>");
+            last_copied = idx;
+            previous = None;
+        } else if !segment.is_empty() {
+            previous = Some(segment);
+        }
+        start = idx + ch.len_utf8();
     }
-    path.to_string()
+    // The path may END with the user segment (no trailing separator).
+    let tail = &path[start..];
+    if previous.is_some_and(is_marker) && !tail.is_empty() {
+        out.push_str(&path[last_copied..start]);
+        out.push_str("<masked-user>");
+        return out;
+    }
+    out.push_str(&path[last_copied..]);
+    out
 }
 
 // ── Adapter name redaction ────────────────────────────────────────────────────
@@ -254,8 +314,13 @@ pub fn redact_adapter_id(
     match user_label {
         Some(label) if !label.is_empty() => Redacted::Value(label.to_string()),
         _ => {
-            let shortened = if technical_id.len() > 8 {
-                format!("{}...", &technical_id[..8])
+            // By CHARACTERS, not bytes: an adapter name where a multi-byte
+            // character straddles the eighth byte (`以太网 2`, a Cyrillic
+            // connection name) panicked here — in a crate that denies
+            // `unwrap`, on the path that builds a support archive.
+            let shortened = if technical_id.chars().count() > 8 {
+                let head: String = technical_id.chars().take(8).collect();
+                format!("{head}...")
             } else {
                 technical_id.to_string()
             };
@@ -290,6 +355,51 @@ pub fn redact_resolver_source(
 
 #[cfg(test)]
 mod tests {
+
+    /// The archive goes to support. A home directory on any drive, on any
+    /// platform, or on a share must lose the user name — two hard-coded `C:`
+    /// prefixes did not.
+    #[test]
+    fn a_home_directory_loses_the_user_name_wherever_it_lives() {
+        let cases = [
+            (r"C:\Users\john\AppData", r"C:\Users\<masked-user>\AppData"),
+            (
+                r"D:\Users\john\rules.txt",
+                r"D:\Users\<masked-user>\rules.txt",
+            ),
+            (
+                r"C:\Documents and Settings\john\x",
+                r"C:\Documents and Settings\<masked-user>\x",
+            ),
+            ("/home/john/.config/nrr", "/home/<masked-user>/.config/nrr"),
+            ("/Users/john/Library", "/Users/<masked-user>/Library"),
+            (
+                r"\\server\home\john\share",
+                r"\\server\home\<masked-user>\share",
+            ),
+            // No trailing separator: the user segment is the last one.
+            ("/home/john", "/home/<masked-user>"),
+            // Nothing that looks like a home directory is left alone.
+            (
+                r"C:\Program Files\NetRuleRouter",
+                r"C:\Program Files\NetRuleRouter",
+            ),
+        ];
+        for (input, want) in cases {
+            assert_eq!(mask_path_username(input), want, "input: {input}");
+        }
+    }
+
+    /// A v6 literal has no dots, so the eTLD+1 shortener used to hand it back
+    /// whole — through the very path that exists to shorten it.
+    #[test]
+    fn an_ipv6_literal_is_not_mistaken_for_a_single_label_hostname() {
+        assert_eq!(extract_etld1("2001:db8::1"), None);
+        assert_eq!(extract_etld1("[2001:db8::1]"), None);
+        assert_eq!(extract_etld1("::1"), None);
+        // A real single-label hostname still passes.
+        assert_eq!(extract_etld1("localhost"), Some("localhost".to_string()));
+    }
     use super::*;
 
     // ── Redacted<T> ──────────────────────────────────────────────────────────

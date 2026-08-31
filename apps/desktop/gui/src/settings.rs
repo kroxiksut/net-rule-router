@@ -1,5 +1,5 @@
 use nrr_shared::{AppShellModel, SettingAvailability};
-use nrr_ui_support::ui_preferences::{UiPreferences, UiPreferencesStore};
+use nrr_ui_support::ui_preferences::{SessionPreferences, UiPreferences, UiPreferencesStore};
 
 pub fn render_settings_screen(shell: &AppShellModel, preferences: UiPreferences) {
     println!("Settings screen (standalone shell view):");
@@ -30,17 +30,19 @@ pub fn render_settings_screen(shell: &AppShellModel, preferences: UiPreferences)
 
 pub fn load_preferences_with_fallback() -> (Option<UiPreferencesStore>, UiPreferences) {
     match UiPreferencesStore::managed_local() {
-        Ok(store) => match store.load() {
-            Ok(preferences) => (Some(store), preferences),
-            Err(error) => {
-                eprintln!(
-                    "Failed to load UI preferences from managed storage ({}): {}",
-                    store.path().display(),
-                    error
-                );
-                (Some(store), UiPreferences::default())
+        Ok(store) => {
+            let path = store.path().to_path_buf();
+            match nrr_ui_support::ui_preferences::open_for_session(store) {
+                SessionPreferences::Writable { store, preferences } => (Some(store), preferences),
+                SessionPreferences::ReadOnly { preferences, error } => {
+                    eprintln!(
+                        "Failed to load UI preferences from managed storage ({}): {error}                          — running read-only this session so the file is not overwritten",
+                        path.display(),
+                    );
+                    (None, preferences)
+                }
             }
-        },
+        }
         Err(error) => {
             eprintln!(
                 "Failed to initialize managed UI preferences storage, using defaults: {}",

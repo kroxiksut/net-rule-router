@@ -18,9 +18,11 @@
 //! **logic unit-testable** with a fake runner — the OS is exercised only by the
 //! thin, Windows-gated [`PowerShellRunner`].
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use nrr_platform_api::adapters::names_indicate_virtual_machine_network;
 use nrr_platform_api::dns::UpstreamDnsCandidate;
+use nrr_platform_api::fake_ip::FakeIpPoolConfig;
 
 use crate::error::PlatformError;
 
@@ -93,11 +95,18 @@ fn flush_script() -> &'static str {
     "Clear-DnsClientCache"
 }
 
-/// PowerShell listing candidate upstream IPv4 DNS servers as `<ifIndex> <server>`
-/// lines, excluding our own loopback listener. Emits the DNS server(s) of the
-/// interface that owns the DEFAULT ROUTE (the active egress, lowest route
-/// metric) FIRST, then the servers of every CONNECTED interface as a fallback.
-/// The interface column lets the caller prefer the link its routing policy uses.
+/// PowerShell listing candidate upstream IPv4 DNS servers as tab-separated
+/// `<ifIndex> <server> <adapter description> <adapter name>` lines. Emits the
+/// DNS server(s) of the interface that owns the DEFAULT ROUTE (the active
+/// egress, lowest route metric) FIRST, then the servers of every CONNECTED
+/// interface as a fallback. The interface column lets the caller prefer the link
+/// its routing policy uses.
+///
+/// It rejects nothing on its own: WHICH of these is a resolver we may forward to
+/// is a policy question, and it is decided in Rust by [`is_usable_upstream`],
+/// against the same adapter classifier the kill-switch and the traffic counter
+/// use. The two name columns exist for exactly that — a filter spelled here
+/// would be a second, invisible definition of "adapter we ignore".
 ///
 /// Both halves are gated on `ConnectionState -eq 'Connected'`: a disconnected
 /// adapter — an unplugged NIC, an idle Wi-Fi radio, a Bluetooth PAN — keeps its
@@ -132,10 +141,11 @@ fn upstream_dns_script() -> &'static str {
      if ($idx -and ($live -contains $idx)) { $order += $idx }; \
      $order += $live; \
      foreach ($i in $order) { \
+       $a = Get-NetAdapter -InterfaceIndex $i -IncludeHidden | Select-Object -First 1; \
        Get-DnsClientServerAddress -InterfaceIndex $i -AddressFamily IPv4 | \
        Select-Object -ExpandProperty ServerAddresses | \
-       Where-Object { $_ -and $_ -ne '127.0.0.1' } | \
-       ForEach-Object { \"$i $_\" } \
+       Where-Object { $_ } | \
+       ForEach-Object { \"$i`t$_`t$($a.InterfaceDescription)`t$($a.Name)\" } \
      }"
 }
 
@@ -156,27 +166,70 @@ pub fn capture_upstream_dns_candidates_v4<R: CommandRunner>(
     }
     let mut seen: Vec<UpstreamDnsCandidate> = Vec::new();
     for line in out.stdout.lines() {
-        let Some(candidate) = parse_candidate_line(line) else {
+        let Some(parsed) = parse_candidate_line(line) else {
             continue;
         };
-        if !seen.iter().any(|c| c.server == candidate.server) {
-            seen.push(candidate);
+        if !is_usable_upstream(&parsed) {
+            continue;
+        }
+        if !seen.iter().any(|c| c.server == parsed.server) {
+            seen.push(UpstreamDnsCandidate::new(parsed.index, parsed.server));
         }
     }
     seen
 }
 
-/// `"17 192.168.0.1"` → candidate. A bare address (no interface column) still
-/// parses, so a future/degraded emitter never silently yields nothing.
-fn parse_candidate_line(line: &str) -> Option<UpstreamDnsCandidate> {
-    let line = line.trim();
-    let (index, addr) = match line.split_once(char::is_whitespace) {
-        Some((idx, rest)) => (idx.trim().parse::<u32>().ok(), rest.trim()),
-        None => (None, line),
+/// One emitted candidate line, split into its columns.
+struct CandidateLine<'a> {
+    index: Option<u32>,
+    server: Ipv4Addr,
+    description: &'a str,
+    friendly_name: &'a str,
+}
+
+/// `"17\t192.168.0.1\tIntel(R) I219-V\tEthernet"` → columns. A bare address, or
+/// the older space-separated `<index> <addr>` shape, still parses (with no
+/// names), so a degraded emitter never silently yields nothing.
+fn parse_candidate_line(line: &str) -> Option<CandidateLine<'_>> {
+    let mut columns = line.trim_end().split('\t');
+    let head = columns.next()?.trim();
+    let (index, addr) = match columns.next() {
+        Some(addr) => (head.parse::<u32>().ok(), addr.trim()),
+        None => match head.split_once(char::is_whitespace) {
+            Some((idx, rest)) => (idx.trim().parse::<u32>().ok(), rest.trim()),
+            None => (None, head),
+        },
     };
-    let server = addr.parse::<Ipv4Addr>().ok()?;
-    (!server.is_loopback() && !server.is_unspecified() && !server.is_broadcast())
-        .then_some(UpstreamDnsCandidate::new(index, server))
+    Some(CandidateLine {
+        index,
+        server: addr.parse::<Ipv4Addr>().ok()?,
+        description: columns.next().unwrap_or_default().trim(),
+        friendly_name: columns.next().unwrap_or_default().trim(),
+    })
+}
+
+/// Whether this line names a resolver we may actually forward to.
+///
+/// Three ways it is not. The address is not routable. The address comes out of
+/// our own fake-IP pool — our TUN carries the lowest interface metric on the
+/// box, so it heads this very list, and forwarding there points the resolver at
+/// itself. Or the adapter is a hypervisor's host-only / NAT network, whose DNS
+/// answers its guests and black-holes everything else: a NAT adapter that has
+/// been given a resolver looks exactly like a live link here, and every query
+/// then burns a probe timeout.
+///
+/// Names we could not read leave the gate open — an unprobed candidate beats no
+/// candidate, and the caller probes. Dropping the last real upstream would cost
+/// general name resolution, which is the worse failure by far.
+fn is_usable_upstream(line: &CandidateLine<'_>) -> bool {
+    let server = line.server;
+    if server.is_loopback() || server.is_unspecified() || server.is_broadcast() {
+        return false;
+    }
+    if FakeIpPoolConfig::is_default_pool_addr(IpAddr::V4(server)) {
+        return false;
+    }
+    !names_indicate_virtual_machine_network(line.description, line.friendly_name)
 }
 
 /// The preferred upstream — the head of [`capture_upstream_dns_candidates_v4`].
@@ -221,11 +274,21 @@ pub fn clear_orphan_redirect<R: CommandRunner>(runner: &R) -> Result<usize, Plat
     Ok(removed_count(&out.stdout))
 }
 
-/// Echo our marker iff a rule of ours is present (empty stdout otherwise).
-fn verify_script(marker: &str) -> String {
+/// Echo the namespace our redirect governs iff the OS is ACTUALLY resolving
+/// through `listener_ip` (empty stdout otherwise).
+///
+/// Reads `Get-DnsClientNrptPolicy` — the table in force — and deliberately not
+/// `Get-DnsClientNrptRule`, which reads back the very configuration we just
+/// wrote and therefore can only ever answer "present", never "in effect".
+/// Windows accepts the write and evaluates the table afterwards; a rule it
+/// rejects stays listed as configured, and the rejection surfaces nowhere except
+/// a DNS-Client event.
+fn effective_policy_script(listener_ip: &str) -> String {
     format!(
-        "Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{marker}' }} | \
-         Select-Object -First 1 -ExpandProperty Comment"
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-DnsClientNrptPolicy | \
+         Where-Object {{ $_.NameServers -contains '{listener_ip}' }} | \
+         Select-Object -First 1 -ExpandProperty Namespace"
     )
 }
 
@@ -252,10 +315,38 @@ impl<R: CommandRunner> SystemDnsRedirectPort for NrptDnsRedirect<R> {
                 detail: format!("NRPT add failed: {}", out.stderr.trim()),
             });
         }
-        Ok(RedirectHandle {
+        let handle = RedirectHandle {
             marker: NRPT_MARKER.to_string(),
             listener,
-        })
+        };
+        // The cmdlet exiting 0 says the rule was WRITTEN, not that the OS honours
+        // it. Confirm against the table in force, and take a rejected rule back
+        // out: left in place it buys nothing and leaves the DNS client holding a
+        // policy it refuses, while the resolver above believes Mode B is armed.
+        match self.verify(&handle) {
+            Ok(RedirectState::Active) => Ok(handle),
+            Ok(RedirectState::Inactive) => {
+                let _ = self.runner.run_powershell(&remove_script(NRPT_MARKER));
+                Err(PlatformError::Transient {
+                    operation: "nrpt.redirect_to",
+                    detail: "NRPT rule was written but is absent from the policy table \
+                             Windows is using; the rule was withdrawn and system DNS \
+                             left untouched"
+                        .to_string(),
+                })
+            }
+            // Could not ask. Keep the redirect rather than tear down a working
+            // one: an unreadable answer is not a rejection, and treating it as
+            // one would disable Mode B wherever the query is unavailable.
+            Err(error) => {
+                tracing::warn!(
+                    target: "nrr::dns-redirect",
+                    "NRPT redirect installed but could not be confirmed against the \
+                     effective policy table ({error}); proceeding as armed",
+                );
+                Ok(handle)
+            }
+        }
     }
 
     fn restore(&self, handle: &RedirectHandle) -> Result<(), PlatformError> {
@@ -270,11 +361,21 @@ impl<R: CommandRunner> SystemDnsRedirectPort for NrptDnsRedirect<R> {
     }
 
     fn verify(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
-        let out = self.runner.run_powershell(&verify_script(&handle.marker))?;
-        Ok(if out.stdout.contains(&handle.marker) {
-            RedirectState::Active
-        } else {
+        let ip = handle.listener.ip().to_string();
+        let out = self.runner.run_powershell(&effective_policy_script(&ip))?;
+        // A query that did not run answers nothing — reporting that as `Inactive`
+        // would make "we could not look" indistinguishable from "the OS is not
+        // using it", which is the exact conflation this method exists to end.
+        if !out.success {
+            return Err(PlatformError::Transient {
+                operation: "nrpt.verify",
+                detail: format!("NRPT policy query failed: {}", out.stderr.trim()),
+            });
+        }
+        Ok(if out.stdout.trim().is_empty() {
             RedirectState::Inactive
+        } else {
+            RedirectState::Active
         })
     }
 
@@ -416,6 +517,61 @@ mod tests {
         }
     }
 
+    /// Answers each script separately: the first rule whose needle the script
+    /// contains wins, else `default`. Keyed on CONTENT rather than call order,
+    /// so reordering the calls cannot make a test pass for the wrong reason.
+    struct ScriptedRunner {
+        rules: Vec<(&'static str, CommandOutput)>,
+        default: CommandOutput,
+        scripts: Mutex<Vec<String>>,
+    }
+    impl ScriptedRunner {
+        fn new(rules: Vec<(&'static str, CommandOutput)>) -> Self {
+            Self {
+                rules,
+                default: ok(""),
+                scripts: Mutex::new(Vec::new()),
+            }
+        }
+        fn scripts(&self) -> Vec<String> {
+            self.scripts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+    impl CommandRunner for ScriptedRunner {
+        fn run_powershell(&self, script: &str) -> Result<CommandOutput, PlatformError> {
+            self.scripts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(script.to_string());
+            Ok(self
+                .rules
+                .iter()
+                .find(|(needle, _)| script.contains(needle))
+                .map_or_else(|| self.default.clone(), |(_, out)| out.clone()))
+        }
+    }
+
+    /// A runner whose add succeeds and whose effective-policy query reports the
+    /// catch-all in force — the ordinary, accepted case.
+    fn accepting_runner() -> ScriptedRunner {
+        ScriptedRunner::new(vec![("Get-DnsClientNrptPolicy", ok(".\n"))])
+    }
+
+    /// How many scripts are a STANDALONE withdrawal. `add_script` names the same
+    /// cmdlet to clear a stale rule of ours before adding, so a bare "mentions
+    /// Remove-DnsClientNrptRule" would be true of every redirect ever attempted.
+    fn withdrawals(scripts: &[String]) -> usize {
+        scripts
+            .iter()
+            .filter(|s| {
+                s.contains("Remove-DnsClientNrptRule") && !s.contains("Add-DnsClientNrptRule")
+            })
+            .count()
+    }
+
     fn listener() -> SocketAddr {
         "127.0.0.1:53".parse().unwrap()
     }
@@ -493,12 +649,55 @@ mod tests {
 
     #[test]
     fn redirect_runs_add_and_returns_handle() {
-        let runner = FakeRunner::new(ok(""));
-        let h = NrptDnsRedirect::new(runner)
-            .redirect_to(listener())
-            .expect("redirect");
+        let redirect = NrptDnsRedirect::new(accepting_runner());
+        let h = redirect.redirect_to(listener()).expect("redirect");
         assert_eq!(h.marker, NRPT_MARKER);
         assert_eq!(h.listener, listener());
+        let scripts = redirect.runner.scripts();
+        assert!(scripts[0].contains("Add-DnsClientNrptRule"));
+        assert!(
+            scripts[1].contains("Get-DnsClientNrptPolicy"),
+            "a successful add must still be confirmed against the table in force"
+        );
+    }
+
+    #[test]
+    fn redirect_withdraws_a_rule_the_os_does_not_honour() {
+        // Add reports success (the rule IS written), the effective table comes
+        // back empty: Windows evaluated the rule and refused it.
+        let redirect = NrptDnsRedirect::new(ScriptedRunner::new(vec![(
+            "Get-DnsClientNrptPolicy",
+            ok("   \n"),
+        )]));
+        let err = redirect.redirect_to(listener()).unwrap_err();
+        assert!(matches!(err, PlatformError::Transient { .. }));
+        assert_eq!(
+            withdrawals(&redirect.runner.scripts()),
+            1,
+            "a rule the OS refuses must not be left behind for the next boot to trip over"
+        );
+    }
+
+    #[test]
+    fn redirect_survives_an_unreadable_policy_table() {
+        // The query itself failed. That is not a rejection, and treating it as
+        // one would disable Mode B on every host where the cmdlet is missing.
+        let redirect = NrptDnsRedirect::new(ScriptedRunner::new(vec![(
+            "Get-DnsClientNrptPolicy",
+            CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "cmdlet not found".into(),
+            },
+        )]));
+        redirect
+            .redirect_to(listener())
+            .expect("an unreadable answer must not tear down a working redirect");
+        assert_eq!(
+            withdrawals(&redirect.runner.scripts()),
+            0,
+            "nothing was refused, so nothing may be withdrawn"
+        );
     }
 
     #[test]
@@ -545,20 +744,80 @@ mod tests {
     }
 
     #[test]
-    fn verify_reads_marker_presence_from_stdout() {
+    fn verify_asks_the_effective_policy_table_not_our_own_write() {
         let handle = RedirectHandle {
             marker: NRPT_MARKER.to_string(),
             listener: listener(),
         };
-        // Rule present → Active.
-        let active = NrptDnsRedirect::new(FakeRunner::new(ok(NRPT_MARKER)))
-            .verify(&handle)
-            .expect("verify");
-        assert_eq!(active, RedirectState::Active);
-        // Empty stdout → Inactive.
-        let inactive = NrptDnsRedirect::new(FakeRunner::new(ok("")))
-            .verify(&handle)
-            .expect("verify");
-        assert_eq!(inactive, RedirectState::Inactive);
+        let redirect = NrptDnsRedirect::new(FakeRunner::new(ok(".\n")));
+        assert_eq!(
+            redirect.verify(&handle).expect("verify"),
+            RedirectState::Active
+        );
+        let script = &redirect.runner.scripts()[0];
+        assert!(
+            script.contains("Get-DnsClientNrptPolicy"),
+            "reading back our own configuration can only answer 'present'"
+        );
+        assert!(
+            !script.contains("Get-DnsClientNrptRule"),
+            "the configured table is the wrong source for 'is it in effect'"
+        );
+        assert!(
+            script.contains("127.0.0.1"),
+            "the redirect is ours only if the policy points at OUR listener"
+        );
+
+        // Nothing in force → Inactive.
+        assert_eq!(
+            NrptDnsRedirect::new(FakeRunner::new(ok("")))
+                .verify(&handle)
+                .expect("verify"),
+            RedirectState::Inactive
+        );
+
+        // A query that could not run is an error, not "Inactive".
+        assert!(NrptDnsRedirect::new(FakeRunner::new(CommandOutput {
+            success: false,
+            stdout: String::new(),
+            stderr: "denied".into(),
+        }))
+        .verify(&handle)
+        .is_err());
+    }
+
+    #[test]
+    fn upstream_candidates_drop_hypervisor_networks_and_our_own_pool() {
+        let runner = FakeRunner::new(ok(concat!(
+            "16\t192.168.0.1\tIntel(R) Ethernet Connection (2) I219-V\tEthernet\n",
+            "24\t1.1.1.1\tTAP-Windows Adapter V9\thidemy.name VPN OpenVPN Adapter\n",
+            "4\t192.168.140.2\tVMware Virtual Ethernet Adapter for VMnet8\tVMware Network Adapter VMnet8\n",
+            "28\t172.20.80.1\tHyper-V Virtual Ethernet Adapter\tvEthernet (Default Switch)\n",
+            "14\t192.168.56.1\tVirtualBox Host-Only Ethernet Adapter\tVirtualBox Host-Only Network\n",
+            "57\t198.18.0.1\tNetRuleRouter Tunnel\tNetRuleRouter\n",
+        )));
+        assert_eq!(
+            capture_upstream_dns_candidates_v4(&runner),
+            vec![
+                UpstreamDnsCandidate::new(Some(16), "192.168.0.1".parse().unwrap()),
+                UpstreamDnsCandidate::new(Some(24), "1.1.1.1".parse().unwrap()),
+            ],
+            "a hypervisor's NAT/host-only resolver answers its guests and black-holes \
+             us; our own TUN would point the resolver at itself; a VPN's resolver is \
+             a legitimate upstream and must survive"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_adapter_still_yields_its_candidate() {
+        // Names we could not read must not cost us the last real upstream.
+        let runner = FakeRunner::new(ok("16\t192.168.0.1\t\t\n"));
+        assert_eq!(
+            capture_upstream_dns_candidates_v4(&runner),
+            vec![UpstreamDnsCandidate::new(
+                Some(16),
+                "192.168.0.1".parse().unwrap()
+            )]
+        );
     }
 }

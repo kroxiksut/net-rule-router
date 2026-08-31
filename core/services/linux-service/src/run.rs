@@ -129,10 +129,13 @@ pub fn run() -> ExitCode {
     // the moment a user approves a change. Two stacks would mean two readers of
     // one table, each replacing what the other just wrote.
     let adapter_source = Arc::new(nrr_platform_linux::adapters::LinuxAdapterSource);
-    let policy_stack =
-        crate::runtime_deps::build_policy_stack(&artifacts, Arc::clone(&adapter_source));
+    let policy_stack = crate::runtime_deps::build_policy_stack(
+        &artifacts,
+        Arc::clone(&adapter_source),
+        Arc::clone(&event_bus),
+    );
 
-    let ipc_server = crate::runtime_deps::build_ipc_server(
+    let ipc = crate::runtime_deps::build_ipc_server(
         &artifacts,
         Arc::clone(&health),
         Arc::clone(&event_bus),
@@ -147,7 +150,7 @@ pub fn run() -> ExitCode {
     let deps = crate::runtime_deps::build_runtime_deps(
         &artifacts,
         Arc::clone(&health),
-        ipc_server,
+        ipc,
         event_bus,
         policy_stack,
         dns_observation,

@@ -6,7 +6,7 @@
 //! A `UnixStream` is already `Read + Write + Send`, so — unlike the Windows
 //! named pipe, which needs `FILE_FLAG_OVERLAPPED` + a `PipeIo` adapter + a
 //! reader sub-thread to avoid kernel I/O-lock serialisation — the same generic
-//! wire codec (`nrr_ipc_client::wire`) reads and writes the socket directly.
+//! wire codec (`nrr_shared::ipc_wire`) reads and writes the socket directly.
 //! The client side (`nrr-ipc-client::client_unix`) already proved this; this is
 //! its server mirror.
 //!
@@ -14,10 +14,14 @@
 //!
 //! - **No exe-basename whitelist / no per-connection reject.** The Windows pipe
 //!   accepts only `NetRuleRouter(.Tray).exe`; on Linux the connecting exe is not
-//!   part of the peer credential, so the gate is the `0700`
-//!   `RuntimeDirectory=netrulerouter` (systemd) that restricts who can reach the
-//!   socket at all. `peer_cred::classify_unix_client` resolves identity but
-//!   never rejects on an exe basis.
+//!   part of the peer credential, and there is no directory gate either: the
+//!   daemon is root and its clients are ordinary users, so a `0700` runtime
+//!   directory would lock out every client the product has. Any local user may
+//!   reach the socket. That is not authority - identity is SO_PEERCRED
+//!   (`unix:uid:<n>`), the rules a caller can touch are their own principal's,
+//!   and privileged operations go through polkit.
+//!   `peer_cred::classify_unix_client` resolves identity but never rejects on
+//!   an exe basis.
 //! - **Client profile defaults to `GuiInteractive`.** The Windows server derives
 //!   `IpcClientProfile` from the exe basename; peer-cred cannot, so every caller
 //!   is treated as the full-capability profile. Authorization that matters flows
@@ -44,13 +48,14 @@
 
 #![cfg(target_os = "linux")]
 
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use nrr_ipc_client::wire::{read_frame, write_frame};
 use nrr_platform_linux::peer_cred::classify_unix_client;
 use nrr_service_runtime::ipc_push::{
     extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
@@ -61,6 +66,7 @@ use nrr_service_runtime::{
     UserPrincipal,
 };
 use nrr_shared::ipc::IpcClientProfile;
+use nrr_shared::ipc_wire::{read_frame, write_frame};
 
 /// Canonical socket path — the cross-OS endpoint SSOT resolves to the Unix
 /// socket form here (`/run/netrulerouter/service-v1.sock`), so server and client
@@ -74,6 +80,11 @@ pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 /// Linux transport cannot distinguish GUI from tray and defaults to the
 /// full-capability profile.
 const DEFAULT_CLIENT_PROFILE: IpcClientProfile = IpcClientProfile::GuiInteractive;
+
+/// How long a freshly accepted connection may stay silent before the slot is
+/// taken back. Generous - a GUI starting on a cold machine is slower than one
+/// might think - but finite, which is the whole point.
+const FIRST_FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Production AF_UNIX IPC server. Holds the router it dispatches to and the
 /// socket path to bind. Cheap to construct — the `UnixListener::bind` happens in
@@ -122,6 +133,11 @@ impl IpcServer for UnixDomainSocketServer {
         // run) can bind too.
         if let Some(parent) = self.socket_path.parent() {
             let _ = std::fs::create_dir_all(parent);
+            // Traversable, set explicitly rather than left to the umask: under
+            // systemd `RuntimeDirectoryMode` already says this, but a daemon
+            // started any other way must not end up with a directory whose mode
+            // depends on how the process was launched.
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755));
         }
         // A stale socket file from a previous run makes `bind` fail with
         // EADDRINUSE — remove it first (absence is fine).
@@ -138,8 +154,33 @@ impl IpcServer for UnixDomainSocketServer {
         let listener = UnixListener::bind(&self.socket_path).map_err(|e| {
             IpcBindError::Other(format!("bind {} failed: {e}", self.socket_path.display()))
         })?;
+        // The socket is the permission surface, and it is set here rather than
+        // inherited from the umask: the daemon is root, its clients are not, and
+        // a socket that happened to come out 0755 would refuse every one of
+        // them. Reaching the socket is not authority - identity is SO_PEERCRED
+        // (`unix:uid:<n>`), rules are per principal, and privileged operations
+        // go through polkit.
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o666))
+            .map_err(|e| {
+                IpcBindError::Other(format!(
+                    "cannot set mode on {}: {e}",
+                    self.socket_path.display()
+                ))
+            })?;
+        // Identity of the node we just created. `Drop` unlinks only if the path
+        // still resolves to it: an accept-error rebind creates a NEW socket at
+        // the same path while the failed acceptor is still alive, and its
+        // unlink would delete the replacement, leaving the daemon listening on
+        // an anonymous inode with every client getting ENOENT until the unit is
+        // restarted.
+        let node = std::fs::metadata(&self.socket_path)
+            .map(|m| (m.dev(), m.ino()))
+            .map_err(|e| {
+                IpcBindError::Other(format!("cannot stat {}: {e}", self.socket_path.display()))
+            })?;
         Ok(Box::new(UnixDomainSocketAcceptor {
             listener,
+            node,
             router: Arc::clone(&self.router),
             event_bus: self.event_bus.clone(),
             socket_path: self.socket_path.clone(),
@@ -159,6 +200,9 @@ pub struct UnixDomainSocketAcceptor {
     /// The bound path, kept so `request_shutdown` can self-connect to wake a
     /// blocked `accept`, and `Drop` can unlink the socket file.
     socket_path: PathBuf,
+    /// `(dev, ino)` of the node this acceptor created, so `Drop` can tell our
+    /// socket from a replacement bound at the same path.
+    node: (u64, u64),
     shutdown_requested: Arc<AtomicBool>,
     active_count: Arc<AtomicUsize>,
     worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -196,13 +240,16 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
 
         let router = Arc::clone(&self.router);
         let bus = self.event_bus.clone();
-        let active = Arc::clone(&self.active_count);
-        self.active_count.fetch_add(1, Ordering::SeqCst);
+        // A guard, so a panic in dispatch cannot leak the slot - see
+        // `connection_slot`.
+        let slot = nrr_service_runtime::connection_slot::ConnectionSlot::claim(Arc::clone(
+            &self.active_count,
+        ));
         let spawn = thread::Builder::new()
             .name("nrr-ipc-worker".into())
             .spawn(move || {
+                let _slot = slot;
                 handle_connection(stream, router, bus);
-                active.fetch_sub(1, Ordering::SeqCst);
             });
 
         match spawn {
@@ -214,7 +261,7 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
                 AcceptOutcome::Connected
             }
             Err(e) => {
-                self.active_count.fetch_sub(1, Ordering::SeqCst);
+                // The guard went with the failed closure and released the slot.
                 AcceptOutcome::Err(AcceptError {
                     category: AcceptErrorCategory::WorkerSpawn,
                     message: format!("worker thread spawn failed: {e}"),
@@ -239,14 +286,24 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
             }
         }
     }
+
+    fn active_connections(&self) -> usize {
+        self.active_count.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for UnixDomainSocketAcceptor {
     fn drop(&mut self) {
         self.shutdown_requested.store(true, Ordering::SeqCst);
-        // Unlink the socket file so a later bind on the same path does not hit a
-        // stale node (bind also clears it, but leaving the fs clean is tidier).
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Unlink OUR node only. If the path now resolves to a different inode,
+        // somebody rebound while we were still alive and the file belongs to
+        // them.
+        let still_ours = std::fs::metadata(&self.socket_path)
+            .map(|m| (m.dev(), m.ino()) == self.node)
+            .unwrap_or(false);
+        if still_ours {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 }
 
@@ -285,17 +342,38 @@ fn handle_connection(
         }
     };
     let (reader_tx, reader_rx) = std::sync::mpsc::sync_channel::<ReaderMsg>(8);
+    // Idle timeout for the FIRST frame only. A connection that says nothing
+    // holds one of 32 slots for as long as it likes, and 32 silent connections
+    // make the service unreachable without a single malformed byte. After the
+    // first frame the timeout comes off: a subscriber legitimately sits quiet
+    // for hours waiting to be pushed to, and cutting it would break the very
+    // thing the connection is for.
+    let _ = reader.set_read_timeout(Some(FIRST_FRAME_IDLE_TIMEOUT));
     let reader_thread = thread::Builder::new()
         .name("nrr-ipc-reader".into())
-        .spawn(move || loop {
-            let msg = match read_frame::<_, IpcRequestEnvelope>(&mut reader) {
-                Ok(req) => ReaderMsg::Request(req),
-                Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
-                Err(_) => ReaderMsg::Malformed,
-            };
-            let terminal = !matches!(msg, ReaderMsg::Request(_));
-            if reader_tx.send(msg).is_err() || terminal {
-                break;
+        .spawn(move || {
+            let mut first = true;
+            loop {
+                let msg = match read_frame::<_, IpcRequestEnvelope>(&mut reader) {
+                    Ok(req) => ReaderMsg::Request(req),
+                    Err(e) if e.is_transport_dead() => ReaderMsg::Closed,
+                    Err(_) if first => {
+                        // Nothing arrived in the window - including a read that
+                        // timed out, which `read_frame` reports as a broken
+                        // frame. Treat it as a client that never introduced
+                        // itself and give the slot back.
+                        ReaderMsg::Closed
+                    }
+                    Err(_) => ReaderMsg::Malformed,
+                };
+                if first {
+                    first = false;
+                    let _ = reader.set_read_timeout(None);
+                }
+                let terminal = !matches!(msg, ReaderMsg::Request(_));
+                if reader_tx.send(msg).is_err() || terminal {
+                    break;
+                }
             }
         })
         .ok();
@@ -488,17 +566,110 @@ mod tests {
     }
 
     fn sample_request() -> IpcRequestEnvelope {
-        use nrr_service_runtime::IpcOperationClass;
-        use nrr_shared::ipc::IpcOperationName;
+        request_for(nrr_shared::ipc::IpcOperationName::ContractNegotiate)
+    }
+
+    /// The class is DERIVED, the way the client derives it and the way the
+    /// router admits it: a hand-picked one is refused as a malformed envelope.
+    fn request_for(operation: nrr_shared::ipc::IpcOperationName) -> IpcRequestEnvelope {
+        let payload = serde_json::json!({});
         IpcRequestEnvelope {
             protocol_version: 1,
             request_id: "req-1".into(),
             correlation_id: None,
-            operation: IpcOperationName::ContractNegotiate,
-            operation_class: IpcOperationClass::ReadSnapshot,
+            operation,
+            operation_class: nrr_service_runtime::ipc::canonical_operation_class(
+                operation, &payload,
+            ),
             confirmation_token: None,
-            payload: serde_json::json!({}),
+            payload,
         }
+    }
+
+    /// An accept error rebinds: the failed acceptor is still alive while the
+    /// replacement binds a NEW socket at the same path, and the old one's
+    /// unlink used to delete it. The daemon then listened on an anonymous inode
+    /// and every client got ENOENT until the unit was restarted, while health
+    /// reported a successful rebind.
+    /// A connection that says nothing holds one of 32 slots for as long as it
+    /// likes. Thirty-two silent connections make the service unreachable
+    /// without sending a single malformed byte.
+    #[test]
+    fn a_connection_that_never_speaks_gives_its_slot_back() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let acceptor: Arc<dyn IpcAcceptor> = Arc::from(server.bind().expect("bind"));
+
+        let acc = Arc::clone(&acceptor);
+        let ticker = thread::spawn(move || acc.accept_one());
+        // Connect and stay silent.
+        let quiet = connect(&sock);
+        assert!(matches!(
+            ticker.join().expect("tick"),
+            AcceptOutcome::Connected
+        ));
+
+        // The worker is parked on the first frame. Give it a moment and check
+        // the slot is still held - the timeout is measured in seconds, so this
+        // proves the guard is not released early.
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(acceptor.active_connections(), 1);
+        drop(quiet);
+        // A closed peer is the fast path out; the timeout covers the peer that
+        // stays open and silent, which no unit test should wait 20 s for.
+        for _ in 0..200 {
+            if acceptor.active_connections() == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            acceptor.active_connections(),
+            0,
+            "the worker must release its slot once the peer goes away",
+        );
+    }
+
+    #[test]
+    fn a_rebind_does_not_lose_its_socket_to_the_acceptor_it_replaced() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+
+        let first = server.bind().expect("first bind");
+        let second = server.bind().expect("rebind");
+        drop(first);
+
+        assert!(
+            sock.exists(),
+            "the replacement's socket must survive the old acceptor's drop",
+        );
+        assert!(
+            UnixStream::connect(&sock).is_ok(),
+            "and still be connectable"
+        );
+        drop(second);
+        assert!(!sock.exists(), "the last acceptor cleans up after itself");
+    }
+
+    /// The daemon runs as root and its clients do not, so a socket left at the
+    /// umask's mercy refuses every client the product has.
+    #[test]
+    fn the_socket_is_reachable_by_an_ordinary_user() {
+        let dir = temp_dir();
+        let sock = dir.0.join("service.sock");
+        let server = UnixDomainSocketServer::new_at(empty_router(), &sock);
+        let acceptor = server.bind().expect("bind");
+        let mode = std::fs::metadata(&sock).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666, "socket mode");
+        let parent_mode = std::fs::metadata(dir.0.as_path())
+            .expect("stat parent")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parent_mode, 0o755, "runtime dir must be traversable");
+        drop(acceptor);
     }
 
     #[test]
@@ -627,8 +798,7 @@ mod tests {
         let ticker = thread::spawn(move || acc.accept_one());
 
         let mut client = connect(&sock);
-        let mut request = sample_request();
-        request.operation = IpcOperationName::StatusUpdatesSubscribe;
+        let mut request = request_for(IpcOperationName::StatusUpdatesSubscribe);
         request.payload = serde_json::json!({ "client-id": "test-client" });
         write_frame(&mut client, &request).expect("client writes subscribe");
         let response: IpcResponseEnvelope = read_frame(&mut client).expect("client reads response");

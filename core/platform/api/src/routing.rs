@@ -208,6 +208,25 @@ impl RoutingTransaction {
     pub fn pending_undo_count(&self) -> usize {
         self.compensating.len()
     }
+
+    /// The routes this transaction actually ADDED — the ones the caller may
+    /// claim as its own.
+    ///
+    /// A conflicting add is reported as success (a route with that key already
+    /// exists, put there by somebody else — a redirect VPN's own overlay is the
+    /// usual case), and it leaves no compensating entry precisely because it is
+    /// not ours to undo. A caller that assumes "the whole desired set is mine
+    /// now" adopts that foreign route and deletes it on a later pass.
+    #[must_use]
+    pub fn added_routes(&self) -> Vec<RouteEntry> {
+        self.compensating
+            .iter()
+            .filter_map(|c| match c {
+                CompensatingAction::DeleteRoute(entry) => Some(entry.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

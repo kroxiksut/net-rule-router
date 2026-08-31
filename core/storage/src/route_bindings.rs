@@ -167,6 +167,16 @@ pub struct RoutePolicyRecord {
     /// only, so a host with an AAAA record would otherwise keep a second,
     /// unpinned way out.
     pub block_ipv6_when_protected: bool,
+    /// Record the permissive answer for a newly discovered local network
+    /// instead of asking. Off by default - opening a segment unasked is the
+    /// user's call. It suppresses the QUESTION, never the record: the network
+    /// still appears in the list with a decision they can change.
+    pub local_networks_auto_accept: bool,
+    /// Evaluate `Zone` BEFORE `ExactIp` in tier 3. Default `false` — the more
+    /// specific address wins, which is what the rule model documents. The
+    /// engine has always taken this as a parameter; until now nothing supplied
+    /// one, so the user-facing setting existed only in the documentation.
+    pub zone_priority_over_ip: bool,
     /// "Treat a domain as `domain` + `*.domain`". When `true`, the
     /// enforcement layer expands every bare-domain (`ExactFqdn`) rule with a
     /// `SuffixDomain` sibling so it also covers subdomains (apex kept).
@@ -259,6 +269,8 @@ impl RoutePolicyRecord {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             // Default ON: adding `mysite.com` and silently losing
             // `cdn.mysite.com` to the other route was the surprising outcome.
             // Widening only adds coverage towards the route the rule names, so
@@ -376,6 +388,8 @@ struct BlockPolicyRow {
     primary_probe_max_targets: u32,
     primary_probe_repeat_secs: u32,
     block_ipv6_when_protected: bool,
+    local_networks_auto_accept: bool,
+    zone_priority_over_ip: bool,
 }
 
 impl Default for BlockPolicyRow {
@@ -402,6 +416,8 @@ impl Default for BlockPolicyRow {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
         }
     }
 }
@@ -510,9 +526,9 @@ impl<'c> RouteBindingsRepository<'c> {
                  kill_switch_strict_shared_ips, auto_rules_mode, \
                  auto_rules_eager_delivery_names, primary_probe_auto, \
                  primary_probe_timeout_ms, primary_probe_max_targets, \
-                 primary_probe_repeat_secs, block_ipv6_when_protected, updated_at)
+                 primary_probe_repeat_secs, block_ipv6_when_protected, local_networks_auto_accept,                  zone_priority_over_ip, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, ?22, ?23)
+             ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
              ON CONFLICT(sid) DO UPDATE SET
                 block_secondary_when_unavailable = excluded.block_secondary_when_unavailable,
                 kill_switch_fail_closed = excluded.kill_switch_fail_closed,
@@ -535,6 +551,8 @@ impl<'c> RouteBindingsRepository<'c> {
                 primary_probe_max_targets = excluded.primary_probe_max_targets,
                 primary_probe_repeat_secs = excluded.primary_probe_repeat_secs,
                 block_ipv6_when_protected = excluded.block_ipv6_when_protected,
+                local_networks_auto_accept = excluded.local_networks_auto_accept,
+                zone_priority_over_ip = excluded.zone_priority_over_ip,
                 updated_at = excluded.updated_at",
             params![
                 sid,
@@ -559,6 +577,8 @@ impl<'c> RouteBindingsRepository<'c> {
                 record.primary_probe_max_targets as i64,
                 record.primary_probe_repeat_secs as i64,
                 record.block_ipv6_when_protected as i64,
+                record.local_networks_auto_accept as i64,
+                record.zone_priority_over_ip as i64,
                 now_epoch_secs
             ],
         )
@@ -703,6 +723,8 @@ impl<'c> RouteBindingsRepository<'c> {
             primary_probe_max_targets: policy.primary_probe_max_targets,
             primary_probe_repeat_secs: policy.primary_probe_repeat_secs,
             block_ipv6_when_protected: policy.block_ipv6_when_protected,
+            local_networks_auto_accept: policy.local_networks_auto_accept,
+            zone_priority_over_ip: policy.zone_priority_over_ip,
             binding_source,
         })
     }
@@ -802,7 +824,7 @@ impl<'c> RouteBindingsRepository<'c> {
         let row: Option<BlockPolicyRow> = self
             .conn
             .query_row(
-                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs, block_ipv6_when_protected
+                "SELECT block_secondary_when_unavailable, kill_switch_fail_closed,                  kill_switch_protocols, kill_switch_block_all, kill_switch_enabled,                  allow_dns_over_primary, include_subdomains, shared_ip_policy,                  mode_a_coverage_strategy, resolve_hosts_bypass,                  doh_lockdown_enabled, doh_lockdown_scope, browser_history_auto_seed,                  kill_switch_strict_shared_ips, auto_rules_mode,                  auto_rules_eager_delivery_names, primary_probe_auto,                  primary_probe_timeout_ms, primary_probe_max_targets,                  primary_probe_repeat_secs, block_ipv6_when_protected,                  local_networks_auto_accept, zone_priority_over_ip
                  FROM secondary_block_policy WHERE sid = ?1",
                 params![sid],
                 |row| {
@@ -838,6 +860,8 @@ impl<'c> RouteBindingsRepository<'c> {
                         primary_probe_max_targets: row.get::<_, i64>(18)? as u32,
                         primary_probe_repeat_secs: row.get::<_, i64>(19)? as u32,
                         block_ipv6_when_protected: row.get::<_, i64>(20)? != 0,
+                        local_networks_auto_accept: row.get::<_, i64>(21)? != 0,
+                        zone_priority_over_ip: row.get::<_, i64>(22)? != 0,
                     })
                 },
             )
@@ -1283,6 +1307,8 @@ mod tests {
             primary_probe_max_targets: 4,
             primary_probe_repeat_secs: 120,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: source,
         }
     }
@@ -1375,6 +1401,41 @@ mod tests {
             repo.load_for_sid(sid)
                 .expect("load after reopen")
                 .auto_rules_eager_delivery_names
+        );
+    }
+
+    /// "Stop asking me about local networks I have not seen before." Off unless
+    /// the user says otherwise: opening a segment unasked is their call.
+    #[test]
+    fn local_networks_auto_accept_survives_reopen_and_defaults_off() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("nrr_service_state.db");
+        let sid = "S-1-5-21-A";
+        {
+            let conn = open_connection(&path).expect("open");
+            let runner = SqliteMigrationRunner::for_state_db(conn);
+            runner.run_pending_migrations().expect("migrate");
+            let conn = runner.into_connection();
+            let repo = RouteBindingsRepository::new(&conn);
+            assert!(
+                !repo
+                    .load_for_sid(sid)
+                    .expect("load")
+                    .local_networks_auto_accept,
+                "an un-configured principal is still asked",
+            );
+            let mut rec = sample_record(BindingSource::UserAssigned);
+            rec.local_networks_auto_accept = true;
+            repo.update_for_sid(sid, &rec, 1_700_000_000)
+                .expect("update");
+        }
+
+        let conn = open_connection(&path).expect("reopen");
+        let repo = RouteBindingsRepository::new(&conn);
+        assert!(
+            repo.load_for_sid(sid)
+                .expect("load after reopen")
+                .local_networks_auto_accept,
         );
     }
 

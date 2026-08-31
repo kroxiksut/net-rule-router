@@ -93,13 +93,29 @@ Item {
     }
 
     // Reset all traffic data (ledger + session + cursors); settings are kept.
+    //
+    // The rows are blanked only once the service confirms it did it. The ledger
+    // is machine-wide, so the wipe needs Administrator rights; blanking first
+    // showed the clear as done even when the rights were refused, and the
+    // numbers then reappeared on the next poll with nothing said.
     function clear() {
         if (!ownerRoot || !ownerRoot.rpc || typeof ownerRoot.rpc.rpcTrafficStatsClear !== "function") return
         var corr = ownerRoot.rpc.rpcTrafficStatsClear()
-        controller.todayRows = []
-        controller.sessionRows = []
-        controller.allTimeRows = []
-        if (corr && corr !== "") controller.refresh()
+        if (!corr || corr === "") return
+        ownerRoot.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (ok) {
+                controller.todayRows = []
+                controller.sessionRows = []
+                controller.allTimeRows = []
+                controller.refresh()
+                return
+            }
+            ownerRoot.statusLine = (code === "uac-declined")
+                ? ownerRoot.tr("progress.service-uac-declined",
+                    "Administrator prompt declined - operation cancelled.")
+                : ownerRoot.tr("status.clear-failed", "Could not clear: ")
+                    + String(msg || code || "")
+        })
     }
 
     // Request a CSV export for [fromDay, toDay], with the received/sent columns

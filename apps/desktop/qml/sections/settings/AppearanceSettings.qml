@@ -32,6 +32,22 @@ GroupBox {
             onActivated: root.updatePrefs({ themeMode: model[currentIndex] })
         }
         Label {
+            // Only when "System" is chosen AND the probe came back empty: the
+            // app then shows light because it has to show something, and
+            // saying so beats letting the user think their dark desktop was
+            // ignored.
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            visible: root.uiRevision >= 0
+                && String(root.prefs.themeMode || "") === "system"
+                && !((root.context && root.context.theme)
+                    ? root.context.theme.systemModeDetected : true)
+            text: root.tr("settings.theme.system-undetected",
+                "The system theme could not be determined — using the light theme.")
+            color: root.mutedTextColor
+            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+        }
+        Label {
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             text: root.tr("settings.field.ui-scale", "UI scale") + ": "

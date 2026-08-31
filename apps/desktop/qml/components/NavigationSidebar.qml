@@ -149,7 +149,19 @@ Pane {
                             border.color: navButton.highlighted ? root.uiTheme.stateSelectedBorder : root.uiTheme.stateDefaultBorder
                         }
                         contentItem: RowLayout {
+                            id: navContent
                             spacing: root.sidebarCollapsed ? 0 : root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+                            // Addresses waiting for an answer. The count lives
+                            // on the "Suggested addresses" entry inside the
+                            // Rules submenu, which is hidden whenever the rail
+                            // is collapsed or the submenu is folded — the
+                            // states the window spends most of its life in. It
+                            // is repeated on the header so "there is something
+                            // to answer" survives them.
+                            readonly property int pendingBadge:
+                                navEntry.isRulesEntry
+                                    && (root.sidebarCollapsed || !navigationSidebar.rulesNavExpanded)
+                                ? root.autoRuleCandidatesPending : 0
                             Label {
                                 Layout.preferredWidth: 20
                                 Layout.fillWidth: root.sidebarCollapsed
@@ -158,6 +170,19 @@ Pane {
                                 font.pixelSize: Math.max(16, root.font.pixelSize + 2)
                                 horizontalAlignment: Text.AlignHCenter
                                 Layout.alignment: Qt.AlignVCenter
+                                // A collapsed rail has no room for the number,
+                                // so the glyph itself carries a dot.
+                                Rectangle {
+                                    visible: root.sidebarCollapsed && navContent.pendingBadge > 0
+                                    width: 8
+                                    height: 8
+                                    radius: 4
+                                    color: root.accentColor
+                                    anchors.right: parent.right
+                                    anchors.top: parent.top
+                                    anchors.rightMargin: -2
+                                    anchors.topMargin: -1
+                                }
                             }
                             RowLayout {
                                 visible: !root.sidebarCollapsed
@@ -169,6 +194,15 @@ Pane {
                                     color: navButton.highlighted ? palette.highlightedText : root.textColor
                                     horizontalAlignment: Text.AlignLeft
                                     elide: Text.ElideRight
+                                }
+                                Label {
+                                    visible: navContent.pendingBadge > 0
+                                    text: String(navContent.pendingBadge)
+                                    color: navButton.highlighted ? palette.highlightedText : root.accentColor
+                                    font.bold: true
+                                    Accessible.name: root.tr("rules.suggestions.inbox.pending-badge",
+                                        "{n} address(es) waiting for an answer")
+                                        .replace("{n}", String(navContent.pendingBadge))
                                 }
                                 Label {
                                     Layout.alignment: Qt.AlignRight | Qt.AlignVCenter

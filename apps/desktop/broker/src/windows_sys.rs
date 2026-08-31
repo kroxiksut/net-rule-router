@@ -49,7 +49,7 @@ use windows::Win32::System::Pipes::{
 };
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForMultipleObjects,
-    INFINITE, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
+    WaitForSingleObject, INFINITE, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
@@ -523,9 +523,51 @@ pub fn connect_pipe(pipe_name: &str, timeout: Duration) -> Result<OwnedHandle, W
 pub struct PipeIo {
     handle: HANDLE,
     event: HANDLE,
+    /// Budget for one overlapped operation. `None` waits forever — which is
+    /// what every read used to do, so a broker that stopped answering left the
+    /// caller blocked with no way back.
+    deadline: Option<Duration>,
 }
 
 impl PipeIo {
+    /// Bounds every subsequent read and write. On expiry the pending operation
+    /// is cancelled and the call returns `TimedOut`.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.deadline = Some(timeout);
+    }
+
+    /// Waits for the pending overlapped operation, honouring [`set_timeout`].
+    fn wait_for_completion(&self, overlapped: &OVERLAPPED, bytes: &mut u32) -> io::Result<()> {
+        let Some(timeout) = self.deadline else {
+            // SAFETY: overlapped is live for this call; blocking wait.
+            return unsafe {
+                GetOverlappedResult(self.handle, overlapped, bytes, true)
+                    .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+            };
+        };
+        let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+        // SAFETY: our own auto-reset event, signalled by the completed I/O.
+        let wait = unsafe { WaitForSingleObject(self.event, millis) };
+        if wait != WAIT_OBJECT_0 {
+            // SAFETY: cancels only this handle's pending I/O before the
+            // OVERLAPPED on our stack goes away.
+            unsafe {
+                let _ = CancelIoEx(self.handle, Some(overlapped));
+                // Reap the cancelled operation so the OVERLAPPED is free.
+                let _ = GetOverlappedResult(self.handle, overlapped, bytes, true);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "broker pipe operation timed out",
+            ));
+        }
+        // SAFETY: the event is signalled, so the result is already available.
+        unsafe {
+            GetOverlappedResult(self.handle, overlapped, bytes, false)
+                .map_err(|e| io::Error::from_raw_os_error(e.code().0))
+        }
+    }
+
     pub fn new(handle: HANDLE) -> io::Result<Self> {
         // SAFETY: auto-reset event, starts unsignaled; owned + closed on drop.
         let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }
@@ -533,7 +575,11 @@ impl PipeIo {
         if event.is_invalid() {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { handle, event })
+        Ok(Self {
+            handle,
+            event,
+            deadline: None,
+        })
     }
 }
 
@@ -568,11 +614,7 @@ impl Read for PipeIo {
             Err(_) => {
                 let last = last_error();
                 if last == ERR_IO_PENDING {
-                    // SAFETY: wait for completion via the event.
-                    unsafe {
-                        GetOverlappedResult(self.handle, &overlapped, &mut bytes, true)
-                            .map_err(|e| io::Error::from_raw_os_error(e.code().0))?;
-                    }
+                    self.wait_for_completion(&overlapped, &mut bytes)?;
                     Ok(bytes as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(last as i32))
@@ -602,11 +644,7 @@ impl Write for PipeIo {
             Err(_) => {
                 let last = last_error();
                 if last == ERR_IO_PENDING {
-                    // SAFETY: wait for completion via the event.
-                    unsafe {
-                        GetOverlappedResult(self.handle, &overlapped, &mut bytes, true)
-                            .map_err(|e| io::Error::from_raw_os_error(e.code().0))?;
-                    }
+                    self.wait_for_completion(&overlapped, &mut bytes)?;
                     Ok(bytes as usize)
                 } else {
                     Err(io::Error::from_raw_os_error(last as i32))

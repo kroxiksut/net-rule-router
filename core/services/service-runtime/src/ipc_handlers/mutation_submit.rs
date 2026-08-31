@@ -374,7 +374,9 @@ impl MutationSubmitHandler {
             });
         }
 
-        let op_id = self.operation_store.enqueue();
+        let op_id = self
+            .operation_store
+            .enqueue_for(crate::ipc_handlers::operation_status_store::owner_of(ctx));
         let outcome = self.executor.execute(stored, &principal);
         match outcome {
             MutationOutcome::Completed(result) => {

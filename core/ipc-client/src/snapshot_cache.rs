@@ -22,11 +22,11 @@
 //!
 //! ## Schema versioning
 //!
-//! Every cache entry carries a [`CACHE_SCHEMA_VERSION`]. On read, a
+//! Every cache entry carries the wire-contract fingerprint of the build
+//! that wrote it (`nrr_shared::contract_fingerprint`). On read, a
 //! mismatch (or unparseable JSON) deletes the file rather than
-//! returning bad data. The version bumps whenever any DTO under
-//! [`nrr_shared::ipc_payloads`] or [`nrr_shared::diagnostics_dto`]
-//! changes shape in a way that would corrupt deserialisation.
+//! returning bad data — the fingerprint moves with the contracts crate,
+//! so nobody has to remember to bump anything.
 //!
 //! ## Atomicity
 //!
@@ -40,6 +40,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -48,9 +49,17 @@ use serde_json::Value;
 use nrr_application::backend_facade::CacheError;
 use nrr_shared::ipc_payloads::MutationKind;
 
-/// Bump whenever any cached payload's wire shape changes. Stale files
-/// (different version) are deleted on read instead of being returned.
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+/// Entries written by a build that speaks a different wire contract are
+/// deleted on read rather than returned.
+///
+/// This used to be a hand-maintained `CACHE_SCHEMA_VERSION`, which is exactly
+/// the number nobody remembers to bump: 127 fields in `ipc_payloads` carry
+/// `serde(default)`, so a DTO can gain a field, decode "successfully", and hand
+/// the GUI a silently wrong value. The fingerprint moves on its own with the
+/// contracts crate, and the typed read in the facade catches the rest.
+fn contract_fingerprint() -> String {
+    nrr_shared::contract_fingerprint()
+}
 
 /// TTL for the service-health entry — short because health flips fast.
 pub const HEALTH_TTL_SECS: u64 = 5 * 60;
@@ -175,7 +184,11 @@ struct CacheEntry {
     operation: String,
     cached_at_epoch: u64,
     ttl_secs: u64,
-    schema_version: u32,
+    /// Wire-contract fingerprint of the build that wrote this entry.
+    /// `serde(default)` so an entry from before this field simply reads as an
+    /// empty string — and is then discarded, which is the correct answer.
+    #[serde(default)]
+    contract: String,
     payload: Value,
 }
 
@@ -225,6 +238,14 @@ impl FileCache {
                 e
             ))
         })?;
+        reject_foreign_root(&root)?;
+        restrict_to_owner(&root).map_err(|e| {
+            CacheError::Io(format!(
+                "cannot restrict snapshot cache root {}: {}",
+                root.display(),
+                e
+            ))
+        })?;
         Ok(Self { root })
     }
 
@@ -252,17 +273,30 @@ impl FileCache {
                 return None;
             }
         };
-        if entry.schema_version != CACHE_SCHEMA_VERSION {
+        if entry.contract != contract_fingerprint() {
             let _ = fs::remove_file(&path);
             return None;
         }
         let now = epoch_now();
+        // TTL comes from the KEY's policy, not from the file: the file is the
+        // untrusted side of this comparison, and an entry written by an older
+        // build (or edited) would otherwise carry its own idea of how long it
+        // stays valid.
+        let ttl_secs = key.ttl_secs();
+        // A timestamp in the future is not a fresh entry — `saturating_sub`
+        // read it as "age 0" and pinned it fresh forever. A clock that moved
+        // backwards, or a file copied from another machine, is exactly the
+        // case where the cache must be distrusted.
+        let expired = match now.checked_sub(entry.cached_at_epoch) {
+            Some(age) => age > ttl_secs,
+            None => true,
+        };
         let age_secs = now.saturating_sub(entry.cached_at_epoch);
         Some(CachedPayload {
             payload: entry.payload,
             cached_at_epoch: entry.cached_at_epoch,
             age_secs,
-            expired: age_secs > entry.ttl_secs,
+            expired,
         })
     }
 
@@ -275,7 +309,7 @@ impl FileCache {
             operation: key.operation_slug().to_string(),
             cached_at_epoch: epoch_now(),
             ttl_secs: key.ttl_secs(),
-            schema_version: CACHE_SCHEMA_VERSION,
+            contract: contract_fingerprint(),
             payload,
         };
         let bytes = serde_json::to_vec_pretty(&entry)
@@ -338,8 +372,8 @@ impl FileCache {
 
     /// Sweep any non-recognised JSON file out of the cache root. Used
     /// at startup so files left over from an earlier
-    /// [`CACHE_SCHEMA_VERSION`] are purged proactively rather than only
-    /// at first read of each key.
+    /// contract are purged proactively rather than only at first read of
+    /// each key.
     pub fn purge_unknown_files(&self) -> Result<(), CacheError> {
         let known: HashSet<&str> = CacheKey::ALL.iter().map(|k| k.filename()).collect();
         let entries = fs::read_dir(&self.root).map_err(|e| {
@@ -356,7 +390,12 @@ impl FileCache {
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if name.ends_with(".tmp") {
-                    let _ = fs::remove_file(&path);
+                    // Another process may be mid-write. Only sweep temps that
+                    // are demonstrably abandoned — deleting a live one makes
+                    // its `rename` fail and loses the entry it was writing.
+                    if is_abandoned_temp(&path) {
+                        let _ = fs::remove_file(&path);
+                    }
                     continue;
                 }
                 if !known.contains(name) {
@@ -366,6 +405,63 @@ impl FileCache {
         }
         Ok(())
     }
+}
+
+/// Refuse a cache root this user does not own, or that is a symlink.
+///
+/// On Unix the default root lives under the shared temp directory, so another
+/// local account can create it — or point it at a directory of their choosing —
+/// before we do. Permissions alone do not cover that: they are applied to
+/// whatever is already there. On Windows the root is inside the user's profile,
+/// which no other account can pre-create, so there is nothing to check.
+fn reject_foreign_root(root: &Path) -> Result<(), CacheError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(root).map_err(|e| {
+            CacheError::Io(format!("cannot stat cache root {}: {e}", root.display()))
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(CacheError::Io(format!(
+                "cache root {} is a symlink; refusing to use it",
+                root.display()
+            )));
+        }
+        // SAFETY-free: `geteuid` via the std-exposed metadata of a file we
+        // just created ourselves would be circular, so read the process uid
+        // from `/proc/self` — available on every platform this runs on.
+        let own_uid = fs::metadata("/proc/self")
+            .map(|m| m.uid())
+            .map_err(|e| CacheError::Io(format!("cannot determine the current user: {e}")))?;
+        if meta.uid() != own_uid {
+            return Err(CacheError::Io(format!(
+                "cache root {} belongs to another user; refusing to use it",
+                root.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+    }
+    Ok(())
+}
+
+/// Is this temp file old enough that no one can still be writing it?
+///
+/// A write is a `create` + `write_all` + `sync_all` + `rename`; anything that
+/// has not finished in this long is a leftover from a process that died.
+fn is_abandoned_temp(path: &Path) -> bool {
+    const ABANDONED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .map(|modified| {
+            SystemTime::now()
+                .duration_since(modified)
+                .map(|age| age > ABANDONED_AFTER)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(target_os = "windows")]
@@ -402,17 +498,62 @@ fn epoch_now() -> u64 {
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    // The temp name carries the writing process and a per-write counter. It
+    // used to be derived from the target alone, and the window and the tray —
+    // one crate, one cache root, the tray started by the window — then wrote
+    // the same temp file at once and renamed a torn one into place.
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
     let mut tmp = path.to_path_buf();
     tmp.set_extension(match path.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{ext}.tmp"),
-        None => "tmp".to_string(),
+        Some(ext) => format!("{ext}.{}.{seq}.tmp", std::process::id()),
+        None => format!("{}.{seq}.tmp", std::process::id()),
     });
     {
-        let mut f = fs::File::create(&tmp)?;
+        let mut f = create_owner_only(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+/// Create (or truncate) a file only its owner can read.
+///
+/// What lands here is one user's rules, route bindings and security alerts.
+/// The default 0644 made every local account on a Linux box a reader of every
+/// other account's policy; on Windows the file inherits the profile's ACL,
+/// which is already owner-scoped, so the mode is a no-op there.
+fn create_owner_only(path: &Path) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::File::create(path)
+    }
+}
+
+/// Keep the cache directory readable by its owner alone, for the same reason.
+/// An existing directory is tightened too — a cache written by an older build
+/// is still sitting there at 0755.
+fn restrict_to_owner(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -422,6 +563,87 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
+
+    #[test]
+    fn an_entry_stamped_in_the_future_is_not_treated_as_fresh() {
+        // A clock that jumped back, or a file copied from another machine.
+        // `saturating_sub` reported age 0 and the entry stayed "fresh" forever.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = FileCache::with_root(dir.path().to_path_buf()).expect("cache");
+        cache
+            .write(CacheKey::RulesAll, json!({ "rules": [] }))
+            .expect("write");
+        let path = cache.root().join(CacheKey::RulesAll.filename());
+        let mut entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        entry["cached_at_epoch"] = json!(epoch_now() + 86_400);
+        fs::write(&path, serde_json::to_vec(&entry).expect("serialise")).expect("rewrite");
+
+        let read = cache.read(CacheKey::RulesAll).expect("entry present");
+        assert!(read.expired, "a future timestamp must not read as fresh");
+    }
+
+    #[test]
+    fn the_ttl_comes_from_the_key_not_from_the_file() {
+        // The file is the untrusted side: an entry may not extend its own life.
+        let dir = TempDir::new().expect("tempdir");
+        let cache = FileCache::with_root(dir.path().to_path_buf()).expect("cache");
+        cache
+            .write(CacheKey::ServiceHealth, json!({ "ok": true }))
+            .expect("write");
+        let path = cache.root().join(CacheKey::ServiceHealth.filename());
+        let mut entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read")).expect("parse");
+        entry["ttl_secs"] = json!(u64::MAX);
+        entry["cached_at_epoch"] = json!(epoch_now() - (CacheKey::ServiceHealth.ttl_secs() + 60));
+        fs::write(&path, serde_json::to_vec(&entry).expect("serialise")).expect("rewrite");
+
+        let read = cache.read(CacheKey::ServiceHealth).expect("entry present");
+        assert!(read.expired, "the key's TTL decides, not the file's");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_root_that_is_a_symlink_is_refused() {
+        // On a shared temp directory another account can put a link where our
+        // root goes; permissions applied afterwards would land on their target.
+        let dir = TempDir::new().expect("tempdir");
+        let real = dir.path().join("elsewhere");
+        fs::create_dir(&real).expect("create target");
+        let link = dir.path().join("snapshot_cache");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert!(
+            FileCache::with_root(link).is_err(),
+            "a symlinked cache root must be refused"
+        );
+    }
+
+    /// The cache holds one user's rules, bindings and alerts — on a shared
+    /// Linux box the default modes handed them to every local account.
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_and_files_are_readable_by_their_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().expect("tempdir");
+        let cache = FileCache::with_root(dir.path().join("snapshot_cache")).expect("cache");
+        cache
+            .write(CacheKey::RulesAll, json!({ "rules": [] }))
+            .expect("write entry");
+
+        let dir_mode = fs::metadata(cache.root())
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "cache directory must be owner-only");
+
+        let file_mode = fs::metadata(cache.root().join(CacheKey::RulesAll.filename()))
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "cache entry must be owner-only");
+    }
 
     fn fresh_cache() -> (TempDir, FileCache) {
         let dir = TempDir::new().expect("create tempdir");
@@ -458,15 +680,15 @@ mod tests {
     }
 
     #[test]
-    fn read_returns_none_and_deletes_on_schema_mismatch() {
+    fn read_returns_none_and_deletes_an_entry_from_another_contract() {
         let (_dir, cache) = fresh_cache();
         let path = cache.path_for(CacheKey::SecurityAlerts);
-        // Hand-craft an entry with a future schema version.
+        // An entry written by a build that spoke a different wire contract.
         let bad_entry = serde_json::json!({
             "operation": "security.alerts.list",
             "cached_at_epoch": epoch_now(),
             "ttl_secs": SNAPSHOT_TTL_SECS,
-            "schema_version": CACHE_SCHEMA_VERSION + 99,
+            "contract": "0.0.0-from-the-past/rules-0",
             "payload": {"alerts": []},
         });
         fs::write(
@@ -475,7 +697,10 @@ mod tests {
         )
         .expect("write");
         assert!(cache.read(CacheKey::SecurityAlerts).is_none());
-        assert!(!path.exists(), "schema-mismatched file must be deleted");
+        assert!(
+            !path.exists(),
+            "an entry from another contract must be deleted"
+        );
     }
 
     #[test]
@@ -487,7 +712,7 @@ mod tests {
             operation: CacheKey::ServiceHealth.operation_slug().to_string(),
             cached_at_epoch: epoch_now().saturating_sub(HEALTH_TTL_SECS + 60),
             ttl_secs: HEALTH_TTL_SECS,
-            schema_version: CACHE_SCHEMA_VERSION,
+            contract: contract_fingerprint(),
             payload: json!({"state": "running"}),
         };
         fs::write(&path, serde_json::to_vec_pretty(&entry).expect("serialize")).expect("write");
@@ -600,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_unknown_files_removes_strangers_and_tmps() {
+    fn purge_unknown_files_removes_strangers_and_abandoned_tmps() {
         let (dir, cache) = fresh_cache();
         // A known entry — must survive.
         cache
@@ -608,12 +833,37 @@ mod tests {
             .expect("seed known");
         // An unknown JSON file from a future cache version.
         fs::write(dir.path().join("future_cache.json"), b"{}").expect("write stranger");
-        // A leaked tmp file from an interrupted write.
-        fs::write(dir.path().join("snapshot_initial.json.tmp"), b"partial").expect("write tmp");
+        // A tmp file left by a process that died long ago.
+        let stale_tmp = dir.path().join("snapshot_initial.json.999.0.tmp");
+        fs::write(&stale_tmp, b"partial").expect("write tmp");
+        let long_ago = SystemTime::now() - std::time::Duration::from_secs(3600);
+        filetime_set(&stale_tmp, long_ago);
         cache.purge_unknown_files().expect("purge");
         assert!(cache.path_for(CacheKey::SnapshotInitial).exists());
         assert!(!dir.path().join("future_cache.json").exists());
-        assert!(!dir.path().join("snapshot_initial.json.tmp").exists());
+        assert!(!stale_tmp.exists());
+    }
+
+    #[test]
+    fn a_fresh_tmp_file_survives_the_purge() {
+        // It may belong to the other surface's write in flight — the window and
+        // the tray share this directory. Deleting it makes that write's rename
+        // fail and loses the entry.
+        let (dir, cache) = fresh_cache();
+        let live_tmp = dir.path().join("snapshot_initial.json.1234.0.tmp");
+        fs::write(&live_tmp, b"partial").expect("write tmp");
+        cache.purge_unknown_files().expect("purge");
+        assert!(live_tmp.exists(), "a write in flight must not be swept");
+    }
+
+    /// Backdate a file so the purge sees it as abandoned. `File::set_modified`
+    /// keeps this to std — no extra dependency for one test.
+    fn filetime_set(path: &Path, when: SystemTime) {
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for backdating");
+        f.set_modified(when).expect("set mtime");
     }
 
     #[test]

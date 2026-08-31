@@ -1163,6 +1163,21 @@ pub enum StatusUpdateEvent {
         service_state: String,
         worst_severity: String,
     },
+    /// The protection in force for this principal does not match what their
+    /// settings ask for, or is in force because of somebody ELSE's settings.
+    ///
+    /// Two situations, one event, because the user's question is the same
+    /// ("why is my network behaving like this?"):
+    /// - `blanket-block-not-armed`: the settings ask for a blanket block, but
+    ///   the service does not know the additional link's address and will not
+    ///   plan a block that would cut the tunnel it is protecting;
+    /// - `machine-wide-cut-by-another-user`: another logged-in principal armed
+    ///   protection whose packet-layer half cannot be scoped to one user (the
+    ///   WFP packet layer carries no user context), so ICMP and IPv6 are cut
+    ///   machine-wide.
+    ///
+    /// `reason` is a slug — the GUI renders it through `tr()`, never raw.
+    ProtectionCoverageChanged { reason: String },
     /// Adapter set changed (interface added/removed/role-changed). The
     /// client should refresh `SnapshotInterfacesGet`.
     AdaptersChanged { data_source: String },
@@ -1307,6 +1322,41 @@ pub enum StatusUpdateEvent {
         #[serde(default)]
         candidates: Vec<String>,
     },
+}
+
+impl StatusUpdateEvent {
+    /// The principal this event is ABOUT, when it is about one.
+    ///
+    /// An event that names a SID in its own payload is, by construction, that
+    /// user's news: their pause, their coverage, their tunnel. Broadcasting it
+    /// tells every other session what they are doing, and makes every other GUI
+    /// react to a change that is not theirs. The bus routes on this answer, so
+    /// the two cannot disagree.
+    ///
+    /// The match is exhaustive on purpose — a new variant does not compile until
+    /// someone has said who it belongs to, which is the only way this stays true.
+    #[must_use]
+    pub fn addressee(&self) -> Option<&str> {
+        match self {
+            Self::RoutingPauseStateChanged { sid, .. }
+            | Self::AutoRuleCandidatesChanged { sid, .. }
+            | Self::SecondaryExternalAddressObserved { sid, .. }
+            | Self::UnassignedTunnelDetected { sid, .. }
+            | Self::BlockNoticeRaised { sid, .. }
+            | Self::EnforcementStatusChanged { sid, .. } => Some(sid.as_str()),
+            Self::HealthChanged { .. }
+            | Self::ProtectionCoverageChanged { .. }
+            | Self::AdaptersChanged { .. }
+            | Self::AlertRaised { .. }
+            | Self::OperationFinished { .. }
+            | Self::Overflow { .. }
+            | Self::RevisionStatusChanged { .. }
+            | Self::ApplyFailurePolicyChanged { .. }
+            | Self::AutostartStateChanged { .. }
+            | Self::RetentionSettingsChanged
+            | Self::MutationProgress { .. } => None,
+        }
+    }
 }
 
 /// Wire frame used for *push* delivery of an event on an existing
@@ -1635,6 +1685,14 @@ pub struct RoutePolicyDto {
     /// unpinned way out — the rule would be applied to half the host.
     #[serde(default = "default_block_ipv6_when_protected")]
     pub block_ipv6_when_protected: bool,
+    /// Record the permissive answer for a newly discovered local network
+    /// instead of asking about it. Off by default.
+    #[serde(default)]
+    pub local_networks_auto_accept: bool,
+    /// Evaluate a `Zone` rule BEFORE an `ExactIp` one. Off by default: the more
+    /// specific address wins, which is what the rule model documents.
+    #[serde(default)]
+    pub zone_priority_over_ip: bool,
 }
 
 /// Additive default for [`RoutePolicyDto::auto_rules_mode`] /
@@ -1876,6 +1934,14 @@ pub struct RoutePolicyUpdateRequest {
     /// unpinned way out — the rule would be applied to half the host.
     #[serde(default = "default_block_ipv6_when_protected")]
     pub block_ipv6_when_protected: bool,
+    /// Record the permissive answer for a newly discovered local network
+    /// instead of asking about it. Off by default.
+    #[serde(default)]
+    pub local_networks_auto_accept: bool,
+    /// Evaluate a `Zone` rule BEFORE an `ExactIp` one. Off by default: the more
+    /// specific address wins, which is what the rule model documents.
+    #[serde(default)]
+    pub zone_priority_over_ip: bool,
 }
 
 impl RoutePolicyUpdateRequest {
@@ -1924,6 +1990,8 @@ impl RoutePolicyUpdateRequest {
             primary_probe_max_targets,
             primary_probe_repeat_secs,
             block_ipv6_when_protected,
+            local_networks_auto_accept,
+            zone_priority_over_ip,
             binding_source: _,
         } = self;
         let RoutePolicyDto {
@@ -1952,6 +2020,8 @@ impl RoutePolicyUpdateRequest {
             primary_probe_max_targets: stored_probe_max_targets,
             primary_probe_repeat_secs: stored_probe_repeat,
             block_ipv6_when_protected: stored_block_v6,
+            local_networks_auto_accept: stored_auto_accept,
+            zone_priority_over_ip: stored_zone_priority,
             binding_source: _,
         } = current;
 
@@ -1979,6 +2049,10 @@ impl RoutePolicyUpdateRequest {
             || primary_probe_max_targets != stored_probe_max_targets
             || primary_probe_repeat_secs != stored_probe_repeat
             || block_ipv6_when_protected != stored_block_v6
+            // Part of the policy: switching it on makes discovery record
+            // permissive answers, which become kill-switch exemptions.
+            || local_networks_auto_accept != stored_auto_accept
+            || zone_priority_over_ip != stored_zone_priority
     }
 }
 
@@ -2841,9 +2915,10 @@ pub struct ServiceStabilityConfigDto {
     pub allow_user_rule_edits: Option<bool>,
     /// ISP block-page rule candidates: when `true`, a host the service
     /// recognises as blocked by the ISP (rather than genuinely unreachable) is
-    /// offered as a suggestion to move into the additional route. Off by
-    /// default (opt-in). `#[serde(default)]` keeps the field additive — an
-    /// older GUI's full-row Set turns it OFF (safe direction). Wire key
+    /// offered as a suggestion to move into the additional route. ON by
+    /// default (the product default lives in the storage record, not here).
+    /// `#[serde(default)]` stays `false` so the field remains additive — an
+    /// older GUI's full-row Set turns it OFF, never silently ON. Wire key
     /// `"isp-block-candidates-enabled"`. Global service setting (NOT per-SID).
     #[serde(default)]
     pub isp_block_candidates_enabled: bool,
@@ -3824,6 +3899,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         }
     }

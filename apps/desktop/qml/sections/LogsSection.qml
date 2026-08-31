@@ -128,6 +128,7 @@ ColumnLayout {
             category: String(w.category || ""),
             kind: String(w.kind || ""),
             messageKey: String(w.message_key || ""),
+            message: String(w.message || ""),
             hasPayload: !!w.has_payload,
             correlationSummary: w.correlation_summary || []
         }
@@ -285,6 +286,17 @@ ColumnLayout {
         _fetchVerboseLogging()
     }
 
+    // The launch snapshot no longer carries the first page: fetching logs and
+    // audit before the window exists cost two IPC timeouts of black screen on a
+    // slow service and bought nothing, because this screen is opened, not
+    // watched. Load on show instead — and only when there is nothing yet, so
+    // coming back to the tab does not throw away what the user was reading.
+    onVisibleChanged: {
+        if (!visible) return
+        if (_logEntries.length === 0) _refreshLogs()
+        if (_auditEntries.length === 0) _refreshAudit()
+    }
+
     function formatCreatedAt(ms) {
         var n = Number(ms || 0)
         if (!isFinite(n) || n <= 0) return "-"
@@ -305,7 +317,11 @@ ColumnLayout {
         return date + " " + time + " " + off
     }
     function formatMessage(entry) {
-        var text = root.tr(String(entry.messageKey || ""), String(entry.kind || ""))
+        // Fallback order: a real locale key, then the event's own text, then
+        // the area it came from. A tracing event never has a key that exists,
+        // so before the text was carried the reader saw only the area.
+        var fallback = String(entry.message || "") || String(entry.kind || "")
+        var text = root.tr(String(entry.messageKey || ""), fallback)
         var corr = entry.correlationSummary || []
         for (var i = 0; i < corr.length; i += 1) {
             text = text.replace("{" + i + "}", String(corr[i]))

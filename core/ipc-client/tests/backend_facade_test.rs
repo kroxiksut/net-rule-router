@@ -136,8 +136,8 @@ fn fresh_facade() -> (TempDir, Arc<FakeIpcClient>, IpcBackendFacade) {
 
 fn diagnostics_status_response(stale: bool) -> SnapshotDiagnosticsResponse {
     use nrr_shared::diagnostics_dto::{
-        CacheHealthCard, DiagnosticModeStateDto, DiagnosticsStatusDto, LogHealthCard,
-        SecurityStatusCard, ServiceHealthCard,
+        CacheHealthCard, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+        LogHealthCard, SecurityStatusCard, ServiceHealthCard,
     };
     SnapshotDiagnosticsResponse {
         status: DiagnosticsStatusDto {
@@ -167,12 +167,35 @@ fn diagnostics_status_response(stale: bool) -> SnapshotDiagnosticsResponse {
             },
             diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale,
+            origin: DiagnosticsDataOrigin::Service,
         },
         explain_sample: None,
     }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_cached_payload_that_no_longer_fits_its_type_is_thrown_away() {
+    // The fingerprint catches an entry written by another contract; this
+    // catches one whose shape drifted without it — and it must not keep
+    // failing every read until the TTL expires.
+    let (_dir, fake, facade) = fresh_facade();
+    facade
+        .cache()
+        .write(CacheKey::SnapshotDiagnostics, json!({ "nonsense": true }))
+        .expect("seed cache");
+    fake.set_status(ConnectionStatus::Disconnected {
+        last_error: "test".into(),
+    });
+
+    // Reading falls back to the cache, fails to type it, and drops the entry.
+    let _ = facade.diagnostics_status_snapshot();
+    assert!(
+        facade.cache().read(CacheKey::SnapshotDiagnostics).is_none(),
+        "an unusable cache entry must not survive the read that found it"
+    );
+}
 
 #[test]
 fn diagnostics_status_writes_cache_on_success() {
@@ -215,17 +238,32 @@ fn diagnostics_status_returns_cached_with_stale_when_disconnected() {
 }
 
 #[test]
-fn diagnostics_status_falls_back_to_mock_when_disconnected_with_no_cache() {
+fn a_disconnected_diagnostics_read_cannot_look_healthy() {
     let (_dir, fake, facade) = fresh_facade();
-    // No cache, no live response → facade returns the mock placeholder.
+    // No cache, no live response → the answer must say "unknown", not "fine".
     fake.set_status(ConnectionStatus::Disconnected {
         last_error: "no service".into(),
     });
     let snap = facade.diagnostics_status_snapshot();
-    // Mock snapshot is well-formed but its provenance is the preview
-    // data — we don't assert specific values, only that the facade
-    // didn't panic and returned a syntactically valid snapshot.
-    assert!(!snap.service_health.state.is_empty());
+    use nrr_shared::diagnostics_dto::DiagnosticsDataOrigin;
+    assert!(!snap.overall_healthy);
+    assert!(snap.stale);
+    assert_eq!(snap.service_health.state, "unavailable");
+    assert_eq!(snap.origin, DiagnosticsDataOrigin::Unavailable);
+}
+
+#[test]
+fn a_disconnected_alerts_read_is_not_an_empty_alert_list() {
+    let (_dir, fake, facade) = fresh_facade();
+    fake.set_status(ConnectionStatus::Disconnected {
+        last_error: "no service".into(),
+    });
+    let alerts = facade.list_security_alerts(None);
+    assert!(alerts.alerts.is_empty());
+    assert!(
+        alerts.stale,
+        "\"could not ask\" must not read as \"no alerts\""
+    );
 }
 
 #[test]
@@ -249,9 +287,12 @@ fn list_security_alerts_round_trips_payload_and_caches_it() {
             alerts: vec![alert.clone()],
         },
     );
-    let alerts = facade.list_security_alerts(Some("active"));
-    assert_eq!(alerts.len(), 1);
-    assert_eq!(alerts[0].alert_id, "alt-test-1");
+    // Unfiltered: one cache key cannot stand for several filters, so only this
+    // read is cached — a filtered one is a query and goes to the service.
+    let alerts = facade.list_security_alerts(None);
+    assert!(!alerts.stale);
+    assert_eq!(alerts.alerts.len(), 1);
+    assert_eq!(alerts.alerts[0].alert_id, "alt-test-1");
     // Cache populated.
     let cached = facade
         .cache()
@@ -286,6 +327,7 @@ fn list_log_entries_returns_server_payload_when_connected() {
         category: "service".into(),
         kind: "service.started".into(),
         message_key: "diag.service.started.summary".into(),
+        message: String::new(),
         has_payload: false,
         correlation_summary: Vec::new(),
     };

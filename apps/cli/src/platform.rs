@@ -4,6 +4,7 @@
 //! implementation yet, the console says so and exits with the "unsupported"
 //! code — it never degrades into a different behaviour.
 
+use nrr_platform_api::elevation::PrivilegedRelaunchPort;
 use nrr_platform_api::service_control::ServiceControlPort;
 
 /// The host's service manager, when this build has one.
@@ -47,5 +48,34 @@ pub fn offline_reset_verb() -> Option<&'static str> {
 /// The service binary's own network-reset verb, when this platform has one.
 #[cfg(not(windows))]
 pub fn offline_reset_verb() -> Option<&'static str> {
+    None
+}
+
+/// The host's way of re-running one command with administrator rights, when
+/// this build has one.
+#[cfg(windows)]
+pub fn privileged_relaunch() -> Option<Box<dyn PrivilegedRelaunchPort>> {
+    Some(Box::new(nrr_platform_windows::elevation::UacRelaunch::new()))
+}
+
+/// The host's way of re-running one command with administrator rights, when
+/// this build has one.
+#[cfg(target_os = "linux")]
+pub fn privileged_relaunch() -> Option<Box<dyn PrivilegedRelaunchPort>> {
+    Some(Box::new(
+        nrr_platform_linux::elevation::PkexecRelaunch::new(),
+    ))
+}
+
+/// The host's way of re-running one command with administrator rights, when
+/// this build has one.
+///
+/// macOS has no platform crate yet, so there is nothing to select and the
+/// console degrades to what it did before elevation existed: say what is needed
+/// and exit. The mechanism is not in doubt when that crate arrives — a console
+/// on macOS elevates through `sudo`, which (like `pkexec`, unlike UAC) keeps the
+/// caller's terminal, so it needs the port and none of the relay machinery.
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn privileged_relaunch() -> Option<Box<dyn PrivilegedRelaunchPort>> {
     None
 }

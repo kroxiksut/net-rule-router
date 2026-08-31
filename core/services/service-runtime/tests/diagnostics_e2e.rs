@@ -221,6 +221,7 @@ fn make_log_entry(id: u32) -> LogEntryDto {
         category: "service".into(),
         kind: "diagnostics.test".into(),
         message_key: "diag.test.entry".into(),
+        message: String::new(),
         has_payload: false,
         correlation_summary: Vec::new(),
     }

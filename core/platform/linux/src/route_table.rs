@@ -390,6 +390,23 @@ struct NetlinkRequestSocket {
     sequence: u32,
 }
 
+/// Wraps the current `errno` with the operation that produced it.
+///
+/// NOT `Transient`: the contract doc on `PlatformError::Errno` says exactly why
+/// — collapsing these turns "this route already exists" into an endless retry,
+/// and `EPERM` in a container into an endless retry of something that can never
+/// succeed. `classify_errno` already knows idempotent from conflict from
+/// privilege; it just needs to be given the number.
+#[cfg(target_os = "linux")]
+fn last_errno(operation: &'static str) -> PlatformError {
+    let error = std::io::Error::last_os_error();
+    PlatformError::Errno {
+        operation,
+        code: error.raw_os_error().unwrap_or(0),
+        message: error.to_string(),
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl NetlinkRequestSocket {
     fn open() -> Result<Self, PlatformError> {
@@ -402,10 +419,7 @@ impl NetlinkRequestSocket {
             )
         };
         if fd < 0 {
-            return Err(PlatformError::Transient {
-                operation: "open rtnetlink socket",
-                detail: std::io::Error::last_os_error().to_string(),
-            });
+            return Err(last_errno("open rtnetlink socket"));
         }
         // SAFETY: `sockaddr_nl` is plain data; zeroed is a valid starting value.
         let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -421,13 +435,10 @@ impl NetlinkRequestSocket {
             )
         };
         if rc < 0 {
-            let detail = std::io::Error::last_os_error().to_string();
+            let error = last_errno("bind rtnetlink socket");
             // SAFETY: `fd` is the descriptor just opened and not yet shared.
             unsafe { libc::close(fd) };
-            return Err(PlatformError::Transient {
-                operation: "bind rtnetlink socket",
-                detail,
-            });
+            return Err(error);
         }
         Ok(Self {
             fd,
@@ -449,10 +460,7 @@ impl NetlinkRequestSocket {
             )
         };
         if sent < 0 {
-            return Err(PlatformError::Transient {
-                operation: "send rtnetlink request",
-                detail: std::io::Error::last_os_error().to_string(),
-            });
+            return Err(last_errno("send rtnetlink request"));
         }
         Ok(())
     }
@@ -471,10 +479,7 @@ impl NetlinkRequestSocket {
             )
         };
         if read < 0 {
-            return Err(PlatformError::Transient {
-                operation: "read rtnetlink reply",
-                detail: std::io::Error::last_os_error().to_string(),
-            });
+            return Err(last_errno("read rtnetlink reply"));
         }
         buffer.truncate(read as usize);
         Ok(buffer)
@@ -680,5 +685,27 @@ mod tests {
         body[7] = RTN_UNICAST;
         push_attr(&mut body, RTA_DST, &[10, 0, 0, 0]);
         assert!(parse_route_message(&body).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_failure_carries_its_errno_instead_of_reading_as_retryable() {
+        use nrr_platform_api::error::ErrorClass;
+
+        // Any failing syscall sets errno; the point is what we WRAP it as.
+        let _ = std::fs::File::open("/nrr-does-not-exist");
+        let error = super::last_errno("open rtnetlink socket");
+
+        match &error {
+            nrr_platform_api::error::PlatformError::Errno { code, .. } => {
+                assert_ne!(*code, 0, "the errno must survive the wrapping");
+            }
+            other => panic!("a netlink failure must not collapse into {other:?}"),
+        }
+        assert_ne!(
+            error.classify(),
+            ErrorClass::Retryable,
+            "ENOENT is not something to retry forever"
+        );
     }
 }

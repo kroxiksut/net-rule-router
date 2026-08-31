@@ -152,6 +152,15 @@ pub struct SupervisedRuntimeDeps {
     pub adapter_monitor: Arc<AdapterMonitor>,
     /// Operation-status records — GC'd at 5 min.
     pub operation_results: Arc<OperationStatusStore>,
+    /// Confirmation tokens issued by dry-runs, GC'd on the same tick.
+    ///
+    /// A dry-run is classified read-only (it MINTS the token the confirm phase
+    /// must carry), so it needs no elevation, skips the mutation queue and is
+    /// not rate-limited - and it parks a payload of up to the IPC message cap
+    /// in this map. Nothing collected them, so a client looping dry-runs
+    /// without ever confirming grew the service's memory without bound.
+    /// `None` in profiles that wire no token store.
+    pub mutation_tokens: Option<Arc<crate::ipc_handlers::mutation_token_store::MutationTokenStore>>,
     /// IPC accept-failure policy and friends.
     pub stability: ServiceStabilityConfig,
     /// Operational-log directory the cleanup task scans. Audit files in
@@ -259,7 +268,9 @@ pub struct SupervisedRuntimeDeps {
     /// demand (live re-arm). `run_supervised_runtime`
     /// applies `dns_resolver_boot_mode` to it once tasks are up (arming the
     /// resolver iff the persisted mode is `Resolver`) and calls `stop()` on
-    /// shutdown so the NRPT redirect is always restored before the service exits.
+    /// shutdown, so an ORDERLY exit restores the NRPT redirect - within a
+    /// teardown budget, and only on that path. A kill leaves the redirect
+    /// behind; the next boot's `clear_orphan_redirect` is what covers that.
     /// The SAME `Arc` is shared with the service-stability IPC writer, so toggling
     /// enforcement mode in the GUI starts/stops the resolver WITHOUT a restart.
     /// `None` in test profiles / when the platform factory could not be wired.
@@ -290,6 +301,13 @@ pub struct SupervisedRuntimeDeps {
     /// (`resume-watchdog-tick`) runs regardless, so a platform without an impl
     /// still recovers from sleep — just a few seconds later.
     pub power_event_observer: Option<Arc<dyn nrr_platform_api::power::PowerEventObserver>>,
+    /// OS interactive-logon observer. When present, a sign-in re-applies
+    /// `dns_resolver_boot_mode` — the arm is gated on a principal existing, so
+    /// on a cold boot it is this event that arms Mode B rather than the boot
+    /// snapshot. `None` on a platform without an impl; the resolver then arms on
+    /// the first later re-arm that finds a user.
+    pub logon_session_observer:
+        Option<Arc<dyn nrr_platform_api::logon_session::LogonSessionObserver>>,
     /// Drained by the resume watchdog: whoever notices a binding worth
     /// re-resolving (the fail-closed posture heartbeat) sets a flag here instead
     /// of recomputing from inside its own compute. `None` in test profiles.
@@ -424,6 +442,8 @@ pub fn run_supervised_runtime(
     let mut network_rearm: Option<crate::network_rearm::NetworkChangeRearm> = None;
     // Same lifetime as `network_rearm`: dropped in the Stopping phase.
     let mut power_rearm: Option<crate::power_resume::PowerResumeRearm> = None;
+    // Same lifetime again: dropped in the Stopping phase.
+    let mut logon_rearm: Option<crate::logon_rearm::LogonSessionRearm> = None;
 
     if blocked {
         // Bootstrap reported Blocking — stay in recovery, no tasks.
@@ -457,18 +477,18 @@ pub fn run_supervised_runtime(
         // unavailable" while everything is actually fine.
         health.clear_lifecycle_override();
         // Worst severity defaults to `Unknown` (last in the enum) when
-        // no component has reported `Ok` yet — and the derived-state
-        // mapping treats `Unknown -> Starting`. Seed each production
-        // component with `Ok` so the snapshot reflects "Running" the
-        // instant `clear_lifecycle_override` removes the Starting
-        // override. The subsequent task ticks overwrite these with
-        // actual readings.
+        // no component has reported yet — and the derived-state mapping treats
+        // `Unknown -> Starting`. Seed each production component so the snapshot
+        // reflects "Running" the instant `clear_lifecycle_override` removes the
+        // Starting override. Seed, not record: bootstrap degradation and any
+        // `Blocking` a task already reported are verdicts, and `Diagnostics` is
+        // never written again after them.
         for component in [
             crate::health::HealthComponent::Ipc,
             crate::health::HealthComponent::Adapters,
             crate::health::HealthComponent::Diagnostics,
         ] {
-            health.record(component, ServiceHealthSeverity::Ok, "task spawned");
+            health.record_initial(component, ServiceHealthSeverity::Ok, "task spawned");
         }
         controller.report(ServiceRuntimeState::Running);
         spawn_optional_tasks(&supervisor, &deps);
@@ -526,6 +546,41 @@ pub fn run_supervised_runtime(
                     tracing::warn!(
                         target: "nrr::route-coordinator",
                         "power-event observer registration failed ({e:?}); relying on the resume watchdog",
+                    );
+                }
+            }
+        }
+
+        // What actually arms Mode B on a cold boot: the resolver refuses to arm
+        // while no one is signed in (no principal, hence no rules), so the boot
+        // apply above is a deliberate no-op until this fires.
+        if let (Some(observer), Some(controller)) = (
+            deps.logon_session_observer.as_ref(),
+            resolver_controller.as_ref(),
+        ) {
+            let controller = Arc::clone(controller);
+            match crate::logon_rearm::LogonSessionRearm::start(
+                observer.as_ref(),
+                Arc::new(move || {
+                    tracing::info!(
+                        target: "nrr::dns-resolver",
+                        "user signed in — applying the persisted enforcement mode",
+                    );
+                    controller.apply(resolver_boot_mode);
+                }),
+                crate::logon_rearm::LOGON_DEBOUNCE,
+            ) {
+                Ok(rearm) => {
+                    tracing::info!(
+                        target: "nrr::dns-resolver",
+                        "logon observer active — Mode B arms on sign-in, not during the logon phase",
+                    );
+                    logon_rearm = Some(rearm);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        "logon observer registration failed ({e:?}); Mode B will arm on a later re-arm instead",
                     );
                 }
             }
@@ -610,6 +665,9 @@ pub fn run_supervised_runtime(
         }
         if let Some(rearm) = power_rearm.take() {
             teardown_step("power-rearm-stop", REARM_STOP_BUDGET, move || drop(rearm));
+        }
+        if let Some(rearm) = logon_rearm.take() {
+            teardown_step("logon-rearm-stop", REARM_STOP_BUDGET, move || drop(rearm));
         }
 
         let drain_began = Instant::now();
@@ -838,9 +896,10 @@ fn spawn_production_tasks(
 /// `Running` transition past `START_TIMEOUT`.
 fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntimeDeps) {
     // 1. operation-results-gc.
-    if let Err(e) = supervisor.spawn(build_operation_results_gc_task(Arc::clone(
-        &deps.operation_results,
-    ))) {
+    if let Err(e) = supervisor.spawn(build_operation_results_gc_task(
+        Arc::clone(&deps.operation_results),
+        deps.mutation_tokens.clone(),
+    )) {
         tracing::warn!(target: "nrr::supervisor", "spawn operation-results-gc failed: {e}");
     }
 
@@ -1108,6 +1167,7 @@ mod tests {
             ipc_server: Arc::new(InertServer::default()),
             adapter_monitor: monitor,
             operation_results: Arc::new(OperationStatusStore::default()),
+            mutation_tokens: None,
             stability: ServiceStabilityConfig::default(),
             logs_dir: std::env::temp_dir(),
             log_retention: LogRetentionPolicy::default(),
@@ -1133,6 +1193,7 @@ mod tests {
             network_change_observer: None,
             secondary_liveness_hook: None,
             power_event_observer: None,
+            logon_session_observer: None,
             rebind_requests: None,
             app_observation: None,
             dns_observation: None,

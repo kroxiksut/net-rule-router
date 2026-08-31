@@ -39,8 +39,15 @@ pub const RATE_LIMIT_MAX_DEFAULT: u64 = 5;
 pub const RATE_LIMIT_MAX_DIAGNOSTIC: u64 = 50;
 
 /// Categories that are rate-limited in Default mode.
-pub const RATE_LIMITED_CATEGORIES: &[EventCategory] =
-    &[EventCategory::Decision, EventCategory::Cache];
+///
+/// `Cache` alone: its one producer warns about the SAME degraded condition
+/// repeatedly, so a cap costs nothing and bounds a storm. `Decision` used to be
+/// here from before the targets were classified — now that the DNS, enforcement
+/// and connection-trace targets land there, a cap of five per ten seconds would
+/// drop exactly the lines an acceptance run reads. Add a category here only
+/// with a measurement showing it drowns the log; the level gate is the primary
+/// filter and it already keeps Default at Info and above.
+pub const RATE_LIMITED_CATEGORIES: &[EventCategory] = &[EventCategory::Cache];
 
 // ── LoggingMode ───────────────────────────────────────────────────────────────
 
@@ -79,16 +86,20 @@ impl LoggingMode {
 
 // ── AllowedCategories ─────────────────────────────────────────────────────────
 
-/// Returns `true` if the category is unconditionally allowed in Default mode.
+/// Categories Default mode deliberately drops, whatever their level.
+///
+/// EMPTY, and that is the design. This used to be an allow-list, which is the
+/// wrong polarity for an operational log: a category nobody had classified yet
+/// was silently excluded, and classifying a target correctly could DELETE
+/// evidence from the running product. As a deny-list the default is "write it",
+/// and silencing a whole area becomes a deliberate, reviewable entry here.
+/// Volume is handled where volume belongs — the level gate (Default starts at
+/// Info) and [`RATE_LIMITED_CATEGORIES`].
+const DEFAULT_MODE_SILENCED: &[EventCategory] = &[];
+
+/// Returns `true` if the category is written in Default mode.
 fn is_default_allowed(category: EventCategory) -> bool {
-    matches!(
-        category,
-        EventCategory::Service
-            | EventCategory::Security
-            | EventCategory::Apply
-            | EventCategory::Integrity
-            | EventCategory::Diagnostics
-    )
+    !DEFAULT_MODE_SILENCED.contains(&category)
 }
 
 /// Returns `true` if the category is always allowed in Diagnostic mode.
@@ -100,29 +111,36 @@ fn is_diagnostic_allowed(category: EventCategory) -> bool {
 
 // ── RateLimiter ───────────────────────────────────────────────────────────────
 
+/// A leaky bucket, not a fixed window.
+///
+/// A window that resets on a clock boundary lets `max` events at the end of one
+/// window and `max` at the start of the next through milliseconds apart — twice
+/// the stated rate, in the burst the limit exists to contain. Draining
+/// continuously spreads the allowance over time instead.
 struct RateBucket {
-    count: u64,
-    window_start: Instant,
+    /// Events counted against the allowance, drained as time passes.
+    level: f64,
+    last_drain: Instant,
 }
 
 impl RateBucket {
     fn new() -> Self {
         Self {
-            count: 0,
-            window_start: Instant::now(),
+            level: 0.0,
+            last_drain: Instant::now(),
         }
     }
 
     /// Returns `true` if the event should be allowed (not rate-limited).
     fn allow(&mut self, max_per_window: u64) -> bool {
-        let elapsed = self.window_start.elapsed().as_secs();
-        if elapsed >= RATE_LIMIT_WINDOW_SECS {
-            // Reset window.
-            self.count = 0;
-            self.window_start = Instant::now();
-        }
-        if self.count < max_per_window {
-            self.count += 1;
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_drain).as_secs_f64();
+        self.last_drain = now;
+        let drain_per_sec = max_per_window as f64 / RATE_LIMIT_WINDOW_SECS as f64;
+        self.level = (self.level - elapsed * drain_per_sec).max(0.0);
+
+        if self.level + 1.0 <= max_per_window as f64 {
+            self.level += 1.0;
             true
         } else {
             false
@@ -243,24 +261,31 @@ mod tests {
     }
 
     #[test]
-    fn default_mode_blocks_user_action_category() {
+    fn default_mode_silences_no_category() {
+        // The polarity is the point: a category nobody has classified yet must
+        // be WRITTEN, not dropped. Silencing an area is a deliberate entry in
+        // `DEFAULT_MODE_SILENCED`, and today there is none.
         let f = LogFilter::new(LoggingMode::Default);
-        // UserAction is not in default allowlist.
-        assert!(!f.should_emit(
-            EventLevel::Info,
-            EventCategory::UserAction,
-            PrivacyClass::PublicSummary
-        ));
-    }
-
-    #[test]
-    fn default_mode_blocks_review_category() {
-        let f = LogFilter::new(LoggingMode::Default);
-        assert!(!f.should_emit(
-            EventLevel::Info,
+        for category in [
+            EventCategory::Service,
+            EventCategory::Decision,
+            EventCategory::Apply,
+            EventCategory::Import,
             EventCategory::Review,
-            PrivacyClass::PublicSummary
-        ));
+            EventCategory::Integrity,
+            EventCategory::Security,
+            EventCategory::Diagnostics,
+            EventCategory::UserAction,
+        ] {
+            assert!(
+                f.should_emit(EventLevel::Info, category, PrivacyClass::PublicSummary),
+                "{category:?} was dropped in Default mode"
+            );
+        }
+        assert!(
+            DEFAULT_MODE_SILENCED.is_empty(),
+            "adding a category here removes it from the running product's log —              say why in the constant's doc"
+        );
     }
 
     #[test]
@@ -341,14 +366,12 @@ mod tests {
 
     #[test]
     fn rate_limit_blocks_after_max() {
-        // Decision is rate-limited in Diagnostic mode (where it's in the allowlist).
-        // In Default mode Decision is blocked by category allowlist before rate limiting.
         let f = LogFilter::new(LoggingMode::Diagnostic);
         let mut allowed = 0u64;
         for _ in 0..RATE_LIMIT_MAX_DIAGNOSTIC + 5 {
             if f.should_emit(
                 EventLevel::Info,
-                EventCategory::Decision,
+                EventCategory::Cache,
                 PrivacyClass::PublicSummary,
             ) {
                 allowed += 1;
@@ -400,5 +423,36 @@ mod tests {
         assert_eq!(LoggingMode::Default.min_level(), EventLevel::Info);
         assert_eq!(LoggingMode::Diagnostic.min_level(), EventLevel::Debug);
         assert_eq!(LoggingMode::DeveloperTrace.min_level(), EventLevel::Trace);
+    }
+
+    #[test]
+    fn a_bucket_does_not_hand_out_two_windows_worth_back_to_back() {
+        let mut bucket = RateBucket::new();
+        for _ in 0..5 {
+            assert!(bucket.allow(5));
+        }
+        assert!(!bucket.allow(5), "the allowance is spent");
+
+        // A fixed window would refill the whole allowance the instant the
+        // boundary passes; draining hands back only what time has earned.
+        bucket.last_drain -= std::time::Duration::from_secs(RATE_LIMIT_WINDOW_SECS / 2);
+        let mut granted = 0;
+        while bucket.allow(5) {
+            granted += 1;
+        }
+        assert_eq!(
+            granted, 2,
+            "half a window earns half the allowance, not all of it"
+        );
+    }
+
+    #[test]
+    fn a_cache_warning_reaches_the_log_in_default_mode() {
+        let filter = LogFilter::new(LoggingMode::Default);
+        assert!(filter.should_emit(
+            EventLevel::Warn,
+            EventCategory::Cache,
+            PrivacyClass::PublicSummary
+        ));
     }
 }

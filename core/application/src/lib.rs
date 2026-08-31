@@ -15,16 +15,11 @@ pub use nrr_domain::rule_value_validation;
 pub const APPLICATION_LAYER_NOTE: &str =
     "Transport-agnostic application workflows are composed here.";
 
-pub fn runtime_boot_banner(component: &str) -> String {
-    format!(
-        "NetRuleRouter {} entrypoint scaffold (Rust-first)",
-        component
-    )
-}
-
-pub fn runtime_boot_guard_message() -> &'static str {
-    "Runtime starts without routing business logic."
-}
+// Moved into `nrr-shared`: the service needed these two strings and nothing
+// else from this crate, and that lone edge dragged the UI and preview crates
+// into its binary. Re-exported so the desktop runtimes, which legitimately
+// depend on this crate, keep the same path.
+pub use nrr_shared::{runtime_boot_banner, runtime_boot_role_message};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AboutWindowInfo {
@@ -36,10 +31,15 @@ pub struct AboutWindowInfo {
     pub rust_toolchain: &'static str,
 }
 
+/// The edition this build ships. One value today; it exists as a field because
+/// the About window shows it and Pro is a planned second value.
+pub const EDITION: &str = "Free";
+
 pub const fn about_window_info() -> AboutWindowInfo {
     AboutWindowInfo {
-        product_name: "NetRuleRouter",
-        edition: "",
+        // Read from the product-identity SSOT, never retyped.
+        product_name: nrr_shared::product_identity::PRODUCT_NAME,
+        edition: EDITION,
         version: env!("CARGO_PKG_VERSION"),
         license: env!("CARGO_PKG_LICENSE"),
         build_profile: if cfg!(debug_assertions) {
@@ -47,14 +47,17 @@ pub const fn about_window_info() -> AboutWindowInfo {
         } else {
             "release"
         },
-        rust_toolchain: "stable",
+        // Baked from `rust-version` at compile time rather than the word
+        // "stable", which was neither the pinned toolchain nor ever updated.
+        rust_toolchain: env!("CARGO_PKG_RUST_VERSION"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        about_window_info, runtime_boot_banner, runtime_boot_guard_message, APPLICATION_LAYER_NOTE,
+        about_window_info, runtime_boot_banner, runtime_boot_role_message, APPLICATION_LAYER_NOTE,
+        EDITION,
     };
 
     #[test]
@@ -64,26 +67,40 @@ mod tests {
 
     #[test]
     fn boot_banner_mentions_component_name() {
-        assert_eq!(
-            runtime_boot_banner("GUI"),
-            "NetRuleRouter GUI entrypoint scaffold (Rust-first)"
+        let banner = runtime_boot_banner("GUI");
+        assert!(banner.contains("GUI"), "{banner}");
+        assert!(
+            banner.contains(nrr_shared::product_identity::PRODUCT_NAME),
+            "{banner}"
         );
     }
 
     #[test]
-    fn boot_guard_message_stays_stable() {
-        assert_eq!(
-            runtime_boot_guard_message(),
-            "Runtime starts without routing business logic."
-        );
+    fn the_service_boot_line_says_it_enforces() {
+        // The old line claimed the runtime carried no routing logic — in the
+        // process that carries all of it.
+        let line = runtime_boot_role_message("service");
+        assert!(line.contains("enforces"), "{line}");
     }
 
     #[test]
     fn about_window_info_contains_expected_metadata() {
         let info = about_window_info();
-        assert_eq!(info.product_name, "NetRuleRouter");
-        assert_eq!(info.edition, "");
+        // Compared with the SSOT, not with a second copy of the name.
+        assert_eq!(
+            info.product_name,
+            nrr_shared::product_identity::PRODUCT_NAME
+        );
+        assert_eq!(info.edition, EDITION);
         assert_eq!(info.license, "MPL-2.0");
         assert!(!info.version.is_empty());
+        // The toolchain shown to the user is the pinned one, not the word
+        // "stable" — that literal never matched and never updated.
+        assert_eq!(info.rust_toolchain, env!("CARGO_PKG_RUST_VERSION"));
+        assert!(
+            info.rust_toolchain.starts_with('1'),
+            "{}",
+            info.rust_toolchain
+        );
     }
 }

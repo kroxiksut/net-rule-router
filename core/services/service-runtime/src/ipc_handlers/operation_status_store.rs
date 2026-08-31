@@ -63,6 +63,11 @@ pub struct OperationRecord {
     /// states, this is `None` (records hang around until a terminal
     /// transition resets the timer).
     pub retain_until: Option<Instant>,
+    /// Who submitted the operation, in stored form. The result of a mutation
+    /// belongs to the principal who asked for it: the pipe admits every
+    /// authenticated local process, so without this an id is the only thing
+    /// between one user and another user's mutation result.
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +80,14 @@ pub struct OperationError {
     pub message: String,
 }
 
+/// Who owns an operation submitted through `ctx`, in stored form. `None` when
+/// the transport could not attribute the caller.
+#[must_use]
+pub fn owner_of(ctx: &crate::ipc::IpcRequestContext) -> Option<String> {
+    let stored = ctx.caller_stored();
+    (!stored.is_empty()).then(|| stored.to_string())
+}
+
 #[derive(Default)]
 pub struct OperationStatusStore {
     inner: Mutex<HashMap<String, OperationRecord>>,
@@ -82,10 +95,29 @@ pub struct OperationStatusStore {
 
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Operation ids name a record that carries the RESULT of somebody's mutation,
+/// so they must not be enumerable. The old suffix was
+/// `Instant::now().elapsed()`, which is a few nanoseconds by construction —
+/// the id was the counter and nothing else. The counter stays as the ordering
+/// aid it always was; the randomness is what makes the id unguessable.
+///
+/// A failed draw falls back to the clock: an operation whose status cannot be
+/// reported at all is worse than an id that is merely hard to guess, and the
+/// record is owner-checked on read regardless.
 fn next_operation_id() -> String {
     let n = OPERATION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = Instant::now().elapsed().subsec_nanos();
-    format!("op-{n:016x}{nanos:08x}")
+    let mut bytes = [0u8; 8];
+    let suffix: String = match getrandom::fill(&mut bytes) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!(
+            "{:016x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+        ),
+    };
+    format!("op-{n:016x}{suffix}")
 }
 
 // State is `Mutex`-guarded; `lock().expect(...)` propagates poisoning (a prior
@@ -96,8 +128,11 @@ impl OperationStatusStore {
         Self::default()
     }
 
-    /// Reserve an operation id and stash an initial `Queued` record.
-    pub fn enqueue(&self) -> String {
+    /// Reserve an operation id owned by `owner` and stash an initial `Queued`
+    /// record. `None` means the transport could not attribute the caller; such
+    /// a record is readable by nobody, which is the safe reading of "we do not
+    /// know whose this is".
+    pub fn enqueue_for(&self, owner: Option<String>) -> String {
         let id = next_operation_id();
         let mut g = self.inner.lock().expect("op store mutex poisoned");
         g.insert(
@@ -108,6 +143,7 @@ impl OperationStatusStore {
                 result: None,
                 error: None,
                 retain_until: None,
+                owner,
             },
         );
         id
@@ -148,6 +184,17 @@ impl OperationStatusStore {
             .cloned()
     }
 
+    /// Read a record on behalf of `requester`. A record belonging to somebody
+    /// else answers exactly like one that never existed — telling the caller
+    /// "exists, not yours" would confirm the id for a guesser.
+    pub fn get_for(&self, op_id: &str, requester: &str) -> Option<OperationRecord> {
+        let rec = self.get(op_id)?;
+        match rec.owner.as_deref() {
+            Some(owner) if owner == requester && !requester.is_empty() => Some(rec),
+            _ => None,
+        }
+    }
+
     /// Drop entries whose retention window has elapsed.
     pub fn gc_expired(&self, now: Instant) -> usize {
         let mut g = self.inner.lock().expect("op store mutex poisoned");
@@ -175,8 +222,8 @@ mod tests {
     #[test]
     fn enqueue_returns_unique_ids_in_queued_state() {
         let s = OperationStatusStore::new();
-        let id1 = s.enqueue();
-        let id2 = s.enqueue();
+        let id1 = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
+        let id2 = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
         assert_ne!(id1, id2);
         assert_eq!(s.get(&id1).unwrap().state, OperationState::Queued);
     }
@@ -184,7 +231,7 @@ mod tests {
     #[test]
     fn complete_sets_result_and_terminal_state() {
         let s = OperationStatusStore::new();
-        let id = s.enqueue();
+        let id = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
         s.complete(&id, serde_json::json!({ "ok": true }), Instant::now());
         let rec = s.get(&id).unwrap();
         assert_eq!(rec.state, OperationState::Completed);
@@ -196,7 +243,7 @@ mod tests {
     #[test]
     fn fail_sets_error_and_terminal_state() {
         let s = OperationStatusStore::new();
-        let id = s.enqueue();
+        let id = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
         s.fail(
             &id,
             OperationError {
@@ -214,9 +261,9 @@ mod tests {
     fn gc_drops_terminal_entries_past_retention_only() {
         let s = OperationStatusStore::new();
         let now = Instant::now();
-        let id_done = s.enqueue();
+        let id_done = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
         s.complete(&id_done, serde_json::json!({}), now);
-        let id_running = s.enqueue();
+        let id_running = s.enqueue_for(Some("S-1-5-21-owner".to_string()));
 
         // Just past retention.
         let dropped = s.gc_expired(now + DEFAULT_OPERATION_RETENTION + Duration::from_secs(1));

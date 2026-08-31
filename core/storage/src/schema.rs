@@ -1795,6 +1795,50 @@ pub const STATE_DB_V58_DDL: &[&str] = &[
     "DELETE FROM local_network_rules WHERE origin = 'discovered' AND allow = 1",
 ];
 
+/// v59 — "stop asking about local networks I have not seen yet".
+///
+/// The answer is per adapter (v58), so a switch that renumbers stops asking
+/// twice for the same adapter. It still asks once for each NEW adapter, and a
+/// machine with hypervisors, WSL and a VPN grows those over time - which reads
+/// as "it asks every time" even though every question is about something it
+/// genuinely had not seen.
+///
+/// Off by default: opening a segment without asking is the user's call to make,
+/// not ours to assume. When on, nothing is written - a discovered network is
+/// simply reported as already answered, so the offer stays quiet while the list
+/// in Settings still shows every network and lets any of them be refused.
+/// Turning the option back off asks again, which is the honest behaviour for a
+/// switch that decides on the user's behalf.
+pub const STATE_DB_V59_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN local_networks_auto_accept INTEGER NOT NULL      DEFAULT 0 CHECK(local_networks_auto_accept IN (0, 1))",
+];
+
+/// Drop the `active_revision` / `last_known_good` singletons.
+///
+/// Both were machine-wide rows from before policy became per-principal. The
+/// enforcement path moved to `active_revision_pointer` and the rollback target
+/// is derived from `revisions`, so nothing wrote them any more — but
+/// `check_integrity` still read their `integrity_hash`, which means it verified
+/// a hash it had written itself, in tables the system no longer used. It now
+/// checks the live `revisions.row_hmac` instead, and these tables have no
+/// remaining reader.
+pub const STATE_DB_V60_DDL: &[&str] = &[
+    "DROP TABLE IF EXISTS active_revision",
+    "DROP TABLE IF EXISTS last_known_good",
+];
+
+/// The Zone-vs-ExactIp evaluation order, per principal.
+///
+/// The rule model documents it as a user setting ("Exact IP wins by default;
+/// configurable"), the engine has honoured it since `ZonePriorityPolicy`
+/// existed, and nothing ever supplied a value: both production callers passed
+/// the default. Stored beside the other rule-affecting per-SID switches rather
+/// than in device-local UI preferences, because it changes what the SERVICE
+/// enforces.
+pub const STATE_DB_V61_DDL: &[&str] = &[
+    "ALTER TABLE secondary_block_policy ADD COLUMN zone_priority_over_ip INTEGER NOT NULL      DEFAULT 0 CHECK(zone_priority_over_ip IN (0, 1))",
+];
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

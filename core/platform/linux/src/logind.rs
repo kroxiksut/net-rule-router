@@ -33,8 +33,6 @@
 
 #![cfg(target_os = "linux")]
 
-use std::process::Command;
-
 use serde::Deserialize;
 
 /// A user with a live login, as logind sees them.
@@ -69,10 +67,14 @@ struct LoginctlUser {
 /// enforcing nothing because the question failed would silently drop every
 /// user's protection.
 pub fn live_users() -> Result<Vec<LiveUser>, LogindError> {
-    let out = Command::new("loginctl")
-        .args(["list-users", "--output=json", "--no-legend"])
-        .output()
-        .map_err(|e| LogindError::Unavailable(e.to_string()))?;
+    // Budgeted: this runs on EVERY enforcement tick, and a `loginctl` blocked on
+    // an unreachable D-Bus used to stop the apply loop for good.
+    let out = crate::command::output_with_timeout(
+        "loginctl",
+        &["list-users", "--output=json", "--no-legend"],
+        crate::command::DEFAULT_COMMAND_TIMEOUT,
+    )
+    .map_err(|e| LogindError::Unavailable(e.to_string()))?;
     if !out.status.success() {
         return Err(LogindError::Failed {
             status: out.status.to_string(),

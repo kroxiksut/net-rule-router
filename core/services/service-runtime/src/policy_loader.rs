@@ -206,8 +206,13 @@ where
         };
 
         match (active, integrity) {
-            // Happy path: active OK and integrity OK.
-            (Some(active_id), (IntegrityCheckResult::Ok, _)) => {
+            // Happy path: active OK and integrity OK. `OkNoRollbackTarget` is
+            // the same load — it only says there is nothing to fall back to,
+            // which is the normal state right after the first activation.
+            (
+                Some(active_id),
+                (IntegrityCheckResult::Ok | IntegrityCheckResult::OkNoRollbackTarget, _),
+            ) => {
                 let summary = self.summary_for(&active_id, "active");
                 self.set_current(Some(summary.clone()));
                 PolicyLoadResult::ActiveLoaded(summary)
@@ -397,8 +402,17 @@ mod tests {
         let runner = SqliteMigrationRunner::for_state_db(conn);
         runner.run_pending_migrations().unwrap();
         runner.verify_schema().unwrap();
-        (dir, SqliteStateStore::new(runner.into_connection()))
+        (
+            dir,
+            SqliteStateStore::new(runner.into_connection())
+                .with_signing_key(TEST_SIGNING_KEY.to_vec()),
+        )
     }
+
+    /// The key the fixtures sign rows with. Integrity now rests on
+    /// `revisions.row_hmac`, so a test that wants a "corrupt active revision"
+    /// signs a row and then edits it — the same thing tampering does.
+    const TEST_SIGNING_KEY: &[u8] = b"policy-loader-test-key-0123456789";
 
     /// Recording audit emitter — records every event. The closure-driven
     /// variant lets tests force a write failure.
@@ -421,6 +435,55 @@ mod tests {
 
     fn rev(s: &str) -> RevisionId {
         RevisionId::from_prefixed_string(format!("rev-{s}")).unwrap()
+    }
+
+    /// Give the store a revision history. Revisions must exist before the
+    /// active pointer can name one — the pointer carries a foreign key into
+    /// `revisions` — and the LKG is now READ from this history rather than
+    /// promoted into a table of its own: the most recently superseded row is
+    /// the rollback target.
+    fn seed_revisions(
+        store: SqliteStateStore,
+        rows: &[(&RevisionId, &str, i64)],
+    ) -> SqliteStateStore {
+        let conn = store.into_connection();
+        for (id, status, superseded_at) in rows {
+            conn.execute(
+                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
+                                        status, source, correlation_id, created_at,
+                                        superseded_at)
+                 VALUES (?1, ?2, 'h', '{}', ?3, 'gui-rules-edit', 'c', 0, ?4)",
+                rusqlite::params![
+                    nrr_storage::BASELINE_PRINCIPAL,
+                    id.as_str(),
+                    status,
+                    (*superseded_at > 0).then_some(*superseded_at)
+                ],
+            )
+            .unwrap();
+        }
+        {
+            let repo = nrr_storage::revisions::RevisionsRepository::with_signing_key(
+                &conn,
+                TEST_SIGNING_KEY.to_vec(),
+            );
+            for (id, _, _) in rows {
+                repo.re_sign_row(id.as_str()).unwrap();
+            }
+        }
+        SqliteStateStore::new(conn).with_signing_key(TEST_SIGNING_KEY.to_vec())
+    }
+
+    /// Edit a signed row behind the store's back — what an external editor or a
+    /// hand-patched database does, and what `check_integrity` must catch.
+    fn tamper_row(store: SqliteStateStore, id: &RevisionId) -> SqliteStateStore {
+        let conn = store.into_connection();
+        conn.execute(
+            "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = ?1",
+            rusqlite::params![id.as_str()],
+        )
+        .unwrap();
+        SqliteStateStore::new(conn).with_signing_key(TEST_SIGNING_KEY.to_vec())
     }
 
     fn loader_for(
@@ -453,6 +516,7 @@ mod tests {
     fn active_present_with_valid_hash_loads_active_ready() {
         let (_dir, store) = fresh_state_store();
         let id = rev("11111111-2222-3333-4444-555555555555");
+        let store = seed_revisions(store, &[(&id, "active", 0)]);
         store.set_active_revision(&id).unwrap();
         let (_, _, loader) = loader_for(store, RecordingAudit::default());
         match loader.load() {
@@ -470,17 +534,14 @@ mod tests {
         let (_dir, store) = fresh_state_store();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let store = seed_revisions(
+            store,
+            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        );
         store.set_active_revision(&active).unwrap();
-        store.set_last_known_good(&lkg).unwrap();
-        // Corrupt the active row's stored hash so check_integrity reports
+        // An edited active row is what makes check_integrity report
         // PolicyIntegrityFailed for the active pointer.
-        let conn = store.into_connection();
-        conn.execute(
-            "UPDATE active_revision SET integrity_hash = 'deadbeef' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        let store = SqliteStateStore::new(conn);
+        let store = tamper_row(store, &active);
 
         let (repo, audit, loader) = loader_for(store, RecordingAudit::default());
         match loader.load() {
@@ -509,14 +570,11 @@ mod tests {
     fn active_corrupt_with_missing_lkg_requires_recovery() {
         let (_dir, store) = fresh_state_store();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        // The only revision there has ever been: nothing superseded behind it,
+        // so there is no rollback target.
+        let store = seed_revisions(store, &[(&active, "active", 0)]);
         store.set_active_revision(&active).unwrap();
-        let conn = store.into_connection();
-        conn.execute(
-            "UPDATE active_revision SET integrity_hash = 'deadbeef' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        let store = SqliteStateStore::new(conn);
+        let store = tamper_row(store, &active);
 
         let (repo, audit, loader) = loader_for(store, RecordingAudit::default());
         match loader.load() {
@@ -541,15 +599,12 @@ mod tests {
         let (_dir, store) = fresh_state_store();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let store = seed_revisions(
+            store,
+            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        );
         store.set_active_revision(&active).unwrap();
-        store.set_last_known_good(&lkg).unwrap();
-        let conn = store.into_connection();
-        conn.execute(
-            "UPDATE active_revision SET integrity_hash = 'deadbeef' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        let store = SqliteStateStore::new(conn);
+        let store = tamper_row(store, &active);
 
         let audit = RecordingAudit {
             fail_on_started: true,
@@ -573,16 +628,15 @@ mod tests {
         let (_dir, store) = fresh_state_store();
         let active = rev("aaaa1111-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         let lkg = rev("bbbb2222-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        let store = seed_revisions(
+            store,
+            &[(&lkg, "superseded", 1_000), (&active, "active", 0)],
+        );
         store.set_active_revision(&active).unwrap();
-        store.set_last_known_good(&lkg).unwrap();
-        let conn = store.into_connection();
-        // Corrupt LKG hash so check_integrity returns RequireUserAction.
-        conn.execute(
-            "UPDATE last_known_good SET integrity_hash = 'deadbeef' WHERE id = 1",
-            [],
-        )
-        .unwrap();
-        let store = SqliteStateStore::new(conn);
+        // The rollback TARGET is the edited row this time: the active revision
+        // is intact, so the guard has to refuse falling back to a target it
+        // cannot vouch for rather than installing edited policy.
+        let store = tamper_row(store, &lkg);
 
         let (repo, _audit, loader) = loader_for(store, RecordingAudit::default());
         match loader.load() {

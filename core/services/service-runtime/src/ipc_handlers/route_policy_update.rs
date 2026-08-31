@@ -179,6 +179,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         }
     }
@@ -215,6 +217,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -275,6 +279,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -315,6 +321,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -354,6 +362,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();
@@ -396,6 +406,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -458,6 +470,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: dto.binding_source,
         })
         .unwrap();
@@ -507,6 +521,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         })
         .unwrap();

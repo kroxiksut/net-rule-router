@@ -20,9 +20,11 @@ name = "nrr-service"
 path = "src/main.rs"
 
 [dependencies]
-nrr-application = { path = "../../application" }
 nrr-domain      = { path = "../../domain" }
-nrr-ipc-client  = { path = "../../ipc-client" }
+# NOTE: no `nrr-ipc-client` here. Its wire codec moved to `nrr-shared`, where
+# both ends of the protocol reach it. While the server depended on the client it
+# also inherited `nrr-application` and, behind it, `nrr-ui-support` and
+# `nrr-mock-backend` — UI and preview code linked into a LocalSystem service.
 nrr-service-runtime = { path = "../service-runtime" }
 nrr-shared = { path = "../../../shared/contracts" }
 # Needed only to construct the production `StorageProfile` for the

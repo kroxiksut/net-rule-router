@@ -191,6 +191,14 @@ pub struct PerSidPolicySnapshot {
     /// an AAAA record otherwise keeps a second, unpinned way out — the same site
     /// travelling the tunnel over v4 and the main link over v6.
     pub block_ipv6_when_protected: bool,
+    /// Answer for a newly discovered local network without asking. Off by
+    /// default; it suppresses the question, never the record.
+    pub local_networks_auto_accept: bool,
+    /// Evaluate a zone rule ahead of an exact-address rule. Off by default —
+    /// the rule model's stated default is that an exact address wins. Read by
+    /// the address-ownership arbiter, which is where the two can actually
+    /// contest one address.
+    pub zone_priority_over_ip: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -562,6 +570,17 @@ impl NeutralPlanVerdict {
 }
 
 pub struct PerSidApplyOrchestrator {
+    /// One lock per SID, held across COMPUTE AND APPLY.
+    ///
+    /// Deriving a filter set reads the policy, the rules and the live FQDN
+    /// cache and takes real time; three things drive it concurrently (the
+    /// ~5 s leak-guard tick, the fake-IP replan and the IPC apply trigger).
+    /// Without this, a thread that started with an older reading finished last
+    /// and reinstalled filters another thread had just taken down - including
+    /// a block-all - and the engine ended up holding a set nobody had asked
+    /// for. The per-SID state mutex is not enough: it is taken pointwise, so
+    /// two computes interleave between its acquisitions.
+    apply_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
     session: Arc<WfpSession>,
     policy_source: Arc<dyn RoutePolicySource>,
     rules_provider: Arc<dyn RulesProvider>,
@@ -639,6 +658,13 @@ pub struct PerSidApplyOrchestrator {
     /// block-all set. Only transitions trigger a flush — the leak-guard
     /// reconcile recomputes every few seconds and must not flush steadily.
     block_all_flush_state: Mutex<HashMap<String, bool>>,
+    /// Who is asking for a cut the packet layer cannot scope to one user.
+    /// The WFP packet layers carry no `ALE_USER_ID`, so one principal's
+    /// block-all (or IPv6 cut) takes ICMP and IPv6 away from everyone logged
+    /// in. The others are told rather than left to discover it.
+    machine_wide_cut_state: Mutex<HashMap<String, bool>>,
+    /// Push bus for those notices. `None` in tests that do not care.
+    events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
     /// last LOGGED kill-switch posture per SID. The
     /// leak-guard reconcile recomputes every ~5 s, and repeating the armed /
     /// fail-closed posture line each tick flooded the operational NDJSON
@@ -669,6 +695,16 @@ pub struct PerSidApplyOrchestrator {
     /// (see [`crate::app_enforcement_status::BlockAllPostureStatus`]). Written
     /// on every block-all transition edge. `None` (default) = log-only.
     block_all_posture_status: Option<crate::app_enforcement_status::BlockAllPostureStatus>,
+    /// Per-SID latch for the WIDER "the additional link is unresolved and the
+    /// guard is blocking" posture — armed for the per-IP block set too, not
+    /// just the catch-all. Feeds
+    /// [`crate::app_enforcement_status::FailClosedPostureStatus`], which the
+    /// DNS handler and the hostname seeder read: while it is armed the guard
+    /// can only block addresses it already knows, so neither of them may act as
+    /// if a rule host were covered.
+    fail_closed_state: Mutex<HashMap<String, bool>>,
+    /// Shared publication of the latch above. `None` (default) = log-only.
+    fail_closed_posture_status: Option<crate::app_enforcement_status::FailClosedPostureStatus>,
     /// Reactive VPN-endpoint learning — publishes the WFP spec ids of the
     /// CURRENT kill-switch/fail-closed BLOCK filters so the connection
     /// observer's learner can role-verify a drop before trusting it (see
@@ -845,6 +881,21 @@ fn is_app_only_block(spec: &WfpFilterSpec) -> bool {
         && spec.remote_subnet_v6.is_none()
 }
 
+/// Whether `ip` sits in any of `subnets`, given as `(network, prefix_len)`.
+fn in_any_subnet(ip: std::net::Ipv4Addr, subnets: &[(std::net::Ipv4Addr, u8)]) -> bool {
+    let addr = u32::from(ip);
+    subnets.iter().any(|(net, prefix)| {
+        if *prefix == 0 {
+            return true;
+        }
+        if *prefix > 32 {
+            return false;
+        }
+        let mask = u32::MAX << (32 - u32::from(*prefix));
+        (addr & mask) == (u32::from(*net) & mask)
+    })
+}
+
 impl PerSidApplyOrchestrator {
     pub fn new(
         session: Arc<WfpSession>,
@@ -854,6 +905,7 @@ impl PerSidApplyOrchestrator {
         audit: Arc<dyn PerSidApplyAudit>,
     ) -> Self {
         Self {
+            apply_locks: Mutex::new(std::collections::HashMap::new()),
             session,
             policy_source,
             rules_provider,
@@ -901,6 +953,10 @@ impl PerSidApplyOrchestrator {
             // via `with_dns_cache_control`.
             dns_cache_control: Arc::new(nrr_platform_api::NoopDnsCacheControl),
             block_all_flush_state: Mutex::new(HashMap::new()),
+            fail_closed_state: Mutex::new(HashMap::new()),
+            fail_closed_posture_status: None,
+            machine_wide_cut_state: Mutex::new(HashMap::new()),
+            events: None,
             posture_log_state: Mutex::new(HashMap::new()),
             // Default: fake-IP out of the plan. Production wires a live
             // provider via `with_fake_ip_context_provider`.
@@ -976,6 +1032,14 @@ impl PerSidApplyOrchestrator {
         self
     }
 
+    /// Attach the push bus so machine-wide-cut notices reach the principals
+    /// they concern.
+    #[must_use]
+    pub fn with_events(mut self, events: Arc<crate::ipc_handlers::event_bus::EventBus>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
     /// wire the shared "block-all armed" posture the GUI
     /// banner reads via `SnapshotInitial`.
     #[must_use]
@@ -984,6 +1048,17 @@ impl PerSidApplyOrchestrator {
         status: crate::app_enforcement_status::BlockAllPostureStatus,
     ) -> Self {
         self.block_all_posture_status = Some(status);
+        self
+    }
+
+    /// Wire the shared "the additional link is unresolved and the guard is
+    /// blocking" posture the DNS handler and the hostname seeder read.
+    #[must_use]
+    pub fn with_fail_closed_posture_status(
+        mut self,
+        status: crate::app_enforcement_status::FailClosedPostureStatus,
+    ) -> Self {
+        self.fail_closed_posture_status = Some(status);
         self
     }
 
@@ -1064,6 +1139,18 @@ impl PerSidApplyOrchestrator {
     /// the catch-all is armed.
     pub fn any_block_all_armed(&self) -> bool {
         self.block_all_flush_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|armed| *armed)
+    }
+
+    /// Whether ANY tracked SID currently has the guard blocking because its
+    /// additional link is unresolved — the per-IP posture included. See
+    /// [`crate::app_enforcement_status::FailClosedPostureStatus`] for why this
+    /// is the flag a DNS answer must key on rather than the block-all one.
+    pub fn any_fail_closed_armed(&self) -> bool {
+        self.fail_closed_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
@@ -1302,6 +1389,96 @@ impl PerSidApplyOrchestrator {
         }
     }
 
+    /// Record whether the latest compute for `sid` left the guard BLOCKING with
+    /// the additional link unresolved, and publish the "any SID armed?" answer
+    /// on the transition edge.
+    ///
+    /// No cache flush and no logging of its own: the posture it mirrors is
+    /// already logged where it is decided, and this latch exists for readers
+    /// that must not treat a rule host as covered while the guard has nothing
+    /// but its known addresses to block with.
+    fn note_fail_closed_state(&self, sid: &str, armed: bool) {
+        let transitioned = {
+            let mut g = self
+                .fail_closed_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prior = g.get(sid).copied().unwrap_or(false);
+            if prior != armed {
+                g.insert(sid.to_string(), armed);
+                true
+            } else {
+                false
+            }
+        };
+        if !transitioned {
+            return;
+        }
+        if let Some(status) = self.fail_closed_posture_status.as_ref() {
+            status.set(self.any_fail_closed_armed());
+        }
+    }
+
+    /// Drop every per-SID record describing an enforcement that is gone: the
+    /// installed-filter set, both posture latches, the kill-switch block-id
+    /// registry and the posture-log throttle (so a later re-arm logs as the
+    /// transition it is, not as a steady state).
+    fn forget_sid_state(&self, sid: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+        self.note_block_all_state(sid, false);
+        self.note_fail_closed_state(sid, false);
+        self.update_killswitch_registry(sid, KillswitchBlockIds::default());
+        self.posture_log_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(sid);
+    }
+
+    /// Tell everyone else when somebody arms a cut that reaches them.
+    ///
+    /// Published on the CHANGE only, and only to principals whose own plan asks
+    /// for no such cut: a notice repeated on every recompute is one the user
+    /// learns to dismiss without reading. The Linux side does the same from
+    /// `PrincipalEnforcementCycle` — same event, same slug, because the
+    /// limitation is the packet layer's on both systems, not this backend's.
+    fn note_machine_wide_cut(&self, sid: &str, wants: bool) {
+        let (changed, bystanders) = {
+            let mut g = self
+                .machine_wide_cut_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let prior = g.insert(sid.to_string(), wants);
+            let changed = prior != Some(wants);
+            let anybody_cuts = g.values().any(|v| *v);
+            let bystanders: Vec<String> = if anybody_cuts {
+                g.iter()
+                    .filter(|(_, cuts)| !**cuts)
+                    .map(|(other, _)| other.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (changed, bystanders)
+        };
+        if !changed || bystanders.is_empty() {
+            return;
+        }
+        let Some(bus) = self.events.as_ref() else {
+            return;
+        };
+        for other in bystanders {
+            bus.publish_for(
+                other,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
+                    reason: "machine-wide-cut-by-another-user".to_string(),
+                },
+            );
+        }
+    }
+
     /// Build the fail-closed filter set for the failure posture. Mode A
     /// (selective) blocks only the protected secondary destinations; modes B
     /// (everything-via-secondary) block all egress except the safe
@@ -1354,14 +1531,43 @@ impl PerSidApplyOrchestrator {
                     // guard was supposed to be strictest. The block-all branches
                     // carry the cut already.
                     if block_ipv6 {
-                        out.extend(crate::killswitch_codegen::catch_all_v6_filters(sid));
+                        out.extend(crate::killswitch_codegen::catch_all_v6_filters(
+                            sid,
+                            exemptions.secondary_luid,
+                        ));
                     }
                     out
                 }
             }
             RouteBehaviorMode::PreferSecondaryWhenAvailable
             | RouteBehaviorMode::StrictSecondaryFailClosed => {
-                crate::killswitch_codegen::fail_closed_block_all_filters(sid, exemptions, protocols)
+                // `block_all` is honoured here too. It used to be ignored, and
+                // the caller that arms the guard while the tunnel is HEALTHY
+                // (empty pin set on a cold FQDN cache) states in its own
+                // comment that it must not escalate — it passed `false` and got
+                // a catch-all anyway, cutting every egress on a live tunnel and
+                // deadlocking the very cache warm-up that would lift it.
+                if block_all {
+                    crate::killswitch_codegen::fail_closed_block_all_filters(
+                        sid, exemptions, protocols,
+                    )
+                } else {
+                    let protected: Vec<Ipv4Addr> = protected_secondary_ips
+                        .iter()
+                        .copied()
+                        .filter(|ip| !exemptions.bootstrap_server_ips.contains(ip))
+                        .collect();
+                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
+                        sid, &protected, protocols,
+                    );
+                    if block_ipv6 {
+                        out.extend(crate::killswitch_codegen::catch_all_v6_filters(
+                            sid,
+                            exemptions.secondary_luid,
+                        ));
+                    }
+                    out
+                }
             }
         }
     }
@@ -1459,6 +1665,7 @@ impl PerSidApplyOrchestrator {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
+            zone_priority_over_ip: false,
         };
         let plan = EnforcementPlan {
             principal,
@@ -1513,6 +1720,7 @@ impl PerSidApplyOrchestrator {
                     self.clear_app_enforcement_status();
                     // policy gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
+                    self.note_fail_closed_state(sid, false);
                     // No policy ⇒ no kill-switch filters either; drop any stale
                     // entry so the registry never role-verifies a drop for a SID
                     // whose leak-guard is no longer armed.
@@ -1536,6 +1744,7 @@ impl PerSidApplyOrchestrator {
                     self.clear_app_enforcement_status();
                     // rules gone ⇒ any block-all is disarming.
                     self.note_block_all_state(sid, false);
+                    self.note_fail_closed_state(sid, false);
                     self.update_killswitch_registry(sid, KillswitchBlockIds::default());
                 }
                 return Ok(ComputedFilterSet::NoActiveRules);
@@ -1637,6 +1846,7 @@ impl PerSidApplyOrchestrator {
             app_observations: self.app_observations.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             secondary_ip_denylist: &secondary_ip_denylist,
+            zone_priority_over_ip: false,
         });
         // Shadow-compare the neutral pipeline against the live one, BEFORE the
         // fake-IP augmentation is folded in (the planner does not model it yet).
@@ -1824,6 +2034,9 @@ impl PerSidApplyOrchestrator {
         // block-all set (feeds the arming-edge OS resolver-cache flush at the
         // end of the function; per-IP pinning and fail-open never flush).
         let mut block_all_armed = false;
+        // whether THIS compute left the guard blocking with the additional link
+        // unresolved (either posture) — see `note_fail_closed_state`.
+        let mut fail_closed_armed = false;
         if leak_guard_armed {
             // `fail_closed` (default) → block rather than leak when the leak-proof
             // kill-switch cannot arm because the secondary is unresolvable.
@@ -1925,15 +2138,52 @@ impl PerSidApplyOrchestrator {
             // the shared-IP trade-off below — it is a direct contradiction
             // between two of the user's rules, and a block is neither of the two
             // things they asked for.
-            let ownership = crate::address_ownership::AddressOwnership::resolve(
+            let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
                 &rules.rule_book,
                 self.fqdn_cache.as_ref(),
+                crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+                    policy.zone_priority_over_ip,
+                ),
             );
+            // The machine's OWN local networks are never pinned to the tunnel.
+            // An application rule learns its destinations by watching, and a
+            // NAS, a printer or a hypervisor's host address is exactly what it
+            // will touch; pinned, that address is unreachable for the whole SID
+            // the moment the tunnel drops - the device is one hop away on a
+            // cable. Note this is NOT "skip RFC1918": a corporate tunnel to a
+            // 10.x network is a legitimate destination. The distinction is
+            // whether the address sits in a subnet the PRIMARY link is
+            // connected to.
+            let local_subnets = (self.kill_switch_resolver)(sid)
+                .map(|r| r.local_subnets)
+                .unwrap_or_default();
+            // An address only an APPLICATION rule brought in is not pinned
+            // per-destination: the app's own egress-conditional pair (or its
+            // unconditional fail-closed block) already governs every flow of
+            // that process, and ~12 standing filters per pinned address turned
+            // hours of P2P peer churn into a thousands-strong standing filter
+            // set, far past what the platform is meant to hold. An address an ADDITIONAL address rule
+            // also names stays pinned — there the pin is the only guard. Gated
+            // on the app pair being armable at all (TCP/UDP selected); with
+            // neither selected the historic per-destination posture stands.
+            let app_covered: std::collections::HashSet<std::net::Ipv4Addr> =
+                if protocols.wants_ale_block() {
+                    codegen_out
+                        .app_observed_secondary_ips
+                        .iter()
+                        .copied()
+                        .filter(|ip| !ownership.additional_named().contains(ip))
+                        .collect()
+                } else {
+                    std::collections::HashSet::new()
+                };
             let protectable: Vec<std::net::Ipv4Addr> = codegen_out
                 .secondary_dest_ips
                 .iter()
                 .copied()
                 .filter(|ip| ownership.may_block(*ip))
+                .filter(|ip| !in_any_subnet(*ip, &local_subnets))
+                .filter(|ip| !app_covered.contains(ip))
                 .collect();
             if protectable.len() != codegen_out.secondary_dest_ips.len() {
                 tracing::info!(
@@ -1941,7 +2191,8 @@ impl PerSidApplyOrchestrator {
                     sid,
                     kept = protectable.len(),
                     dropped = codegen_out.secondary_dest_ips.len() - protectable.len(),
-                    "addresses claimed by a main-route rule are excluded from the kill-switch:                      blocking one would kill a destination the user routed the other way",
+                    app_covered = app_covered.len(),
+                    "kill-switch pin set trimmed: main-route-claimed addresses (blocking one kills a destination the user routed the other way) and app-observed destinations (their app's own pair is the guard)",
                 );
             }
             let (ks_dest_ips, ks_shared_excluded_ips): (
@@ -2030,7 +2281,15 @@ impl PerSidApplyOrchestrator {
             // unrelated recompute.
             let never_exempt_secondary_ips: std::collections::HashSet<std::net::Ipv4Addr> =
                 if fake_ip_name_enforcement_active {
-                    ks_dest_ips.iter().copied().collect()
+                    // App-observed destinations ride along even though they are
+                    // no longer pinned: their guard is the per-app block, and an
+                    // exemption permit outranks it — rescuing one would hand the
+                    // app a primary-egress path while the tunnel is down.
+                    ks_dest_ips
+                        .iter()
+                        .copied()
+                        .chain(app_covered.iter().copied())
+                        .collect()
                 } else if policy.kill_switch_strict_shared_ips {
                     codegen_out.secondary_dest_ips.iter().copied().collect()
                 } else {
@@ -2048,12 +2307,55 @@ impl PerSidApplyOrchestrator {
             // never-exempt secondary set: while the secondary is down (the only
             // time the block-all arms) those IPs must stay blocked
             // (fail-closed), never rescued via the primary permit.
-            let known_primary_dest_ips: Vec<std::net::Ipv4Addr> = codegen_out
-                .primary_dest_ips
-                .iter()
-                .copied()
-                .filter(|ip| !never_exempt_secondary_ips.contains(ip))
-                .collect();
+            // Asked of the ARBITER, not of the filter codegen. Both answer
+            // "is this address named by a main-link rule", and they answered
+            // differently: the codegen lists what it managed to emit a permit
+            // for (subject to its own fan-out caps), the arbiter lists what the
+            // user's rules actually name. Two answers to one question is how
+            // the address-ownership bugs of 23.08 happened; this is the same
+            // arbiter the route, filter and kill-switch codegens read.
+            // Sorted so the emitted exemption set is stable across recomputes.
+            let known_primary_dest_ips: Vec<std::net::Ipv4Addr> = {
+                let mut named: Vec<std::net::Ipv4Addr> = ownership
+                    .main_named()
+                    .iter()
+                    .copied()
+                    .filter(|ip| !never_exempt_secondary_ips.contains(ip))
+                    .collect();
+                named.sort_unstable();
+                named
+            };
+            // The exemption record BOTH postures read. Built once here so the
+            // catch-all (tunnel up) and the fail-closed block-all (tunnel gone)
+            // cannot spare different things: the catch-all used to carry a
+            // smaller set, so a host the user carved out onto the main link
+            // stopped answering ping the moment the tunnel came up.
+            let shared_exemptions =
+                |resolution: &crate::killswitch_codegen::KillSwitchResolution| {
+                    FailClosedExemptions {
+                        bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        local_subnets: resolution.local_subnets.clone(),
+                        primary_dest_ips: known_primary_dest_ips.clone(),
+                        known_direct_ips: self
+                            .known_direct
+                            .as_ref()
+                            .map(|registry| {
+                                registry
+                                    .snapshot()
+                                    .into_iter()
+                                    .filter(|ip| !never_exempt_secondary_ips.contains(ip))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                        // A block-all-only relaxation: while the tunnel is up, name
+                        // resolution belongs in it.
+                        allow_dns_over_primary: false,
+                        // The catch-all never blocks the tunnel next-hop, so the
+                        // liveness probe needs no hole through it.
+                        probe_target_ips: Vec::new(),
+                        secondary_luid: 0,
+                    }
+                };
             match (self.kill_switch_resolver)(sid) {
                 Some(resolution) => {
                     // Mode A (PreferPrimary) protects only the selected secondary
@@ -2068,6 +2370,9 @@ impl PerSidApplyOrchestrator {
                             );
                             //  — also pin secondary-routed apps to the
                             // secondary adapter egress (ALE layer only — no per-app ICMP).
+                            // Main-named addresses need no rescue permits: the
+                            // app block sits below the primary rule band, so the
+                            // primary rules' own permits carry them.
                             ks.extend(crate::killswitch_codegen::app_kill_switch_filters(
                                 sid,
                                 &codegen_out.secondary_app_patterns,
@@ -2078,21 +2383,32 @@ impl PerSidApplyOrchestrator {
                         }
                         RouteBehaviorMode::PreferSecondaryWhenAvailable
                         | RouteBehaviorMode::StrictSecondaryFailClosed => {
-                            crate::killswitch_codegen::catch_all_kill_switch_filters(
+                            let ks = crate::killswitch_codegen::catch_all_kill_switch_filters(
                                 sid,
                                 &resolution,
+                                &shared_exemptions(&resolution),
                                 protocols,
-                            )
+                            );
+                            // The catch-all IS a block-all: everything not
+                            // leaving through the tunnel is dropped. It was not
+                            // recorded as one, so `any_block_all_armed()`
+                            // answered false while it was live - the DNS gate
+                            // then handed out answers for direct hosts the
+                            // catch-all was cutting, and the transition INTO
+                            // this posture read as a disarm (a needless DNS
+                            // flush, and the GUI banner going out under a live
+                            // block).
+                            block_all_armed = !ks.is_empty();
+                            ks
                         }
                     };
                     if ks.is_empty() {
                         // Leak-proof pair could not arm — honour the failure
                         // posture instead of silently allowing.
                         if fail_closed {
-                            // the non-PreferPrimary modes
-                            // catch-all in `fail_closed_filters` regardless of
-                            // the `block_all` flag below.
-                            block_all_armed = behavior_mode != RouteBehaviorMode::PreferPrimary;
+                            // The secondary is UP in this branch, so nothing is
+                            // escalated: the per-IP guard is the whole posture.
+                            block_all_armed = false;
                             let exemptions = FailClosedExemptions {
                                 bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
                                 local_subnets: resolution.local_subnets.clone(),
@@ -2112,6 +2428,9 @@ impl PerSidApplyOrchestrator {
                                 // (only enumerated rule destinations), so the
                                 // liveness probe needs no hole here.
                                 probe_target_ips: Vec::new(),
+                                // The v6 cut this path may emit still has to let
+                                // the tunnel itself out.
+                                secondary_luid: resolution.secondary_luid,
                             };
                             // review fix — the secondary (VPN) is UP here
                             // (`Some`); `ks` is empty only because there is nothing
@@ -2123,7 +2442,7 @@ impl PerSidApplyOrchestrator {
                             // leak-guard (an empty dest set ⇒ a harmless no-op).
                             // The catch-all is reserved for the `None` branch,
                             // where the secondary is genuinely unresolved.
-                            let fc = self.fail_closed_filters(
+                            let mut fc = self.fail_closed_filters(
                                 sid,
                                 behavior_mode,
                                 &ks_dest_ips,
@@ -2134,6 +2453,15 @@ impl PerSidApplyOrchestrator {
                                     block_ipv6: ipv6_cut_wanted,
                                 },
                             );
+                            // App-observed destinations left the per-IP pin set,
+                            // so a secondary-routed app is cut here by its own
+                            // unconditional block instead — same coverage the
+                            // egress pair would give with a usable tunnel.
+                            fc.extend(crate::killswitch_codegen::fail_closed_block_apps(
+                                sid,
+                                &codegen_out.secondary_app_patterns,
+                                protocols,
+                            ));
                             // full-level only on posture change;
                             // the ~5 s reconcile re-deriving the same state
                             // logs at debug (NDJSON flood → archive-cap burn).
@@ -2232,7 +2560,10 @@ impl PerSidApplyOrchestrator {
                         // catch-all, which emits this very set already, and a
                         // second copy would be identical filters twice.
                         if behavior_mode == RouteBehaviorMode::PreferPrimary && ipv6_cut_wanted {
-                            let v6_cut = crate::killswitch_codegen::catch_all_v6_filters(sid);
+                            let v6_cut = crate::killswitch_codegen::catch_all_v6_filters(
+                                sid,
+                                resolution.secondary_luid,
+                            );
                             collect_block_ids(&v6_cut, &mut killswitch_block_ids);
                             filters.extend(v6_cut);
                         }
@@ -2282,11 +2613,22 @@ impl PerSidApplyOrchestrator {
                         // it regardless of the strategy.
                         let effective_block_all =
                             policy.kill_switch_block_all || mode_a_fail_closed_unknown;
-                        // the non-PreferPrimary modes catch-all
-                        // in `fail_closed_filters` regardless of the flag.
-                        block_all_armed = effective_block_all
+                        // The secondary is genuinely unresolved here, and in
+                        // the tunnel-default modes everything the user sends is
+                        // supposed to leave through it — so the escalation is
+                        // the mode's own meaning, not an extra setting. Decided
+                        // here rather than inside `fail_closed_filters`, so the
+                        // posture the caller reports and the filters it gets
+                        // cannot say different things.
+                        let effective_block_all = effective_block_all
                             || behavior_mode != RouteBehaviorMode::PreferPrimary;
-                        let fc = self.fail_closed_filters(
+                        block_all_armed = effective_block_all;
+                        // Armed for BOTH shapes: with the default per-IP posture
+                        // the block set covers only the addresses already known,
+                        // which is exactly the state a DNS answer or a seeder
+                        // backoff must not ignore.
+                        fail_closed_armed = true;
+                        let mut fc = self.fail_closed_filters(
                             sid,
                             behavior_mode,
                             &ks_dest_ips,
@@ -2297,6 +2639,16 @@ impl PerSidApplyOrchestrator {
                                 block_ipv6: ipv6_cut_wanted,
                             },
                         );
+                        // A secondary-routed app is cut whole while its link is
+                        // unresolved: the per-IP set no longer carries its
+                        // observed destinations, and its UN-observed ones never
+                        // had a block in this branch at all — first contact used
+                        // to egress the primary until the observer caught up.
+                        fc.extend(crate::killswitch_codegen::fail_closed_block_apps(
+                            sid,
+                            &codegen_out.secondary_app_patterns,
+                            protocols,
+                        ));
                         // Full-level only on a posture change or a heartbeat (the
                         // block-all/per-IP split is part of the posture, so a
                         // coverage escalation still re-logs immediately); steady
@@ -2396,6 +2748,25 @@ impl PerSidApplyOrchestrator {
         // leak-guard disarmed ⇒ reset the posture latch so a
         // later re-arm logs at full level again (recorded silently).
         if !leak_guard_armed {
+            // Strict still emits its default block (that is the mode, not the
+            // guard), so it still needs the exemptions the guard used to carry.
+            if behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed {
+                if let Some(resolution) = (self.kill_switch_resolver)(sid) {
+                    let exemptions = FailClosedExemptions {
+                        bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        local_subnets: resolution.local_subnets.clone(),
+                        primary_dest_ips: Vec::new(),
+                        allow_dns_over_primary: false,
+                        known_direct_ips: Vec::new(),
+                        probe_target_ips: Vec::new(),
+                        secondary_luid: resolution.secondary_luid,
+                    };
+                    filters.extend(crate::killswitch_codegen::default_block_exemptions(
+                        sid,
+                        &exemptions,
+                    ));
+                }
+            }
             let _ = self.posture_changed_for(intent, sid, "off");
             // П0-A — nothing is pinned while disarmed, so no shared-IP
             // exclusions either; clear the GUI warning.
@@ -2443,6 +2814,10 @@ impl PerSidApplyOrchestrator {
         // unless the block-all state changed since the previous compute.
         if intent.publishes() {
             self.note_block_all_state(sid, block_all_armed);
+            self.note_fail_closed_state(sid, fail_closed_armed);
+            // Both postures cut at the packet layer, which has no user
+            // condition — see `note_machine_wide_cut`.
+            self.note_machine_wide_cut(sid, block_all_armed || ipv6_cut_wanted);
             self.update_killswitch_registry(sid, killswitch_block_ids);
         }
         Ok(ComputedFilterSet::Install(ComputedPlan {
@@ -2556,7 +2931,22 @@ impl PerSidApplyOrchestrator {
         }
     }
 
+    /// Take this SID's apply lock. Held for the whole compute-and-apply, so two
+    /// triggers cannot interleave and leave the engine holding a set neither of
+    /// them decided on.
+    fn apply_lock_for(&self, sid: &str) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.apply_locks
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(sid.to_string())
+                .or_default(),
+        )
+    }
+
     pub fn install_for_sid(&self, sid: &str) -> Result<usize, OrchestratorError> {
+        let lock = self.apply_lock_for(sid);
+        let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         self.install_for_sid_with(sid, None)
     }
 
@@ -2680,6 +3070,17 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .contains_key(sid);
+        // What this SID already carries. A full-replace install only ADDS, so
+        // whatever is not in the new set has to be deleted explicitly —
+        // otherwise it stays alive in the engine while dropping out of our
+        // accounting, and keeps dropping traffic nobody can see or reap.
+        let previously_installed: Vec<WfpFilterId> = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .map(|s| s.installed.clone())
+            .unwrap_or_default();
         // Derive the full filter set (rule-driven + leak-guard) via the shared
         // `compute_filters_for_sid` path. No-policy / no-active-rules install
         // nothing but still record the SID so a later on_disconnect / recompile
@@ -2688,12 +3089,16 @@ impl PerSidApplyOrchestrator {
             match self.compute_filters_for_sid(sid, true, rules_override, ComputeIntent::Apply)? {
                 ComputedFilterSet::NoPolicy => {
                     // No policy → record the SID as known (so a later on_disconnect
-                    // doesn't panic) but install nothing.
+                    // doesn't panic) but install nothing. Anything this SID was
+                    // carrying has to come down: the empty state would otherwise
+                    // orphan it.
+                    self.delete_superseded_filters(sid, &previously_installed, &[]);
                     self.upsert_state(sid, Vec::new());
                     self.emit_audit(sid, PerSidApplyAuditKind::Applied, 0, "no-policy");
                     return Ok(0);
                 }
                 ComputedFilterSet::NoActiveRules => {
+                    self.delete_superseded_filters(sid, &previously_installed, &[]);
                     self.upsert_state(sid, Vec::new());
                     let kind = if was_known {
                         PerSidApplyAuditKind::Updated
@@ -2741,6 +3146,10 @@ impl PerSidApplyOrchestrator {
             .filter(|id| !skipped.contains(&id.raw))
             .collect();
         let count = installed_ids.len();
+        // BREAK after MAKE, the same ordering `reconcile_to_desired` uses: the
+        // replacement set is already up, so dropping what it supersedes cannot
+        // open a window.
+        self.delete_superseded_filters(sid, &previously_installed, &installed_ids);
         // re-read our LIVE WFP filters
         // and confirm every id we just recorded as installed is actually
         // present in the engine. A missing id = a PHANTOM: counted as installed
@@ -2759,18 +3168,7 @@ impl PerSidApplyOrchestrator {
         }
         // Destinations this set scopes to, deduplicated. Compared against the
         // previous install BEFORE the state is replaced.
-        let destinations: Vec<std::net::Ipv4Addr> = {
-            let mut seen = std::collections::HashSet::new();
-            filters
-                .iter()
-                .filter_map(|spec| spec.remote_ip)
-                .filter(|ip| seen.insert(*ip))
-                .collect()
-        };
-        // The leak-guard emits an egress-via-secondary permit only when it has
-        // a resolved adapter, so this is the tunnel's state without asking the
-        // OS a second time.
-        let secondary_resolved = filters.iter().any(|f| f.local_interface_luid.is_some());
+        let (destinations, secondary_resolved) = Self::coverage_of(&filters);
         self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
         self.upsert_state_with_destinations(sid, installed_ids, destinations, secondary_resolved);
         let kind = if was_known {
@@ -2847,6 +3245,8 @@ impl PerSidApplyOrchestrator {
     /// inactive / not-yet-installed SID is owned by [`Self::reconcile`]).
     /// Returns the count of filters added.
     pub fn reconcile_secondary_coverage(&self, sid: &str) -> Result<usize, OrchestratorError> {
+        let lock = self.apply_lock_for(sid);
+        let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         // Snapshot the currently-tracked filters; skip SIDs we have not installed.
         let tracked: Vec<WfpFilterId> = {
             let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -3011,14 +3411,24 @@ impl PerSidApplyOrchestrator {
                 .copied()
                 .map(WfpFilterAction::DeleteFilter)
                 .collect();
-            if let Err(e) = self.session.execute_wfp_plan(&actions) {
-                tracing::warn!(
-                    target: "nrr::per_sid_orchestrator",
-                    sid,
-                    "reconcile coverage: delete of superseded filters best-effort failed: {e:?}",
-                );
+            match self.session.execute_wfp_plan(&actions) {
+                Ok(()) => to_remove.clone(),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "nrr::per_sid_orchestrator",
+                        sid,
+                        deferred = to_remove.len() as u64,
+                        "reconcile coverage: delete of superseded filters best-effort failed — keeping them tracked so the next tick retries: {e:?}",
+                    );
+                    // The batch stops at its first failure, so an unknown suffix
+                    // of these is still installed. Reporting the whole set as
+                    // removed dropped them from the tracked ids — and a filter
+                    // nobody tracks is one `cleanup_wfp` cannot delete by id.
+                    // A delete of something already gone is idempotent, so
+                    // retrying the whole batch next tick costs nothing.
+                    Vec::new()
+                }
             }
-            to_remove.clone()
         } else {
             if !to_remove.is_empty() {
                 tracing::warn!(
@@ -3034,6 +3444,17 @@ impl PerSidApplyOrchestrator {
         // (3) Update the tracked set = (tracked − removed) ∪ installed. `removed`
         // reflects what was actually deleted (empty when the delete was deferred),
         // so deferred ids stay tracked and are retried on the next tick.
+        //
+        // The coverage fields travel with it. This path used to leave whatever
+        // the last install wrote, so the record described a set this pass had
+        // already changed: the addresses it started enforcing were never swept
+        // (sockets already open to them finished on the old link), and the next
+        // install then saw those same addresses as new and swept connections
+        // that had just been re-established. `secondary_resolved` drifted the
+        // same way, turning a tunnel that had been up all along into one that
+        // "just came up" — a sweep of every pinned destination for nothing.
+        let (destinations, secondary_resolved) = Self::coverage_of(&desired);
+        self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
         let live_total = {
             let removed_ids: std::collections::HashSet<u64> =
                 removed.iter().map(|id| id.raw).collect();
@@ -3044,6 +3465,8 @@ impl PerSidApplyOrchestrator {
                 destinations: Vec::new(),
                 secondary_resolved: false,
             });
+            entry.destinations = destinations;
+            entry.secondary_resolved = secondary_resolved;
             entry.installed.retain(|id| !removed_ids.contains(&id.raw));
             let mut have: std::collections::HashSet<u64> =
                 entry.installed.iter().map(|id| id.raw).collect();
@@ -3072,26 +3495,36 @@ impl PerSidApplyOrchestrator {
         if sid.is_empty() {
             return Err(OrchestratorError::EmptySid);
         }
-        let installed = {
-            let mut g = self.state.lock().unwrap_or_else(|p| p.into_inner());
-            g.remove(sid).map(|s| s.installed).unwrap_or_default()
+        let lock = self.apply_lock_for(sid);
+        let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        // READ the tracked ids; do not drop the record yet. A delete that fails
+        // leaves those filters installed, and forgetting their ids here left
+        // them enforcing with nobody accounting for them — `cleanup_wfp`
+        // deletes tracked filters BY ID, so an untracked block survives even a
+        // graceful stop and can only be found by an enumerate sweep.
+        let installed: Vec<WfpFilterId> = {
+            let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            g.get(sid).map(|s| s.installed.clone()).unwrap_or_default()
         };
-        // a removed set can no longer be blocking; reset the
-        // latch so a later re-arm is a real edge (fires the flush again).
-        self.note_block_all_state(sid, false);
-        if installed.is_empty() {
-            return Ok(0);
+        let count = installed.len();
+        if count > 0 {
+            let actions: Vec<WfpFilterAction> = installed
+                .into_iter()
+                .map(WfpFilterAction::DeleteFilter)
+                .collect();
+            if let Err(e) = self.session.execute_wfp_plan(&actions) {
+                let msg = format!("remove for {sid}: {e:?}");
+                self.emit_audit(sid, PerSidApplyAuditKind::Failed, count as u32, &msg);
+                return Err(OrchestratorError::WfpFailed(msg));
+            }
         }
-        let actions: Vec<WfpFilterAction> = installed
-            .iter()
-            .copied()
-            .map(WfpFilterAction::DeleteFilter)
-            .collect();
-        let count = actions.len();
-        if let Err(e) = self.session.execute_wfp_plan(&actions) {
-            let msg = format!("remove for {sid}: {e:?}");
-            self.emit_audit(sid, PerSidApplyAuditKind::Failed, count as u32, &msg);
-            return Err(OrchestratorError::WfpFailed(msg));
+        // Only now is the SID genuinely un-enforced: drop the record and every
+        // per-SID latch that describes a posture which no longer exists. The
+        // block-id registry has to go too, or the drop learner keeps
+        // role-verifying against ids that are gone.
+        self.forget_sid_state(sid);
+        if count == 0 {
+            return Ok(0);
         }
         self.emit_audit(sid, PerSidApplyAuditKind::Withdrawn, count as u32, "ok");
         Ok(count)
@@ -3138,11 +3571,28 @@ impl PerSidApplyOrchestrator {
             .session
             .cleanup_all()
             .map_err(|e| OrchestratorError::WfpFailed(format!("cleanup_all: {e:?}")))?;
+        // Every per-SID record describes filters that no longer exist. Dropping
+        // them one SID at a time keeps this in step with `remove_for_sid` —
+        // including the block-id registry, which otherwise kept role-verifying
+        // drops against ids the strip just deleted, and the posture-log
+        // throttle, which would have read a post-cleanup re-arm as a steady
+        // state and logged it at debug.
+        let known: Vec<String> = {
+            let g = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            g.keys().cloned().collect()
+        };
+        for sid in &known {
+            self.forget_sid_state(sid);
+        }
+        // Anything the loop above did not cover (a latch left from a SID whose
+        // record was already gone). No flush here — teardown itself unblocks
+        // nothing the OS cache could hide.
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clear();
-        // every set is gone; reset the block-all latches so a
-        // post-cleanup re-arm is a real edge. (No flush here — teardown itself
-        // unblocks nothing the OS cache could hide.)
         self.block_all_flush_state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+        self.fail_closed_state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
@@ -3229,6 +3679,8 @@ impl PerSidApplyOrchestrator {
     /// policy/rules disappeared tears down via the full-replace path so the
     /// empty state and its audits stay exactly as before.
     pub fn recompile_for_sid(&self, sid: &str) -> Result<usize, OrchestratorError> {
+        let lock = self.apply_lock_for(sid);
+        let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         self.recompile_for_sid_impl(sid, None)
     }
 
@@ -3245,6 +3697,8 @@ impl PerSidApplyOrchestrator {
         sid: &str,
         rules: &ActiveRulesSnapshot,
     ) -> Result<usize, OrchestratorError> {
+        let lock = self.apply_lock_for(sid);
+        let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         let outcome = self.recompile_for_sid_impl(sid, Some(rules));
         self.flush_os_dns_after_rule_change(sid);
         outcome
@@ -3340,9 +3794,72 @@ impl PerSidApplyOrchestrator {
         Ok(())
     }
 
+    /// Delete the filters this SID used to carry that the new set no longer
+    /// contains. A full-replace install only adds, so without this pass a
+    /// superseded filter stays live in the engine while dropping out of our
+    /// accounting: it keeps dropping traffic that no recompute can explain and
+    /// no teardown can reach. Best-effort, and deleting a missing id is
+    /// idempotent — an engine error must not fail an install whose filters are
+    /// already committed.
+    fn delete_superseded_filters(&self, sid: &str, previous: &[WfpFilterId], kept: &[WfpFilterId]) {
+        let kept_ids: std::collections::HashSet<u64> = kept.iter().map(|id| id.raw).collect();
+        let superseded: Vec<WfpFilterId> = previous
+            .iter()
+            .copied()
+            .filter(|id| !kept_ids.contains(&id.raw))
+            .collect();
+        if superseded.is_empty() {
+            return;
+        }
+        let actions: Vec<WfpFilterAction> = superseded
+            .iter()
+            .copied()
+            .map(WfpFilterAction::DeleteFilter)
+            .collect();
+        match self.session.execute_wfp_plan(&actions) {
+            Ok(_) => tracing::info!(
+                target: "nrr::per_sid_orchestrator",
+                sid,
+                removed = superseded.len() as u64,
+                "install: removed filters the new set supersedes",
+            ),
+            Err(e) => tracing::warn!(
+                target: "nrr::per_sid_orchestrator",
+                sid,
+                superseded = superseded.len() as u64,
+                "install: delete of superseded filters best-effort failed: {e:?}",
+            ),
+        }
+    }
+
     fn upsert_state(&self, sid: &str, installed: Vec<WfpFilterId>) {
         // No destinations, so nothing to sweep either way.
         self.upsert_state_with_destinations(sid, installed, Vec::new(), false);
+    }
+
+    /// What a filter set covers: the destinations it scopes to (deduplicated,
+    /// in emission order) and whether the leak guard had a resolved tunnel when
+    /// it was built. Both answers are READ OFF the filters, so the install path
+    /// and the reconcile path cannot derive them differently — they used to,
+    /// and the reconcile path simply left them at their defaults.
+    ///
+    /// Only host-scoped filters contribute. Every subnet-scoped filter we emit
+    /// today is an exemption (loopback / LAN / the fake pool), and there is
+    /// nothing to break loose from a permit. A CIDR RULE would change that —
+    /// its pin needs the same sweep a `/32` pin gets, through
+    /// `StaleFlowReset::reset_flows_to(base, prefix)`.
+    fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::Ipv4Addr>, bool) {
+        let mut seen = std::collections::HashSet::new();
+        let destinations = filters
+            .iter()
+            .filter_map(|spec| spec.remote_ip)
+            .filter(|ip| seen.insert(*ip))
+            .collect();
+        // The leak-guard emits an egress-via-secondary permit only when it has a
+        // resolved adapter, so this is the tunnel's state without asking the OS
+        // a second time.
+        let secondary_resolved = filters.iter().any(|f| f.local_interface_luid.is_some());
+        (destinations, secondary_resolved)
     }
 
     fn upsert_state_with_destinations(
@@ -3412,6 +3929,9 @@ impl PerSidApplyOrchestrator {
             .filter(|ip| tunnel_came_up || !previous.contains(ip))
             .collect();
         let fresh = victims.len();
+        if victims.is_empty() {
+            return;
+        }
         let torn_down = reset.reset_flows_to_any(&victims).torn_down;
         if torn_down > 0 {
             let reason = if tunnel_came_up {
@@ -3762,6 +4282,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
         }
     }
 
@@ -3795,6 +4317,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
         }
     }
 
@@ -4106,6 +4630,52 @@ mod tests {
             reset.calls().len(),
             before,
             "an unchanged destination set is not re-torn-down"
+        );
+    }
+
+    /// A coverage reconcile maintains the SAME record an install does. It used
+    /// to leave the coverage fields alone, so the destinations it started
+    /// enforcing were never swept — the sockets already running to them
+    /// finished on the old link — and the next install then saw them as new and
+    /// swept connections that had already been re-established.
+    #[test]
+    fn a_coverage_reconcile_records_and_sweeps_what_it_starts_covering() {
+        let first_ip = Ipv4Addr::new(203, 0, 113, 9);
+        let second_ip = Ipv4Addr::new(203, 0, 113, 10);
+        let (_api, orch, src, rules) = fixture_with_luid(Some(0x0001_0000_0000_0007));
+        rules.set(rules_with_secondary_ip(first_ip));
+        src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+        let reset = Arc::new(nrr_platform_api::fake_ip::stale_flows::MockStaleFlowReset::new());
+        let orch = Arc::new(
+            Arc::try_unwrap(orch)
+                .unwrap_or_else(|_| panic!("sole owner"))
+                .with_stale_flow_reset(Arc::clone(&reset)
+                    as Arc<dyn nrr_platform_api::fake_ip::stale_flows::StaleFlowReset>),
+        );
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let after_install: Vec<Ipv4Addr> = reset.calls().into_iter().map(|(ip, _)| ip).collect();
+        assert!(after_install.contains(&first_ip));
+
+        // A rule appears between passes; the coverage reconcile is what installs
+        // its filters, so it is also what must break the flows already running
+        // to that address.
+        rules.set(rules_with_secondary_ips(&[first_ip, second_ip]));
+        orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
+        let swept: Vec<Ipv4Addr> = reset.calls().into_iter().map(|(ip, _)| ip).collect();
+        assert!(
+            swept.contains(&second_ip),
+            "the address this pass started enforcing must be swept by it"
+        );
+
+        // And the install that follows must not re-sweep what the reconcile
+        // already recorded as covered.
+        let before = reset.calls().len();
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert_eq!(
+            reset.calls().len(),
+            before,
+            "an unchanged coverage set is not re-torn-down"
         );
     }
 
@@ -4556,6 +5126,14 @@ mod tests {
         s
     }
 
+    /// Strict mode with the leak-guard switched OFF.
+    fn snap_strict_guard_off(primary: &str, secondary: &str) -> PerSidPolicySnapshot {
+        let mut s = snap_block(primary, secondary);
+        s.mode = PerSidBehaviorMode::StrictSecondaryFailClosed;
+        s.kill_switch_enabled = false;
+        s
+    }
+
     fn full_ks_resolution() -> KillSwitchResolution {
         KillSwitchResolution {
             secondary_luid: KS_LUID,
@@ -4711,22 +5289,32 @@ mod tests {
         // 1 rule permit + ALE pair (permit+block) + packet pair (egress
         // permit + block per named packet protocol) = 1 + 2 + 4×2 = 11, plus
         // the IPv6 closure (loopback, link-local and link-local-multicast
-        // exemptions and a block, at both v6 layers = 8): a pinned host with
-        // an AAAA record would otherwise keep an unpinned way out.
-        assert_eq!(count, 19);
+        // exemptions, a tunnel-egress permit and a block, at both v6 layers
+        // = 10): a pinned host with an AAAA record would otherwise keep an
+        // unpinned way out, and the egress permit is what keeps a tunnel whose
+        // endpoint is v6 able to reconnect through its own cut.
+        assert_eq!(count, 21);
 
         let filters = api.wfp_filters.lock().unwrap();
-        assert_eq!(filters.len(), 19);
-        // Egress-conditional permits carry the LUID — the ALE one plus one per
-        // named packet protocol — all over the protected destination.
+        assert_eq!(filters.len(), 21);
+        // Egress-conditional permits carry the LUID: the v4 ones (ALE plus one
+        // per named packet protocol) are scoped to the protected destination;
+        // the two v6 ones are not - the v6 cut is family-wide, so what it
+        // permits through the tunnel is family-wide too.
         let egress_permits: Vec<_> = filters
             .iter()
             .filter(|f| f.local_interface_luid == Some(KS_LUID))
             .collect();
-        assert_eq!(egress_permits.len(), 5);
-        assert!(egress_permits
-            .iter()
-            .all(|f| f.action == WfpAction::Permit && f.remote_ip == Some(ip)));
+        assert_eq!(egress_permits.len(), 7);
+        assert!(egress_permits.iter().all(|f| f.action == WfpAction::Permit));
+        assert_eq!(
+            egress_permits
+                .iter()
+                .filter(|f| f.remote_ip == Some(ip))
+                .count(),
+            5,
+            "the v4 egress permits are destination-scoped",
+        );
         // Blocks over the pinned address: 1 ALE + 4 named packet, unconditional
         // on the egress interface. The two IPv6 blocks are counted apart — they
         // close a family, not a destination, so they carry no `remote_ip`.
@@ -4804,16 +5392,16 @@ mod tests {
                 .iter()
                 .filter(|f| f.local_interface_luid == Some(LUID_A))
                 .count(),
-            5,
-            "egress permits pinned to LUID_A: 1 ALE + 4 named packet"
+            7,
+            "egress permits pinned to LUID_A: 1 ALE + 4 named packet + one per v6 layer"
         );
 
         // Secondary adapter reconnect: the resolver now yields a new LUID.
         luid_cell.store(LUID_B, Ordering::SeqCst);
         let added = orch.reconcile_secondary_coverage("S-1-5-21-A").unwrap();
         assert_eq!(
-            added, 5,
-            "reconcile installs the five new-LUID egress permits"
+            added, 7,
+            "reconcile installs the new-LUID egress permits: 5 over v4 plus one per v6 layer"
         );
 
         let after = api.wfp_filters.lock().unwrap();
@@ -4822,8 +5410,8 @@ mod tests {
                 .iter()
                 .filter(|f| f.local_interface_luid == Some(LUID_B))
                 .count(),
-            5,
-            "new-LUID egress permits installed"
+            7,
+            "new-LUID egress permits installed: 5 over v4 plus one per v6 layer"
         );
         assert_eq!(
             after
@@ -5355,6 +5943,61 @@ mod tests {
         }
     }
 
+    /// A delete that fails must not erase the accounting for the filters it
+    /// failed to delete: `cleanup_wfp` removes tracked filters BY ID, so an
+    /// untracked block survives even a graceful stop.
+    #[test]
+    fn a_failed_remove_keeps_the_filters_on_the_books() {
+        let ip = Ipv4Addr::new(203, 0, 113, 9);
+        let (api, orch, src, rules) = fixture_with_luid(Some(0x0001_0000_0000_0007));
+        rules.set(rules_with_secondary_ip(ip));
+        src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+        let installed = orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert!(installed > 0);
+        assert_eq!(orch.installed_sids(), vec!["S-1-5-21-A".to_string()]);
+
+        api.set_force_error(Some(nrr_platform_api::PlatformError::Transient {
+            operation: "delete_filter",
+            detail: "wfp busy".into(),
+        }));
+        assert!(orch.remove_for_sid("S-1-5-21-A").is_err());
+        assert_eq!(
+            orch.installed_sids(),
+            vec!["S-1-5-21-A".to_string()],
+            "the SID must stay on the books while its filters are still installed"
+        );
+
+        // With the platform back, the tracked ids are still there to delete.
+        api.set_force_error(None);
+        assert!(orch.cleanup_wfp().unwrap() > 0);
+    }
+
+    /// The per-IP posture is the DEFAULT one, and it leaves the block-all latch
+    /// disarmed — so a reader that keys on the block-all flag believes nothing
+    /// is being blocked while rule destinations are. The wider latch is what
+    /// the DNS handler and the seeder read.
+    #[test]
+    fn the_wider_fail_closed_latch_arms_on_the_per_ip_posture_too() {
+        let ip = Ipv4Addr::new(203, 0, 113, 9);
+        let (_api, orch, src, rules) = fixture_with_luid(None);
+        rules.set(rules_with_secondary_ip(ip));
+        src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert!(
+            !orch.any_block_all_armed(),
+            "per-IP posture: the catch-all is not what armed"
+        );
+        assert!(
+            orch.any_fail_closed_armed(),
+            "but the guard IS blocking, and that is what a DNS answer must key on"
+        );
+
+        // Removing the set disarms it — a later re-arm must read as a real edge.
+        orch.remove_for_sid("S-1-5-21-A").unwrap();
+        assert!(!orch.any_fail_closed_armed());
+    }
+
     #[test]
     fn link_provider_app_earns_app_exempt_permit_under_fail_closed() {
         // the user-confirmed link-provider app (VPN client)
@@ -5522,15 +6165,18 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_block_all_permits_known_primary_ip_but_not_shared_secondary() {
-        // under a Mode-A FailClosedUnknown
-        // block-all (secondary unresolved), a host matched ONLY by a primary
-        // rule earns a packet-layer permit (ping survives), but a host matched
-        // by BOTH primary and secondary rules stays blocked (it is
-        // secondary-destined; while the secondary is down it must fail closed).
+    fn fail_closed_block_all_permits_what_the_main_link_names_and_nothing_else() {
+        // Under a Mode-A FailClosedUnknown block-all (secondary unresolved) a
+        // host matched by a primary rule earns a packet-layer permit, so ping
+        // survives — INCLUDING one the secondary rules also name. Two of the
+        // user's rules pointing one address in opposite directions is not a
+        // reason to block it: blocking is a third outcome neither rule asked
+        // for, and the main link is the one the user can still see and correct.
+        // A host only the SECONDARY names is the leak case, and stays blocked.
         use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
         let primary_only = Ipv4Addr::new(203, 0, 113, 20);
         let shared = Ipv4Addr::new(203, 0, 113, 21);
+        let secondary_only = Ipv4Addr::new(203, 0, 113, 22);
         let (api, orch, src, rules) = fixture_with_luid(None); // secondary unresolved
         rules.set(ActiveRulesSnapshot {
             rule_book: CanonicalRuleBook {
@@ -5538,15 +6184,10 @@ mod tests {
                     primary_ip_rule("r-pri", primary_only),
                     primary_ip_rule("r-shared-pri", shared),
                 ]),
-                secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
-                    id: RuleId("r-shared-sec".into()),
-                    enabled: true,
-                    address_match: Some(CanonicalAddressMatch::ExactIp(shared)),
-                    app_match: None,
-                    comment: String::new(),
-                    action: nrr_domain::RuleAction::Route,
-                    origin: None,
-                }]),
+                secondary: CanonicalRuleSet::from_rules(vec![
+                    primary_ip_rule("r-shared-sec", shared),
+                    primary_ip_rule("r-sec-only", secondary_only),
+                ]),
             },
             behavior_mode: RouteBehaviorMode::PreferPrimary,
         });
@@ -5570,8 +6211,12 @@ mod tests {
             "a primary-only host gets a transport permit so ping survives the block-all (HW-0718)"
         );
         assert!(
-            !has_primary_permit(shared),
-            "a shared primary+secondary IP stays blocked while the secondary is down"
+            has_primary_permit(shared),
+            "an address the main link's own rule names is never blocked, in either mode"
+        );
+        assert!(
+            !has_primary_permit(secondary_only),
+            "an address only the secondary names must fail closed while the tunnel is down"
         );
     }
 
@@ -5763,20 +6408,18 @@ mod tests {
     }
 
     /// The rule book shared by the fake-IP-gate tests below: one census-shared
-    /// IP matched by BOTH a primary and a secondary rule.
+    /// IP a SECONDARY rule names, reachable on the primary only through the
+    /// known-direct rescue.
+    ///
+    /// No main-link rule on that address on purpose — an address both links
+    /// name never reaches the kill-switch as a secondary destination at all
+    /// (the arbiter settles it in the codegen), so putting one here would test
+    /// a state production cannot be in.
     fn shared_ip_rule_book(shared: Ipv4Addr) -> ActiveRulesSnapshot {
         ActiveRulesSnapshot {
             rule_book: CanonicalRuleBook {
-                primary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-pri", shared)]),
-                secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
-                    id: RuleId("r-sec".into()),
-                    enabled: true,
-                    address_match: Some(CanonicalAddressMatch::ExactIp(shared)),
-                    app_match: None,
-                    comment: String::new(),
-                    action: nrr_domain::RuleAction::Route,
-                    origin: None,
-                }]),
+                primary: CanonicalRuleSet::default(),
+                secondary: CanonicalRuleSet::from_rules(vec![primary_ip_rule("r-sec", shared)]),
             },
             behavior_mode: RouteBehaviorMode::PreferPrimary,
         }
@@ -5864,32 +6507,38 @@ mod tests {
 
     #[test]
     fn fake_ip_datapath_flip_retightens_shared_ip_exemption_on_recompute() {
-        //  — the gate is read LIVE on every compute, so the replan
-        // fired on a fake-IP toggle/datapath transition (the composition
-        // root's fake-IP replan hook, which runs the window-free
-        // `recompile_for_sid` diff) is sufficient to tighten or loosen the
-        // exemption: same SID, same rules, only the datapath signal flips
-        // between passes. The tightening pass must also DELETE the superseded
-        // permit — an add-only pass would leave the leak installed.
-        use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
+        // The gate is read LIVE on every compute, so the replan fired on a
+        // fake-IP toggle/datapath transition (the composition root's fake-IP
+        // replan hook, which runs the window-free `recompile_for_sid` diff) is
+        // sufficient to tighten or loosen the known-direct rescue: same SID,
+        // same rules, only the datapath signal flips between passes. The
+        // tightening pass must also DELETE the superseded permit — an add-only
+        // pass would leave the leak installed.
         use std::sync::atomic::{AtomicBool, Ordering};
         let shared = Ipv4Addr::new(209, 85, 233, 84);
         let effective = Arc::new(AtomicBool::new(true));
-        let (api, orch, src, rules) =
-            fixture_with_census(None, &[shared], None, Arc::clone(&effective));
+        let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
+        registry.register(&[shared]);
+        let (api, orch, src, rules) = fixture_with_census(
+            None,
+            &[shared],
+            Some(Arc::clone(&registry)),
+            Arc::clone(&effective),
+        );
         rules.set(shared_ip_rule_book(shared));
-        let mut snap = snap_block("Wi-Fi", "TAP");
-        snap.mode_a_coverage_strategy = ModeACoverageStrategy::FailClosedUnknown;
+        let mut snap = snap_block_mode_b("Wi-Fi", "TAP");
         snap.kill_switch_strict_shared_ips = false;
         src.set("S-1-5-21-A", snap);
 
         use nrr_platform_api::types::WfpLayerKey;
+        // Only the catch-all EXEMPT band counts — the rule's own ALE permit
+        // sits lower and exists either way.
         let shared_permitted = |api: &MockWindowsApi| {
             api.wfp_filters.lock().unwrap().iter().any(|f| {
-                f.layer == WfpLayerKey::OutboundTransportV4
+                f.layer == WfpLayerKey::AleAuthConnectV4
                     && f.action == WfpAction::Permit
                     && f.remote_ip == Some(shared)
-                    && f.ip_protocol.is_none()
+                    && f.weight >= 0x0050_0000
             })
         };
 
@@ -6034,6 +6683,240 @@ mod tests {
             blocks.len(),
             7,
             "mode-B fail-closed: V4 ALE block-all + 4 named V4 packet blocks (16.HW-0716) + V6 ALE + V6 packet block-all"
+        );
+    }
+
+    /// Three things drive a recompute concurrently (the leak-guard tick, the
+    /// fake-IP replan, the IPC trigger). Without a per-SID lock the one that
+    /// started with the older reading finished last and reinstalled what the
+    /// other had just taken down.
+    /// The mode-B catch-all drops everything that does not leave through the
+    /// tunnel - that IS a block-all, and the service has to say so: the DNS
+    /// gate reads this to stop handing out answers for direct hosts, and the
+    /// GUI banner reads it to stay up while the block is live.
+    /// The Windows half of the same limitation the Linux cycle announces: the
+    /// WFP packet layers carry no `ALE_USER_ID`, so a cut one principal armed
+    /// takes ICMP and IPv6 from everyone. Before this the others just lost them.
+    #[test]
+    fn a_machine_wide_cut_is_announced_to_the_principal_who_did_not_ask_for_it() {
+        use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+        let bus = Arc::new(crate::ipc_handlers::event_bus::EventBus::new());
+        let asked = bus.subscribe_as("gui-a".into(), Some("S-1-5-21-A".into()), Some(0));
+        let bystander = bus.subscribe_as("gui-b".into(), Some("S-1-5-21-B".into()), Some(0));
+
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let src = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        let resolution = Some(full_ks_resolution());
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&src) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            Arc::new(MockFqdnCacheLookup::new()) as Arc<dyn FqdnCacheLookup>,
+            Arc::new(CollectAudit::default()) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()))
+        .with_events(Arc::clone(&bus));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+
+        // B is on the primary with no cut of its own; A then arms the mode-B
+        // catch-all, which is a packet-layer block-all.
+        let mut bystander_policy = snap_primary_only("Wi-Fi");
+        bystander_policy.block_ipv6_when_protected = false;
+        src.set("S-1-5-21-B", bystander_policy);
+        orch.install_for_sid("S-1-5-21-B").unwrap();
+        src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+
+        let is_notice = |e: &crate::ipc_handlers::event_bus::EventEntry| {
+            matches!(
+                &e.event,
+                StatusUpdateEvent::ProtectionCoverageChanged { reason }
+                    if reason == "machine-wide-cut-by-another-user"
+            )
+        };
+        assert!(
+            bus.peek_pending_for(&bystander.subscription_id, 8)
+                .iter()
+                .any(is_notice),
+            "the bystander must be told why their IPv6 and ICMP stopped",
+        );
+        assert!(
+            !bus.peek_pending_for(&asked.subscription_id, 8)
+                .iter()
+                .any(is_notice),
+            "the principal who armed the cut needs no notice",
+        );
+    }
+
+    #[test]
+    fn a_live_catch_all_reports_itself_as_a_block_all() {
+        let (_api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+        src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert!(
+            orch.any_block_all_armed(),
+            "the catch-all is armed, so the posture must read as a block-all",
+        );
+    }
+
+    #[test]
+    fn two_triggers_for_one_sid_do_not_interleave() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (api, orch, src, rules) = fixture_with_resolution(Some(full_ks_resolution()));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
+        src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+        let orch = Arc::new(orch);
+
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let overlapped = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let orch = Arc::clone(&orch);
+            let inflight = Arc::clone(&inflight);
+            let overlapped = Arc::clone(&overlapped);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..8 {
+                    let lock = orch.apply_lock_for("S-1-5-21-A");
+                    let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
+                    if inflight.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlapped.fetch_add(1, Ordering::SeqCst);
+                    }
+                    std::thread::yield_now();
+                    inflight.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        assert_eq!(
+            overlapped.load(Ordering::SeqCst),
+            0,
+            "two applies for the same SID were in flight at once",
+        );
+        // And the orchestrator still works through that lock.
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        assert!(!api.wfp_filters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
+        // The Strict default block belongs to the MODE, so it is emitted with
+        // the guard off too. Its exemptions used to live inside the guard's
+        // branch, so switching the kill-switch off left a bare block-all with
+        // no loopback, no LAN, no DHCP and no route to the VPN server.
+        let resolution = KillSwitchResolution {
+            secondary_luid: KS_LUID,
+            bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+            local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        };
+        let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
+        src.set("S-1-5-21-A", snap_strict_guard_off("Wi-Fi", "TAP"));
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap();
+        assert!(
+            filters.iter().any(|f| f.action == WfpAction::Block
+                && f.remote_ip.is_none()
+                && f.layer == WfpLayerKey::AleAuthConnectV4),
+            "fixture guard: Strict must still emit its default block",
+        );
+        assert!(
+            filters.iter().any(|f| f.action == WfpAction::Permit
+                && f.remote_subnet == Some((Ipv4Addr::new(127, 0, 0, 0), 8))),
+            "loopback must survive the default block",
+        );
+        assert!(
+            filters.iter().any(|f| f.action == WfpAction::Permit
+                && f.remote_subnet == Some((Ipv4Addr::new(192, 168, 1, 0), 24))),
+            "the local network must survive it too",
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.action == WfpAction::Permit
+                    && f.remote_ip == Some(Ipv4Addr::new(9, 9, 9, 9))),
+            "and so must the way to the VPN server",
+        );
+    }
+
+    #[test]
+    fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
+        // An application rule learns destinations by watching, so a NAS, a
+        // printer or the hypervisor's host address is exactly what it touches.
+        // Pinned, that address is unreachable for the whole SID the moment the
+        // tunnel drops - for a device one hop away on a cable.
+        const NAS: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 50);
+        const REMOTE: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
+        let resolution = KillSwitchResolution {
+            secondary_luid: KS_LUID,
+            bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
+            local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        };
+        let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
+        rules.set(rules_with_secondary_ips(&[NAS, REMOTE]));
+        src.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap();
+        assert!(
+            !filters
+                .iter()
+                .any(|f| f.remote_ip == Some(NAS) && f.action == WfpAction::Block),
+            "a host on the machine's own subnet must not be blocked when the tunnel drops",
+        );
+        assert!(
+            filters
+                .iter()
+                .any(|f| f.remote_ip == Some(REMOTE) && f.action == WfpAction::Block),
+            "an ordinary remote destination is still protected",
+        );
+    }
+
+    #[test]
+    fn a_healthy_tunnel_is_never_cut_by_the_guard_in_the_tunnel_default_modes() {
+        // The tunnel is UP (LUID resolved) but the leak-proof pair cannot arm —
+        // no bootstrap server IP to exempt, the everyday cold-cache case for
+        // zone/suffix rules. The caller states it must NOT escalate here, and
+        // passes `block_all: false`; the guard used to ignore that in the
+        // tunnel-default modes and install a catch-all anyway, cutting every
+        // egress on a healthy tunnel and deadlocking the cache warm-up that
+        // would have lifted it.
+        let resolution = KillSwitchResolution {
+            secondary_luid: KS_LUID,
+            bootstrap_server_ips: Vec::new(),
+            local_subnets: Vec::new(),
+        };
+        let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
+        rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
+        src.set("S-1-5-21-A", snap_block_mode_b("Wi-Fi", "TAP"));
+
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+        let filters = api.wfp_filters.lock().unwrap();
+        let catch_all_v4 = filters.iter().any(|f| {
+            f.action == WfpAction::Block
+                && f.remote_ip.is_none()
+                && f.remote_subnet.is_none()
+                && f.layer == WfpLayerKey::AleAuthConnectV4
+        });
+        assert!(
+            !catch_all_v4,
+            "a live tunnel must not be cut by a catch-all the caller explicitly declined",
+        );
+        // The per-IP guard is still there: declining to escalate is not
+        // declining to guard.
+        assert!(
+            filters.iter().any(|f| f.action == WfpAction::Block
+                && f.remote_ip == Some(Ipv4Addr::new(203, 0, 113, 9))),
+            "the enumerated destination must still be blocked",
         );
     }
 
@@ -6336,8 +7219,9 @@ mod tests {
         let count = orch.install_for_sid("S-1-5-21-A").unwrap();
         // 2 rule permits (primary + secondary) + kill-switch ALE pair + one
         // packet pair per named protocol = 2 + 2 + 8 = 12, plus the IPv6
-        // closure (3 exemptions + 1 block, at each of the two v6 layers = 8).
-        assert_eq!(count, 20);
+        // closure (3 exemptions + a tunnel-egress permit + 1 block, at each of
+        // the two v6 layers = 10).
+        assert_eq!(count, 22);
         let filters = api.wfp_filters.lock().unwrap();
         // The kill-switch never targets the primary destination.
         // Every DESTINATION-scoped kill-switch filter names the secondary
@@ -6663,6 +7547,68 @@ mod tests {
         assert_eq!(records[0].kind, PerSidApplyAuditKind::Applied);
         assert_eq!(records[1].kind, PerSidApplyAuditKind::Updated);
         assert_eq!(records[1].filter_count, (2 + EXEMPT) as u32);
+    }
+
+    #[test]
+    fn a_second_install_deletes_the_filters_the_new_set_supersedes() {
+        // A full-replace install only ADDS. Without an explicit delete pass the
+        // filters the new set drops stay live in the engine while leaving our
+        // accounting — they keep dropping traffic that no recompute explains
+        // and no teardown reaches (observed in the field as a pinned address
+        // still being blocked long after its rule was gone).
+        let (api, orch, src, rules, _audit) = fixture();
+        src.set("A", snap_full("Wi-Fi", "TAP"));
+        rules.set(rules_with_n_primary_ips(3));
+        orch.install_for_sid("A").unwrap();
+        let after_wide = api.wfp_filters.lock().unwrap().len();
+
+        // Narrower rule set: some of the previous filters are no longer wanted.
+        rules.set(rules_with_n_primary_ips(1));
+        orch.install_for_sid("A").unwrap();
+
+        let live = api.wfp_filters.lock().unwrap().len();
+        assert!(
+            live < after_wide,
+            "the narrower set must leave fewer filters live, got {live} vs {after_wide}"
+        );
+        // The invariant that actually matters: what the engine holds for this
+        // SID is exactly what we think we installed.
+        // The destinations the narrower set dropped must be gone from the
+        // engine, not merely gone from our bookkeeping. (`filter_count_for` is
+        // not comparable here: the mock re-adds an identical id instead of
+        // answering FWP_E_ALREADY_EXISTS the way the real engine does.)
+        let live_ips: Vec<Option<Ipv4Addr>> = api
+            .wfp_filters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|f| f.remote_ip)
+            .collect();
+        for dropped in [Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)] {
+            assert!(
+                !live_ips.contains(&Some(dropped)),
+                "{dropped} left the rule set, so its filter must not survive in the engine; live: {live_ips:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn losing_the_policy_takes_down_the_filters_the_sid_was_carrying() {
+        // `NoPolicy` / `NoActiveRules` used to record an empty set while
+        // leaving every installed filter alive.
+        let (api, orch, src, rules, _audit) = fixture();
+        src.set("A", snap_full("Wi-Fi", "TAP"));
+        rules.set(rules_with_n_primary_ips(2));
+        orch.install_for_sid("A").unwrap();
+        assert!(!api.wfp_filters.lock().unwrap().is_empty());
+
+        rules.set(rules_with_n_primary_ips(0));
+        orch.install_for_sid("A").unwrap();
+        assert!(
+            api.wfp_filters.lock().unwrap().is_empty(),
+            "no active rules must leave nothing behind in the engine"
+        );
+        assert_eq!(orch.filter_count_for("A"), 0);
     }
 
     #[test]
@@ -7093,5 +8039,125 @@ mod tests {
         // Only the app-only block is app-scoped.
         assert!(registry.is_app_scoped(app_block.id.raw));
         assert!(!registry.is_app_scoped(dest_block.id.raw));
+    }
+
+    /// Builds the registry-test fixture with an observation store attached:
+    /// one secondary address rule, one secondary app rule whose process was
+    /// observed on `observed_ip`.
+    fn fixture_with_app_observation(
+        resolution: Option<KillSwitchResolution>,
+        observed_ip: Ipv4Addr,
+    ) -> (Arc<MockWindowsApi>, PerSidApplyOrchestrator) {
+        let api = Arc::new(MockWindowsApi::new());
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+        let source = Arc::new(ScriptedSource::default());
+        let rules = Arc::new(ScriptedRules::default());
+        let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+        let audit = Arc::new(CollectAudit::default());
+        let resolver = nrr_platform_api::MockAppPathResolver::new()
+            .with("tg.exe", vec![std::path::PathBuf::from(r"C:\Apps\tg.exe")]);
+        let observations = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+        observations.record("tg.exe", observed_ip);
+        let orch = PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            cache,
+            Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_app_resolver(Arc::new(resolver))
+        .with_app_observations(observations)
+        .with_kill_switch_resolver(Arc::new(move |_| resolution.clone()));
+        let secondary = CanonicalRuleSet::from_rules(vec![
+            CanonicalRule {
+                id: RuleId("r-ip".into()),
+                enabled: true,
+                address_match: Some(CanonicalAddressMatch::ExactIp(Ipv4Addr::new(
+                    203, 0, 113, 10,
+                ))),
+                app_match: None,
+                comment: String::new(),
+                action: nrr_domain::RuleAction::Route,
+                origin: None,
+            },
+            CanonicalRule {
+                id: RuleId("r-app".into()),
+                enabled: true,
+                address_match: None,
+                app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+                    pattern: nrr_domain::canonical::CanonicalAppPattern::Exact("tg.exe".into()),
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: nrr_domain::RuleAction::Route,
+                origin: None,
+            },
+        ]);
+        rules.set(ActiveRulesSnapshot {
+            rule_book: CanonicalRuleBook {
+                primary: CanonicalRuleSet::default(),
+                secondary,
+            },
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        });
+        source.set("S-1-5-21-A", snap_block("Wi-Fi", "TAP"));
+        (api, orch)
+    }
+
+    #[test]
+    fn an_app_observed_destination_is_not_pinned_per_destination() {
+        // The BFE volume class: every observed P2P peer used to earn ~12
+        // standing filters (ALE pair + packet pairs). The app's own pair is
+        // the leak-guard now; the observed IP keeps its /32 permit mirror but
+        // no destination-scoped block.
+        let observed = Ipv4Addr::new(198, 51, 100, 7);
+        let (api, orch) = fixture_with_app_observation(Some(full_ks_resolution()), observed);
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+
+        let live = api.wfp_filters.lock().unwrap().clone();
+        assert!(
+            !live
+                .iter()
+                .any(|f| record_is_destination_block(f) && f.remote_ip == Some(observed)),
+            "an app-observed destination must not carry a destination-scoped block"
+        );
+        assert!(
+            live.iter().any(|f| record_is_destination_block(f)
+                && f.remote_ip == Some(Ipv4Addr::new(203, 0, 113, 10))),
+            "the address-rule destination keeps its pin"
+        );
+        assert!(
+            live.iter()
+                .any(|f| f.action == WfpAction::Permit && f.remote_ip == Some(observed)),
+            "the observed destination still has its /32 permit mirror"
+        );
+        assert!(
+            live.iter().any(record_is_app_only_block),
+            "the per-app pair is what guards the app now"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_secondary_blocks_the_routed_app_itself() {
+        // The link is unresolved, so there is no LUID for the egress pair —
+        // and the per-IP set no longer carries the app's observed
+        // destinations. The unconditional fail-closed app block is what keeps
+        // the app from egressing the primary.
+        let observed = Ipv4Addr::new(198, 51, 100, 7);
+        let (api, orch) = fixture_with_app_observation(None, observed);
+        orch.install_for_sid("S-1-5-21-A").unwrap();
+
+        let live = api.wfp_filters.lock().unwrap().clone();
+        assert!(
+            live.iter().any(record_is_app_only_block),
+            "fail-closed must cut the routed app whole while its link is unresolved"
+        );
+        assert!(
+            !live
+                .iter()
+                .any(|f| record_is_destination_block(f) && f.remote_ip == Some(observed)),
+            "no destination-scoped block for the app-observed address here either"
+        );
     }
 }

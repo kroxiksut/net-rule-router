@@ -68,7 +68,7 @@ use sha2::{Digest, Sha256};
 
 use crate::dns_observation_consumer::{rule_set_match_origin, rule_set_matches};
 use crate::ipc_handlers::event_bus::EventBus;
-use crate::per_sid_orchestrator::RulesProvider;
+use crate::per_sid_orchestrator::{ActiveRulesSnapshot, RulesProvider};
 
 pub use authoring::{
     AuthorError, AuthoredMatchKind, AuthoredRule, AutoRuleAuthor, ProductionAutoRuleAuthor,
@@ -294,6 +294,19 @@ pub struct ActionSummary {
 /// principal's live rule book.
 struct RuleBookExclusions<'a> {
     book: &'a CanonicalRuleBook,
+}
+
+/// Is `hostname` already the subject of, or matched by, a rule in `snapshot`?
+/// `None` (no active revision to read) answers `false`: an unreadable rule book
+/// must not silently withdraw offers.
+fn covered_by_rules(snapshot: Option<&ActiveRulesSnapshot>, hostname: &str) -> bool {
+    let Some(snapshot) = snapshot else {
+        return false;
+    };
+    let exclusions = RuleBookExclusions {
+        book: &snapshot.rule_book,
+    };
+    exclusions.is_rule_host(hostname) || exclusions.is_matched_by_existing_rule(hostname)
 }
 
 impl CandidateExclusions for RuleBookExclusions<'_> {
@@ -796,6 +809,9 @@ impl AutoRulesEngine {
         };
         let now_ms = unix_ms(now);
         self.expire_pending(sid, now_ms);
+        // Withdraw offers the rules have since covered, before anything reads
+        // the parked set or its count.
+        self.retire_covered(sid, &snapshot, now_ms);
 
         // Compute proposals with the ledger lock held and NOTHING else: the
         // exclusions read the rule book (already in hand) and the authoring path
@@ -1072,12 +1088,20 @@ impl AutoRulesEngine {
             .as_ref()
             .map(|read| read(sid))
             .unwrap_or_default();
+        // An address the rules already cover has nothing left to approve, and
+        // it gets covered in ways this engine never observes: a rule typed by
+        // hand, a preset import, a revision another session activated, or the
+        // user accepting the offer itself. `suppressed_ids` only closes the
+        // same-session race — this is the check the read path was documented to
+        // make and did not, which left an accepted suggestion standing forever.
+        let snapshot = self.rules.active_rules_for(sid);
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(sid)
             .map(|v| {
                 v.iter()
+                    .filter(|c| !covered_by_rules(snapshot.as_ref(), &c.dto.proposed_match))
                     .map(|c| {
                         let mut dto = c.dto.clone();
                         dto.anchor_refuses_main_link = refusing.contains(&dto.anchor);
@@ -1086,6 +1110,36 @@ impl AutoRulesEngine {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Durable half of the same check: drop covered offers from the parked set
+    /// so they stop being counted (the tray badge reads `pending_count`) and do
+    /// not come back after a restart. Runs on the tick, which owns a clock.
+    fn retire_covered(&self, sid: &str, snapshot: &ActiveRulesSnapshot, now_ms: i64) {
+        let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = guard.get_mut(sid) else {
+            return;
+        };
+        let before = entry.len();
+        let exclusions = RuleBookExclusions {
+            book: &snapshot.rule_book,
+        };
+        entry.retain(|c| {
+            let host = c.dto.proposed_match.as_str();
+            !(exclusions.is_rule_host(host) || exclusions.is_matched_by_existing_rule(host))
+        });
+        let retired = before - entry.len();
+        let updated = (retired > 0).then(|| entry.clone());
+        drop(guard);
+        if let Some(updated) = updated {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                sid = %sid,
+                retired,
+                "suggestions whose address a rule already covers were withdrawn",
+            );
+            self.persist_pending(sid, &updated, now_ms);
+        }
     }
 
     /// Does any parked suggestion for the ADDITIONAL route already cover
@@ -1710,11 +1764,14 @@ impl AutoRulesEngine {
             .extend(offered.iter().map(|c| c.dto.id.clone()));
         state.announced_at = Some(now);
         drop(states);
-        bus.publish(StatusUpdateEvent::AutoRuleCandidatesChanged {
-            sid: sid.to_string(),
-            pending_count: pending,
-            top_anchor: top_anchor(&anchor_source),
-        });
+        bus.publish_for(
+            sid,
+            StatusUpdateEvent::AutoRuleCandidatesChanged {
+                sid: sid.to_string(),
+                pending_count: pending,
+                top_anchor: top_anchor(&anchor_source),
+            },
+        );
         true
     }
 }

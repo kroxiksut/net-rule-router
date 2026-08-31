@@ -20,6 +20,7 @@ pub struct LogQueryFilter {
     pub category: Option<EventCategory>,
     pub kind: Option<String>,
     pub decision_id: Option<String>,
+    pub revision_id: Option<String>,
 }
 
 impl LogQueryFilter {
@@ -47,6 +48,14 @@ impl LogQueryFilter {
         self.kind = Some(kind.into());
         self
     }
+    pub fn decision_id(mut self, id: impl Into<String>) -> Self {
+        self.decision_id = Some(id.into());
+        self
+    }
+    pub fn revision_id(mut self, id: impl Into<String>) -> Self {
+        self.revision_id = Some(id.into());
+        self
+    }
 
     fn matches(&self, event: &LogEvent) -> bool {
         if let Some(from) = self.from_ms {
@@ -71,6 +80,19 @@ impl LogQueryFilter {
         }
         if let Some(k) = &self.kind {
             if &event.kind != k {
+                return false;
+            }
+        }
+        // Correlation filters were declared and never applied: the user picked
+        // a decision or a revision and got the whole log back, believing it
+        // filtered. An event with no correlation cannot match one.
+        if let Some(id) = &self.decision_id {
+            if event.correlation.decision_id.as_deref() != Some(id.as_str()) {
+                return false;
+            }
+        }
+        if let Some(id) = &self.revision_id {
+            if event.correlation.revision_id.as_deref() != Some(id.as_str()) {
                 return false;
             }
         }
@@ -135,7 +157,7 @@ fn list_log_files(dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .collect();
-    files.sort();
+    crate::rotation::sort_chronologically(&mut files);
     files
 }
 
@@ -290,5 +312,34 @@ mod tests {
 
         let reader = LogReader::new(dir.path());
         assert_eq!(reader.count_corrupt_lines(), 1);
+    }
+
+    #[test]
+    fn a_correlation_filter_actually_filters() {
+        let dir = tempfile::tempdir().expect("temp");
+        for (id, decision, revision) in [
+            ("evt-1", Some("d-aaa"), Some("rev-1")),
+            ("evt-2", Some("d-bbb"), Some("rev-2")),
+            ("evt-3", None, None),
+        ] {
+            let mut event = crate::event::LogEvent::new(
+                id.to_string(),
+                1_745_000_000_000,
+                EventLevel::Info,
+                reason::service::STARTED,
+            );
+            event.correlation.decision_id = decision.map(str::to_string);
+            event.correlation.revision_id = revision.map(str::to_string);
+            append_event_raw(dir.path(), event);
+        }
+
+        let reader = LogReader::new(dir.path());
+        let by_decision = reader.scan(&LogQueryFilter::new().decision_id("d-aaa"));
+        assert_eq!(by_decision.len(), 1, "decision filter must narrow the list");
+        assert_eq!(by_decision[0].event_id, "evt-1");
+
+        let by_revision = reader.scan(&LogQueryFilter::new().revision_id("rev-2"));
+        assert_eq!(by_revision.len(), 1);
+        assert_eq!(by_revision[0].event_id, "evt-2");
     }
 }

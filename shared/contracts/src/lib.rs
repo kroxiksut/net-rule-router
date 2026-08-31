@@ -3,6 +3,48 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+/// The line a runtime prints when it comes up, and the one naming what that
+/// runtime is responsible for.
+///
+/// They live here, in the contracts crate every runtime already depends on,
+/// because the background service needed exactly these two strings and nothing
+/// else from `nrr-application` — and that one unused-in-practice dependency was
+/// enough to link 5423 lines of UI and preview code into a service running as
+/// LocalSystem. A shared string does not justify a shared dependency edge.
+pub fn runtime_boot_banner(component: &str) -> String {
+    format!(
+        "{} {component} starting",
+        crate::product_identity::PRODUCT_NAME
+    )
+}
+
+/// What this process does — printed under the banner. The service carries the
+/// routing engine, enforcement and the kill switch, so the old wording
+/// ("starts without routing business logic") was a statement about the code
+/// that stopped being true long ago; a boot line that lies is worse than none.
+pub fn runtime_boot_role_message(component: &str) -> String {
+    match component {
+        "service" => "Applies and enforces the routing policy.".to_string(),
+        _ => "Presents the routing policy; the background service enforces it.".to_string(),
+    }
+}
+
+/// A short string identifying the shape of the wire contracts this build
+/// speaks: crate version plus the two schema numbers that gate decoding.
+///
+/// Anything that persists decoded payloads (the GUI's snapshot cache) stores it
+/// alongside the data and refuses what does not match. A hand-maintained
+/// "cache schema version" was the alternative, and it is the kind of number
+/// that is only ever bumped after the bug: nothing forces it to move when a DTO
+/// gains a field.
+pub fn contract_fingerprint() -> String {
+    format!(
+        "{}/rules-{}",
+        env!("CARGO_PKG_VERSION"),
+        rules_json::RULES_JSON_SCHEMA_VERSION
+    )
+}
+
 pub mod app_identity;
 pub mod auto_rule;
 pub mod diagnostics_dto;
@@ -13,6 +55,7 @@ pub mod ipc_flow;
 pub mod ipc_payloads;
 pub mod ipc_readiness;
 pub mod ipc_transport;
+pub mod ipc_wire;
 pub mod launcher_rpc;
 pub mod localization;
 pub mod merge_dto;
@@ -21,6 +64,7 @@ pub mod platform_profile;
 pub mod preset_parser;
 pub mod product_identity;
 pub mod rules_json;
+pub mod rules_overlap;
 pub mod settings_export;
 pub mod summary;
 pub mod system_info;

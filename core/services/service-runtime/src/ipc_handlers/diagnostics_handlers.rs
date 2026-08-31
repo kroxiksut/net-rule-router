@@ -1096,23 +1096,38 @@ impl DiagnosticsExportArchiveHandler {
     fn read_service_stderr(&self) -> Option<String> {
         /// Enough for a panic and its backtrace; the file is bounded by the
         /// capture itself, this only guards a pathological one.
-        const MAX_BYTES: usize = 256 * 1024;
+        const MAX_BYTES: u64 = 256 * 1024;
         let logs_dir = self
             .archives_dir
             .parent()
             .map(|root| root.join("logs"))
             .unwrap_or_else(|| self.archives_dir.join("logs"));
-        let mut text = std::fs::read_to_string(logs_dir.join("nrr_service_stderr.log")).ok()?;
-        if text.len() <= MAX_BYTES {
-            return Some(text);
+
+        // Seek to the tail rather than reading the file and trimming after: a
+        // cap enforced only after the whole file is in memory is no cap at all,
+        // and this runs inside the service.
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(logs_dir.join("nrr_service_stderr.log")).ok()?;
+        let len = file.metadata().ok()?.len();
+        if len > MAX_BYTES {
+            file.seek(SeekFrom::Start(len - MAX_BYTES)).ok()?;
         }
-        // Keep the TAIL: the last thing written is what the process died
-        // saying. Cut on a char boundary so the result stays valid UTF-8.
-        let mut cut = text.len() - MAX_BYTES;
-        while cut < text.len() && !text.is_char_boundary(cut) {
-            cut += 1;
-        }
-        Some(text.split_off(cut))
+        let mut bytes = Vec::with_capacity(MAX_BYTES.min(len) as usize);
+        file.take(MAX_BYTES).read_to_end(&mut bytes).ok()?;
+
+        // The seek can land mid-character; drop the partial head.
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) => {
+                let bytes = e.into_bytes();
+                let start = bytes
+                    .iter()
+                    .position(|b| (*b as i8) >= -0x40)
+                    .unwrap_or(bytes.len());
+                String::from_utf8_lossy(&bytes[start..]).into_owned()
+            }
+        };
+        Some(text)
     }
 
     /// `health.json` fields beyond the live status snapshot. Best-effort: a
@@ -2129,6 +2144,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSourceDto::UserAssigned,
         });
 

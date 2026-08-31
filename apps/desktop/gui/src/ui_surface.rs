@@ -1,20 +1,4 @@
-use crate::interfaces_routes::{
-    format_interface_row_for_contract, render_interfaces_and_routes_screen,
-};
-use crate::rules::render_rules_screen;
-use crate::security::render_screen_only_security_status;
-use crate::settings::render_settings_screen;
-use nrr_application::backend_facade::diagnostics::{
-    preview_active_security_alerts, preview_diagnostics_status,
-};
-use nrr_application::backend_facade::logs::{
-    preview_audit_entries_first_page, preview_operational_logs_first_page, AuditEntryFilter,
-    LogEntryFilter, PaginationParams,
-};
-use nrr_application::backend_facade::network_interfaces::{
-    interface_diagnostics_checks_snapshot, interfaces_routes_preview_snapshot,
-    RouteSelectionRequest,
-};
+use nrr_application::backend_facade::network_interfaces::RouteSelectionRequest;
 use nrr_application::backend_facade::rules::RulesScreenRequest;
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, BackendProviderKind,
@@ -34,279 +18,6 @@ use serde_json::json;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-
-const PREFERENCES_MARKER: &str = "NRR_PREFS_JSON:";
-
-pub fn render_first_run_wizard(first_run: &FirstRunFlowSnapshot) {
-    println!("First-run wizard:");
-    println!("- required={}", first_run.wizard_required);
-    println!("- scenario={}", first_run.selected_scenario.title());
-    println!(
-        "- available scenarios={}",
-        first_run
-            .available_scenarios
-            .iter()
-            .map(|scenario| scenario.title())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!(
-        "- quick-start path={}",
-        first_run
-            .quick_start_path_sections
-            .iter()
-            .map(|section| section.title())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    );
-}
-
-pub fn render_main_window_frame(shell: &AppShellModel, section: AppSection) {
-    println!(
-        "Main window frame: title='{}', section='{}'",
-        shell.main_window_shell.window_title,
-        section.title()
-    );
-    println!(
-        "Main menu groups: {}",
-        shell
-            .menu_bar
-            .iter()
-            .map(|group| group.id.title())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-}
-
-pub fn render_section_shell(
-    shell: &AppShellModel,
-    section: AppSection,
-    preferences: UiPreferences,
-) {
-    match section {
-        AppSection::InterfacesAndRoutes => render_interfaces_and_routes_screen(shell),
-        AppSection::Rules => render_rules_screen(shell),
-        AppSection::Diagnostics => render_diagnostics_screen(shell),
-        AppSection::Logs => render_logs_screen(),
-        AppSection::Settings => render_settings_screen(shell, preferences),
-    }
-
-    render_screen_only_security_status(shell);
-}
-
-pub fn run_interactive_window(
-    _shell: AppShellModel,
-    _section_to_open: AppSection,
-    _source: ActivationSource,
-    preferences: UiPreferences,
-    _first_run: FirstRunFlowSnapshot,
-    request: &crate::app_shell::LaunchRequest,
-) -> Result<UiPreferences, String> {
-    let qml_main = resolve_qml_main_path()
-        .ok_or_else(|| "Qt runtime file is missing: apps/desktop/qml/Main.qml".to_string())?;
-    let qml_argument = format!("--qml={}", qml_main.display());
-    let backend_executable = env::current_exe()
-        .map_err(|error| format!("Failed to resolve GUI backend executable path: {error}"))?;
-    let mut host_arguments = vec![
-        qml_argument,
-        format!("--nrr-backend-exe={}", backend_executable.display()),
-    ];
-    for backend_argument in serialize_backend_arguments(request) {
-        host_arguments.push(format!("--nrr-backend-arg={backend_argument}"));
-    }
-    if let Some(icon_path) = resolve_native_icon_path() {
-        host_arguments.push(format!("--nrr-app-icon={}", icon_path.display()));
-    }
-    if let Ok(raw_ms) = env::var("NRR_QML_AUTOCLOSE_MS") {
-        if let Ok(parsed_ms) = raw_ms.trim().parse::<u64>() {
-            if parsed_ms > 0 {
-                host_arguments.push(format!("--nrr-auto-close-ms={parsed_ms}"));
-            }
-        }
-    }
-
-    let output_result = run_qt_host_command(&host_arguments);
-
-    let output = match output_result {
-        Ok(output) => output,
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Err(
-                    "Qt host executable was not found. Build `nrr-qt-host` or ensure `cargo` is available in PATH."
-                        .to_string(),
-                );
-            }
-            return Err(format!("Failed to launch Qt host runtime: {error}"));
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let updated_preferences = parse_preferences_from_qt_output(preferences, &stdout, &stderr)?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Qt host runtime exited with status {}.\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            stdout.trim(),
-            stderr.trim()
-        ));
-    }
-
-    Ok(updated_preferences)
-}
-
-fn serialize_backend_arguments(request: &crate::app_shell::LaunchRequest) -> Vec<String> {
-    let mut arguments = vec![format!("--source={}", request.source)];
-    if let Some(section) = request.section {
-        arguments.push(format!("--section={section}"));
-    }
-    if request.open_about {
-        arguments.push("--about".to_string());
-    }
-    if request.open_license {
-        arguments.push("--license".to_string());
-    }
-    if let Some(first_run_completed) = request.first_run_completed_override {
-        arguments.push(format!(
-            "--first-run={}",
-            if first_run_completed {
-                "completed"
-            } else {
-                "required"
-            }
-        ));
-    }
-    if let Some(scenario) = request.first_run_scenario_override {
-        arguments.push(format!("--scenario={}", scenario.slug()));
-    }
-    arguments
-}
-
-fn render_diagnostics_screen(shell: &AppShellModel) {
-    let status = preview_diagnostics_status();
-    let alerts = preview_active_security_alerts();
-    let request = RouteSelectionRequest::default();
-    let adapters = interfaces_routes_preview_snapshot(request.clone());
-    let checks_snapshot = interface_diagnostics_checks_snapshot(request);
-    println!("Diagnostics screen (preview data):");
-    println!(
-        "- overall: healthy={} stale={}",
-        status.overall_healthy, status.stale
-    );
-    println!(
-        "- service: state={} revision={:?} pending={}",
-        status.service_health.state,
-        status.service_health.active_revision_id,
-        status.service_health.pending_changes
-    );
-    println!(
-        "- security: audit_chain_ok={} write_healthy={} active_alerts={}",
-        status.security_status.audit_chain_ok,
-        status.security_status.audit_write_healthy,
-        status.security_status.active_alert_count
-    );
-    for alert in &alerts {
-        println!(
-            "  alert {}: kind={} state={} reason={} requires_action={}",
-            alert.alert_id, alert.kind, alert.state, alert.reason_code, alert.requires_action
-        );
-    }
-    println!(
-        "- cache: entries={} healthy={} rebuilding={}",
-        status.cache_health.entry_count,
-        status.cache_health.healthy,
-        status.cache_health.rebuilding
-    );
-    println!(
-        "- logs: writable={} size_bytes={} files={} dropped={}",
-        status.log_health.dir_writable,
-        status.log_health.total_size_bytes,
-        status.log_health.file_count,
-        status.log_health.dropped_count
-    );
-    println!(
-        "- diagnostic_mode: active={} scope={:?} expires_at={:?}",
-        status.diagnostic_mode.active,
-        status.diagnostic_mode.scope_key,
-        status.diagnostic_mode.expires_at
-    );
-    println!(
-        "- Adapter fields format (shared with interfaces/explain): unknown='{}'",
-        shell.interfaces_routes.display_format.unknown_value_marker
-    );
-    println!("- Adapter snapshot:");
-    for row in &adapters.rows {
-        println!("  {}", format_interface_row_for_contract(shell, row));
-    }
-    println!("- Adapter checks: {}", checks_snapshot.integration_note);
-    for row in &checks_snapshot.rows {
-        println!("  {}:", row.windows_name);
-        for check in &row.checks {
-            println!(
-                "    {} -> {} ({})",
-                check.action.title(),
-                check.status.title(),
-                check.explanation
-            );
-        }
-    }
-}
-
-fn render_logs_screen() {
-    let page = preview_operational_logs_first_page();
-    let audit_page = preview_audit_entries_first_page();
-    println!("Logs screen (preview data):");
-    println!(
-        "- operational: {} entries (page), next_cursor={:?}",
-        page.items.len(),
-        page.next_cursor.as_ref().map(|c| c.as_str().to_string())
-    );
-    for entry in &page.items {
-        println!(
-            "  {} [{}/{}] {} :: {}",
-            entry.created_at, entry.level, entry.category, entry.kind, entry.message_key
-        );
-    }
-    println!(
-        "- audit: {} entries (page), next_cursor={:?}",
-        audit_page.items.len(),
-        audit_page
-            .next_cursor
-            .as_ref()
-            .map(|c| c.as_str().to_string())
-    );
-    for entry in &audit_page.items {
-        println!(
-            "  seq={} kind={} result={} reason={} revision={:?}",
-            entry.seq, entry.kind, entry.result, entry.reason_code, entry.revision_id
-        );
-    }
-}
-
-fn resolve_qml_main_path() -> Option<PathBuf> {
-    if let Ok(explicit_path) = env::var("NRR_QML_MAIN") {
-        let path = PathBuf::from(explicit_path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../qml")
-        .join("Main.qml");
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
-
-    let cwd_candidate = env::current_dir().ok()?.join("apps/desktop/qml/Main.qml");
-    if cwd_candidate.exists() {
-        return Some(cwd_candidate);
-    }
-
-    None
-}
 
 fn resolve_icon_path() -> Option<PathBuf> {
     let manifest_candidate =
@@ -318,36 +29,6 @@ fn resolve_icon_path() -> Option<PathBuf> {
     let cwd_candidate = env::current_dir()
         .ok()?
         .join("assets/icons/app/icon-256.png");
-    if cwd_candidate.exists() {
-        return Some(cwd_candidate);
-    }
-
-    None
-}
-
-fn resolve_native_icon_path() -> Option<PathBuf> {
-    // Installed / portable layout first: the icon next to the running
-    // executable (walk a few levels up so a redirected target-dir / a
-    // nested install tree resolves), then the dev source tree, then cwd.
-    if let Ok(exe) = env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..6 {
-            let Some(d) = dir else { break };
-            let candidate = d.join("assets/icons/app/app.ico");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            dir = d.parent();
-        }
-    }
-
-    let manifest_candidate =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/icons/app/app.ico");
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
-
-    let cwd_candidate = env::current_dir().ok()?.join("assets/icons/app/app.ico");
     if cwd_candidate.exists() {
         return Some(cwd_candidate);
     }
@@ -522,6 +203,15 @@ fn load_eula_text(language: &str) -> String {
 // still consumes the deprecated fields, and the launcher's migration
 // flow keeps the on-disk values in sync with what the service has
 // stored.
+/// How long the launcher may spend on backend snapshots before the window
+/// exists.
+///
+/// Measured against the SUM of the calls, because that is what the user waits
+/// through. Chosen so a healthy service (single-digit milliseconds per call)
+/// never notices it, while a wedged one costs a couple of seconds instead of
+/// twenty.
+const COLD_START_BACKEND_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
+
 #[allow(deprecated)]
 #[allow(clippy::too_many_arguments)] // context emitter threads the full UI surface
 pub fn write_qt_context_file_at(
@@ -596,17 +286,118 @@ pub fn write_qt_context_file_at(
     // (with `stale=true` flagged in the typed wrappers) on transient
     // disconnects. The launcher's `backend_status` argument drives the
     // QML banner; this function does not interpret it.
-    let interfaces_snapshot = backend.interfaces_snapshot(interfaces_request);
+    // Every one of these blocks the launcher BEFORE the window exists, and each
+    // carries its own IPC timeout — so a service that is slow (or absent) is
+    // paid for in seconds of no window at all. The timings go to the launcher
+    // log so the cost is measured rather than guessed.
+    let mut cold_start_timings: Vec<(&'static str, u128)> = Vec::new();
+    let mut timed = |name: &'static str, started: std::time::Instant| {
+        cold_start_timings.push((name, started.elapsed().as_millis()));
+    };
+    // ONE budget for the whole pre-window block, not one timeout per call.
+    // The user experiences the SUM: six calls with their own budgets added up
+    // to 21 s of black screen against a wedged service. Once this is spent the
+    // remaining snapshots are served locally — the same fallback the production
+    // facade takes on an IPC failure — and `backendStatus` is degraded to
+    // `Connecting`, so nothing on screen claims to have been verified against
+    // the service. The GUI's own refresh fills in moments later.
+    //
+    // The bound is BUDGET + one call's timeout: a call already in flight cannot
+    // be cut short from here, only the next one can be skipped.
+    let cold_start_started = std::time::Instant::now();
+    let mut budget_spent = false;
+    let budget_left = |started: &std::time::Instant| started.elapsed() < COLD_START_BACKEND_BUDGET;
+
+    let t = std::time::Instant::now();
+    let interfaces_snapshot = if budget_left(&cold_start_started) {
+        backend.interfaces_snapshot(interfaces_request)
+    } else {
+        budget_spent = true;
+        nrr_application::mock_backend::network_interfaces::interfaces_routes_preview_snapshot(
+            interfaces_request,
+        )
+    };
+    timed("interfaces", t);
+    // Derived from the snapshot just taken rather than asked for separately:
+    // the checks read nothing but the rows, so a second round-trip bought only
+    // another wait before the window and a second enumeration describing a
+    // different instant. Bluetooth-like adapters are dropped here because the
+    // list request asks for them and the checks request did not.
+    let t = std::time::Instant::now();
+    let checks_rows: Vec<_> = interfaces_snapshot
+        .rows
+        .iter()
+        .filter(|row| {
+            base_route_selection_request.include_bluetooth_adapters || !row.is_bluetooth_like
+        })
+        .cloned()
+        .collect();
     let diagnostics_checks_snapshot =
-        backend.interface_checks_snapshot(base_route_selection_request);
-    let rules_snapshot = backend.rules_snapshot(RulesScreenRequest::default());
-    let diagnostics_status = backend.diagnostics_status_snapshot();
-    let active_alerts = backend.list_security_alerts(None);
-    let logs_page =
-        backend.list_log_entries(&LogEntryFilter::default(), &PaginationParams::default());
-    let audit_page =
-        backend.list_audit_entries(&AuditEntryFilter::default(), &PaginationParams::default());
-    let security_snapshot = backend.status_snapshot();
+        nrr_application::mock_backend::network_interfaces::interface_diagnostics_checks_from_rows(
+            interfaces_snapshot.data_source,
+            &checks_rows,
+        );
+    timed("adapter-checks", t);
+    let t = std::time::Instant::now();
+    let rules_snapshot = if budget_left(&cold_start_started) {
+        backend.rules_snapshot(RulesScreenRequest::default())
+    } else {
+        budget_spent = true;
+        nrr_application::mock_backend::rules::rules_screen_preview_snapshot(
+            RulesScreenRequest::default(),
+        )
+    };
+    timed("rules", t);
+    let t = std::time::Instant::now();
+    let diagnostics_status = if budget_left(&cold_start_started) {
+        backend.diagnostics_status_snapshot()
+    } else {
+        budget_spent = true;
+        nrr_application::mock_backend::diagnostics::preview_diagnostics_status()
+    };
+    timed("diagnostics", t);
+    let t = std::time::Instant::now();
+    let active_alerts = if budget_left(&cold_start_started) {
+        backend.list_security_alerts(None)
+    } else {
+        budget_spent = true;
+        nrr_application::mock_backend::diagnostics::preview_active_security_alerts()
+    };
+    timed("alerts", t);
+    // Logs and audit are NOT fetched here. Both are paged screens the user
+    // reaches by opening them, and `LogsSection` loads its own first page on
+    // show — fetching them before the window exists bought nothing and could
+    // cost two IPC timeouts of black screen on a slow or absent service. The
+    // context keeps the shape, with an empty first page.
+    let logs_page = nrr_application::mock_backend::logs::PageResult::<
+        nrr_application::mock_backend::logs::LogEntryDto,
+    >::empty();
+    let audit_page = nrr_application::mock_backend::logs::PageResult::<
+        nrr_application::mock_backend::logs::AuditEntryDto,
+    >::empty();
+    let t = std::time::Instant::now();
+    let security_snapshot = if budget_left(&cold_start_started) {
+        backend.status_snapshot()
+    } else {
+        budget_spent = true;
+        nrr_application::mock_backend::security_status::security_status_preview_snapshot()
+    };
+    timed("status", t);
+    let total: u128 = cold_start_timings.iter().map(|(_, ms)| ms).sum();
+    if budget_spent {
+        println!(
+            "NRR_LAUNCHER[cold-start] budget of {}ms spent — the rest is local,              the window opens now and the GUI refreshes from the service",
+            COLD_START_BACKEND_BUDGET.as_millis()
+        );
+    }
+    println!(
+        "NRR_LAUNCHER[cold-start] total={total}ms {}",
+        cold_start_timings
+            .iter()
+            .map(|(name, ms)| format!("{name}={ms}ms"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     let bindings_snapshot =
         route_bindings_export_snapshot(&preferences, security_snapshot.active_revision);
     let bindings_export_text = format_route_bindings_export(&bindings_snapshot);
@@ -726,31 +517,42 @@ pub fn write_qt_context_file_at(
     // from the service via `RulesListResponse.rows[i].validation_status`
     // (16.4 / 16.11). The in-place revalidation below is retained as
     // a fallback for the preview (mock) mode only.
-    let rules_rows_json: Vec<serde_json::Value> = rules_snapshot
-        .rows
-        .iter()
-        .map(|row| {
-            let validation = nrr_application::rule_value_validation::validate_rule_value(
-                row.rule_type.slug(),
-                row.match_value,
-            );
-            json!({
-                "id": row.id,
-                "enabled": row.enabled,
-                "ruleType": row.rule_type.slug(),
-                "ruleTypeTitle": row.rule_type.title(),
-                "matchValue": row.match_value,
-                "targetRoute": match row.target_route {
-                    nrr_shared::RouteRole::Primary => "primary",
-                    nrr_shared::RouteRole::Secondary => "secondary",
-                },
-                "comment": row.comment,
-                "validationStatus": validation.status_slug(),
-                "validationMessageKey": validation.message_key(),
-                "validationMessageArgs": validation.args(),
-            })
-        })
-        .collect();
+    // Demo rules are something the user asks for — the first-run wizard's
+    // "use built-in demo rules", the Rules screen's "load demo rules" — never
+    // something a launch hands them. A service-backed start therefore carries
+    // NO rows: the table stays empty until the live revision arrives, and
+    // stays empty for good if the user has no rules yet. Only a mock/preview
+    // build still renders the preview seed; it has no service to read.
+    let rules_rows_json: Vec<serde_json::Value> =
+        if backend_provider_is_service_backed(backend.provider_kind()) {
+            Vec::new()
+        } else {
+            rules_snapshot
+                .rows
+                .iter()
+                .map(|row| {
+                    let validation = nrr_application::rule_value_validation::validate_rule_value(
+                        row.rule_type.slug(),
+                        row.match_value,
+                    );
+                    json!({
+                        "id": row.id,
+                        "enabled": row.enabled,
+                        "ruleType": row.rule_type.slug(),
+                        "ruleTypeTitle": row.rule_type.title(),
+                        "matchValue": row.match_value,
+                        "targetRoute": match row.target_route {
+                            nrr_shared::RouteRole::Primary => "primary",
+                            nrr_shared::RouteRole::Secondary => "secondary",
+                        },
+                        "comment": row.comment,
+                        "validationStatus": validation.status_slug(),
+                        "validationMessageKey": validation.message_key(),
+                        "validationMessageArgs": validation.args(),
+                    })
+                })
+                .collect()
+        };
     // The empty-rules state is driven entirely by `EmptyState` in
     // `RulesSection.qml`; users see "Add your first rule" instead of a
     // pre-populated invalid example.
@@ -768,7 +570,16 @@ pub fn write_qt_context_file_at(
         })
     }));
 
-    let backend_status_payload = backend_connection_status_to_payload(backend_status);
+    // Data we served locally was never verified against the service, so the
+    // window must not claim a live connection. `Connecting` is the state the
+    // GUI already renders honestly ("Not verified — the service isn't
+    // reachable right now") and refreshes out of on its own.
+    let effective_backend_status = if budget_spent && backend_status.is_connected() {
+        BackendConnectionStatus::Connecting
+    } else {
+        backend_status.clone()
+    };
+    let backend_status_payload = backend_connection_status_to_payload(&effective_backend_status);
     let backend_service_backed = backend_provider_is_service_backed(backend.provider_kind());
     // Capability descriptor for the running OS. The QML renders
     // capability-driven (a section shows only when `supports.<feature>` is
@@ -884,7 +695,6 @@ pub fn write_qt_context_file_at(
             // `block-secondary-when-unavailable` flag, so the Routing
             // settings checkbox renders the saved choice. The
             // authoritative value is written through `route.policy.update`.
-            "blockSecondaryWhenUnavailable": preferences.block_secondary_traffic_when_unavailable,
             "showBluetoothAdapters": preferences.show_bluetooth_adapters,
             // Display toggle for the security-audit viewing tab in the Logs
             // area (default off). Device-local; the audit trail is recorded
@@ -930,6 +740,9 @@ pub fn write_qt_context_file_at(
             // Persisted dismiss signature for the "app rules aren't active
             // yet" notification (sorted set, `|`-joined).
             "unenforcedAppsAckSig": preferences.unenforced_apps_ack_signature.clone(),
+            // Overlap pairs the user asked the rules screen to stop offering
+            // for cleanup (`|`-joined).
+            "rulesOverlapKeepSig": preferences.rules_overlap_keep_signature.clone(),
             // Device-local record of the executable the user pointed out as
             // their VPN in the onboarding dialog.
             "confirmedVpnExePath": preferences.confirmed_vpn_exe_path.clone(),
@@ -1108,8 +921,6 @@ pub fn write_qt_context_file_at(
                 "activeRevision": bindings_snapshot.active_revision,
                 "behaviorMode": bindings_snapshot.behavior_mode.slug(),
                 "changeClass": bindings_snapshot.change_class.title(),
-                "revisionLinkPolicy": bindings_snapshot.revision_link_policy,
-                "changeClassificationPolicy": bindings_snapshot.change_classification_policy,
                 "primary": {
                     "persistentId": bindings_snapshot.primary.persistent_id,
                     "adapterName": bindings_snapshot.primary.adapter_name,
@@ -1138,6 +949,7 @@ pub fn write_qt_context_file_at(
         "diagnostics": {
             "overallHealthy": diagnostics_status.overall_healthy,
             "stale": diagnostics_status.stale,
+            "origin": diagnostics_status.origin.as_str(),
             "serviceHealth": {
                 "state": diagnostics_status.service_health.state,
                 "activeRevisionId": diagnostics_status.service_health.active_revision_id,
@@ -1148,7 +960,8 @@ pub fn write_qt_context_file_at(
                 "activeAlertCount": diagnostics_status.security_status.active_alert_count,
                 "auditWriteHealthy": diagnostics_status.security_status.audit_write_healthy,
             },
-            "activeAlerts": active_alerts.iter().map(|alert| json!({
+            "alertsStale": active_alerts.stale,
+            "activeAlerts": active_alerts.alerts.iter().map(|alert| json!({
                 "alertId": alert.alert_id,
                 "kind": alert.kind,
                 "state": alert.state,
@@ -1302,34 +1115,14 @@ pub fn write_qt_context_file_at(
 
     let payload =
         serde_json::to_string_pretty(&context).map_err(|error| format!("JSON error: {error}"))?;
-    fs::write(file_path, payload)
+    // Exclusive, owner-only creation rather than `fs::write`: the file carries
+    // the user's settings, and on Unix the coordination directory can sit in a
+    // shared `/tmp`, where a planted symlink would redirect the write.
+    let mut file = nrr_platform_api::paths::create_private_file(file_path)
+        .map_err(|error| format!("Failed to create Qt context file: {error}"))?;
+    std::io::Write::write_all(&mut file, payload.as_bytes())
         .map_err(|error| format!("Failed to write Qt context file: {error}"))?;
     Ok(())
-}
-
-fn parse_preferences_from_qt_output(
-    current: UiPreferences,
-    stdout: &str,
-    stderr: &str,
-) -> Result<UiPreferences, String> {
-    let mut payload_line = None::<String>;
-
-    for line in stdout.lines().chain(stderr.lines()) {
-        if let Some(index) = line.find(PREFERENCES_MARKER) {
-            let value = line[(index + PREFERENCES_MARKER.len())..].trim();
-            if !value.is_empty() {
-                payload_line = Some(value.to_string());
-            }
-        }
-    }
-
-    let Some(serialized_payload) = payload_line else {
-        return Ok(current);
-    };
-
-    let payload: QtPreferencesPayload = serde_json::from_str(&serialized_payload)
-        .map_err(|error| format!("Failed to parse Qt preferences payload: {error}"))?;
-    Ok(payload.apply_over(current))
 }
 
 pub fn apply_qt_preferences_payload(
@@ -1370,100 +1163,15 @@ fn path_to_file_url(path: &Path) -> String {
     }
 }
 
-fn run_qt_host_command(host_arguments: &[String]) -> Result<std::process::Output, std::io::Error> {
-    if let Some(qt_host_executable) = resolve_qt_host_executable() {
-        return Command::new(qt_host_executable)
-            .args(host_arguments)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-    }
-
-    let Some(workspace_root) = resolve_workspace_root() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "workspace root was not found for launching nrr-qt-host",
-        ));
-    };
-
-    Command::new("cargo")
-        .current_dir(workspace_root)
-        .arg("run")
-        .arg("-p")
-        .arg("nrr-qt-host")
-        .arg("--")
-        .args(host_arguments)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-}
-
-fn resolve_qt_host_executable() -> Option<PathBuf> {
-    if let Ok(explicit_path) = env::var("NRR_QT_HOST_EXE") {
-        let path = PathBuf::from(explicit_path);
-        if path.exists() {
-            return Some(path);
-        }
-    }
-
-    let executable_name = if cfg!(windows) {
-        "nrr-qt-host.exe"
-    } else {
-        "nrr-qt-host"
-    };
-
-    // Look adjacent to the running binary first. This is the only path that
-    // works regardless of `[build] target-dir` redirects — the Cargo manifest
-    // path baked at compile time can point to a directory that does not hold
-    // the actual artifacts when target-dir was moved (e.g. to a fast local
-    // drive away from a synced source tree).
-    if let Ok(current_executable) = env::current_exe() {
-        if let Some(parent) = current_executable.parent() {
-            let candidate = parent.join(executable_name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-
-    for profile in ["debug", "release"] {
-        let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../target")
-            .join(profile)
-            .join(executable_name);
-        if manifest_candidate.exists() {
-            return Some(manifest_candidate);
-        }
-    }
-
-    None
-}
-
-fn resolve_workspace_root() -> Option<PathBuf> {
-    let manifest_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    if manifest_workspace.join("Cargo.toml").exists() {
-        return Some(manifest_workspace);
-    }
-
-    let mut directory = env::current_dir().ok()?;
-    loop {
-        if directory.join("Cargo.toml").exists() {
-            return Some(directory);
-        }
-        if !directory.pop() {
-            break;
-        }
-    }
-
-    None
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QtPreferencesPayload {
-    launch_window_on_startup: bool,
-    minimize_to_tray_instead_of_close: bool,
-    show_notifications: bool,
+    #[serde(default)]
+    launch_window_on_startup: Option<bool>,
+    #[serde(default)]
+    minimize_to_tray_instead_of_close: Option<bool>,
+    #[serde(default)]
+    show_notifications: Option<bool>,
     /// Additive: a payload written before the per-kind mute existed leaves the
     /// stripe enabled, which is the pre-existing behaviour.
     #[serde(default = "default_true")]
@@ -1479,39 +1187,49 @@ struct QtPreferencesPayload {
     /// Additive: absent means the opaque default.
     #[serde(default = "default_tray_notice_opacity_percent")]
     tray_notice_opacity_percent: u16,
-    reopen_last_section_on_startup: bool,
-    first_run_completed: bool,
+    #[serde(default)]
+    reopen_last_section_on_startup: Option<bool>,
+    #[serde(default)]
+    first_run_completed: Option<bool>,
     // EULA acceptance version. `#[serde(default)]` (→ 0 = not accepted) keeps
     // the round-trip backward-compatible with QML builds that don't emit the
     // key, matching the safe default (re-prompt the agreement).
     #[serde(default)]
     accepted_eula_version: u32,
-    theme_mode: String,
-    accessibility_high_contrast: bool,
-    font_scale_percent: u16,
-    system_font: String,
-    enhanced_focus: bool,
-    simplified_labels: bool,
-    tooltips_enabled: bool,
-    language: String,
-    route_primary_label: String,
-    route_secondary_label: String,
+    #[serde(default)]
+    theme_mode: Option<String>,
+    #[serde(default)]
+    accessibility_high_contrast: Option<bool>,
+    #[serde(default)]
+    font_scale_percent: Option<u16>,
+    #[serde(default)]
+    system_font: Option<String>,
+    #[serde(default)]
+    enhanced_focus: Option<bool>,
+    #[serde(default)]
+    simplified_labels: Option<bool>,
+    #[serde(default)]
+    tooltips_enabled: Option<bool>,
+    #[serde(default)]
+    language: Option<String>,
+    #[serde(default)]
+    route_primary_label: Option<String>,
+    #[serde(default)]
+    route_secondary_label: Option<String>,
     #[serde(default)]
     selected_primary_interface_id: String,
-    selected_primary_interface_name: String,
+    #[serde(default)]
+    selected_primary_interface_name: Option<String>,
     #[serde(default)]
     primary_role_user_confirmed: bool,
     #[serde(default)]
     selected_secondary_interface_id: String,
-    selected_secondary_interface_name: String,
+    #[serde(default)]
+    selected_secondary_interface_name: Option<String>,
     #[serde(default)]
     secondary_role_user_confirmed: bool,
-    route_behavior_mode: String,
-    // `#[serde(default)]` (→ false) keeps the round-trip backward-compatible
-    // with QML builds that don't emit the key, and matches the safe default
-    // (kill-switch off).
     #[serde(default)]
-    block_secondary_when_unavailable: bool,
+    route_behavior_mode: Option<String>,
     #[serde(default)]
     show_bluetooth_adapters: bool,
     // Security-audit viewing-tab display toggle. `#[serde(default)]` (→ false)
@@ -1594,6 +1312,10 @@ struct QtPreferencesPayload {
     // string is an honest "never dismissed" state.
     #[serde(default)]
     unenforced_apps_ack_sig: Option<String>,
+    // Overlap pairs kept by the user. `Option` so a payload that OMITS the
+    // key keeps the stored value; an explicit empty string clears the list.
+    #[serde(default)]
+    rules_overlap_keep_sig: Option<String>,
     // Confirmed VPN executable path. `Option` so a payload that OMITS the
     // key (older QML build) keeps the stored value; an explicit empty
     // string is an honest "not set" state.
@@ -1666,7 +1388,8 @@ struct QtPreferencesPayload {
     // older QML builds additive.
     #[serde(default)]
     service_intent_json: String,
-    last_opened_section: String,
+    #[serde(default)]
+    last_opened_section: Option<String>,
 
     // File-source state. Optional: an older QML build may not emit
     // these keys, so #[serde(default)] keeps the round-trip
@@ -1796,53 +1519,84 @@ impl QtPreferencesPayload {
     // values have been written through IPC.
     #[allow(deprecated)]
     fn apply_over(self, mut current: UiPreferences) -> UiPreferences {
-        current.launch_window_on_startup = self.launch_window_on_startup;
-        current.minimize_to_tray_instead_of_close = self.minimize_to_tray_instead_of_close;
-        current.show_notifications = self.show_notifications;
+        // Absent means "not reported", never "set it to the type default".
+        // These nineteen fields used to be mandatory, so one key missing from
+        // the QML payload failed the whole parse — and the launcher then wrote
+        // its start-up baseline back over the file. Making them defaultable
+        // without making them optional would have been worse: a forgotten key
+        // would silently reset the setting instead of failing loudly.
+        if let Some(v) = self.launch_window_on_startup {
+            current.launch_window_on_startup = v;
+        }
+        if let Some(v) = self.minimize_to_tray_instead_of_close {
+            current.minimize_to_tray_instead_of_close = v;
+        }
+        if let Some(v) = self.show_notifications {
+            current.show_notifications = v;
+        }
         current.notify_suggestion_changes = self.notify_suggestion_changes;
         current.notify_block_notices = self.notify_block_notices;
         current.hide_block_notice_addresses = self.hide_block_notice_addresses;
-        current.tray_notice_opacity_percent = self.tray_notice_opacity_percent.clamp(40, 100);
-        current.reopen_last_section_on_startup = self.reopen_last_section_on_startup;
-        current.first_run_completed = self.first_run_completed;
+        current.tray_notice_opacity_percent = self.tray_notice_opacity_percent.clamp(
+            nrr_ui_support::ui_preferences::TRAY_NOTICE_OPACITY_MIN_PERCENT,
+            nrr_ui_support::ui_preferences::TRAY_NOTICE_OPACITY_MAX_PERCENT,
+        );
+        if let Some(v) = self.reopen_last_section_on_startup {
+            current.reopen_last_section_on_startup = v;
+        }
+        if let Some(v) = self.first_run_completed {
+            current.first_run_completed = v;
+        }
         current.accepted_eula_version = self.accepted_eula_version;
 
-        current.theme_mode = self
-            .theme_mode
-            .parse::<ThemeMode>()
-            .unwrap_or(current.theme_mode);
-        if self.accessibility_high_contrast {
+        if let Some(mode) = self.theme_mode.as_deref() {
+            current.theme_mode = mode.parse::<ThemeMode>().unwrap_or(current.theme_mode);
+        }
+        if self.accessibility_high_contrast == Some(true) {
             current.theme_mode = ThemeMode::HighContrast;
         }
         current.accessibility_high_contrast = current.theme_mode == ThemeMode::HighContrast;
-        current.accessibility_ui_font_scale_percent = self.font_scale_percent.clamp(80, 300);
-        current.accessibility_system_font = self
-            .system_font
-            .parse::<SystemFontFamily>()
-            .unwrap_or(current.accessibility_system_font);
-        current.accessibility_enhanced_focus_indicator = self.enhanced_focus;
-        current.accessibility_simplified_labels = self.simplified_labels;
-        current.tooltips_enabled = self.tooltips_enabled;
-        if let Some(language_id) = canonicalize_language_id(&self.language) {
+        if let Some(scale) = self.font_scale_percent {
+            current.accessibility_ui_font_scale_percent = scale.clamp(80, 300);
+        }
+        if let Some(font) = self.system_font.as_deref() {
+            current.accessibility_system_font = font
+                .parse::<SystemFontFamily>()
+                .unwrap_or(current.accessibility_system_font);
+        }
+        if let Some(v) = self.enhanced_focus {
+            current.accessibility_enhanced_focus_indicator = v;
+        }
+        if let Some(v) = self.simplified_labels {
+            current.accessibility_simplified_labels = v;
+        }
+        if let Some(v) = self.tooltips_enabled {
+            current.tooltips_enabled = v;
+        }
+        if let Some(language_id) = self.language.as_deref().and_then(canonicalize_language_id) {
             current.language = language_id;
         }
-        if !self.route_primary_label.trim().is_empty() {
-            current.route_primary_label = self.route_primary_label;
+        if let Some(label) = self.route_primary_label.filter(|l| !l.trim().is_empty()) {
+            current.route_primary_label = label;
         }
-        if !self.route_secondary_label.trim().is_empty() {
-            current.route_secondary_label = self.route_secondary_label;
+        if let Some(label) = self.route_secondary_label.filter(|l| !l.trim().is_empty()) {
+            current.route_secondary_label = label;
         }
         current.selected_primary_interface_id = self.selected_primary_interface_id;
-        current.selected_primary_interface_name = self.selected_primary_interface_name;
+        if let Some(name) = self.selected_primary_interface_name {
+            current.selected_primary_interface_name = name;
+        }
         current.primary_role_user_confirmed = self.primary_role_user_confirmed;
         current.selected_secondary_interface_id = self.selected_secondary_interface_id;
-        current.selected_secondary_interface_name = self.selected_secondary_interface_name;
+        if let Some(name) = self.selected_secondary_interface_name {
+            current.selected_secondary_interface_name = name;
+        }
         current.secondary_role_user_confirmed = self.secondary_role_user_confirmed;
-        current.route_behavior_mode = self
-            .route_behavior_mode
-            .parse::<RouteBehaviorMode>()
-            .unwrap_or(current.route_behavior_mode);
-        current.block_secondary_traffic_when_unavailable = self.block_secondary_when_unavailable;
+        if let Some(mode) = self.route_behavior_mode.as_deref() {
+            current.route_behavior_mode = mode
+                .parse::<RouteBehaviorMode>()
+                .unwrap_or(current.route_behavior_mode);
+        }
         // Policy-toggle mirrors. An empty shared-IP slug means the QML
         // build did not emit it (older payload) — keep the current value
         // rather than blanking it.
@@ -2000,6 +1754,13 @@ impl QtPreferencesPayload {
                 current.unenforced_apps_ack_signature = sig;
             }
         }
+        // Same shape as the signature above: single line only, absent key
+        // keeps what is stored.
+        if let Some(sig) = self.rules_overlap_keep_sig {
+            if !sig.contains(['\n', '\r']) {
+                current.rules_overlap_keep_signature = sig;
+            }
+        }
         // Key present → take the value (single line only, so the
         // line-oriented prefs file stays intact); key absent (older QML) →
         // keep stored.
@@ -2015,10 +1776,11 @@ impl QtPreferencesPayload {
                 current.confirmed_vpn_exe_paths = paths;
             }
         }
-        current.last_opened_section = self
-            .last_opened_section
-            .parse::<AppSection>()
-            .unwrap_or(current.last_opened_section);
+        if let Some(section) = self.last_opened_section.as_deref() {
+            current.last_opened_section = section
+                .parse::<AppSection>()
+                .unwrap_or(current.last_opened_section);
+        }
 
         // Carry through the eight file-source-state fields verbatim.
         // Empty-string round-trips through `parse_optional_string` as
@@ -2072,7 +1834,7 @@ impl QtPreferencesPayload {
 /// Maps a [`BackendConnectionStatus`] to the kebab-case JSON shape
 /// consumed by `Main.qml`'s connection banner. Shape:
 ///
-/// - `kind = "connected" | "connecting" | "disconnected" | "service-stopped" | "service-not-installed" | "protocol-mismatch"`
+/// - `kind = "connected" | "connecting" | "disconnected" | "service-stopped" | "service-not-installed" | "protocol-mismatch" | "refused"`
 /// - `lastError` is present when `kind == "disconnected"`
 /// - `serverVersion` / `clientVersion` are present when `kind == "protocol-mismatch"`
 fn backend_connection_status_to_payload(status: &BackendConnectionStatus) -> serde_json::Value {
@@ -2094,6 +1856,9 @@ fn backend_connection_status_to_payload(status: &BackendConnectionStatus) -> ser
             "serverVersion": server_version,
             "clientVersion": client_version,
         }),
+        BackendConnectionStatus::Refused { reason } => {
+            json!({"kind": "refused", "lastError": reason})
+        }
     }
 }
 

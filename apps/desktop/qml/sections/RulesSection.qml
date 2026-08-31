@@ -100,7 +100,7 @@ ColumnLayout {
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             section.mainRouteCheckBusy = false
             if (!ok) {
-                root.statusLine = String(msg || code || "")
+                root.statusLine = root.ipcErrorLabel(code)
                 return
             }
             var accepted = Number((payload || {}).accepted || 0)
@@ -200,7 +200,10 @@ ColumnLayout {
     onFilterRouteChanged:   scheduleRebuild()
     onFilterAutoAddedOnlyChanged: scheduleRebuild()
     onSearchTextChanged:    scheduleRebuild()
-    Component.onCompleted:  rebuildDisplay()
+    Component.onCompleted: {
+        rebuildDisplay()
+        if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
+    }
     Connections {
         target: root ? root.rulesModel : null
         // External row add/remove/reset (snapshot bind, preset import, clear).
@@ -225,7 +228,10 @@ ColumnLayout {
         // value change, but the boolean condition here is the belt to that
         // suspenders).
         function onRulesBulkLoadingChanged() {
-            if (root && root.rulesBulkLoading === false) section.rebuildDisplay()
+            if (root && root.rulesBulkLoading === false) {
+                section.rebuildDisplay()
+                if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
+            }
         }
         // A set was written into the folder from Settings. The folder PATH is
         // unchanged, so `onPresetsSourceDirChanged` below stays silent and the
@@ -240,7 +246,11 @@ ColumnLayout {
     // in Explorer), and nothing signals that. Re-enumerating whenever the user
     // comes back to this screen is cheap and covers it.
     onVisibleChanged: {
-        if (!visible || !section._presetRowReady) return
+        if (!visible) return
+        // Cheap local pass; the count drives the "Remove covered rules" button,
+        // so it has to reflect the table the user is looking at right now.
+        if (typeof root.refreshRulesOverlaps === "function") root.refreshRulesOverlaps()
+        if (!section._presetRowReady) return
         section._refreshBundledPresetSelection()
     }
 
@@ -682,14 +692,14 @@ ColumnLayout {
     // Source-file info. Shows the full path of the preset file(s) the current
     // rules are bound to, with a button to open the containing folder in
     // Explorer (handy for testing / locating presets).
-    // The path the current rules CAME FROM, per route — resolved by the
-    // window's `rulesSourcePathFor`, the same call the cold-start hydration
-    // makes, so the path shown here is always the path that gets loaded. The
+    // The rules file behind `route` — resolved by the window's
+    // `rulesSourcePathFor`, the same call the cold-start hydration makes, so
+    // the path shown here is always the path that gets loaded. The
     // `uiRevision >= 0` term re-evaluates it on every prefs write (picking a
     // rule-set folder in Settings repoints this row without a restart).
     function _sourcePathFor(route) {
         return root.uiRevision >= 0
-            ? String(root.rulesSourceDisplayPathFor(route) || "") : ""
+            ? String(root.rulesSourcePathFor(route) || "") : ""
     }
 
     // Administrator lock notice. Deliberately calm and explanatory rather than
@@ -744,13 +754,19 @@ ColumnLayout {
         // It is deliberately NOT gated on the table
         // being populated: the binding is exactly what the user needs to see
         // while the table is still empty (service not up yet, rules about to
-        // be hydrated from these very files). Bundled-tree paths render here
-        // too — the factory-path filter guards SAVE targets only, never the
-        // source display.
+        // be hydrated from these very files).
         visible: section._sourcePathFor("primary") !== ""
             || section._sourcePathFor("secondary") !== ""
         Label {
-            text: root.uiRevision >= 0 ? root.tr("rules.source.label", "Source:") : ""
+            // Two claims, one row. "Source:" only where the user's own load or
+            // save put the file on record; otherwise the row names the set the
+            // quick-load points at, which is not where the rules on screen came
+            // from (those come from the service).
+            text: root.uiRevision >= 0
+                ? (root.rulesSourceIsUserBound()
+                    ? root.tr("rules.source.label", "Source:")
+                    : root.tr("rules.source.set-label", "Rule set:"))
+                : ""
             color: root.mutedTextColor
             verticalAlignment: Text.AlignVCenter
         }
@@ -1036,6 +1052,26 @@ ColumnLayout {
             Accessible.name: text
             Accessible.description: ToolTip.text
             onClicked: section._checkMainRoute()
+        }
+        ThemedButton {
+            theme: root.uiTheme
+            Layout.fillWidth: true
+            visible: root.rulesOverlapActionableCount > 0 && !section.rulesLocked
+            text: root.tr("rules.action.clean-overlaps", "Remove covered rules ({n})")
+                .replace("{n}", String(root.rulesOverlapActionableCount))
+            icon.source: root.uiIconSource("delete")
+            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+            ToolTip.text: root.tr("rules.action.clean-overlaps-tooltip",
+                "Some rules name a host one of your wildcard rules already covers. Review them and drop the spare ones.")
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            Accessible.description: ToolTip.text
+            onClicked: {
+                // Re-read before showing: the table may have changed since the
+                // count was last computed.
+                root.refreshRulesOverlaps()
+                root.rulesOverlapCleanupDialog.open()
+            }
         }
         ThemedButton {
             theme: root.uiTheme
@@ -1938,24 +1974,6 @@ ColumnLayout {
                 leftPadding: autoAddedFilterCheck.indicator.width + autoAddedFilterCheck.spacing
                 verticalAlignment: Text.AlignVCenter
             }
-        }
-
-        // Addresses the service is offering but nobody has answered yet. Lives
-        // next to the auto-added filter because both are about rules this app
-        // proposed rather than rules the user wrote.
-        ThemedButton {
-            theme: root.uiTheme
-            visible: root.autoRuleCandidatesPending > 0
-            text: root.uiRevision >= 0
-                ? root.tr("rules.suggestions.chip", "Suggested addresses ({count})")
-                    .replace("{count}", String(root.autoRuleCandidatesPending))
-                : ""
-            icon.source: root.uiIconSource("add")
-            Accessible.role: Accessible.Button
-            Accessible.name: text
-            Accessible.description: root.tr("rules.suggestions.chip-description",
-                "Review addresses the service suggests adding to your rules.")
-            onClicked: root.openAutoRuleSuggestions()
         }
     }
 

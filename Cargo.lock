@@ -846,7 +846,6 @@ dependencies = [
  "nrr-shared",
  "nrr-ui-support",
  "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -876,17 +875,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrr-core"
-version = "0.1.0-prealpha"
-dependencies = [
- "nrr-application",
- "nrr-mock-backend",
- "nrr-platform-windows",
- "nrr-shared",
- "nrr-ui-support",
-]
-
-[[package]]
 name = "nrr-desktop-gui"
 version = "0.1.0-prealpha"
 dependencies = [
@@ -904,6 +892,7 @@ name = "nrr-desktop-tray"
 version = "0.1.0-prealpha"
 dependencies = [
  "nrr-application",
+ "nrr-platform-api",
  "nrr-shared",
  "nrr-ui-support",
  "serde",
@@ -982,7 +971,6 @@ version = "0.1.0-prealpha"
 dependencies = [
  "nrr-diagnostics",
  "nrr-domain",
- "nrr-ipc-client",
  "nrr-platform-api",
  "nrr-platform-linux",
  "nrr-service-runtime",
@@ -1061,7 +1049,7 @@ name = "nrr-service-runtime"
 version = "0.1.0-prealpha"
 dependencies = [
  "base64",
- "nrr-application",
+ "getrandom 0.3.4",
  "nrr-diagnostics",
  "nrr-domain",
  "nrr-platform-api",
@@ -1115,6 +1103,7 @@ dependencies = [
 name = "nrr-ui-support"
 version = "0.1.0-prealpha"
 dependencies = [
+ "nrr-platform-api",
  "nrr-shared",
  "tempfile",
 ]
@@ -1124,10 +1113,8 @@ name = "nrr-windows-service"
 version = "0.1.0-prealpha"
 dependencies = [
  "embed-resource",
- "nrr-application",
  "nrr-diagnostics",
  "nrr-domain",
- "nrr-ipc-client",
  "nrr-platform-api",
  "nrr-platform-windows",
  "nrr-service-runtime",

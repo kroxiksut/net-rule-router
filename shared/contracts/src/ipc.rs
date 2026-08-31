@@ -210,9 +210,10 @@ pub enum IpcOperationName {
     /// Read the shared DoH/DoT resolver baseline list (the
     /// machine-wide `doh_resolver_entries`). Query, GUI+tray readable.
     DohResolversGet,
-    /// Replace the shared DoH/DoT resolver baseline list. The list
-    /// is machine-wide (not per-SID), so this is a privileged write (elevation) —
-    /// `requires_service_mutation_privilege`.
+    /// Replace the shared DoH/DoT resolver baseline list. The list is
+    /// machine-wide (not per-SID), so a CHANGE needs an administrator — checked
+    /// by value in the handler, because a settings page saves the whole list
+    /// back whether or not the user touched it.
     DohResolversSet,
     /// OPT-IN — read the caller's browser history, resolve the
     /// rule-matching hostnames, and cache them (closes the "visited before the
@@ -629,7 +630,22 @@ pub struct IpcOperationSpec {
     pub name: IpcOperationName,
     pub class: IpcInteractionClass,
     pub execution: IpcExecutionModel,
+    /// Which client surfaces may invoke this operation at all. Enforced by the
+    /// dispatcher next to the class check — it used to be a note nobody read,
+    /// so "GUI only" on two dozen operations meant nothing and the tray could
+    /// call every one of them.
     pub allowed_clients: &'static [IpcClientProfile],
+    /// Declares that this operation writes state the whole service shares, so
+    /// some gate must stand in front of it.
+    ///
+    /// It is a DECLARATION, not the gate: nothing reads this field at runtime.
+    /// Two mechanisms do the actual refusing — the envelope class
+    /// (`IpcOperationClass::requires_elevation`), and a by-value check inside the
+    /// handler (`machine_scoped_write_allowed`, which lets an unelevated caller
+    /// save an unchanged row and demands rights only for a real change).
+    /// `acceptance_block16::every_privileged_operation_is_actually_gated` binds
+    /// the declaration to one of the two, so a carrier with no gate fails the
+    /// build instead of shipping. Do not cite this field as the gate itself.
     pub requires_service_mutation_privilege: bool,
 }
 
@@ -682,11 +698,14 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         allowed_clients: &CLIENTS_GUI_AND_TRAY,
         requires_service_mutation_privilege: false,
     },
+    // The tray lives on push events — it is how it shows service state
+    // without polling. Marked GUI-only while nothing enforced the field;
+    // enforcing it as written would have silenced the tray.
     IpcOperationSpec {
         name: IpcOperationName::StatusUpdatesSubscribe,
         class: IpcInteractionClass::EventUpdate,
         execution: IpcExecutionModel::AsyncAccepted,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TRAY,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -837,7 +856,9 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
     },
     IpcOperationSpec {
         name: IpcOperationName::LogRetentionConfigSet,
-        // Service-global policy — admin gate enforced by the pipe identity.
+        // Service-global policy; a CHANGE is refused in the handler unless the
+        // caller is elevated. Pipe identity decides WHICH process may ask, never
+        // whether it may change this.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_ONLY,
@@ -1023,7 +1044,8 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
     },
     IpcOperationSpec {
         name: IpcOperationName::TrafficStatsSet,
-        // Service-global settings — admin gate enforced by the pipe identity.
+        // Accounting is machine-wide, so a CHANGE is refused in the handler unless
+        // the caller is elevated; saving the row back untouched always passes.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_ONLY,
@@ -1031,7 +1053,8 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
     },
     IpcOperationSpec {
         name: IpcOperationName::TrafficStatsClear,
-        // Service-global reset — admin gate enforced by the pipe identity.
+        // Erases what the whole machine did, so the CLASS refuses an unelevated
+        // caller outright — there is no unchanged-save case for a wipe.
         class: IpcInteractionClass::Command,
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_ONLY,
@@ -1055,11 +1078,12 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         requires_service_mutation_privilege: false,
     },
     // ── Local networks under the kill-switch ───────────────────
+    // Read-only, and the tray offers the local-network question.
     IpcOperationSpec {
         name: IpcOperationName::LocalNetworksGet,
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_ONLY,
+        allowed_clients: &CLIENTS_GUI_AND_TRAY,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -1408,6 +1432,11 @@ pub fn ipc_operation_catalog() -> &'static [IpcOperationSpec] {
     &IPC_OPERATION_CATALOG
 }
 
+/// The catalogue entry for one operation, or `None` when the slug is unknown.
+pub fn ipc_operation_spec(name: IpcOperationName) -> Option<&'static IpcOperationSpec> {
+    IPC_OPERATION_CATALOG.iter().find(|spec| spec.name == name)
+}
+
 pub fn ipc_lifecycle_stages() -> &'static [IpcLifecycleStage] {
     &IPC_LIFECYCLE_STAGES
 }
@@ -1446,14 +1475,29 @@ mod tests {
 
     #[test]
     fn gui_and_tray_profiles_have_different_capabilities() {
+        // The distinction is real and enforced (see the dispatcher's
+        // `allowed_clients` check): there are operations only the window may
+        // invoke. Pinned as a PROPERTY of the catalogue rather than to one
+        // operation — pinning `StatusUpdatesSubscribe` said the tray may not
+        // subscribe to push events, which is how the tray works, and the field
+        // was not enforced at the time so nothing contradicted it.
         let catalog = ipc_operation_catalog();
-        let tray_subscribe = catalog.iter().find(|item| {
-            item.name == IpcOperationName::StatusUpdatesSubscribe
-                && item
+        let gui_only: Vec<_> = catalog
+            .iter()
+            .filter(|item| {
+                !item
                     .allowed_clients
                     .contains(&IpcClientProfile::TrayLightweight)
-        });
-        assert!(tray_subscribe.is_none());
+            })
+            .collect();
+        assert!(
+            !gui_only.is_empty(),
+            "the tray is meant to be the narrower surface"
+        );
+        // Every one of them still admits the window.
+        assert!(gui_only.iter().all(|item| item
+            .allowed_clients
+            .contains(&IpcClientProfile::GuiInteractive)));
     }
 
     #[test]

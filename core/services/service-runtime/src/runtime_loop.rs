@@ -247,6 +247,16 @@ impl TaskFailureSink for CountingFailureSink {
     }
 }
 
+/// What a caught panic said, as far as it can be recovered.
+fn panic_message(payload: &dyn std::any::Any) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned());
+    format!("task panicked: {detail}")
+}
+
 // ── Supervisor ───────────────────────────────────────────────────────────────
 
 /// Owns thread handles for every running task plus the shared
@@ -297,7 +307,21 @@ impl ServiceSupervisor {
             .spawn(move || {
                 let mut attempt: u8 = 0;
                 while !stop.is_stop_requested() {
-                    let outcome = (task.tick)(&stop);
+                    // A panic in a tick is a task failure like any other. Left
+                    // uncaught it killed the thread in silence: no
+                    // `task_failed`, no fatal report, health still `Ok`, and
+                    // `shutdown()` counted the corpse among the clean exits.
+                    // `AssertUnwindSafe` is the honest label — the task's state
+                    // may be inconsistent after a panic, which is exactly why
+                    // the outcome is `Failed` and the class decides whether it
+                    // restarts.
+                    let outcome =
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            (task.tick)(&stop)
+                        })) {
+                            Ok(outcome) => outcome,
+                            Err(payload) => TaskOutcome::Failed(panic_message(payload.as_ref())),
+                        };
                     match outcome {
                         TaskOutcome::Continue => {
                             attempt = 0;
@@ -484,6 +508,47 @@ mod tests {
         assert_eq!(report.total, 1);
         assert!(report.clean >= 1, "report = {report:?}");
         assert!(counter.load(Ordering::SeqCst) >= 3);
+    }
+
+    #[test]
+    fn a_panicking_tick_is_reported_and_torn_down_like_any_other_failure() {
+        // The silent version of this bug: thread gone, sink untouched, health
+        // still Ok, and shutdown counting the dead thread as a clean exit.
+        let stop = StopToken::new();
+        let sink = counting_sink();
+        let supervisor =
+            ServiceSupervisor::new(stop.clone(), sink.clone() as Arc<dyn TaskFailureSink>);
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let stopped_hook = Arc::clone(&stopped);
+        let mut task = ServiceTask::periodic(
+            "panicker",
+            TaskClass::Critical,
+            Duration::from_millis(5),
+            1,
+            |_stop| panic!("tick blew up"),
+        );
+        task.on_stop = Some(Box::new(move || {
+            stopped_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+        supervisor.spawn(task).expect("spawn");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.fatal.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(sink.failures.load(Ordering::SeqCst), 1, "failure reported");
+        assert_eq!(
+            sink.fatal.load(Ordering::SeqCst),
+            1,
+            "a critical task that panicked is terminated fatally"
+        );
+        let report = supervisor.shutdown();
+        assert_eq!(report.total, 1);
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            1,
+            "teardown must run on the panic path too"
+        );
     }
 
     #[test]

@@ -54,13 +54,25 @@ use nrr_shared::RouteRole;
 // above both.
 const BASE_PRIMARY: u64 = 0x0020_0000;
 const BASE_SECONDARY: u64 = 0x0010_0000;
-const BASE_BLOCK: u64 = 0x0060_0000;
+// A band of its own, ABOVE the app exemptions: both used to sit on
+// `0x0060_0000`, and all of these filters live on one ALE layer in one
+// sub-layer, where the highest weight wins. A user's explicit Block and the
+// kill-switch's primary-app exemption arbitrating by accident is not a trade-off
+// anyone chose — and `CLEAR_ACTION_RIGHT` does not settle it, since it defends a
+// Block against OTHER sub-layers, not against our own higher-weighted permit.
+const BASE_BLOCK: u64 = 0x0070_0000;
 // Kill-switch bands, mirrored from `killswitch_codegen`: the egress-conditional
 // permit sits above its unconditional block (both above the route-rule bands),
 // so "permit only while egressing the secondary adapter, else block" arbitrates
 // correctly.
 const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
 const KILLSWITCH_BLOCK_BASE: u64 = 0x0030_0000;
+// Per-APP kill-switch / fail-closed block band, mirrored from
+// `killswitch_codegen::APP_KILLSWITCH_BLOCK_BASE`. Like the catch-all, it sits
+// BETWEEN the secondary and primary rule bands: a primary rule's own permit
+// outranks it, so every main-named address keeps working for a pinned app —
+// uncapped, replacing the 64-entry per-(app, address) rescue permits.
+const APP_KILLSWITCH_BLOCK_BASE: u64 = 0x001C_0000;
 // DoH/DoT lockdown band, mirrored from `killswitch_codegen::DOH_BLOCK_BASE`.
 // Between the primary rule band (`0x0020_0000`) and the kill-switch block
 // band (`0x0030_0000`).
@@ -92,6 +104,21 @@ const APP_EXEMPT_BASE: u64 = 0x0060_0000;
 // `wfp_codegen::DEFAULT_BLOCK_WEIGHT`. Below every per-rule band so a rule-driven
 // `Permit` always wins over the StrictSecondaryFailClosed default block.
 const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
+
+// Compile-time guard over the mirrored bands: the ordering above is the whole
+// point of mirroring them, and two bands sharing a base silently lose it.
+const _: () = {
+    assert!(BASE_BLOCK > APP_EXEMPT_BASE);
+    assert!(APP_EXEMPT_BASE > CATCHALL_EXEMPT_BASE);
+    assert!(CATCHALL_EXEMPT_BASE > KILLSWITCH_PERMIT_BASE);
+    assert!(KILLSWITCH_PERMIT_BASE > KILLSWITCH_BLOCK_BASE);
+    assert!(KILLSWITCH_BLOCK_BASE > DOH_BLOCK_BASE);
+    assert!(DOH_BLOCK_BASE > BASE_PRIMARY);
+    assert!(BASE_PRIMARY > APP_KILLSWITCH_BLOCK_BASE);
+    assert!(APP_KILLSWITCH_BLOCK_BASE > CATCHALL_BLOCK_WEIGHT);
+    assert!(CATCHALL_BLOCK_WEIGHT > BASE_SECONDARY);
+    assert!(BASE_SECONDARY > DEFAULT_BLOCK_WEIGHT);
+};
 
 /// Lower the address-match route rules of `plan` to WFP filters.
 ///
@@ -165,7 +192,11 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
                             KILLSWITCH_PERMIT_BASE + ord,
                             user_sid.clone(),
                         ));
-                        out.push(ale_app_block(pat, KILLSWITCH_BLOCK_BASE + ord, user_sid));
+                        out.push(ale_app_block(
+                            pat,
+                            APP_KILLSWITCH_BLOCK_BASE + ord,
+                            user_sid,
+                        ));
                     }
                     // 4a — ALE per-destination egress-conditional pair (proto-agnostic).
                     (
@@ -219,7 +250,11 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
                 match (flow.coverage, flow.flow.dst, app.as_deref()) {
                     // per-app ALE block (proto-agnostic).
                     (Coverage::ConnectOnly, DstMatch::Any, Some(pat)) => {
-                        out.push(ale_app_block(pat, KILLSWITCH_BLOCK_BASE + ord, user_sid));
+                        out.push(ale_app_block(
+                            pat,
+                            APP_KILLSWITCH_BLOCK_BASE + ord,
+                            user_sid,
+                        ));
                     }
                     // per-destination ALE block (narrowed to the ALE protocol).
                     (Coverage::ConnectOnly, DstMatch::HostV4(ip), None) => {

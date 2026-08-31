@@ -9,32 +9,28 @@ ae                   # ОАЭ / United Arab Emirates (.ae)
 امارات                # ОАЭ (.امارات, Punycode xn--mgbaam7a8h)
 
 --- Domains
-# UAE telecom and government/public services
-*.etisalat.ae
-*.du.ae
-*.google.com
-*.tdra.gov.ae
-*.u.ae
-*.gov.ae
+*.etisalat.ae  # UAE telecom and government/public services
+*.du.ae  # UAE telecom and government/public services
+*.google.com  # UAE telecom and government/public services
+*.tdra.gov.ae  # UAE telecom and government/public services
+*.u.ae  # UAE telecom and government/public services
+*.gov.ae  # UAE telecom and government/public services
 
-# UAE banking and commerce examples
-*.emiratesnbd.com
-*.adcb.com
-*.fab.ae
-*.careem.com
-*.noon.com
+*.emiratesnbd.com  # UAE banking and commerce examples
+*.adcb.com  # UAE banking and commerce examples
+*.fab.ae  # UAE banking and commerce examples
+*.careem.com  # UAE banking and commerce examples
+*.noon.com  # UAE banking and commerce examples
 
-# Regional and local media/services often expected on direct route
-*.bayut.com
-*.dubizzle.com
+*.bayut.com  # Regional and local media/services often expected on direct route
+*.dubizzle.com  # Regional and local media/services often expected on direct route
 
 --- IP
 # Intentionally left empty: do not pin DNS resolver IPs in presets
 
 --- Windows
-# Local/region-oriented desktop apps (examples)
-careem*.exe
-noon*.exe
+careem*.exe  # Local/region-oriented desktop apps (examples)
+noon*.exe  # Local/region-oriented desktop apps (examples)
 
 --- Linux
 # (reserved - not applied on Windows)

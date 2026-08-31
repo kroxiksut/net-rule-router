@@ -32,14 +32,36 @@
 //!   helper still calls `MigrationMarkComplete` so subsequent starts
 //!   short-circuit at step 1.
 //!
-//! ## Wiring status
+//! ## Wiring status — DO NOT WIRE THIS YET
 //!
-//! The helper is library-grade (no I/O outside the injected
-//! `IpcClient`) and unit-tested with a fake client. The production call
-//! from `launcher::run_primary` is not yet wired in; once the IPC client
-//! is available past launcher startup, call
-//! `run_legacy_preferences_migration` between
-//! `load_preferences_with_fallback` and `emit_context`.
+//! The helper is library-grade (no I/O outside the injected `IpcClient`) and
+//! unit-tested with a fake client. It has no production caller, and wiring one
+//! in today would break the GUI rather than finish a migration.
+//!
+//! This section used to say the opposite — "call it between
+//! `load_preferences_with_fallback` and `emit_context`" — and following that
+//! instruction is the failure. What it zeroes is not leftover legacy data: the
+//! eight fields it cleans up (`selected_{primary,secondary}_interface_{id,name}`,
+//! both `*_role_user_confirmed`, `route_behavior_mode`) are the GUI's ONLY live
+//! store of adapter bindings. `InterfacesRolesController.qml` writes them,
+//! `RoutePolicyController.qml` reads them, and the authoritative
+//! `route.policy.update` is built out of what it read. There is no path
+//! anywhere that seeds them back from `SnapshotInitial.routePolicy`.
+//!
+//! So the minute this runs, the interfaces screen goes blank,
+//! `_attemptRouteBindingResync` takes its early exit on
+//! `prefsHasBinding === false`, and the service keeps enforcing bindings the
+//! user can no longer see or overwrite.
+//!
+//! The order of work is therefore the reverse of what this comment used to
+//! imply:
+//!   1. FIRST teach the GUI to seed those prefs back from the service snapshot;
+//!   2. only THEN call this helper, whose job is to move the last machines off
+//!      the legacy fields.
+//!
+//! The `#[deprecated]` markers on those fields point the same way and are just
+//! as premature — every consumer silences them with `#[allow(deprecated)]`, so
+//! they warn nobody and mislead whoever reads them.
 
 use std::time::Duration;
 
@@ -200,7 +222,10 @@ fn push_route_policy<C: IpcClient + ?Sized>(
             prefs.secondary_role_user_confirmed,
         ),
         mode: behavior_mode_to_dto(prefs.route_behavior_mode),
-        block_secondary_when_unavailable: prefs.block_secondary_traffic_when_unavailable,
+        // No legacy pref any more: the mirror this used to read was a
+        // device-local copy of a per-SID setting that nothing consumed, and it
+        // is gone. Migrate to the safe default; Routing settings owns it.
+        block_secondary_when_unavailable: false,
         // No legacy pref for the failure posture — migrate to the safe
         // default (fail-closed). The user can switch it in Routing settings.
         kill_switch_fail_closed: true,
@@ -247,6 +272,10 @@ fn push_route_policy<C: IpcClient + ?Sized>(
         primary_probe_max_targets: 8,
         primary_probe_repeat_secs: 300,
         block_ipv6_when_protected: true,
+        local_networks_auto_accept: false,
+        // Tier-3 order: no legacy pref, and the documented default is that the
+        // more specific address wins.
+        zone_priority_over_ip: false,
     };
     let payload = serde_json::to_value(&req).map_err(|e| StageError {
         stage: FailureStage::PolicyUpdate,
@@ -411,7 +440,6 @@ mod tests {
             selected_secondary_interface_name: "OpenVPN TAP".into(),
             secondary_role_user_confirmed: false,
             route_behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            block_secondary_traffic_when_unavailable: true,
             ..Default::default()
         }
     }
@@ -486,6 +514,8 @@ mod tests {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
         };
         let mark = MigrationMarkCompleteResponse {
             recorded: true,
@@ -533,7 +563,9 @@ mod tests {
         assert_eq!(parsed.primary.unwrap().stable_id, "Wi-Fi");
         assert_eq!(parsed.secondary.unwrap().stable_id, "TAP");
         assert_eq!(parsed.mode, BehaviorModeDto::PreferSecondaryWhenAvailable);
-        assert!(parsed.block_secondary_when_unavailable);
+        // The device-local mirror of this per-SID setting is gone; the
+        // migration sends the safe default and Routing settings owns it.
+        assert!(!parsed.block_secondary_when_unavailable);
     }
 
     #[test]

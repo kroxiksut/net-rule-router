@@ -19,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
 use windows::Win32::System::Services::{
     OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
     SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING,
@@ -97,12 +98,28 @@ pub fn probe() -> ServiceProbe {
     }
 }
 
+/// The Win32 code behind a windows-rs error.
+///
+/// `Error::code()` is an HRESULT, and windows-rs wraps Win32 failures with
+/// `HRESULT::from_win32` — `ERROR_SERVICE_DOES_NOT_EXIST` (1060) arrives as
+/// `0x80070424`. Comparing the raw HRESULT with the Win32 number reads
+/// correctly and never matches, which is how "service not installed" stayed
+/// unreachable. Unwrap the FACILITY_WIN32 form here, once, for every caller.
+fn win32_code(err: &windows::core::Error) -> u32 {
+    let hr = err.code().0 as u32;
+    if hr & 0xFFFF_0000 == 0x8007_0000 {
+        hr & 0xFFFF
+    } else {
+        hr
+    }
+}
+
 /// Open SCM for read-only queries. No admin needed.
 fn open_scm_for_query() -> Result<SC_HANDLE, u32> {
     // SAFETY: passing nulls for machine name and database name targets
     // local SCM with the default database; access flag is read-only.
     unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-        .map_err(|e| e.code().0 as u32)
+        .map_err(|e| win32_code(&e))
 }
 
 enum OpenSvcResult {
@@ -122,9 +139,8 @@ fn open_service_for_query(scm: SC_HANDLE) -> OpenSvcResult {
     match result {
         Ok(h) => OpenSvcResult::Ok(h),
         Err(e) => {
-            let code = e.code().0 as u32;
-            // ERROR_SERVICE_DOES_NOT_EXIST = 1060
-            if code == 1060 {
+            let code = win32_code(&e);
+            if code == ERROR_SERVICE_DOES_NOT_EXIST.0 {
                 OpenSvcResult::NotFound
             } else {
                 OpenSvcResult::OtherError(code)
@@ -154,6 +170,22 @@ impl Drop for ScHandleGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_win32_failure_wrapped_in_an_hresult_reads_back_as_its_win32_code() {
+        // What windows-rs actually hands us for a missing service.
+        let wrapped =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8007_0424_u32 as i32));
+        assert_eq!(win32_code(&wrapped), ERROR_SERVICE_DOES_NOT_EXIST.0);
+    }
+
+    #[test]
+    fn an_hresult_that_is_not_a_wrapped_win32_code_passes_through() {
+        // E_NOINTERFACE — facility ITF, nothing to unwrap.
+        let other =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_4002_u32 as i32));
+        assert_eq!(win32_code(&other), 0x8000_4002);
+    }
 
     #[test]
     fn probe_returns_some_variant() {

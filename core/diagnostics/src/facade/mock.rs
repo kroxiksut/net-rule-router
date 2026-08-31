@@ -18,9 +18,9 @@ use crate::error::{DiagnosticsError, DiagnosticsResult};
 use crate::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use crate::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
-    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
-    SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
+    ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use crate::facade::pagination::{PageResult, PaginationParams};
 use crate::facade::service::DiagnosticsFacade;
@@ -97,7 +97,7 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
 
     fn acknowledge_alert(&self, req: &AcknowledgeAlertRequest) -> DiagnosticsResult<()> {
         if req.alert_id.is_empty() {
-            return Err(DiagnosticsError::AuditWriteFailed {
+            return Err(DiagnosticsError::InvalidArgument {
                 reason: "alert_id must not be empty".into(),
             });
         }
@@ -173,6 +173,8 @@ fn healthy_status() -> DiagnosticsStatusDto {
         },
         diagnostic_mode: DiagnosticModeStateDto::inactive(),
         stale: false,
+        // Canned content: never let it read as a verdict about this machine.
+        origin: DiagnosticsDataOrigin::Preview,
     }
 }
 
@@ -236,6 +238,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             category: "service".into(),
             kind: "service.started".into(),
             message_key: "diag.service.started.summary".into(),
+            message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
         },
@@ -246,6 +249,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             category: "apply".into(),
             kind: "apply.completed".into(),
             message_key: "diag.apply.completed.summary".into(),
+            message: String::new(),
             has_payload: false,
             correlation_summary: vec!["rev-preview-001".into()],
         },
@@ -258,6 +262,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             category: "decision".into(),
             kind: "decision.fail_closed".into(),
             message_key: "diag.decision.fail_closed.summary".into(),
+            message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
         });

@@ -250,6 +250,10 @@ impl ExternalAddressAnnouncer {
                 entry.since = now;
                 entry.probed = false;
                 entry.attempts = 0;
+                // Whatever probe is still in the air belongs to the previous
+                // incarnation and will be discarded on arrival; leaving the
+                // flag set would keep this one from ever being probed.
+                entry.in_flight = false;
                 continue;
             }
             if entry.probed || entry.in_flight || entry.attempts >= MAX_PROBE_ATTEMPTS {
@@ -290,6 +294,14 @@ impl ExternalAddressAnnouncer {
         let Some(entry) = state.get_mut(&link.sid) else {
             return AnnounceOutcome::Stale;
         };
+        // The answer must belong to the incarnation that asked. A link that
+        // re-connected while its probe was in the air has a different identity
+        // now, and publishing the old exit as the current one is worse than
+        // publishing nothing — the flag is left alone because it belongs to the
+        // probe of the new incarnation, not to this one.
+        if entry.identity != Some(link.identity()) {
+            return AnnounceOutcome::Stale;
+        }
         entry.in_flight = false;
 
         let Some(address) = observed else {
@@ -334,11 +346,14 @@ impl ExternalAddressAnnouncer {
             "external address of the additional route observed after it connected — telling the user",
         );
         if let Some(bus) = self.events.as_ref() {
-            bus.publish(StatusUpdateEvent::SecondaryExternalAddressObserved {
-                sid: link.sid.clone(),
-                adapter_name: link.adapter_name.clone(),
-                external_address: address.to_string(),
-            });
+            bus.publish_for(
+                link.sid.clone(),
+                StatusUpdateEvent::SecondaryExternalAddressObserved {
+                    sid: link.sid.clone(),
+                    adapter_name: link.adapter_name.clone(),
+                    external_address: address.to_string(),
+                },
+            );
         }
         AnnounceOutcome::Announced
     }
@@ -603,9 +618,29 @@ mod tests {
     }
 
     #[test]
-    fn a_re_ip_while_a_probe_is_out_does_not_double_probe() {
+    fn one_probe_per_incarnation_stays_in_the_air() {
         // The worker is detached, so the state machine — not a join — is what
-        // keeps one probe per principal in the air.
+        // keeps a settled link from being probed twice over.
+        let a = announcer();
+        let t0 = Instant::now();
+        let only = link(7, [10, 88, 1, 41]);
+        a.observe(std::slice::from_ref(&only), t0);
+        assert_eq!(
+            a.observe(std::slice::from_ref(&only), t0 + LINK_SETTLE),
+            vec![only.clone()]
+        );
+        assert!(
+            a.observe(std::slice::from_ref(&only), t0 + LINK_SETTLE * 2)
+                .is_empty(),
+            "the probe of this incarnation has not reported yet"
+        );
+    }
+
+    #[test]
+    fn a_re_ip_while_a_probe_is_out_probes_anew_and_discards_the_old_answer() {
+        // The old probe measured the exit of a connection that no longer
+        // exists. Waiting for it left the live one unprobed, and folding its
+        // answer in published the previous exit as the current one.
         let a = announcer();
         let t0 = Instant::now();
         let first = link(7, [10, 88, 1, 41]);
@@ -618,15 +653,20 @@ mod tests {
         let renewed = link(7, [10, 88, 2, 9]);
         let t1 = t0 + LINK_SETTLE + Duration::from_secs(1);
         a.observe(std::slice::from_ref(&renewed), t1);
-        assert!(
-            a.observe(std::slice::from_ref(&renewed), t1 + LINK_SETTLE)
-                .is_empty(),
-            "the earlier probe has not reported yet"
-        );
-        a.on_probe_result(&first, Some(addr(10)), t1 + LINK_SETTLE);
         assert_eq!(
-            a.observe(std::slice::from_ref(&renewed), t1 + LINK_SETTLE * 2),
-            vec![renewed]
+            a.observe(std::slice::from_ref(&renewed), t1 + LINK_SETTLE),
+            vec![renewed.clone()],
+            "the new incarnation must not wait on the old probe"
+        );
+        assert_eq!(
+            a.on_probe_result(&first, Some(addr(10)), t1 + LINK_SETTLE),
+            AnnounceOutcome::Stale,
+            "an answer about the previous connection is not the current address"
+        );
+        // And the live probe still owns its slot: its own answer lands.
+        assert_eq!(
+            a.on_probe_result(&renewed, Some(addr(11)), t1 + LINK_SETTLE * 2),
+            AnnounceOutcome::Announced
         );
     }
 
@@ -668,7 +708,7 @@ mod tests {
     }
 
     fn published(bus: &EventBus) -> Vec<StatusUpdateEvent> {
-        let outcome = bus.subscribe("test".to_string(), Some(0));
+        let outcome = bus.subscribe_as("test".to_string(), Some(SID.to_string()), Some(0));
         bus.peek_pending_for(&outcome.subscription_id, 64)
             .into_iter()
             .map(|entry| entry.event)

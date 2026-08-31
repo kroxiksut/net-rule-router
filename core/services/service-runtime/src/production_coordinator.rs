@@ -97,6 +97,20 @@ impl Default for ProductionIdGenerator {
     }
 }
 
+/// 128 bits of randomness, hex-encoded.
+///
+/// A failed draw falls back to the clock-plus-counter suffix: worse, but a
+/// mutation that cannot be confirmed at all is a worse outcome than a token
+/// that is merely hard to guess, and the fallback is still single-use,
+/// principal-scoped and short-lived.
+fn random_token_suffix() -> String {
+    let mut bytes = [0u8; 16];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => bytes.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => format!("{:020}", nanos_since_epoch()),
+    }
+}
+
 // Counter is `Mutex`-guarded; `lock().expect(...)` propagates poisoning — deliberate.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl IdGenerator for ProductionIdGenerator {
@@ -108,8 +122,13 @@ impl IdGenerator for ProductionIdGenerator {
             .expect("ProductionIdGenerator produces well-formed rev-* ids")
     }
 
+    /// The confirmation token IS the authority for the confirm phase: whoever
+    /// presents it commits the staged mutation. Built from the CSPRNG rather
+    /// than the shared counter-plus-clock suffix, which was guessable from any
+    /// observed id. Revision and attempt ids keep that suffix on purpose - they
+    /// name things, they do not authorise anything.
     fn new_token(&self) -> String {
-        format!("tok-{}", self.next_suffix())
+        format!("tok-{}", random_token_suffix())
     }
 
     fn new_attempt_id(&self) -> String {
@@ -520,22 +539,23 @@ impl ProductionApplyMarkerStore {
         })
     }
 
+    /// Serialised by the JSON library, not by hand. The hand-rolled version
+    /// escaped the quote and nothing else, so a `correlation_id` carrying a
+    /// backslash — it comes from the caller — wrote a marker that
+    /// [`Self::marker_from_json`] could not read back. An unreadable marker is
+    /// not "no marker": after a crash mid-apply the recovery then read
+    /// "nothing was in flight" and proceeded normally instead of rolling back.
     fn marker_to_json(marker: &ApplyAttemptMarker) -> String {
-        let intended = marker
-            .intended_rollback_to
-            .as_ref()
-            .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
-            .unwrap_or_else(|| "null".to_string());
-        format!(
-            r#"{{"attempt-id":"{}","active-revision-id":"{}","phase":"{}","started-at-epoch-secs":{},"last-step-at-epoch-secs":{},"intended-rollback-to":{},"correlation-id":"{}"}}"#,
-            marker.attempt_id.replace('"', "\\\""),
-            marker.active_revision_id.replace('"', "\\\""),
-            Self::phase_to_slug(&marker.phase),
-            marker.started_at_epoch_secs,
-            marker.last_step_at_epoch_secs,
-            intended,
-            marker.correlation_id.replace('"', "\\\""),
-        )
+        serde_json::json!({
+            "attempt-id": marker.attempt_id,
+            "active-revision-id": marker.active_revision_id,
+            "phase": Self::phase_to_slug(&marker.phase),
+            "started-at-epoch-secs": marker.started_at_epoch_secs,
+            "last-step-at-epoch-secs": marker.last_step_at_epoch_secs,
+            "intended-rollback-to": marker.intended_rollback_to,
+            "correlation-id": marker.correlation_id,
+        })
+        .to_string()
     }
 
     fn marker_from_json(json: &str) -> Option<ApplyAttemptMarker> {
@@ -1070,6 +1090,44 @@ pub fn run_crash_recovery_on_startup(
 
 #[cfg(test)]
 mod tests {
+
+    /// The token is the authority for the confirm phase, so two of them must
+    /// not be related by anything an observer can compute. The old suffix was a
+    /// nanosecond clock plus a counter: see one token, know the next.
+    #[test]
+    fn confirmation_tokens_are_not_derivable_from_each_other() {
+        let gen = ProductionIdGenerator::new();
+        let a = gen.new_token();
+        let b = gen.new_token();
+        assert_ne!(a, b);
+        assert!(a.starts_with("tok-"));
+        // 16 bytes hex-encoded, plus the prefix.
+        assert_eq!(a.len(), "tok-".len() + 32, "token: {a}");
+
+        // A counter shows up as a shared prefix that grows by one at the end;
+        // random ids share nothing beyond the tag.
+        let (ta, tb) = (&a["tok-".len()..], &b["tok-".len()..]);
+        let shared = ta
+            .chars()
+            .zip(tb.chars())
+            .take_while(|(x, y)| x == y)
+            .count();
+        assert!(
+            shared < 8,
+            "two tokens share {shared} leading hex digits, which a counter would explain: {a} / {b}",
+        );
+    }
+
+    /// Revision and attempt ids deliberately keep the ordered suffix: they name
+    /// things, and an operator reading the audit trail benefits from ids that
+    /// sort by time.
+    #[test]
+    fn revision_ids_stay_ordered() {
+        let gen = ProductionIdGenerator::new();
+        let first = gen.new_revision_id();
+        let second = gen.new_revision_id();
+        assert!(first.as_str() < second.as_str(), "{first:?} !< {second:?}");
+    }
     use super::*;
     use std::collections::HashSet;
 
@@ -1233,6 +1291,33 @@ mod tests {
         store.write(&marker).expect("write");
         let read_back = store.read().expect("read");
         assert_eq!(read_back, marker);
+    }
+
+    /// The `correlation_id` comes from the caller. Hand-escaping only the quote
+    /// meant a backslash in it wrote a marker that could not be read back — and
+    /// an unreadable marker reads as "nothing was in flight", so a crash
+    /// mid-apply recovered by proceeding instead of rolling back.
+    #[test]
+    fn a_marker_survives_a_correlation_id_full_of_json_metacharacters() {
+        // Built from code points so the literals here carry no escapes of their
+        // own — what is under test is escaping, and a doubly-escaped fixture
+        // proves nothing.
+        let bs = char::from(92u8);
+        let quote = char::from(34u8);
+        let newline = char::from(10u8);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ProductionApplyMarkerStore::new(dir.path());
+        let marker = ApplyAttemptMarker {
+            attempt_id: format!("att{bs}1"),
+            active_revision_id: format!("rev{quote}1"),
+            phase: ApplyPhase::RollbackRequired,
+            started_at_epoch_secs: 1,
+            last_step_at_epoch_secs: 2,
+            intended_rollback_to: Some(format!("rev{newline}prev")),
+            correlation_id: format!("corr{bs}{quote}{newline}1"),
+        };
+        store.write(&marker).expect("write");
+        assert_eq!(store.read().expect("read"), marker);
     }
 
     #[test]

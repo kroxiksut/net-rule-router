@@ -43,11 +43,31 @@ application and press **Add console to PATH**. It registers the folder for your
 user only. Terminals that are already open keep the `PATH` they started with:
 open a new one, or paste the one-line command the panel shows you.
 
-Verbs marked *administrator* need an elevated console. The console never
-elevates itself: it prints the exact command to repeat and exits with code `3`.
-On Windows, open a console as administrator and run the command again; there is
-no `--elevate` flag, because an elevated child process on Windows gets its own
-window, and the output you were waiting for would disappear with it.
+### Verbs that need administrator rights
+
+Verbs marked *administrator* need rights an ordinary console does not have. What
+happens then depends on who is asking, and the difference is deliberate:
+
+- **In a script** — anywhere the console is not attached to a terminal — nothing
+  changes and nothing pops up. The console prints the exact command to repeat and
+  exits with code `3`, exactly as it always has. An authorisation dialog in the
+  middle of an unattended run is a stall, not a feature.
+- **In your own terminal**, it asks: `Retry with elevation? [y/N]`. Answer `y`
+  and it requests rights the way your system does — a UAC prompt on Windows, your
+  polkit dialog on Linux — then runs the command again and prints the result
+  here. Anything other than `y` leaves you with code `3` and nothing done.
+- **With `--elevate`**, it skips the question and requests rights straight away.
+  Use this in a wrapper script that has already decided.
+
+Either way the console tries the command *first* and only asks for rights if it
+is actually refused — so where the service is configured to let you control it
+unprivileged, nothing prompts at all.
+
+If you decline the system's own prompt, the exit code is `8`, not `1`: nothing
+ran, and that is worth telling apart from something that ran and failed.
+
+On Windows the elevated copy runs hidden and reports back to the console you
+started it from, so the output does not vanish with a window you never saw.
 
 ## Verbs
 
@@ -75,6 +95,7 @@ Flags:
 | `--purge` | `uninstall` | Also delete the service-owned data directory. Your rule files are kept either way |
 | `--confirm` | `reset-network` | Required. Without it the command explains what it would drop and refuses |
 | `--tail=<N>` | `diag logs` | How many of the newest lines to print. Default 50, maximum 2000 |
+| `--elevate` | every *administrator* verb | If the command turns out to need administrator rights, ask the system for them and run it again instead of asking you |
 
 `status` answers without talking to the running service, because that is the
 question people ask precisely when the service is not answering.
@@ -132,6 +153,7 @@ same set on every operating system.
 | `5` | The service is installed but not answering |
 | `6` | The operation has no meaning on this platform |
 | `7` | Refused because a dangerous command was not confirmed |
+| `8` | Administrator rights were requested and refused — nothing ran |
 
 `diag doctor` reports warnings without failing: being stopped, or being
 installed from another directory, exits `0` with the finding printed. A code

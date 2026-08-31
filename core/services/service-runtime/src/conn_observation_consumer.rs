@@ -100,8 +100,8 @@ pub struct ConnConsumeSummary {
     /// thing that puts one of its destinations on the tunnel is a `/32` route
     /// derived from an address the observer has already seen. First contact
     /// with a new address therefore drops by design — and that drop is what
-    /// teaches `app_observation_lookup` the address, after which the route and
-    /// the per-destination pin follow within a tick. Bounded (one burst per
+    /// teaches `app_observation_lookup` the address, after which the route
+    /// follows within a tick. Bounded (one burst per
     /// new destination) and self-healing, so it is NOT evidence of a scope
     /// bug; only the destination-scoped remainder is.
     pub killswitch_drops_live_secondary_app_scope: u32,
@@ -475,17 +475,21 @@ fn collateral_pin_owners(
     role: EgressRole,
     ip: std::net::Ipv4Addr,
 ) -> Vec<String> {
-    use crate::app_observation_lookup::pattern_matches;
-    if role != EgressRole::Secondary || this_app.is_empty() || this_app == own_process_key {
+    use crate::app_observation_lookup::{app_key, pattern_matches};
+    // Both sides through the same key: the census holds keys, callers may hold
+    // a rule spelling, and a raw compare would silently disagree.
+    let this_app = app_key(this_app);
+    if role != EgressRole::Secondary || this_app.is_empty() || this_app == app_key(own_process_key)
+    {
         return Vec::new();
     }
-    if routed.iter().any(|p| pattern_matches(p, this_app)) {
+    if routed.iter().any(|p| pattern_matches(p, &this_app)) {
         return Vec::new();
     }
     store
         .apps_for_ip(ip)
         .into_iter()
-        .filter(|owner| owner != this_app)
+        .filter(|owner| owner != &this_app)
         .filter(|owner| routed.iter().any(|p| pattern_matches(p, owner)))
         .collect()
 }
@@ -1507,7 +1511,7 @@ mod tests {
             EgressRole::Secondary,
             Ipv4Addr::new(178, 248, 237, 68),
         );
-        assert_eq!(owners, vec!["assistant.exe".to_string()]);
+        assert_eq!(owners, vec!["assistant".to_string()]);
     }
 
     /// Regression from a live run: the store holds an entry for EVERY process,
@@ -1576,7 +1580,7 @@ mod tests {
                 EgressRole::Secondary,
                 Ipv4Addr::new(178, 248, 237, 68)
             ),
-            vec!["codex-helper.exe".to_string()]
+            vec!["codex-helper".to_string()]
         );
     }
 
@@ -1871,6 +1875,8 @@ mod tests {
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
                 block_ipv6_when_protected: true,
+                local_networks_auto_accept: false,
+                zone_priority_over_ip: false,
             })
         }
     }

@@ -29,6 +29,12 @@ const FAILURES_BEFORE_ROTATE: u32 = 3;
 /// of failures (or a flapping link) would otherwise hammer it.
 const MIN_REFRESH_GAP: Duration = Duration::from_secs(10);
 
+/// Floor between probe sweeps that found nothing. [`MIN_REFRESH_GAP`] only gates
+/// re-enumeration; without a floor here an offline machine pays the whole
+/// candidate list at [`PROBE_TIMEOUT`] each on every failed forward, in every
+/// worker at once.
+const MIN_SWEEP_GAP: Duration = Duration::from_secs(3);
+
 /// Name used to probe a candidate. Reserved by RFC 2606, answered by every
 /// recursive resolver, owned by nobody — and the probe accepts ANY well-formed
 /// reply (NXDOMAIN and REFUSED included), so what is being tested is reachability
@@ -58,18 +64,38 @@ impl Default for UdpUpstreamProbe {
     }
 }
 
+/// Query id for one probe. Random, because the id is the only thing that ties
+/// a reply to this probe: a counter starting at a fixed value announces the
+/// next id to anyone who saw the last one.
+fn probe_id() -> u16 {
+    let mut bytes = [0u8; 2];
+    match getrandom::fill(&mut bytes) {
+        Ok(()) => u16::from_ne_bytes(bytes),
+        // Same fallback shape as the token store: a clock-derived value is
+        // weaker than random but better than a predictable sequence.
+        Err(_) => {
+            static PROBE_ID: AtomicU32 = AtomicU32::new(0x5100);
+            PROBE_ID.fetch_add(1, Ordering::Relaxed) as u16
+        }
+    }
+}
+
 impl UpstreamProbe for UdpUpstreamProbe {
     fn responds(&self, server: SocketAddr) -> bool {
-        static PROBE_ID: AtomicU32 = AtomicU32::new(0x5100);
-        let id = PROBE_ID.fetch_add(1, Ordering::Relaxed) as u16;
+        let id = probe_id();
         let Some(query) = crate::dns_wire::build_a_query(id, PROBE_NAME) else {
             return false;
         };
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
             return false;
         };
+        // Connected, so the kernel drops datagrams from anyone but the server
+        // being probed. Unconnected, any host on the segment could answer for
+        // it — and this probe is what decides which upstream we then trust with
+        // every rule-host lookup.
         if sock.set_read_timeout(Some(self.timeout)).is_err()
-            || sock.send_to(&query, server).is_err()
+            || sock.connect(server).is_err()
+            || sock.send(&query).is_err()
         {
             return false;
         }
@@ -77,8 +103,8 @@ impl UpstreamProbe for UdpUpstreamProbe {
         let Ok(n) = sock.recv(&mut buf) else {
             return false;
         };
-        // Only the id has to match: an NXDOMAIN or REFUSED proves the server is
-        // there, which is the whole question.
+        // Beyond the source, only the id has to match: an NXDOMAIN or REFUSED
+        // proves the server is there, which is the whole question.
         n >= crate::dns_wire::DNS_HEADER_LEN && u16::from_be_bytes([buf[0], buf[1]]) == id
     }
 }
@@ -106,6 +132,9 @@ struct PoolState {
     /// Consecutive failures reported against `active`.
     failures: u32,
     last_refresh: Option<Instant>,
+    /// When the last full sweep ended with nothing answering. Gates the probes
+    /// themselves, which `last_refresh` does not.
+    last_empty_sweep: Option<Instant>,
 }
 
 /// The live choice of upstream DNS server.
@@ -117,6 +146,10 @@ pub struct UpstreamDnsPool {
     servers: Arc<dyn SystemDnsServersPort>,
     probe: Arc<dyn UpstreamProbe>,
     preferred_interface: OnceLock<PreferredInterfaceFn>,
+    /// Held for the duration of one sweep. Probing is slow and the answer is
+    /// shared, so a second caller takes the current choice rather than running
+    /// the same probes beside the first.
+    sweep: Mutex<()>,
     state: Mutex<PoolState>,
 }
 
@@ -126,11 +159,13 @@ impl UpstreamDnsPool {
             servers,
             probe,
             preferred_interface: OnceLock::new(),
+            sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
                 candidates: Vec::new(),
                 active: None,
                 failures: 0,
                 last_refresh: None,
+                last_empty_sweep: None,
             }),
         }
     }
@@ -166,11 +201,13 @@ impl UpstreamDnsPool {
             servers: Arc::new(nrr_platform_api::dns::StaticDnsServers::new(vec![ip])),
             probe: Arc::new(AcceptingProbe),
             preferred_interface: OnceLock::new(),
+            sweep: Mutex::new(()),
             state: Mutex::new(PoolState {
                 candidates: vec![UpstreamDnsCandidate::new(None, ip)],
                 active: Some(ip),
                 failures: 0,
                 last_refresh: Some(Instant::now()),
+                last_empty_sweep: None,
             }),
         }
     }
@@ -227,7 +264,10 @@ impl UpstreamDnsPool {
         let previous = self.lock().active;
         {
             let mut state = self.lock();
-            state.last_refresh = None; // an explicit refresh ignores the floor
+            // An explicit refresh ignores both floors: a network change is a
+            // reason to re-probe even if the last sweep just came up empty.
+            state.last_refresh = None;
+            state.last_empty_sweep = None;
         }
         let selected = self.reselect(None);
         if selected != previous {
@@ -260,6 +300,20 @@ impl UpstreamDnsPool {
     /// Pick the first candidate that answers, preferring anything over `avoid`.
     /// Re-enumerates from the OS when the candidate list is stale.
     fn reselect(&self, avoid: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+        let swept_recently = {
+            let state = self.lock();
+            state
+                .last_empty_sweep
+                .is_some_and(|at| at.elapsed() < MIN_SWEEP_GAP)
+        };
+        if swept_recently {
+            return self.lock().active;
+        }
+        // A sweep already under way answers for everyone: waiting on it would
+        // cost the same as running it, and running it twice costs double.
+        let Ok(_sweeping) = self.sweep.try_lock() else {
+            return self.lock().active;
+        };
         let stale = {
             let state = self.lock();
             state
@@ -297,13 +351,20 @@ impl UpstreamDnsPool {
                 let mut state = self.lock();
                 state.active = Some(ip);
                 state.failures = 0;
+                state.last_empty_sweep = None;
                 return Some(ip);
             }
         }
         // Nothing answered. Keep the previous choice rather than blanking it:
         // a machine that is briefly offline has no better server to offer, and
         // dropping the redirect mid-session would be the louder failure.
-        self.lock().active
+        let mut state = self.lock();
+        state.last_empty_sweep = Some(Instant::now());
+        // The rotation this streak asked for has been attempted and there was
+        // nowhere to go. Leaving the streak at its limit would re-enter the
+        // sweep on every single failure that follows.
+        state.failures = 0;
+        state.active
     }
 }
 
@@ -449,5 +510,135 @@ mod tests {
             Some(SocketAddr::from((ip(0), 53))),
             "a brief outage must not blank the upstream mid-session"
         );
+    }
+
+    #[test]
+    fn an_offline_machine_does_not_re_probe_on_every_failure() {
+        // Each sweep costs the whole candidate list at PROBE_TIMEOUT. Without a
+        // floor, every forward that fails pays for it again.
+        let probe = ScriptedProbe::new(vec![ip(0)]);
+        let pool = pool(vec![ip(0), ip(1), ip(2)], Arc::clone(&probe));
+        pool.refresh();
+        probe.set_alive(vec![]);
+        for _ in 0..FAILURES_BEFORE_ROTATE {
+            pool.note_failure();
+        }
+        let after_first_sweep = probe.calls.load(Ordering::Relaxed);
+        for _ in 0..30 {
+            pool.note_failure();
+        }
+        assert_eq!(
+            probe.calls.load(Ordering::Relaxed),
+            after_first_sweep,
+            "a sweep that found nothing must not be repeated within MIN_SWEEP_GAP"
+        );
+    }
+
+    #[test]
+    fn a_sweep_that_found_nothing_resets_the_failure_streak() {
+        let probe = ScriptedProbe::new(vec![ip(0)]);
+        let pool = pool(vec![ip(0)], Arc::clone(&probe));
+        pool.refresh();
+        probe.set_alive(vec![]);
+        for _ in 0..FAILURES_BEFORE_ROTATE {
+            pool.note_failure();
+        }
+        assert_eq!(
+            pool.lock().failures,
+            0,
+            "leaving the streak at its limit re-enters the sweep on every later failure"
+        );
+    }
+
+    #[test]
+    fn a_network_change_re_probes_even_right_after_an_empty_sweep() {
+        // The floor must not outlive its reason: a new link is exactly when a
+        // server that was unreachable a second ago becomes reachable.
+        let probe = ScriptedProbe::new(vec![]);
+        let pool = pool(vec![ip(0)], Arc::clone(&probe));
+        pool.refresh();
+        let after_empty = probe.calls.load(Ordering::Relaxed);
+        probe.set_alive(vec![ip(0)]);
+        assert_eq!(
+            pool.refresh(),
+            Some(SocketAddr::from((ip(0), 53))),
+            "an explicit refresh must probe again"
+        );
+        assert!(probe.calls.load(Ordering::Relaxed) > after_empty);
+    }
+
+    /// Probe that parks inside the first call until it is released.
+    struct ParkingProbe {
+        entered: (Mutex<bool>, std::sync::Condvar),
+        release: (Mutex<bool>, std::sync::Condvar),
+        calls: AtomicUsize,
+    }
+
+    impl ParkingProbe {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: (Mutex::new(false), std::sync::Condvar::new()),
+                release: (Mutex::new(false), std::sync::Condvar::new()),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn wait_until_inside(&self) {
+            let (lock, cv) = &self.entered;
+            let mut inside = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !*inside {
+                inside = cv.wait(inside).unwrap_or_else(|p| p.into_inner());
+            }
+        }
+
+        fn release(&self) {
+            let (lock, cv) = &self.release;
+            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        }
+    }
+
+    impl UpstreamProbe for ParkingProbe {
+        fn responds(&self, _server: SocketAddr) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            {
+                let (lock, cv) = &self.entered;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                cv.notify_all();
+            }
+            let (lock, cv) = &self.release;
+            let mut released = lock.lock().unwrap_or_else(|p| p.into_inner());
+            while !*released {
+                released = cv.wait(released).unwrap_or_else(|p| p.into_inner());
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn a_second_caller_takes_the_current_choice_instead_of_sweeping_beside_the_first() {
+        // Eight serve workers report failures independently; the probes are the
+        // expensive part and the answer is shared.
+        let probe = ParkingProbe::new();
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::new(vec![ip(0)])),
+            Arc::clone(&probe) as Arc<dyn UpstreamProbe>,
+        ));
+        let sweeping = {
+            let pool = Arc::clone(&pool);
+            std::thread::spawn(move || pool.refresh())
+        };
+        probe.wait_until_inside();
+        assert_eq!(
+            pool.refresh(),
+            None,
+            "the second caller must return the current choice, not queue behind the sweep"
+        );
+        probe.release();
+        assert_eq!(
+            sweeping.join().expect("sweep thread"),
+            Some(SocketAddr::from((ip(0), 53)))
+        );
+        assert_eq!(probe.calls.load(Ordering::Relaxed), 1, "one sweep, not two");
     }
 }

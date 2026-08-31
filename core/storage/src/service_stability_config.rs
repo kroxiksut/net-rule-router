@@ -282,7 +282,7 @@ impl ServiceStabilityConfigRecord {
             fake_ip_udp_relay: false,
             fake_ip_instant_rst: true,
             allow_user_rule_edits: true,
-            isp_block_candidates_enabled: false,
+            isp_block_candidates_enabled: true,
         }
     }
 }
@@ -914,19 +914,20 @@ mod tests {
     }
 
     #[test]
-    fn isp_block_candidates_enabled_defaults_false_and_roundtrips() {
-        // ISP block-page rule candidates: off for the implicit default record
-        // and for a pre-v50 row — the detector had no admin-facing switch
-        // until this field existed. An explicit `true` persists.
+    fn isp_block_candidates_enabled_defaults_on_and_roundtrips() {
+        // ISP block-page rule candidates are ON for a machine that has never
+        // been configured: a site the provider cuts off should reach the user
+        // as a suggestion without them first finding a switch. A row already on
+        // disk keeps whatever it holds — the column default stays 0, so
+        // changing the product default never flips an installed machine.
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let repo = ServiceStabilityConfigRepository::new(&conn);
         assert!(
-            !repo
-                .get_or_default()
+            repo.get_or_default()
                 .expect("get")
                 .isp_block_candidates_enabled,
-            "implicit default must be off (opt-in feature)"
+            "implicit default must be on"
         );
         repo.set(
             &IpcAcceptPolicyWrite::Critical,

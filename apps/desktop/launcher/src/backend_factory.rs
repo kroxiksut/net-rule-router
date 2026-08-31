@@ -204,9 +204,10 @@ fn wait_for_connect(client: &ServiceIpcClient, deadline: Duration) -> bool {
     while start.elapsed() < deadline {
         match client.connection_status() {
             ConnectionStatus::Connected => return true,
-            ConnectionStatus::ProtocolMismatch { .. } | ConnectionStatus::NotInstalled => {
-                return false
-            }
+            // Terminal for this wait: none of them clears without the user.
+            ConnectionStatus::ProtocolMismatch { .. }
+            | ConnectionStatus::NotInstalled
+            | ConnectionStatus::Refused { .. } => return false,
             _ => std::thread::sleep(Duration::from_millis(50)),
         }
     }
@@ -229,6 +230,7 @@ fn ipc_status_to_backend_status(s: ConnectionStatus) -> BackendConnectionStatus 
             server_version,
             client_version,
         },
+        ConnectionStatus::Refused { reason } => BackendConnectionStatus::Refused { reason },
     }
 }
 

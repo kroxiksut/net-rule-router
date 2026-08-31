@@ -59,6 +59,13 @@ QtObject {
     /// binding.
     function _bindImportedSourcePaths(state) {
         if (!state) return
+        // A hydration load is the app's own doing, not the user's: recording
+        // its pick as `lastLoadedPath*` turned "what would load" into "what
+        // the user loaded" — after the service took ownership of the rules,
+        // the Source row kept naming a bundled set nobody chose. A hydration
+        // of an already-remembered file loses nothing here: those paths are
+        // on record already.
+        if (state.hydration) return
         var bound = false
         function bind(route, path) {
             if (!path || String(path) === "") return
@@ -720,7 +727,7 @@ QtObject {
     /// already-base64-wrapped preset file body (read by
     /// `nrrNativeBridge.readFileBytes`). `sourcePath` is stashed so
     /// the review flow can save it into `UiPreferences::last_saved_path_<role>`.
-    function startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode) {
+    function startPresetImportReviewFlow(targetRoute, bytesB64, sourcePath, mode, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import: bridge unavailable, aborting")
             return

@@ -14,9 +14,9 @@ use nrr_diagnostics::error::DiagnosticsResult;
 use nrr_diagnostics::explain::{ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
-    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
-    SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
+    ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use nrr_diagnostics::facade::pagination::{PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
@@ -170,6 +170,7 @@ impl FakeDiagnostics {
             },
             diagnostic_mode: DiagnosticModeStateDto::inactive(),
             stale: false,
+            origin: DiagnosticsDataOrigin::Service,
         }
     }
 
@@ -556,6 +557,8 @@ impl RoutePolicyWriter for FakeRoutePolicyWriter {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: request.binding_source,
         };
         *self.stored.lock().unwrap() = Some(dto.clone());

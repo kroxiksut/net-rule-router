@@ -145,9 +145,58 @@ impl BlockAllPostureStatus {
     }
 }
 
+/// Whether ANY tracked SID currently has the leak guard BLOCKING because the
+/// additional link could not be resolved — the `secondary interface unresolved
+/// — kill-switch FAIL-CLOSED` posture, in either of its shapes (the enumerated
+/// per-IP block set or the catch-all).
+///
+/// Deliberately WIDER than [`BlockAllPostureStatus`], which arms only for the
+/// catch-all: with the default per-IP posture that one stays disarmed while
+/// the guard is very much blocking. Readers that must not hand an application a
+/// destination the guard has no filter for yet — the DNS handler and the rule
+/// hostname seeder — key on THIS one.
+///
+/// Not armed when the pair is merely empty on a healthy tunnel: there the
+/// additional link is up and the per-IP guard is a no-op, so withholding an
+/// answer or hammering the resolver would cost the user connectivity it never
+/// protects.
+#[derive(Clone, Default)]
+pub struct FailClosedPostureStatus(Arc<Mutex<bool>>);
+
+impl FailClosedPostureStatus {
+    /// Construct disarmed.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the stored armed flag. A poisoned lock is skipped (best-effort
+    /// diagnostics must never panic the apply path).
+    pub fn set(&self, armed: bool) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = armed;
+        }
+    }
+
+    /// The last stored armed flag. A poisoned lock recovers the inner value.
+    pub fn armed(&self) -> bool {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fail_closed_posture_round_trips_and_shares_state() {
+        let writer = FailClosedPostureStatus::new();
+        let reader = writer.clone();
+        assert!(!reader.armed(), "disarmed by default");
+        writer.set(true);
+        assert!(reader.armed());
+        writer.set(false);
+        assert!(!reader.armed());
+    }
 
     #[test]
     fn block_all_posture_round_trips_and_shares_state() {

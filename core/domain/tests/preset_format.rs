@@ -299,11 +299,14 @@ fn fixture_preset_with_extended_sections_parses_correctly() {
     let content = include_str!("fixtures/preset_with_extended_sections.txt");
     let outcome = parse_rules_file(content);
 
-    // Preset header present.
+    // Preset header present. The fixture declares version 1 — the assertion is
+    // that the header is READ, not that it happens to match what this build
+    // writes, and an older file must parse without complaint.
     assert!(outcome.preset_metadata.is_some());
-    assert_eq!(
-        outcome.file_format_version,
-        Some(CURRENT_PRESET_FORMAT_VERSION)
+    assert_eq!(outcome.file_format_version, Some(1));
+    assert!(
+        outcome.file_format_version <= Some(CURRENT_PRESET_FORMAT_VERSION),
+        "a build must understand every version up to its own"
     );
 
     // Free sections parsed.

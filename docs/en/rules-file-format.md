@@ -131,7 +131,7 @@ Empty lines and lines containing only whitespace are ignored.
 ### 1.4 Complete example
 
 ```
-# NetRuleRouter rules file — version 1
+# NetRuleRouter rules file — version 4
 # Route: Primary (main network)
 
 --- Zones
@@ -177,9 +177,9 @@ The following priority order is fixed (highest to lowest):
 5. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
    filename (exact or glob). Exact names take precedence over glob patterns;
    among glob matches, the first rule in the file wins. Only the
-   platform-appropriate section is evaluated. An application rule's **nested
-   destinations** (§1.10) are also evaluated at this tier — below the Domains
-   and IP tiers, so a top-level address rule for the same address wins.
+   platform-appropriate section is evaluated. The destinations an application
+   rule teaches the router (§1.10) are evaluated at this tier too — below the
+   Domains and IP tiers, so a top-level address rule for the same address wins.
 6. **Default route** — determined by `ActiveConfiguration.behavior_mode`.
 
 Both the primary and secondary rule files are evaluated independently. The
@@ -328,127 +328,29 @@ In the GUI, rules belonging to unrecognised sections are shown with a
 On export, unrecognised rules are written back to the file unchanged, so no
 information is lost when a file travels through this version.
 
-### 1.10 Application destination lists (`--- Windows`)
+### 1.10 Application rules and the destinations they route
 
-> **Status: `--- Windows` only for now.** The same nesting will extend to the
-> `--- Linux` and `--- MacOS` sections in a later revision. This subsection is a
-> **format version 2** addition (see §1.11).
-
-Routing is **destination-based**: a route is keyed by the remote address,
-not by the originating process. A Windows application rule therefore cannot, by
-itself, send a process's traffic out the secondary adapter. Instead, an
-application rule **carries a list of destinations** the application uses, and
-each destination is routed via the application rule's route (the file the rule
-lives in — `rules_primary.txt` or `rules_secondary.txt`). NetRuleRouter learns
-these destinations by **observing the application's outbound connections** and
-routes them on subsequent connections.
+Routing is **destination-based**: a route is keyed by the remote address, not by
+the originating process. An application rule therefore cannot, by itself, send a
+process's traffic out the secondary adapter. What it does is tell NetRuleRouter
+which application to watch: the destinations that application contacts are
+learned by observation and routed via the rule's route (the file the rule lives
+in — `rules_primary.txt` or `rules_secondary.txt`) on subsequent connections.
 
 > True per-process *isolation* (only **this** application's traffic to a shared
 > address rides the secondary; other applications contacting the same address do
-> not) requires a kernel driver and is out of scope for now. Currently, a
-> destination learned from an application is an ordinary destination route — it
-> applies wherever that address is contacted. The first connection to a
-> not-yet-observed address always egresses normally (it is what reveals the
-> address); routing takes effect from the next connection.
+> not) requires a kernel driver and is out of scope for now. A destination
+> learned from an application is an ordinary destination route — it applies
+> wherever that address is contacted. The first connection to a not-yet-observed
+> address always egresses normally (it is what reveals the address); routing
+> takes effect from the next connection.
 
-#### Syntax
-
-Within `--- Windows`, a line whose first non-whitespace characters are a hyphen
-and a space (`- `) is a **nested destination** belonging to the most recent
-application rule above it:
-
-```
---- Windows
-claude.exe
-  - claude.ai
-  - claude.org
-  - 203.0.113.7
-mysuper.exe
-  - mysite.org
-```
-
-- Leading indentation is cosmetic (recommended for readability) and is ignored
-  by the parser; the `- ` prefix is what marks the line as a nested destination.
-- The value after `- ` (trimmed) is either an **exact FQDN** (`claude.org`) or
-  an **exact IPv4 address** (`203.0.113.7`); the parser auto-detects which by
-  syntax. Suffix (`*.`) and CIDR forms are **not** accepted in a nested
-  destination — promote a suffix to a top-level `--- Domains` rule instead
-  (CIDR is not supported yet).
-- A nested destination with no preceding application rule in the section is a
-  validation error.
-- Inline comments (`- claude.org  # vendor API`) and the 200-character comment
-  limit apply exactly as for top-level rules (§1.3).
-
-#### Route inheritance
-
-A nested destination inherits the **route of its application rule** — i.e. the
-file it appears in. A `claude.exe` block in `rules_secondary.txt` routes its
-destinations via the secondary adapter; the same block in `rules_primary.txt`
-routes them via the primary.
-
-#### Priority against top-level address rules
-
-A top-level `--- Domains` or `--- IP` rule for the same address **outranks** a
-nested application destination — the fixed priority places the Domains and IP
-tiers above the Application tier (§1.5). When an address appears both as a
-top-level rule and as a nested destination, the top-level rule determines the
-route and the nested copy is not applied a second time. This lets a user "pin"
-an address explicitly (move `claude.ai` up into `--- Domains` to force a route)
-and have it win over what the application learned.
-
-#### Disabling
-
-- Commenting the application line (`# claude.exe`) disables the application rule
-  **and** all of its nested destinations.
-- Commenting a single nested line (`# - claude.org`) disables just that
-  destination.
-
-#### Explicit vs observed destinations
-
-Nested destinations written in the file are **explicit** — user-authored
-canonical intent. NetRuleRouter additionally maintains, at runtime, a durable
-set of **observed** destinations per application (learned by connection
-observation). The two are shown together under each application in the GUI
-(observed ones are labelled), with these actions:
-
-- **Pin** — promote an observed destination to an explicit `- ` line in the
-  file.
-- **Exclude / forget** — stop routing an observed destination. Observed
-  destinations cannot be *deleted* (observation would re-learn them); excluding
-  records that the address must not be routed for this application.
-
-Observed destinations are runtime state and are **not** part of the canonical
-file by default, so the rules file stays a record of user intent. On export,
-observed destinations may optionally be written out as explicit `- ` lines so a
-shared file is self-contained. (The auto-learning behaviour, the per-machine
-administrator policy that governs who may change rules, and the GUI surface are
-specified outside this format document.)
-
-#### Provenance and shared-address annotations
-
-A nested destination's inline comment MAY carry conventional annotations that
-NetRuleRouter writes when it serialises a learned destination and reads back to
-show provenance. They are ordinary inline comments — a reader that does not
-understand them just shows them as the destination's label — but the GUI parses
-these leading tokens (`;`-separated):
-
-| Token | Meaning |
-|---|---|
-| `via <process>` | The subtree process that discovered this address (e.g. a child of the application rule, under `+children`). Stable provenance — round-trips through the file. |
-| `also <proc>, <proc>…` | Other applications observed contacting the **same** address — routing it affects them too (shared address). A **point-in-time snapshot** at write time; the live set is shown in the GUI, not kept fresh in the file. |
-| `shared-ip` | More than one site or service answers from this address, so a rule that targets it affects them too, not only the one you intended. |
-
-```
---- Windows
-codex.exe +children
-  - api.openai.com         # via codex.exe
-  - registry.npmjs.org     # via node_repl.exe
-  - 140.82.121.4           # via powershell.exe; also chrome.exe, slack.exe; shared-ip
-```
-
-Free-form user text may follow the conventional tokens and is preserved
-verbatim. Only the `via` token is authoritative and persisted; `also …` and
-`shared-ip` are advisory annotations recomputed from live observation.
+In the file, an application rule is a **process name on its own line** — there
+is no nested syntax for its destinations, and learned destinations are runtime
+state rather than part of the file. To route one specific address regardless of
+which program contacts it, write it as an ordinary `--- Domains` or `--- IP`
+rule; those tiers outrank the Application tier (§1.5), so an explicit rule
+always wins over what an application taught the router.
 
 ### 1.11 Format version
 
@@ -458,15 +360,14 @@ The header line `# NetRuleRouter rules file — version N` (and the preset heade
 | Version | Adds |
 |---|---|
 | 1 | Sections, top-level rules, inline comments, disabled rules. |
-| 2 | Nested application destinations (§1.10, `--- Windows`). |
+| 2 | Reserved, never used. |
 | 3 | Per-rule `+block` flag (§1.12). |
 | 4 | App-authored rules section (§1.13, `--- Auto`). |
 
-A file that uses nested `- ` lines declares **version 2**. A version 1 reader
-predates the nesting syntax and would mis-parse a `- destination` line as a
-(never-matching) process rule, so version-2 files should be read by version-2+
-builds. NetRuleRouter preserves nested lines on round-trip; a version 2 file
-opened and re-saved by a current build keeps its nesting intact.
+Version 2 was reserved for a nested `- destination` syntax under application
+rules. It was never implemented and no build reads or writes it; the number is
+left in place rather than reused, so a file from any build means the same thing
+in every build. Do not declare version 2 in a file.
 
 A file that contains an `--- Auto` section declares **version 4**. A
 pre-version-4 reader does not recognise the section name and therefore treats
@@ -708,14 +609,14 @@ Preset metadata is stored as header comments at the top of each file, before
 any section headers. All keys are optional.
 
 ```
-# NetRuleRouter preset — version 1
+# NetRuleRouter preset — version 4
 # name: Corporate VPN Rules
 # description: Routes corporate traffic via the secondary (VPN) interface
 # author: Jane Doe
 # preset_version: 1
 ```
 
-The first line `# NetRuleRouter preset — version 1` identifies the file as a
+The first line `# NetRuleRouter preset — version 4` identifies the file as a
 preset and carries the format version. A file without this header is still
 valid as a rules file; the metadata lines are treated as free comments.
 

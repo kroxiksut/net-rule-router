@@ -97,6 +97,10 @@ pub struct AuditChainVerification {
     pub actual_hash: Option<String>,
     /// Number of lines in the file that could not be parsed.
     pub corrupt_lines: usize,
+    /// `true` when the out-of-band anchor names an event the files no longer
+    /// hold. A chain with its tail cut off is still internally consistent, so
+    /// `chain_ok` alone says nothing about it.
+    pub tail_truncated: bool,
 }
 
 impl AuditChainVerification {
@@ -108,6 +112,7 @@ impl AuditChainVerification {
             expected_hash: None,
             actual_hash: None,
             corrupt_lines: 0,
+            tail_truncated: false,
         }
     }
 }
@@ -150,6 +155,25 @@ impl AuditReader {
     ///
     /// Returns `AuditChainVerification::ok(0)` if no files exist.
     pub fn verify_latest_chain(&self) -> AuditChainVerification {
+        self.verify_latest_chain_anchored(None)
+    }
+
+    /// Verifies the latest file AND compares the tail against an out-of-band
+    /// anchor. Without the anchor a removed tail is indistinguishable from
+    /// "nothing happened since" — the remaining events verify perfectly.
+    pub fn verify_latest_chain_anchored(
+        &self,
+        anchor: Option<&crate::audit::anchor::AuditChainAnchor>,
+    ) -> AuditChainVerification {
+        let mut verification = self.verify_latest_chain_inner();
+        if crate::audit::anchor::check_tail(&self.audit_dir, anchor).is_truncated() {
+            verification.tail_truncated = true;
+            verification.chain_ok = false;
+        }
+        verification
+    }
+
+    fn verify_latest_chain_inner(&self) -> AuditChainVerification {
         let files = self.list_files();
         match files.split_last() {
             None => AuditChainVerification::ok(0),
@@ -195,32 +219,32 @@ impl AuditReader {
         if max_bytes == 0 {
             return Vec::new();
         }
-        // Collect every line across all files in chronological order.
-        let mut lines: Vec<String> = Vec::new();
-        for path in self.list_files() {
+        // Walk the files NEWEST first and stop as soon as the budget is met.
+        // Reading every file first and trimming afterwards pulled the entire
+        // trail — up to the 50 MiB retention cap — into the service's memory to
+        // answer a request for its last few hundred KiB.
+        let mut newest_first: Vec<String> = Vec::new();
+        let mut used: usize = 0;
+        'files: for path in self.list_files().into_iter().rev() {
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            for line in contents.lines() {
-                if !line.is_empty() {
-                    lines.push(line.to_string());
+            for line in contents.lines().rev() {
+                if line.is_empty() {
+                    continue;
                 }
+                let cost = line.len() + 1;
+                // The newest line is always kept, however long it is: a caller
+                // asking for the tail must not get an empty answer.
+                if !newest_first.is_empty() && used + cost > max_bytes {
+                    break 'files;
+                }
+                used += cost;
+                newest_first.push(line.to_string());
             }
         }
-        // Keep the newest contiguous suffix under the byte budget. Walk from the
-        // end summing each line plus its newline; always keep the newest line,
-        // then stop before adding the (older) line that would overflow.
-        let mut kept_from = lines.len();
-        let mut used: usize = 0;
-        for (idx, line) in lines.iter().enumerate().rev() {
-            let cost = line.len() + 1; // +1 for the newline separator
-            if kept_from != lines.len() && used + cost > max_bytes {
-                break;
-            }
-            used += cost;
-            kept_from = idx;
-        }
-        lines.split_off(kept_from)
+        newest_first.reverse();
+        newest_first
     }
 }
 
@@ -240,7 +264,7 @@ fn list_audit_files(dir: &Path) -> Vec<PathBuf> {
                 .unwrap_or(false)
         })
         .collect();
-    files.sort();
+    crate::rotation::sort_chronologically(&mut files);
     files
 }
 
@@ -281,6 +305,7 @@ fn verify_chain_in_file_with_seed(path: &Path, seed_prev_hash: &str) -> AuditCha
             expected_hash: None,
             actual_hash: None,
             corrupt_lines: 1,
+            tail_truncated: false,
         };
     };
 
@@ -312,6 +337,7 @@ fn verify_chain_in_file_with_seed(path: &Path, seed_prev_hash: &str) -> AuditCha
                 expected_hash: Some(expected),
                 actual_hash: Some(stored_hash),
                 corrupt_lines: corrupt,
+                tail_truncated: false,
             };
         }
         prev = stored_hash;
@@ -325,6 +351,7 @@ fn verify_chain_in_file_with_seed(path: &Path, seed_prev_hash: &str) -> AuditCha
         expected_hash: None,
         actual_hash: None,
         corrupt_lines: corrupt,
+        tail_truncated: false,
     }
 }
 
@@ -566,25 +593,30 @@ mod tests {
     }
 
     #[test]
-    fn files_are_sorted_lexicographically() {
+    fn files_are_sorted_chronologically_past_the_ninth_rotation() {
         let dir = tempfile::tempdir().expect("temp");
-        // Write two files with different names to test sorting.
-        std::fs::write(dir.path().join("nrr_audit_20260423-2.ndjson"), "").unwrap();
-        std::fs::write(dir.path().join("nrr_audit_20260423-1.ndjson"), "").unwrap();
-        std::fs::write(dir.path().join("nrr_audit_20260422-1.ndjson"), "").unwrap();
+        for name in [
+            "nrr_audit_20260423-2.ndjson",
+            "nrr_audit_20260423-11.ndjson",
+            "nrr_audit_20260423-1.ndjson",
+            "nrr_audit_20260422-9.ndjson",
+        ] {
+            std::fs::write(dir.path().join(name), "").unwrap();
+        }
 
         let reader = AuditReader::new(dir.path());
-        let files = reader.list_files();
-        let names: Vec<_> = files
+        let names: Vec<_> = reader
+            .list_files()
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(
             names,
             [
-                "nrr_audit_20260422-1.ndjson",
+                "nrr_audit_20260422-9.ndjson",
                 "nrr_audit_20260423-1.ndjson",
                 "nrr_audit_20260423-2.ndjson",
+                "nrr_audit_20260423-11.ndjson",
             ]
         );
     }

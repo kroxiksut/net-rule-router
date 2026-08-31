@@ -413,6 +413,15 @@ enum AuthorizationOutcome {
     Refused(String),
 }
 
+/// `MutationQueue` slot count for a production router.
+///
+/// The queue serialises privileged mutations (`Apply`, `Rollback`,
+/// `SafeDisable`); this covers the GUI's worst-case burst of mass-toggle clicks
+/// without hoarding memory. Declared here rather than in one platform's wiring:
+/// Windows passed 32 and Linux passed a literal 1, so the same burst that
+/// queued on one OS was refused as a conflict on the other.
+pub const MUTATION_QUEUE_CAPACITY: usize = 32;
+
 pub struct IpcRouter {
     registry: IpcHandlerRegistry,
     audit: Arc<dyn IpcAuditEmitter>,
@@ -517,13 +526,30 @@ impl IpcRouter {
         // `read-snapshot` skipped all four.
         let class = canonical_operation_class(request.operation, &request.payload);
         if class != request.operation_class {
+            // Our own client derives the label from this very function, so a
+            // divergent envelope is never ours - and the pipe's DACL admits any
+            // authenticated local process. Admitting it "by the derived class"
+            // was not enough on its own: handlers downstream read the DECLARED
+            // one to pick a principal, which is how a user-scoped edit reached
+            // the shared admin baseline.
             tracing::warn!(
                 target: "nrr::ipc::dispatch",
                 operation = op_slug,
                 declared = request.operation_class.slug(),
                 actual = class.slug(),
-                "request declared a different operation class than the operation has; \
-                 admitting it by the derived class",
+                "refusing a request that declares an operation class the operation does not have",
+            );
+            return IpcResponseEnvelope::err(
+                &request,
+                IpcError {
+                    code: IpcErrorCode::MalformedRequest,
+                    message: format!(
+                        "operation {op_slug} is {}, not {}",
+                        class.slug(),
+                        request.operation_class.slug()
+                    ),
+                    diagnostics_id: None,
+                },
             );
         }
         // Demoted from info → debug. Every IPC request was emitting
@@ -581,6 +607,13 @@ impl IpcRouter {
     ) -> IpcResponseEnvelope {
         // Derived, never accepted — see `dispatch`.
         let class = canonical_operation_class(request.operation, &request.payload);
+        // Stamped onto the envelope so a handler reading the field reads the
+        // derived class, not the caller's claim. `dispatch` already refused a
+        // divergent envelope; this keeps the guarantee local rather than
+        // resting on that call order.
+        let mut request = request;
+        request.operation_class = class;
+        let request = request;
 
         // 1. Protocol version.
         if request.protocol_version != IPC_PROTOCOL_VERSION {
@@ -631,6 +664,28 @@ impl IpcRouter {
                     diagnostics_id: None,
                 },
             );
+        }
+
+        // 3b. Which surfaces may invoke THIS operation. The class check above
+        //     asks what kind of thing the caller may do; this asks whether the
+        //     catalogue lets this surface do this particular one. The field
+        //     carried that answer from the start and nothing read it, so the
+        //     tray could invoke operations the catalogue marks GUI-only.
+        if let Some(spec) = nrr_shared::ipc::ipc_operation_spec(request.operation) {
+            if !spec.allowed_clients.contains(&ctx.client_profile) {
+                return IpcResponseEnvelope::err(
+                    &request,
+                    IpcError {
+                        code: IpcErrorCode::Forbidden,
+                        message: format!(
+                            "{} clients may not invoke {}",
+                            ctx.client_profile.slug(),
+                            request.operation.slug()
+                        ),
+                        diagnostics_id: None,
+                    },
+                );
+            }
         }
 
         // 4. Elevation check. An unelevated caller may still be authorized for
@@ -801,28 +856,26 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_classes_do_not_require_elevation() {
-        // Regression pins: InterfacesRefreshRequest (adapter re-enumeration
-        // and external-address probe) is a DiagnosticQuery since HW-0730 —
-        // read-class dispatch, outside the mutation queue, callable by a
-        // non-elevated client without a UAC prompt. DiagnosticAction keeps
-        // the same non-elevating property for the ops that still use it.
+    fn a_diagnostic_query_needs_no_elevation() {
+        // `InterfacesRefreshRequest` (adapter re-enumeration + external-address
+        // probe) is a DiagnosticQuery: read-class dispatch, outside the mutation
+        // queue, callable by a non-elevated client without a UAC prompt.
+        //
+        // This used to loop over DiagnosticQuery and DiagnosticAction by
+        // stamping each onto the same operation; that envelope is now refused.
         let router = make_router();
-        for class in [
+        let request = req(
+            IpcOperationName::InterfacesRefreshRequest,
             IpcOperationClass::DiagnosticQuery,
-            IpcOperationClass::DiagnosticAction,
-        ] {
-            let r = router.dispatch(
-                req(
-                    IpcOperationName::InterfacesRefreshRequest,
-                    class,
-                    IPC_PROTOCOL_VERSION,
-                    None,
-                ),
-                unprivileged_tray(),
-            );
-            assert!(r.ok, "{class:?}: {:?}", r.error);
-        }
+            IPC_PROTOCOL_VERSION,
+            None,
+        );
+        assert_eq!(
+            canonical_operation_class(request.operation, &request.payload),
+            IpcOperationClass::DiagnosticQuery,
+        );
+        let r = router.dispatch(request, unprivileged_tray());
+        assert!(r.ok, "{:?}", r.error);
     }
 
     #[test]
@@ -859,97 +912,61 @@ mod tests {
 
     /// A caller cannot pick which checks it faces by labelling its request.
     ///
-    /// Before the class was derived server-side, the four admission checks read
-    /// the caller's own label, so a mutation announced as `read-snapshot`
-    /// skipped the confirmation token, the elevation gate, the pre-execution
-    /// audit record and the single-writer queue in one move.
+    /// The four admission checks (confirmation token, elevation gate,
+    /// pre-execution audit, single-writer queue) are selected by the class.
+    /// While the class came from the envelope, a mutation announced as
+    /// `read-snapshot` skipped all four in one move. Deriving it server-side
+    /// closed that, but handlers still read the DECLARED field to choose a
+    /// principal — a user-scoped edit announced as `mutation-request` wrote to
+    /// the shared admin baseline. So a divergent label is now refused outright:
+    /// our own client derives its label from the same function, which makes a
+    /// mismatched envelope something we did not send.
     #[test]
-    fn a_mutation_labelled_as_a_read_is_still_admitted_as_a_mutation() {
+    fn a_request_whose_declared_class_is_not_the_operations_own_is_refused() {
         let router = make_router();
 
-        // Unprivileged caller, mutation dressed as a read: elevation still
-        // required.
-        let r = router.dispatch(
-            req(
+        for (op, wrong_class, ctx) in [
+            (
                 IpcOperationName::MutationSubmit,
                 IpcOperationClass::ReadSnapshot,
-                IPC_PROTOCOL_VERSION,
-                Some("ok"),
+                unprivileged_tray(),
             ),
-            unprivileged_tray(),
-        );
-        assert!(!r.ok, "an unprivileged mutation must not pass as a read");
-        assert_eq!(r.error.unwrap().code, IpcErrorCode::Forbidden);
-
-        // Elevated caller, same disguise, no token: the two-phase gate holds.
-        let r = router.dispatch(
-            req(
-                IpcOperationName::MutationSubmit,
-                IpcOperationClass::ReadSnapshot,
-                IPC_PROTOCOL_VERSION,
-                None,
-            ),
-            elevated_gui(),
-        );
-        assert!(
-            !r.ok,
-            "the confirmation-token gate must not be label-driven"
-        );
-        assert_eq!(r.error.unwrap().code, IpcErrorCode::PreconditionFailed);
-    }
-
-    /// The console may read, but may not change policy — enforced by the
-    /// service, not by discipline inside the console's own code.
-    #[test]
-    fn the_console_profile_cannot_reach_a_mutation_even_when_elevated() {
-        let router = make_router();
-        let console = IpcRequestContext {
-            client_profile: IpcClientProfile::AdminConsole,
-            caller_is_elevated: true,
-            caller_principal: None,
-            caller_pid: None,
-        };
-        let r = router.dispatch(
-            req(
-                IpcOperationName::MutationSubmit,
-                IpcOperationClass::MutationRequest,
-                IPC_PROTOCOL_VERSION,
-                Some("ok"),
-            ),
-            console.clone(),
-        );
-        assert!(!r.ok, "an elevated console must still not mutate policy");
-        assert_eq!(r.error.unwrap().code, IpcErrorCode::Forbidden);
-
-        // What it exists for still works.
-        let r = router.dispatch(
-            req(
-                IpcOperationName::ServiceHealthGet,
-                IpcOperationClass::ReadSnapshot,
-                IPC_PROTOCOL_VERSION,
-                None,
-            ),
-            console,
-        );
-        assert!(r.ok, "{:?}", r.error);
-    }
-
-    /// The other direction: a read labelled as a mutation must not acquire a
-    /// mutation's obligations, or a mislabelling client would deadlock itself
-    /// against the single-writer queue.
-    #[test]
-    fn a_read_labelled_as_a_mutation_is_still_admitted_as_a_read() {
-        let router = make_router();
-        let r = router.dispatch(
-            req(
+            (
                 IpcOperationName::ServiceHealthGet,
                 IpcOperationClass::MutationRequest,
-                IPC_PROTOCOL_VERSION,
-                None,
+                unprivileged_tray(),
             ),
-            unprivileged_tray(),
+        ] {
+            let r = router.dispatch(req(op, wrong_class, IPC_PROTOCOL_VERSION, Some("ok")), ctx);
+            assert!(!r.ok, "{op:?} labelled {wrong_class:?} must be refused");
+            assert_eq!(
+                r.error.expect("error").code,
+                IpcErrorCode::MalformedRequest,
+                "{op:?}: a mislabelled envelope is a malformed one",
+            );
+        }
+    }
+
+    /// The handler side of the same rule: whatever a handler reads out of the
+    /// envelope is the DERIVED class. Belt and braces — `dispatch` refuses a
+    /// divergent envelope before this matters — but the guarantee is what stops
+    /// the next handler from reintroducing a principal chosen by the caller.
+    #[test]
+    fn handlers_see_the_derived_class_not_the_declared_one() {
+        let request = req(
+            IpcOperationName::ServiceHealthGet,
+            IpcOperationClass::MutationRequest,
+            IPC_PROTOCOL_VERSION,
+            None,
         );
-        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            canonical_operation_class(request.operation, &request.payload),
+            IpcOperationClass::ReadSnapshot,
+            "fixture guard: the operation must actually be a read",
+        );
+        let router = make_router();
+        let r = router.dispatch(request, unprivileged_tray());
+        assert!(!r.ok, "the divergent envelope is refused at the door");
     }
 
     #[test]
@@ -1091,10 +1108,10 @@ mod tests {
         assert!(!IpcOperationClass::UserScopedMutation.requires_elevation());
         assert!(IpcOperationClass::UserScopedMutation.requires_confirmation_token());
 
-        // DiagnosticAction: mutating (audited before dispatch) but must
-        // not require client elevation — it is the class used by the
-        // external-address probe / adapter refresh, which must never
-        // surface a UAC prompt. Single-step, no confirmation token.
+        // DiagnosticAction: mutating (audited before dispatch) but must not
+        // require client elevation — clearing logs, discarding the rebuildable
+        // cache and toggling the diagnostic session must never surface a UAC
+        // prompt. Single-step, no confirmation token.
         assert!(IpcOperationClass::DiagnosticAction.is_mutating());
         assert!(!IpcOperationClass::DiagnosticAction.requires_elevation());
         assert!(!IpcOperationClass::DiagnosticAction.requires_confirmation_token());

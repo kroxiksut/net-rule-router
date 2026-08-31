@@ -4,8 +4,8 @@
 //! The catch-all block-all (`FailClosedUnknown` / `kill_switch_block_all`) cuts
 //! every destination it cannot classify. Rule hosts escape via their compiled
 //! permits, but a DIRECT host — one no rule matches — has no permit at all, so
-//! it is cut too (the habr.com case: the secondary adapter vanished
-//! after a BSOD, the block-all armed, and a plain primary-path site died).
+//! it is cut too (the habr.com case: the secondary adapter vanished after an
+//! unclean restart, the block-all armed, and a plain primary-path site died).
 //!
 //! This registry collects addresses two provers feed in:
 //!
@@ -23,7 +23,7 @@
 //! catch-all. Session-scoped like the FCrDNS attempt set: the block-all is a
 //! transient posture, and a service restart starts clean.
 
-use std::collections::HashSet;
+use crate::bounded_set::BoundedRecentSet;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
 
@@ -38,9 +38,13 @@ pub const DEFAULT_KNOWN_DIRECT_CAP: usize = 1024;
 
 /// Thread-safe, capped, session-scoped set of known-direct IPv4 destinations.
 pub struct KnownDirectRegistry {
-    ips: Mutex<HashSet<Ipv4Addr>>,
-    cap: usize,
-    cap_warned: Mutex<bool>,
+    /// Bounded and least-recently-registered first. A cap that REFUSED new
+    /// addresses froze the registry: once full, every direct host discovered
+    /// afterwards stayed blocked under the block-all for the rest of the
+    /// session, which the user experiences as sites that work until they
+    /// suddenly do not. Evicting the coldest entry instead costs at most one
+    /// re-registration - the next resolution of that host puts it back.
+    ips: Mutex<BoundedRecentSet<Ipv4Addr>>,
 }
 
 impl Default for KnownDirectRegistry {
@@ -52,9 +56,7 @@ impl Default for KnownDirectRegistry {
 impl KnownDirectRegistry {
     pub fn new(cap: usize) -> Self {
         Self {
-            ips: Mutex::new(HashSet::new()),
-            cap,
-            cap_warned: Mutex::new(false),
+            ips: Mutex::new(BoundedRecentSet::new(cap)),
         }
     }
 
@@ -72,22 +74,18 @@ impl KnownDirectRegistry {
             .filter(|ip| !is_non_routable_v4(ip))
             .copied()
         {
-            if set.contains(&ip) {
+            let seen = set.observe(ip);
+            if !seen.is_new {
                 continue;
             }
-            if set.len() >= self.cap {
-                let mut warned = self.cap_warned.lock().unwrap_or_else(|p| p.into_inner());
-                if !*warned {
-                    *warned = true;
-                    tracing::warn!(
-                        target: "nrr::killswitch",
-                        cap = self.cap,
-                        "known-direct registry is full — further direct hosts stay blocked under the block-all until it disarms (session cap)",
-                    );
-                }
-                break;
+            if let Some(evicted) = seen.evicted {
+                tracing::debug!(
+                    target: "nrr::killswitch",
+                    evicted = %evicted,
+                    admitted = %ip,
+                    "known-direct registry full; the coldest direct host gave way",
+                );
             }
-            set.insert(ip);
             added += 1;
         }
         added
@@ -156,12 +154,20 @@ mod tests {
     }
 
     #[test]
-    fn cap_refuses_overflow_but_keeps_existing() {
+    fn a_full_registry_admits_the_new_host_and_drops_the_coldest() {
+        // Refusing new entries froze the registry: every direct host discovered
+        // after the cap stayed BLOCKED under the block-all for the rest of the
+        // session — sites that work until they suddenly do not.
         let r = KnownDirectRegistry::new(2);
         assert_eq!(r.register(&[ip(1, 1, 1, 1), ip(2, 2, 2, 2)]), 2);
-        assert_eq!(r.register(&[ip(3, 3, 3, 3)]), 0, "cap reached");
-        assert_eq!(r.len(), 2);
-        // Existing entries still re-register as no-ops.
-        assert_eq!(r.register(&[ip(1, 1, 1, 1)]), 0);
+        assert_eq!(r.register(&[ip(3, 3, 3, 3)]), 1, "the new host is admitted");
+        assert_eq!(r.len(), 2, "the bound still holds");
+        assert_eq!(
+            r.snapshot(),
+            vec![ip(2, 2, 2, 2), ip(3, 3, 3, 3)],
+            "the coldest gave way",
+        );
+        // Re-registering something present is still a no-op.
+        assert_eq!(r.register(&[ip(3, 3, 3, 3)]), 0);
     }
 }

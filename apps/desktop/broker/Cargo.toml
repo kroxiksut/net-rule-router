@@ -56,6 +56,10 @@ windows = { version = "0.58", features = [
     # Block 16 (2026-06-27) #7 — start a DemandStart service from the
     # unprivileged launcher using the granted SERVICE_START right (no UAC).
     "Win32_System_Services",
+    # The elevated broker reads the MACHINE environment block instead of
+    # inheriting the user's, which a user can rewrite without any privilege.
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
 ] }
 
 [dev-dependencies]

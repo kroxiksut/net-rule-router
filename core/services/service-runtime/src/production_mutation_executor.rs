@@ -4,7 +4,7 @@
 //! Handles `MutationKind::RulesUpdate` end-to-end through the
 //! coordinator's revision lifecycle:
 //! - `preview` → `submit_candidate` (idempotent dedup) +
-//!   `dry_run_apply` → `ReviewSummaryResponse`
+//!   `dry_run_rules` → `ReviewSummaryResponse`
 //! - `execute` → `submit_candidate` + `issue_confirmation_token` +
 //!   `activate` → `MutationOutcome`
 //! - `rollback` → `rollback_to(target)` → `MutationOutcome`
@@ -327,22 +327,16 @@ impl ProductionMutationExecutor {
         if let Err(e) = Self::enforce_free_rule_cap(&parsed.rules_json) {
             return malformed_summary(&e.message);
         }
-        // Score risk BEFORE submitting the candidate
-        // so we don't poison the candidate's stored `risk_level` when
-        // the dry-run path completes. The score is reflected back into
-        // the wire `ReviewSummaryResponse`; the candidate itself stays
-        // at `risk_level: None` until activation persists it.
+        // The score is reflected back into the wire `ReviewSummaryResponse`.
         let scored = self.score_candidate_for_payload(&parsed.rules_json, principal);
-
-        let submission = Self::submission_from(&parsed, "ipc-dry-run", principal);
-        let revision_id = match self.coordinator.submit_candidate(submission) {
-            Ok(id) => id,
-            Err(e) => return policy_error_summary(&e),
-        };
-        match self.coordinator.dry_run_apply(&revision_id, "ipc-dry-run") {
-            Ok(summary) => dry_run_to_review_summary(&summary, scored),
-            Err(e) => policy_error_summary(&e),
-        }
+        // Planned from the payload, NOT from a stored candidate. This is a read
+        // operation; submitting one made it write a revision row per press of
+        // the preview button, and those rows then showed up in the user's
+        // pending list as edits they never made.
+        let summary = self
+            .coordinator
+            .dry_run_rules(principal, &parsed.rules_json, "ipc-dry-run");
+        dry_run_to_review_summary(&summary, scored)
     }
 
     /// Computes the [`RiskAssessment`] for the
@@ -373,8 +367,8 @@ impl ProductionMutationExecutor {
         // differed.
         let prev_book = load_active_rule_book(conn, principal);
 
-        let prev_profile = prev_book.map(synthetic_profile);
-        let next_profile = synthetic_profile(candidate_book);
+        let prev_profile = prev_book.map(|book| profile_for(conn, principal, book));
+        let next_profile = profile_for(conn, principal, candidate_book);
 
         let diff = nrr_domain::review::compute_diff(prev_profile.as_ref(), &next_profile);
         let assessment = nrr_domain::risk::score_candidate(
@@ -506,10 +500,22 @@ impl ProductionMutationExecutor {
         // deduped against the now-acknowledged alert).
         if crate::tamper_bootstrap::is_blocking_alert_kind(&alert.kind) {
             match self.coordinator.re_sign_all_revisions() {
-                Ok(n) => tracing::info!(
+                // Rows that did NOT match their signature before this call are
+                // named, at warn level: acknowledging the alert adopts their
+                // current contents as legitimate, and that decision must be
+                // visible afterwards rather than buried in a row count.
+                Ok(report) if !report.adopted_tampered.is_empty() => tracing::warn!(
                     target: "nrr::tamper",
                     alert_id = %parsed.alert_id,
-                    re_signed = n,
+                    re_signed = report.re_signed,
+                    adopted = report.adopted_tampered.len(),
+                    revisions = %report.adopted_tampered.join(", "),
+                    "tamper-alert acknowledgement re-signed revision rows that did NOT match                      their stored signature — their current contents are now trusted",
+                ),
+                Ok(report) => tracing::info!(
+                    target: "nrr::tamper",
+                    alert_id = %parsed.alert_id,
+                    re_signed = report.re_signed,
                     "re-signed revision rows on tamper-alert acknowledgement",
                 ),
                 Err(e) => tracing::warn!(
@@ -571,7 +577,7 @@ impl ProductionMutationExecutor {
     /// active revision's other-route rules (single-route imports only)
     /// or assembles both routes (both-routes imports), encodes into
     /// canonical `rules_json`, then runs the standard
-    /// `submit_candidate` + `dry_run_apply` flow.
+    /// preview flow — planned from the payload, stored only on execute.
     fn preview_preset_import(
         &self,
         payload: &serde_json::Value,
@@ -585,15 +591,12 @@ impl ProductionMutationExecutor {
             return malformed_summary(&e.message);
         }
         let scored = self.score_candidate_for_payload(&assembled.rules_json, principal);
-        let submission = preset_submission_from(&assembled, "ipc-dry-run", principal);
-        let revision_id = match self.coordinator.submit_candidate(submission) {
-            Ok(id) => id,
-            Err(e) => return policy_error_summary(&e),
-        };
-        match self.coordinator.dry_run_apply(&revision_id, "ipc-dry-run") {
-            Ok(summary) => dry_run_to_review_summary(&summary, scored),
-            Err(e) => policy_error_summary(&e),
-        }
+        // Planned from the assembled rules, not from a stored candidate — see
+        // the rules-preview path above.
+        let summary =
+            self.coordinator
+                .dry_run_rules(principal, &assembled.rules_json, "ipc-dry-run");
+        dry_run_to_review_summary(&summary, scored)
     }
 
     /// Execute path for `MutationKind::PresetImport`. Same assembly as
@@ -831,8 +834,16 @@ impl ProductionMutationExecutor {
     /// `RevisionNotInExpectedStatus { actual: Active, expected: candidate }`
     /// (the empty-import / full-reset clear failure observed in the field).
     /// Detect that case and report a no-op success instead.
-    fn already_active_noop(&self, revision_id: &RevisionId) -> Option<MutationOutcome> {
-        match self.coordinator.current_active() {
+    fn already_active_noop(
+        &self,
+        revision_id: &RevisionId,
+        principal: &str,
+    ) -> Option<MutationOutcome> {
+        // The CALLER's active revision, not the baseline's. A revision belongs
+        // to one principal, so comparing against the baseline never matches a
+        // user's own id: the no-op was missed and the flow went on to fail the
+        // `Candidate`-only activate gate with `RevisionNotInExpectedStatus`.
+        match self.coordinator.current_active_for(principal) {
             Ok(Some(active)) if active.revision_id == revision_id.as_str() => {
                 tracing::info!(
                     target: "nrr::mutation::execute",
@@ -875,7 +886,7 @@ impl ProductionMutationExecutor {
         correlation: &str,
         principal: &str,
     ) -> Option<MutationOutcome> {
-        if let Some(noop) = self.already_active_noop(revision_id) {
+        if let Some(noop) = self.already_active_noop(revision_id, principal) {
             return Some(noop);
         }
         let status = match self.coordinator.status_of(revision_id) {
@@ -1547,22 +1558,6 @@ fn not_implemented_summary(reason: &str) -> ReviewSummaryResponse {
     }
 }
 
-fn policy_error_summary(err: &PolicyError) -> ReviewSummaryResponse {
-    ReviewSummaryResponse {
-        diff_summary: format!("dry-run failed: {err:?}"),
-        provenance: "service".into(),
-        risk_level: ReviewRiskLevel::High,
-        requires_review: true,
-        changed_fields: Vec::new(),
-        risk_signals: Vec::new(),
-        rules_added: Vec::new(),
-        rules_removed: Vec::new(),
-        rules_modified: Vec::new(),
-        rules_retargeted: Vec::new(),
-        extended_sections: Vec::new(),
-    }
-}
-
 /// Wire-shaped scoring result produced by
 /// [`ProductionMutationExecutor::score_candidate_for_payload`]. When
 /// `None` is returned the dry-run path falls back to the legacy
@@ -1624,26 +1619,65 @@ fn load_active_rule_book(
     decode_rule_book(&record.rules_json)
 }
 
-/// Wrap a rule book into a synthetic [`CanonicalProfile`] so
-/// `review::compute_diff` can consume it. Bindings + behavior_mode
-/// are placeholders — `RulesUpdate` doesn't change them, so prev and
-/// next must use the SAME placeholder values for `compute_diff` to
-/// report no binding/mode change. The synthetic adapter id is stable
-/// across calls inside one `score_candidate_for_payload` invocation;
-/// the actual binding-change signal is never emitted from this path.
-fn synthetic_profile(rule_book: CanonicalRuleBook) -> CanonicalProfile {
+/// Wrap a rule book into the [`CanonicalProfile`] the risk scorer compares.
+///
+/// The binding and the behaviour mode are read from the caller's stored policy
+/// rather than invented: they used to be fixed placeholders
+/// (`PreferPrimary`, one synthetic adapter) on BOTH sides of the diff, which
+/// made `FailClosedActivation` unreachable — a first revision activated while
+/// the user is in the strict fail-closed mode is exactly the case that signal
+/// exists for, and it read as `PreferPrimary`.
+///
+/// `DefaultBehaviorChanged` and `UnstableInterfaceBinding` still cannot fire
+/// HERE, and that is correct: editing rules changes neither, so both sides of
+/// this diff carry the same policy. They belong to the route-policy update
+/// path, which does not score risk at all today.
+fn profile_for(
+    conn: &Arc<Mutex<Connection>>,
+    principal: &str,
+    rule_book: CanonicalRuleBook,
+) -> CanonicalProfile {
     const SYNTHETIC_ID: &str = "synthetic-rules-update";
-    CanonicalProfile {
-        primary: RouteBinding {
-            role: RouteRole::Primary,
-            adapter: AdapterIdentity {
-                stable_id: SYNTHETIC_ID.to_string(),
-                display_name: SYNTHETIC_ID.to_string(),
-            },
-            source: BindingSource::UserAssigned,
+    let stored = conn.lock().ok().and_then(|guard| {
+        nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+            .load_for_sid(principal)
+            .ok()
+    });
+    let binding = |b: Option<&nrr_storage::RouteBindingRecord>, role: RouteRole| RouteBinding {
+        role,
+        adapter: AdapterIdentity {
+            stable_id: b
+                .map(|b| b.stable_id.clone())
+                .unwrap_or_else(|| SYNTHETIC_ID.to_string()),
+            display_name: b
+                .map(|b| b.display_name.clone())
+                .unwrap_or_else(|| SYNTHETIC_ID.to_string()),
         },
-        secondary: None,
-        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        source: BindingSource::UserAssigned,
+    };
+    CanonicalProfile {
+        primary: binding(
+            stored.as_ref().and_then(|p| p.primary.as_ref()),
+            RouteRole::Primary,
+        ),
+        secondary: stored
+            .as_ref()
+            .and_then(|p| p.secondary.as_ref())
+            .map(|b| binding(Some(b), RouteRole::Secondary)),
+        behavior_mode: stored
+            .as_ref()
+            .map(|p| match p.mode {
+                nrr_storage::route_bindings::BehaviorMode::PreferPrimary => {
+                    RouteBehaviorMode::PreferPrimary
+                }
+                nrr_storage::route_bindings::BehaviorMode::PreferSecondaryWhenAvailable => {
+                    RouteBehaviorMode::PreferSecondaryWhenAvailable
+                }
+                nrr_storage::route_bindings::BehaviorMode::StrictSecondaryFailClosed => {
+                    RouteBehaviorMode::StrictSecondaryFailClosed
+                }
+            })
+            .unwrap_or(RouteBehaviorMode::PreferPrimary),
         rule_book,
     }
 }
@@ -1787,6 +1821,10 @@ fn policy_error_outcome(err: &PolicyError) -> MutationOutcome {
         PolicyError::ConfirmationTokenExpired => {
             ("token-expired", "confirmation token TTL elapsed".into())
         }
+        PolicyError::ConfirmationTokenForOtherRevision => (
+            "token-revision-mismatch",
+            "confirmation token was issued for a different revision".into(),
+        ),
         PolicyError::RevisionNotFound(_) => ("revision-not-found", format!("{err:?}")),
         PolicyError::RevisionNotInExpectedStatus { .. } => {
             ("revision-status-mismatch", format!("{err:?}"))
@@ -2442,7 +2480,7 @@ mod tests {
     #[test]
     fn dry_run_to_review_summary_aggregates_per_sid() {
         let summary = DryRunSummary {
-            revision_id: RevisionId::from_prefixed_string("rev-test".into()).unwrap(),
+            revision_id: Some(RevisionId::from_prefixed_string("rev-test".into()).unwrap()),
             action_plans: vec![
                 crate::activation_coordinator::SidActionPlanSummary {
                     sid: "S-1".into(),
@@ -2575,11 +2613,72 @@ mod tests {
             "include-child-processes": false,
         });
         let review = exec.preview_preset_import(&payload, nrr_storage::BASELINE_PRINCIPAL);
-        // Coordinator's dry_run_apply may succeed or fail depending on
+        // The coordinator's preview may succeed or fail depending on
         // empty-DB state — either way the wire shape must be a valid
         // review summary, not a malformed/precondition stub.
         assert!(!review.diff_summary.is_empty());
         assert!(!review.diff_summary.starts_with("malformed payload"));
+    }
+
+    /// A first revision activated while the user sits in the strict fail-closed
+    /// mode is exactly what `FailClosedActivation` exists to flag, and it could
+    /// never fire: the scorer compared two synthetic profiles that both said
+    /// `PreferPrimary`.
+    #[test]
+    fn the_strict_mode_of_the_caller_reaches_the_risk_scorer() {
+        let (exec, conn) = build_test_executor();
+        let sid = nrr_storage::BASELINE_PRINCIPAL;
+        {
+            let guard = conn.lock().expect("lock");
+            let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+            let mut policy = repo.load_for_sid(sid).expect("load");
+            // Strict mode is only storable with a bound secondary — the same
+            // precondition the GUI enforces.
+            policy.secondary = Some(nrr_storage::RouteBindingRecord {
+                stable_id: "win-adapter:vpn".into(),
+                display_name: "vpn".into(),
+                user_confirmed: true,
+                known_stable_ids: Vec::new(),
+            });
+            policy.mode = nrr_storage::route_bindings::BehaviorMode::StrictSecondaryFailClosed;
+            repo.update_for_sid(sid, &policy, 0).expect("store");
+        }
+
+        let scored = exec
+            .score_candidate_for_payload(r#"{"schema-version":1,"primary":[],"secondary":[]}"#, sid)
+            .expect("scored");
+        assert!(
+            scored
+                .signals
+                .iter()
+                .any(|s| matches!(s, RiskSignalDto::FailClosedActivation)),
+            "expected the fail-closed signal, got {:?}",
+            scored.signals
+        );
+    }
+
+    /// A preview is a READ. It used to submit a candidate to get a plan, so
+    /// every press of it wrote a revision row — rows the user then found in
+    /// their pending list as edits they never made.
+    #[test]
+    fn a_preview_writes_no_revision_row() {
+        let (exec, conn) = build_test_executor();
+        let count = |conn: &Arc<Mutex<rusqlite::Connection>>| -> i64 {
+            let guard = conn.lock().expect("lock");
+            guard
+                .query_row("SELECT COUNT(*) FROM revisions", [], |r| r.get(0))
+                .expect("count")
+        };
+        assert_eq!(count(&conn), 0, "empty to start with");
+
+        let payload = serde_json::json!({
+            "primary-bytes-b64": b64(SAMPLE_PRESET),
+            "include-child-processes": false,
+        });
+        for _ in 0..3 {
+            let _ = exec.preview_preset_import(&payload, nrr_storage::BASELINE_PRINCIPAL);
+        }
+        assert_eq!(count(&conn), 0, "a preview stores nothing");
     }
 
     #[test]

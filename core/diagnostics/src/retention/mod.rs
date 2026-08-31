@@ -24,5 +24,6 @@ pub use health::{AuditWriteStatus, StorageHealthCollector, StorageHealthSnapshot
 pub use policy::{
     AuditRetentionPolicy, LogRetentionPolicy, ManualCleanupScope, DEFAULT_AUDIT_MAX_AGE_DAYS,
     DEFAULT_AUDIT_MAX_SIZE_BYTES, DEFAULT_DIAGNOSTIC_MODE_MAX_HOURS, DEFAULT_LOG_MAX_AGE_DAYS,
-    DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_MAX_SIZE_BYTES,
+    DEFAULT_LOG_MAX_FILES, DEFAULT_LOG_MAX_SIZE_BYTES, MIN_AUDIT_MAX_AGE_DAYS,
+    MIN_AUDIT_MAX_SIZE_BYTES,
 };

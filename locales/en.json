@@ -549,7 +549,9 @@
         "kind-main-link": "main connection: {name}",
         "kind-virtual-machine": "virtual machine: {name}",
         "reject-not-private": "{cidr} is not a local network — only private ranges can be kept reachable.",
-        "reject-malformed": "{cidr} is not a network address. Write it as 10.0.2.0/24."
+        "reject-malformed": "{cidr} is not a network address. Write it as 10.0.2.0/24.",
+        "auto-accept": "Keep newly found local networks reachable without asking",
+        "auto-accept-hint": "A hypervisor, WSL or a second VPN adds a network of its own over time. With this on they stay reachable and no question is shown; every network is still listed below and any of them can be refused."
       },
       "primary-probe": {
         "auto": "Check the main route for new suggestions automatically",
@@ -560,7 +562,11 @@
         "repeat": "Do not re-check the same address for, s"
       },
       "block-ipv6": "Switch IPv6 off while leak protection is on",
-      "block-ipv6-description": "Rules cover IPv4 addresses. A site that also has an IPv6 address could otherwise reach it over the main connection while its IPv4 traffic goes through the additional route. Turn this off only if your network needs IPv6."
+      "block-ipv6-description": "Rules cover IPv4 addresses. A site that also has an IPv6 address could otherwise reach it over the main connection while its IPv4 traffic goes through the additional route. Turn this off only if your network needs IPv6.",
+      "isp-block-candidates": {
+        "label": "Suggest sites your provider blocks",
+        "description": "When a site stops opening on the main connection and that looks like a block rather than the site being down, it is offered as a suggestion to move to the additional route. You still decide — nothing is added on its own."
+      }
     },
     "logs": {
       "level": {
@@ -612,7 +618,11 @@
         }
       },
       "default-mode-note": "When no additional adapter is configured, your main connection is used by default.",
-      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops."
+      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops.",
+      "zone-priority": {
+        "label": "Let a zone rule win over an exact address rule",
+        "note": "Off by default: when a whole zone (say “.ru”) goes one way and a single address inside it goes another, the single address wins, because it is the more specific of the two. Turn this on to make the zone win instead — useful when the zone is the decision you care about and the address rule was only meant as a hint."
+      }
     },
     "revisions": {
       "retention": {
@@ -839,6 +849,9 @@
         "failed": "Could not add the mute: ",
         "saved": "Mute added."
       }
+    },
+    "theme": {
+      "system-undetected": "The system theme could not be determined — using the light theme."
     }
   },
   "vpn-onboarding": {
@@ -1448,6 +1461,19 @@
       "body": "The service will be registered from this folder and restarted. Routing pauses for a moment; your rules, settings and history are kept. Administrator rights are required.",
       "cancel": "Cancel",
       "confirm": "Update service"
+    },
+    "rules-overlap": {
+      "title": "Remove rules already covered",
+      "body": "These rules name a host that one of your wildcard rules already covers. Removing them changes nothing about where your traffic goes — it only shortens the list.",
+      "group-spare": "Safe to remove",
+      "group-deliberate": "Your call",
+      "deliberate-body": "These name a host under a wildcard but send it somewhere else, or block it. That is what an exception looks like, so nothing here is removed for you.",
+      "covered-by": "{host} — already covered by *.{apex}",
+      "exception-line": "{host} ({coveredRoute}) under *.{apex} ({apexRoute})",
+      "keep": "Keep",
+      "keep-tooltip": "Leave this rule alone and stop offering it here.",
+      "remove": "Remove selected",
+      "empty": "Nothing is covered twice right now."
     }
   },
   "status": {
@@ -1467,6 +1493,7 @@
     "route-mode-failed": "Could not update the default route: ",
     "route-binding-uac-declined": "Administrator approval was declined; the adapter binding was not saved to the service, so routing will not be enforced.",
     "route-binding-failed": "Could not save the adapter binding to the service: ",
+    "route-policy-read-failed": "Could not read the current routing policy, so nothing was changed. The setting is saved and will be sent again: ",
     "full-reset-running": "Performing full reset…",
     "bundled-preset-empty": "Could not read the selected bundled preset.",
     "user-presets-folder-empty": "No rule sets found in your folder — showing the sets that come with the app.",
@@ -1750,7 +1777,18 @@
     "binding-parked-offline": "Saved. The connection assignment will be applied as soon as the background service is running.",
     "binding-delivered-after-offline": "The connections you chose are now applied by the background service.",
     "provisioned-rule-set-missing": "The rule set named in the setup answers was not found: ",
-    "drift-still-different": "Compared just now: the rules on screen and the ones the service applies still differ."
+    "drift-still-different": "Compared just now: the rules on screen and the ones the service applies still differ.",
+    "local-network-offer-never-ask": "Stop asking",
+    "local-network-auto-accept-on": "New local networks stay reachable without asking. You can still refuse any of them in Settings.",
+    "local-network-auto-accept-off": "You will be asked about each new local network again.",
+    "protection": {
+      "blanket-block-not-armed": "Full blocking is not switched on: the address of the additional link is unknown, and blocking everything without it would cut the link itself. Traffic outside your rules is not blocked.",
+      "machine-wide-cut-by-another-user": "Another user of this computer switched on leak protection. Part of it cannot be limited to one account, so IPv6 and ping are off for everyone until they switch it off."
+    },
+    "clear-failed": "Could not clear: ",
+    "rules-overlap-removed": "{n} rule(s) removed as already covered. Apply to put the change into effect.",
+    "zone-priority-on": "A zone rule now wins over an exact address rule inside it.",
+    "zone-priority-off": "An exact address rule now wins over the zone it sits in."
   },
   "interfaces": {
     "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
@@ -1915,7 +1953,9 @@
       "delete-confirm": "Delete",
       "save-rules": "Save rules...",
       "save-as-set": "Save as a set (both routes)...",
-      "more": "More..."
+      "more": "More...",
+      "clean-overlaps": "Remove covered rules ({n})",
+      "clean-overlaps-tooltip": "Some rules name a host one of your wildcard rules already covers. Review them and drop the spare ones."
     },
     "bulk": {
       "selected-count": "{n} rule(s) selected",
@@ -2022,6 +2062,7 @@
     },
     "source": {
       "label": "Source:",
+      "set-label": "Rule set:",
       "open-folder-tooltip": "Open the folder containing this rules file in Explorer."
     },
     "app-pins": {
@@ -2145,7 +2186,11 @@
         "action-check-main-route-tooltip": "Tries to reach these addresses over the main connection and marks what it finds. Answering there does not mean the site works there — it only means the address is reachable.",
         "behavior-responds-refusing": "the main route reaches it, but the site refuses addresses there",
         "mark-refusing": "This site refuses addresses on the main connection",
-        "mark-refusing-tooltip": "Use this when the site opens over the main connection but answers that your address is not served. Its addresses then keep being offered even though they are reachable."
+        "mark-refusing-tooltip": "Use this when the site opens over the main connection but answers that your address is not served. Its addresses then keep being offered even though they are reachable.",
+        "show-dismissed": "Show answered ({n})",
+        "show-dismissed-tooltip": "Also list the addresses you told the app not to suggest again, so you can change your mind about one.",
+        "empty-but-answered": "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.",
+        "pending-badge": "{n} address(es) waiting for an answer"
       },
       "table": {
         "intro": "Every address below was pulled in by a site you route. Adding one <b>sends it through the additional route together with the site that needs it</b> — <i>anything you leave alone keeps going through the main route</i>. A dismissed address <i>only stops being offered</i>; \"Allow again\" lifts that suppression and nothing else.",
@@ -2172,7 +2217,8 @@
       "disconnected": "Service offline — showing locally-cached data",
       "service-stopped": "NetRuleRouter service is stopped",
       "service-not-installed": "NetRuleRouter service is not installed",
-      "protocol-mismatch": "Service version mismatch — please update NetRuleRouter"
+      "protocol-mismatch": "Service version mismatch — please update NetRuleRouter",
+      "refused": "The background service refused this connection"
     },
     "service-status": {
       "connected": "OK",
@@ -2180,7 +2226,8 @@
       "disconnected": "offline",
       "service-stopped": "stopped",
       "service-not-installed": "not installed",
-      "protocol-mismatch": "incompatible"
+      "protocol-mismatch": "incompatible",
+      "refused": "refused"
     }
   },
   "first-run": {
@@ -2902,6 +2949,14 @@
         "title": "Your rules are not being applied",
         "body": "The service reported a state this version does not recognise. Open interfaces and routes to check the setup."
       }
+    },
+    "rules-file-converged": {
+      "title": "Your rules file was brought up to date",
+      "body": "The linked rules file was written differently from the rules in the app, but both described the same routing. The file has been rewritten to match; nothing about what is applied changed."
+    },
+    "service-refused": {
+      "title": "The service will not accept this app",
+      "body": "The background service is running, but it refused a connection from this account. That usually means the service was installed by a different user, or it is already serving as many connections as it allows. Reinstalling the service as an administrator, or signing in as the account that installed it, restores the link."
     }
   },
   "route": {

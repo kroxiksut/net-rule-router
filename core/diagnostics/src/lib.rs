@@ -53,6 +53,7 @@ pub mod query;
 pub mod reason;
 pub mod redaction;
 pub mod retention;
+pub mod rotation;
 pub mod sink;
 pub mod startup;
 pub mod taxonomy;
@@ -62,16 +63,16 @@ pub use archive::{
     DiagnosticArchiveRequest, RedactionReport,
 };
 pub use audit::{
-    compute_chain_hash, local_date_string, utc_date_string, ActorKind, AuditChainVerification,
-    AuditEventInput, AuditEventKind, AuditEventResult, AuditQueryFilter, AuditReader, AuditWriter,
-    AuditWriterConfig, InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState,
-    SecurityAlertsRepository, AUDIT_CHAIN_GENESIS, DEFAULT_MAX_FILE_SIZE_BYTES,
+    compute_chain_hash, local_date_string, utc_date_string, ActorKind, AuditChainAnchor,
+    AuditChainAnchorStore, AuditChainVerification, AuditEventInput, AuditEventKind,
+    AuditEventResult, AuditQueryFilter, AuditReader, AuditTailIntegrity, AuditWriter,
+    AuditWriterConfig, FileAnchorStore, InMemorySecurityAlertsRepository, SecurityAlert,
+    SecurityAlertState, SecurityAlertsRepository, AUDIT_CHAIN_GENESIS, DEFAULT_MAX_FILE_SIZE_BYTES,
 };
 pub use error::{DiagnosticsError, DiagnosticsResult};
 pub use event::{AuditEvent, LogEvent, AUDIT_EVENT_SCHEMA_VERSION, LOG_EVENT_SCHEMA_VERSION};
 pub use explain::{
-    map_explain, ExplainDataAvailability, ExplainQuery, ExplainQueryKind, ExplainResponse,
-    RuntimeInputSample,
+    ExplainDataAvailability, ExplainQuery, ExplainQueryKind, ExplainResponse, RuntimeInputSample,
 };
 pub use facade::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, ClearLogsRequest, ClearLogsResult,
@@ -99,7 +100,8 @@ pub use redaction::{
 };
 pub use retention::{
     AuditRetentionPolicy, AuditWriteStatus, CleanupJob, CleanupResult, LogRetentionPolicy,
-    ManualCleanupScope, StorageHealthCollector, StorageHealthSnapshot,
+    ManualCleanupScope, StorageHealthCollector, StorageHealthSnapshot, MIN_AUDIT_MAX_AGE_DAYS,
+    MIN_AUDIT_MAX_SIZE_BYTES,
 };
 pub use sink::{AuditSink, CapturingSink, DiagnosticsSink, FailingAuditSink, NoopSink};
 pub use startup::{DiagnosticsAvailability, DiagnosticsStartupHealth};

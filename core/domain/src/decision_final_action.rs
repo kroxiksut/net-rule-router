@@ -37,22 +37,36 @@ use crate::RuleAction;
 
 // ── Known browser process names ───────────────────────────────────────────────
 
-/// Normalized lowercase process names that are recognised as browser executables.
+/// Browser executables by NAME, without an extension.
 ///
-/// Matching is exact — process names are already normalised to lowercase `.exe`
-/// before reaching this check.
+/// A product name is not OS mechanism — `chrome` is called `chrome` everywhere
+/// — but the `.exe` suffix is, and spelling it here made the whole check dead
+/// on Linux and macOS by construction: no process name there ends in `.exe`, so
+/// every process came back `Unclassified`. The suffix is stripped at the
+/// comparison instead, which leaves this list neutral and true on every OS.
+///
+/// `opera_autoupdate` is deliberately ABSENT: it used to sit in this list with
+/// a comment saying it is not a browser, while the code classifies exactly by
+/// membership — the comment described an intention the code did not have.
 const KNOWN_BROWSER_NAMES: &[&str] = &[
-    "chrome.exe",
-    "firefox.exe",
-    "msedge.exe",
-    "brave.exe",
-    "opera.exe",
-    "vivaldi.exe",
-    "iexplore.exe",
-    "waterfox.exe",
-    "seamonkey.exe",
-    "opera_autoupdate.exe", // intentionally not a browser for stub purposes
+    "chrome",
+    "firefox",
+    "msedge",
+    "brave",
+    "opera",
+    "vivaldi",
+    "iexplore",
+    "waterfox",
+    "seamonkey",
 ];
+
+/// The executable's name without a platform suffix, lowercased.
+fn executable_stem(process_name: &str) -> &str {
+    process_name
+        .strip_suffix(".exe")
+        .unwrap_or(process_name)
+        .trim_end_matches('.')
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -227,7 +241,7 @@ fn classify_browser(
         return BrowserClassification::unclassified();
     };
     let name = &identity.process_name;
-    if KNOWN_BROWSER_NAMES.contains(&name.as_str()) {
+    if KNOWN_BROWSER_NAMES.contains(&executable_stem(name)) {
         return BrowserClassification {
             is_browser: true,
             basis: BrowserClassificationBasis::KnownProcessName {
@@ -844,5 +858,24 @@ mod tests {
                 "StrictSecondaryFailClosed must never silently route to primary"
             );
         }
+    }
+
+    #[test]
+    fn a_browser_is_recognised_by_its_name_on_every_os() {
+        // The Windows spelling and the one every other OS uses must reach the
+        // same verdict — the `.exe` in the table made the check dead outside
+        // Windows by construction.
+        assert_eq!(executable_stem("chrome.exe"), "chrome");
+        assert_eq!(executable_stem("chrome"), "chrome");
+        assert!(KNOWN_BROWSER_NAMES.contains(&executable_stem("firefox.exe")));
+        assert!(KNOWN_BROWSER_NAMES.contains(&executable_stem("firefox")));
+    }
+
+    #[test]
+    fn an_updater_is_not_a_browser() {
+        // It sat in the table with a comment saying it is not one, and the code
+        // classifies by membership.
+        assert!(!KNOWN_BROWSER_NAMES.contains(&executable_stem("opera_autoupdate.exe")));
+        assert!(!KNOWN_BROWSER_NAMES.contains(&executable_stem("opera_autoupdate")));
     }
 }

@@ -154,13 +154,18 @@ impl Broker {
                 };
                 *used = None;
             }
-            let mut guard = match self.state.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            let session = {
+                let mut guard = match self.state.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                match guard.take() {
+                    Some(session) => session,
+                    None => return false,
+                }
             };
-            let Some(session) = guard.take() else {
-                return false;
-            };
+            // Frame sent with the lock released: the session is already gone
+            // from our state, so nothing else can be waiting on the answer.
             let _ = perform_call(
                 &session,
                 crate::protocol::BROKER_SHUTDOWN,
@@ -179,26 +184,42 @@ impl Broker {
 
 #[cfg(target_os = "windows")]
 impl Broker {
+    /// Returns the live session, spawning one (a single UAC prompt) if needed.
+    /// The lock is held across the spawn on purpose — two concurrent callers
+    /// must not raise two prompts — and released before any relay.
+    fn session_or_spawn(&self) -> Result<Session, BrokerCallError> {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(session) = guard.as_ref() {
+            return Ok(session.clone());
+        }
+        let session = self.spawn_session()?;
+        *guard = Some(session.clone());
+        Ok(session)
+    }
+
+    fn forget_session(&self) {
+        let mut guard = match self.state.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = None;
+    }
+
     fn call_windows(
         &self,
         operation: &str,
         payload: &serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, BrokerCallError> {
-        let mut guard = match self.state.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-
-        // Ensure a session, spawning (one UAC) if needed.
-        let session = match guard.as_ref() {
-            Some(s) => s.clone(),
-            None => {
-                let s = self.spawn_session()?;
-                *guard = Some(s.clone());
-                s
-            }
-        };
+        // The lock covers session BOOKKEEPING only, never the relay itself.
+        // Holding it across the call meant every `is_session_active` poll — the
+        // GUI asks roughly once a second, each on its own thread — blocked
+        // behind a long privileged operation, and threads piled up without
+        // bound whenever one of them hung.
+        let session = self.session_or_spawn()?;
 
         let result = match perform_call(&session, operation, payload, timeout, CALL_CONNECT_TIMEOUT)
         {
@@ -207,9 +228,8 @@ impl Broker {
                 // Broker likely died (app idle, killed, crashed). Drop the
                 // dead session and re-spawn once (a fresh UAC prompt).
                 eprintln!("[nrr-broker] call transport failure ({transport}); re-spawning");
-                *guard = None;
-                let session = self.spawn_session()?;
-                *guard = Some(session.clone());
+                self.forget_session();
+                let session = self.session_or_spawn()?;
                 match perform_call(&session, operation, payload, timeout, CALL_CONNECT_TIMEOUT) {
                     Ok(resp) => map_response(resp),
                     Err(e) => Err(BrokerCallError::Unavailable(e)),
@@ -317,6 +337,10 @@ fn perform_call(
     let handle =
         connect_pipe(&session.pipe_name, connect_timeout).map_err(|e| format!("connect: {e}"))?;
     let mut io = PipeIo::new(handle.raw()).map_err(|e| format!("pipe io: {e}"))?;
+    // The broker relays a command that can hang (a wedged service stop); the
+    // caller's budget plus a margin is what stops a hung relay from blocking
+    // this thread forever.
+    io.set_timeout(timeout + CALL_CONNECT_TIMEOUT);
     let request = BrokerRequest {
         nonce: session.nonce.clone(),
         operation: operation.to_string(),

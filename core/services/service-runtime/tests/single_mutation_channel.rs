@@ -9,7 +9,7 @@
 //! [`ActivationCoordinator`]:
 //!
 //! - `submit_candidate(...)`
-//! - `dry_run_apply(...)`
+//! - `dry_run_rules(...)`
 //! - `activate(...)`
 //! - `rollback_to(...)`
 //!
@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 /// at the call site (`.<name>(`).
 const PRIVILEGED_METHODS: &[&str] = &[
     "submit_candidate",
-    "dry_run_apply",
+    "dry_run_rules",
     "activate",
     "rollback_to",
 ];

@@ -77,7 +77,7 @@ const ADAPTER_DEBOUNCE_MS: u64 = 500;
 pub(crate) fn build_runtime_deps(
     artifacts: &BootstrapArtifacts,
     health: Arc<HealthAggregator>,
-    ipc_server: Arc<dyn IpcServer>,
+    ipc: IpcServerParts,
     event_bus: Arc<EventBus>,
     policy: Option<PolicyStack>,
     dns_observation: Option<DnsObservationWiring>,
@@ -155,9 +155,10 @@ pub(crate) fn build_runtime_deps(
 
     SupervisedRuntimeDeps {
         health,
-        ipc_server,
+        ipc_server: ipc.server,
         adapter_monitor,
         operation_results: Arc::default(),
+        mutation_tokens: ipc.mutation_tokens,
         stability: ServiceStabilityConfig::default(),
         logs_dir,
         log_retention: LogRetentionPolicy::default(),
@@ -234,6 +235,9 @@ pub(crate) fn build_runtime_deps(
         // No Linux suspend/resume mechanism yet. The neutral resume watchdog
         // below still recovers from a wake — just a few seconds later.
         power_event_observer: None,
+        // TODO: no logind session-change stream yet — Mode B arms on the next
+        // periodic re-arm instead of on the sign-in edge.
+        logon_session_observer: None,
         rebind_requests: recompute_hook
             .is_some()
             .then(|| Arc::new(nrr_service_runtime::power_resume::RebindRequests::new())),
@@ -266,13 +270,21 @@ pub(crate) fn build_runtime_deps(
 /// without it (no state database) it falls back to the handshake trio, because
 /// a registry whose providers cannot read anything would answer every question
 /// with a plausible-looking blank.
+pub(crate) struct IpcServerParts {
+    pub server: Arc<dyn IpcServer>,
+    /// The dry-run token store the served surface uses, so the housekeeping
+    /// tick can collect what expires. `None` on the handshake-only fallback:
+    /// with no state database nothing mints a token to begin with.
+    pub mutation_tokens: Option<Arc<nrr_service_runtime::MutationTokenStore>>,
+}
+
 pub(crate) fn build_ipc_server(
     artifacts: &BootstrapArtifacts,
     health: Arc<HealthAggregator>,
     event_bus: Arc<EventBus>,
     stack: Option<&PolicyStack>,
-) -> Arc<dyn IpcServer> {
-    let registry = match stack {
+) -> IpcServerParts {
+    let (registry, audit, mutation_tokens) = match stack {
         Some(stack) => {
             let surface = crate::ipc_deps::build_ipc_surface(
                 Arc::clone(&stack.state_conn),
@@ -295,7 +307,7 @@ pub(crate) fn build_ipc_server(
                 &mut registry,
                 surface.deps,
             );
-            registry
+            (registry, surface.audit, Some(surface.mutation_tokens))
         }
         None => {
             tracing::error!(
@@ -303,7 +315,15 @@ pub(crate) fn build_ipc_server(
                 "no state database: only the handshake, subscription and health operations \
                  are served — the GUI will show the service as needing recovery",
             );
-            crate::run::serving_registry_with(health, Arc::clone(&event_bus))
+            // Handshake trio only: nothing here mints a dry-run token, and the
+            // privileged mutations whose refusal the audit safeguard protects are
+            // not served at all.
+            (
+                crate::run::serving_registry_with(health, Arc::clone(&event_bus)),
+                Arc::new(nrr_service_runtime::NoopIpcAuditEmitter)
+                    as Arc<dyn nrr_service_runtime::IpcAuditEmitter>,
+                None,
+            )
         }
     };
     // polkit answers "may this user do this" for callers who cannot elevate
@@ -312,12 +332,15 @@ pub(crate) fn build_ipc_server(
     let router = Arc::new(
         nrr_service_runtime::IpcRouter::new(
             registry,
-            Arc::new(nrr_service_runtime::NoopIpcAuditEmitter),
-            1,
+            audit,
+            nrr_service_runtime::ipc::MUTATION_QUEUE_CAPACITY,
         )
         .with_authority(Arc::new(nrr_platform_linux::polkit::PolkitAuthority)),
     );
-    Arc::new(UnixDomainSocketServer::new(router).with_event_bus(event_bus))
+    IpcServerParts {
+        server: Arc::new(UnixDomainSocketServer::new(router).with_event_bus(event_bus)),
+        mutation_tokens,
+    }
 }
 
 /// Remember what routed applications talked to, so the next session's routes
@@ -619,6 +642,10 @@ pub(crate) struct PolicyStack {
 pub(crate) fn build_policy_stack(
     artifacts: &BootstrapArtifacts,
     adapters: Arc<nrr_platform_linux::adapters::LinuxAdapterSource>,
+    // Coverage notices go to the principal they concern, so the cycle needs the
+    // push bus: a user whose settings ask for more protection than the machine
+    // can arm learns it from their own window, not from the service log.
+    events: Arc<EventBus>,
 ) -> Option<PolicyStack> {
     let conn = open_state_connection(&artifacts.topology.state_db_path)?;
     let state_conn = Arc::clone(&conn);
@@ -650,12 +677,24 @@ pub(crate) fn build_policy_stack(
     // The same resolver the refresh task uses, pointed at the rule book instead
     // of at expiring cache rows: one asks "what is this name now", the other
     // "what are the names my rules mention".
-    let rule_seeder = Arc::new(RuleHostnameSeeder::new(
-        Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
-        Arc::clone(&cache_store),
-        Arc::clone(&fqdn_cache),
-        Arc::clone(&rules),
-    ));
+    // While the guard holds destinations back, a rule host with no cached
+    // address has nothing protecting it — the seeder then retries in seconds
+    // rather than minutes. The cycle below writes the flag on every pass.
+    let fail_closed_posture =
+        nrr_service_runtime::app_enforcement_status::FailClosedPostureStatus::new();
+    let seed_leak_guard: Arc<dyn nrr_service_runtime::dns_resolver::LeakGuardPosture> = {
+        let posture = fail_closed_posture.clone();
+        Arc::new(move || posture.armed())
+    };
+    let rule_seeder = Arc::new(
+        RuleHostnameSeeder::new(
+            Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+            Arc::clone(&cache_store),
+            Arc::clone(&fqdn_cache),
+            Arc::clone(&rules),
+        )
+        .with_leak_guard_posture(seed_leak_guard),
+    );
 
     // The consumer matches an observed name against a principal's rules, and asks
     // WHICH principal through a callback. With several users present the answer
@@ -778,7 +817,9 @@ pub(crate) fn build_policy_stack(
         dns_consumer_subject,
         cycle: Arc::new(
             PrincipalEnforcementCycle::new(Arc::new(LogindActivePrincipals), plans, enforcer)
-                .with_routes(routes),
+                .with_routes(routes)
+                .with_events(events)
+                .with_fail_closed_posture_status(fail_closed_posture),
         ),
     })
 }

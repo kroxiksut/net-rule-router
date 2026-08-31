@@ -29,7 +29,6 @@ use crate::dto::{
     StorageHealthStatus,
 };
 use crate::error::{StorageError, StorageResult};
-use crate::integrity;
 use crate::repository::{CacheRepository, RevisionMetadataRepository, StorageHealthChecker};
 use crate::resolution_source::{CachePriorityStrategy, StorageResolutionSource};
 use crate::schema::{lookup_direction_as_str, FreshnessStateDb};
@@ -1142,13 +1141,30 @@ impl CacheRepository for SqliteCacheStore {
 /// Owns one connection to `nrr_service_state.db`.
 pub struct SqliteStateStore {
     conn: RefCell<Connection>,
+    /// Row-signing key, when the caller has one. Without it the integrity check
+    /// can still verify structure and format, but a row's `row_hmac` cannot be
+    /// recomputed — an unsigned answer, never a failed one.
+    signing_key: Option<Vec<u8>>,
 }
 
 impl SqliteStateStore {
     pub fn new(conn: Connection) -> Self {
         Self {
             conn: RefCell::new(conn),
+            signing_key: None,
         }
+    }
+
+    /// Attach the key `revisions` rows are signed with, so
+    /// [`Self::check_integrity`] can tell a tampered row from an unsigned one.
+    #[must_use]
+    pub fn with_signing_key(mut self, key: Vec<u8>) -> Self {
+        self.signing_key = Some(key);
+        self
+    }
+
+    fn signing_key(&self) -> Option<Vec<u8>> {
+        self.signing_key.clone()
     }
 
     pub fn into_connection(self) -> Connection {
@@ -1157,75 +1173,73 @@ impl SqliteStateStore {
 }
 
 impl RevisionMetadataRepository for SqliteStateStore {
+    /// The active revision, read from the pair the activation path maintains:
+    /// `active_revision_pointer` (plus `revisions.status = 'active'`).
+    ///
+    /// It used to consult an `active_revision` singleton first — two
+    /// representations of one fact, grown apart. Reading only the singleton
+    /// meant bootstrap reported "no active revision yet (first run)" on a
+    /// machine that had been enforcing rules for months, and offered a recovery
+    /// that would have written over a pointer nothing read. The singleton is
+    /// gone as of state-DB v60; this is the only representation left.
     fn get_active_revision(&self) -> StorageResult<Option<RevisionId>> {
         let conn = self.conn.borrow();
-        let raw: Option<String> = conn
+        let live: Option<String> = conn
             .query_row(
-                "SELECT revision_id FROM active_revision WHERE id = 1",
-                [],
+                "SELECT revision_id FROM active_revision_pointer WHERE principal = ?1",
+                params![crate::BASELINE_PRINCIPAL],
                 |r| r.get(0),
             )
             .optional()
             .map_err(db_err)?;
-        raw.map(RevisionId::from_prefixed_string)
-            .transpose()
-            .map_err(|e| StorageError::Internal(format!("parse active revision: {e}")))
+        if let Some(id) = live {
+            return RevisionId::from_prefixed_string(id)
+                .map(Some)
+                .map_err(|e| StorageError::Internal(format!("parse active revision: {e}")));
+        }
+        Ok(None)
     }
 
+    /// Writes the pointer the rest of the system reads —
+    /// `active_revision_pointer` for the baseline principal — and not the
+    /// singleton `active_revision` row it used to write. Those were two
+    /// different places: the recovery flow flipped one while every reader
+    /// consulted the other, so an LKG fallback could not take effect even if
+    /// there had been an LKG to fall back to.
     fn set_active_revision(&self, revision_id: &RevisionId) -> StorageResult<()> {
         let conn = self.conn.borrow();
-        let hash = integrity::compute_revision_hash(revision_id.as_str());
         conn.execute(
-            "INSERT INTO active_revision (id, revision_id, activated_at, integrity_hash)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                 revision_id      = excluded.revision_id,
-                 activated_at     = excluded.activated_at,
-                 integrity_hash   = excluded.integrity_hash,
-                 last_verified_at = NULL",
+            "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(principal) DO UPDATE SET
+                 revision_id  = excluded.revision_id,
+                 activated_at = excluded.activated_at",
             params![
+                crate::BASELINE_PRINCIPAL,
                 revision_id.as_str(),
-                system_time_to_ms(SystemTime::now()),
-                hash
+                system_time_to_ms(SystemTime::now())
             ],
         )
         .map_err(db_err)?;
         Ok(())
     }
 
+    /// Derived, not stored: the rollback target is the most recent revision
+    /// that WAS active and was replaced, which `revisions` already records.
+    ///
+    /// It used to be read out of a `last_known_good` singleton that nothing
+    /// ever wrote — so the recovery flow always found `None` and every
+    /// "fall back to the last known good" decision resolved to "there is
+    /// nothing to fall back to". Deriving removes the write path instead of
+    /// adding one, and keeps the answer per-principal, which a machine-wide
+    /// singleton could never be.
     fn get_last_known_good(&self) -> StorageResult<Option<RevisionId>> {
         let conn = self.conn.borrow();
-        let raw: Option<String> = conn
-            .query_row(
-                "SELECT revision_id FROM last_known_good WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .map_err(db_err)?;
-        raw.map(RevisionId::from_prefixed_string)
+        let record = crate::revisions::RevisionsRepository::new(&conn).last_known_good()?;
+        record
+            .map(|r| RevisionId::from_prefixed_string(r.revision_id))
             .transpose()
             .map_err(|e| StorageError::Internal(format!("parse LKG revision: {e}")))
-    }
-
-    fn set_last_known_good(&self, revision_id: &RevisionId) -> StorageResult<()> {
-        let conn = self.conn.borrow();
-        let hash = integrity::compute_revision_hash(revision_id.as_str());
-        conn.execute(
-            "INSERT INTO last_known_good (id, revision_id, promoted_at, integrity_hash)
-             VALUES (1, ?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                 revision_id    = excluded.revision_id,
-                 promoted_at    = excluded.promoted_at,
-                 integrity_hash = excluded.integrity_hash",
-            params![
-                revision_id.as_str(),
-                system_time_to_ms(SystemTime::now()),
-                hash
-            ],
-        )
-        .map_err(db_err)?;
-        Ok(())
     }
 
     fn check_integrity(&self) -> StorageResult<(IntegrityCheckResult, RecoveryAction)> {
@@ -1242,18 +1256,35 @@ impl RevisionMetadataRepository for SqliteStateStore {
             ));
         }
 
-        // 2. Validate active revision format and hash (if present).
-        let active_row: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT revision_id, integrity_hash FROM active_revision WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(db_err)?;
-
-        let active_id = if let Some((raw, stored_hash)) = &active_row {
-            // 2a. Format check.
+        // 2. Every principal's ACTIVE revision, checked against the live
+        // per-row signature — when this store was given the key. Bootstrap runs
+        // before the platform key store is opened, so there it verifies
+        // structure and format only; the signature sweep over every revision
+        // happens right after, in the keyed tamper bootstrap, which raises its
+        // own blocking alerts. What matters is that neither of them checks the
+        // dead singletons any more. This used to read an `active_revision` singleton
+        // whose `integrity_hash` was written by this same function and read by
+        // nothing else — the check verified its own bookkeeping over a table
+        // the enforcement path had stopped using, so in production it verified
+        // an empty table. `revisions.row_hmac` is what actually protects a row
+        // from being edited underneath us.
+        let repo = match self.signing_key() {
+            Some(key) => crate::revisions::RevisionsRepository::with_signing_key(&conn, key),
+            None => crate::revisions::RevisionsRepository::new(&conn),
+        };
+        let mut active_ids: Vec<String> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT revision_id FROM active_revision_pointer")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(db_err)?;
+            for row in rows {
+                active_ids.push(row.map_err(db_err)?);
+            }
+        }
+        for raw in &active_ids {
             if RevisionId::from_prefixed_string(raw.clone()).is_err() {
                 return Ok((
                     IntegrityCheckResult::PolicyIntegrityFailed {
@@ -1262,52 +1293,52 @@ impl RevisionMetadataRepository for SqliteStateStore {
                     RecoveryAction::FallbackToLastKnownGood,
                 ));
             }
-            // 2b. Hash verification (only when hash was written by v2+ schema).
-            if let Some(h) = stored_hash {
-                if !integrity::verify_revision_hash(raw, h) {
-                    return Ok((
-                        IntegrityCheckResult::PolicyIntegrityFailed {
-                            details: format!("active revision integrity_hash mismatch for {raw:?}"),
-                        },
-                        RecoveryAction::FallbackToLastKnownGood,
-                    ));
-                }
-            }
-            Some(raw.clone())
-        } else {
-            None
-        };
-
-        // 3. Check LKG presence and hash when an active revision is set.
-        let lkg_row: Option<(String, Option<String>)> = conn
-            .query_row(
-                "SELECT revision_id, integrity_hash FROM last_known_good WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()
-            .map_err(db_err)?;
-
-        if active_id.is_some() && lkg_row.is_none() {
-            // LKG missing — not a hard failure on first start, but service cannot
-            // fall back safely. The service layer should record
-            // IntegrityFailureKind::MissingLastKnownGood in its health state and
-            // escalate if a rollback is actually needed.
-            return Ok((IntegrityCheckResult::Ok, RecoveryAction::None));
-        }
-
-        // 4. Verify LKG hash (if present).
-        if let Some((lkg_id, Some(h))) = &lkg_row {
-            if !integrity::verify_revision_hash(lkg_id, h) {
+            // `Unsigned` is not a failure: a row written without a key predates
+            // signing, and refusing to start over it would lock the user out of
+            // their own policy. `Tampered` is.
+            if matches!(
+                repo.verify_row_hmac(raw)?,
+                Some(crate::revision_hmac::HmacVerification::Tampered)
+            ) {
                 return Ok((
                     IntegrityCheckResult::PolicyIntegrityFailed {
-                        details: format!("last_known_good integrity_hash mismatch for {lkg_id:?}"),
+                        details: format!("active revision row signature mismatch for {raw:?}"),
                     },
-                    RecoveryAction::RequireUserAction(
-                        "LKG revision hash mismatch — fallback target may be corrupt".to_string(),
-                    ),
+                    RecoveryAction::FallbackToLastKnownGood,
                 ));
             }
+        }
+
+        // 3. The rollback target, derived from `revisions` (see
+        // `get_last_known_good`). Missing is not a hard failure on a first
+        // start — there is simply nothing to fall back to yet.
+        let lkg = crate::revisions::RevisionsRepository::new(&conn).last_known_good()?;
+        let Some(lkg) = lkg else {
+            // Distinguishable from a clean `Ok`: rollback is not available, and
+            // the caller decides what to do about that.
+            return Ok((
+                IntegrityCheckResult::OkNoRollbackTarget,
+                RecoveryAction::None,
+            ));
+        };
+
+        // 4. A rollback target whose row has been tampered with is worse than
+        // no target: falling back to it would install edited policy.
+        if matches!(
+            repo.verify_row_hmac(&lkg.revision_id)?,
+            Some(crate::revision_hmac::HmacVerification::Tampered)
+        ) {
+            return Ok((
+                IntegrityCheckResult::PolicyIntegrityFailed {
+                    details: format!(
+                        "last-known-good row signature mismatch for {:?}",
+                        lkg.revision_id
+                    ),
+                },
+                RecoveryAction::RequireUserAction(
+                    "LKG revision signature mismatch — fallback target may be corrupt".to_string(),
+                ),
+            ));
         }
 
         Ok((IntegrityCheckResult::Ok, RecoveryAction::None))
@@ -1626,6 +1657,7 @@ fn best_source_of(
 fn integrity_result_text(result: &IntegrityCheckResult) -> (&'static str, Option<String>) {
     match result {
         IntegrityCheckResult::Ok => ("ok", None),
+        IntegrityCheckResult::OkNoRollbackTarget => ("ok", Some("no rollback target".to_string())),
         IntegrityCheckResult::CacheCorruptRebuildable => ("cache_corrupt", None),
         IntegrityCheckResult::PolicyIntegrityFailed { details } => {
             ("policy_failed", Some(details.clone()))
@@ -2179,15 +2211,40 @@ mod tests {
 
     // ── SqliteStateStore ──────────────────────────────────────────────────────
 
+    /// A revision row for the baseline principal. Needed because the active
+    /// pointer now carries a foreign key into `revisions`: a revision that does
+    /// not exist can no longer be made active, which is the point.
+    fn seed_revision(store: &SqliteStateStore, revision_id: &str, status: &str) {
+        let conn = store.conn.borrow();
+        conn.execute(
+            "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
+                                    status, source, correlation_id, created_at)
+             VALUES (?1, ?2, 'h', '{}', ?3, 'gui-rules-edit', 'c', 0)",
+            params![crate::BASELINE_PRINCIPAL, revision_id, status],
+        )
+        .expect("seed revision");
+    }
+
     #[test]
     fn state_store_set_and_get_active_revision() {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_state_store(&dir);
         let rev = RevisionId::from_prefixed_string("rev-abc-001".to_string()).expect("rev");
+        seed_revision(&store, "rev-abc-001", "active");
 
         store.set_active_revision(&rev).expect("set");
         let got = store.get_active_revision().expect("get");
         assert_eq!(got.unwrap().as_str(), "rev-abc-001");
+    }
+
+    #[test]
+    fn an_active_pointer_cannot_name_a_revision_that_does_not_exist() {
+        // The pointer carries a foreign key into `revisions`, so the recovery
+        // flow can no longer point the system at an id nothing backs.
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = migrated_state_store(&dir);
+        let ghost = RevisionId::from_prefixed_string("rev-ghost".to_string()).expect("rev");
+        assert!(store.set_active_revision(&ghost).is_err());
     }
 
     #[test]
@@ -2199,14 +2256,48 @@ mod tests {
     }
 
     #[test]
-    fn state_store_set_and_get_lkg() {
+    fn lkg_is_the_revision_that_was_active_before_this_one() {
+        // Nothing "promotes" a revision to last-known-good any more: the answer
+        // is read off the revision history, so it exists as soon as a second
+        // revision replaces the first. Previously it came from a singleton
+        // table nothing wrote, so this always answered `None` in production.
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_state_store(&dir);
-        let rev = RevisionId::from_prefixed_string("rev-lkg-001".to_string()).expect("rev");
+        assert!(
+            store.get_last_known_good().expect("get").is_none(),
+            "nothing superseded yet — no rollback target",
+        );
 
-        store.set_last_known_good(&rev).expect("set");
-        let got = store.get_last_known_good().expect("get");
-        assert_eq!(got.unwrap().as_str(), "rev-lkg-001");
+        {
+            let conn = store.conn.borrow();
+            for (id, status, superseded_at) in [
+                ("rev-lkg-001", "superseded", 1_000_i64),
+                ("rev-lkg-002", "superseded", 2_000),
+                ("rev-lkg-003", "active", 0),
+            ] {
+                conn.execute(
+                    "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
+                                            status, source, correlation_id, created_at,
+                                            superseded_at)
+                     VALUES (?1, ?2, 'h', '{}', ?3, 'gui-rules-edit', 'c', ?4, ?5)",
+                    params![
+                        crate::BASELINE_PRINCIPAL,
+                        id,
+                        status,
+                        superseded_at,
+                        (superseded_at > 0).then_some(superseded_at)
+                    ],
+                )
+                .expect("seed revision");
+            }
+        }
+
+        let got = store.get_last_known_good().expect("get").expect("present");
+        assert_eq!(
+            got.as_str(),
+            "rev-lkg-002",
+            "the MOST RECENTLY superseded revision is the rollback target",
+        );
     }
 
     #[test]
@@ -2214,7 +2305,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_state_store(&dir);
         let (result, action) = store.check_integrity().expect("check");
-        assert_eq!(result, IntegrityCheckResult::Ok);
+        assert_eq!(
+            result,
+            IntegrityCheckResult::OkNoRollbackTarget,
+            "a fresh DB verifies clean, and has nothing to roll back to"
+        );
         assert_eq!(action, RecoveryAction::None);
     }
 
@@ -2240,6 +2335,8 @@ mod tests {
 
         let r1 = RevisionId::from_prefixed_string("rev-v1".to_string()).expect("r1");
         let r2 = RevisionId::from_prefixed_string("rev-v2".to_string()).expect("r2");
+        seed_revision(&store, "rev-v1", "superseded");
+        seed_revision(&store, "rev-v2", "active");
 
         store.set_active_revision(&r1).expect("set r1");
         store.set_active_revision(&r2).expect("set r2");
@@ -2502,119 +2599,117 @@ mod tests {
 
     // ── integrity checks ─────────────────────────────────────────────────────
 
-    #[test]
-    fn state_store_integrity_hash_stored_on_set_active_revision() {
-        let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_state_store(&dir);
-        let rev = RevisionId::from_prefixed_string("rev-hash-001".to_string()).expect("rev");
-
-        store.set_active_revision(&rev).expect("set");
-
-        let stored_hash: Option<String> = {
-            let conn = store.conn.borrow();
-            conn.query_row(
-                "SELECT integrity_hash FROM active_revision WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("query")
-        };
-        assert!(stored_hash.is_some(), "integrity_hash must be written");
-        let h = stored_hash.unwrap();
-        assert_eq!(h.len(), 64, "SHA-256 hex must be 64 chars");
-        assert!(
-            crate::integrity::verify_revision_hash("rev-hash-001", &h),
-            "stored hash must verify against the revision id"
-        );
+    /// Seed the legacy singleton rows `check_integrity` still verifies.
+    ///
+    /// They are seeded by SQL because nothing in the product writes them any
+    /// more: `set_active_revision` now writes `active_revision_pointer`, where
+    /// the readers look, and the LKG is derived from `revisions`. The checks
+    /// below therefore cover code that is still present, over data that is no
+    /// longer produced — see the open half of §36.12.2 (moving tamper detection
+    /// onto `revisions.row_hmac`).
+    /// A signed revision row, written the way production writes one.
+    fn seed_signed_revision(conn: &Connection, key: &[u8], revision_id: &str, status: &str) {
+        let repo = crate::revisions::RevisionsRepository::with_signing_key(conn, key.to_vec());
+        repo.insert_candidate_for(
+            crate::BASELINE_PRINCIPAL,
+            &crate::revisions::RevisionRecord {
+                revision_id: revision_id.to_string(),
+                content_hash: format!("{revision_id}-hash"),
+                rules_json: "{}".to_string(),
+                status: nrr_domain::rules_revision::RevisionStatus::Candidate,
+                source: nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit,
+                correlation_id: "c".to_string(),
+                created_at: 0,
+                activated_at: None,
+                superseded_at: None,
+                superseded_by: None,
+                rejected_reason: None,
+                review_summary_json: None,
+                risk_level: None,
+            },
+        )
+        .expect("seed signed revision");
+        conn.execute(
+            "UPDATE revisions SET status = ?2, superseded_at = 1 WHERE revision_id = ?1",
+            params![revision_id, status],
+        )
+        .expect("set status");
+        // The status is part of the signed payload, so a direct UPDATE
+        // invalidates the row's signature exactly as tampering would. Production
+        // re-signs on every status change; the fixture does the same, otherwise
+        // every test row would read as tampered.
+        repo.re_sign_row(revision_id).expect("re-sign");
     }
 
+    const TEST_SIGNING_KEY: &[u8] = b"integrity-test-key-0123456789abcdef";
+
     #[test]
-    fn state_store_integrity_hash_stored_on_set_lkg() {
+    fn state_store_check_integrity_ok_with_signed_rows() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_state_store(&dir);
-        let rev = RevisionId::from_prefixed_string("rev-lkg-hash".to_string()).expect("rev");
-
-        store.set_last_known_good(&rev).expect("set");
-
-        let stored_hash: Option<String> = {
+        let store = migrated_state_store(&dir).with_signing_key(TEST_SIGNING_KEY.to_vec());
+        {
             let conn = store.conn.borrow();
-            conn.query_row(
-                "SELECT integrity_hash FROM last_known_good WHERE id = 1",
-                [],
-                |r| r.get(0),
-            )
-            .expect("query")
-        };
-        assert!(stored_hash.is_some());
-        let h = stored_hash.unwrap();
-        assert!(crate::integrity::verify_revision_hash("rev-lkg-hash", &h));
-    }
-
-    #[test]
-    fn state_store_check_integrity_ok_with_valid_hashes() {
-        let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_state_store(&dir);
+            seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-valid-001", "active");
+            seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-valid-000", "superseded");
+        }
         let rev = RevisionId::from_prefixed_string("rev-valid-001".to_string()).expect("rev");
-
         store.set_active_revision(&rev).expect("set active");
-        store.set_last_known_good(&rev).expect("set lkg");
 
         let (result, action) = store.check_integrity().expect("check");
         assert_eq!(result, IntegrityCheckResult::Ok);
         assert_eq!(action, RecoveryAction::None);
     }
 
+    /// The check now protects the row the ENFORCEMENT path reads, so editing
+    /// that row behind the service's back is what it must catch.
     #[test]
-    fn state_store_check_integrity_detects_active_hash_mismatch() {
+    fn state_store_check_integrity_detects_a_tampered_active_row() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_state_store(&dir);
-        let rev = RevisionId::from_prefixed_string("rev-tamper-001".to_string()).expect("rev");
-
-        store.set_active_revision(&rev).expect("set");
-
-        // Tamper with the stored hash directly.
+        let store = migrated_state_store(&dir).with_signing_key(TEST_SIGNING_KEY.to_vec());
         {
             let conn = store.conn.borrow();
+            seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-tamper-001", "active");
             conn.execute(
-                "UPDATE active_revision SET integrity_hash = 'deadbeef' WHERE id = 1",
-                [],
+                "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = ?1",
+                params!["rev-tamper-001"],
             )
             .expect("tamper");
         }
+        let rev = RevisionId::from_prefixed_string("rev-tamper-001".to_string()).expect("rev");
+        store.set_active_revision(&rev).expect("set active");
 
         let (result, action) = store.check_integrity().expect("check");
         assert!(
             matches!(result, IntegrityCheckResult::PolicyIntegrityFailed { .. }),
-            "hash mismatch must yield PolicyIntegrityFailed, got {result:?}"
+            "an edited active row must yield PolicyIntegrityFailed, got {result:?}"
         );
         assert_eq!(action, RecoveryAction::FallbackToLastKnownGood);
     }
 
     #[test]
-    fn state_store_check_integrity_detects_lkg_hash_mismatch() {
+    fn state_store_check_integrity_detects_a_tampered_rollback_target() {
         let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_state_store(&dir);
-        let rev = RevisionId::from_prefixed_string("rev-lkg-tamper".to_string()).expect("rev");
-
-        store.set_active_revision(&rev).expect("set active");
-        store.set_last_known_good(&rev).expect("set lkg");
-
-        // Tamper with the LKG hash.
+        let store = migrated_state_store(&dir).with_signing_key(TEST_SIGNING_KEY.to_vec());
         {
             let conn = store.conn.borrow();
+            seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-lkg-tamper", "superseded");
+            seed_signed_revision(&conn, TEST_SIGNING_KEY, "rev-active-002", "active");
             conn.execute(
-                "UPDATE last_known_good SET integrity_hash = 'deadbeef' WHERE id = 1",
-                [],
+                "UPDATE revisions SET rules_json = '{\"tampered\":true}' WHERE revision_id = ?1",
+                params!["rev-lkg-tamper"],
             )
             .expect("tamper lkg");
         }
+        let rev = RevisionId::from_prefixed_string("rev-active-002".to_string()).expect("rev");
+        store.set_active_revision(&rev).expect("set active");
 
         let (result, action) = store.check_integrity().expect("check");
         assert!(
             matches!(result, IntegrityCheckResult::PolicyIntegrityFailed { .. }),
-            "lkg hash mismatch must yield PolicyIntegrityFailed, got {result:?}"
+            "an edited rollback target must yield PolicyIntegrityFailed, got {result:?}"
         );
-        // LKG itself is suspect — cannot safely fall back to it.
+        // The target itself is suspect — falling back to it would install
+        // edited policy.
         assert!(
             matches!(action, RecoveryAction::RequireUserAction(_)),
             "corrupt LKG must require user action, got {action:?}"
@@ -2626,13 +2721,20 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_state_store(&dir);
         let rev = RevisionId::from_prefixed_string("rev-no-lkg".to_string()).expect("rev");
+        seed_revision(&store, "rev-no-lkg", "active");
 
-        // Set active revision but never promote LKG (first-start scenario).
+        // The very first revision: active, and nothing superseded behind it,
+        // so there is no rollback target yet.
         store.set_active_revision(&rev).expect("set active");
+        assert!(store.get_last_known_good().expect("lkg").is_none());
 
         let (result, action) = store.check_integrity().expect("check");
         // Not a failure — just means rollback is unsafe until LKG is promoted.
-        assert_eq!(result, IntegrityCheckResult::Ok);
+        assert_eq!(
+            result,
+            IntegrityCheckResult::OkNoRollbackTarget,
+            "reported as its own state, not as an indistinguishable Ok"
+        );
         assert_eq!(action, RecoveryAction::None);
     }
 
@@ -2641,16 +2743,25 @@ mod tests {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_state_store(&dir);
 
-        // Inject a row with an invalid revision_id format directly (bypasses
-        // RevisionId validation in set_active_revision).
+        // A revision row whose id is not a valid `RevisionId`, plus the pointer
+        // that names it. Written directly: every production path validates the
+        // format, and this test is about what happens when something bypassed
+        // them (a hand-edited database, a partially-applied migration).
         {
             let conn = store.conn.borrow();
             conn.execute(
-                "INSERT INTO active_revision (id, revision_id, activated_at)
-                 VALUES (1, 'NOT_A_VALID_REVISION', 0)",
-                [],
+                "INSERT INTO revisions (principal, revision_id, content_hash, rules_json,
+                                        status, source, correlation_id, created_at)
+                 VALUES (?1, 'NOT_A_VALID_REVISION', 'h', '{}', 'active', 'gui-rules-edit', 'c', 0)",
+                params![crate::BASELINE_PRINCIPAL],
             )
-            .expect("inject bad row");
+            .expect("inject bad revision");
+            conn.execute(
+                "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)
+                 VALUES (?1, 'NOT_A_VALID_REVISION', 0)",
+                params![crate::BASELINE_PRINCIPAL],
+            )
+            .expect("inject bad pointer");
         }
 
         let (result, action) = store.check_integrity().expect("check");
@@ -3349,5 +3460,56 @@ mod tests {
         let store = migrated_cache_store(&dir);
         let listed = store.list_hostnames_under_suffix("", 16).expect("list");
         assert!(listed.is_empty());
+    }
+
+    /// Bootstrap asks this to decide whether the machine has a policy at all.
+    /// It used to read only the singleton the loader itself writes, so a
+    /// machine that had been enforcing rules for months reported "first run" -
+    /// and the recovery offered on the strength of that would have written a
+    /// pointer nothing reads.
+    #[test]
+    fn the_active_revision_comes_from_the_pointer_the_activation_path_writes() {
+        use crate::revisions::{ActiveRevisionPointer, RevisionsRepository};
+        use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let conn = open_connection(&path).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = runner.into_connection();
+        {
+            let repo = RevisionsRepository::new(&conn);
+            repo.insert_candidate(&crate::revisions::RevisionRecord {
+                revision_id: "rev-live".into(),
+                content_hash: "h".into(),
+                rules_json: r#"{"rules":[]}"#.into(),
+                status: RevisionStatus::Candidate,
+                source: RulesRevisionSource::GuiRulesEdit,
+                correlation_id: "c".into(),
+                created_at: 1_700_000_000,
+                activated_at: None,
+                superseded_at: None,
+                superseded_by: None,
+                rejected_reason: None,
+                review_summary_json: None,
+                risk_level: None,
+            })
+            .expect("insert");
+            repo.set_active_pointer(&ActiveRevisionPointer {
+                revision_id: "rev-live".into(),
+                activated_at: 1_700_000_000,
+                apply_attempt_id: None,
+            })
+            .expect("pointer");
+        }
+        let store = SqliteStateStore::new(conn);
+        assert_eq!(
+            store
+                .get_active_revision()
+                .expect("read")
+                .map(|id| id.as_str().to_string()),
+            Some("rev-live".to_string()),
+        );
     }
 }

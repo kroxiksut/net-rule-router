@@ -265,16 +265,11 @@ fn collect_application(
             let Some(app_match) = &rule.app_match else {
                 continue; // invariant: at least one of address_match/app_match is Some
             };
-            let (matched, specificity) = match &app_match.pattern {
-                CanonicalAppPattern::Exact(pattern) => (
-                    *pattern == app_identity.process_name,
-                    SpecificityScore::APP_EXACT,
-                ),
-                CanonicalAppPattern::Glob(pattern) => (
-                    glob_matches(pattern, &app_identity.process_name),
-                    SpecificityScore::APP_GLOB,
-                ),
+            let specificity = match &app_match.pattern {
+                CanonicalAppPattern::Exact(_) => SpecificityScore::APP_EXACT,
+                CanonicalAppPattern::Glob(_) => SpecificityScore::APP_GLOB,
             };
+            let matched = app_pattern_matches(&app_match.pattern, &app_identity.process_name);
             // TODO: `include_child_processes` requires a process tree
             // snapshot (parent PID → process name mapping) that is not
             // available in `DecisionRequest`. The pure-domain layer can't
@@ -382,14 +377,27 @@ fn eval_app_filter(
     let Some(identity) = app_identity else {
         return AppFilterResult::NotMatched;
     };
-    let matched = match &app_match.pattern {
-        CanonicalAppPattern::Exact(pattern) => *pattern == identity.process_name,
-        CanonicalAppPattern::Glob(pattern) => glob_matches(pattern, &identity.process_name),
-    };
+    let matched = app_pattern_matches(&app_match.pattern, &identity.process_name);
     if matched {
         AppFilterResult::Matched
     } else {
         AppFilterResult::NotMatched
+    }
+}
+
+/// Does `pattern` name the observed process?
+///
+/// Both sides go through the one match key, so the `.exe` spelling — appended
+/// to the observed name on every OS, appended to an exact rule but never to a
+/// glob — cannot decide the answer: `*torrent` names `qbittorrent.exe`, and an
+/// exact rule matches a Linux process that has no suffix at all.
+fn app_pattern_matches(pattern: &CanonicalAppPattern, process_name: &str) -> bool {
+    let observed = nrr_shared::app_identity::app_match_key(process_name);
+    match pattern {
+        CanonicalAppPattern::Exact(p) => nrr_shared::app_identity::app_match_key(p) == observed,
+        CanonicalAppPattern::Glob(p) => {
+            glob_matches(&nrr_shared::app_identity::app_match_key(p), &observed)
+        }
     }
 }
 
@@ -1201,6 +1209,47 @@ mod tests {
         );
         assert_eq!(matched_class(&d), Some(MatchClass::Application));
         assert_eq!(matched_specificity(&d), Some(SpecificityScore::APP_GLOB));
+    }
+
+    /// The observed name always carries `.exe`; a glob never gets one added.
+    #[test]
+    fn a_glob_without_the_suffix_still_names_the_process() {
+        let rb = book(vec![rule("r1", None, Some(app_glob("*torrent")))], vec![]);
+        let input = normalize_runtime_input(&runtime_input_for(
+            "example.com",
+            None,
+            Some("qbittorrent.exe"),
+        ));
+        let d = match_rules(
+            &input,
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::Application));
+    }
+
+    /// A Linux process has no suffix; the rule store canonicalises one on.
+    #[test]
+    fn an_exact_rule_matches_a_process_spelled_without_the_suffix() {
+        let rb = book(
+            vec![rule("r1", None, Some(app_exact("firefox.exe")))],
+            vec![],
+        );
+        let input = normalize_runtime_input(&runtime_input_for(
+            "example.com",
+            None,
+            Some("/usr/bin/firefox"),
+        ));
+        let d = match_rules(
+            &input,
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::Application));
     }
 
     #[test]

@@ -95,3 +95,34 @@ fn a_cold_start_opens_the_section_the_tray_asked_for() {
         AppSection::Diagnostics
     );
 }
+
+/// The shipped application skipped the first-run gate entirely: the launcher
+/// asked which section to open and wrote the context, so "Rules before the
+/// wizard is finished redirects to Interfaces" — a promise of the shell model —
+/// held only in the console shell.
+#[test]
+fn a_cold_start_before_the_wizard_is_redirected_out_of_rules() {
+    let shell = nrr_shared::gui_shell_v1();
+    let (section, availability) = nrr_ui_support::first_run::resolve_entry_section_for_first_run(
+        &shell,
+        nrr_shared::AppSection::Rules,
+        false,
+    );
+    assert_ne!(
+        section,
+        nrr_shared::AppSection::Rules,
+        "an unfinished wizard must not open Rules"
+    );
+    assert!(!matches!(
+        availability,
+        nrr_shared::SetupActionAvailability::Allowed
+    ));
+
+    // With the wizard finished, the requested section is honoured.
+    let (section, _) = nrr_ui_support::first_run::resolve_entry_section_for_first_run(
+        &shell,
+        nrr_shared::AppSection::Rules,
+        true,
+    );
+    assert_eq!(section, nrr_shared::AppSection::Rules);
+}

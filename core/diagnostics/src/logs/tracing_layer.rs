@@ -32,6 +32,7 @@
 //! developer-facing tracing system.  User-visible event descriptions are
 //! derived from `reason_code` fields, not from `tracing` message strings.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tracing::field::{Field, Visit};
@@ -46,9 +47,10 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::Registry;
 
 use crate::event::{rfc3339_local_millis, LogEvent, LOG_EVENT_SCHEMA_VERSION};
+use crate::logs::privacy;
 use crate::logs::writer::LogWriter;
 use crate::sink::DiagnosticsSink;
-use crate::taxonomy::{EventCategory, EventCorrelation, EventLevel, PrivacyClass};
+use crate::taxonomy::{EventCategory, EventCorrelation, EventLevel};
 
 // ── Level mapping ─────────────────────────────────────────────────────────────
 
@@ -71,29 +73,74 @@ fn tracing_to_level(level: &tracing::Level) -> EventLevel {
 /// appear in the operational NDJSON log. The caller is expected to early-return
 /// on `None` before any allocation.
 fn target_to_category(target: &str) -> Option<EventCategory> {
-    if !target.starts_with("nrr::") {
-        return None;
+    let area = target.strip_prefix("nrr::")?;
+    // `-` and `_` are both in use for the same areas (`fake-ip` / `fake_ip`,
+    // `dns-resolver` / `dns_resolver`); one spelling here, normalised on the
+    // way in.
+    let normalized = area.replace('_', "-");
+    Some(category_of_area(&normalized))
+}
+
+/// Maps a target's area (everything after `nrr::`) to its category.
+///
+/// The table is the point. Before it, eight prefixes were listed and 56 areas
+/// existed, so nearly everything fell through to `Service` — which made the
+/// category filter in the Logs section useless and the per-category rate limit
+/// unreachable. Adding an area here changes how it is FILTERED, never whether
+/// it is written: Default mode silences no category (see `DEFAULT_MODE_SILENCED`).
+fn category_of_area(area: &str) -> EventCategory {
+    // Nested areas are classified by their full path where the leaf matters.
+    match area {
+        "mutation::preset" | "mutation::preview" => return EventCategory::Import,
+        "mutation::execute" => return EventCategory::Apply,
+        _ => {}
     }
-    let cat = if target.starts_with("nrr::decision") {
-        EventCategory::Decision
-    } else if target.starts_with("nrr::cache") {
-        EventCategory::Cache
-    } else if target.starts_with("nrr::apply") {
-        EventCategory::Apply
-    } else if target.starts_with("nrr::integrity") {
-        EventCategory::Integrity
-    } else if target.starts_with("nrr::security") {
-        EventCategory::Security
-    } else if target.starts_with("nrr::import") {
-        EventCategory::Import
-    } else if target.starts_with("nrr::review") {
-        EventCategory::Review
-    } else if target.starts_with("nrr::diagnostics") {
-        EventCategory::Diagnostics
-    } else {
-        EventCategory::Service
-    };
-    Some(cat)
+    let head = area.split("::").next().unwrap_or(area);
+    match head {
+        // The decision path and everything that observes traffic to feed it.
+        "decision"
+        | "dns"
+        | "dns-observe"
+        | "dns-redirect"
+        | "dns-resolver"
+        | "doh"
+        | "fcrdns"
+        | "fake-ip"
+        | "conn-observe"
+        | "conn-trace"
+        | "app-routing"
+        | "app-resolver"
+        | "app-path-resolver"
+        | "persistent-app-resolver"
+        | "app-observations"
+        | "auto-rules"
+        | "browser-history"
+        | "vpn-learn"
+        | "block-notice" => EventCategory::Decision,
+
+        // Putting policy onto the machine, and taking it off again.
+        "enforcement" | "enforcement-plan" | "killswitch" | "killswitch-codegen" | "routes"
+        | "route-codegen" | "route-coordinator" | "wfp" | "wfp-codegen" | "wfp-ledger" | "nft"
+        | "nftlink" | "activation" | "rules-provider" | "rule-seed" | "apply" => {
+            EventCategory::Apply
+        }
+
+        "cache" => EventCategory::Cache,
+
+        // State that must be trustworthy, and what happens when it is not.
+        "tamper" | "state" | "recovery" | "integrity" => EventCategory::Integrity,
+
+        "authorization" | "keystore" | "audit" | "security" => EventCategory::Security,
+
+        "diagnostics" | "retention" | "traffic" => EventCategory::Diagnostics,
+
+        // Pausing routing is something a person did, not something the service
+        // decided.
+        "routing-pause" => EventCategory::UserAction,
+
+        // Lifecycle, transport, and the machine's own inventory.
+        _ => EventCategory::Service,
+    }
 }
 
 // ── Field visitor ─────────────────────────────────────────────────────────────
@@ -179,6 +226,30 @@ impl NdjsonTracingLayer {
     }
 }
 
+/// A unique id for one operational log event.
+///
+/// It used to be `evt-tracing-<call site>`, which is a CONSTANT per line of
+/// code: every event from the same statement shared an id. The log page cursor
+/// is the pair `(created_at, event_id)` and skips everything at or before it,
+/// so whenever a page boundary landed inside a run of identical pairs the rest
+/// of that run was dropped and never shown — 180 lost lines out of 7927 when
+/// replayed against a real log.
+///
+/// Deliberately not a v4 UUID: this runs on every log write, and process start
+/// + pid + a counter is unique for the same purpose without touching an RNG.
+fn next_event_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let prefix = PREFIX.get_or_init(|| {
+        let start_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        format!("{start_ms:x}-{:x}", std::process::id())
+    });
+    format!("evt-{prefix}-{:x}", SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
 impl<S> Layer<S> for NdjsonTracingLayer
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -194,28 +265,53 @@ where
         // Collect fields.
         let mut visitor = EventFieldVisitor::new();
         event.record(&mut visitor);
-        let payload = visitor.into_payload();
+        let mut payload = visitor.into_payload();
+
+        // What this event actually discloses, read off the names of the fields
+        // it carries. Every event used to be stamped `PublicSummary` no matter
+        // what was in it, which is why the writer's privacy gate could not fire
+        // once in any mode — and why production logs held thousands of process
+        // paths and remote addresses in a directory local users can read.
+        //
+        // Fields the current mode may not disclose lose their VALUE; the event
+        // itself is written either way. Dropping it would take the timeline
+        // with it, and the timeline is the reason the log exists.
+        let privacy_class = privacy::classify(payload.as_ref());
+        let ceiling = self.writer.filter().mode().max_privacy();
+        if privacy_class > ceiling {
+            if let Some(payload) = payload.as_mut() {
+                privacy::redact_above(payload, ceiling);
+            }
+        }
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
 
-        // Use the tracing event name as the `kind` field.
-        // This is a developer-facing identifier; not a localized UI key.
-        let kind = meta.name().to_string();
-        let message_key = format!("tracing.{}.{}", meta.target(), meta.name());
+        // `kind` is the target's leaf (`nrr::conn-trace` → `conn-trace`), not
+        // tracing's event name. That name is the CALL SITE — `event
+        // core\services\…:1223` — and the Logs section falls back to `kind`
+        // when no locale key resolves, so the user was shown a source path
+        // where a message belongs. The leaf is also what the section's "kind"
+        // filter is useful against.
+        let kind = meta
+            .target()
+            .strip_prefix("nrr::")
+            .unwrap_or(meta.target())
+            .replace("::", ".");
+        let message_key = format!("tracing.{}.{kind}", meta.target());
 
         let log_event = LogEvent {
             schema_version: LOG_EVENT_SCHEMA_VERSION,
-            event_id: format!("evt-tracing-{}", meta.name()),
+            event_id: next_event_id(),
             created_at: now_ms,
             created_at_iso: rfc3339_local_millis(now_ms),
             level,
             category,
             kind,
             correlation: EventCorrelation::default(),
-            privacy_class: PrivacyClass::PublicSummary,
+            privacy_class,
             message_key,
             payload,
         };
@@ -295,10 +391,11 @@ impl TracingVerbosityHandle {
     /// otherwise) for the same reason — see the `writer` field doc.
     ///
     /// Privacy note: switching the writer to `Diagnostic` mode widens the
-    /// level gate to `Debug+` and lifts the category allowlist; it does
-    /// NOT change what the tracing layer stamps on events (always
-    /// `PublicSummary`), so redaction semantics are untouched — those are
-    /// governed by the separate diagnostic-mode (redaction) setting.
+    /// level gate to `Debug+`, lifts the category allowlist, AND raises the
+    /// ceiling the tracing layer redacts against — hostnames and addresses
+    /// appear with their values, process paths stay redacted (that needs
+    /// `DeveloperTrace`). In `Default` mode both are written as
+    /// `<redacted>`; the events themselves are never dropped for privacy.
     ///
     /// Best-effort: a reload failure (e.g. the global subscriber was
     /// somehow replaced after install) is logged via `tracing::warn!` and
@@ -475,36 +572,35 @@ mod tests {
     }
 
     #[test]
-    fn target_to_category_mapping() {
-        assert_eq!(
-            target_to_category("nrr::decision::engine"),
-            Some(EventCategory::Decision)
-        );
-        assert_eq!(
-            target_to_category("nrr::cache::store"),
-            Some(EventCategory::Cache)
-        );
-        assert_eq!(
-            target_to_category("nrr::apply::windows"),
-            Some(EventCategory::Apply)
-        );
-        assert_eq!(
-            target_to_category("nrr::integrity"),
-            Some(EventCategory::Integrity)
-        );
-        assert_eq!(
-            target_to_category("nrr::security::audit"),
-            Some(EventCategory::Security)
-        );
-        assert_eq!(
-            target_to_category("nrr::service"),
-            Some(EventCategory::Service)
-        );
-        // Unknown nrr::* subcrate falls back to Service.
-        assert_eq!(
-            target_to_category("nrr::brand_new_subsystem"),
-            Some(EventCategory::Service)
-        );
+    fn every_live_target_area_lands_where_it_belongs() {
+        // Sampled from the areas that actually appear in `target:` today. The
+        // point of the table is that these stop falling through to `Service`.
+        for (target, expected) in [
+            ("nrr::decision::engine", EventCategory::Decision),
+            ("nrr::dns-resolver", EventCategory::Decision),
+            ("nrr::dns_resolver", EventCategory::Decision),
+            ("nrr::fake_ip", EventCategory::Decision),
+            ("nrr::conn-trace", EventCategory::Decision),
+            ("nrr::enforcement-plan", EventCategory::Apply),
+            ("nrr::killswitch", EventCategory::Apply),
+            ("nrr::wfp-ledger", EventCategory::Apply),
+            ("nrr::nft", EventCategory::Apply),
+            ("nrr::mutation::execute", EventCategory::Apply),
+            ("nrr::mutation::preset", EventCategory::Import),
+            ("nrr::cache::store", EventCategory::Cache),
+            ("nrr::tamper", EventCategory::Integrity),
+            ("nrr::keystore", EventCategory::Security),
+            ("nrr::retention", EventCategory::Diagnostics),
+            ("nrr::routing-pause", EventCategory::UserAction),
+            ("nrr::boot", EventCategory::Service),
+            ("nrr::ipc::dispatch", EventCategory::Service),
+        ] {
+            assert_eq!(
+                target_to_category(target),
+                Some(expected),
+                "target {target} is misfiled"
+            );
+        }
     }
 
     #[test]
@@ -707,5 +803,71 @@ mod tests {
             .handle
             .with_current(ToString::to_string)
             .expect("reload handle's Layer must still be alive in this test")
+    }
+
+    #[test]
+    fn events_from_one_call_site_do_not_share_an_id() {
+        use crate::logs::writer::LogWriter;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+        let subscriber =
+            tracing_subscriber::registry().with(NdjsonTracingLayer::new(Arc::clone(&writer)));
+        with_default(subscriber, || {
+            for _ in 0..3 {
+                tracing::info!(target: "nrr::test", "same call site");
+            }
+        });
+        drop(writer);
+
+        let ids: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter_map(|v| v["event_id"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ids.len(), 3, "all three events must be written: {ids:?}");
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), 3, "ids from one call site collided: {ids:?}");
+    }
+
+    #[test]
+    fn a_log_kind_never_carries_a_source_path() {
+        use crate::logs::writer::LogWriter;
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+        let subscriber =
+            tracing_subscriber::registry().with(NdjsonTracingLayer::new(Arc::clone(&writer)));
+        with_default(subscriber, || {
+            tracing::info!(target: "nrr::conn-trace", "flow observed");
+        });
+        drop(writer);
+
+        let kinds: Vec<String> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter_map(|v| v["kind"].as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        // The Logs section shows `kind` when no locale key resolves, which is
+        // always the case for a tracing event.
+        assert_eq!(kinds, ["conn-trace"]);
     }
 }

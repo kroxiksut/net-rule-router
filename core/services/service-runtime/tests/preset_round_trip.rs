@@ -276,6 +276,8 @@ fn settings_export_full_yaml_conforms_to_formats_md_2_4() {
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
             block_ipv6_when_protected: true,
+            local_networks_auto_accept: false,
+            zone_priority_over_ip: false,
             binding_source: BindingSource::UserAssigned,
         };
         repo.update_for_sid("S-1-5-21-test", &record, 1)

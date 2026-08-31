@@ -351,8 +351,9 @@ pub struct RuleMatchCandidate {
 
 /// Controls whether `ExactIp` or `Zone` is checked first in tier 3.
 ///
-/// Stored in `UiPreferences` as `zone_priority_over_ip: bool`.
-/// Surfaced to the user in **Settings → Routing**.
+/// Stored per principal as `secondary_block_policy.zone_priority_over_ip`
+/// (state-DB v61) and surfaced in **Settings → Routing**. It used to live in
+/// device-local UI preferences, where nothing read it.
 ///
 /// **This setting affects only runtime evaluation order — it has no effect on
 /// canonical storage order** (which is always `ExactFqdn < SuffixDomain <

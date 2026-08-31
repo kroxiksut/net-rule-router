@@ -74,7 +74,7 @@ ColumnLayout {
         if (!corr || corr === "") return
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             if (!ok) {
-                root.statusLine = String(msg || code || "")
+                root.statusLine = root.ipcErrorLabel(code)
                 return
             }
             section.refusingAnchors = (payload || {}).refusing || []
@@ -106,7 +106,7 @@ ColumnLayout {
         root.rpc.registerRpcCallback(corr, function(ok, payload, code, msg) {
             section.probeBusy = false
             if (!ok) {
-                root.statusLine = String(msg || code || "")
+                root.statusLine = root.ipcErrorLabel(code)
                 return
             }
             var accepted = Number((payload || {}).accepted || 0)
@@ -184,8 +184,15 @@ ColumnLayout {
     // the already-computed group objects — never re-derive anything.
     readonly property var mergedGroups: Pure.groupAutoRuleRows(
         root.autoRuleCandidates, root.autoRuleDismissed)
+    /// Answered addresses are history, not work — off by default, and the
+    /// toggle says how many are hiding behind it.
+    property bool showDismissed: false
+    readonly property int dismissedCount:
+        Pure.countDismissedAutoRuleHosts(section.mergedGroups)
+    readonly property var statusFilteredGroups: Pure.filterAutoRuleGroupsByStatus(
+        section.mergedGroups, section.showDismissed)
     readonly property var consumerFilteredGroups: Pure.filterAutoRuleGroups(
-        section.mergedGroups, section.consumerFilter)
+        section.statusFilteredGroups, section.consumerFilter)
     readonly property var displayGroups: Pure.sortAutoRuleGroups(
         Pure.searchAutoRuleGroups(section.consumerFilteredGroups, section.searchQuery),
         section.sortMode)
@@ -442,13 +449,17 @@ ColumnLayout {
         // intro on screen and puts its own message inside the list frame
         // below instead, so the rest of the layout does not collapse while
         // the user is still typing.
-        text: section.mergedGroups.length > 0
+        text: section.statusFilteredGroups.length > 0
             ? root.tr("rules.suggestions.table.intro",
                 "Every address below was pulled in by a site you route. Adding one <b>sends it through "
                 + "the additional route together with the site that needs it</b> — <i>anything you leave "
                 + "alone keeps going through the main route</i>. A dismissed address <i>only stops being "
                 + "offered</i>; \"Allow again\" lifts that suppression and nothing else.")
-            : root.tr("rules.suggestions.inbox.empty", "Nothing is waiting for an answer right now.")
+            : (section.dismissedCount > 0 && !section.showDismissed
+                ? root.tr("rules.suggestions.inbox.empty-but-answered",
+                    "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.")
+                    .replace("{n}", String(section.dismissedCount))
+                : root.tr("rules.suggestions.inbox.empty", "Nothing is waiting for an answer right now."))
         Accessible.role: Accessible.StaticText
         // Screen readers get plain text — strip the styling tags used for visual emphasis.
         Accessible.name: text.replace(/<\/?[a-z]+>/gi, "")
@@ -485,7 +496,8 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.preferredHeight: toolbarFlow.height
         // Data may exist even when the current search/filter shows nothing --
-        // the row (and its search box) must stay reachable so it can be cleared.
+        // the row (and its search box, and the "show answered" toggle) must
+        // stay reachable so it can be cleared.
         visible: section.mergedGroups.length > 0
 
         Flow {
@@ -567,6 +579,21 @@ ColumnLayout {
                     text: root.tr("rules.suggestions.inbox.select-all", "Select all")
                     color: root.textColor
                 }
+            }
+
+            CheckBox {
+                id: showDismissedToggle
+                visible: section.dismissedCount > 0 || section.showDismissed
+                checked: section.showDismissed
+                text: root.tr("rules.suggestions.inbox.show-dismissed",
+                    "Show answered ({n})").replace("{n}", String(section.dismissedCount))
+                onClicked: section.showDismissed = checked
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.show-dismissed-tooltip",
+                    "Also list the addresses you told the app not to suggest again, so you can change your mind about one.")
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: ToolTip.text
             }
 
             Label {

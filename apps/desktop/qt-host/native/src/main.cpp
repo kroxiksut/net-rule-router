@@ -1432,6 +1432,15 @@ public:
                               obj);
     }
 
+    /// Async wrapper over the launcher-local `local.rules-overlaps` RPC.
+    /// The callback lands on `rpcResponse` with `{pairs, redundant-count}`
+    /// — every exact rule a wildcard rule already covers.
+    Q_INVOKABLE QString rpcRulesOverlaps(const QString &rulesJson) {
+        QJsonObject obj;
+        obj.insert(QStringLiteral("rules-json"), rulesJson);
+        return emitRpcRequest(QStringLiteral("local.rules-overlaps"), obj);
+    }
+
     /// Async wrapper over the launcher-local
     /// `local.vpn.discover` RPC. Scans the machine (running processes +
     /// installed programs) for likely VPN clients; the callback lands on
@@ -1752,6 +1761,30 @@ public:
     /// Used by the local canonical-txt writer for preset export so the
     /// QML side doesn't have to base64-encode Cyrillic / IDN text just
     /// to immediately decode it again. Same 1 MiB cap as the bytes path.
+    /// Path for a diagnostic file under the runtime directory
+    /// (`diagnostics/` beside the launcher logs), creating the folder on
+    /// demand.
+    ///
+    /// Used by the drift comparison to leave behind what it actually compared:
+    /// a divergence that turns out to be equivalent has no reproduction left
+    /// once the bound file is rewritten, and that is exactly the case worth
+    /// studying. Empty string when the folder cannot be created.
+    Q_INVOKABLE QString runtimeDiagnosticsPath(const QString &filename) {
+        const QString name = filename.trimmed();
+        if (name.isEmpty() || name.contains(QLatin1Char('/'))
+                || name.contains(QLatin1Char('\\'))) {
+            return QString();
+        }
+        QDir dir(appRuntimeDirectoryPath());
+        if (!dir.exists(QStringLiteral("diagnostics"))
+                && !dir.mkpath(QStringLiteral("diagnostics"))) {
+            qWarning() << "runtimeDiagnosticsPath: mkpath failed under"
+                       << dir.absolutePath();
+            return QString();
+        }
+        return dir.filePath(QStringLiteral("diagnostics/") + name);
+    }
+
     Q_INVOKABLE bool writeTextFile(const QString &path, const QString &text) {
         constexpr qint64 MAX_BYTES = 1024 * 1024;
         const QByteArray utf8 = text.toUtf8();

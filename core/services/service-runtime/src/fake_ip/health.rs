@@ -65,6 +65,11 @@ pub struct FakeIpHealth {
     /// time out — a nonzero count next to `udp_dial_refused` is the expected
     /// pairing, a nonzero count without one means an upstream died mid-flow.
     udp_unreachable_sent: AtomicU64,
+    /// SYNs reset because the stack was already carrying its maximum number of
+    /// TCP flows. Nonzero means either a burst of genuine traffic or a client
+    /// opening connections it never closes — both worth seeing before the
+    /// user reports "some sites stopped loading".
+    tcp_flows_refused_at_capacity: AtomicU64,
 }
 
 impl FakeIpHealth {
@@ -96,6 +101,17 @@ impl FakeIpHealth {
     /// A TCP relay flow was opened — a dial was attempted (outcome unknown yet).
     pub fn record_tcp_relay_flow_opened(&self) {
         self.tcp_relay_flows_opened.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A SYN was reset because the flow table is full.
+    pub fn record_tcp_flow_refused_at_capacity(&self) {
+        self.tcp_flows_refused_at_capacity
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn tcp_flows_refused_at_capacity(&self) -> u64 {
+        self.tcp_flows_refused_at_capacity.load(Ordering::Relaxed)
     }
 
     /// A TCP dial completed successfully.

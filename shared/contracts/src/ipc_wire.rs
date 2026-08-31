@@ -14,8 +14,14 @@
 //! - Max payload: `IPC_MAX_MESSAGE_BYTES` (`nrr-shared::ipc_transport`)
 //!
 //! Single source of truth for the codec. Both client (`nrr-ipc-client`)
-//! and server (`nrr-windows-service`) consume this module, so any change
-//! to the framing rules lands in one place.
+//! and server (`nrr-windows-service`, `nrr-serviced`) consume this module, so
+//! any change to the framing rules lands in one place.
+//!
+//! It lives in the contracts crate for the reason that sentence implies: a
+//! frame format is a fact shared by both ends. While it sat in the CLIENT
+//! crate, every server had to depend on the client to speak its own protocol —
+//! and that edge carried `nrr-application` and, behind it, the UI and preview
+//! crates into a service running as LocalSystem.
 //!
 //! Cross-platform: takes `Read` / `Write` so the same codec drives both
 //! real Windows pipes and the in-memory test transport.
@@ -24,7 +30,7 @@ use std::io::{Read, Write};
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
+use crate::ipc_transport::IPC_MAX_MESSAGE_BYTES;
 
 /// Read one length-prefixed JSON frame from `r` and decode into `T`.
 pub fn read_frame<R: Read, T: DeserializeOwned>(r: &mut R) -> Result<T, WireError> {
@@ -57,6 +63,13 @@ pub fn write_frame<W: Write, T: Serialize>(w: &mut W, value: &T) -> Result<(), W
     let len = (payload.len() as u32).to_be_bytes();
     w.write_all(&len).map_err(WireError::Io)?;
     w.write_all(&payload).map_err(WireError::Io)?;
+    // `flush` stays. It is load-bearing on a Windows named pipe: the
+    // request/response paths write a frame and close the handle right after,
+    // and without `FlushFileBuffers` the peer can be left reading a pipe whose
+    // both ends are gone (os error 233 - the broker's round-trip test fails on
+    // exactly that). The parked-worker problem it causes on the PUSH path is
+    // real but is a different fix: a write deadline for push frames, not a
+    // codec that stops delivering.
     w.flush().map_err(WireError::Io)?;
     Ok(())
 }
@@ -107,8 +120,6 @@ impl WireError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::io::Cursor;
 
     #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct Sample {
@@ -122,6 +133,41 @@ mod tests {
             value: 42,
         }
     }
+
+    /// `flush` is part of the contract, not an accident: the request/response
+    /// paths close the pipe handle immediately after writing, and on Windows a
+    /// frame that was not flushed can leave the peer reading a pipe with no
+    /// process on either end (os error 233).
+    #[test]
+    fn a_frame_is_flushed_before_the_writer_is_let_go() {
+        struct CountingFlush {
+            written: Vec<u8>,
+            flushes: usize,
+        }
+        impl std::io::Write for CountingFlush {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let mut w = CountingFlush {
+            written: Vec::new(),
+            flushes: 0,
+        };
+        write_frame(&mut w, &sample()).expect("write");
+        assert_eq!(w.flushes, 1, "the frame must be flushed exactly once");
+        let mut read = std::io::Cursor::new(w.written);
+        let got: Sample = read_frame(&mut read).expect("read");
+        assert_eq!(got, sample());
+    }
+
+    use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn write_then_read_roundtrip() {

@@ -126,13 +126,16 @@ impl BlockNoticeCenter {
                 journal.append(sid, &notice, now_ms as i64);
             }
             if let Some(bus) = self.events.as_ref() {
-                bus.publish(StatusUpdateEvent::BlockNoticeRaised {
-                    sid: sid.to_owned(),
-                    destination: notice.destination,
-                    app: notice.app,
-                    reason: notice.reason.slug().to_string(),
-                    attempts: u64::from(notice.attempts),
-                });
+                bus.publish_for(
+                    sid,
+                    StatusUpdateEvent::BlockNoticeRaised {
+                        sid: sid.to_owned(),
+                        destination: notice.destination,
+                        app: notice.app,
+                        reason: notice.reason.slug().to_string(),
+                        attempts: u64::from(notice.attempts),
+                    },
+                );
             }
         }
     }
@@ -277,7 +280,7 @@ mod tests {
     #[test]
     fn a_new_episode_publishes_a_push_event_alongside_the_log_line() {
         let bus = Arc::new(EventBus::new());
-        let sub = bus.subscribe("test-client".to_string(), None);
+        let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
         let center = BlockNoticeCenter::new().with_event_bus(Arc::clone(&bus));
 
         center.record(ALICE, &attempt());
@@ -305,7 +308,7 @@ mod tests {
     #[test]
     fn a_retry_of_a_live_episode_does_not_publish_a_second_event() {
         let bus = Arc::new(EventBus::new());
-        let sub = bus.subscribe("test-client".to_string(), None);
+        let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
         let center = BlockNoticeCenter::new().with_event_bus(Arc::clone(&bus));
 
         center.record(ALICE, &attempt());
@@ -344,7 +347,7 @@ mod tests {
     #[test]
     fn a_muted_episode_publishes_nothing() {
         let bus = Arc::new(EventBus::new());
-        let sub = bus.subscribe("test-client".to_string(), None);
+        let sub = bus.subscribe_as("test-client".to_string(), Some(ALICE.to_string()), None);
         let center = BlockNoticeCenter::new()
             .with_event_bus(Arc::clone(&bus))
             .with_mute_loader(Arc::new(|_sid: &str| vec![Mute::forever(MuteScope::All)]));

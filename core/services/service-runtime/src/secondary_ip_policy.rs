@@ -22,10 +22,12 @@ use nrr_domain::shared_ip::{commit_shared_ip, SharedIpPolicy};
 use nrr_domain::RuleAction;
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-
-/// Cap on suffix/zone fan-out when expanding rules to their cached hostnames —
-/// mirrors the codegen's own bound so the two views stay consistent.
-const SUFFIX_FANOUT_LIMIT: usize = 1024;
+// Cap on suffix/zone fan-out when expanding rules to their cached hostnames,
+// taken from the codegen rather than restated: the two used to say 1024 and
+// 4096 under a comment claiming they mirrored each other, so the census
+// answered "who else uses this address" over a smaller set of hosts than the
+// codegen actually enforces.
+use crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP as SUFFIX_FANOUT_LIMIT;
 
 /// The secondary IPs to EXCLUDE from secondary routing/protection under
 /// `policy`. Empty when the policy is [`SharedIpPolicy::AnyRuleDomain`] (it

@@ -129,7 +129,7 @@ impl IpcHandler for SnapshotInitialHandler {
         // Settings snapshot.
         let pending_revisions: Vec<RevisionSummaryDto> = self
             .policy
-            .pending_revisions()
+            .pending_revisions(ctx.caller_stored())
             .into_iter()
             .map(|rs| RevisionSummaryDto {
                 revision_id: rs.revision_id,

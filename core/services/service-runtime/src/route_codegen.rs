@@ -39,6 +39,7 @@ use nrr_domain::canonical::{
 use nrr_domain::{RouteBehaviorMode, RuleAction};
 use nrr_platform_api::RouteEntry;
 
+use crate::address_ownership::AppDestinationRefusal;
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::net_filter::is_non_routable_v4;
@@ -51,6 +52,26 @@ use crate::wfp_codegen::{PER_HOSTNAME_IP_CAP, SUFFIX_FANOUT_BACKSTOP};
 /// loses its `/32` would silently ride the wrong link. A runaway guard, not
 /// a product limit.
 pub const MAX_ROUTES_PER_RULE: usize = 4096;
+
+/// Prefix length of a host route — the shape every address rule fans out to.
+pub const HOST_PREFIX: u8 = 32;
+
+/// Whether `prefix_length` is a shape THIS codegen emits.
+///
+/// Startup orphan adoption identifies our leftovers by metric plus shape, and
+/// it used to carry its own list of prefixes. The list went stale the moment a
+/// mode grew a shape it did not know: the split-default `/1` pair survived a
+/// crash unadopted, so every packet kept being steered into a tunnel that was
+/// no longer there, and nothing reclaimed the table. Derived from the overlay
+/// constants rather than restated, and pinned by a test that generates every
+/// mode and asserts each emitted shape is recognised here.
+#[must_use]
+pub fn is_owned_prefix_length(prefix_length: u8) -> bool {
+    prefix_length == HOST_PREFIX
+        || prefix_length == OVERLAY_LOW.1
+        || prefix_length == OVERLAY_HIGH.1
+        || COUNTER_OVERLAY.iter().any(|(_, p)| *p == prefix_length)
+}
 
 /// Metric for our secondary routes. Low = preferred over the default
 /// route, but we never touch the system default itself (`is_ours = true`
@@ -133,6 +154,18 @@ pub enum RouteCodegenDiagnostic {
         app: String,
         ip: Ipv4Addr,
     },
+    /// An ADDRESS rule on the additional link named an address the MAIN link's
+    /// rules also name, so it was not pinned into the tunnel. Rules name hosts,
+    /// routes move addresses, and one address carries many hosts: pinning it
+    /// would take the main link's hosts along, and they would then work only
+    /// while the tunnel is up. Aggregated per rule — `ip` is one example and
+    /// `count` is how many that rule lost, because a suffix rule can hold back
+    /// hundreds and a line each would bury the log.
+    AddressClaimedByMainLink {
+        rule_id: String,
+        ip: Ipv4Addr,
+        count: usize,
+    },
     /// a mode wanted to send some traffic to the **primary**
     /// NIC but no usable primary target is bound: in mode B the per-rule
     /// exceptions can't be carved back off the tunnel; in mode A the `/2`
@@ -165,19 +198,13 @@ pub fn generate_secondary_routes(
 ) -> RouteCodegenOutput {
     let mut out = RouteCodegenOutput::default();
     let mut seen: BTreeSet<Ipv4Addr> = BTreeSet::new();
-    // Every application this rule set routes over the additional link, not just
-    // the one being compiled: a destination two routed applications share is
-    // not somebody else's, and a route serves both identically.
-    let friendly: Vec<String> = secondary_rules
-        .rules()
-        .iter()
-        .filter(|r| r.enabled && matches!(r.action, RuleAction::Route))
-        .filter(|r| r.address_match.is_none())
-        .filter_map(|r| r.app_match.as_ref())
-        .map(|app| match &app.pattern {
-            CanonicalAppPattern::Exact(v) | CanonicalAppPattern::Glob(v) => v.clone(),
-        })
-        .collect();
+    // Ownership and the outside-use census are asked as one question, through
+    // the one gate every mechanism shares.
+    let gate = crate::address_ownership::AppDestinationGate::for_rule_set(
+        ownership,
+        app_observations,
+        secondary_rules,
+    );
 
     for rule in secondary_rules.rules() {
         if !rule.enabled {
@@ -222,8 +249,8 @@ pub fn generate_secondary_routes(
             let pattern = match &app.pattern {
                 CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
             };
-            let observed = app_observations.ips_for_app(pattern);
-            if observed.is_empty() {
+            let destinations = gate.admit(pattern, link);
+            if destinations.admitted.is_empty() && destinations.refused.is_empty() {
                 out.diagnostics
                     .push(RouteCodegenDiagnostic::AppRuleUnobserved {
                         rule_id: rule.id.as_str().to_string(),
@@ -231,45 +258,46 @@ pub fn generate_secondary_routes(
                     });
                 continue;
             }
-            let mut per_rule = 0usize;
-            for ip in observed {
-                // Shared with a direct destination and declined by policy —
-                // dropped from the route exactly as it is from the filter set.
+            for (ip, reason) in destinations.refused {
+                // Declined by the shared-address policy is reported by that
+                // policy, not here.
                 if denied.contains(&ip) {
                     continue;
                 }
-                // The other link's rules already claim this address, by name or
-                // by literal. An app rule learns its destinations by watching
-                // the app, so anything the app happens to touch would otherwise
-                // be pinned — machine-wide — over an explicit rule the user
-                // wrote for that very host. Address beats application in the
-                // evaluation order, and a route cannot be process-scoped, so
-                // the only way to honour the order here is to not emit it.
-                if !ownership.app_rule_may_claim(ip, link) {
-                    out.diagnostics.push(
+                out.diagnostics.push(match reason {
+                    // The other link's rules already claim this address, by
+                    // name or by literal. An app rule learns its destinations
+                    // by watching the app, so anything the app happens to touch
+                    // would otherwise be pinned — machine-wide — over an
+                    // explicit rule the user wrote for that very host. Address
+                    // beats application in the evaluation order, and a route
+                    // cannot be process-scoped, so the only way to honour the
+                    // order is to not emit it.
+                    AppDestinationRefusal::ClaimedByAddressRule => {
                         RouteCodegenDiagnostic::AppRuleDestinationClaimedByMainLink {
                             rule_id: rule.id.as_str().to_string(),
                             app: pattern.to_string(),
                             ip,
-                        },
-                    );
-                    continue;
-                }
-                // Somebody the rule set never named is already using this
-                // address. Pinning it would move their traffic too — the
-                // browser reaching the same site is the case that matters — and
-                // the rule is not worth that. Nothing known about the address
-                // is not evidence of exclusivity, so an unobserved one still
-                // gets its route; the withdrawal path covers the other order,
-                // where the second process arrives after the pin.
-                if app_observations.destination_used_outside(&friendly, ip) {
-                    out.diagnostics.push(
+                        }
+                    }
+                    // Somebody the rule set never named is already using this
+                    // address. Pinning it would move their traffic too — the
+                    // browser reaching the same site is the case that matters —
+                    // and the rule is not worth that.
+                    AppDestinationRefusal::UsedByOtherProcess => {
                         RouteCodegenDiagnostic::AppRuleDestinationUsedByOtherProcess {
                             rule_id: rule.id.as_str().to_string(),
                             app: pattern.to_string(),
                             ip,
-                        },
-                    );
+                        }
+                    }
+                });
+            }
+            let mut per_rule = 0usize;
+            for ip in destinations.admitted {
+                // Shared with a direct destination and declined by policy —
+                // dropped from the route exactly as it is from the filter set.
+                if denied.contains(&ip) {
                     continue;
                 }
                 if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
@@ -279,9 +307,17 @@ pub fn generate_secondary_routes(
             continue;
         }
         let mut per_rule = 0usize;
+        // An address this rule may not steer — the other link's address rules
+        // name it too. Held back rather than pinned, reported once per rule.
+        let mut held: Option<(Ipv4Addr, usize)> = None;
+        let steerable = |ip: Ipv4Addr| ownership.address_rule_may_steer(ip, link);
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactIp(ip)) => {
-                push_route(*ip, target, &mut seen, &mut out, &mut per_rule);
+                if steerable(*ip) {
+                    push_route(*ip, target, &mut seen, &mut out, &mut per_rule);
+                } else {
+                    note_held(&mut held, *ip);
+                }
             }
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 let ips = cache.ips_for_hostname(host);
@@ -294,6 +330,10 @@ pub fn generate_secondary_routes(
                     continue;
                 }
                 for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
+                    if !steerable(ip) {
+                        note_held(&mut held, ip);
+                        continue;
+                    }
                     if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
                         break;
                     }
@@ -305,6 +345,8 @@ pub fn generate_secondary_routes(
                     true,
                     target,
                     cache,
+                    &steerable,
+                    &mut held,
                     &mut seen,
                     &mut out,
                     &mut per_rule,
@@ -322,6 +364,8 @@ pub fn generate_secondary_routes(
                     false,
                     target,
                     cache,
+                    &steerable,
+                    &mut held,
                     &mut seen,
                     &mut out,
                     &mut per_rule,
@@ -339,9 +383,26 @@ pub fn generate_secondary_routes(
                 // the `app_match` guard above.)
             }
         }
+        if let Some((ip, count)) = held {
+            out.diagnostics
+                .push(RouteCodegenDiagnostic::AddressClaimedByMainLink {
+                    rule_id: rule.id.as_str().to_string(),
+                    ip,
+                    count,
+                });
+        }
     }
 
     out
+}
+
+/// Record one held-back address: the first is kept as the example, all of them
+/// count.
+fn note_held(held: &mut Option<(Ipv4Addr, usize)>, ip: Ipv4Addr) {
+    match held {
+        Some((_, count)) => *count += 1,
+        None => *held = Some((ip, 1)),
+    }
 }
 
 /// Mode-aware route generation (block 16.18.vpn). The desired route set
@@ -363,6 +424,11 @@ pub fn generate_secondary_routes(
 /// the primary NIC (the mode-A counter-overlay and the mode-B exceptions);
 /// `None` records [`RouteCodegenDiagnostic::PrimaryExceptionsUnavailable`] and
 /// skips that part. Pure: no I/O beyond the injected FQDN cache reader.
+// Eight positional arguments, one over the lint's taste. Grouping them into a
+// struct would be a second shape of the same call for the ten call sites to
+// keep in step, and the last one is what this function is FOR: the arbitration
+// order every mechanism must share.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_routes(
     mode: RouteBehaviorMode,
     rule_book: &CanonicalRuleBook,
@@ -374,6 +440,10 @@ pub fn generate_routes(
     // the mode-A secondary `/32` fan-out ONLY; the same set the WFP codegen uses,
     // so a declined shared IP is dropped from BOTH the route and the kill-switch.
     denied: &HashSet<Ipv4Addr>,
+    // Where an exact-address rule sits against a zone rule, from the
+    // principal's `zone_priority_over_ip`. The two can only contest the same
+    // address in the ownership arbiter, so this is the whole of its reach here.
+    order: crate::address_ownership::ZoneVsIpOrder,
 ) -> RouteCodegenOutput {
     match mode {
         RouteBehaviorMode::PreferPrimary => {
@@ -384,7 +454,9 @@ pub fn generate_routes(
             // Read from the UNFILTERED cache: the denylist view exists to
             // trim what goes to the tunnel, and using it here would understate
             // what the main link claims.
-            let ownership = crate::address_ownership::AddressOwnership::resolve(rule_book, cache);
+            let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+                rule_book, cache, order,
+            );
             let mut out = generate_secondary_routes(
                 &rule_book.secondary,
                 secondary_target,
@@ -432,8 +504,9 @@ pub fn generate_routes(
                     // the ADDITIONAL link's rules name, or a host the user
                     // deliberately tunnels would follow a program out onto the
                     // open link.
-                    let ownership =
-                        crate::address_ownership::AddressOwnership::resolve(rule_book, cache);
+                    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+                        rule_book, cache, order,
+                    );
                     let exceptions = generate_secondary_routes(
                         &rule_book.primary,
                         pt,
@@ -558,11 +631,14 @@ fn push_route(
 // halves came to disagree.
 pub use crate::address_ownership::address_rule_ips;
 
+#[allow(clippy::too_many_arguments)]
 fn fanout_suffix(
     suffix: &str,
     include_apex: bool,
     target: &SecondaryRouteTarget,
     cache: &dyn FqdnCacheLookup,
+    steerable: &dyn Fn(Ipv4Addr) -> bool,
+    held: &mut Option<(Ipv4Addr, usize)>,
     seen: &mut BTreeSet<Ipv4Addr>,
     out: &mut RouteCodegenOutput,
     per_rule: &mut usize,
@@ -579,6 +655,10 @@ fn fanout_suffix(
             .into_iter()
             .take(PER_HOSTNAME_IP_CAP)
         {
+            if !steerable(ip) {
+                note_held(held, ip);
+                continue;
+            }
             if !push_route(ip, target, seen, out, per_rule) {
                 return had_subhosts;
             }
@@ -748,6 +828,93 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
+    }
+
+    /// The live case (26.08): `*.google.com` on the main link,
+    /// `notebooklm.google.com` on the additional one, one address serving both.
+    /// The tunnel pin used to take translate.google.com with it, and the site
+    /// was dead in every browser while both rules were honoured individually.
+    #[test]
+    fn a_shared_address_is_not_pinned_into_the_tunnel() {
+        let shared = ip(172, 217, 17, 206);
+        let only_theirs = ip(142, 250, 150, 101);
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("translate.google.com", vec![shared]);
+        cache.set_ips("notebooklm.google.com", vec![shared, only_theirs]);
+        let book = CanonicalRuleBook {
+            primary: ruleset(vec![rule(
+                "p1",
+                true,
+                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+            )]),
+            secondary: ruleset(vec![rule(
+                "s1",
+                true,
+                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+            )]),
+        };
+        let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
+
+        let out = generate_secondary_routes(
+            &book.secondary,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &ownership,
+            crate::address_ownership::Link::Additional,
+        );
+
+        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
+        assert_eq!(dests, vec![only_theirs], "the shared address must stay put");
+        assert!(
+            out.diagnostics.iter().any(|d| matches!(
+                d,
+                RouteCodegenDiagnostic::AddressClaimedByMainLink { rule_id, ip, count }
+                    if rule_id == "s1" && *ip == shared && *count == 1
+            )),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// The main link is never the one held back: its own rules are what the
+    /// gate protects, and mode B carves them back off the tunnel through this
+    /// same function.
+    #[test]
+    fn the_main_links_own_rules_are_never_held_back() {
+        let shared = ip(172, 217, 17, 206);
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("translate.google.com", vec![shared]);
+        cache.set_ips("notebooklm.google.com", vec![shared]);
+        let book = CanonicalRuleBook {
+            primary: ruleset(vec![rule(
+                "p1",
+                true,
+                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+            )]),
+            secondary: ruleset(vec![rule(
+                "s1",
+                true,
+                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+            )]),
+        };
+        let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
+
+        let out = generate_secondary_routes(
+            &book.primary,
+            &target(),
+            &cache,
+            &no_apps(),
+            &HashSet::new(),
+            &ownership,
+            crate::address_ownership::Link::Main,
+        );
+
+        assert_eq!(
+            out.routes.iter().map(|r| r.destination).collect::<Vec<_>>(),
+            vec![shared]
+        );
     }
 
     #[test]
@@ -1076,6 +1243,68 @@ mod tests {
 
     // ── mode-aware generate_routes (block 16.18.vpn) ──
 
+    /// Startup orphan adoption recognises our leftovers by metric plus shape.
+    /// Its shape list is derived from the overlay constants — this is the other
+    /// end: every route any mode actually emits must be recognised, so a mode
+    /// that grows a new shape fails here instead of leaving that shape orphaned
+    /// in the table after a crash.
+    #[test]
+    fn every_shape_the_codegen_emits_is_one_adoption_recognises() {
+        let cache = MockFqdnCacheLookup::new();
+        cache.set_ips("news.example", vec![ip(198, 51, 100, 7)]);
+        let apps = MockAppObservationLookup::new();
+        apps.set_ips("assistant.exe", vec![ip(203, 0, 113, 9)]);
+        let rb = book(
+            vec![rule(
+                "R-main",
+                true,
+                CanonicalAddressMatch::ExactFqdn("news.example".to_string()),
+            )],
+            vec![
+                rule(
+                    "R-sec",
+                    true,
+                    CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
+                ),
+                app_rule("R-app", "assistant.exe"),
+            ],
+        );
+        let primary = SecondaryRouteTarget {
+            gateway: ip(192, 168, 1, 1),
+            interface_index: 12,
+        };
+
+        for mode in [
+            RouteBehaviorMode::PreferPrimary,
+            RouteBehaviorMode::PreferSecondaryWhenAvailable,
+            RouteBehaviorMode::StrictSecondaryFailClosed,
+        ] {
+            for primary_opt in [None, Some(&primary)] {
+                let out = generate_routes(
+                    mode,
+                    &rb,
+                    primary_opt,
+                    &target(),
+                    &cache,
+                    &apps,
+                    &std::collections::HashSet::new(),
+                    crate::address_ownership::ZoneVsIpOrder::default(),
+                );
+                for route in &out.routes {
+                    assert!(
+                        is_owned_prefix_length(route.prefix_length),
+                        "{mode:?} emits /{} but orphan adoption would not recognise it:                          a crash leaves that route steering traffic into a dead tunnel",
+                        route.prefix_length,
+                    );
+                    assert_eq!(
+                        route.metric, SECONDARY_ROUTE_METRIC,
+                        "adoption also keys on the metric",
+                    );
+                }
+            }
+        }
+    }
+
     fn book(primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>) -> CanonicalRuleBook {
         CanonicalRuleBook {
             primary: CanonicalRuleSet::from_rules(primary),
@@ -1115,6 +1344,7 @@ mod tests {
             &cache,
             &apps,
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::default(),
         );
 
         let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
@@ -1194,6 +1424,7 @@ mod tests {
             &cache,
             &no_apps(),
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::default(),
         );
         // No /1 overlay in mode A; only the secondary rule's /32 (primary rule
         // is irrelevant — default already rides primary).
@@ -1226,6 +1457,7 @@ mod tests {
             &cache,
             &no_apps(),
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::default(),
         );
         // Counter-overlay: four /2 via the primary NIC (ifindex 12) — these
         // out-specific a redirect VPN's /1 so non-rule traffic rides primary.
@@ -1280,6 +1512,7 @@ mod tests {
             &cache,
             &no_apps(),
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::default(),
         );
         // Overlay 0.0.0.0/1 + 128.0.0.0/1 via the secondary (ifindex 7).
         let overlay: Vec<_> = out.routes.iter().filter(|r| r.prefix_length == 1).collect();
@@ -1317,6 +1550,7 @@ mod tests {
             &cache,
             &no_apps(),
             &std::collections::HashSet::new(),
+            crate::address_ownership::ZoneVsIpOrder::default(),
         );
         // Only the overlay survives (no exceptions without a primary target).
         assert_eq!(out.routes.len(), 2);

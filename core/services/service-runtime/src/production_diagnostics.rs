@@ -44,28 +44,31 @@
 //! item returned. Future blocks may add SQLite-indexed log storage —
 //! the trait surface won't change.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use rusqlite::{Connection, OptionalExtension};
 
 use nrr_diagnostics::audit::alert::{SecurityAlert, SecurityAlertsRepository};
+use nrr_diagnostics::audit::anchor::AuditChainAnchorStore;
 use nrr_diagnostics::audit::reader::{AuditQueryFilter, AuditReader};
 use nrr_diagnostics::error::{DiagnosticsError, DiagnosticsResult};
 use nrr_diagnostics::event::{AuditEvent, LogEvent};
 use nrr_diagnostics::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter,
-    LogHealthCard, SecurityAlertDto, SecurityStatusCard, ServiceHealthCard,
-    SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
+    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
+    ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use nrr_diagnostics::facade::pagination::{PageCursor, PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
 use nrr_diagnostics::logs::reader::{LogQueryFilter, LogReader};
+use nrr_diagnostics::privacy::redact::redact_hostname;
 use nrr_diagnostics::privacy::{DiagnosticSession, DiagnosticSessionScope, RedactionMode};
 use nrr_diagnostics::redaction::ExplainDetailLevel;
+use nrr_diagnostics::retention::health::is_dir_writable;
 use nrr_diagnostics::taxonomy::{EventCategory, EventLevel};
 
 // ── DiagnosticSessionHandle ──────────────────────────────────────────────────
@@ -131,9 +134,49 @@ pub struct ProductionDiagnosticsFacade {
     /// `RevisionsRepository`. `None` when storage is degraded.
     state_conn: Option<Arc<Mutex<Connection>>>,
     diagnostic_session: DiagnosticSessionHandle,
+    /// Last chain verification, keyed by the newest audit file's
+    /// (path, length, mtime). The GUI polls `get_status` on a timer and each
+    /// call re-read the whole current audit file and re-hashed every line;
+    /// nothing about that answer changes until the file grows.
+    chain_cache: Mutex<Option<(ChainCacheKey, bool)>>,
 }
 
+type ChainCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
+
 impl ProductionDiagnosticsFacade {
+    /// Whether the audit trail is intact, recomputed only when the newest
+    /// audit file has changed.
+    ///
+    /// `chain_ok` alone answers "was anything edited"; the anchor is what
+    /// answers "is anything missing", and a cut tail passes the first check.
+    fn audit_chain_ok(&self, reader: &AuditReader) -> bool {
+        let newest = reader.list_files().pop();
+        let key: Option<ChainCacheKey> = newest.map(|path| {
+            let meta = std::fs::metadata(&path).ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.and_then(|m| m.modified().ok());
+            (path, len, modified)
+        });
+
+        // A poisoned lock only means a prior panic while holding it; the cache
+        // is an optimisation, so take the value and carry on.
+        let mut cache = match self.chain_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let (Some(key), Some((cached_key, cached))) = (key.as_ref(), cache.as_ref()) {
+            if cached_key == key {
+                return *cached;
+            }
+        }
+
+        let anchor = nrr_diagnostics::FileAnchorStore::in_dir(&self.audit_dir).load();
+        let chain = reader.verify_latest_chain_anchored(anchor.as_ref());
+        let ok = chain.chain_ok && chain.corrupt_lines == 0;
+        *cache = key.map(|key| (key, ok));
+        ok
+    }
+
     pub fn new(
         logs_dir: impl Into<PathBuf>,
         audit_dir: impl Into<PathBuf>,
@@ -148,6 +191,7 @@ impl ProductionDiagnosticsFacade {
             alerts_repo,
             state_conn,
             diagnostic_session: DiagnosticSessionHandle::new(),
+            chain_cache: Mutex::new(None),
         }
     }
 
@@ -174,8 +218,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
 
         // Audit
         let audit_reader = AuditReader::new(self.audit_dir.clone());
-        let chain = audit_reader.verify_latest_chain();
-        let audit_chain_ok = chain.chain_ok;
+        let audit_chain_ok = self.audit_chain_ok(&audit_reader);
         let audit_write_healthy = is_dir_writable(&self.audit_dir);
 
         let open_alerts = self.alerts_repo.list_open().unwrap_or_default();
@@ -231,6 +274,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
             log_health,
             diagnostic_mode,
             stale: false,
+            origin: DiagnosticsDataOrigin::Service,
         }
     }
 
@@ -270,11 +314,6 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         let reader = AuditReader::new(self.audit_dir.clone());
         let query_filter = audit_filter_to_query(filter);
         let mut events: Vec<AuditEvent> = reader.scan(&query_filter);
-
-        // Wire filter fields that the reader query doesn't honour.
-        if let Some(rid) = filter.revision_id.as_deref() {
-            events.retain(|e| e.revision_id.as_deref() == Some(rid));
-        }
 
         events.sort_by(|a, b| {
             a.created_at
@@ -413,16 +452,6 @@ impl ProductionDiagnosticsFacade {
         let query_filter = log_filter_to_query(filter);
         let mut events: Vec<LogEvent> = reader.scan(&query_filter);
 
-        // Filter post-conditions that LogQueryFilter doesn't honour
-        // (revision_id; decision_id ALREADY honoured indirectly via
-        // correlation — wire filter has it, query filter doesn't).
-        if let Some(rid) = filter.revision_id.as_deref() {
-            events.retain(|e| e.correlation.revision_id.as_deref() == Some(rid));
-        }
-        if let Some(did) = filter.decision_id.as_deref() {
-            events.retain(|e| e.correlation.decision_id.as_deref() == Some(did));
-        }
-
         // Stable order: ascending (created_at_ms, event_id).
         events.sort_by(|a, b| {
             a.created_at
@@ -503,6 +532,7 @@ impl ProductionDiagnosticsFacade {
         // Feed the caller's per-SID behavior_mode so an unmatched sample
         // reports the default route the service actually enforces.
         let behavior_mode = self.behavior_mode_for_sid(caller_sid);
+        let zone_policy = self.zone_policy_for_sid(caller_sid);
         // A BARE-IP probe (no hostname) is rule-less by
         // itself, so a shared CDN IP like `8.6.112.0` would report the DEFAULT
         // route even though its owning hostname IS routed — contradicting the
@@ -525,7 +555,7 @@ impl ProductionDiagnosticsFacade {
                         Some(h),
                         observed_ipaddr,
                         sample.process_name.as_deref(),
-                        nrr_domain::decision_matching::ZonePriorityPolicy::default(),
+                        zone_policy,
                         behavior_mode,
                     ),
                     nrr_domain::decision_matching::RequestedRouteDecision::MatchedRoute { .. }
@@ -538,7 +568,7 @@ impl ProductionDiagnosticsFacade {
             match_host,
             observed_ipaddr,
             sample.process_name.as_deref(),
-            nrr_domain::decision_matching::ZonePriorityPolicy::default(),
+            zone_policy,
             behavior_mode,
         );
         let (route_role, action_key, reason_key) = match &decision {
@@ -588,8 +618,19 @@ impl ProductionDiagnosticsFacade {
         } else {
             sample.observed_ip.clone()
         };
+        // The hostname went out in full at Compact while the IP beside it was
+        // elided — the level gate protected one field of the pair and not the
+        // other. Compact gets eTLD+1, which is what the redaction helper has
+        // always produced for exactly this case.
+        let destination_hostname = sample.hostname.as_deref().map(|hostname| {
+            if matches!(level, ExplainDetailLevel::CompactUi) {
+                redact_hostname(hostname, RedactionMode::Default).display_or_marker()
+            } else {
+                hostname.to_string()
+            }
+        });
         let input_section = ExplainInputSection {
-            destination_hostname: sample.hostname.clone(),
+            destination_hostname,
             destination_ip_present: sample.observed_ip.is_some(),
             destination_ip,
             process_name: sample.process_name.clone(),
@@ -656,6 +697,31 @@ impl ProductionDiagnosticsFacade {
     /// for a SID with no policy row). Degrades to `false` on an empty SID,
     /// missing state DB, lock failure, or read error — the probe reports the
     /// narrow rule book rather than guessing at an unreadable policy.
+    /// The caller's Zone-vs-ExactIp order. The engine has always taken this as
+    /// a parameter and both production callers passed the default, so the
+    /// setting the rule model documents ("Exact IP wins by default;
+    /// configurable") had no way to take effect.
+    fn zone_policy_for_sid(&self, sid: &str) -> nrr_domain::decision_matching::ZonePriorityPolicy {
+        let prefer_ip = !self.reads_zone_priority_over_ip(sid);
+        nrr_domain::decision_matching::ZonePriorityPolicy { prefer_ip }
+    }
+
+    fn reads_zone_priority_over_ip(&self, sid: &str) -> bool {
+        if sid.is_empty() {
+            return false;
+        }
+        let Some(conn_arc) = self.state_conn.as_ref() else {
+            return false;
+        };
+        let Ok(conn) = conn_arc.lock() else {
+            return false;
+        };
+        nrr_storage::route_bindings::RouteBindingsRepository::new(&conn)
+            .load_for_sid(sid)
+            .map(|p| p.zone_priority_over_ip)
+            .unwrap_or(false)
+    }
+
     fn reads_include_subdomains(&self, sid: &str) -> bool {
         if sid.is_empty() {
             return false;
@@ -883,22 +949,6 @@ fn millis_since_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-fn is_dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(".nrr-write-probe");
-    let opened = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&probe);
-    match opened {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
 fn scope_slug(scope: DiagnosticSessionScope) -> &'static str {
     match scope {
         DiagnosticSessionScope::All => "all",
@@ -965,6 +1015,12 @@ fn log_filter_to_query(filter: &LogEntryFilter) -> LogQueryFilter {
     if let Some(kind) = filter.kind.clone() {
         q = q.kind(kind);
     }
+    if let Some(id) = filter.decision_id.clone() {
+        q = q.decision_id(id);
+    }
+    if let Some(id) = filter.revision_id.clone() {
+        q = q.revision_id(id);
+    }
     q
 }
 
@@ -976,6 +1032,7 @@ fn audit_filter_to_query(filter: &AuditEntryFilter) -> AuditQueryFilter {
     q.from_ms = filter.from_ms;
     q.to_ms = filter.to_ms;
     q.kind = filter.kind.clone();
+    q.revision_id = filter.revision_id.clone();
     q
 }
 
@@ -1003,6 +1060,15 @@ fn log_event_to_dto(event: &LogEvent) -> LogEntryDto {
         category: event.category.as_str().to_string(),
         kind: event.kind.clone(),
         message_key,
+        // The writer already redacted the payload down to the active mode's
+        // ceiling, so whatever is left here is safe to show as written.
+        message: event
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("message"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
         // Payload-detail surfacing requires diagnostic
         // mode plus a structured payload column on `LogEvent` that
         // doesn't exist on the wire today. Leave `false` until that
@@ -1058,15 +1124,34 @@ fn audit_entry_position(item: &AuditEntryDto) -> (i64, &str) {
 /// last returned item — caller treats it as opaque.
 ///
 /// Inputs MUST already be sorted ascending by `(created_at, event_id)`.
+/// Number of adjacent items sharing a `(created_at, event_id)` position, or
+/// `None` when every position is distinct.
+fn duplicate_positions<T>(items: &[T], position: PositionFn<T>) -> Option<u64> {
+    let count = items
+        .windows(2)
+        .filter(|pair| position(&pair[0]) == position(&pair[1]))
+        .count() as u64;
+    (count > 0).then_some(count)
+}
+
 fn paginate<T>(items: Vec<T>, params: &PaginationParams, position: PositionFn<T>) -> PageResult<T> {
     let total = items.len() as u64;
     let cursor_pos: Option<(i64, String)> = params
         .cursor
         .as_ref()
         .and_then(|c| c.parse().map(|(ts, id)| (ts, id.to_string())));
-    // Skip items strictly less than or equal to the cursor's
-    // position. Cursor points at the LAST item already delivered, so
-    // the next page starts strictly after it.
+    // Resume strictly after the cursor's position. This is only sound because
+    // every event id is unique: when ids repeated (the old call-site-constant
+    // id), a page edge inside a run of identical pairs dropped the rest of that
+    // run — silently. Ids are unique at the source now; the loop below turns a
+    // regression there into a visible line instead of missing evidence.
+    if let Some(duplicates) = duplicate_positions(&items, position) {
+        tracing::warn!(
+            target: "nrr::diagnostics",
+            duplicates,
+            "log page positions are not unique — paging can drop entries"
+        );
+    }
     let start_index = match cursor_pos {
         None => 0,
         Some((cts, cid)) => items
@@ -1112,8 +1197,56 @@ mod tests {
     use nrr_diagnostics::audit::{ActorKind, AuditEventKind, AuditEventResult};
     use nrr_diagnostics::reason::ReasonCode;
     use nrr_diagnostics::sink::AuditSink;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    /// The engine takes the Zone-vs-ExactIp order as a parameter and both
+    /// production callers passed the default, so the setting the rule model
+    /// documents could not take effect. It is now stored per principal and read
+    /// here.
+    #[test]
+    fn the_zone_priority_setting_reaches_the_matcher() {
+        use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
+        use nrr_storage::repository::MigrationRunner;
+
+        let dir = TempDir::new().expect("tmp");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(std::sync::Mutex::new(runner.into_connection()));
+        let alerts: Arc<dyn SecurityAlertsRepository> =
+            Arc::new(InMemorySecurityAlertsRepository::new());
+        let facade = ProductionDiagnosticsFacade::new(
+            dir.path(),
+            dir.path(),
+            None,
+            alerts,
+            Some(Arc::clone(&conn)),
+        );
+        let sid = "S-1-5-21-zone";
+
+        // Nothing stored yet: the documented default (the exact address wins).
+        assert!(facade.zone_policy_for_sid(sid).prefer_ip);
+
+        {
+            let guard = conn.lock().expect("lock");
+            let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+            let mut policy = repo.load_for_sid(sid).expect("load policy");
+            policy.zone_priority_over_ip = true;
+            repo.update_for_sid(sid, &policy, 0).expect("store policy");
+            assert!(
+                repo.load_for_sid(sid)
+                    .expect("reload")
+                    .zone_priority_over_ip,
+                "storage round-trip"
+            );
+        }
+        assert!(
+            !facade.zone_policy_for_sid(sid).prefer_ip,
+            "the stored setting must reach the matcher"
+        );
+    }
 
     fn make_facade(audit_dir: &Path, logs_dir: &Path) -> ProductionDiagnosticsFacade {
         let alerts: Arc<dyn SecurityAlertsRepository> =
@@ -1563,5 +1696,120 @@ mod tests {
         );
         h.store(Some(s));
         assert_eq!(h.redaction_mode(2_000), RedactionMode::Diagnostics);
+    }
+
+    fn log_entry(created_at: i64, event_id: &str) -> LogEntryDto {
+        LogEntryDto {
+            event_id: event_id.to_string(),
+            created_at,
+            level: "info".into(),
+            category: "service".into(),
+            kind: "service.started".into(),
+            message_key: "diag.service.started.summary".into(),
+            message: String::new(),
+            has_payload: false,
+            correlation_summary: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn paging_delivers_every_line_when_ids_are_unique() {
+        // Same millisecond, distinct ids — exactly what the tracing layer now
+        // produces, and what the cursor needs to page without losses.
+        let items: Vec<LogEntryDto> = (0..5)
+            .map(|n| log_entry(1_000, &format!("evt-{n}")))
+            .collect();
+
+        let mut delivered = 0usize;
+        let mut cursor = None;
+        for _ in 0..10 {
+            let params = PaginationParams {
+                cursor: cursor.clone(),
+                page_size: 2,
+            };
+            let page = paginate(items.clone(), &params, log_entry_position);
+            delivered += page.items.len();
+            match page.next_cursor {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+        assert_eq!(delivered, items.len());
+    }
+
+    #[test]
+    fn repeated_positions_are_reported_not_swallowed() {
+        let items: Vec<LogEntryDto> = (0..3).map(|_| log_entry(1_000, "evt-same")).collect();
+        assert_eq!(duplicate_positions(&items, log_entry_position), Some(2));
+
+        let unique: Vec<LogEntryDto> = (0..3)
+            .map(|n| log_entry(1_000, &format!("evt-{n}")))
+            .collect();
+        assert_eq!(duplicate_positions(&unique, log_entry_position), None);
+    }
+
+    #[test]
+    fn the_compact_explain_does_not_ship_the_full_hostname() {
+        let dir = TempDir::new().expect("tempdir");
+        let audit_dir = dir.path().join("audit");
+        let logs_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let facade = make_facade(&audit_dir, &logs_dir);
+        let q = ExplainQuery::Synthetic {
+            input_sample: nrr_diagnostics::explain::RuntimeInputSample::new()
+                .with_hostname("secret-project.internal.example.com"),
+        };
+
+        let compact = facade
+            .get_explain(&q, ExplainDetailLevel::CompactUi, "")
+            .unwrap();
+        let hostname = compact
+            .input
+            .expect("input section")
+            .destination_hostname
+            .expect("hostname");
+        assert_eq!(
+            hostname, "example.com",
+            "Compact must not carry the full hostname"
+        );
+
+        let detailed = facade
+            .get_explain(&q, ExplainDetailLevel::Diagnostics, "")
+            .unwrap();
+        assert_eq!(
+            detailed
+                .input
+                .expect("input section")
+                .destination_hostname
+                .as_deref(),
+            Some("secret-project.internal.example.com"),
+            "Diagnostics keeps the full hostname — that is what it is for"
+        );
+    }
+
+    #[test]
+    fn a_tracing_events_text_reaches_the_log_view() {
+        use nrr_diagnostics::event::LogEvent;
+        use nrr_diagnostics::taxonomy::EventLevel;
+
+        let mut event = LogEvent::new(
+            "evt-1".to_string(),
+            1_745_000_000_000,
+            EventLevel::Info,
+            nrr_diagnostics::reason::service::STARTED,
+        );
+        event.payload = Some(serde_json::json!({ "message": "kill-switch armed" }));
+
+        let dto = log_event_to_dto(&event);
+        assert_eq!(
+            dto.message, "kill-switch armed",
+            "the Logs section showed a category name because the text never left the NDJSON"
+        );
+
+        // An event with no message must not invent one.
+        let mut bare = event.clone();
+        bare.payload = None;
+        assert!(log_event_to_dto(&bare).message.is_empty());
     }
 }

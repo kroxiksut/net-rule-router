@@ -58,7 +58,9 @@ use nrr_shared::RouteRole;
 
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::killswitch_codegen::{KillSwitchProtocols, KILLSWITCH_MAX_DESTINATIONS};
+use crate::killswitch_codegen::{
+    KillSwitchProtocols, APP_KILLSWITCH_MAX_APPS, KILLSWITCH_MAX_DESTINATIONS,
+};
 use crate::net_filter::is_non_routable_v4;
 use crate::route_codegen::{
     COUNTER_OVERLAY, MAX_ROUTES_PER_RULE, OVERLAY_HIGH, OVERLAY_LOW, SECONDARY_ROUTE_METRIC,
@@ -75,6 +77,11 @@ pub struct PlannerInput<'a> {
     pub fqdn_cache: &'a dyn FqdnCacheLookup,
     pub app_resolver: &'a dyn AppPathResolver,
     pub app_observations: &'a dyn AppObservationLookup,
+    /// Evaluate a zone rule ahead of an exact-address rule, from the
+    /// principal's stored `zone_priority_over_ip`. Reaches the
+    /// address-ownership arbiter, which is the one place the two can contest
+    /// the same address.
+    pub zone_priority_over_ip: bool,
 }
 
 /// Within-band ordinal slots reserved per rule, mirroring
@@ -139,10 +146,31 @@ pub fn plan_route_rules(
 ) -> Vec<FlowRule> {
     let principal = principal_scope(sid);
     let mut flows = Vec::new();
+    // The same arbiter the Windows codegens read. Without it this path pins an
+    // app rule's observed destinations over an address rule the user wrote for
+    // that very host, and the kill-switch then blocks the address for every
+    // process — the incident the arbiter exists for, reproduced on the Linux
+    // enforcement path.
+    let ownership = crate::address_ownership::AddressOwnership::resolve_with_order(
+        rule_book,
+        input.fqdn_cache,
+        crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
+            input.zone_priority_over_ip,
+        ),
+    );
     for (role, set) in [
         (RouteRole::Primary, &rule_book.primary),
         (RouteRole::Secondary, &rule_book.secondary),
     ] {
+        let gate = crate::address_ownership::AppDestinationGate::for_rule_set(
+            &ownership,
+            input.app_observations,
+            set,
+        );
+        let link = match role {
+            RouteRole::Primary => crate::address_ownership::Link::Main,
+            RouteRole::Secondary => crate::address_ownership::Link::Additional,
+        };
         for (pos, rule) in set.rules().iter().enumerate() {
             if !rule.enabled {
                 continue;
@@ -179,6 +207,16 @@ pub fn plan_route_rules(
 
             if let Some(addr_match) = rule.address_match.as_ref() {
                 for (fanout_idx, ip) in resolve_targets(addr_match, input.fqdn_cache) {
+                    // A Block rule steers nothing, so the arbiter has no say
+                    // over it. Otherwise: an address the main link's own rules
+                    // name is not this link's to take, however specific this
+                    // rule is about the HOST — the flow acts on the ADDRESS,
+                    // and it carries the main link's hosts too.
+                    if !matches!(rule.action, RuleAction::Block)
+                        && !ownership.address_rule_may_steer(ip, link)
+                    {
+                        continue;
+                    }
                     flows.push(host_flow(fanout_idx, ip));
                 }
             } else if let Some(app) = rule.app_match.as_ref() {
@@ -217,9 +255,9 @@ pub fn plan_route_rules(
                 }
                 // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i) —
                 // ordinary host flows, so `coverage` (mirror for Block) applies.
-                for (i, ip) in input
-                    .app_observations
-                    .ips_for_app(pattern)
+                for (i, ip) in gate
+                    .admit(pattern, link)
+                    .admitted
                     .into_iter()
                     .take(PER_HOSTNAME_IP_CAP)
                     .enumerate()
@@ -743,6 +781,11 @@ fn ks_flow(
 /// One [`PrecedenceClass::KillSwitchPermit`] flow per app; `lower_kill_switch`
 /// expands each into the ALE permit(luid)+block pair. Zero-LUID fail-open is a
 /// lowering concern.
+///
+/// Main-named addresses need no rescue flows: the lowered per-app block sits
+/// below the primary rule band, so the primary rules' own permits carry every
+/// address the main link names — uncapped, unlike the per-(app, address) rescue
+/// permits that ordering replaced.
 pub fn plan_app_kill_switch(
     sid: &str,
     app_patterns: &[String],
@@ -752,24 +795,25 @@ pub fn plan_app_kill_switch(
         return Vec::new();
     }
     let principal = principal_scope(sid);
-    app_patterns
+    let mut flows = Vec::new();
+    for (idx, pattern) in app_patterns
         .iter()
-        .take(KILLSWITCH_MAX_DESTINATIONS)
+        .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
-        .map(|(idx, pattern)| {
-            ks_flow(
-                &principal,
-                Verdict::Permit,
-                PrecedenceClass::KillSwitchPermit,
-                DstMatch::Any,
-                app_scope(pattern),
-                EgressConstraint::OnlyVia(EgressRef::Secondary),
-                None,
-                Coverage::ConnectOnly,
-                idx as u32,
-            )
-        })
-        .collect()
+    {
+        flows.push(ks_flow(
+            &principal,
+            Verdict::Permit,
+            PrecedenceClass::KillSwitchPermit,
+            DstMatch::Any,
+            app_scope(pattern),
+            EgressConstraint::OnlyVia(EgressRef::Secondary),
+            None,
+            Coverage::ConnectOnly,
+            idx as u32,
+        ));
+    }
+    flows
 }
 
 /// Plan the **primary-app kill-switch exemption** (Sub-slice 4d) — one
@@ -887,7 +931,7 @@ pub fn plan_fail_closed_apps(
     let principal = principal_scope(sid);
     app_patterns
         .iter()
-        .take(KILLSWITCH_MAX_DESTINATIONS)
+        .take(APP_KILLSWITCH_MAX_APPS)
         .enumerate()
         .map(|(idx, pattern)| {
             ks_flow(
@@ -1224,9 +1268,19 @@ pub fn plan_routes(
     rule_book: &CanonicalRuleBook,
     has_primary: bool,
     cache: &dyn FqdnCacheLookup,
+    app_observations: &dyn AppObservationLookup,
     denied: &HashSet<Ipv4Addr>,
+    // Where an exact-address rule sits against a zone rule, from the
+    // principal's `zone_priority_over_ip`. The two can only contest the same
+    // address in the ownership arbiter, so this is the whole of its reach here.
+    order: crate::address_ownership::ZoneVsIpOrder,
 ) -> Vec<RouteIntent> {
     let mut routes = Vec::new();
+    // Ownership from the UNFILTERED cache: the denylist view exists to trim
+    // what goes to the tunnel, and reading it here would understate what the
+    // main link claims.
+    let ownership =
+        crate::address_ownership::AddressOwnership::resolve_with_order(rule_book, cache, order);
     match mode {
         RouteBehaviorMode::PreferPrimary => {
             // Secondary rules → /32 via the secondary, minus any declined shared IP.
@@ -1236,6 +1290,12 @@ pub fn plan_routes(
                 &rule_book.secondary,
                 EgressRef::Secondary,
                 &secondary_cache,
+                &crate::address_ownership::AppDestinationGate::for_rule_set(
+                    &ownership,
+                    app_observations,
+                    &rule_book.secondary,
+                ),
+                &ownership,
                 &mut seen,
                 &mut routes,
             );
@@ -1266,6 +1326,12 @@ pub fn plan_routes(
                     &rule_book.primary,
                     EgressRef::Primary,
                     cache,
+                    &crate::address_ownership::AppDestinationGate::for_rule_set(
+                        &ownership,
+                        app_observations,
+                        &rule_book.primary,
+                    ),
+                    &ownership,
                     &mut seen,
                     &mut routes,
                 );
@@ -1277,25 +1343,57 @@ pub fn plan_routes(
 
 /// Plan the `/32` host routes for one ruleset (neutral equivalent of
 /// `route_codegen::generate_secondary_routes`), deduped by destination across
-/// rules via `seen`. Skips disabled / `Block` / app-carrying rules and
-/// non-routable destinations, capped per rule at [`MAX_ROUTES_PER_RULE`].
+/// rules via `seen`. Skips disabled / `Block` rules and non-routable
+/// destinations, capped per rule at [`MAX_ROUTES_PER_RULE`].
+///
+/// An APPLICATION-only rule routes the destinations the app has been observed
+/// using, exactly as the Windows codegen does: the app's permit is conditional
+/// on the traffic leaving that link, so without the route the packet leaves the
+/// other one, misses its own permit and is dropped.
+#[allow(clippy::too_many_arguments)]
 fn plan_host_routes(
     rules: &CanonicalRuleSet,
     egress: EgressRef,
     cache: &dyn FqdnCacheLookup,
+    gate: &crate::address_ownership::AppDestinationGate<'_>,
+    ownership: &crate::address_ownership::AddressOwnership,
     seen: &mut BTreeSet<Ipv4Addr>,
     out: &mut Vec<RouteIntent>,
 ) {
+    let link = match egress {
+        EgressRef::Primary => crate::address_ownership::Link::Main,
+        _ => crate::address_ownership::Link::Additional,
+    };
     for rule in rules.rules() {
-        if !rule.enabled || matches!(rule.action, RuleAction::Block) || rule.app_match.is_some() {
-            // Disabled / Block (dropped, no route) / app rules (block-only in
-            // Free — the codegen records a diagnostic, absent from the plan).
+        if !rule.enabled || matches!(rule.action, RuleAction::Block) {
+            continue;
+        }
+        // A rule carrying BOTH conditions matches as AND, and no route table
+        // scopes a route to a process — routing its address would ignore the
+        // application half and move every other process too.
+        if rule.app_match.is_some() && rule.address_match.is_some() {
             continue;
         }
         let mut per_rule = 0usize;
+        if let Some(app) = rule.app_match.as_ref() {
+            let pattern = match &app.pattern {
+                CanonicalAppPattern::Exact(s) | CanonicalAppPattern::Glob(s) => s.as_str(),
+            };
+            for ip in gate.admit(pattern, link).admitted {
+                if !push_host_route(ip, &egress, seen, out, &mut per_rule) {
+                    break;
+                }
+            }
+            continue;
+        }
+        // The same gate the Windows route codegen applies: an address the main
+        // link's rules also name stays on the main link.
+        let steerable = |ip: Ipv4Addr| ownership.address_rule_may_steer(ip, link);
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactIp(ip)) => {
-                push_host_route(*ip, &egress, seen, out, &mut per_rule);
+                if steerable(*ip) {
+                    push_host_route(*ip, &egress, seen, out, &mut per_rule);
+                }
             }
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 for ip in cache
@@ -1303,6 +1401,9 @@ fn plan_host_routes(
                     .into_iter()
                     .take(PER_HOSTNAME_IP_CAP)
                 {
+                    if !steerable(ip) {
+                        continue;
+                    }
                     if !push_host_route(ip, &egress, seen, out, &mut per_rule) {
                         break;
                     }
@@ -1327,6 +1428,9 @@ fn plan_host_routes(
                         .into_iter()
                         .take(PER_HOSTNAME_IP_CAP)
                     {
+                        if !steerable(ip) {
+                            continue;
+                        }
                         if !push_host_route(ip, &egress, seen, out, &mut per_rule) {
                             break 'outer;
                         }
@@ -1452,6 +1556,7 @@ mod tests {
             fqdn_cache: cache,
             app_resolver: resolver,
             app_observations: obs,
+            zone_priority_over_ip: false,
         }
     }
 
@@ -1710,6 +1815,7 @@ mod tests {
             app_observations: &obs,
             app_resolver: &resolver,
             secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
         });
 
         let plan = EnforcementPlan {
@@ -1966,7 +2072,12 @@ mod tests {
         };
 
         let check = |protos: KillSwitchProtocols, expected_len: usize| {
-            let current = catch_all_kill_switch_filters(sid, &resolution, protos);
+            let current = catch_all_kill_switch_filters(
+                sid,
+                &resolution,
+                &crate::killswitch_codegen::FailClosedExemptions::default(),
+                protos,
+            );
             assert_eq!(
                 current.len(),
                 expected_len,
@@ -2061,7 +2172,9 @@ mod tests {
             );
         };
 
-        // (A) per-app kill-switch — ALE pair per app.
+        // (A) per-app kill-switch — ALE pair per app. Main-named addresses no
+        // longer earn rescue permits: the block sits below the primary rule
+        // band, so the primary rules' own permits carry them.
         let cur = app_kill_switch_filters(sid, &apps, luid, KillSwitchProtocols::ALL);
         assert_eq!(cur.len(), 4, "2 apps × (permit + block)");
         let low = lower_kill_switch(
@@ -2120,6 +2233,7 @@ mod tests {
                     allow_dns_over_primary: allow_dns,
                     known_direct_ips: directs.to_vec(),
                     probe_target_ips: probes.to_vec(),
+                    secondary_luid: 0,
                 };
                 let cur = fail_closed_block_all_filters(sid, &ex, protos);
                 let low = lower_catch_all_kill_switch(
@@ -2168,6 +2282,7 @@ mod tests {
             app_observations: &obs,
             app_resolver: &resolver,
             secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
         });
 
         let plan = EnforcementPlan {
@@ -2260,6 +2375,21 @@ mod tests {
                     RuleAction::Route,
                 ),
                 exact_ip_rule("s-loop", Ipv4Addr::new(127, 0, 0, 1)),
+                // An app-only rule: routed from observations on both sides, so
+                // the equivalence covers the destinations the Windows codegen
+                // learns rather than resolves.
+                CanonicalRule {
+                    id: nrr_domain::RuleId("s-app".into()),
+                    enabled: true,
+                    address_match: None,
+                    app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+                        pattern: CanonicalAppPattern::Exact("messenger.exe".into()),
+                        include_child_processes: false,
+                    }),
+                    comment: String::new(),
+                    action: RuleAction::Route,
+                    origin: None,
+                },
             ],
         );
 
@@ -2292,16 +2422,33 @@ mod tests {
             ] {
                 for has_primary in [false, true] {
                     let primary_opt = has_primary.then_some(&pri);
-                    let no_apps = crate::app_observation_lookup::MockAppObservationLookup::new();
-                    let current =
-                        generate_routes(mode, &rb, primary_opt, &sec, &cache, &no_apps, &denylist);
+                    let apps = crate::app_observation_lookup::MockAppObservationLookup::new();
+                    apps.set_ips("messenger.exe", vec![Ipv4Addr::new(203, 0, 113, 7)]);
+                    let current = generate_routes(
+                        mode,
+                        &rb,
+                        primary_opt,
+                        &sec,
+                        &cache,
+                        &apps,
+                        &denylist,
+                        crate::address_ownership::ZoneVsIpOrder::default(),
+                    );
                     let plan = EnforcementPlan {
                         principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(
                             "S-1-5-21-A",
                         )
                         .expect("valid sid"),
                         flows: Vec::new(),
-                        routes: plan_routes(mode, &rb, has_primary, &cache, &denylist),
+                        routes: plan_routes(
+                            mode,
+                            &rb,
+                            has_primary,
+                            &cache,
+                            &apps,
+                            &denylist,
+                            crate::address_ownership::ZoneVsIpOrder::default(),
+                        ),
                         policy_rules: Vec::new(),
                     };
                     let lowered =

@@ -32,9 +32,11 @@
 //! confirmed-fact sink are injected as traits; the production wiring reuses the
 //! raw-UDP transport and [`crate::dns_observation_consumer`] keep-logic.
 
-use std::collections::HashSet;
+use crate::bounded_set::BoundedRecentSet;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Reverse + forward DNS lookups for FCrDNS confirmation. The production impl
 /// (wiring slice) reuses the captured-upstream raw-UDP transport; both calls are
@@ -90,20 +92,59 @@ pub enum LearnOutcome {
 pub struct ReverseDnsLearner<R: ReverseDnsResolver, S: ConfirmedHostSink> {
     resolver: R,
     sink: S,
-    /// IPs already attempted (dedup + rate limit); also bounds total lookups.
-    attempted: Mutex<HashSet<Ipv4Addr>>,
-    /// Max distinct IPs attempted per session (backstop against a drop storm).
-    max_attempts: usize,
+    /// IPs already attempted, bounded and least-recently-seen first.
+    ///
+    /// This used to be an unbounded set plus a hard per-session ceiling: once
+    /// the ceiling was reached the learner stopped learning until the service
+    /// restarted, and an address attempted once during a blip was never retried
+    /// at all. Bounding the memory does both jobs — it caps what a drop storm
+    /// can cost in memory, and an address that falls out of the window becomes
+    /// learnable again, which is how a transient failure heals.
+    attempted: Mutex<BoundedRecentSet<Ipv4Addr>>,
+    /// When a lookup for an address came back with nothing at all. Such an
+    /// attempt still dedups a drop storm, but only for
+    /// [`FAILED_LOOKUP_RETRY_AFTER`] — a PTR that did not answer is most often
+    /// the block-all that caused the drop, and remembering it as failed forever
+    /// disabled learning for that address until the service restarted.
+    failed_at: Mutex<HashMap<Ipv4Addr, Instant>>,
+    remembered_attempts: usize,
 }
 
+/// How long a lookup that answered nothing suppresses the next attempt.
+const FAILED_LOOKUP_RETRY_AFTER: Duration = Duration::from_secs(60);
+
 impl<R: ReverseDnsResolver, S: ConfirmedHostSink> ReverseDnsLearner<R, S> {
-    pub fn new(resolver: R, sink: S, max_attempts: usize) -> Self {
+    /// `remembered_attempts` bounds how many distinct destinations the learner
+    /// keeps in mind at once.
+    pub fn new(resolver: R, sink: S, remembered_attempts: usize) -> Self {
         Self {
             resolver,
             sink,
-            attempted: Mutex::new(HashSet::new()),
-            max_attempts,
+            attempted: Mutex::new(BoundedRecentSet::new(remembered_attempts)),
+            failed_at: Mutex::new(HashMap::new()),
+            remembered_attempts,
         }
+    }
+
+    /// May an address that is already in the window be tried again? Only if its
+    /// last attempt learned nothing at all and the retry delay has passed.
+    fn retry_is_due(&self, ip: Ipv4Addr) -> bool {
+        let mut failed = self.failed_at.lock().unwrap_or_else(|p| p.into_inner());
+        match failed.get(&ip) {
+            Some(at) if at.elapsed() >= FAILED_LOOKUP_RETRY_AFTER => {
+                failed.remove(&ip);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn note_failed_lookup(&self, ip: Ipv4Addr) {
+        let mut failed = self.failed_at.lock().unwrap_or_else(|p| p.into_inner());
+        if failed.len() > self.remembered_attempts {
+            failed.retain(|_, at| at.elapsed() < FAILED_LOOKUP_RETRY_AFTER);
+        }
+        failed.insert(ip, Instant::now());
     }
 
     /// Attempt to learn the name behind one NRR-dropped destination `ip`. Pure of
@@ -124,19 +165,24 @@ impl<R: ReverseDnsResolver, S: ConfirmedHostSink> ReverseDnsLearner<R, S> {
     pub fn learn_scoped(&self, ip: Ipv4Addr, allow_direct: bool) -> LearnOutcome {
         {
             let mut seen = self.attempted.lock().unwrap_or_else(|p| p.into_inner());
-            if seen.contains(&ip) {
+            if seen.contains(&ip) && !self.retry_is_due(ip) {
                 return LearnOutcome::Skipped;
             }
-            if seen.len() >= self.max_attempts {
-                return LearnOutcome::Skipped;
-            }
-            seen.insert(ip);
+            seen.observe(ip);
         }
 
         let names = self.resolver.resolve_ptr(ip);
+        if names.is_empty() {
+            // Nothing learned and nothing refuted. The attempt still dedups a
+            // drop storm, but it must expire: a PTR that did not answer is
+            // most often the block-all that caused this very drop, and a
+            // permanent record disabled the address until the next restart.
+            self.note_failed_lookup(ip);
+            return LearnOutcome::NotConfirmed;
+        }
         // Two passes so a rule-matching PTR name always wins over a direct
         // classification when an IP carries several confirmed names.
-        let mut confirmed: Vec<(String, Vec<Ipv4Addr>)> = Vec::new();
+        let mut confirmed: Vec<String> = Vec::new();
         for name in names {
             // A machine name spelled out of the address itself forward-confirms
             // like any other, but names the operator's host rather than a
@@ -150,18 +196,25 @@ impl<R: ReverseDnsResolver, S: ConfirmedHostSink> ReverseDnsLearner<R, S> {
             if !forward.contains(&ip) {
                 continue;
             }
-            if !address_derived && self.sink.record_confirmed(&name, &forward) {
+            // ONLY the dropped address is forward-confirmed. The rest of the
+            // `A` answer is whatever the zone's owner chose to return, and this
+            // path feeds routes, pins and kill-switch exemptions — handing it
+            // the whole set would let anyone who controls a PTR record and a
+            // zone move addresses that were never confirmed to belong to the
+            // name. The name's other addresses arrive the ordinary way, through
+            // the resolver that confirms answers against a second source.
+            if !address_derived && self.sink.record_confirmed(&name, &[ip]) {
                 return LearnOutcome::Learned;
             }
-            confirmed.push((name, forward));
+            confirmed.push(name);
         }
         // Every confirmed name was refused by the rule gate, so the
         // destination is positively direct; register it as such.
         if !allow_direct {
             return LearnOutcome::NotConfirmed;
         }
-        for (name, forward) in confirmed {
-            if self.sink.record_confirmed_direct(&name, &forward) {
+        for name in confirmed {
+            if self.sink.record_confirmed_direct(&name, &[ip]) {
                 return LearnOutcome::LearnedDirect;
             }
         }
@@ -191,14 +244,19 @@ mod tests {
     struct RuleSink {
         rule_suffix: String,
         kept: Mutex<Vec<String>>,
+        kept_addresses: Mutex<Vec<Ipv4Addr>>,
     }
     impl ConfirmedHostSink for RuleSink {
-        fn record_confirmed(&self, hostname: &str, _addresses: &[Ipv4Addr]) -> bool {
+        fn record_confirmed(&self, hostname: &str, addresses: &[Ipv4Addr]) -> bool {
             if hostname.ends_with(&self.rule_suffix) {
                 self.kept
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push(hostname.to_string());
+                self.kept_addresses
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .extend_from_slice(addresses);
                 true
             } else {
                 false
@@ -225,6 +283,7 @@ mod tests {
         let sink = RuleSink {
             rule_suffix: rule_suffix.to_string(),
             kept: Mutex::new(Vec::new()),
+            kept_addresses: Mutex::new(Vec::new()),
         };
         ReverseDnsLearner::new(resolver, sink, cap)
     }
@@ -412,13 +471,87 @@ mod tests {
     }
 
     #[test]
-    fn per_session_cap_stops_new_attempts() {
+    fn the_window_evicts_instead_of_stopping_the_learner() {
+        // The cap used to stop learning for the rest of the session: after N
+        // distinct destinations nothing new was ever attempted, and an address
+        // tried once during a blip was never retried. Now the memory is a
+        // window - a new destination is always attempted, and one that falls
+        // out of the window can be tried again, which is how a transient
+        // failure heals.
         let a = Ipv4Addr::new(1, 1, 1, 1);
         let b = Ipv4Addr::new(2, 2, 2, 2);
-        // Cap 1: first IP attempted (not confirmed), second refused.
         let l = learner(&[], &[], ".ru", 1);
         assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
-        assert_eq!(l.learn(b), LearnOutcome::Skipped, "cap reached");
+        assert_eq!(
+            l.learn(b),
+            LearnOutcome::NotConfirmed,
+            "a new destination is still attempted once the window is full",
+        );
+        assert_eq!(
+            l.learn(a),
+            LearnOutcome::NotConfirmed,
+            "and the evicted one is attempted again rather than remembered as failed forever",
+        );
+    }
+
+    #[test]
+    fn only_the_dropped_address_reaches_the_sink() {
+        // Forward-confirmation proves ONE thing: that the name owns the address
+        // we dropped. The rest of the `A` answer is whatever the zone's owner
+        // chose to return, and this path feeds routes, pins and kill-switch
+        // exemptions.
+        let ip = Ipv4Addr::new(5, 45, 202, 100);
+        let stranger = Ipv4Addr::new(203, 0, 113, 7);
+        let l = learner(
+            &[(ip, &["dzen.ru"])],
+            &[("dzen.ru", &[ip, stranger])],
+            ".ru",
+            64,
+        );
+        assert_eq!(l.learn(ip), LearnOutcome::Learned);
+        assert_eq!(
+            l.sink
+                .kept_addresses
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_slice(),
+            &[ip],
+            "an unconfirmed address from the same answer must not be adopted"
+        );
+    }
+
+    #[test]
+    fn a_lookup_that_answered_nothing_is_retried_once_the_delay_passes() {
+        // The failure most likely to happen here is the block-all that caused
+        // the drop; a permanent record would disable the address until restart.
+        let ip = Ipv4Addr::new(1, 1, 1, 1);
+        let l = learner(&[], &[], ".ru", 8);
+        assert_eq!(l.learn(ip), LearnOutcome::NotConfirmed);
+        assert_eq!(l.learn(ip), LearnOutcome::Skipped, "still deduped");
+
+        // Age the record instead of sleeping out the delay.
+        {
+            let mut failed = l.failed_at.lock().unwrap_or_else(|p| p.into_inner());
+            let stale = Instant::now()
+                .checked_sub(FAILED_LOOKUP_RETRY_AFTER + Duration::from_secs(1))
+                .expect("monotonic clock past the delay");
+            failed.insert(ip, stale);
+        }
+        assert_eq!(
+            l.learn(ip),
+            LearnOutcome::NotConfirmed,
+            "past the delay the address is attempted again"
+        );
+    }
+
+    #[test]
+    fn a_remembered_attempt_is_not_repeated() {
+        // The window is still a dedup: while an address is in it, a drop storm
+        // against the same destination costs one lookup, not one per packet.
+        let a = Ipv4Addr::new(1, 1, 1, 1);
+        let l = learner(&[], &[], ".ru", 8);
+        assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
+        assert_eq!(l.learn(a), LearnOutcome::Skipped);
     }
 
     #[test]

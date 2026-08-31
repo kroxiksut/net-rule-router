@@ -68,17 +68,19 @@ pub trait DiagnosticsFacade: Send + Sync {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
-        // Page through the ascending (oldest-first) listing, retaining only the
-        // newest `max_entries` seen so far. Page count is bounded so a
-        // pathological store cannot spin (production overrides this anyway).
-        let max_pages = max_entries / MAX_PAGE_SIZE as usize + 2;
+        // Page through the ascending (oldest-first) listing to the END, keeping
+        // only the newest `max_entries` seen. Capping the page count bounded the
+        // walk by how many entries were ASKED FOR, so a store holding more than
+        // that returned its oldest window — the exact opposite of what this
+        // method promises. The spin guard is a cursor that stops advancing,
+        // which is the only way a well-behaved store can fail to terminate.
         let mut acc: Vec<LogEntryDto> = Vec::new();
         let mut cursor: Option<PageCursor> = None;
-        for _ in 0..max_pages {
+        loop {
             let page = self.list_log_entries(
                 filter,
                 &PaginationParams {
-                    cursor,
+                    cursor: cursor.clone(),
                     page_size: MAX_PAGE_SIZE,
                 },
             )?;
@@ -89,8 +91,8 @@ pub trait DiagnosticsFacade: Send + Sync {
                 acc.drain(0..overflow);
             }
             match next {
-                Some(c) => cursor = Some(c),
-                None => break,
+                Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+                _ => break,
             }
         }
         acc.reverse();

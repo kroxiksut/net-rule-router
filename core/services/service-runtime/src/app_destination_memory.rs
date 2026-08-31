@@ -10,7 +10,7 @@
 //! from addresses [`crate::app_observation_lookup`] has already seen. So the
 //! app's first contact with a new address has no route, egresses the main link,
 //! misses the permit and is refused — and that refusal is what teaches the
-//! address, after which the route and the pin follow within a tick.
+//! address, after which the route follows within a tick.
 //!
 //! The behaviour is correct: it never leaks, and it converges in milliseconds.
 //! What is wasteful is that the observation set is in-memory, so **every session
@@ -188,7 +188,11 @@ impl AppDestinationMemory {
         summary: &mut FlushSummary,
     ) {
         for pattern in routed_app_patterns(&snapshot.rule_book.secondary) {
-            if !written.insert(pattern.clone()) {
+            // The column is `app_key` and the observation store answers on
+            // keys; persisting the rule spelling instead left rows nothing
+            // could later withdraw.
+            let key = crate::app_observation_lookup::app_key(&pattern);
+            if key.is_empty() || !written.insert(key.clone()) {
                 continue;
             }
             // The same slice the codegen enforces: sorted, capped identically,
@@ -198,9 +202,22 @@ impl AppDestinationMemory {
                 continue;
             }
             let ips = &ips[..ips.len().min(PER_HOSTNAME_IP_CAP)];
-            (self.persist)(&pattern, ips, now);
+            // Only what was actually seen since the last pass. The store also
+            // holds addresses re-seeded from earlier sessions and ones last
+            // used hours ago; writing those with `now` re-confirms them on
+            // every flush, so the freshness window never expires and
+            // `prune_before` never has anything to prune. Untouched rows keep
+            // the `learned_at` they earned — the upsert only moves it forward
+            // for the addresses named here.
+            let seen = self.observations.take_seen_since_flush(&pattern);
+            let confirmed: Vec<Ipv4Addr> =
+                ips.iter().copied().filter(|ip| seen.contains(ip)).collect();
+            if confirmed.is_empty() {
+                continue;
+            }
+            (self.persist)(&key, &confirmed, now);
             summary.apps = summary.apps.saturating_add(1);
-            summary.destinations = summary.destinations.saturating_add(ips.len() as u32);
+            summary.destinations = summary.destinations.saturating_add(confirmed.len() as u32);
         }
     }
 }
@@ -460,9 +477,11 @@ mod tests {
             }
         );
         assert_eq!(table.len(), 1);
+        // Persisted under the observation key, which is what a later
+        // withdrawal looks the row up by.
         assert_eq!(
             table.rows.lock().unwrap_or_else(|p| p.into_inner())[0].0,
-            "telegram.exe"
+            "telegram"
         );
     }
 
@@ -489,8 +508,9 @@ mod tests {
 
     #[test]
     fn a_flush_restamps_addresses_still_in_use() {
-        // A long-running app keeps a fixed destination set; without the restamp
-        // it would age out of the window mid-session and stop being seeded.
+        // "Still in use" means observed again, not merely still in memory: a
+        // long-running app keeps touching its destinations, and each sighting
+        // is what carries the address forward through the freshness window.
         let table = Arc::new(FakeTable::default());
         let rules = book(vec![app_rule("r1", "telegram.exe")]);
         let store = Arc::new(AppObservationStore::new());
@@ -503,12 +523,46 @@ mod tests {
         mem.flush(long_ago);
         let now = SystemTime::now();
         assert_eq!(mem.warm_load(now), 0, "the stale stamp is withheld");
+        store.record("telegram.exe", ip(1));
         mem.flush(now);
 
         let next_session = Arc::new(AppObservationStore::new());
         let mem = memory(&next_session, rules.clone(), &table);
         assert_eq!(mem.warm_load(now), 1);
         assert_eq!(routes_for(&rules, &next_session), vec![ip(1)]);
+    }
+
+    #[test]
+    fn a_flush_does_not_re_confirm_an_address_nobody_touched() {
+        // The store keeps addresses re-seeded from earlier sessions and ones
+        // last used hours ago. Stamping those with `now` on every pass kept the
+        // confirmation window from ever expiring, so nothing was ever pruned.
+        let table = Arc::new(FakeTable::default());
+        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let store = Arc::new(AppObservationStore::new());
+        store.record("telegram.exe", ip(1));
+        let mem = memory(&store, rules.clone(), &table);
+
+        let long_ago = SystemTime::now()
+            .checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
+            .expect("clock past the epoch");
+        mem.flush(long_ago);
+        // Nothing observed since: the address is still in memory, but nobody
+        // used it.
+        let now = SystemTime::now();
+        assert_eq!(
+            mem.flush(now),
+            FlushSummary::default(),
+            "an untouched address must not be written again"
+        );
+
+        let next_session = Arc::new(AppObservationStore::new());
+        let mem = memory(&next_session, rules, &table);
+        assert_eq!(
+            mem.warm_load(now),
+            0,
+            "and so it ages out of the window as it should"
+        );
     }
 
     #[test]

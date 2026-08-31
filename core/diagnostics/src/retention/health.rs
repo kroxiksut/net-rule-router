@@ -165,9 +165,14 @@ fn dir_stats(dir: &std::path::Path, prefix: &str, suffix: &str) -> (u64, u32) {
     (total_size, count)
 }
 
-fn is_dir_writable(dir: &std::path::Path) -> bool {
+/// Whether the service can write into `dir`, answered by a probe file that is
+/// removed again. Read-only with respect to the directory's existence.
+pub fn is_dir_writable(dir: &std::path::Path) -> bool {
+    // A health QUESTION must not change the thing it asks about. This used to
+    // create the directory when it was missing, so "is it writable" silently
+    // reported "yes" about a directory it had just made.
     if !dir.exists() {
-        return std::fs::create_dir_all(dir).is_ok();
+        return false;
     }
     // Try to create and immediately delete a probe file.
     let probe = dir.join(".nrr_write_probe");

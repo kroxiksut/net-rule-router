@@ -29,6 +29,7 @@ use nrr_domain::canonical::{
 use nrr_domain::{RouteBehaviorMode, RuleAction, RuleId};
 use nrr_platform_api::MockAppPathResolver;
 use nrr_service_runtime::app_observation_lookup::MockAppObservationLookup;
+use nrr_service_runtime::enforcement_planner::{plan_route_rules, PlannerInput};
 use nrr_service_runtime::fqdn_cache_lookup::MockFqdnCacheLookup;
 use nrr_service_runtime::route_codegen::{address_rule_ips, generate_routes, SecondaryRouteTarget};
 use nrr_service_runtime::wfp_codegen::{generate_filters, CodegenInput};
@@ -130,6 +131,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             app_observations: &observations,
             app_resolver: &resolver,
             secondary_ip_denylist: &HashSet::new(),
+            zone_priority_over_ip: false,
         });
         let routes = generate_routes(
             RouteBehaviorMode::PreferPrimary,
@@ -139,6 +141,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             &cache,
             &observations,
             &HashSet::new(),
+            nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
         );
 
         assert!(
@@ -190,6 +193,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         app_observations: &observations,
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
+        zone_priority_over_ip: false,
     });
     let routes = generate_routes(
         RouteBehaviorMode::PreferPrimary,
@@ -199,6 +203,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         &cache,
         &observations,
         &HashSet::new(),
+        nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
     );
 
     let steered: HashSet<Ipv4Addr> = routes.routes.iter().map(|r| r.destination).collect();
@@ -265,6 +270,7 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
         app_observations: &observations,
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
+        zone_priority_over_ip: false,
     });
 
     assert!(
@@ -277,4 +283,163 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
     );
     // And what only the program knows about is still the program's.
     assert!(filters.primary_dest_ips.contains(&APP_ONLY));
+}
+
+/// The census is the second half of the same question, and it went missing on
+/// the filter side: an address somebody the rule set never named is ALSO using
+/// must not be pinned — a `/32` filter is no more process-scoped than a route,
+/// so the kill-switch would block that process's traffic too.
+#[test]
+fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
+    let cache = cache();
+    let observations = observations();
+    observations.set_used_outside(APP_ONLY);
+    let resolver = resolver();
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(Vec::new()),
+        secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+    };
+
+    let filters = generate_filters(CodegenInput {
+        sid: "S-1-5-21-TEST",
+        rule_book: &rule_book,
+        behavior_mode: RouteBehaviorMode::PreferPrimary,
+        fqdn_cache: &cache,
+        app_observations: &observations,
+        app_resolver: &resolver,
+        secondary_ip_denylist: &HashSet::new(),
+        zone_priority_over_ip: false,
+    });
+    let routes = generate_routes(
+        RouteBehaviorMode::PreferPrimary,
+        &rule_book,
+        None,
+        &target(),
+        &cache,
+        &observations,
+        &HashSet::new(),
+        nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
+    );
+
+    assert!(
+        !filters.secondary_dest_ips.contains(&APP_ONLY),
+        "the filter side pinned a destination another process is using; the kill-switch would          cut that process off too",
+    );
+    assert!(
+        !routes.routes.iter().any(|r| r.destination == APP_ONLY),
+        "the route side steered a destination another process is using",
+    );
+    // Untouched by the census, so still the app rule's own.
+    assert!(
+        filters.secondary_dest_ips.contains(&CONTESTED),
+        "the census swallowed a destination nobody else uses",
+    );
+}
+
+/// The neutral planner is the enforcement path on Linux and the shadow
+/// comparison on Windows. It read the observations raw, so it reproduced the
+/// incident on one OS and reported permanent false drift on the other.
+#[test]
+fn the_neutral_planner_reads_the_same_arbiter() {
+    let cache = cache();
+    let observations = observations();
+    observations.set_used_outside(APP_ONLY);
+    let resolver = resolver();
+    let rule_book = CanonicalRuleBook {
+        primary: CanonicalRuleSet::from_rules(vec![address_rule(
+            "r-main",
+            CanonicalAddressMatch::ExactFqdn(HOST.into()),
+        )]),
+        secondary: CanonicalRuleSet::from_rules(vec![app_rule("r-app", APP)]),
+    };
+
+    let flows = plan_route_rules(
+        &rule_book,
+        "S-1-5-21-TEST",
+        RouteBehaviorMode::PreferPrimary,
+        &PlannerInput {
+            fqdn_cache: &cache,
+            app_resolver: &resolver,
+            app_observations: &observations,
+            zone_priority_over_ip: false,
+        },
+    );
+
+    let secondary_hosts: Vec<Ipv4Addr> = flows
+        .iter()
+        .filter(|f| {
+            f.precedence.class
+                == nrr_platform_api::enforcement::PrecedenceClass::RouteRule(
+                    nrr_shared::RouteRole::Secondary,
+                )
+        })
+        .filter_map(|f| match f.flow.dst {
+            nrr_platform_api::enforcement::DstMatch::HostV4(ip) => Some(ip),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !secondary_hosts.contains(&CONTESTED),
+        "the planner pinned an address the main link names: {secondary_hosts:?}",
+    );
+    assert!(
+        !secondary_hosts.contains(&APP_ONLY),
+        "the planner pinned an address another process is using: {secondary_hosts:?}",
+    );
+}
+
+/// The gate that keeps the others honest: production code reaches the
+/// observation store through the arbiter, never directly. A new mechanism that
+/// queries `ips_for_app` itself is a new place to forget one of the two checks
+/// — which is exactly how the filter side lost the census.
+#[test]
+fn only_the_arbiter_reads_the_observation_store() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("src is readable") {
+            let path = entry.expect("readable entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file = path.file_name().unwrap_or_default().to_string_lossy();
+            // The arbiter itself, and the store that defines the query. Plus
+            // the cross-session memory, which persists observations for a warm
+            // start and emits no filter, route or block of its own — what it
+            // re-seeds is read back through the gate like any other
+            // observation. It holds no address cache, so it could not resolve
+            // ownership even if it wanted to.
+            if matches!(
+                file.as_ref(),
+                "address_ownership.rs" | "app_observation_lookup.rs" | "app_destination_memory.rs"
+            ) {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("readable source");
+            // Test modules declare their own fixtures against the raw store.
+            let production = body
+                .split(
+                    "
+#[cfg(test)]
+",
+                )
+                .next()
+                .unwrap_or_default();
+            for (n, line) in production.lines().enumerate() {
+                if line.contains(".ips_for_app(") || line.contains(".destination_used_outside(") {
+                    offenders.push(format!("{}:{}", file, n + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these read the observation store without going through AppDestinationGate, so nothing          forces them to apply both ownership and the census: {offenders:?}",
+    );
 }

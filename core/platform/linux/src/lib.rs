@@ -15,6 +15,15 @@
 //! dev host too; only the syscalls and the `nft`/`loginctl` calls sit behind
 //! `#[cfg(target_os = "linux")]`.
 
+/// Linux implementation of the system light/dark probe.
+pub mod system_theme;
+
+/// Running an external helper with a budget and a fixed locale. Every shell-out
+/// in this crate goes through it — a helper that never answers must not stop
+/// policy enforcement, and failure classification must not depend on the
+/// system's language.
+pub mod command;
+
 /// Linux autostart mechanism (XDG `.desktop`) — the first REAL (non-stub) port
 /// impl in this crate. Unlike the enforcement ports below (which need root /
 /// kernel and stay stubs until their mechanism lands), autostart is

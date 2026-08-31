@@ -26,8 +26,22 @@
 //! against every observed process name and union their IPs.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::{Duration, Instant};
+
+use crate::bounded_set::BoundedRecentSet;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
+
+/// How recently an app's destination must have been SEEN to keep producing a
+/// route and filters. The same window every other enforcement view uses
+/// ([`crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW`]): the FQDN
+/// side already ages its addresses through it, while an app-observed pin used
+/// to stand until the LRU cap or a restart — a P2P session left its last peers
+/// enforced for the life of the process. An address that ages out loses only
+/// its own `/32`; the app touching it again relearns it within a tick (the
+/// first contact drops on the per-app block, which is what teaches it).
+pub const APP_PIN_FRESHNESS_WINDOW: Duration =
+    crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
 
 /// Max distinct IPs retained per app — bounds the codegen fan-out (mirrors
 /// [`crate::wfp_codegen::PER_HOSTNAME_IP_CAP`] in spirit). A busy browser can
@@ -46,6 +60,18 @@ pub const CENSUS_IP_CAP: usize = 8192;
 /// "is anybody here who is not one of these rules?", so a handful is enough and
 /// an unbounded list would be a leak with no reader.
 pub const CENSUS_KEYS_PER_IP: usize = 4;
+
+/// How many withdrawn `(app, ip)` pairs are remembered. Bounded for the same
+/// reason as everything else learned from traffic: a machine that runs for
+/// weeks and keeps hitting new conflicts would otherwise grow this forever. Far
+/// above any plausible number of live conflicts, so an eviction here means the
+/// pair stopped being contested long ago.
+pub const RETRACTED_CAP: usize = 4096;
+
+/// Cap on the "seen since the last flush" ledger. A flush drains it, so this
+/// only has to survive one interval; the bound is for the case where nothing
+/// flushes at all (no application rules) and observations keep arriving.
+pub const SEEN_SINCE_FLUSH_CAP: usize = 4096;
 
 /// Narrow read-only port the WFP codegen consumes for `Application` rules.
 ///
@@ -85,28 +111,41 @@ pub fn own_process_key() -> &'static str {
     })
 }
 
-/// Reduce a process path or rule pattern to its lowercased file name, so
-/// `C:\…\Chrome.exe`, `chrome.exe` and `CHROME.EXE` all key the same app.
+/// Reduce a process path or rule pattern to the one key both sides of a match
+/// are compared on — see [`nrr_shared::app_identity::app_match_key`].
 pub fn app_key(raw: &str) -> String {
-    let trimmed = raw.trim();
-    let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
-    name.to_ascii_lowercase()
+    nrr_shared::app_identity::app_match_key(raw)
 }
 
 /// In-memory app→IP observation store. Shared via `Arc`: the observation
 /// consumer writes through [`record`](Self::record); the codegen reads
 /// through the [`AppObservationLookup`] impl.
 pub struct AppObservationStore {
-    inner: Mutex<HashMap<String, HashSet<Ipv4Addr>>>,
+    inner: Mutex<HashMap<String, BoundedRecentSet<Ipv4Addr>>>,
     /// Who has been seen using each destination — the evidence a pin is
     /// weighed against before it is emitted.
     census: Mutex<CensusIndex>,
     /// `(app, ip)` pairs withdrawn because the host route they produced was
-    /// carrying somebody else's traffic. Sticky for the life of the process:
+    /// carrying somebody else's traffic. Sticky, but bounded: the app will
+    /// touch the address again within seconds, and without this the pair would
+    /// be relearned immediately and the two processes would take the address
+    /// from each other in a loop. Bounded because
     /// the app will touch the address again within seconds, and without this
     /// the pair would be relearned immediately and the two processes would take
     /// the address from each other in a loop.
-    retracted: Mutex<HashSet<(String, Ipv4Addr)>>,
+    retracted: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+    /// `(app, ip)` pairs actually seen since the last persistence pass. The
+    /// store also holds addresses re-seeded from previous sessions and ones
+    /// last used hours ago; persisting those again would stamp them as
+    /// confirmed now, and the freshness window they are supposed to age out of
+    /// would never expire.
+    seen_since_flush: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
+    /// Last sighting per `(app, ip)` — what [`APP_PIN_FRESHNESS_WINDOW`] is
+    /// measured against. Maintained alongside `inner`; a missing stamp is
+    /// treated as fresh (unknown age fails toward protection) and restamped.
+    last_seen: Mutex<HashMap<(String, Ipv4Addr), Instant>>,
+    pin_ttl: Duration,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
     cap_per_app: usize,
 }
 
@@ -125,19 +164,61 @@ impl AppObservationStore {
         Self {
             inner: Mutex::new(HashMap::new()),
             census: Mutex::new(CensusIndex::default()),
-            retracted: Mutex::new(HashSet::new()),
+            retracted: Mutex::new(BoundedRecentSet::new(RETRACTED_CAP)),
+            seen_since_flush: Mutex::new(BoundedRecentSet::new(SEEN_SINCE_FLUSH_CAP)),
+            last_seen: Mutex::new(HashMap::new()),
+            pin_ttl: APP_PIN_FRESHNESS_WINDOW,
+            clock: Arc::new(Instant::now),
             cap_per_app,
         }
     }
 
+    /// Override the freshness window. Builder-style; production keeps the
+    /// shared [`APP_PIN_FRESHNESS_WINDOW`] default.
+    pub fn with_pin_ttl(mut self, ttl: Duration) -> Self {
+        self.pin_ttl = ttl;
+        self
+    }
+
+    /// Replace the clock, so a test can cross the freshness window without
+    /// sleeping. Always compiled (test_support style); no production caller.
+    pub fn with_clock(mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Record that `process_path` connected to `ip`. No-op for non-routable
     /// IPs (loopback / unspecified / link-local) — they are never routed and
-    /// would only pollute the set. The newest observation wins once the
-    /// per-app cap is hit (a full set drops nothing — it has already reached
-    /// steady state for the codegen's purposes).
+    /// would only pollute the set. At the per-app cap the least recently seen
+    /// address gives way, so an app that migrates to new destinations gets them
+    /// routed instead of being frozen on its first 256.
     /// Returns `true` when `ip` was **newly** observed for this app — the
     /// caller uses that to trigger a route recompute so the new destination is
     /// routed promptly.
+    /// Take the destinations of `app_pattern` seen since the previous call.
+    /// Draining is the point: a destination reported once must not be reported
+    /// as freshly confirmed on every later pass.
+    pub fn take_seen_since_flush(&self, app_pattern: &str) -> std::collections::HashSet<Ipv4Addr> {
+        if app_key(app_pattern).is_empty() {
+            return std::collections::HashSet::new();
+        }
+        let mut ledger = self
+            .seen_since_flush
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // `pattern_matches`, not string equality: a glob rule covers every
+        // process it names, exactly as `ips_for_app` unions them.
+        let mine: Vec<(String, Ipv4Addr)> = ledger
+            .iter()
+            .filter(|(app, _)| pattern_matches(app_pattern, app))
+            .cloned()
+            .collect();
+        for pair in &mine {
+            ledger.remove(pair);
+        }
+        mine.into_iter().map(|(_, ip)| ip).collect()
+    }
+
     pub fn record(&self, process_path: &str, ip: Ipv4Addr) -> bool {
         if is_unroutable(ip) {
             return false;
@@ -154,14 +235,33 @@ impl AppObservationStore {
         {
             return false;
         }
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let set = g.entry(key).or_default();
-        if set.len() < self.cap_per_app {
-            // `HashSet::insert` is true only when the IP wasn't already present.
-            set.insert(ip)
-        } else {
-            false
+        let seen = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let set = g
+                .entry(key.clone())
+                .or_insert_with(|| BoundedRecentSet::new(self.cap_per_app));
+            set.observe(ip)
+        };
+        {
+            let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+            stamps.insert((key.clone(), ip), (self.clock)());
+            if let Some(old) = seen.evicted {
+                stamps.remove(&(key.clone(), old));
+            }
         }
+        self.seen_since_flush
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe((key, ip));
+        if let Some(old) = seen.evicted {
+            tracing::debug!(
+                target: "nrr::app-observations",
+                evicted = %old,
+                admitted = %ip,
+                "per-app destination cap reached; the least recently seen address gave way",
+            );
+        }
+        seen.is_new
     }
 
     /// Pre-load `pairs` (rule app pattern → destination) carried over from an
@@ -223,10 +323,14 @@ impl AppObservationStore {
             .unwrap_or_else(|p| p.into_inner())
             .get_mut(&key)
             .is_some_and(|set| set.remove(&ip));
+        self.last_seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(key.clone(), ip));
         self.retracted
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert((key, ip));
+            .observe((key, ip));
         removed
     }
 
@@ -290,6 +394,41 @@ impl AppObservationStore {
     pub fn app_count(&self) -> usize {
         self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
+
+    /// Drop `name`'s entries whose last sighting fell outside the freshness
+    /// window. An entry with no stamp is restamped now — unknown age fails
+    /// toward protection, mirroring the FQDN cache's rule. Lock order is
+    /// `inner` → `last_seen`, the only place both are held together.
+    fn prune_stale(&self, g: &mut HashMap<String, BoundedRecentSet<Ipv4Addr>>, name: &str) {
+        let now = (self.clock)();
+        let Some(cutoff) = now.checked_sub(self.pin_ttl) else {
+            return;
+        };
+        let Some(set) = g.get_mut(name) else {
+            return;
+        };
+        let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stale: Vec<Ipv4Addr> = Vec::new();
+        for ip in set.iter() {
+            match stamps.get(&(name.to_string(), *ip)) {
+                Some(t) if *t < cutoff => stale.push(*ip),
+                Some(_) => {}
+                None => {
+                    stamps.insert((name.to_string(), *ip), now);
+                }
+            }
+        }
+        for ip in stale {
+            set.remove(&ip);
+            stamps.remove(&(name.to_string(), ip));
+            tracing::debug!(
+                target: "nrr::app-observations",
+                app = name,
+                destination = %ip,
+                "destination aged out of the freshness window — its route and pin lapse with it",
+            );
+        }
+    }
 }
 
 /// Destinations mapped to the processes seen using them, FIFO-bounded.
@@ -307,18 +446,27 @@ impl AppObservationLookup for AppObservationStore {
         if key.is_empty() {
             return Vec::new();
         }
-        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         // Glob pattern (e.g. `*vpn*.exe`) → union the IPs of every observed
-        // process whose name matches; exact name → a single lookup.
+        // process whose name matches; exact name → a single lookup. Stale
+        // sightings are pruned first, so what enforcement reads is only what
+        // was seen inside the freshness window.
         let mut v: Vec<Ipv4Addr> = if key.contains('*') {
+            let names: Vec<String> = g
+                .keys()
+                .filter(|name| glob_match(&key, name))
+                .cloned()
+                .collect();
             let mut set: HashSet<Ipv4Addr> = HashSet::new();
-            for (name, ips) in g.iter() {
-                if glob_match(&key, name) {
+            for name in names {
+                self.prune_stale(&mut g, &name);
+                if let Some(ips) = g.get(&name) {
                     set.extend(ips.iter().copied());
                 }
             }
             set.into_iter().collect()
         } else {
+            self.prune_stale(&mut g, &key);
             match g.get(&key) {
                 Some(set) => set.iter().copied().collect(),
                 None => Vec::new(),
@@ -560,11 +708,8 @@ mod tests {
 
         let mut owners = store.apps_for_ip(addr(10));
         owners.sort();
-        assert_eq!(
-            owners,
-            vec!["alpha.exe".to_string(), "beta.exe".to_string()]
-        );
-        assert_eq!(store.apps_for_ip(addr(11)), vec!["beta.exe".to_string()]);
+        assert_eq!(owners, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(store.apps_for_ip(addr(11)), vec!["beta".to_string()]);
         assert!(store.apps_for_ip(addr(12)).is_empty());
     }
 
@@ -615,10 +760,10 @@ mod tests {
 
     #[test]
     fn app_key_takes_lowercased_file_name() {
-        assert_eq!(app_key("C:\\Program Files\\Foo\\Chrome.exe"), "chrome.exe");
+        assert_eq!(app_key("C:\\Program Files\\Foo\\Chrome.exe"), "chrome");
         assert_eq!(app_key("/usr/bin/Firefox"), "firefox");
-        assert_eq!(app_key("CHROME.EXE"), "chrome.exe");
-        assert_eq!(app_key("  notepad.exe  "), "notepad.exe");
+        assert_eq!(app_key("CHROME.EXE"), "chrome");
+        assert_eq!(app_key("  notepad.exe  "), "notepad");
     }
 
     #[test]
@@ -657,12 +802,96 @@ mod tests {
     }
 
     #[test]
-    fn cap_bounds_the_set() {
+    fn the_cap_evicts_the_oldest_rather_than_freezing_the_set() {
+        // A cap that refuses new addresses freezes the set: an application that
+        // migrates to new servers keeps the destinations of a previous session
+        // and never gets the current ones routed until the service restarts.
         let store = AppObservationStore::with_cap(2);
         store.record("a.exe", ip(1, 1, 1, 1));
         store.record("a.exe", ip(2, 2, 2, 2));
-        store.record("a.exe", ip(3, 3, 3, 3)); // dropped — cap hit
-        assert_eq!(store.ips_for_app("a.exe").len(), 2);
+        store.record("a.exe", ip(3, 3, 3, 3));
+
+        let live = store.ips_for_app("a.exe");
+        assert_eq!(live.len(), 2, "the bound still holds");
+        assert!(!live.contains(&ip(1, 1, 1, 1)), "the oldest gave way");
+        assert!(live.contains(&ip(3, 3, 3, 3)), "the newest was admitted");
+    }
+
+    /// Test clock: a base instant plus a shared, advanceable offset — crossing
+    /// the freshness window without sleeping.
+    fn test_clock() -> (Arc<Mutex<Duration>>, Arc<dyn Fn() -> Instant + Send + Sync>) {
+        let base = Instant::now();
+        let offset = Arc::new(Mutex::new(Duration::ZERO));
+        let o = Arc::clone(&offset);
+        #[allow(clippy::unwrap_used)]
+        let clock: Arc<dyn Fn() -> Instant + Send + Sync> =
+            Arc::new(move || base + *o.lock().unwrap());
+        (offset, clock)
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_destination_outside_the_freshness_window_stops_enforcing() {
+        // The P2P shape: peers observed hours ago must not keep a standing
+        // route/pin for the life of the process — the FQDN side already ages
+        // through this very window.
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        store.record("torrent.exe", ip(203, 0, 113, 1));
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW + Duration::from_secs(60);
+        store.record("torrent.exe", ip(203, 0, 113, 2));
+
+        assert_eq!(
+            store.ips_for_app("torrent.exe"),
+            vec![ip(203, 0, 113, 2)],
+            "only the recently-seen destination still enforces"
+        );
+        // Aged out means learnable again — the next sighting is NEW, so it
+        // triggers the recompute that restores the route.
+        assert!(store.record("torrent.exe", ip(203, 0, 113, 1)));
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_re_observed_destination_rides_the_window_forward() {
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        store.record("chat.exe", ip(203, 0, 113, 1));
+        // Keep touching it just inside the window, twice over.
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(60);
+        store.record("chat.exe", ip(203, 0, 113, 1));
+        *offset.lock().unwrap() = 2 * APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(120);
+        assert_eq!(
+            store.ips_for_app("chat.exe"),
+            vec![ip(203, 0, 113, 1)],
+            "a live destination is never aged out"
+        );
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_glob_rule_prunes_stale_destinations_of_every_process_it_names() {
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        store.record("myvpnclient.exe", ip(203, 0, 113, 1));
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW + Duration::from_secs(60);
+        store.record("openvpn.exe", ip(203, 0, 113, 2));
+        assert_eq!(store.ips_for_app("*vpn*.exe"), vec![ip(203, 0, 113, 2)]);
+    }
+
+    #[test]
+    fn re_observing_an_address_keeps_it_from_being_evicted() {
+        // Freshness is by LAST sighting, not first: an address the app still
+        // uses must not be evicted by one it touched once.
+        let store = AppObservationStore::with_cap(2);
+        store.record("a.exe", ip(1, 1, 1, 1));
+        store.record("a.exe", ip(2, 2, 2, 2));
+        store.record("a.exe", ip(1, 1, 1, 1)); // still in use
+        store.record("a.exe", ip(3, 3, 3, 3));
+
+        let live = store.ips_for_app("a.exe");
+        assert!(live.contains(&ip(1, 1, 1, 1)), "recently used survives");
+        assert!(!live.contains(&ip(2, 2, 2, 2)), "the stale one gave way");
     }
 
     #[test]
