@@ -291,10 +291,15 @@ pub fn add_filter(
     // The Vec is the backing storage for `FWPM_FILTER0.filterCondition`.
     // Sub-pointers inside each condition reference variables on this
     // same stack frame; they all outlive the FwpmFilterAdd0 call.
-    let mut conditions: Vec<FWPM_FILTER_CONDITION0> = Vec::with_capacity(8);
+    let mut conditions: Vec<FWPM_FILTER_CONDITION0> =
+        Vec::with_capacity(8 + spec.remote_ip_set.len());
 
     if let Some(addr) = spec.remote_ip {
         conditions.push(condition_remote_ip_v4(addr));
+    }
+    // Same-field conditions are OR'd by WFP — one filter guards the whole set.
+    for addr in &spec.remote_ip_set {
+        conditions.push(condition_remote_ip_v4(*addr));
     }
     if spec.remote_subnet.is_some() {
         conditions.push(condition_remote_subnet_v4(&mut subnet_value));
@@ -633,11 +638,17 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
     // reversal) or user_sid (skipped — apply layer cross-references storage).
     let decoded = decode_conditions(row);
 
+    let (remote_ip, remote_ip_set) = match decoded.v4_hosts.len() {
+        0 => (None, Vec::new()),
+        1 => (decoded.v4_hosts.first().copied(), Vec::new()),
+        _ => (None, decoded.v4_hosts),
+    };
     Some(WfpFilterRecord {
         id,
         layer,
         action,
-        remote_ip: decoded.remote_ip,
+        remote_ip,
+        remote_ip_set,
         remote_port: decoded.remote_port,
         weight,
         user_sid: None,
@@ -652,7 +663,9 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
 /// Conditions recovered from a live `FWPM_FILTER0` during enumeration.
 #[derive(Default)]
 struct DecodedConditions {
-    remote_ip: Option<Ipv4Addr>,
+    /// Every exact-host `IP_REMOTE_ADDRESS` condition, in condition order —
+    /// one is the single-address form, several are a packed set.
+    v4_hosts: Vec<Ipv4Addr>,
     remote_port: Option<u16>,
     local_interface_luid: Option<u64>,
     remote_subnet: Option<(Ipv4Addr, u8)>,
@@ -680,7 +693,7 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
             // SAFETY: `r#type == FWP_UINT32` selects the `uint32: u32`
             // arm.
             let host_order = unsafe { cond.conditionValue.Anonymous.uint32 };
-            out.remote_ip = Some(Ipv4Addr::from(host_order));
+            out.v4_hosts.push(Ipv4Addr::from(host_order));
         } else if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_ADDRESS
             && cond.conditionValue.r#type == FWP_V4_ADDR_MASK
         {
@@ -1074,6 +1087,7 @@ mod tests {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Block,
             remote_ip: Some(Ipv4Addr::new(203, 0, 113, 17)),
+            remote_ip_set: Vec::new(),
             remote_port: Some(8443),
             weight: 0x0010_0000,
             id: WfpFilterId {

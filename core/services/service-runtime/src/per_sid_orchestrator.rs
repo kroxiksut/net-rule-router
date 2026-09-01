@@ -658,6 +658,11 @@ pub struct PerSidApplyOrchestrator {
     /// block-all set. Only transitions trigger a flush — the leak-guard
     /// reconcile recomputes every few seconds and must not flush steadily.
     block_all_flush_state: Mutex<HashMap<String, bool>>,
+    /// SIDs whose standing filter volume is above the alarm line — the
+    /// watchdog warns on the rising edge only (the reconcile recomputes every
+    /// few seconds). Alarm, never self-healing: unpinning a guard would trade
+    /// the BFE crash for a leak.
+    standing_volume_alarmed: Mutex<std::collections::HashSet<String>>,
     /// Who is asking for a cut the packet layer cannot scope to one user.
     /// The WFP packet layers carry no `ALE_USER_ID`, so one principal's
     /// block-all (or IPv6 cut) takes ICMP and IPv6 away from everyone logged
@@ -863,6 +868,7 @@ fn collect_block_ids(specs: &[WfpFilterSpec], into: &mut KillswitchBlockIds) {
 fn is_destination_block(spec: &WfpFilterSpec) -> bool {
     spec.action == WfpAction::Block
         && (spec.remote_ip.is_some()
+            || !spec.remote_ip_set.is_empty()
             || spec.remote_subnet.is_some()
             || spec.remote_subnet_v6.is_some())
 }
@@ -877,6 +883,7 @@ fn is_app_only_block(spec: &WfpFilterSpec) -> bool {
     spec.action == WfpAction::Block
         && spec.app_pattern.is_some()
         && spec.remote_ip.is_none()
+        && spec.remote_ip_set.is_empty()
         && spec.remote_subnet.is_none()
         && spec.remote_subnet_v6.is_none()
 }
@@ -953,6 +960,7 @@ impl PerSidApplyOrchestrator {
             // via `with_dns_cache_control`.
             dns_cache_control: Arc::new(nrr_platform_api::NoopDnsCacheControl),
             block_all_flush_state: Mutex::new(HashMap::new()),
+            standing_volume_alarmed: Mutex::new(std::collections::HashSet::new()),
             fail_closed_state: Mutex::new(HashMap::new()),
             fail_closed_posture_status: None,
             machine_wide_cut_state: Mutex::new(HashMap::new()),
@@ -2516,6 +2524,7 @@ impl PerSidApplyOrchestrator {
                                 sid,
                                 mode = ?behavior_mode,
                                 kill_switch_filters = ks.len(),
+                                pinned_addresses = ks_dest_ips.len(),
                                 "kill-switch active — pinned egress-conditional filters",
                             );
                         } else {
@@ -2524,6 +2533,7 @@ impl PerSidApplyOrchestrator {
                                 sid,
                                 mode = ?behavior_mode,
                                 kill_switch_filters = ks.len(),
+                                pinned_addresses = ks_dest_ips.len(),
                                 "kill-switch active — pinned egress-conditional filters",
                             );
                         }
@@ -2808,6 +2818,35 @@ impl PerSidApplyOrchestrator {
                     "DoH/DoT lockdown blocks emitted",
                 );
                 filters.extend(doh);
+            }
+        }
+        // Standing-volume watchdog. Four 0xEF crashes established that the BFE
+        // host degrades over hours under thousands of standing filters; the
+        // packed codegen keeps this in the low hundreds, so crossing the line
+        // means a packing regression somewhere upstream. Rising-edge warn only.
+        const STANDING_FILTER_ALARM: usize = 1000;
+        if intent.publishes() {
+            let mut alarmed = self
+                .standing_volume_alarmed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if filters.len() > STANDING_FILTER_ALARM {
+                if alarmed.insert(sid.to_string()) {
+                    tracing::warn!(
+                        target: "nrr::per_sid_orchestrator",
+                        sid,
+                        filters = filters.len(),
+                        threshold = STANDING_FILTER_ALARM,
+                        "standing WFP filter volume crossed the alarm line — packing regression? Alarm only: dropping guards would trade the BFE crash for a leak",
+                    );
+                }
+            } else if alarmed.remove(sid) {
+                tracing::info!(
+                    target: "nrr::per_sid_orchestrator",
+                    sid,
+                    filters = filters.len(),
+                    "standing WFP filter volume back under the alarm line",
+                );
             }
         }
         // edge-triggered OS resolver-cache flush; a no-op
@@ -3852,7 +3891,11 @@ impl PerSidApplyOrchestrator {
         let mut seen = std::collections::HashSet::new();
         let destinations = filters
             .iter()
-            .filter_map(|spec| spec.remote_ip)
+            .flat_map(|spec| {
+                spec.remote_ip
+                    .into_iter()
+                    .chain(spec.remote_ip_set.iter().copied())
+            })
             .filter(|ip| seen.insert(*ip))
             .collect();
         // The leak-guard emits an egress-via-secondary permit only when it has a
@@ -4928,6 +4971,7 @@ mod tests {
             layer: nrr_platform_api::types::WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Block,
             remote_ip: Some(Ipv4Addr::new(9, 9, 9, raw as u8)),
+            remote_ip_set: Vec::new(),
             remote_port: None,
             weight: 0x10_0000 + raw,
             id: WfpFilterId { raw },
@@ -5308,10 +5352,7 @@ mod tests {
         assert_eq!(egress_permits.len(), 7);
         assert!(egress_permits.iter().all(|f| f.action == WfpAction::Permit));
         assert_eq!(
-            egress_permits
-                .iter()
-                .filter(|f| f.remote_ip == Some(ip))
-                .count(),
+            egress_permits.iter().filter(|f| f.covers_v4(ip)).count(),
             5,
             "the v4 egress permits are destination-scoped",
         );
@@ -5322,13 +5363,16 @@ mod tests {
             .iter()
             .filter(|f| f.action == WfpAction::Block)
             .collect();
-        let v4_blocks = blocks.iter().filter(|f| f.remote_ip == Some(ip)).count();
-        let v6_blocks = blocks.iter().filter(|f| f.remote_ip.is_none()).count();
+        let v4_blocks = blocks.iter().filter(|f| f.covers_v4(ip)).count();
+        let v6_blocks = blocks
+            .iter()
+            .filter(|f| f.remote_ip.is_none() && f.remote_ip_set.is_empty())
+            .count();
         assert_eq!(v4_blocks, 5);
         assert_eq!(v6_blocks, 2, "one per IPv6 layer");
         assert!(blocks
             .iter()
-            .filter(|f| f.remote_ip == Some(ip))
+            .filter(|f| f.covers_v4(ip))
             .all(|f| f.local_interface_luid.is_none()));
     }
 
@@ -5579,7 +5623,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|f| f.action == WfpAction::Block && f.remote_ip == Some(ip)),
+                .any(|f| f.action == WfpAction::Block && f.covers_v4(ip)),
             "dest covered by a block while secondary adapter up"
         );
 
@@ -5589,7 +5633,7 @@ mod tests {
         let after = api.wfp_filters.lock().unwrap();
         assert!(
             after.iter().any(|f| f.action == WfpAction::Block
-                && (f.remote_ip == Some(ip) || f.remote_ip.is_none())),
+                && (f.covers_v4(ip) || (f.remote_ip.is_none() && f.remote_ip_set.is_empty()))),
             "dest still covered by a block after secondary adapter loss — no uncovering window"
         );
         assert_eq!(
@@ -5644,7 +5688,7 @@ mod tests {
         // The resolved openvpn path is present as an exempt Permit (no remote ip).
         assert!(
             filters.iter().any(|f| f.action == WfpAction::Permit
-                && f.remote_ip.is_none()
+                && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
                 && f.app_pattern.as_deref() == Some(r"C:\Tools\openvpn.exe")),
             "built-in openvpn glob installed an exempt permit stamped with the resolved path",
         );
@@ -5732,7 +5776,7 @@ mod tests {
         assert!(
             after
                 .iter()
-                .any(|f| f.action == WfpAction::Block && f.remote_ip == Some(ip)),
+                .any(|f| f.action == WfpAction::Block && f.covers_v4(ip)),
             "dest stays covered by its block"
         );
     }
@@ -5804,7 +5848,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|f| f.action == WfpAction::Block && f.remote_ip == Some(ip1)),
+                .any(|f| f.action == WfpAction::Block && f.covers_v4(ip1)),
             "delete deferred: old block survives when a replacement block add was skipped"
         );
     }
@@ -5825,6 +5869,7 @@ mod tests {
                 layer: WfpLayerKey::AleAuthConnectV4,
                 action,
                 remote_ip,
+                remote_ip_set: Vec::new(),
                 remote_port: None,
                 weight: 0,
                 id: WfpFilterId::from_raw(1),
@@ -5935,7 +5980,7 @@ mod tests {
             "fail-closed blocks the secondary dest at the ALE + named packet layers"
         );
         for b in &blocks {
-            assert_eq!(b.remote_ip, Some(ip));
+            assert!(b.covers_v4(ip));
             assert_eq!(
                 b.local_interface_luid, None,
                 "no tunnel to permit through — the block is unconditional"
@@ -6202,7 +6247,7 @@ mod tests {
             filters.iter().any(|f| {
                 f.layer == WfpLayerKey::OutboundTransportV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(ip)
+                    && f.covers_v4(ip)
                     && f.ip_protocol.is_none()
             })
         };
@@ -6340,7 +6385,7 @@ mod tests {
             let has_permit = filters.iter().any(|f| {
                 f.layer == WfpLayerKey::OutboundTransportV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(shared)
+                    && f.covers_v4(shared)
                     && f.ip_protocol.is_none()
             });
             assert_eq!(
@@ -6393,7 +6438,7 @@ mod tests {
             filters.iter().any(|f| {
                 f.layer == WfpLayerKey::AleAuthConnectV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(ip)
+                    && f.covers_v4(ip)
                     && f.weight >= 0x0050_0000
             })
         };
@@ -6455,7 +6500,7 @@ mod tests {
             !filters.iter().any(|f| {
                 f.layer == WfpLayerKey::OutboundTransportV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(shared)
+                    && f.covers_v4(shared)
                     && f.ip_protocol.is_none()
             }),
             "without an effective fake-IP datapath a census-shared secondary \
@@ -6497,7 +6542,7 @@ mod tests {
             !filters.iter().any(|f| {
                 f.layer == WfpLayerKey::AleAuthConnectV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(shared)
+                    && f.covers_v4(shared)
                     && f.weight >= 0x0050_0000
             }),
             "known-direct must not rescue a census-shared secondary destination \
@@ -6537,7 +6582,7 @@ mod tests {
             api.wfp_filters.lock().unwrap().iter().any(|f| {
                 f.layer == WfpLayerKey::AleAuthConnectV4
                     && f.action == WfpAction::Permit
-                    && f.remote_ip == Some(shared)
+                    && f.covers_v4(shared)
                     && f.weight >= 0x0050_0000
             })
         };
@@ -6657,7 +6702,7 @@ mod tests {
         assert!(
             filters
                 .iter()
-                .any(|f| f.action == WfpAction::Block && f.remote_ip == Some(ip)),
+                .any(|f| f.action == WfpAction::Block && f.covers_v4(ip)),
             "with the kill-switch on and no secondary bound, the routed destination must be blocked",
         );
     }
@@ -6676,7 +6721,9 @@ mod tests {
         let blocks: Vec<_> = filters
             .iter()
             .filter(|f| {
-                f.action == WfpAction::Block && f.remote_ip.is_none() && f.remote_subnet.is_none()
+                f.action == WfpAction::Block
+                    && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
+                    && f.remote_subnet.is_none()
             })
             .collect();
         assert_eq!(
@@ -6825,7 +6872,7 @@ mod tests {
         let filters = api.wfp_filters.lock().unwrap();
         assert!(
             filters.iter().any(|f| f.action == WfpAction::Block
-                && f.remote_ip.is_none()
+                && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
                 && f.layer == WfpLayerKey::AleAuthConnectV4),
             "fixture guard: Strict must still emit its default block",
         );
@@ -6842,8 +6889,7 @@ mod tests {
         assert!(
             filters
                 .iter()
-                .any(|f| f.action == WfpAction::Permit
-                    && f.remote_ip == Some(Ipv4Addr::new(9, 9, 9, 9))),
+                .any(|f| f.action == WfpAction::Permit && f.covers_v4(Ipv4Addr::new(9, 9, 9, 9))),
             "and so must the way to the VPN server",
         );
     }
@@ -6870,13 +6916,13 @@ mod tests {
         assert!(
             !filters
                 .iter()
-                .any(|f| f.remote_ip == Some(NAS) && f.action == WfpAction::Block),
+                .any(|f| f.covers_v4(NAS) && f.action == WfpAction::Block),
             "a host on the machine's own subnet must not be blocked when the tunnel drops",
         );
         assert!(
             filters
                 .iter()
-                .any(|f| f.remote_ip == Some(REMOTE) && f.action == WfpAction::Block),
+                .any(|f| f.covers_v4(REMOTE) && f.action == WfpAction::Block),
             "an ordinary remote destination is still protected",
         );
     }
@@ -6903,7 +6949,7 @@ mod tests {
         let filters = api.wfp_filters.lock().unwrap();
         let catch_all_v4 = filters.iter().any(|f| {
             f.action == WfpAction::Block
-                && f.remote_ip.is_none()
+                && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
                 && f.remote_subnet.is_none()
                 && f.layer == WfpLayerKey::AleAuthConnectV4
         });
@@ -6915,7 +6961,7 @@ mod tests {
         // declining to guard.
         assert!(
             filters.iter().any(|f| f.action == WfpAction::Block
-                && f.remote_ip == Some(Ipv4Addr::new(203, 0, 113, 9))),
+                && f.covers_v4(Ipv4Addr::new(203, 0, 113, 9))),
             "the enumerated destination must still be blocked",
         );
     }
@@ -7181,7 +7227,7 @@ mod tests {
         assert_eq!(count, 11, "the v4 set is unchanged");
         let filters = api.wfp_filters.lock().unwrap();
         assert!(
-            filters.iter().all(|f| f.remote_ip == Some(ip)),
+            filters.iter().all(|f| f.covers_v4(ip)),
             "with the closure off, every filter is destination-scoped v4 again"
         );
     }
@@ -7232,14 +7278,15 @@ mod tests {
             filters
                 .iter()
                 .filter(|f| f.local_interface_luid == Some(KS_LUID) || f.action == WfpAction::Block)
-                .filter(|f| f.remote_ip.is_some())
-                .all(|f| f.remote_ip == Some(secondary_ip)),
+                .filter(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
+                .all(|f| f.covers_v4(secondary_ip)),
             "kill-switch filters must only target the secondary destination"
         );
         assert!(
             filters
                 .iter()
-                .filter(|f| f.remote_ip.is_none() && f.action == WfpAction::Block)
+                .filter(|f| (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
+                    && f.action == WfpAction::Block)
                 .all(|f| f.local_interface_luid.is_none()),
             "the IPv6 closure blocks a family, so it is bound to no interface"
         );
@@ -7786,14 +7833,16 @@ mod tests {
     /// hands back) rather than a spec. Same predicate, different type.
     fn record_is_destination_block(f: &nrr_platform_api::types::WfpFilterRecord) -> bool {
         f.action == WfpAction::Block
-            && (f.remote_ip.is_some() || f.remote_subnet.is_some() || f.remote_subnet_v6.is_some())
+            && ((f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
+                || f.remote_subnet.is_some()
+                || f.remote_subnet_v6.is_some())
     }
 
     /// `is_app_only_block` over an ENUMERATED filter.
     fn record_is_app_only_block(f: &nrr_platform_api::types::WfpFilterRecord) -> bool {
         f.action == WfpAction::Block
             && f.app_pattern.is_some()
-            && f.remote_ip.is_none()
+            && (f.remote_ip.is_none() && f.remote_ip_set.is_empty())
             && f.remote_subnet.is_none()
             && f.remote_subnet_v6.is_none()
     }
@@ -8119,17 +8168,18 @@ mod tests {
         assert!(
             !live
                 .iter()
-                .any(|f| record_is_destination_block(f) && f.remote_ip == Some(observed)),
+                .any(|f| record_is_destination_block(f) && f.covers_v4(observed)),
             "an app-observed destination must not carry a destination-scoped block"
         );
         assert!(
-            live.iter().any(|f| record_is_destination_block(f)
-                && f.remote_ip == Some(Ipv4Addr::new(203, 0, 113, 10))),
+            live.iter()
+                .any(|f| record_is_destination_block(f)
+                    && f.covers_v4(Ipv4Addr::new(203, 0, 113, 10))),
             "the address-rule destination keeps its pin"
         );
         assert!(
             live.iter()
-                .any(|f| f.action == WfpAction::Permit && f.remote_ip == Some(observed)),
+                .any(|f| f.action == WfpAction::Permit && f.covers_v4(observed)),
             "the observed destination still has its /32 permit mirror"
         );
         assert!(
@@ -8156,7 +8206,7 @@ mod tests {
         assert!(
             !live
                 .iter()
-                .any(|f| record_is_destination_block(f) && f.remote_ip == Some(observed)),
+                .any(|f| record_is_destination_block(f) && f.covers_v4(observed)),
             "no destination-scoped block for the app-observed address here either"
         );
     }

@@ -56,24 +56,35 @@ fn collect_windows_rows_from_snapshot(
     adapters: Vec<nrr_shared::AdapterSnapshotEntry>,
     probe_external_ip: bool,
 ) -> Vec<InterfaceRouteRow> {
-    let runtime_by_adapter = collect_windows_runtime_data()
-        .map(|items| {
-            items
-                .into_iter()
-                .map(|item| {
+    // An IP Helper failure leaves every row without IP/gateway/DNS, which the
+    // consumers read as "this adapter has no local IP" — a temporary API
+    // failure then looks exactly like "this machine has no usable adapter".
+    // It cannot be repaired here (there is no second source for the data), so
+    // it is at least stated.
+    let runtime_by_adapter = match collect_windows_runtime_data() {
+        Ok(items) => items
+            .into_iter()
+            .map(|item| {
+                (
+                    item.adapter_name.to_ascii_lowercase(),
                     (
-                        item.adapter_name.to_ascii_lowercase(),
-                        (
-                            item.local_ip,
-                            item.gateway,
-                            item.dns_servers,
-                            item.has_default_route,
-                        ),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+                        item.local_ip,
+                        item.gateway,
+                        item.dns_servers,
+                        item.has_default_route,
+                    ),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>(),
+        Err(error) => {
+            tracing::warn!(
+                target: "nrr::interface-rows",
+                %error,
+                "adapter runtime data (IP/gateway/DNS) could not be read — every row will report no local IP, which is NOT the same as the machine having no usable adapter",
+            );
+            std::collections::HashMap::new()
+        }
+    };
 
     // Which adapters can actually forward traffic out: a classic gateway, or a
     // default-style route with a real next-hop (the gateway-less OpenVPN /
@@ -225,6 +236,10 @@ fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String
 
     let api = crate::windows_api::ProductionWindowsApi;
     let (Ok(routes), Ok(infos)) = (api.get_ip_forward_table(), api.get_adapter_infos()) else {
+        tracing::warn!(
+            target: "nrr::interface-rows",
+            "route table or adapter list unreadable — forwarding capability stays unevaluated for every adapter",
+        );
         return None;
     };
     Some(

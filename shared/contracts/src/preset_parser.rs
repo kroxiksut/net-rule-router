@@ -643,6 +643,29 @@ fn normalise_trailing_newline(mut s: String) -> String {
 mod tests {
     use super::*;
 
+    /// The application section THIS build classifies as rules, and two it does
+    /// not. The roles are host-relative and these tests spelled them out
+    /// (`Windows` = rules, `Linux`/`MacOS` = passthrough), which held only on a
+    /// Windows runner: on a Linux one `--- Linux` becomes the rule section and
+    /// every passthrough assertion here inverts.
+    const NATIVE_APP: &str = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else {
+        "MacOS"
+    };
+    const FOREIGN_A: &str = if cfg!(target_os = "windows") {
+        "Linux"
+    } else {
+        "Windows"
+    };
+    const FOREIGN_B: &str = if cfg!(target_os = "macos") {
+        "Linux"
+    } else {
+        "MacOS"
+    };
+
     fn rule(
         id: u32,
         enabled: bool,
@@ -683,12 +706,12 @@ mod tests {
     /// the same lines, or saving from the GUI deletes what the service applies.
     #[test]
     fn a_disabled_program_name_with_a_space_is_a_rule_not_prose() {
-        let result = parse_canonical_rules(
-            "--- Windows
+        let result = parse_canonical_rules(&format!(
+            "--- {NATIVE_APP}
 # Adobe Reader.exe
 browser.exe
-",
-        );
+"
+        ));
         assert_eq!(result.rules.len(), 2, "{:?}", result.rules);
         assert_eq!(result.rules[0].match_value, "Adobe Reader.exe");
         assert!(!result.rules[0].enabled);
@@ -835,12 +858,12 @@ example.org
 
     #[test]
     fn unknown_section_goes_to_passthrough() {
-        let input = "--- Linux\n# (reserved)\nfirefox\nchromium\n";
-        let result = parse_canonical_rules(input);
+        let input = format!("--- {FOREIGN_A}\n# (reserved)\nfirefox\nchromium\n");
+        let result = parse_canonical_rules(&input);
         assert!(result.rules.is_empty());
         assert_eq!(result.passthrough.len(), 1);
         let block = &result.passthrough[0];
-        assert_eq!(block.section_name, "Linux");
+        assert_eq!(block.section_name, FOREIGN_A);
         // Content (non-blank, non-comment): firefox, chromium → 2 lines.
         assert_eq!(block.content_lines, 2);
         assert_eq!(
@@ -853,8 +876,8 @@ example.org
 
     #[test]
     fn passthrough_preserves_blank_lines_and_comments_in_raw() {
-        let input = "--- Linux\n\nfirefox\n# vendor note\nchromium\n";
-        let result = parse_canonical_rules(input);
+        let input = format!("--- {FOREIGN_A}\n\nfirefox\n# vendor note\nchromium\n");
+        let result = parse_canonical_rules(&input);
         assert_eq!(result.passthrough.len(), 1);
         let block = &result.passthrough[0];
         assert_eq!(block.raw_text, "\nfirefox\n# vendor note\nchromium\n");
@@ -867,7 +890,7 @@ example.org
 
     #[test]
     fn passthrough_preview_caps_at_five_lines() {
-        let mut input = String::from("--- Linux\n");
+        let mut input = format!("--- {FOREIGN_A}\n");
         for i in 0..10 {
             input.push_str(&format!("app{i}\n"));
         }
@@ -881,27 +904,27 @@ example.org
 
     #[test]
     fn empty_unknown_section_produces_block_with_empty_body() {
-        let result = parse_canonical_rules("--- Linux\n--- MacOS\nSafari\n");
-        // Two passthrough blocks — Linux (empty) and MacOS (one line).
+        let result = parse_canonical_rules(&format!("--- {FOREIGN_A}\n--- {FOREIGN_B}\nSafari\n"));
+        // Two passthrough blocks — the first empty, the second one line.
         assert_eq!(result.passthrough.len(), 2);
-        assert_eq!(result.passthrough[0].section_name, "Linux");
+        assert_eq!(result.passthrough[0].section_name, FOREIGN_A);
         assert_eq!(result.passthrough[0].raw_text, "");
         assert_eq!(result.passthrough[0].content_lines, 0);
         assert!(result.passthrough[0].preview.is_empty());
-        assert_eq!(result.passthrough[1].section_name, "MacOS");
+        assert_eq!(result.passthrough[1].section_name, FOREIGN_B);
         assert_eq!(result.passthrough[1].content_lines, 1);
     }
 
     #[test]
     fn duplicate_unknown_section_creates_two_passthrough_blocks() {
-        let input = "--- Linux\nfirefox\n--- Linux\nchromium\n";
-        let result = parse_canonical_rules(input);
+        let input = format!("--- {FOREIGN_A}\nfirefox\n--- {FOREIGN_A}\nchromium\n");
+        let result = parse_canonical_rules(&input);
         assert_eq!(result.passthrough.len(), 2);
         assert_eq!(result.passthrough[0].raw_text, "firefox\n");
         assert_eq!(result.passthrough[1].raw_text, "chromium\n");
         // The duplicate diagnostic fires.
         assert_eq!(result.duplicate_sections.len(), 1);
-        assert_eq!(result.duplicate_sections[0].section_name, "Linux");
+        assert_eq!(result.duplicate_sections[0].section_name, FOREIGN_A);
         assert_eq!(result.duplicate_sections[0].occurrences, 2);
         assert!(!result.duplicate_sections[0].is_known_section);
     }
@@ -924,12 +947,14 @@ example.org
 
     #[test]
     fn multiple_distinct_duplicates_in_order() {
-        let input = "--- Linux\na\n--- MacOS\nb\n--- Linux\nc\n--- MacOS\nd\n";
-        let result = parse_canonical_rules(input);
+        let input = format!(
+            "--- {FOREIGN_A}\na\n--- {FOREIGN_B}\nb\n--- {FOREIGN_A}\nc\n--- {FOREIGN_B}\nd\n"
+        );
+        let result = parse_canonical_rules(&input);
         assert_eq!(result.duplicate_sections.len(), 2);
-        // Order preserved by first-encounter (Linux before MacOS).
-        assert_eq!(result.duplicate_sections[0].section_name, "Linux");
-        assert_eq!(result.duplicate_sections[1].section_name, "MacOS");
+        // Order preserved by first encounter.
+        assert_eq!(result.duplicate_sections[0].section_name, FOREIGN_A);
+        assert_eq!(result.duplicate_sections[1].section_name, FOREIGN_B);
     }
 
     #[test]
@@ -972,8 +997,8 @@ example.org
 
     #[test]
     fn windows_section_treated_as_application() {
-        let input = "--- Windows\nbrowser.exe\n*vpn*.exe\n";
-        let result = parse_canonical_rules(input);
+        let input = format!("--- {NATIVE_APP}\nbrowser.exe\n*vpn*.exe\n");
+        let result = parse_canonical_rules(&input);
         assert_eq!(result.rules.len(), 2);
         for r in &result.rules {
             assert_eq!(r.rule_type, ParsedRuleType::Application);
@@ -1021,6 +1046,9 @@ example.org
         assert_eq!(classify_section("Zones"), Some(ParsedRuleType::Zone));
         assert_eq!(classify_section("zones"), None);
         assert_eq!(classify_section("ZONES"), None);
+        // A literal on purpose: unlike the lenient classifier, the strict one
+        // is host-independent — its known set is fixed, so `Linux` is unknown
+        // to it on every OS.
         assert_eq!(classify_section("Linux"), None);
     }
 
@@ -1038,7 +1066,9 @@ example.org
             classify_section_lenient_pub("ZONES"),
             Some(ParsedRuleType::Zone)
         );
-        assert_eq!(classify_section_lenient_pub("Linux"), None);
+        // A section belonging to another OS classifies as nothing here — which
+        // one that is depends on the host, so it is named rather than spelled.
+        assert_eq!(classify_section_lenient_pub(FOREIGN_A), None);
     }
 
     #[test]
@@ -1065,9 +1095,11 @@ example.org
     fn complete_realistic_preset_matches_qml_behaviour() {
         // A realistic RU preset shape — verifies the parser behaves
         // identically to the QML reference for a representative file.
-        let input = "# NetRuleRouter preset - version 1\n# name: Test\n# preset_version: 1\n\n--- Zones\nru          # Россия (.ru)\nрф          # Россия (.рф, Punycode xn--p1ai)\n\n--- Domains\nvk.com\n*.vk.com\n# *.deprecated.com  # turned off last week\n\n--- IP\n# Intentionally left empty\n\n--- Windows\ntelegram.exe\n# notepad.exe\n\n--- Linux\n# (reserved - not applied on Windows)\nfirefox\n\n--- MacOS\n# (reserved - not applied on Windows)\nSafari\n";
+        let input = format!(
+            "# NetRuleRouter preset - version 1\n# name: Test\n# preset_version: 1\n\n--- Zones\nru          # Россия (.ru)\nрф          # Россия (.рф, Punycode xn--p1ai)\n\n--- Domains\nvk.com\n*.vk.com\n# *.deprecated.com  # turned off last week\n\n--- IP\n# Intentionally left empty\n\n--- {NATIVE_APP}\ntelegram.exe\n# notepad.exe\n\n--- {FOREIGN_A}\n# (reserved - not applied on this host)\nfirefox\n\n--- {FOREIGN_B}\n# (reserved - not applied on this host)\nSafari\n"
+        );
 
-        let result = parse_canonical_rules(input);
+        let result = parse_canonical_rules(&input);
 
         // 2 zones + 2 domains + 1 disabled domain + 1 enabled app +
         // 1 disabled app = 7 rules.
@@ -1081,11 +1113,11 @@ example.org
         assert!(result.rules[5].enabled); // telegram.exe
         assert!(!result.rules[6].enabled); // # notepad.exe
 
-        // Passthrough: Linux and MacOS sections preserved.
+        // Passthrough: the two foreign-OS sections preserved.
         assert_eq!(result.passthrough.len(), 2);
-        assert_eq!(result.passthrough[0].section_name, "Linux");
-        assert_eq!(result.passthrough[1].section_name, "MacOS");
-        // Linux has 1 content line (firefox), MacOS has 1 (Safari).
+        assert_eq!(result.passthrough[0].section_name, FOREIGN_A);
+        assert_eq!(result.passthrough[1].section_name, FOREIGN_B);
+        // One content line each (firefox, Safari).
         assert_eq!(result.passthrough[0].content_lines, 1);
         assert_eq!(result.passthrough[1].content_lines, 1);
 
@@ -1094,7 +1126,7 @@ example.org
 
         // ── Verify exact rule layout ──
         let expected_section_for_idx = [
-            "Zones", "Zones", "Domains", "Domains", "Domains", "Windows", "Windows",
+            "Zones", "Zones", "Domains", "Domains", "Domains", NATIVE_APP, NATIVE_APP,
         ];
         for (i, r) in result.rules.iter().enumerate() {
             assert_eq!(r.section_name, expected_section_for_idx[i], "rule {i}");
@@ -1123,7 +1155,7 @@ example.org
 
     #[test]
     fn passthrough_block_for_section_with_only_blank_lines() {
-        let result = parse_canonical_rules("--- Linux\n\n\n\n");
+        let result = parse_canonical_rules(&format!("--- {FOREIGN_A}\n\n\n\n"));
         assert_eq!(result.passthrough.len(), 1);
         let block = &result.passthrough[0];
         assert_eq!(block.content_lines, 0);
@@ -1161,10 +1193,11 @@ example.org
 
     #[test]
     fn duplicate_known_section_with_passthrough_after_does_not_confuse() {
-        // Linux is unknown, Domains is known. Two of each.
-        let input =
-            "--- Domains\nvk.com\n--- Linux\nfirefox\n--- Domains\nya.ru\n--- Linux\nchromium\n";
-        let result = parse_canonical_rules(input);
+        // The foreign section is unknown, Domains is known. Two of each.
+        let input = format!(
+            "--- Domains\nvk.com\n--- {FOREIGN_A}\nfirefox\n--- Domains\nya.ru\n--- {FOREIGN_A}\nchromium\n"
+        );
+        let result = parse_canonical_rules(&input);
         assert_eq!(result.rules.len(), 2);
         assert_eq!(result.passthrough.len(), 2);
         assert_eq!(result.duplicate_sections.len(), 2);
@@ -1176,10 +1209,10 @@ example.org
         // (e.g. `----- Zones` with four dashes) is not a header, and
         // inside a known section it would be parsed as a rule value.
         // Inside an unknown section it accumulates as passthrough text.
-        let result = parse_canonical_rules("--- Linux\n----- not a header\nfoo\n");
+        let result = parse_canonical_rules(&format!("--- {FOREIGN_A}\n----- not a header\nfoo\n"));
         assert!(result.rules.is_empty());
         let block = &result.passthrough[0];
-        assert_eq!(block.section_name, "Linux");
+        assert_eq!(block.section_name, FOREIGN_A);
         assert_eq!(block.raw_text, "----- not a header\nfoo\n");
     }
 
@@ -1205,7 +1238,9 @@ example.org
 
     #[test]
     fn fixture_application_with_glob_pattern() {
-        let result = parse_canonical_rules("--- Windows\n*chrome*.exe  # any chrome variant\n");
+        let result = parse_canonical_rules(&format!(
+            "--- {NATIVE_APP}\n*chrome*.exe  # any chrome variant\n"
+        ));
         assert_eq!(result.rules[0].match_value, "*chrome*.exe");
         assert_eq!(result.rules[0].comment, "any chrome variant");
     }

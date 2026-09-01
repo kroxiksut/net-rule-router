@@ -1021,13 +1021,26 @@ pub enum CrashRecoveryOutcome {
 /// failure (file missing, lock contention, schema mismatch) — the
 /// conservative default that triggers `RequireManualAction` for
 /// recovery decisions that need an LKG.
+///
+/// The connection comes from `nrr_storage::open_connection`, not a raw
+/// `Connection::open`: without its `busy_timeout` a writer holding the lock
+/// for a moment returns `SQLITE_BUSY` immediately, this probe answers "no
+/// last-known-good", and recovery demands manual action over a database that
+/// is perfectly healthy.
 pub fn probe_lkg_available(state_db_path: &std::path::Path) -> bool {
     if !state_db_path.exists() {
         return false;
     }
-    let conn = match rusqlite::Connection::open(state_db_path) {
+    let conn = match nrr_storage::migration::open_connection(state_db_path) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(e) => {
+            tracing::warn!(
+                target: "nrr::crash-recovery",
+                error = %e,
+                "state DB could not be opened for the last-known-good probe; assuming none",
+            );
+            return false;
+        }
     };
     let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
     matches!(repo.last_known_good(), Ok(Some(_)))

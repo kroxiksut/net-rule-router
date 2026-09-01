@@ -1156,24 +1156,23 @@ impl ActivationCoordinator {
     ) -> Result<Phase1Outcome, PolicyError> {
         let conn = self.conn.lock().expect("connection mutex poisoned");
         let token_store = MutationTokenStoreSqlite::new(&conn);
-        // Consume scoped to the principal: a token issued
-        // for another user is reported as Unknown (no cross-user replay).
+        // Consume scoped to the principal AND to this revision: a token is
+        // issued to activate ONE candidate and its payload says which, so both
+        // conditions are stated to the store rather than checked afterwards. A
+        // token of the right user for a different candidate now fails without
+        // being burned — it still authorises what the user actually confirmed.
         let outcome = token_store
-            .consume_for(principal, token.as_str(), now)
+            .consume_for_matching(principal, token.as_str(), now, |payload| {
+                Self::token_revision_of(payload).as_deref() == Some(revision_id.as_str())
+            })
             .map_err(|e| PolicyError::StorageFailure {
                 operation: "consume_token",
                 message: e.to_string(),
             })?;
         match outcome {
-            // A token is issued to activate ONE candidate, and the payload says
-            // which. Without this check any live token of the principal
-            // activated any candidate of theirs — including one the user had
-            // just rejected in the GUI, which is the opposite of what a
-            // confirmation is for.
-            ConsumeOutcome::Consumed { payload_json, .. } => {
-                if Self::token_revision_of(&payload_json).as_deref() != Some(revision_id.as_str()) {
-                    return Err(PolicyError::ConfirmationTokenForOtherRevision);
-                }
+            ConsumeOutcome::Consumed { .. } => {}
+            ConsumeOutcome::PayloadRejected => {
+                return Err(PolicyError::ConfirmationTokenForOtherRevision)
             }
             ConsumeOutcome::Unknown => return Err(PolicyError::ConfirmationTokenUnknown),
             ConsumeOutcome::AlreadyConsumed => {

@@ -640,6 +640,10 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
     let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut known: Vec<SectionContent> = Vec::new();
     let mut unknown: Vec<UnknownSection> = Vec::new();
+    // Name → position in `unknown`, so a file full of distinct headers costs
+    // linear time rather than quadratic.
+    let mut unknown_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut warnings: Vec<ParseWarning> = Vec::new();
     let mut file_format_version: Option<u32> = None;
     let mut is_preset_file = false;
@@ -685,16 +689,19 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
                     current = Some(Slot::Known(idx));
                 }
                 None => {
-                    let idx = unknown
-                        .iter()
-                        .position(|s| s.name == name)
-                        .unwrap_or_else(|| {
-                            unknown.push(UnknownSection {
-                                name: name.to_string(),
-                                entries: Vec::new(),
-                            });
-                            unknown.len() - 1
+                    // Indexed, not scanned: the section name comes from the
+                    // file, so a linear lookup per header is quadratic in a
+                    // value the caller controls — and this parser is reachable
+                    // over IPC with a 1 MiB payload (~116k headers, tens of
+                    // seconds of CPU). The known-section lookup below stays a
+                    // scan: its length is the enum's, not the file's.
+                    let idx = *unknown_index.entry(name.to_string()).or_insert_with(|| {
+                        unknown.push(UnknownSection {
+                            name: name.to_string(),
+                            entries: Vec::new(),
                         });
+                        unknown.len() - 1
+                    });
                     // Emit warning on first encounter only.
                     if unknown[idx].entries.is_empty() {
                         warnings.push(ParseWarning::UnknownSection {
@@ -823,11 +830,12 @@ pub fn parse_rules_file(input: &str) -> ParseOutcome {
         }
     }
 
-    // Update entry_count in UnknownSection warnings now that parsing is done.
+    // Update entry_count in UnknownSection warnings now that parsing is done —
+    // through the same index, so this pass is linear too.
     for w in &mut warnings {
         if let ParseWarning::UnknownSection { name, entry_count } = w {
-            if let Some(s) = unknown.iter().find(|s| &s.name == name) {
-                *entry_count = s.entries.len();
+            if let Some(idx) = unknown_index.get(name) {
+                *entry_count = unknown[*idx].entries.len();
             }
         }
     }
@@ -1920,17 +1928,26 @@ browser.exe   # browser traffic
 
     /// The toggle in the GUI writes `# <value>` and the file is rewritten from
     /// the parsed model, so a value dropped here is a rule deleted for good.
+    ///
+    /// Written against the HOST's own application section: whether a commented
+    /// line with a space is a disabled rule or prose is decided per rule kind,
+    /// and only the running platform's section counts as one. Hardcoding
+    /// `--- Windows` made this fail under Linux for a reason that has nothing to
+    /// do with what it asserts — the same trap
+    /// `compiled_platform_matches_the_build_target` documents.
     #[test]
     fn a_disabled_program_name_with_a_space_survives_the_round_trip() {
-        let file = "--- Windows
-# Adobe Reader.exe
-browser.exe
-";
-        let outcome = parse_rules_file(file);
-        let win = outcome.parsed.entries_for(RulesFileSection::Windows);
-        assert_eq!(win.len(), 2, "{win:?}");
-        assert_eq!(win[0].match_value, "Adobe Reader.exe");
-        assert!(!win[0].enabled);
+        let section = match HostPlatform::compiled() {
+            HostPlatform::Windows => RulesFileSection::Windows,
+            HostPlatform::Linux => RulesFileSection::Linux,
+            HostPlatform::MacOS => RulesFileSection::MacOS,
+        };
+        let file = format!("--- {}\n# Adobe Reader.exe\nbrowser.exe\n", section.name());
+        let outcome = parse_rules_file(&file);
+        let apps = outcome.parsed.entries_for(section);
+        assert_eq!(apps.len(), 2, "{apps:?}");
+        assert_eq!(apps[0].match_value, "Adobe Reader.exe");
+        assert!(!apps[0].enabled);
     }
 
     #[test]
@@ -2024,6 +2041,29 @@ example.org
             &outcome.warnings[0],
             ParseWarning::UnknownSection { name, entry_count: 3 } if name == "Ports"
         ));
+    }
+
+    /// The parser is reachable over IPC with a client-supplied 1 MiB payload,
+    /// so its cost has to be linear in the input. Section bookkeeping used to
+    /// scan the accumulated list per header — 20k headers took ~750 ms, and the
+    /// import limit allows five times as many. A wall-clock guard is coarse on
+    /// purpose: it fails on a return to quadratic (tens of seconds) and cannot
+    /// flake on a slow machine at these margins.
+    #[test]
+    fn a_file_of_many_distinct_headers_parses_in_linear_time() {
+        const HEADERS: usize = 20_000;
+        let mut input = String::with_capacity(HEADERS * 16);
+        for i in 0..HEADERS {
+            input.push_str(&format!("--- Section{i}\nvalue{i}.example\n"));
+        }
+        let started = std::time::Instant::now();
+        let outcome = parse_rules_file(&input);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.unknown_sections.len(), HEADERS);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "parsing {HEADERS} headers took {elapsed:?} — the per-header lookup is scanning again",
+        );
     }
 
     #[test]

@@ -740,6 +740,16 @@ pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     conn.busy_timeout(std::time::Duration::from_millis(5_000))
         .map_err(|e| StorageError::Internal(format!("busy_timeout: {e}")))?;
 
+    // Fold the journal back into the database file and shrink it. WAL's
+    // automatic checkpoint copies pages across but never truncates the file, so
+    // the journal only grows: on the owner's machine the three databases held
+    // 6.2 MB while their journals held 13.4 MB, and the traffic ledger was 28 KB
+    // of database behind 4.1 MB of journal — nearly all of that data lived in a
+    // file that a crash-cleanup or a restore-from-copy would drop while leaving
+    // an intact-looking database behind. Best-effort by design: with another
+    // connection open, SQLite refuses to truncate and the next open retries.
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+
     Ok(conn)
 }
 

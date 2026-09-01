@@ -117,7 +117,7 @@ pub use policy_settings::{
     VALID_POLICY_SLUGS,
 };
 pub use principal_purge::{
-    principals_with_rules, purge_principal_data, purge_principal_rules, PrincipalPurgeSummary,
+    principals_with_state, purge_principal_data, purge_principal_rules, PrincipalPurgeSummary,
 };
 pub use profile::{resolve_storage_topology, StorageProfile, StorageTopology};
 pub use query::{

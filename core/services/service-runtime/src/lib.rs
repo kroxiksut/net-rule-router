@@ -119,6 +119,10 @@ pub mod persistent_app_resolver;
 pub mod policy_loader;
 pub mod power_resume;
 pub mod primary_path_probe;
+// Which named destinations stall on the MAIN link. Diagnostic only: the
+// companion ledger keeps this evidence for its own candidates and discards it
+// for every other host, which is precisely the host nobody has a theory about.
+pub mod primary_stall_registry;
 pub mod principal_enforcement;
 pub mod production_auto_rule_probe;
 pub mod production_coordinator;

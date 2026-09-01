@@ -685,9 +685,18 @@ fn open_and_migrate_state(path: &Path) -> Result<SqliteStateStore, StateOpenFail
     runner
         .run_pending_migrations()
         .map_err(|e| StateOpenFailure::Migrate(e.to_string()))?;
-    runner
+    let verification = runner
         .verify_schema()
         .map_err(|e| StateOpenFailure::Migrate(format!("verify_schema: {e}")))?;
+    // The verdict is the point of the call. It used to be computed and
+    // dropped, so an interrupted migration — a missing table, a missing index
+    // — reported a clean start and failed on the first query instead.
+    if !verification.is_ok() {
+        return Err(StateOpenFailure::Migrate(describe_schema_failure(
+            "state",
+            &verification,
+        )));
+    }
     let conn = runner.into_connection();
     reject_orphaned_candidate_revisions(&conn);
     Ok(SqliteStateStore::new(conn))
@@ -800,13 +809,37 @@ fn open_and_migrate_cache(
     let conn = open_connection(path).map_err(|e| e.to_string())?;
     let runner = SqliteMigrationRunner::for_cache_db(conn);
     runner.run_pending_migrations().map_err(|e| e.to_string())?;
-    runner
+    let verification = runner
         .verify_schema()
         .map_err(|e| format!("verify_schema: {e}"))?;
+    if !verification.is_ok() {
+        return Err(describe_schema_failure("cache", &verification));
+    }
     Ok(SqliteCacheStore::new(
         runner.into_connection(),
         thresholds.clone(),
     ))
+}
+
+/// Name what the schema check actually found. `is_ok()` is three separate
+/// conditions, and "schema verification failed" without saying which one
+/// leaves the reader to re-run the query by hand.
+fn describe_schema_failure(db: &str, v: &nrr_storage::dto::SchemaVerification) -> String {
+    let mut faults = Vec::new();
+    if !v.required_tables_present {
+        faults.push("required tables missing");
+    }
+    if !v.indexes_ok {
+        faults.push("indexes missing");
+    }
+    if !v.foreign_keys_ok {
+        faults.push("foreign-key check failed");
+    }
+    format!(
+        "{db} DB schema verification failed at version {}: {}",
+        v.version,
+        faults.join(", ")
+    )
 }
 
 fn open_audit(audit_dir: &Path) -> Result<AuditWriter, String> {

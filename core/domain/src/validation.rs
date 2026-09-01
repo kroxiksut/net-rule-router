@@ -593,21 +593,27 @@ fn normalize_rule(
             // "рф" via QUrl::toAce to "xn--p1ai" before saving, and hostnames
             // are punycode at decision time — a raw Unicode zone here would
             // both never match and show up as a spurious removed+added pair in
-            // the rule diff. A leading dot is zone-slice syntax, not a label,
-            // so it is preserved verbatim and only the remainder is encoded.
-            let (dot, body) = match stripped.strip_prefix('.') {
-                Some(rest) => (".", rest),
-                None => ("", stripped),
-            };
-            let normalized = if body.is_empty() {
-                stripped.to_string()
-            } else {
-                match normalize_domain_label(body, &rule.id, warnings) {
-                    Ok(canonical) => format!("{dot}{canonical}"),
-                    Err(e) => {
-                        errors.push(e);
-                        return None;
-                    }
+            // the rule diff.
+            //
+            // `.ru` is the spelling a user naturally writes for a TLD, and it
+            // folds to the same rule as `ru` everywhere else — the wire
+            // comparison key (`nrr_shared::rules_json::fold_suffix`) strips the
+            // dot, and the GUI's own validator rejects it outright. Only this
+            // canonicalizer used to keep it, and `match_zone` looks for
+            // `.{zone}`, so a dotted zone searched for `..ru` and matched
+            // nothing: the rule was accepted and silently inert.
+            let body = stripped.strip_prefix('.').unwrap_or(stripped);
+            if body.is_empty() {
+                errors.push(ValidationError::ZoneEmptyName {
+                    rule_id: rule.id.clone(),
+                });
+                return None;
+            }
+            let normalized = match normalize_domain_label(body, &rule.id, warnings) {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    errors.push(e);
+                    return None;
                 }
             };
             Some(CanonicalAddressMatch::Zone(normalized))
@@ -807,13 +813,21 @@ fn normalize_app_match(
 
 /// The match identity key used to detect duplicate rules.
 ///
-/// Two rules are considered duplicates when their match conditions are
-/// identical — regardless of `id`, `enabled`, or `comment`.
+/// Two rules are duplicates when they match the same traffic AND say the same
+/// thing about it — `id` and `comment` are metadata and stay out.
+///
+/// `action` and `enabled` are part of the identity because they are what the
+/// rule DOES: `example.com` next to `example.com +block` are opposite
+/// instructions, and folding them left whichever came first while the other
+/// vanished behind a "duplicate removed" note. The same went for a disabled
+/// copy above an enabled one — the set kept the disabled line.
 #[derive(PartialEq, Eq, Hash)]
 struct MatchKey {
     address: Option<CanonicalAddressMatch>,
     app_pattern: Option<CanonicalAppPattern>,
     app_children: Option<bool>,
+    action: crate::canonical::RuleAction,
+    enabled: bool,
 }
 
 impl MatchKey {
@@ -822,6 +836,8 @@ impl MatchKey {
             address: rule.address_match.clone(),
             app_pattern: rule.app_match.as_ref().map(|a| a.pattern.clone()),
             app_children: rule.app_match.as_ref().map(|a| a.include_child_processes),
+            action: rule.action,
+            enabled: rule.enabled,
         }
     }
 }
@@ -1181,13 +1197,33 @@ mod tests {
     }
 
     #[test]
-    fn zone_leading_dot_and_multi_label_preserved() {
-        // Leading dot is zone-slice syntax and survives verbatim; only the
-        // labels behind it are IDNA-encoded. Multi-label zones stay intact.
-        assert_eq!(canonical_zone(".ru"), ".ru");
-        assert_eq!(canonical_zone(".рф"), ".xn--p1ai");
+    fn zone_written_with_a_leading_dot_canonicalizes_to_the_matchable_form() {
+        // `.ru` is how a user writes a TLD. It used to be canonicalized
+        // verbatim, and `match_zone` looks for `.{zone}` — so the stored rule
+        // searched hostnames for `..ru` and never fired: accepted, applied,
+        // inert. The canonical form now drops the dot, which is also what the
+        // wire comparison key and the GUI validator already assumed.
+        assert_eq!(canonical_zone(".ru"), "ru");
+        assert_eq!(canonical_zone(".рф"), "xn--p1ai");
         assert_eq!(canonical_zone("msk.ru"), "msk.ru");
         assert_eq!(canonical_zone("мск.рф"), "xn--j1adp.xn--p1ai");
+    }
+
+    /// The property the test above exists for: a zone the user wrote with a
+    /// dot must actually match hostnames in it. Canonical form and matcher are
+    /// checked together, because "accepted" and "enforced" drifting apart is
+    /// exactly the defect.
+    #[test]
+    fn a_dotted_zone_matches_hosts_in_it_after_canonicalization() {
+        let zone = canonical_zone(".ru");
+        assert!(crate::decision_matching::match_zone("example.ru", &zone));
+        assert!(crate::decision_matching::match_zone(
+            "translate.google.ru",
+            &zone
+        ));
+        assert!(!crate::decision_matching::match_zone("example.com", &zone));
+        // The apex itself is not a member — unchanged contract.
+        assert!(!crate::decision_matching::match_zone("ru", &zone));
     }
 
     #[test]
@@ -1446,6 +1482,59 @@ mod tests {
             .warnings()
             .iter()
             .any(|w| matches!(w, ValidationWarning::DuplicateRuleInSameSet { .. })));
+    }
+
+    /// Two rules over the same destination that say OPPOSITE things are not
+    /// duplicates. Folding them dropped one instruction and reported it as a
+    /// removed duplicate, so a `+block` next to a plain route silently lost the
+    /// block (or the route, depending on which came first).
+    #[test]
+    fn a_rule_and_its_opposite_over_the_same_destination_both_survive() {
+        let blocked = Rule {
+            action: crate::canonical::RuleAction::Block,
+            ..domain_rule("r-block", "example.com")
+        };
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            vec![domain_rule("r-route", "example.com"), blocked],
+            vec![],
+        );
+        let outcome = validate_and_canonicalize(&config);
+        assert!(outcome.is_accepted());
+        let profile = outcome.profile().expect("profile must be present");
+        assert_eq!(profile.rule_book.primary.len(), 2);
+        assert!(!outcome
+            .warnings()
+            .iter()
+            .any(|w| matches!(w, ValidationWarning::DuplicateRuleInSameSet { .. })));
+    }
+
+    /// A disabled copy is not a duplicate of the enabled one either — keeping
+    /// the first-seen row meant a commented-out line above an active one left
+    /// the DISABLED copy in the set.
+    #[test]
+    fn a_disabled_copy_does_not_swallow_the_enabled_rule() {
+        let disabled = Rule {
+            enabled: false,
+            ..domain_rule("r-off", "example.com")
+        };
+        let config = config_with_rules(
+            Some(primary()),
+            Some(secondary()),
+            RouteBehaviorMode::PreferPrimary,
+            vec![disabled, domain_rule("r-on", "example.com")],
+            vec![],
+        );
+        let outcome = validate_and_canonicalize(&config);
+        let profile = outcome.profile().expect("profile must be present");
+        assert!(profile
+            .rule_book
+            .primary
+            .rules()
+            .iter()
+            .any(|r| r.enabled && r.id.0 == "r-on"));
     }
 
     #[test]

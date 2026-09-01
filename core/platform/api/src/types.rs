@@ -201,6 +201,15 @@ pub struct WfpFilterSpec {
     pub action: WfpAction,
     /// Match condition: specific remote IPv4 address (None = any).
     pub remote_ip: Option<Ipv4Addr>,
+    /// Match condition: a SET of remote IPv4 addresses. WFP joins multiple
+    /// conditions on one field with OR, so a single filter guards the whole
+    /// set — the packed form that keeps the standing filter count bounded by
+    /// slots instead of addresses (see [`crate::wfp_slotting`]). Sorted,
+    /// non-empty when used; empty = no set condition. Mutually exclusive with
+    /// `remote_ip` (a one-address set is still a set — its id and lifecycle
+    /// follow its chunk).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_set: Vec<Ipv4Addr>,
     /// Match condition: specific remote port (None = any).
     pub remote_port: Option<u16>,
     /// Filter weight within our sub-layer.
@@ -286,9 +295,18 @@ impl WfpFilterSpec {
     /// `FWP_E_CONDITION_NOT_FOUND` at apply time — catching it here turns a
     /// silent per-filter skip in production (and a false green in tests,
     /// where the mock engine accepts anything) into a structured error.
+    /// Whether this filter's v4 destination conditions cover `ip` — the
+    /// single-address form or the packed set.
+    pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {
+        self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
+    }
+
     pub fn validate_layer_conditions(&self) -> Result<(), &'static str> {
         if self.ip_protocol.is_some() && !self.layer.supports_ip_protocol() {
             return Err("FWPM_CONDITION_IP_PROTOCOL is not available at the IPPACKET layers");
+        }
+        if self.remote_ip.is_some() && !self.remote_ip_set.is_empty() {
+            return Err("remote_ip and remote_ip_set are mutually exclusive");
         }
         if !self.layer.supports_ale_scoping() {
             if self.user_sid.is_some() {
@@ -309,6 +327,12 @@ pub struct WfpFilterRecord {
     pub layer: WfpLayerKey,
     pub action: WfpAction,
     pub remote_ip: Option<Ipv4Addr>,
+    /// The packed remote-address set (multiple OR'd
+    /// `FWPM_CONDITION_IP_REMOTE_ADDRESS` conditions). Mirrors
+    /// `WfpFilterSpec::remote_ip_set`; the enumeration path recovers every
+    /// exact-host condition, so live records carry the whole set back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_set: Vec<Ipv4Addr>,
     pub remote_port: Option<u16>,
     pub weight: u64,
     /// `FWPM_CONDITION_ALE_USER_ID` value when the
@@ -352,6 +376,15 @@ pub struct WfpFilterRecord {
     /// their protocol narrowing intact. Mirrors `WfpFilterSpec::ip_protocol`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip_protocol: Option<u8>,
+}
+
+impl WfpFilterRecord {
+    /// Whether this record's v4 destination conditions cover `ip` — the
+    /// single-address form or the packed set. Twin of
+    /// [`WfpFilterSpec::covers_v4`].
+    pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {
+        self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
+    }
 }
 
 // ── Apply action plan ─────────────────────────────────────────────────────────

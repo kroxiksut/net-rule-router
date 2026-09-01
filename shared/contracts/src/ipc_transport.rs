@@ -105,6 +105,17 @@ pub const SERVICE_ENDPOINT_ADDRESS: &str = r"\\.\pipe\NetRuleRouter\service-v1";
 #[cfg(unix)]
 pub const SERVICE_ENDPOINT_ADDRESS: &str = "/run/netrulerouter/service-v1.sock";
 
+/// The rules-lock refusal as CLIENTS spell it.
+///
+/// Two spellings of one condition are legitimate here — the envelope carries
+/// serde's `snake_case` [`IpcErrorCode::RulesLocked`], while the client-facing
+/// slug and the `code` field of a failed mutation are kebab — but they were
+/// two hand-typed literals in two crates, one of them documented as
+/// "mirrors" the other while differing from it. Both sides read this
+/// constant instead, so a rename cannot silently split the durable
+/// rules-read-only state into two unrelated errors.
+pub const RULES_LOCKED_CLIENT_SLUG: &str = "rules-locked";
+
 /// Maximum size of a single wire-format frame (request or response),
 /// in bytes. Both client (`nrr-ipc-client`) and server
 /// (`nrr-windows-service`) enforce this limit. Frames larger than this

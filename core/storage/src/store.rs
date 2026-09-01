@@ -631,13 +631,17 @@ impl CacheRepository for SqliteCacheStore {
         }
         let conn = self.conn.borrow();
         let normalised = suffix.trim().trim_end_matches('.').to_ascii_lowercase();
-        // The LIKE pattern is `%.{suffix}` — `%` is "any prefix
-        // including empty", but the literal `.` before the suffix
-        // makes the apex (`{suffix}` itself) not match. SQLite escape
-        // characters in suffix would only matter if the canonical
-        // hostnames contained `%` / `_`, which they don't (lowercase
-        // ASCII / punycode IDN).
-        let pattern = format!("%.{normalised}");
+        // The LIKE pattern is `%.{suffix}` — `%` is "any prefix including
+        // empty", but the literal `.` before the suffix makes the apex
+        // (`{suffix}` itself) not match.
+        //
+        // The suffix comes from a USER'S rule, so it is the side that has to be
+        // escaped: an unescaped zone `_u` matched `.ru`, `.eu` and `.nu` alike,
+        // and `%` matched every hostname containing a dot. This result feeds the
+        // zone fan-out, i.e. which hosts earn permits and routes — a wildcard
+        // slipping in here silently widens the rule. (The old comment argued the
+        // other side of the join: metacharacters in the stored hostnames.)
+        let pattern = format!("%.{}", escape_like_literal(&normalised));
         // Order by RECENCY, not alphabetically. The result feeds the
         // per-rule zone/suffix fan-out, which is bounded (SUFFIX_FANOUT_BACKSTOP). With
         // the old `canonical_host ASC` a busy zone (e.g. `.ru`) that exceeded the
@@ -649,7 +653,7 @@ impl CacheRepository for SqliteCacheStore {
         let mut stmt = conn
             .prepare(
                 "SELECT canonical_host FROM hostnames
-                 WHERE canonical_host LIKE ?1
+                 WHERE canonical_host LIKE ?1 ESCAPE '\\'
                  ORDER BY last_seen_at DESC, canonical_host ASC
                  LIMIT ?2",
             )
@@ -1517,6 +1521,17 @@ impl StorageHealthChecker for SqliteStateStore {
 
 fn db_err(e: rusqlite::Error) -> StorageError {
     StorageError::Internal(e.to_string())
+}
+
+/// Escape a value that is spliced into a `LIKE` pattern, for use with
+/// `ESCAPE '\'`. Anything derived from a user's rule (a zone, a suffix, a
+/// search term) goes through this: `_` and `%` are wildcards, so a zone named
+/// `_u` would otherwise match `.ru` and `.eu` as readily as itself.
+fn escape_like_literal(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn system_time_to_ms(t: SystemTime) -> i64 {
@@ -3398,6 +3413,45 @@ mod tests {
             listed,
             vec!["api.example.com".to_string(), "www.example.com".to_string()],
             "apex hostname must be excluded, subdomains returned in ASC order"
+        );
+    }
+
+    /// The suffix is a value from the user's rule, so it is spliced into a
+    /// LIKE pattern and must be escaped: an unescaped `_` matched any single
+    /// character and `%` matched everything, quietly widening a zone rule into
+    /// permits and routes for hosts it never named.
+    #[test]
+    fn list_hostnames_under_suffix_treats_like_wildcards_as_literal_text() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = migrated_cache_store(&dir);
+        let now = SystemTime::now();
+
+        for host in ["a.ru", "b.eu", "c.nu", "d.example.com"] {
+            seed_resolution(
+                &store,
+                host,
+                Ipv4Addr::new(9, 9, 9, 9),
+                StorageResolutionSource::Dns,
+                now,
+                300,
+            );
+        }
+
+        // `_u` is not a zone anybody owns; before escaping it matched `.ru`,
+        // `.eu` and `.nu`.
+        assert!(store
+            .list_hostnames_under_suffix("_u", 16)
+            .expect("list")
+            .is_empty());
+        // `%` used to match every hostname containing a dot.
+        assert!(store
+            .list_hostnames_under_suffix("%", 16)
+            .expect("list")
+            .is_empty());
+        // A real zone still resolves.
+        assert_eq!(
+            store.list_hostnames_under_suffix("ru", 16).expect("list"),
+            vec!["a.ru".to_string()],
         );
     }
 

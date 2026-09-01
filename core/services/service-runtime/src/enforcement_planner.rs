@@ -1938,10 +1938,11 @@ mod tests {
             );
         };
 
-        // 2 resolver IPs × (TCP+UDP on 443) = 4; + global DoT (TCP+UDP on 853) = 6.
-        check(true, 6);
-        // Without DoT: only the per-IP 443 blocks.
-        check(false, 4);
+        // Per packed chunk: TCP+UDP on 443; + global DoT (TCP+UDP on 853).
+        let chunks = nrr_platform_api::wfp_slotting::pack_v4(ips).len();
+        check(true, chunks * 2 + 2);
+        // Without DoT: only the packed 443 blocks.
+        check(false, chunks * 2);
     }
 
     // A loopback / link-local resolver IP is never blocked (safety valve).
@@ -1958,7 +1959,11 @@ mod tests {
         assert_eq!(filters.len(), 2, "only the public IP yields TCP+UDP blocks");
         assert!(filters
             .iter()
-            .all(|f| f.remote_ip == Some(Ipv4Addr::new(9, 9, 9, 9))));
+            .all(|f| f.covers_v4(Ipv4Addr::new(9, 9, 9, 9))));
+        assert!(!filters
+            .iter()
+            .any(|f| f.covers_v4(Ipv4Addr::new(127, 0, 0, 1))
+                || f.covers_v4(Ipv4Addr::new(169, 254, 1, 1))));
     }
 
     // ── Sub-slice 4b EQUIVALENCE — multi-protocol kill-switch (Windows only) ────

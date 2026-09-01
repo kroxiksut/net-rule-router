@@ -150,10 +150,28 @@ pub fn run_tamper_bootstrap(
     now_ms: i64,
 ) -> Result<TamperBootstrapOutcome, TamperBootstrapError> {
     // 1. Load or generate the signing key.
-    let (signing_key, key_loaded) = match key_store
+    //
+    // A key too short to be usable counts as ABSENT, not as a key: HMAC accepts
+    // any length, so a truncated blob would sign and verify every row against
+    // itself and the tamper detector would be silently disarmed forever. The
+    // missing-key path below is the honest one — it regenerates and, when the
+    // table already holds rows, raises the blocking key-reset alert that says
+    // the existing rows can no longer be vouched for.
+    let loaded = key_store
         .load()
         .map_err(|e| TamperBootstrapError::KeyStore(e.to_string()))?
-    {
+        .filter(|k| {
+            let usable = nrr_storage::revision_hmac::is_usable_signing_key(k);
+            if !usable {
+                tracing::warn!(
+                    target: "nrr::tamper",
+                    bytes = k.len(),
+                    "stored signing key is too short to be usable — treating it as missing and generating a fresh one",
+                );
+            }
+            usable
+        });
+    let (signing_key, key_loaded) = match loaded {
         Some(k) => (k, true),
         None => {
             let k = generate_signing_key()
@@ -412,6 +430,39 @@ mod tests {
             AuditEventKind::KeyResetWithExistingData.as_str()
         );
         assert!(mutations_blocked_by_alert(repo.as_ref()));
+    }
+
+    /// A truncated key blob (interrupted write, clipped file, substitution)
+    /// used to be accepted verbatim — HMAC takes any length, so every row
+    /// verified against the broken key and no alarm could ever fire. It must
+    /// take the same route as a missing key, alert included.
+    #[test]
+    fn a_truncated_signing_key_is_treated_as_missing_not_used() {
+        let conn = open_state();
+        {
+            let guard = conn.lock().unwrap();
+            let signed = RevisionsRepository::with_signing_key(&guard, key());
+            signed
+                .insert_candidate(&record("rev-1", "h-1"))
+                .expect("insert");
+        }
+        let ks = InMemKeyStore::new();
+        ks.save(&[0xAB; 8]).expect("save truncated key");
+        let repo = alerts();
+        let out = run_tamper_bootstrap(&conn, &ks, &repo, NOW).expect("bootstrap");
+
+        assert_eq!(out.signing_key.len(), 32, "a usable key replaced it");
+        assert!(out.key_was_reset);
+        assert!(
+            out.raised_blocking_alert,
+            "the user must be told the existing rows can no longer be vouched for"
+        );
+        assert!(mutations_blocked_by_alert(repo.as_ref()));
+        assert_eq!(
+            ks.load().expect("load").expect("stored").len(),
+            32,
+            "the unusable blob must not survive in the store",
+        );
     }
 
     // ── Scenario 1: tampered row detected ─────────────────────────────────────

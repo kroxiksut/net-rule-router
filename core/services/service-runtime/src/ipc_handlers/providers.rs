@@ -522,10 +522,12 @@ pub fn rule_edits_allowed_for(
 pub const RULES_LOCKED_MESSAGE: &str =
     "rule changes are disabled by the administrator on this computer";
 
-/// Wire error code the [`MutationOutcome::Failed`] path uses for the lock.
-/// Mirrors the transport-level `rules_locked` code so an operation-status
-/// poll and a direct IPC refusal are recognisably the same event.
-pub const RULES_LOCKED_ERROR_CODE: &str = "rules-locked";
+/// Wire error code the [`MutationOutcome::Failed`] path uses for the lock —
+/// the CLIENT-facing spelling, taken from the contracts crate so an
+/// operation-status poll and a direct IPC refusal really are the same string.
+/// (The envelope's own [`IpcErrorCode::RulesLocked`] is serde `snake_case`;
+/// the two differ on purpose, which is exactly why neither may be retyped.)
+pub const RULES_LOCKED_ERROR_CODE: &str = nrr_shared::ipc_transport::RULES_LOCKED_CLIENT_SLUG;
 
 /// Writer for the singleton `service_stability_config` row. The wire
 /// DTO is validated against the Rust-side range guard

@@ -117,6 +117,11 @@ impl FromStr for IpcClientProfile {
         match value {
             "gui" | "gui-interactive" => Ok(Self::GuiInteractive),
             "tray" | "tray-lightweight" => Ok(Self::TrayLightweight),
+            // The console's own spelling was missing here while `slug()`
+            // emitted it — the parser could not read back what the SSOT
+            // writes, so a profile round-trip through text silently failed for
+            // the one profile whose whole purpose is to be RESTRICTED.
+            "console" | "admin-console" => Ok(Self::AdminConsole),
             _ => Err("unknown ipc client profile"),
         }
     }
@@ -1451,6 +1456,7 @@ mod tests {
         IPC_RETRY_POLICY, IPC_STATE_UPDATE_MODEL, IPC_VERSION_COMPATIBILITY_MATRIX,
     };
     use std::collections::HashSet;
+    use std::str::FromStr;
 
     #[test]
     fn taxonomy_contains_required_interaction_classes() {
@@ -1627,6 +1633,26 @@ mod tests {
         assert!(IPC_ENVELOPE_PAYLOAD_BOUNDARY.payload_is_transport_agnostic);
         assert!(IPC_ENVELOPE_PAYLOAD_BOUNDARY.forbid_transport_metadata_inside_payload);
         assert!(IPC_ENVELOPE_PAYLOAD_BOUNDARY.envelope_fields.len() >= 6);
+    }
+
+    /// Every profile the SSOT can WRITE, it must also be able to READ. The
+    /// console's spelling was missing from the parser, so the one profile that
+    /// exists to be restricted could not survive a round trip through text.
+    #[test]
+    fn every_client_profile_round_trips_through_its_slug() {
+        for profile in IpcClientProfile::ALL {
+            assert_eq!(
+                IpcClientProfile::from_str(profile.slug()),
+                Ok(profile),
+                "{} does not parse back",
+                profile.slug()
+            );
+        }
+        assert_eq!(
+            IpcClientProfile::from_str("console"),
+            Ok(IpcClientProfile::AdminConsole)
+        );
+        assert!(IpcClientProfile::from_str("nonsense").is_err());
     }
 
     #[test]

@@ -122,6 +122,7 @@ pub mod wfp;
 // neutral; reachable by both service-runtime (current codegen) and the future
 // platform-windows `lower_windows`.
 pub mod wfp_behavioral;
+pub mod wfp_slotting;
 pub mod windows_api;
 
 // Crate-root re-exports of the NEUTRAL surface, mirroring the

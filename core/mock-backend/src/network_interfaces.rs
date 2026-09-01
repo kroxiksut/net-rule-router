@@ -122,19 +122,24 @@ pub fn interfaces_routes_preview_snapshot(
     build_preview_snapshot(data_source, rows, &request)
 }
 
-/// Decorate externally-supplied rows (e.g. a live snapshot pulled from
-/// the service over IPC) with the preview engine's advisory
-/// recommendations and the request's explicit role assignment, exactly
-/// as [`interfaces_routes_preview_snapshot`] does for locally-enumerated
-/// rows. This lets the IPC facade treat the service as the single source
-/// of truth for the adapter list while still rendering a fully-decorated
-/// snapshot. Rows arrive already enumerated, so the data source is
-/// `WindowsLive`.
+/// Decorate externally-supplied rows (e.g. a snapshot pulled from the
+/// service over IPC) with the preview engine's advisory recommendations and
+/// the request's explicit role assignment, exactly as
+/// [`interfaces_routes_preview_snapshot`] does for locally-enumerated rows.
+/// This lets the IPC facade treat the service as the single source of truth
+/// for the adapter list while still rendering a fully-decorated snapshot.
+///
+/// `data_source` is the provenance the SUPPLIER reported. It is a parameter
+/// and not a constant because the service answers with a deterministic
+/// placeholder dataset whenever its own live enumeration came back empty;
+/// stamping every incoming row `WindowsLive` turned that placeholder into
+/// four invented adapters the user could bind a route to.
 pub fn decorate_interface_rows(
     rows: Vec<InterfaceRouteRow>,
     request: &RouteSelectionRequest,
+    data_source: InterfacesDataSource,
 ) -> InterfacesRoutesPreviewSnapshot {
-    build_preview_snapshot(InterfacesDataSource::WindowsLive, rows, request)
+    build_preview_snapshot(data_source, rows, request)
 }
 
 fn build_preview_snapshot(
@@ -901,7 +906,8 @@ mod tests {
     use super::{
         assign_preview_roles, assign_recommendations, decorate_interface_rows, fallback_rows,
         interface_diagnostics_checks_from, interface_diagnostics_checks_snapshot,
-        interfaces_routes_preview_snapshot, InterfaceRouteRow, RouteSelectionRequest,
+        interfaces_routes_preview_snapshot, InterfaceRouteRow, InterfacesDataSource,
+        RouteSelectionRequest,
     };
     use nrr_shared::{ConnectivityState, RouteBehaviorMode, RouteRole, RouteSelectionState};
 
@@ -1162,8 +1168,11 @@ mod tests {
             route_state: RouteSelectionState::NotSelected,
         };
 
-        let snapshot =
-            decorate_interface_rows(vec![wired, vpn_tunnel], &RouteSelectionRequest::default());
+        let snapshot = decorate_interface_rows(
+            vec![wired, vpn_tunnel],
+            &RouteSelectionRequest::default(),
+            InterfacesDataSource::WindowsLive,
+        );
         assert!(snapshot.rows.iter().any(|row| {
             row.recommendation.class == nrr_shared::RecommendationClass::PreferredPrimary
         }));
@@ -1234,6 +1243,7 @@ mod tests {
                 include_bluetooth_adapters: false,
                 behavior_mode: RouteBehaviorMode::PreferPrimary,
             },
+            InterfacesDataSource::FallbackMock,
         );
 
         assert!(snapshot.role_assignment_advisory.conflict_warning.is_some());

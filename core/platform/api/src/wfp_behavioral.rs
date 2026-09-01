@@ -45,6 +45,8 @@ pub struct BehavioralKey {
     pub layer: u8,
     pub action: u8,
     pub remote_ip: Option<Ipv4Addr>,
+    /// Canonical (sorted) packed-set condition — set membership is behavior.
+    pub remote_ip_set: Vec<Ipv4Addr>,
     pub remote_port: Option<u16>,
     pub user_sid: Option<String>,
     pub app_pattern: Option<String>,
@@ -79,6 +81,11 @@ pub fn behavioral_key(f: &WfpFilterSpec) -> BehavioralKey {
         layer: layer_ord(f.layer),
         action: action_ord(f.action),
         remote_ip: f.remote_ip,
+        remote_ip_set: {
+            let mut set = f.remote_ip_set.clone();
+            set.sort_unstable();
+            set
+        },
         remote_port: f.remote_port,
         user_sid: f.user_sid.clone(),
         app_pattern: f.app_pattern.clone(),
@@ -176,6 +183,14 @@ impl core::fmt::Display for BehavioralKey {
         if let Some(ip) = self.remote_ip {
             write!(f, " ip={ip}")?;
         }
+        if !self.remote_ip_set.is_empty() {
+            write!(
+                f,
+                " ip_set[{}]={:?}",
+                self.remote_ip_set.len(),
+                self.remote_ip_set
+            )?;
+        }
         if let Some((net, len)) = self.remote_subnet {
             write!(f, " net={net}/{len}")?;
         }
@@ -244,6 +259,7 @@ mod tests {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Permit,
             remote_ip: Some(remote),
+            remote_ip_set: Vec::new(),
             remote_port: None,
             weight,
             id: WfpFilterId::from_raw(id_raw),

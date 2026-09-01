@@ -623,7 +623,13 @@ impl BackendFacade for IpcBackendFacade {
                     .iter()
                     .map(InterfaceRouteRow::from_wire_dto)
                     .collect::<Vec<_>>();
-                decorate_interface_rows(rows, &request)
+                // Carry the service's own verdict on the rows: it answers with
+                // a deterministic placeholder set when its live enumeration
+                // came back empty, and only it knows which happened.
+                let data_source = nrr_application::mock_backend::network_interfaces::InterfacesDataSource::from_title(
+                    &resp.data_source,
+                );
+                decorate_interface_rows(rows, &request, data_source)
             }
             _ => self.fallback.interfaces_snapshot(request),
         }

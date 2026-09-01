@@ -57,11 +57,13 @@ fn reg_dword(subkey: &str, value: &str) -> Option<u32> {
     (rc == ERROR_SUCCESS).then_some(data)
 }
 
-#[cfg(test)]
+// Windows-only: the one test here probes the live registry, so off Windows the
+// module would be empty and its import unused (`-D warnings` in CI). Same shape
+// as `app_path_resolver`'s tests in this crate.
+#[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn the_probe_answers_or_admits_it_cannot() {
         // Whatever this machine is set to, the answer must be a real one or a

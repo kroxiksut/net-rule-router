@@ -468,6 +468,7 @@ mod tests {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Block,
             remote_ip: Some(Ipv4Addr::new(1, 2, 3, id_raw as u8)),
+            remote_ip_set: Vec::new(),
             remote_port: None,
             weight: 0x100000 + id_raw,
             id: WfpFilterId { raw: id_raw },

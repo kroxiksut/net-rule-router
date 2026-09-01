@@ -27,12 +27,19 @@ impl TrayStatusKind {
         }
     }
 
+    /// Last-resort text, used when the locale catalogue cannot answer — which
+    /// happens wholesale, because the validator rejects a malformed locale file
+    /// entirely. English throughout: two of these were Russian, so the one
+    /// scenario the fallback exists for handed an English-speaking user a
+    /// Russian tray tooltip.
     pub const fn title(self) -> &'static str {
         match self {
             Self::PreviewMode => "Preview mode",
             Self::CheckingStatus => "Checking status…",
-            Self::NoActivePolicy => "Нет активного применения policy",
-            Self::ServiceUnavailable => "Служба недоступна",
+            // Worded exactly as `tray.status.*` in the English catalogue, so
+            // the fallback and the normal path read identically.
+            Self::NoActivePolicy => "No active policy application",
+            Self::ServiceUnavailable => "Service unavailable",
         }
     }
 
@@ -257,7 +264,11 @@ mod tests {
             TrayServiceLink::Reachable,
         );
         assert_eq!(snapshot.status_kind, TrayStatusKind::ServiceUnavailable);
-        assert_eq!(snapshot.status_line, "Служба недоступна");
+        // The built-in fallback is English: it is used when the locale
+        // catalogue is unusable, and a Russian string there reached exactly the
+        // user who could not read it. The localized text comes from
+        // `tray.status.service-unavailable`.
+        assert_eq!(snapshot.status_line, "Service unavailable");
         assert_eq!(snapshot.icon_asset_hint, "assets/icons/tray/tray-error.ico");
     }
 
