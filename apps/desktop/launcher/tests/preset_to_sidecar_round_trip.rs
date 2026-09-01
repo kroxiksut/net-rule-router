@@ -53,17 +53,50 @@ fn to_sections_object(blocks: &[PassthroughBlock]) -> Value {
     Value::Object(map)
 }
 
+/// The application section this build parses as rules.
+///
+/// Which of the three it is depends on where the test runs, and spelling it
+/// `Windows` assumed a Windows runner: on a Linux one the roles swap and every
+/// assertion about passthrough inverts.
+fn native_app_section() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "linux") {
+        "Linux"
+    } else if cfg!(target_os = "macos") {
+        "MacOS"
+    } else {
+        "Windows"
+    }
+}
+
+/// The two application sections this build carries through untouched — what the
+/// sidecar exists to preserve.
+fn foreign_app_sections() -> [&'static str; 2] {
+    match native_app_section() {
+        "Windows" => ["Linux", "MacOS"],
+        "Linux" => ["Windows", "MacOS"],
+        _ => ["Windows", "Linux"],
+    }
+}
+
 #[test]
-fn linux_section_survives_parse_then_sidecar_round_trip() {
+fn foreign_os_sections_survive_parse_then_sidecar_round_trip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let handle = fresh_sidecar(&tmp);
 
     // Realistic mixed-OS preset shape: rules in known sections plus
     // foreign-OS blocks that go into passthrough.
-    let preset = "--- Zones\nru\n\n--- Domains\nvk.com\nya.ru\n\n--- IP\n\n--- Windows\ntelegram.exe\n\n--- Linux\n# (reserved - not applied on Windows)\nfirefox\nchromium\n\n--- MacOS\nSafari\nVivaldi\n";
+    let native = native_app_section();
+    let [first, second] = foreign_app_sections();
+    let preset = format!(
+        "--- Zones\nru\n\n--- Domains\nvk.com\nya.ru\n\n--- IP\n\n--- {native}\ntelegram.exe\n\n\
+         --- {first}\n# (reserved - not applied on this host)\nfirefox\nchromium\n\n\
+         --- {second}\nSafari\nVivaldi\n"
+    );
 
     // 1. Parse.
-    let parsed = parse_canonical_rules(preset);
+    let parsed = parse_canonical_rules(&preset);
     assert!(!parsed.rules.is_empty(), "known sections produce rules");
     assert_eq!(parsed.passthrough.len(), 2);
 
@@ -87,13 +120,13 @@ fn linux_section_survives_parse_then_sidecar_round_trip() {
     .expect("read");
     let read_sections = read_resp["sections"].as_object().expect("sections object");
 
-    // Both Linux and MacOS blocks survived byte-identical.
+    // Both foreign blocks survived byte-identical.
     assert_eq!(
-        read_sections.get("Linux").and_then(Value::as_str),
-        Some("# (reserved - not applied on Windows)\nfirefox\nchromium\n"),
+        read_sections.get(first).and_then(Value::as_str),
+        Some("# (reserved - not applied on this host)\nfirefox\nchromium\n"),
     );
     assert_eq!(
-        read_sections.get("MacOS").and_then(Value::as_str),
+        read_sections.get(second).and_then(Value::as_str),
         Some("Safari\nVivaldi\n"),
     );
 }
@@ -103,11 +136,15 @@ fn passthrough_isolated_per_route() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let handle = fresh_sidecar(&tmp);
 
-    // Primary preset has Linux only; secondary has MacOS only.
-    let primary_text = "--- Domains\nprim.example\n--- Linux\nfirefox\n";
-    let secondary_text = "--- Domains\nsec.example\n--- MacOS\nSafari\n";
+    // Primary preset carries one foreign section, secondary the other.
+    let [first, second] = foreign_app_sections();
+    let primary_text = format!("--- Domains\nprim.example\n--- {first}\nfirefox\n");
+    let secondary_text = format!("--- Domains\nsec.example\n--- {second}\nSafari\n");
 
-    for (route, text) in [("primary", primary_text), ("secondary", secondary_text)] {
+    for (route, text) in [
+        ("primary", primary_text.as_str()),
+        ("secondary", secondary_text.as_str()),
+    ] {
         let parsed = parse_canonical_rules(text);
         let sections = to_sections_object(&parsed.passthrough);
         handle_sidecar_request(
@@ -118,7 +155,7 @@ fn passthrough_isolated_per_route() {
         .expect("write");
     }
 
-    // Primary has Linux but not MacOS.
+    // Primary carries the first foreign section, not the second.
     let primary_resp = handle_sidecar_request(
         &handle,
         "sidecar.passthrough.read",
@@ -126,10 +163,10 @@ fn passthrough_isolated_per_route() {
     )
     .expect("read");
     let primary_sections = primary_resp["sections"].as_object().expect("obj");
-    assert!(primary_sections.contains_key("Linux"));
-    assert!(!primary_sections.contains_key("MacOS"));
+    assert!(primary_sections.contains_key(first));
+    assert!(!primary_sections.contains_key(second));
 
-    // Secondary has MacOS but not Linux.
+    // Secondary carries the second, not the first.
     let secondary_resp = handle_sidecar_request(
         &handle,
         "sidecar.passthrough.read",
@@ -137,8 +174,8 @@ fn passthrough_isolated_per_route() {
     )
     .expect("read");
     let secondary_sections = secondary_resp["sections"].as_object().expect("obj");
-    assert!(secondary_sections.contains_key("MacOS"));
-    assert!(!secondary_sections.contains_key("Linux"));
+    assert!(secondary_sections.contains_key(second));
+    assert!(!secondary_sections.contains_key(first));
 }
 
 #[test]
@@ -146,8 +183,9 @@ fn empty_passthrough_write_clears_previous_state() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let handle = fresh_sidecar(&tmp);
 
-    // First import: has Linux passthrough.
-    let parsed = parse_canonical_rules("--- Domains\nvk.com\n--- Linux\nfirefox\n");
+    // First import: carries a foreign-OS section into passthrough.
+    let foreign = foreign_app_sections()[0];
+    let parsed = parse_canonical_rules(&format!("--- Domains\nvk.com\n--- {foreign}\nfirefox\n"));
     let sections = to_sections_object(&parsed.passthrough);
     handle_sidecar_request(
         &handle,
@@ -157,7 +195,7 @@ fn empty_passthrough_write_clears_previous_state() {
     .expect("write 1");
 
     // Second import: no foreign-OS sections. The atomic-replace
-    // semantics means the previous Linux block must be cleared.
+    // semantics means the previous block must be cleared.
     let parsed2 = parse_canonical_rules("--- Domains\nya.ru\n");
     assert!(parsed2.passthrough.is_empty());
     let sections2 = to_sections_object(&parsed2.passthrough);
@@ -215,11 +253,13 @@ fn cyrillic_passthrough_content_survives_round_trip() {
 #[test]
 fn known_section_rules_do_not_leak_into_passthrough() {
     // Regression guard: only sections the parser doesn't classify go
-    // into passthrough. Known sections (Zones, Domains, IP, Windows)
-    // must produce rules, not passthrough blocks.
-    let preset =
-        "--- Zones\nru\n--- Domains\nvk.com\n--- IP\n203.0.113.7\n--- Windows\ntelegram.exe\n";
-    let parsed = parse_canonical_rules(preset);
+    // into passthrough. Known sections (Zones, Domains, IP, and THIS host's
+    // application section) must produce rules, not passthrough blocks.
+    let native = native_app_section();
+    let preset = format!(
+        "--- Zones\nru\n--- Domains\nvk.com\n--- IP\n203.0.113.7\n--- {native}\ntelegram.exe\n"
+    );
+    let parsed = parse_canonical_rules(&preset);
     assert!(
         parsed.passthrough.is_empty(),
         "known-only preset must not produce passthrough blocks, got {:?}",

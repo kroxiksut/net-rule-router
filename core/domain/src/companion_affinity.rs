@@ -980,12 +980,28 @@ impl CandidateState {
     /// the verdict exactly as it would have been without the signal at all.
     fn primary_behavior(&self, count_cuts: bool) -> PrimaryBehavior {
         let cuts = if count_cuts { self.primary_cuts } else { 0 };
-        match (self.primary_completions, self.primary_stalls, cuts) {
-            (c, 0, 0) if c > 0 => PrimaryBehavior::Responds,
-            (0, _, k) if k >= PRIMARY_CUT_CONFIRMATIONS => PrimaryBehavior::Cut,
-            (0, s, _) if s >= PRIMARY_STALL_CONFIRMATIONS => PrimaryBehavior::Stalls,
-            _ => PrimaryBehavior::Unknown,
-        }
+        primary_behavior_from(self.primary_completions, self.primary_stalls, cuts)
+    }
+}
+
+/// How a host behaves on the primary route, from raw outcome counts.
+///
+/// Public and free-standing because this ledger is not the only reader of the
+/// signal: the observer reports how EVERY named destination fares on the main
+/// link, while this ledger keeps only the hosts that are companion candidates.
+/// A second consumer restating these thresholds would be a second definition of
+/// "stalling", and two definitions of one fact is how the mechanisms in this
+/// codebase have drifted apart before.
+///
+/// `cuts` is what the caller decided to count — pass `0` to leave early
+/// teardowns out of the verdict entirely.
+#[must_use]
+pub fn primary_behavior_from(completions: u32, stalls: u32, cuts: u32) -> PrimaryBehavior {
+    match (completions, stalls, cuts) {
+        (c, 0, 0) if c > 0 => PrimaryBehavior::Responds,
+        (0, _, k) if k >= PRIMARY_CUT_CONFIRMATIONS => PrimaryBehavior::Cut,
+        (0, s, _) if s >= PRIMARY_STALL_CONFIRMATIONS => PrimaryBehavior::Stalls,
+        _ => PrimaryBehavior::Unknown,
     }
 }
 

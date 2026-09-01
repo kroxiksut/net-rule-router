@@ -26,7 +26,7 @@ pub fn ipc_error_to_wire(err: &IpcClientError) -> (&'static str, String) {
                 // Kept separate from `forbidden` all the way to the GUI: this
                 // is the slug the rules section keys its read-only state off,
                 // not a one-off toast.
-                IpcErrorCode::RulesLocked => "rules-locked",
+                IpcErrorCode::RulesLocked => nrr_shared::ipc_transport::RULES_LOCKED_CLIENT_SLUG,
                 IpcErrorCode::InvalidVersion => "invalid-version",
                 IpcErrorCode::MalformedRequest => "malformed-request",
                 IpcErrorCode::BusyConflict => "busy-conflict",

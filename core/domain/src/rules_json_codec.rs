@@ -11,13 +11,16 @@
 //!   infallible — it only re-shapes existing canonical types.
 //! - [`decode`] takes a [`CanonicalRulesJsonV1`] and reconstructs a
 //!   `RulesRevisionContent`. It rejects unknown schema versions,
-//!   malformed IPv4 strings, and rules that carry neither
-//!   `address_match` nor `app_match`.
+//!   malformed IPv4 strings, rules that carry neither `address_match`
+//!   nor `app_match`, and the bare `*` application glob.
 //!
-//! The codec is **trust-the-wire**: it does NOT run the full
-//! validation pipeline (lowercase, IDNA, glob syntax, …). Wire bytes
-//! are expected to be canonical. The validation pipeline in
-//! [`crate::validation`] is the upstream gate.
+//! The codec is **trust-the-wire** for spelling: it does NOT re-run the
+//! validation pipeline (lowercase, IDNA, glob syntax, …), and wire bytes are
+//! expected to be canonical — [`crate::validation`] is the upstream gate.
+//! Trusting the spelling is not trusting the CONSEQUENCE, though: a revision
+//! reaches enforcement from storage or the wire without passing that gate, so
+//! the one pattern whose blast radius is the whole machine (`*`, every
+//! process) is refused here as well.
 //!
 //! ## Schema-version vs format-version
 //!
@@ -77,6 +80,16 @@ pub enum RulesJsonCodecError {
         /// The offending rule's id, for error context.
         rule_id: String,
     },
+    /// An application pattern is the bare glob `*`, which matches every
+    /// running process. The rule pipeline rejects it as a blocking error
+    /// ([`crate::validation::ValidationError::AppGlobTooWide`]), so a stored
+    /// or wire-delivered revision carrying one came from a producer that
+    /// skipped validation — and applying it would route (or cut) the traffic
+    /// of every process on the machine.
+    AppGlobTooWide {
+        /// The offending rule's id, for error context.
+        rule_id: String,
+    },
 }
 
 impl core::fmt::Display for RulesJsonCodecError {
@@ -92,6 +105,10 @@ impl core::fmt::Display for RulesJsonCodecError {
             Self::EmptyMatch { rule_id } => write!(
                 f,
                 "rule {rule_id:?}: must carry at least one of address-match / app-match"
+            ),
+            Self::AppGlobTooWide { rule_id } => write!(
+                f,
+                "rule {rule_id:?}: application pattern \"*\" matches every process"
             ),
         }
     }
@@ -223,7 +240,10 @@ fn decode_rule(dto: RuleDto) -> Result<CanonicalRule, RulesJsonCodecError> {
         .address_match
         .map(|m| decode_address_match(&dto.id, m))
         .transpose()?;
-    let app_match = dto.app_match.map(decode_app_match);
+    let app_match = dto
+        .app_match
+        .map(|m| decode_app_match(&dto.id, m))
+        .transpose()?;
     if address_match.is_none() && app_match.is_none() {
         return Err(RulesJsonCodecError::EmptyMatch { rule_id: dto.id });
     }
@@ -264,24 +284,38 @@ fn decode_address_match(
 /// A revision can arrive from a client that never ran validation, and one
 /// un-canonicalized name is enough to make the same rule set compare unequal to
 /// itself — the diff then adds and removes the same rule on every pass.
-fn decode_app_match(m: AppMatchDto) -> CanonicalAppMatch {
-    CanonicalAppMatch {
-        pattern: match m.pattern {
-            // A `*` in an "exact" filename is a client that mislabelled a
-            // pattern: no process can ever carry that name, so read it as the
-            // glob it plainly is instead of storing a rule that matches nothing.
-            AppPatternDto::Exact { value } if value.contains('*') => CanonicalAppPattern::Glob(
-                crate::app_identity::canonical_glob_process_pattern(&value),
-            ),
-            AppPatternDto::Exact { value } => CanonicalAppPattern::Exact(
-                crate::app_identity::canonical_exact_process_name(&value).0,
-            ),
-            AppPatternDto::Glob { value } => CanonicalAppPattern::Glob(
-                crate::app_identity::canonical_glob_process_pattern(&value),
-            ),
-        },
-        include_child_processes: m.include_child_processes,
+///
+/// Canonicalization is not the same as acceptance: the bare glob `*` is a
+/// blocking error in the rule pipeline, and this decoder is the only gate on
+/// the wire/storage path, so it rejects it here rather than handing enforcement
+/// a rule that matches every process.
+fn decode_app_match(
+    rule_id: &str,
+    m: AppMatchDto,
+) -> Result<CanonicalAppMatch, RulesJsonCodecError> {
+    let pattern = match m.pattern {
+        // A `*` in an "exact" filename is a client that mislabelled a
+        // pattern: no process can ever carry that name, so read it as the
+        // glob it plainly is instead of storing a rule that matches nothing.
+        AppPatternDto::Exact { value } if value.contains('*') => {
+            CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
+        }
+        AppPatternDto::Exact { value } => {
+            CanonicalAppPattern::Exact(crate::app_identity::canonical_exact_process_name(&value).0)
+        }
+        AppPatternDto::Glob { value } => {
+            CanonicalAppPattern::Glob(crate::app_identity::canonical_glob_process_pattern(&value))
+        }
+    };
+    if matches!(&pattern, CanonicalAppPattern::Glob(g) if g == "*") {
+        return Err(RulesJsonCodecError::AppGlobTooWide {
+            rule_id: rule_id.to_string(),
+        });
     }
+    Ok(CanonicalAppMatch {
+        pattern,
+        include_child_processes: m.include_child_processes,
+    })
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -407,6 +441,47 @@ mod tests {
                 .pattern,
             CanonicalAppPattern::Glob("disko*.exe".into())
         );
+    }
+
+    /// The pipeline blocks a bare `*` (`ValidationError::AppGlobTooWide`), but
+    /// a revision can reach enforcement from storage or the wire WITHOUT
+    /// passing through it — this decoder is the only gate on that path, and it
+    /// used to wave the pattern through as a rule matching every process.
+    #[test]
+    fn a_bare_star_app_pattern_is_refused_on_the_storage_and_wire_path() {
+        let dto = |pattern: AppPatternDto| CanonicalRulesJsonV1 {
+            schema_version: 1,
+            primary: vec![RuleDto {
+                id: "r-app".into(),
+                enabled: true,
+                address_match: None,
+                app_match: Some(AppMatchDto {
+                    pattern,
+                    include_child_processes: false,
+                }),
+                comment: String::new(),
+                action: WireRuleAction::default(),
+                origin: None,
+            }],
+            secondary: vec![],
+        };
+        // Both spellings a producer can use for "everything".
+        for pattern in [
+            AppPatternDto::Glob { value: "*".into() },
+            AppPatternDto::Exact { value: "*".into() },
+        ] {
+            assert_eq!(
+                decode(dto(pattern)),
+                Err(RulesJsonCodecError::AppGlobTooWide {
+                    rule_id: "r-app".into()
+                })
+            );
+        }
+        // A narrower glob is still perfectly legal.
+        assert!(decode(dto(AppPatternDto::Glob {
+            value: "chrome*.exe".into()
+        }))
+        .is_ok());
     }
 
     #[test]

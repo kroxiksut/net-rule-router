@@ -51,6 +51,10 @@ pub struct LocalNetworkRule {
     /// Adapter the network belonged to when the answer was given. Empty for a
     /// network the user typed in, since nothing on the machine names one.
     pub adapter: String,
+    /// When this answer was last written (epoch seconds). Projected because
+    /// inheritance across a renumbered adapter has to follow the user's LATEST
+    /// word on it — see `production_local_networks::inherited_from_adapter`.
+    pub updated_at: i64,
 }
 
 pub struct LocalNetworkRulesRepository<'a> {
@@ -68,7 +72,7 @@ impl<'a> LocalNetworkRulesRepository<'a> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT cidr, allow, origin, adapter FROM local_network_rules
+                "SELECT cidr, allow, origin, adapter, updated_at FROM local_network_rules
                  WHERE sid = ?1 ORDER BY cidr",
             )
             .map_err(|e| StorageError::Internal(format!("local networks prepare: {e}")))?;
@@ -79,12 +83,13 @@ impl<'a> LocalNetworkRulesRepository<'a> {
                     row.get::<_, i64>(1)? != 0,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|e| StorageError::Internal(format!("local networks query: {e}")))?;
         let mut out = Vec::new();
         for row in rows {
-            let (cidr, allow, origin, adapter) =
+            let (cidr, allow, origin, adapter, updated_at) =
                 row.map_err(|e| StorageError::Internal(format!("local networks row: {e}")))?;
             // An origin this build does not know is a row from a newer schema:
             // drop it rather than guess what it meant.
@@ -94,6 +99,7 @@ impl<'a> LocalNetworkRulesRepository<'a> {
                     allow,
                     origin,
                     adapter,
+                    updated_at,
                 });
             }
         }
@@ -187,6 +193,7 @@ mod tests {
             allow: true,
             origin: LocalNetworkOrigin::Manual,
             adapter: String::new(),
+            updated_at: 0,
         }
     }
 
@@ -196,6 +203,7 @@ mod tests {
             allow,
             origin: LocalNetworkOrigin::Discovered,
             adapter: adapter.into(),
+            updated_at: 0,
         }
     }
 
@@ -204,9 +212,15 @@ mod tests {
         let c = conn();
         let repo = LocalNetworkRulesRepository::new(&c);
         repo.upsert("S-A", &manual("10.0.2.0/24"), 1).expect("save");
+        // The write time is the STORE's, not the caller's: it comes back as the
+        // moment the row was written, which is what recency-based inheritance
+        // reads.
         assert_eq!(
             repo.list_for_sid("S-A").expect("read"),
-            vec![manual("10.0.2.0/24")]
+            vec![LocalNetworkRule {
+                updated_at: 1,
+                ..manual("10.0.2.0/24")
+            }]
         );
         assert!(repo.list_for_sid("S-B").expect("read").is_empty());
     }

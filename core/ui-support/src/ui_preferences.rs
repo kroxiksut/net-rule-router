@@ -18,6 +18,9 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub const MANAGED_STORAGE_POLICY_NOTE: &str =
     "UI preferences are application-managed local state. Policy-affecting data remains service-owned.";
 const STABLE_PREFERENCES_FILE_NAME: &str = "ui-preferences.conf";
+/// Distinguishes two saves from the same process, so their scratch files
+/// cannot collide either.
+static SAVE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const LEGACY_PREFERENCES_FILE_NAMES: [&str; 1] = ["ui-preferences-v1.conf"];
 
 /// Schema version written by this build into every saved preferences file.
@@ -979,7 +982,16 @@ impl UiPreferencesStore {
         // the old file or the new one — never a truncated one. Deleting the
         // destination first would open exactly that window, and it buys
         // nothing.
-        let temporary_path = self.path.with_extension("tmp");
+        // The scratch name is unique per writer. Both the GUI and the tray save
+        // preferences, and a single `<path>.tmp` shared between them lets the
+        // second writer truncate the first one's file mid-write — the first
+        // then renames the other's half-written payload into place, defeating
+        // the very swap this dance exists for.
+        let temporary_path = self.path.with_extension(format!(
+            "{}-{}.tmp",
+            std::process::id(),
+            SAVE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
         let payload = format_preferences(preferences);
         {
             use std::io::Write;
@@ -998,7 +1010,13 @@ impl UiPreferencesStore {
                 let _ = fs::write(self.backup_path(), current);
             }
         }
-        fs::rename(&temporary_path, &self.path)
+        let renamed = fs::rename(&temporary_path, &self.path);
+        if renamed.is_err() {
+            // Nothing else will ever look at this name again, so a failed swap
+            // must not leave it behind.
+            let _ = fs::remove_file(&temporary_path);
+        }
+        renamed
     }
 
     fn try_migrate_legacy_file(&self) -> io::Result<()> {
@@ -1545,8 +1563,16 @@ fn parse_preferences(content: &str) -> UiPreferences {
                 }
             }
             "route_kill_switch_protocols" => {
+                // Masking a nonsense value invents a meaning for it: `128 &
+                // 0x7F` is 0, and an empty protocol mask makes the codegen emit
+                // no filter at all — the kill switch reads as ON and blocks
+                // nothing. A value outside the mask, or one that selects
+                // nothing, is not a preference; it is a damaged line, and the
+                // default (every protocol) is the safe reading.
                 if let Ok(parsed) = value.parse::<u32>() {
-                    preferences.route_kill_switch_protocols = parsed & 0x7F;
+                    if parsed != 0 && parsed & !0x7F == 0 {
+                        preferences.route_kill_switch_protocols = parsed;
+                    }
                 }
             }
             "route_kill_switch_enabled" => {
@@ -2127,6 +2153,52 @@ mod tests {
         assert_eq!(parsed.selected_secondary_interface_id, "win-adapter:vpn");
         assert_eq!(parsed.selected_secondary_interface_name, "VPN");
         assert!(parsed.secondary_role_user_confirmed);
+    }
+
+    /// Two writers save at once (the GUI and the tray both do). With one
+    /// shared `<path>.tmp` the second truncates the first one's file mid-write
+    /// and the first renames the other's half-written payload into place; the
+    /// surviving file must be one of the two, whole.
+    #[test]
+    fn concurrent_saves_never_leave_a_blended_file() {
+        let (dir, path) = test_path("concurrent.conf");
+        let store = UiPreferencesStore::for_path(path);
+        let short = UiPreferences {
+            route_primary_label: "a".repeat(8),
+            ..UiPreferences::default()
+        };
+        let long = UiPreferences {
+            route_primary_label: "b".repeat(4096),
+            ..UiPreferences::default()
+        };
+
+        std::thread::scope(|scope| {
+            for prefs in [&short, &long] {
+                scope.spawn(|| {
+                    for _ in 0..20 {
+                        store.save(prefs).expect("save");
+                    }
+                });
+            }
+        });
+
+        let label = store.load().expect("load").route_primary_label;
+        assert!(
+            label == short.route_primary_label || label == long.route_primary_label,
+            "the saved file blends two writers: {} chars",
+            label.len(),
+        );
+        // No scratch file outlives the writes.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "scratch files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -2782,6 +2854,25 @@ service_install_uac_declined_count=1
     fn has_legacy_policy_fields_returns_false_for_default_preferences() {
         let prefs = UiPreferences::default();
         assert!(!has_legacy_policy_fields(&prefs));
+    }
+
+    /// A damaged protocol mask used to be masked into meaning: `128 & 0x7F` is
+    /// zero, an empty mask makes the codegen emit no filter, and the kill
+    /// switch then reads as ON while blocking nothing — and the value is seeded
+    /// back into the service after its database is cleared.
+    #[test]
+    fn a_nonsense_protocol_mask_keeps_the_default_instead_of_disarming() {
+        let default = UiPreferences::default().route_kill_switch_protocols;
+        for garbage in ["128", "256", "0", "4294967295", "-1", "seven"] {
+            let parsed = parse_preferences(&format!("route_kill_switch_protocols={garbage}\n"));
+            assert_eq!(
+                parsed.route_kill_switch_protocols, default,
+                "{garbage:?} must not redefine the protocol mask",
+            );
+        }
+        // A legitimate selection still round-trips.
+        let parsed = parse_preferences("route_kill_switch_protocols=5\n");
+        assert_eq!(parsed.route_kill_switch_protocols, 5);
     }
 
     #[test]

@@ -55,6 +55,12 @@ pub enum ConsumeOutcome {
     AlreadyConsumed,
     /// Token exists and is unconsumed but `now` is past its `expires_at`.
     Expired,
+    /// Token was live and belonged to the caller, but its payload is not the
+    /// one demanded — a confirmation of one operation presented for another.
+    /// The token **is** burned, matching the established rule that a misuse
+    /// does not get a second try (`a_token_issued_for_one_revision_cannot_
+    /// activate_another`); the caller must refuse the operation.
+    PayloadRejected,
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -131,7 +137,7 @@ impl<'c> MutationTokenStoreSqlite<'c> {
     /// `now` is the caller-supplied wall-clock seconds value used for
     /// the expiration check.
     pub fn consume(&self, token: &str, now: i64) -> StorageResult<ConsumeOutcome> {
-        self.consume_inner(token, now, None)
+        self.consume_inner(token, now, None, |_| true)
     }
 
     /// Consume `token` only if it was issued for
@@ -139,13 +145,36 @@ impl<'c> MutationTokenStoreSqlite<'c> {
     /// as [`ConsumeOutcome::Unknown`] — from the caller's perspective the
     /// token simply does not exist, which is the correct authorization
     /// posture (no information leak about other users' tokens).
+    ///
+    /// ⚠ Scopes to the principal but accepts ANY payload, and a token
+    /// authorises one concrete operation (the payload says which). A caller
+    /// using this must compare the payload itself — the one caller that forgot
+    /// let a confirmation of one revision activate another. Prefer
+    /// [`Self::consume_for_matching`], which cannot be called without stating
+    /// what the token has to say.
     pub fn consume_for(
         &self,
         principal: &str,
         token: &str,
         now: i64,
     ) -> StorageResult<ConsumeOutcome> {
-        self.consume_inner(token, now, Some(principal))
+        self.consume_inner(token, now, Some(principal), |_| true)
+    }
+
+    /// Consume `token` only if it belongs to `principal` **and** `accepts`
+    /// approves its payload — the payload check is an argument rather than a
+    /// convention, so the next caller cannot inherit the omission. A rejected
+    /// payload yields [`ConsumeOutcome::PayloadRejected`] and still burns the
+    /// token. The store stays schema-agnostic: what a payload means is the
+    /// caller's business, and it says so through the predicate.
+    pub fn consume_for_matching(
+        &self,
+        principal: &str,
+        token: &str,
+        now: i64,
+        accepts: impl FnOnce(&str) -> bool,
+    ) -> StorageResult<ConsumeOutcome> {
+        self.consume_inner(token, now, Some(principal), accepts)
     }
 
     fn consume_inner(
@@ -153,6 +182,7 @@ impl<'c> MutationTokenStoreSqlite<'c> {
         token: &str,
         now: i64,
         expected_principal: Option<&str>,
+        accepts: impl FnOnce(&str) -> bool,
     ) -> StorageResult<ConsumeOutcome> {
         let existing: Option<StoredMutationToken> = self.get(token)?;
         match existing {
@@ -165,6 +195,7 @@ impl<'c> MutationTokenStoreSqlite<'c> {
             Some(record) if record.consumed => Ok(ConsumeOutcome::AlreadyConsumed),
             Some(record) if record.expires_at < now => Ok(ConsumeOutcome::Expired),
             Some(record) => {
+                let payload_accepted = accepts(&record.mutation_payload_json);
                 let updated = self
                     .conn
                     .execute(
@@ -177,6 +208,9 @@ impl<'c> MutationTokenStoreSqlite<'c> {
                 if updated != 1 {
                     // Another consumer raced and won.
                     return Ok(ConsumeOutcome::AlreadyConsumed);
+                }
+                if !payload_accepted {
+                    return Ok(ConsumeOutcome::PayloadRejected);
                 }
                 Ok(ConsumeOutcome::Consumed {
                     payload_json: record.mutation_payload_json,
@@ -379,6 +413,41 @@ mod tests {
     }
 
     // ── per-principal token scoping ─────────────────────────────────────────
+
+    /// The payload check belongs to the store's API, not to each caller's
+    /// discipline: a token authorises ONE operation, and the one consumer that
+    /// checked it afterwards was the only reason the hole was closed.
+    #[test]
+    fn consume_for_matching_refuses_a_payload_the_caller_did_not_ask_for() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let store = MutationTokenStoreSqlite::new(&conn);
+        store
+            .issue_for(
+                "S-1-5-21-a",
+                "tok",
+                r#"{"op":"activate","revision_id":"rev-1"}"#,
+                0,
+                100,
+            )
+            .expect("issue");
+
+        // Right user, right TTL, wrong operation.
+        assert!(matches!(
+            store
+                .consume_for_matching("S-1-5-21-a", "tok", 10, |p| p.contains("rev-2"))
+                .expect("consume"),
+            ConsumeOutcome::PayloadRejected
+        ));
+        // Burned all the same — a misuse gets no second try, the rule the
+        // activation path already established.
+        assert!(matches!(
+            store
+                .consume_for_matching("S-1-5-21-a", "tok", 10, |p| p.contains("rev-1"))
+                .expect("consume"),
+            ConsumeOutcome::AlreadyConsumed
+        ));
+    }
 
     #[test]
     fn shim_issue_records_baseline_principal() {

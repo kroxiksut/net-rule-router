@@ -27,18 +27,36 @@ const PURGED_TABLES: &[&str] = &[
     "block_notice_journal",
 ];
 
-/// Principals this database holds rules for, excluding the shared baseline.
-/// Full reset reads it to ask whose data it is about to erase; the count is
-/// all it needs, so nothing here is resolved to a user name.
-pub fn principals_with_rules(conn: &Connection) -> StorageResult<Vec<String>> {
+/// Principals this database holds ANY state for, excluding the shared
+/// baseline. Full reset reads it to know whose data it is about to erase; the
+/// count is all it needs, so nothing here is resolved to a user name.
+///
+/// The union spans the revision history AND every table in [`PURGED_TABLES`],
+/// because in the Free model a `revisions` row appears only at the first rules
+/// edit. Reading `revisions` alone missed the user who bound adapters,
+/// configured the kill switch or answered the local-network questions but
+/// never touched a rule: their state survived a "reset everything", and the
+/// "N other users lose data" count shown before the reset was short by however
+/// many such users there were.
+pub fn principals_with_state(conn: &Connection) -> StorageResult<Vec<String>> {
+    let mut selects = vec!["SELECT principal AS p FROM revisions".to_string()];
+    selects.extend(
+        PURGED_TABLES
+            .iter()
+            .map(|t| format!("SELECT sid AS p FROM {t}")),
+    );
+    let sql = format!(
+        "SELECT DISTINCT p FROM ({}) ORDER BY p ASC",
+        selects.join(" UNION ALL ")
+    );
     let mut stmt = conn
-        .prepare("SELECT DISTINCT principal FROM revisions ORDER BY principal ASC")
-        .map_err(|e| StorageError::Internal(format!("principals_with_rules prepare: {e}")))?;
+        .prepare(&sql)
+        .map_err(|e| StorageError::Internal(format!("principals_with_state prepare: {e}")))?;
     let principals = stmt
         .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|e| StorageError::Internal(format!("principals_with_rules query: {e}")))?
+        .map_err(|e| StorageError::Internal(format!("principals_with_state query: {e}")))?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|e| StorageError::Internal(format!("principals_with_rules collect: {e}")))?;
+        .map_err(|e| StorageError::Internal(format!("principals_with_state collect: {e}")))?;
     Ok(principals
         .into_iter()
         .filter(|p| p != BASELINE_PRINCIPAL && !p.is_empty())
@@ -240,6 +258,18 @@ mod tests {
             |r| r.get(0),
         )
         .expect("count")
+    }
+
+    /// A user who bound adapters or answered a local-network question but
+    /// never edited a rule has no `revisions` row. Enumerating principals from
+    /// that table alone skipped them entirely: their auxiliary state survived
+    /// "reset everything", and the warning that counts affected users was short.
+    #[test]
+    fn a_principal_with_only_auxiliary_state_is_still_listed() {
+        let conn = migrated_conn();
+        seed_sid(&conn, "S-NO-RULES");
+        let listed = principals_with_state(&conn).expect("list");
+        assert_eq!(listed, vec!["S-NO-RULES".to_string()]);
     }
 
     #[test]

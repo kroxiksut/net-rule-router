@@ -138,20 +138,27 @@ impl ProductionLocalNetworks {
 }
 
 /// The answer this adapter already carries, for a segment number it did not
-/// have when the answer was given. A refusal outranks a confirmation: the other
-/// direction would reopen a segment the user closed.
+/// have when the answer was given — the user's LATEST word on that adapter.
+///
+/// A refusal used to outrank every confirmation regardless of age, on the
+/// reasoning that the other direction reopens a segment the user closed. It
+/// does not survive the case the feature exists for: the adapter renumbers,
+/// the refused network number is gone, the user explicitly allows the new one,
+/// it renumbers again — and the dead refusal was inherited over the live
+/// approval. Worse, the row doing it is invisible in the UI (`compose` hides
+/// stored rows whose adapter discovery still reports), so only a full reset
+/// cleared it. Ordering by recency keeps both directions honest and forgets
+/// nothing; a tie still favours the refusal, which is the conservative read.
 fn inherited_from_adapter(stored: &[LocalNetworkRule], adapter: &str) -> Option<bool> {
     if adapter.is_empty() {
         return None;
     }
-    let mut confirmed = None;
-    for rule in stored.iter().filter(|rule| is_same_adapter(adapter, rule)) {
-        if !rule.allow {
-            return Some(false);
-        }
-        confirmed = Some(true);
-    }
-    confirmed
+    stored
+        .iter()
+        .filter(|rule| is_same_adapter(adapter, rule))
+        // Newest wins; on an equal timestamp the refusal does.
+        .max_by_key(|rule| (rule.updated_at, u8::from(!rule.allow)))
+        .map(|rule| rule.allow)
 }
 
 /// A stored answer belongs to `adapter` only if discovery named one when it was
@@ -213,6 +220,9 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                         LocalNetworkOrigin::Manual
                     },
                     adapter: adapter.unwrap_or_default(),
+                    // The store stamps the write time itself; this value is
+                    // read back from the row, never taken from here.
+                    updated_at: 0,
                 };
                 // A confirmed "yes" is stored even though discovery already
                 // answers yes: `decided_by_user` is what tells the surfaces a
@@ -316,11 +326,24 @@ mod tests {
         allow: bool,
         origin: LocalNetworkOrigin,
     ) -> LocalNetworkRule {
+        rule_at(cidr, adapter, allow, origin, 0)
+    }
+
+    /// Same, with an explicit write time — inheritance across a renumbered
+    /// adapter follows the most recent answer, so its tests need to order them.
+    fn rule_at(
+        cidr: &str,
+        adapter: &str,
+        allow: bool,
+        origin: LocalNetworkOrigin,
+        updated_at: i64,
+    ) -> LocalNetworkRule {
         LocalNetworkRule {
             cidr: cidr.into(),
             allow,
             origin,
             adapter: adapter.into(),
+            updated_at,
         }
     }
 
@@ -359,6 +382,52 @@ mod tests {
             ),
         ];
         assert_eq!(inherited_from_adapter(&stored, switch), Some(false));
+    }
+
+    /// The scenario the feature exists for: a hypervisor switch renumbers, the
+    /// user refuses one number, later ALLOWS the new one, it renumbers again.
+    /// The dead refusal used to outrank the live approval forever, and the row
+    /// doing it is not even visible in the UI.
+    #[test]
+    fn a_newer_approval_outranks_an_older_refusal_on_the_same_adapter() {
+        let switch = "Ethernet (Default Switch)";
+        let stored = vec![
+            rule_at(
+                "172.23.208.0/20",
+                switch,
+                false,
+                LocalNetworkOrigin::Discovered,
+                1_000,
+            ),
+            rule_at(
+                "172.28.176.0/20",
+                switch,
+                true,
+                LocalNetworkOrigin::Discovered,
+                2_000,
+            ),
+        ];
+        assert_eq!(inherited_from_adapter(&stored, switch), Some(true));
+
+        // And the other direction still holds: a refusal given AFTER an
+        // approval closes the segment again.
+        let reversed = vec![
+            rule_at(
+                "172.23.208.0/20",
+                switch,
+                true,
+                LocalNetworkOrigin::Discovered,
+                1_000,
+            ),
+            rule_at(
+                "172.28.176.0/20",
+                switch,
+                false,
+                LocalNetworkOrigin::Discovered,
+                2_000,
+            ),
+        ];
+        assert_eq!(inherited_from_adapter(&reversed, switch), Some(false));
     }
 
     #[test]

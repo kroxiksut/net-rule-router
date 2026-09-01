@@ -51,6 +51,24 @@ impl InterfacesDataSource {
             Self::FallbackMock => "fallback-mock",
         }
     }
+
+    /// Parse the wire spelling back. The service reports the provenance of the
+    /// rows it enumerated and the client must carry that verdict rather than
+    /// assume the rows are live — a placeholder list rendered as live invites
+    /// the user to bind a route to an adapter that does not exist. An
+    /// unrecognised spelling reads as [`Self::FallbackMock`]: the honest answer
+    /// when the peer says something this build cannot vouch for.
+    pub fn from_title(title: &str) -> Self {
+        match title {
+            "windows-live" => Self::WindowsLive,
+            _ => Self::FallbackMock,
+        }
+    }
+
+    /// Whether these rows describe the machine as it actually is.
+    pub const fn is_live(self) -> bool {
+        matches!(self, Self::WindowsLive)
+    }
 }
 
 /// One enriched adapter row consumed by the GUI list and the diagnostics
@@ -851,6 +869,25 @@ mod tests {
             derive_forwarding_next_hop(&routes, 60),
             Some(Ipv4Addr::new(10, 89, 0, 1))
         );
+    }
+
+    #[test]
+    fn data_source_round_trips_and_unknown_reads_as_placeholder() {
+        for source in [
+            InterfacesDataSource::WindowsLive,
+            InterfacesDataSource::FallbackMock,
+        ] {
+            assert_eq!(InterfacesDataSource::from_title(source.title()), source);
+        }
+        // A peer this build cannot vouch for must not be believed to be live:
+        // the placeholder reading is the one that keeps invented adapters out
+        // of the list the user binds routes in.
+        assert_eq!(
+            InterfacesDataSource::from_title("something-newer"),
+            InterfacesDataSource::FallbackMock
+        );
+        assert!(InterfacesDataSource::WindowsLive.is_live());
+        assert!(!InterfacesDataSource::FallbackMock.is_live());
     }
 
     #[test]

@@ -394,7 +394,9 @@ pub(crate) fn read_verbose_logging_flag(state_db_path: &std::path::Path) -> bool
     if !state_db_path.exists() {
         return false;
     }
-    match rusqlite::Connection::open(state_db_path) {
+    // Through the storage factory, not a raw open: its `busy_timeout` is what
+    // keeps a momentary writer lock from reading as "the flag is off".
+    match nrr_storage::migration::open_connection(state_db_path) {
         Ok(conn) => nrr_storage::service_stability_config::probe_verbose_logging(&conn),
         Err(_) => false,
     }

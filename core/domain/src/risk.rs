@@ -251,17 +251,24 @@ pub struct RiskAssessment {
 }
 
 impl RiskAssessment {
-    /// Returns `true` when no risk signals were detected (level is `Low`).
+    /// Returns `true` when the assessment carries no risk at all.
+    ///
+    /// Reads the LEVEL, not the signal list: an assessment rebuilt from a
+    /// stored level has no signals to show, and judging it by the empty list
+    /// called a `High` revision low-risk.
     pub fn is_low_risk(&self) -> bool {
-        self.signals.is_empty()
+        self.level == RiskLevel::Low
     }
 
-    /// Returns `true` when the level is `High`.
+    /// Returns `true` when the level demands user review before activation.
     ///
-    /// High-risk candidates require mandatory user review and a persistent alert.
-    /// Silent activation must be blocked.
+    /// `High` **and** `Critical`: the comparison used to name `High` alone, so
+    /// the one level defined as catastrophic — a candidate that would lock the
+    /// user out of the network — was the single level that could activate
+    /// without review. Written as an ordering so a future level above
+    /// `Critical` inherits the requirement instead of quietly escaping it.
     pub fn requires_mandatory_review(&self) -> bool {
-        self.level == RiskLevel::High
+        self.level >= RiskLevel::High
     }
 }
 

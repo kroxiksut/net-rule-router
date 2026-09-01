@@ -126,18 +126,24 @@ mod tests {
         assert_eq!(rules[0]["enabled"], true);
     }
 
+    // A section name no build will ever claim as its own. `--- Linux` used to
+    // stand in for "a section this host does not parse as rules" — true on
+    // Windows, false on a Linux runner, where it is the native application
+    // section and these two tests asserted the opposite of what happens.
+    const FOREIGN_SECTION: &str = "Solaris";
+
     #[test]
     fn parse_with_unknown_section_returns_passthrough() {
         let res = handle_preset_request(
             "preset.parse",
-            &json!({ "text": "--- Linux\nfirefox\nchromium\n" }),
+            &json!({ "text": format!("--- {FOREIGN_SECTION}\nfirefox\nchromium\n") }),
         )
         .expect("call");
         let passthrough = res["result"]["passthrough"]
             .as_array()
             .expect("passthrough");
         assert_eq!(passthrough.len(), 1);
-        assert_eq!(passthrough[0]["section-name"], "Linux");
+        assert_eq!(passthrough[0]["section-name"], FOREIGN_SECTION);
         assert_eq!(passthrough[0]["content-lines"], 2);
         assert_eq!(passthrough[0]["preview"][0], "firefox");
     }
@@ -146,14 +152,14 @@ mod tests {
     fn duplicate_sections_surfaced() {
         let res = handle_preset_request(
             "preset.parse",
-            &json!({ "text": "--- Linux\na\n--- Linux\nb\n" }),
+            &json!({ "text": format!("--- {FOREIGN_SECTION}\na\n--- {FOREIGN_SECTION}\nb\n") }),
         )
         .expect("call");
         let dups = res["result"]["duplicate-sections"]
             .as_array()
             .expect("dups");
         assert_eq!(dups.len(), 1);
-        assert_eq!(dups[0]["section-name"], "Linux");
+        assert_eq!(dups[0]["section-name"], FOREIGN_SECTION);
         assert_eq!(dups[0]["occurrences"], 2);
         assert_eq!(dups[0]["is-known-section"], false);
     }

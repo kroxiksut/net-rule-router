@@ -790,7 +790,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             .conn
             .lock()
             .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
-        let principals = nrr_storage::principals_with_rules(&conn)
+        let principals = nrr_storage::principals_with_state(&conn)
             .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
         let mut total = PrincipalDataPurgeResponse::default();
         for principal in &principals {
@@ -813,7 +813,7 @@ impl PrincipalDataPurger for ProductionPrincipalDataPurger {
             .conn
             .lock()
             .map_err(|_| RoutePolicyWriteError::Storage("connection mutex poisoned".into()))?;
-        let principals = nrr_storage::principals_with_rules(&conn)
+        let principals = nrr_storage::principals_with_state(&conn)
             .map_err(|e| RoutePolicyWriteError::Storage(format!("{e:?}")))?;
         Ok(principals.iter().filter(|p| p.as_str() != sid).count() as u32)
     }
@@ -1244,23 +1244,36 @@ impl MonitoredAdaptersSnapshotProvider {
         // The live adapter enumeration is Windows-only; off
         // Windows the service returns the neutral deterministic fallback rows.
         #[cfg(windows)]
-        let (_source, mut rich_rows) =
+        let (source, mut rich_rows) =
             nrr_platform_windows::interface_rows::collect_interfaces_rows(probe_external_ip);
         #[cfg(not(windows))]
-        let (_source, mut rich_rows) = {
+        let (source, mut rich_rows) = {
             let _ = probe_external_ip;
             (
                 nrr_platform_api::InterfacesDataSource::FallbackMock,
                 nrr_platform_api::fallback_rows(),
             )
         };
+        // Report the provenance the enumeration actually reached, not the one
+        // this path hopes for. The rows are a deterministic PLACEHOLDER
+        // whenever the live enumeration came back empty, and a placeholder
+        // announced as `windows-live` is how invented adapters reach a user
+        // about to bind a route to one.
+        if !source.is_live() {
+            tracing::warn!(
+                target: "nrr::snapshot-interfaces",
+                data_source = source.title(),
+                rows = rich_rows.len(),
+                "live adapter enumeration produced nothing — answering with the deterministic placeholder dataset, marked as such",
+            );
+        }
         self.fold_cached_external(&mut rich_rows);
         let rows = rich_rows
             .iter()
             .map(nrr_shared::ipc_payloads::InterfaceRowDto::from)
             .collect::<Vec<_>>();
         SnapshotInterfacesResponse {
-            data_source: "windows-live".into(),
+            data_source: source.title().into(),
             adapters: adapters.into_iter().map(adapter_to_entry).collect(),
             // Secondary route state — population by the
             // policy manager for the Fail-Closed
@@ -1430,8 +1443,36 @@ mod adapters_snapshot_tests {
         let api = Arc::new(MockWindowsApi::new());
         let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
         let resp = provider.adapters_snapshot(false);
-        assert_eq!(resp.data_source, "windows-live");
         assert!(resp.adapters.is_empty());
+        // The spelling used to be hardcoded `windows-live`, which is also what
+        // this assertion pinned. Which of the two the enumeration reaches is a
+        // property of the HOST (a Windows box with adapters answers live, a
+        // Linux one answers with the placeholder), so the assertion below is
+        // the honesty invariant instead: the label has to be one the contract
+        // defines, and it must round-trip.
+        let source = nrr_platform_api::InterfacesDataSource::from_title(&resp.data_source);
+        assert_eq!(source.title(), resp.data_source);
+    }
+
+    /// The placeholder dataset must never be announced as a live enumeration:
+    /// four invented adapters presented as this machine's own are what a user
+    /// binds a route to (§36.15.1).
+    #[test]
+    fn placeholder_rows_are_never_announced_as_live() {
+        let api = Arc::new(MockWindowsApi::new());
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
+        let resp = provider.adapters_snapshot(false);
+        let placeholder_shipped = resp
+            .rows
+            .iter()
+            .any(|row| row.adapter_name.starts_with("{FAKE-"));
+        if placeholder_shipped {
+            assert_eq!(
+                resp.data_source,
+                nrr_platform_api::InterfacesDataSource::FallbackMock.title(),
+                "placeholder rows announced as a live enumeration",
+            );
+        }
     }
 
     #[test]

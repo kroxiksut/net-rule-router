@@ -14,11 +14,14 @@
 //!
 //! The kill-switch removes the race entirely. Instead of reacting to
 //! adapter state, it pins a **permanent, egress-conditional** pair of
-//! WFP filters per protected destination:
+//! WFP filters per packed CHUNK of protected destinations
+//! ([`nrr_platform_api::wfp_slotting`] — WFP ORs same-field conditions, so one
+//! filter guards a whole set; the per-address form let the standing count grow
+//! linearly into the thousands, which the BFE host does not survive for hours):
 //!
 //! ```text
-//!   Permit  remote_ip == X  AND  local_interface == secondary_luid   (high weight)
-//!   Block   remote_ip == X                                           (lower weight)
+//!   Permit  remote_ip ∈ chunk  AND  local_interface == secondary_luid   (high weight)
+//!   Block   remote_ip ∈ chunk                                           (lower weight)
 //! ```
 //!
 //! - While the secondary adapter is up, the OS sends `X` out the tunnel, the connect
@@ -42,12 +45,13 @@
 //!
 //! | Filter | Weight | Conditions |
 //! |--------|--------|------------|
-//! | KS Permit | `0x0040_0000 + i` | `remote_ip`, `local_interface` |
-//! | KS Block  | `0x0030_0000 + i` | `remote_ip` |
+//! | KS Permit | `0x0040_0000 + i` | `remote_ip ∈ chunk i`, `local_interface` |
+//! | KS Block  | `0x0030_0000 + i` | `remote_ip ∈ chunk i` |
 //! | rule Permit | `≤ 0x0020_xxxx` | `remote_ip` (no interface) |
 //!
-//! For each destination `i`: `KS Permit > KS Block > rule Permit`, which
-//! is precisely the ordering the leak-proof guarantee needs.
+//! A flow only matches the filters of its own address's chunk, and band over
+//! band `KS Permit > KS Block > rule Permit` — precisely the ordering the
+//! leak-proof guarantee needs (the exact `+ i` offsets never decide).
 //!
 //! ## Scope and blast radius
 //!
@@ -78,6 +82,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::fail_closed::is_exempt_from_blocking;
 use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
+use nrr_platform_api::wfp_slotting::{pack_v4, V4SlotChunk};
 
 use crate::wfp_codegen::filter_id_for;
 
@@ -108,10 +113,10 @@ pub(crate) const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
 /// adapter is up and the block wins the instant it is not.
 const KILLSWITCH_BLOCK_BASE: u64 = 0x0030_0000;
 
-/// Maximum number of protected destinations a single kill-switch plan
-/// will emit. The two weight bands are `0x0010_0000` apart, so the
-/// per-destination offset must stay below that to avoid the permit band
-/// overflowing into the block band. The practical destination set
+/// Maximum number of protected destination ADDRESSES a single kill-switch
+/// plan accepts (applied before packing — a chunk index can never exceed the
+/// address count, so every `BASE + idx` weight stays inside its band). The
+/// two weight bands are `0x0010_0000` apart. The practical destination set
 /// (resolved rule IPs / FQDN-cache fan-out) is far smaller; anything
 /// beyond the cap is dropped rather than allowed to collide weights.
 pub const KILLSWITCH_MAX_DESTINATIONS: usize = 0x000D_FFFF;
@@ -356,15 +361,15 @@ const DOT_PORT: u16 = 853;
 pub const DOH_MAX_RESOLVER_IPS: usize = 0x0003_0000;
 
 /// Build the DoH/DoT lockdown block filters for `sid`:
-/// - per resolver IP: a `Block` on `443` for TCP and UDP (kills DoH / DoH-over-HTTP3
-///   to that resolver without touching the resolver's plain DNS on 53 or general
-///   web traffic to other hosts);
+/// - per packed resolver-IP chunk: a `Block` on `443` for TCP and UDP (kills
+///   DoH / DoH-over-HTTP3 to those resolvers without touching their plain DNS
+///   on 53 or general web traffic to other hosts);
 /// - when `block_dot`: a global `Block` on `853` for TCP and UDP (DoT / DoQ).
 ///
 /// All filters are ALE-connect, SID-scoped, at [`DOH_BLOCK_BASE`]. Loopback /
-/// link-local resolver IPs are skipped (never blocked). Emission order (per IP:
-/// TCP then UDP; then the global DoT pair) fixes the ascending weights so the
-/// neutral planner mirror reproduces the same arbitration order.
+/// link-local resolver IPs are skipped (never blocked). Emission order (per
+/// chunk: TCP then UDP; then the global DoT pair) fixes the ascending weights
+/// so the neutral planner mirror reproduces the same arbitration order.
 pub fn doh_dot_block_filters(
     sid: &str,
     resolver_ips: &[Ipv4Addr],
@@ -372,14 +377,15 @@ pub fn doh_dot_block_filters(
 ) -> Vec<WfpFilterSpec> {
     let mut filters = Vec::new();
     let mut weight = DOH_BLOCK_BASE;
-    for ip in resolver_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(DOH_MAX_RESOLVER_IPS)
-    {
+    for chunk in pack_v4(
+        resolver_ips
+            .iter()
+            .copied()
+            .filter(|ip| !is_exempt_from_blocking(*ip))
+            .take(DOH_MAX_RESOLVER_IPS),
+    ) {
         for proto in [PROTO_TCP, PROTO_UDP] {
-            filters.push(doh_port_block(sid, Some(ip), DOH_PORT, proto, weight));
+            filters.push(doh_port_block(sid, Some(&chunk), DOH_PORT, proto, weight));
             weight += 1;
         }
     }
@@ -392,22 +398,23 @@ pub fn doh_dot_block_filters(
     filters
 }
 
-/// One DoH/DoT block: ALE-connect `Block` narrowed to `(remote_ip?, port, proto)`.
+/// One DoH/DoT block: ALE-connect `Block` narrowed to `(chunk?, port, proto)`.
 fn doh_port_block(
     sid: &str,
-    ip: Option<Ipv4Addr>,
+    scope: Option<&V4SlotChunk>,
     port: u16,
     proto: u8,
     weight: u64,
 ) -> WfpFilterSpec {
-    let host_seg = ip
-        .map(|i| i.to_string())
+    let host_seg = scope
+        .map(V4SlotChunk::id_seg)
         .unwrap_or_else(|| "any".to_string());
     let tag = format!("{host_seg}-{port}-{proto}");
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
-        remote_ip: ip,
+        remote_ip: None,
+        remote_ip_set: scope.map(|c| c.members.clone()).unwrap_or_default(),
         remote_port: Some(port),
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-doh", &tag),
@@ -433,10 +440,10 @@ fn doh_port_block(
 /// - `secondary_luid`: the LUID of the secondary (VPN) interface. A
 ///   value of `0` disables the kill-switch (see module "Safety valves").
 ///
-/// Returns the filters in emission order: for each non-exempt
-/// destination, its `Permit` then its `Block`. Loopback / link-local
-/// destinations are skipped. Returns an empty vector when there is
-/// nothing to protect or the LUID is unusable.
+/// Returns the filters in emission order: for each packed chunk of non-exempt
+/// destinations, its `Permit` then its `Block`. Loopback / link-local
+/// destinations are skipped before packing. Returns an empty vector when
+/// there is nothing to protect or the LUID is unusable.
 pub fn kill_switch_filters(
     sid: &str,
     protected_ips: &[Ipv4Addr],
@@ -449,28 +456,29 @@ pub fn kill_switch_filters(
         return Vec::new();
     }
 
+    let chunks = pack_v4(
+        protected_ips
+            .iter()
+            .copied()
+            .filter(|ip| !is_exempt_from_blocking(*ip))
+            .take(KILLSWITCH_MAX_DESTINATIONS),
+    );
     let mut filters = Vec::new();
-    for (idx, ip) in protected_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(KILLSWITCH_MAX_DESTINATIONS)
-        .enumerate()
-    {
+    for (idx, chunk) in chunks.iter().enumerate() {
         let idx = idx as u64;
         // ALE pair (TCP/UDP at the connect layer) — only when TCP or UDP is
         // selected. (The pair is protocol-agnostic, so selecting just one of
         // TCP/UDP still blocks both — a minor over-block in a rare config.)
         if protocols.wants_ale_block() {
-            filters.push(permit_via_secondary(sid, ip, secondary_luid, idx));
-            filters.push(block_off_secondary(sid, ip, idx));
+            filters.push(permit_via_secondary(sid, chunk, secondary_luid, idx));
+            filters.push(block_off_secondary(sid, chunk, idx));
         }
         // 2a — packet-layer egress-conditional pairs so ICMP and
-        // the other selected packet protocols are killed the instant the secondary
-        // adapter drops (the ALE pair above only sees TCP/UDP). Scoped to this /32.
+        // the other selected packet protocols are killed the instant the
+        // secondary adapter drops (the ALE pair above only sees TCP/UDP).
         filters.extend(packet_egress_pairs(
             sid,
-            Some(ip),
+            DestScope::Chunk(chunk),
             protocols,
             secondary_luid,
             idx,
@@ -493,13 +501,20 @@ fn permit_luid_seg(luid: u64) -> String {
     format!("luid-{luid:016x}")
 }
 
-/// `Permit` half: allow `ip` **only while** the flow egresses
-/// `secondary_luid`.
-fn permit_via_secondary(sid: &str, ip: Ipv4Addr, secondary_luid: u64, idx: u64) -> WfpFilterSpec {
+/// `Permit` half: allow the chunk's destinations **only while** the flow
+/// egresses `secondary_luid`. The chunk digest is in the id, so a membership
+/// change mints a new id and the reconcile swaps the filter make-before-break.
+fn permit_via_secondary(
+    sid: &str,
+    chunk: &V4SlotChunk,
+    secondary_luid: u64,
+    idx: u64,
+) -> WfpFilterSpec {
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
-        remote_ip: Some(ip),
+        remote_ip: None,
+        remote_ip_set: chunk.members.clone(),
         remote_port: None,
         weight: KILLSWITCH_PERMIT_BASE + idx,
         id: filter_id_for(
@@ -507,7 +522,7 @@ fn permit_via_secondary(sid: &str, ip: Ipv4Addr, secondary_luid: u64, idx: u64) 
             KILLSWITCH_ROLE,
             &permit_luid_seg(secondary_luid),
             "ks-permit",
-            &ip.to_string(),
+            &chunk.id_seg(),
         ),
         user_sid: Some(sid.to_string()),
         app_pattern: None,
@@ -518,16 +533,18 @@ fn permit_via_secondary(sid: &str, ip: Ipv4Addr, secondary_luid: u64, idx: u64) 
     }
 }
 
-/// `Block` half: drop `ip` whenever the egress-conditional permit does
-/// not match (i.e. the secondary adapter is down and the route fell back elsewhere).
-fn block_off_secondary(sid: &str, ip: Ipv4Addr, idx: u64) -> WfpFilterSpec {
+/// `Block` half: drop the chunk's destinations whenever the egress-conditional
+/// permit does not match (i.e. the secondary adapter is down and the route
+/// fell back elsewhere).
+fn block_off_secondary(sid: &str, chunk: &V4SlotChunk, idx: u64) -> WfpFilterSpec {
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
-        remote_ip: Some(ip),
+        remote_ip: None,
+        remote_ip_set: chunk.members.clone(),
         remote_port: None,
         weight: KILLSWITCH_BLOCK_BASE + idx,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-block", &ip.to_string()),
+        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-block", &chunk.id_seg()),
         user_sid: Some(sid.to_string()),
         app_pattern: None,
         local_interface_luid: None,
@@ -595,6 +612,7 @@ fn permit_app_via_secondary(
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight: KILLSWITCH_PERMIT_BASE + idx,
         id: filter_id_for(
@@ -627,6 +645,7 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight: APP_KILLSWITCH_BLOCK_BASE + idx,
         id: filter_id_for(
@@ -719,6 +738,7 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight: APP_EXEMPT_BASE + idx,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-app-exempt", pattern),
@@ -940,7 +960,7 @@ pub fn catch_all_kill_switch_filters(
         filters.push(packet_egress_permit(
             sid,
             TR,
-            None,
+            DestScope::All,
             None,
             resolution.secondary_luid,
             pw,
@@ -979,7 +999,7 @@ pub fn catch_all_kill_switch_filters(
             filters.push(packet_permit_direct_host(sid, TR, ip, pw));
             pw += 1;
         }
-        filters.extend(packet_protocol_blocks(sid, None, protocols, 0));
+        filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
     }
 
     // ── IPv6 (Free's only IPv6 handling) ──
@@ -998,6 +1018,7 @@ fn exempt_egress(sid: &str, secondary_luid: u64, weight: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1023,6 +1044,7 @@ fn exempt_subnet(sid: &str, net: Ipv4Addr, prefix_len: u8, weight: u64) -> WfpFi
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-subnet", &target),
@@ -1059,6 +1081,7 @@ pub fn fake_ip_pool_permit_filters(
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight: FAKEIP_POOL_PERMIT_BASE,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "v4"),
@@ -1074,6 +1097,7 @@ pub fn fake_ip_pool_permit_filters(
             layer: WfpLayerKey::AleAuthConnectV6,
             action: WfpAction::Permit,
             remote_ip: None,
+            remote_ip_set: Vec::new(),
             remote_port: None,
             weight: FAKEIP_POOL_PERMIT_BASE + 1,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "v6"),
@@ -1097,6 +1121,7 @@ pub fn fake_ip_pool_permit_filters(
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Block,
             remote_ip: None,
+            remote_ip_set: Vec::new(),
             remote_port: None,
             weight: FAKEIP_POOL_PERMIT_BASE + 2,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "udp4"),
@@ -1112,6 +1137,7 @@ pub fn fake_ip_pool_permit_filters(
                 layer: WfpLayerKey::AleAuthConnectV6,
                 action: WfpAction::Block,
                 remote_ip: None,
+                remote_ip_set: Vec::new(),
                 remote_port: None,
                 weight: FAKEIP_POOL_PERMIT_BASE + 3,
                 id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "udp6"),
@@ -1133,6 +1159,7 @@ fn exempt_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: Some(ip),
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-host", &ip.to_string()),
@@ -1154,6 +1181,7 @@ fn exempt_direct_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: Some(ip),
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1181,6 +1209,7 @@ fn exempt_probe_target(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Permit,
         remote_ip: Some(ip),
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1214,6 +1243,7 @@ fn exempt_dns_over_primary(sid: &str, base_weight: u64) -> Vec<WfpFilterSpec> {
             layer: WfpLayerKey::AleAuthConnectV4,
             action: WfpAction::Permit,
             remote_ip: None,
+            remote_ip_set: Vec::new(),
             remote_port: Some(53),
             weight: base_weight + i as u64,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-dns", tag),
@@ -1238,6 +1268,7 @@ fn catch_all_block(sid: &str, ip_protocol: Option<u8>) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight: CATCHALL_BLOCK_WEIGHT,
         // The protocol is part of the id: a filter is immutable by key, and the
@@ -1365,6 +1396,7 @@ fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFi
         layer,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         // Above the exemption band so it outranks every block on this layer.
         weight: CATCHALL_EXEMPT_BASE + 100,
@@ -1416,6 +1448,7 @@ fn exempt_subnet_v6(
         layer,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1452,6 +1485,7 @@ fn block_all_v6(sid: &str, layer: WfpLayerKey) -> WfpFilterSpec {
         layer,
         action: WfpAction::Block,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, "block-all"),
@@ -1542,24 +1576,26 @@ pub fn fail_closed_block_destinations(
     if !protocols.any() {
         return Vec::new();
     }
+    let chunks = pack_v4(
+        protected_ips
+            .iter()
+            .copied()
+            .filter(|ip| !is_exempt_from_blocking(*ip))
+            .take(KILLSWITCH_MAX_DESTINATIONS),
+    );
     let mut out = Vec::new();
-    for (idx, ip) in protected_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(KILLSWITCH_MAX_DESTINATIONS)
-        .enumerate()
-    {
+    for (idx, chunk) in chunks.iter().enumerate() {
         let idx = idx as u64;
+        let scope = DestScope::Chunk(chunk);
         if protocols.wants_ale_block() {
             out.push(ale_block(
                 sid,
-                Some(ip),
+                scope,
                 protocols.ale_protocol(),
                 KILLSWITCH_BLOCK_BASE + idx,
             ));
         }
-        out.extend(packet_protocol_blocks(sid, Some(ip), protocols, idx));
+        out.extend(packet_protocol_blocks(sid, scope, protocols, idx));
     }
     out
 }
@@ -1597,6 +1633,7 @@ fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1681,7 +1718,7 @@ pub fn fail_closed_block_all_filters(
     if protocols.wants_ale_block() {
         filters.push(ale_block(
             sid,
-            None,
+            DestScope::All,
             protocols.ale_protocol(),
             CATCHALL_BLOCK_WEIGHT,
         ));
@@ -1742,7 +1779,7 @@ pub fn fail_closed_block_all_filters(
             filters.push(packet_permit_direct_host(sid, TR, ip, pw));
             pw += 1;
         }
-        filters.extend(packet_protocol_blocks(sid, None, protocols, 0));
+        filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
     }
 
     // ── IPv6 (Free's only IPv6 handling) ──
@@ -1756,21 +1793,48 @@ pub fn fail_closed_block_all_filters(
 
 // ── Protocol-aware filter builders (multi-protocol kill-switch) ──────────────
 
-/// Build a scope/protocol key for a packet- or ALE-layer filter id.
-/// `scope = None` → "all"; `proto = None` → "any".
-fn proto_scope_key(scope: Option<Ipv4Addr>, proto: Option<u8>) -> String {
-    let s = scope.map(|i| i.to_string()).unwrap_or_else(|| "all".into());
-    let p = proto.map(|p| p.to_string()).unwrap_or_else(|| "any".into());
-    format!("{s}-{p}")
+/// Destination scope of a kill-switch filter: everything (the catch-all
+/// forms) or one packed chunk of destinations. The single-address form is
+/// gone deliberately — per-address filters are what grew the standing set
+/// into the thousands.
+#[derive(Clone, Copy)]
+enum DestScope<'a> {
+    All,
+    Chunk(&'a V4SlotChunk),
 }
 
-/// ALE-layer block, optionally narrowed to one IP protocol (TCP/UDP). Scoped to
-/// `sid` (ALE exposes `ALE_USER_ID`). `scope = None` blocks all destinations.
-fn ale_block(sid: &str, scope: Option<Ipv4Addr>, proto: Option<u8>, weight: u64) -> WfpFilterSpec {
+impl DestScope<'_> {
+    fn members(self) -> Vec<Ipv4Addr> {
+        match self {
+            DestScope::All => Vec::new(),
+            DestScope::Chunk(c) => c.members.clone(),
+        }
+    }
+
+    fn key(self) -> String {
+        match self {
+            DestScope::All => "all".into(),
+            DestScope::Chunk(c) => c.id_seg(),
+        }
+    }
+}
+
+/// Build a scope/protocol key for a packet- or ALE-layer filter id.
+/// [`DestScope::All`] → "all"; `proto = None` → "any".
+fn proto_scope_key(scope: DestScope<'_>, proto: Option<u8>) -> String {
+    let p = proto.map(|p| p.to_string()).unwrap_or_else(|| "any".into());
+    format!("{}-{p}", scope.key())
+}
+
+/// ALE-layer block, optionally narrowed to one IP protocol (TCP/UDP). Scoped
+/// to `sid` (ALE exposes `ALE_USER_ID`). [`DestScope::All`] blocks all
+/// destinations.
+fn ale_block(sid: &str, scope: DestScope<'_>, proto: Option<u8>, weight: u64) -> WfpFilterSpec {
     WfpFilterSpec {
         layer: WfpLayerKey::AleAuthConnectV4,
         action: WfpAction::Block,
-        remote_ip: scope,
+        remote_ip: None,
+        remote_ip_set: scope.members(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1803,7 +1867,7 @@ fn ale_block(sid: &str, scope: Option<Ipv4Addr>, proto: Option<u8>, weight: u64)
 fn packet_block(
     sid: &str,
     layer: WfpLayerKey,
-    scope: Option<Ipv4Addr>,
+    scope: DestScope<'_>,
     proto: Option<u8>,
     weight: u64,
 ) -> WfpFilterSpec {
@@ -1815,7 +1879,8 @@ fn packet_block(
     WfpFilterSpec {
         layer,
         action: WfpAction::Block,
-        remote_ip: scope,
+        remote_ip: None,
+        remote_ip_set: scope.members(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1853,6 +1918,7 @@ fn packet_exempt_subnet(
         layer,
         action: WfpAction::Permit,
         remote_ip: None,
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -1884,6 +1950,7 @@ fn packet_exempt_host(sid: &str, layer: WfpLayerKey, ip: Ipv4Addr, weight: u64) 
         layer,
         action: WfpAction::Permit,
         remote_ip: Some(ip),
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, &ip.to_string()),
@@ -1962,6 +2029,7 @@ fn packet_permit_host_with_kind(
         layer,
         action: WfpAction::Permit,
         remote_ip: Some(ip),
+        remote_ip_set: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, &ip.to_string()),
@@ -1992,7 +2060,7 @@ fn packet_permit_host_with_kind(
 /// system-wide and cut TCP/UDP above every ALE permit/exemption.
 fn packet_protocol_blocks(
     sid: &str,
-    scope: Option<Ipv4Addr>,
+    scope: DestScope<'_>,
     protocols: KillSwitchProtocols,
     idx: u64,
 ) -> Vec<WfpFilterSpec> {
@@ -2018,7 +2086,7 @@ fn packet_protocol_blocks(
 fn packet_egress_permit(
     sid: &str,
     layer: WfpLayerKey,
-    scope: Option<Ipv4Addr>,
+    scope: DestScope<'_>,
     proto: Option<u8>,
     luid: u64,
     weight: u64,
@@ -2031,7 +2099,8 @@ fn packet_egress_permit(
     WfpFilterSpec {
         layer,
         action: WfpAction::Permit,
-        remote_ip: scope,
+        remote_ip: None,
+        remote_ip_set: scope.members(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -2061,7 +2130,7 @@ fn packet_egress_permit(
 /// is GONE (see [`KillSwitchProtocols::wants_packet_layer`]).
 fn packet_egress_pairs(
     sid: &str,
-    scope: Option<Ipv4Addr>,
+    scope: DestScope<'_>,
     protocols: KillSwitchProtocols,
     luid: u64,
     idx: u64,
@@ -2285,7 +2354,9 @@ mod tests {
         let block = &out[1];
         assert_eq!(permit.action, WfpAction::Permit);
         assert_eq!(permit.layer, WfpLayerKey::AleAuthConnectV4);
-        assert_eq!(permit.remote_ip, Some(ip(203, 0, 113, 5)));
+        // Packed form: the destination lives in the OR'd set, not `remote_ip`.
+        assert_eq!(permit.remote_ip, None);
+        assert_eq!(permit.remote_ip_set, vec![ip(203, 0, 113, 5)]);
         assert_eq!(
             permit.local_interface_luid,
             Some(LUID),
@@ -2567,7 +2638,9 @@ mod tests {
         // (16.HW-0716: named-only packet layer), all for it.
         assert_eq!(out.len(), 10);
         for f in &out {
-            assert_eq!(f.remote_ip, Some(ip(203, 0, 113, 5)));
+            assert!(f.covers_v4(ip(203, 0, 113, 5)));
+            assert!(!f.covers_v4(ip(127, 0, 0, 1)));
+            assert!(!f.covers_v4(ip(169, 254, 0, 9)));
         }
     }
 
@@ -2579,7 +2652,9 @@ mod tests {
             LUID,
             KillSwitchProtocols::ALL,
         );
-        assert_eq!(out.len(), 20); // 2 dests × (2 ALE + 4×2 named transport)
+        // Per CHUNK: 2 ALE + 4×2 named transport.
+        let chunks = pack_v4([ip(1, 1, 1, 1), ip(2, 2, 2, 2)]).len();
+        assert_eq!(out.len(), chunks * 10);
         for f in &out {
             match f.layer {
                 WfpLayerKey::AleAuthConnectV4 | WfpLayerKey::AleAuthConnectV6 => {
@@ -3065,7 +3140,8 @@ mod tests {
             &[ip(203, 0, 113, 5), ip(8, 8, 8, 8)],
             KillSwitchProtocols::ALL,
         );
-        assert_eq!(out.len(), 10);
+        let chunks = pack_v4([ip(203, 0, 113, 5), ip(8, 8, 8, 8)]).len();
+        assert_eq!(out.len(), chunks * 5);
         for f in &out {
             assert_eq!(f.action, WfpAction::Block);
             assert_eq!(
@@ -3081,7 +3157,7 @@ mod tests {
             .iter()
             .filter(|f| f.layer == WfpLayerKey::OutboundTransportV4)
             .count();
-        assert_eq!((ale, pkt), (2, 8));
+        assert_eq!((ale, pkt), (chunks, chunks * 4));
         // ALE blocks are per-SID; packet blocks are system-wide (no ALE_USER_ID).
         for f in out
             .iter()
@@ -3095,8 +3171,8 @@ mod tests {
         {
             assert_eq!(f.user_sid, None, "packet layer has no ALE_USER_ID");
         }
-        assert!(out.iter().any(|f| f.remote_ip == Some(ip(203, 0, 113, 5))));
-        assert!(out.iter().any(|f| f.remote_ip == Some(ip(8, 8, 8, 8))));
+        assert!(out.iter().any(|f| f.covers_v4(ip(203, 0, 113, 5))));
+        assert!(out.iter().any(|f| f.covers_v4(ip(8, 8, 8, 8))));
     }
 
     #[test]
@@ -3108,7 +3184,8 @@ mod tests {
         );
         // loopback skipped; the one real dest → ALE block + 4 named packet blocks.
         assert_eq!(out.len(), 5, "loopback is never blocked");
-        assert!(out.iter().all(|f| f.remote_ip == Some(ip(203, 0, 113, 5))));
+        assert!(out.iter().all(|f| f.covers_v4(ip(203, 0, 113, 5))));
+        assert!(!out.iter().any(|f| f.covers_v4(ip(127, 0, 0, 1))));
         let ale = out
             .iter()
             .find(|f| f.layer == WfpLayerKey::AleAuthConnectV4)
@@ -3137,7 +3214,7 @@ mod tests {
         assert_eq!(out[0].layer, WfpLayerKey::OutboundTransportV4);
         assert_eq!(out[0].action, WfpAction::Block);
         assert_eq!(out[0].ip_protocol, Some(PROTO_ICMP));
-        assert_eq!(out[0].remote_ip, Some(ip(203, 0, 113, 5)));
+        assert!(out[0].covers_v4(ip(203, 0, 113, 5)));
     }
 
     #[test]

@@ -1700,7 +1700,7 @@ pub(crate) fn build_supervised_runtime_deps(
         // queries).
         let diagnostics_cache_conn: Option<Arc<Mutex<Connection>>> = {
             let path = &artifacts.topology.cache_db_path;
-            match Connection::open(path) {
+            match nrr_storage::migration::open_connection(path) {
                 Ok(c) => Some(Arc::new(Mutex::new(c))),
                 Err(e) => {
                     tracing::warn!(
@@ -4212,15 +4212,25 @@ fn build_conn_trace_pair(
         // the tunnel", so whether it already works without one is the fact that
         // most changes the user's answer.
         let sid_for_health = Arc::clone(active_sid);
+        // The same signal feeds two readers with different scopes. The engine
+        // keeps it only for hosts it already tracks as companion candidates and
+        // drops it for anything else; the registry keeps it for every named
+        // destination, which is the only record of "this host does not open"
+        // for a host nobody has a theory about yet. Diagnostic — it is read by
+        // the log, and nothing acts on it.
+        let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
         consumer_builder =
             consumer_builder.with_companion_primary_health(Arc::new(move |hostname, stalled| {
-                let Some(sid) = sid_for_health() else {
-                    return;
-                };
                 let event = if stalled {
                     nrr_domain::companion_affinity::PrimaryHealthEvent::Stalled
                 } else {
                     nrr_domain::companion_affinity::PrimaryHealthEvent::Completed
+                };
+                if let Some(report) = stalls.note(hostname, event) {
+                    nrr_service_runtime::primary_stall_registry::log_report(&report);
+                }
+                let Some(sid) = sid_for_health() else {
+                    return;
                 };
                 engine_health.note_primary_health(&sid, hostname, event);
             }));
@@ -4441,7 +4451,7 @@ fn open_cache_store(
     use nrr_storage::repository::MigrationRunner;
     use nrr_storage::store::SqliteCacheStore;
 
-    let conn = match Connection::open(path) {
+    let conn = match nrr_storage::migration::open_connection(path) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
@@ -4565,14 +4575,11 @@ fn open_settings_connection(path: &std::path::Path) -> Option<Arc<Mutex<Connecti
     if !path.exists() {
         return None;
     }
-    match Connection::open(path) {
-        Ok(conn) => {
-            // Match the storage-layer baseline so concurrent reads with
-            // `SqliteStateStore`'s connection don't race.
-            let _: rusqlite::Result<()> =
-                conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
-            Some(Arc::new(Mutex::new(conn)))
-        }
+    // The storage factory applies (and VERIFIES) the same baseline this used to
+    // set by hand and discard the result of: a failed pragma left the
+    // connection with no busy timeout and nobody the wiser.
+    match nrr_storage::migration::open_connection(path) {
+        Ok(conn) => Some(Arc::new(Mutex::new(conn))),
         Err(e) => {
             tracing::warn!(
                 target: "nrr::runtime",

@@ -53,6 +53,19 @@ pub const HMAC_BYTE_LEN: usize = 32;
 /// using 32 bytes maximises entropy at the cost of nothing.
 pub const RECOMMENDED_KEY_BYTE_LEN: usize = 32;
 
+/// Whether a blob is usable as the signing key.
+///
+/// HMAC itself accepts any length, which is why nothing used to check: a
+/// truncated or empty key file produced a perfectly valid HMAC over an empty
+/// key. Every row then verified, no alarm could ever fire, and anyone who
+/// guessed the key was empty could forge a row. The detector was disarmed by
+/// the shape of its own input, so the length is checked at the boundary where
+/// the key enters the process instead.
+#[must_use]
+pub fn is_usable_signing_key(key: &[u8]) -> bool {
+    key.len() >= RECOMMENDED_KEY_BYTE_LEN
+}
+
 /// One row's worth of HMAC input — every column of `revisions`
 /// except `row_hmac` itself. Borrowed strings to avoid allocations
 /// on the read path (HMAC computation is on every load).

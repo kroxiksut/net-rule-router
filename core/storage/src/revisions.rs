@@ -337,6 +337,13 @@ impl<'c> RevisionsRepository<'c> {
     /// stored `row_hmac` together. The principal is required to recompute
     /// the HMAC (it is part of the canonical input) but is not exposed on
     /// [`RevisionRecord`], so HMAC paths read it through this helper.
+    ///
+    /// The table's key is `(principal, revision_id)`, so an id alone can
+    /// address two rows — and the threat model this HMAC exists for (an
+    /// external writer in the DB file, see [`crate::revision_hmac`]) is exactly
+    /// how a second one appears. Picking an arbitrary one would let a shadow
+    /// row decide what the signing paths see, so ambiguity is reported as the
+    /// integrity failure it is instead.
     fn row_with_principal_and_hmac(
         &self,
         revision_id: &str,
@@ -344,25 +351,38 @@ impl<'c> RevisionsRepository<'c> {
         // `principal` is appended AFTER the 13 record columns and the
         // `row_hmac` blob so the shared `row_to_record` mapper (columns
         // 0..=12) and the v11 hmac index (13) stay valid.
-        self.conn
-            .query_row(
+        let mut stmt = self
+            .conn
+            .prepare(
                 "SELECT revision_id, content_hash, rules_json, status, source,
                         correlation_id, created_at, activated_at, superseded_at,
                         superseded_by, rejected_reason, review_summary_json, risk_level,
                         row_hmac, principal
-                 FROM revisions WHERE revision_id = ?1",
-                params![revision_id],
-                |row| {
-                    let rec = row_to_record(row)?;
-                    let hmac: Vec<u8> = row.get(13)?;
-                    let principal: String = row.get(14)?;
-                    Ok((principal, rec, hmac))
-                },
+                 FROM revisions WHERE revision_id = ?1 LIMIT 2",
             )
-            .optional()
             .map_err(|e| {
                 StorageError::Internal(format!("revisions row_with_principal_and_hmac: {e}"))
+            })?;
+        let mut rows = stmt
+            .query_map(params![revision_id], |row| {
+                let rec = row_to_record(row)?;
+                let hmac: Vec<u8> = row.get(13)?;
+                let principal: String = row.get(14)?;
+                Ok((principal, rec, hmac))
             })
+            .map_err(|e| {
+                StorageError::Internal(format!("revisions row_with_principal_and_hmac: {e}"))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                StorageError::Internal(format!("revisions row_with_principal_and_hmac: {e}"))
+            })?;
+        if rows.len() > 1 {
+            return Err(StorageError::IntegrityFailed(
+                crate::error::IntegrityFailureKind::PolicyRevisionCorrupt,
+            ));
+        }
+        Ok(rows.pop())
     }
 
     /// Recompute and persist the HMAC for one row. Used after every
@@ -393,10 +413,14 @@ impl<'c> RevisionsRepository<'c> {
         let fields = record_to_row_fields(&principal, &record);
         let before = crate::revision_hmac::verify(&fields, &stored, key);
         let hmac = crate::revision_hmac::compute_hmac(&fields, key).to_vec();
+        // Scoped by the WHOLE key: the HMAC was computed over THIS principal's
+        // fields, and an id-only UPDATE would stamp it onto every row sharing
+        // the id — signing somebody else's content with a signature that was
+        // never computed from it.
         self.conn
             .execute(
-                "UPDATE revisions SET row_hmac = ?1 WHERE revision_id = ?2",
-                params![hmac, revision_id],
+                "UPDATE revisions SET row_hmac = ?1 WHERE principal = ?2 AND revision_id = ?3",
+                params![hmac, principal, revision_id],
             )
             .map_err(|e| StorageError::Internal(format!("revisions re_sign_row: {e}")))?;
         Ok(Some(before))
@@ -1032,14 +1056,34 @@ impl<'c> RevisionsRepository<'c> {
     ) -> StorageResult<RetentionPruneSummary> {
         // Retention runs independently per principal so each user keeps
         // their own count caps and (when pinned) their own LKG.
+        //
+        // Independently also means one principal's failure must not end the
+        // pass: principals are walked in a fixed order, so a single failing
+        // user used to stop retention for everyone sorted after them — silently
+        // and on every subsequent run. A failure is reported and the walk
+        // continues; the first error is returned only if NOTHING succeeded.
         let mut total = RetentionPruneSummary::default();
+        let mut first_error: Option<StorageError> = None;
+        let mut pruned_any = false;
         for principal in self.distinct_principals()? {
-            let s = self.prune_by_retention_for(&principal, settings, now_secs)?;
-            total.superseded_dropped += s.superseded_dropped;
-            total.rejected_dropped += s.rejected_dropped;
-            total.rolledback_dropped += s.rolledback_dropped;
+            match self.prune_by_retention_for(&principal, settings, now_secs) {
+                Ok(s) => {
+                    pruned_any = true;
+                    total.superseded_dropped += s.superseded_dropped;
+                    total.rejected_dropped += s.rejected_dropped;
+                    total.rolledback_dropped += s.rolledback_dropped;
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
         }
-        Ok(total)
+        match first_error {
+            Some(e) if !pruned_any => Err(e),
+            _ => Ok(total),
+        }
     }
 
     /// Prune one principal's terminal-status revisions per
@@ -1125,17 +1169,27 @@ impl<'c> RevisionsRepository<'c> {
         threshold_secs: i64,
         protect_id: Option<&str>,
     ) -> StorageResult<usize> {
+        // Never delete the row `active_revision_pointer` points at. Its
+        // composite FK has no `ON DELETE`, so such a DELETE fails — and since
+        // retention walks principals in one loop, a single stale pointer used
+        // to abort the pass and leave every principal after it unpruned for
+        // good. Whether the pointer is current or stale, its target has to
+        // survive; a stale one is repaired by the pointer's own writers.
         let sql = match protect_id {
             Some(_) => format!(
                 "DELETE FROM revisions
                  WHERE principal = ?1 AND status = ?2 AND {time_col} IS NOT NULL
                        AND {time_col} < ?3
-                       AND revision_id != ?4"
+                       AND revision_id != ?4
+                       AND revision_id NOT IN
+                           (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)"
             ),
             None => format!(
                 "DELETE FROM revisions
                  WHERE principal = ?1 AND status = ?2 AND {time_col} IS NOT NULL
-                       AND {time_col} < ?3"
+                       AND {time_col} < ?3
+                       AND revision_id NOT IN
+                           (SELECT revision_id FROM active_revision_pointer WHERE principal = ?1)"
             ),
         };
         let dropped = match protect_id {
@@ -1755,6 +1809,60 @@ mod tests {
         assert_eq!(rec.superseded_at, Some(99));
     }
 
+    /// Retention walks principals in a fixed order. A row the pointer still
+    /// references cannot be deleted (composite FK, no `ON DELETE`), and that
+    /// one failure used to abort the whole pass — so every principal sorted
+    /// after the stale one stopped being pruned, permanently and silently.
+    #[test]
+    fn a_stale_pointer_of_one_principal_does_not_stop_retention_for_the_others() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RevisionsRepository::new(&conn);
+        let old = 1_000_000i64;
+        let now = old + 100 * 86_400;
+
+        // "A" sorts first and keeps a pointer at an old superseded row.
+        for (principal, id) in [("S-A", "rev-a"), ("S-B", "rev-b")] {
+            repo.insert_candidate_for(principal, &sample_record(id, "h"))
+                .expect("insert");
+            conn.execute(
+                "UPDATE revisions SET status = 'superseded', superseded_at = ?1
+                 WHERE principal = ?2 AND revision_id = ?3",
+                params![old, principal, id],
+            )
+            .expect("age the row");
+        }
+        repo.set_active_pointer_for(
+            "S-A",
+            &ActiveRevisionPointer {
+                revision_id: "rev-a".to_string(),
+                activated_at: old,
+                apply_attempt_id: None,
+            },
+        )
+        .expect("stale pointer");
+
+        let settings = RetentionSettings {
+            superseded_days: 1,
+            pin_lkg: false,
+            ..RetentionSettings::DEFAULT
+        };
+        let summary = repo
+            .prune_by_retention(&settings, now)
+            .expect("retention must not abort on one principal");
+
+        // B's history is pruned even though A's row is pinned by its pointer.
+        assert_eq!(summary.superseded_dropped, 1);
+        assert!(repo.get_by_id("rev-b").expect("get").is_none());
+        assert!(
+            repo.get_by_id("rev-a").expect("get").is_some(),
+            "the pointed-at row must survive rather than break the FK",
+        );
+        // And A's own pass is not an error either: the pinned row is excluded
+        // from the DELETE instead of colliding with the foreign key.
+        assert!(repo.prune_by_retention_for("S-A", &settings, now).is_ok());
+    }
+
     #[test]
     fn active_pointer_set_get_clear_roundtrip() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2031,6 +2139,63 @@ mod tests {
         );
         assert_eq!(
             repo.verify_row_hmac("rev-y").expect("verify"),
+            Some(crate::revision_hmac::HmacVerification::Verified),
+        );
+    }
+
+    /// The table's key is `(principal, revision_id)` and the HMAC exists
+    /// precisely because an outsider can write the file. A shadow row sharing
+    /// an id used to be indistinguishable to the id-keyed signing paths: the
+    /// read picked whichever SQLite returned, and the re-sign UPDATE stamped
+    /// one row's signature onto both.
+    #[test]
+    fn a_shadow_row_sharing_a_revision_id_is_refused_not_picked_at_random() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
+
+        repo.insert_candidate_for("S-1-5-21-owner", &sample_record("rev-dup", "h-own"))
+            .expect("insert owner row");
+        // An outside writer adds a row with the same id under another
+        // principal — legal for the schema, impossible through this API.
+        conn.execute(
+            "INSERT INTO revisions (principal, revision_id, content_hash, rules_json, status,
+                                    source, correlation_id, created_at, row_hmac)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, x'')",
+            params![
+                "S-1-5-21-intruder",
+                "rev-dup",
+                "h-shadow",
+                r#"{"shadow":true}"#,
+                "candidate",
+                "gui-rules-edit",
+                "corr-shadow",
+                1_700_000_001i64,
+            ],
+        )
+        .expect("shadow INSERT");
+
+        assert!(
+            matches!(
+                repo.verify_row_hmac("rev-dup"),
+                Err(StorageError::IntegrityFailed(
+                    crate::error::IntegrityFailureKind::PolicyRevisionCorrupt
+                ))
+            ),
+            "an ambiguous id must not resolve to an arbitrary row",
+        );
+        assert!(matches!(
+            repo.re_sign_row("rev-dup"),
+            Err(StorageError::IntegrityFailed(_))
+        ));
+        // The owner's signature is untouched by the intruder's presence.
+        conn.execute(
+            "DELETE FROM revisions WHERE principal = ?1",
+            params!["S-1-5-21-intruder"],
+        )
+        .expect("remove shadow");
+        assert_eq!(
+            repo.verify_row_hmac("rev-dup").expect("verify"),
             Some(crate::revision_hmac::HmacVerification::Verified),
         );
     }
