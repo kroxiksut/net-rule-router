@@ -36,6 +36,21 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
+
+/// How long an elevated run waits before it starts taking the service down.
+///
+/// The prompt is answered on the secure desktop, and the switch back — with the
+/// shell repainting behind it — overlaps the first moments of the elevated
+/// process. Tearing packet filters down inside that window puts two machine-wide
+/// changes on top of each other for no gain: the stop is seconds long anyway.
+pub const POST_ELEVATION_SETTLE: Duration = Duration::from_millis(1500);
+
+/// Wait out [`POST_ELEVATION_SETTLE`]. Called by the elevated process itself,
+/// once, before the first command that stops the service.
+pub fn settle_after_elevation() {
+    std::thread::sleep(POST_ELEVATION_SETTLE);
+}
 
 /// What an elevated re-run did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +150,17 @@ mod tests {
             ElevatedRun::Completed { exit_code: Some(0) }
         );
         assert_eq!(mock.calls(), vec![(program, args)]);
+    }
+
+    #[test]
+    fn the_settle_is_the_pause_a_person_asked_for() {
+        // A value that drifted to milliseconds would silently stop being the
+        // pause between the prompt and the teardown.
+        assert!(
+            POST_ELEVATION_SETTLE >= Duration::from_secs(1)
+                && POST_ELEVATION_SETTLE <= Duration::from_secs(2),
+            "{POST_ELEVATION_SETTLE:?}"
+        );
     }
 
     #[test]

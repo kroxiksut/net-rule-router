@@ -8,6 +8,13 @@ TextField {
     id: root
     property var theme
 
+    // Accessible baseline — see the note in `ThemedComboBox.qml`. The name
+    // falls back to the placeholder because that is the one label a field
+    // without a visible one still carries.
+    Accessible.role: Accessible.EditableText
+    Accessible.name: root.placeholderText
+    Accessible.description: root.ToolTip.text
+
     color: theme.colorText
     placeholderTextColor: Qt.rgba(theme.colorTextMuted.r, theme.colorTextMuted.g,
                                   theme.colorTextMuted.b, 0.85)

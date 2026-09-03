@@ -70,6 +70,15 @@ Dialog {
     /// click and onDone). Disables the button so impatient users do
     /// not stack RPC calls. Reset by both success and failure.
     property bool _saving: false
+    /// Releases the button if a save never answers. Every saver reports through
+    /// an RPC callback, and a response that never arrives left the only way out
+    /// of this dialog disabled for the rest of the session. Above the 30 s RPC
+    /// budget, so it fires only when that budget has already been missed.
+    property Timer _savingWatchdog: Timer {
+        interval: 35000
+        repeat: false
+        onTriggered: guard._saving = false
+    }
     /// One line naming exactly which state is unsaved, captured at open.
     property string _detailText: ""
 
@@ -218,21 +227,41 @@ Dialog {
                     return guard.ownerRoot.saveCallbackForSection(sectionId) !== null
                 }
                 enabled: !guard._saving
+                // "Save and continue" means ALL of it. Saving only the first
+                // dirty section left the rest dirty, so the guard re-opened on
+                // the very next step of the same navigation and the user was
+                // asked the same question again with no sign of progress.
                 onClicked: {
                     if (!guard.ownerRoot
+                            || typeof guard.ownerRoot.dirtySectionIds !== "function"
                             || typeof guard.ownerRoot.saveCallbackForSection !== "function") return
-                    var sectionId = guard.ownerRoot.firstDirtySectionId()
-                    var cb = guard.ownerRoot.saveCallbackForSection(sectionId)
-                    if (cb === null) return
+                    var ids = guard.ownerRoot.dirtySectionIds()
+                    var savers = []
+                    for (var i = 0; i < ids.length; i += 1) {
+                        var cb = guard.ownerRoot.saveCallbackForSection(ids[i])
+                        if (cb !== null) savers.push(cb)
+                    }
+                    if (savers.length === 0) return
                     guard._saving = true
-                    cb(function(ok) {
+                    guard._savingWatchdog.restart()
+                    var remaining = savers.length
+                    var allOk = true
+                    var settle = function(ok) {
+                        if (!ok) allOk = false
+                        remaining -= 1
+                        if (remaining > 0) return
+                        guard._savingWatchdog.stop()
                         guard._saving = false
-                        if (!ok) return
+                        if (!allOk) return
+                        if (typeof guard.ownerRoot.clearAllUnsavedChanges === "function") {
+                            guard.ownerRoot.clearAllUnsavedChanges()
+                        }
                         var intent = guard._pendingIntent
                         guard._pendingIntent = null
                         guard.close()
                         if (typeof intent === "function") intent()
-                    })
+                    }
+                    for (var j = 0; j < savers.length; j += 1) savers[j](settle)
                 }
             }
             ThemedButton {

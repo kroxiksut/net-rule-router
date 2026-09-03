@@ -50,5 +50,77 @@ GroupBox {
                 root.statusLine = root.tr("status.language-applied", "Interface language was updated.")
             }
         }
+
+        // Locale files that did not load cleanly. A defect inside one file no
+        // longer costs the whole language — the affected keys fall back to
+        // English and the rest of the file is used — so the user needs to be
+        // told which file and which key, here, where the language is chosen.
+        ColumnLayout {
+            id: localeDiagnosticsBlock
+            Layout.fillWidth: true
+            spacing: root.uiTheme.spacingXxs
+
+            // Reports worth showing: anything that was not accepted cleanly.
+            readonly property var problemReports: {
+                var out = []
+                var reports = (root.localeDiagnostics || {}).reports || []
+                for (var i = 0; i < reports.length; i += 1) {
+                    var r = reports[i] || {}
+                    var warnings = r.warnings || []
+                    var errors = r.errors || []
+                    if (warnings.length > 0 || errors.length > 0) out.push(r)
+                }
+                return out
+            }
+            property bool expanded: false
+
+            visible: root.uiRevision >= 0 && problemReports.length > 0
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    color: root.mutedTextColor
+                    text: root.tr("settings.language.diagnostics-summary",
+                        "%1 locale file(s) reported problems. The affected keys fall back to English; everything else in the file is used.")
+                        .arg(localeDiagnosticsBlock.problemReports.length)
+                }
+                ThemedButton {
+                    theme: root.uiTheme
+                    flat: true
+                    text: localeDiagnosticsBlock.expanded
+                        ? root.tr("settings.routing.show-less", "Hide details")
+                        : root.tr("settings.routing.show-more", "Show details")
+                    onClicked: localeDiagnosticsBlock.expanded = !localeDiagnosticsBlock.expanded
+                }
+            }
+
+            Repeater {
+                model: localeDiagnosticsBlock.expanded
+                    ? localeDiagnosticsBlock.problemReports : []
+                delegate: ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+                    Label {
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                        color: root.textColor
+                        font.bold: true
+                        text: String(modelData.fileName || modelData.id || "")
+                    }
+                    Repeater {
+                        model: (modelData.errors || []).concat(modelData.warnings || [])
+                        delegate: Label {
+                            Layout.fillWidth: true
+                            wrapMode: Text.WordWrap
+                            color: root.mutedTextColor
+                            text: "— " + String(modelData)
+                        }
+                    }
+                }
+            }
+        }
     }
 }

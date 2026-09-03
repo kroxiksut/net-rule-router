@@ -70,7 +70,33 @@ impl EnforcementBackend for WfpEnforcement {
     fn reconcile(&self, plan: &EnforcementPlan) -> Result<ApplyReport, Self::Error> {
         let filters = lower_plan(plan, self.egress);
         let requested = filters.len();
-        let actions = additions(filters);
+        let desired: std::collections::HashSet<u64> = filters.iter().map(|f| f.id.raw).collect();
+
+        // Reconcile means DRIVE THE PLATFORM TO MATCH THE PLAN, and this
+        // session is not dynamic — its filters outlive the process. Adding only
+        // what the plan lists left every filter the user has since deleted
+        // still enforced, across restarts, until something else swept them.
+        //
+        // Removal is scoped to THIS principal: filter sets are per-SID objects
+        // in the engine, `reconcile_all` walks one plan per user, and a sweep of
+        // "everything not in this plan" would take the other users' policy with
+        // it. A record with no user condition belongs to no principal and is
+        // left alone here.
+        // On Windows the stored principal IS the SID string, which is what the
+        // `ALE_USER_ID` condition carries back on enumeration.
+        let sid = plan.principal.as_stored();
+        let removals: Vec<WfpFilterAction> = self
+            .session
+            .enumerate_our_filters()?
+            .into_iter()
+            .filter(|record| {
+                record.user_sid.as_deref() == Some(sid) && !desired.contains(&record.id.raw)
+            })
+            .map(|record| WfpFilterAction::DeleteFilter(record.id))
+            .collect();
+
+        let mut actions = removals;
+        actions.extend(additions(filters));
 
         let outcome = self
             .session
@@ -150,17 +176,61 @@ mod tests {
     fn every_lowered_filter_becomes_an_add_action() {
         // The session's plan executor is add/remove-driven; a lowering that
         // produced anything else would silently drop rules here.
-        let filters = lower_plan(
-            &empty_plan(),
-            EgressLuids {
-                secondary: 7,
-                primary: 3,
-            },
-        );
+        let filters = lower_plan(&empty_plan(), EgressLuids { secondary: 7 });
         let actions = additions(filters.clone());
         assert_eq!(actions.len(), filters.len());
         assert!(actions
             .iter()
             .all(|a| matches!(a, WfpFilterAction::AddFilter(_))));
+    }
+    /// Reconcile REMOVES what the plan no longer lists.
+    ///
+    /// The session is not dynamic — its filters outlive the process — so an
+    /// add-only reconcile left every rule the user had deleted still enforced,
+    /// across restarts, until something else swept them. And the removal is
+    /// scoped to the principal: filter sets are per-SID objects, `reconcile_all`
+    /// walks one plan per user, and an unscoped sweep would take another user's
+    /// policy with it.
+    #[test]
+    fn reconcile_deletes_this_principals_filters_that_the_plan_dropped() {
+        use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterRecord, WfpLayerKey};
+        use nrr_platform_api::windows_api::MockWindowsApi;
+        use nrr_platform_api::WindowsApiPort;
+
+        let mine = "S-1-5-21-1-2-3-1001";
+        let theirs = "S-1-5-21-1-2-3-1002";
+        let record = |raw: u64, sid: &str| WfpFilterRecord {
+            id: WfpFilterId { raw },
+            layer: WfpLayerKey::AleAuthConnectV4,
+            action: WfpAction::Block,
+            remote_ip: None,
+            remote_ip_set: Vec::new(),
+            remote_port: None,
+            weight: 1,
+            user_sid: Some(sid.to_string()),
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        };
+        let api = Arc::new(MockWindowsApi::new());
+        *api.wfp_filters.lock().expect("lock") = vec![record(0xAAAA, mine), record(0xBBBB, theirs)];
+        let session =
+            Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).expect("open"));
+        let backend = WfpEnforcement::new(session, EgressLuids::default());
+
+        // An empty plan for `mine` asks for nothing, so everything of theirs
+        // stays and everything of mine goes.
+        backend.reconcile(&empty_plan()).expect("reconcile");
+        let left = api.wfp_filters.lock().expect("lock");
+        assert!(
+            left.iter().any(|f| f.id.raw == 0xBBBB),
+            "another principal's filter must survive",
+        );
+        assert!(
+            !left.iter().any(|f| f.id.raw == 0xAAAA),
+            "our own filter that the plan dropped must be removed",
+        );
     }
 }

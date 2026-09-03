@@ -130,3 +130,27 @@ fn theme_and_language_parsing_are_stable() {
     assert_eq!("reorder".parse::<RuleScenario>(), Ok(RuleScenario::Reorder));
     assert!("unknown-theme".parse::<ThemeMode>().is_err());
 }
+
+#[test]
+fn a_park_older_than_the_window_is_expired() {
+    use nrr_shared::{parked_intents_expired, PARKED_AT_MS_KEY};
+
+    let day_ms = 24 * 60 * 60 * 1000_i64;
+    let parked = format!(r#"{{"{PARKED_AT_MS_KEY}":1000}}"#);
+    assert!(!parked_intents_expired(&parked, 1000 + 6 * day_ms));
+    assert!(parked_intents_expired(&parked, 1000 + 8 * day_ms));
+}
+
+#[test]
+fn a_park_with_no_stamp_or_no_json_is_carried_not_discarded() {
+    use nrr_shared::parked_intents_expired;
+
+    // Losing a user's parked work over a missing field would be the worse
+    // failure of the two.
+    assert!(!parked_intents_expired(
+        r#"{"route-policy":{"a":1}}"#,
+        i64::MAX
+    ));
+    assert!(!parked_intents_expired("not json", i64::MAX));
+    assert!(!parked_intents_expired("", i64::MAX));
+}

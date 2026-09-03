@@ -29,11 +29,27 @@ use crate::revision::{
     RevisionActor, RevisionId, RevisionSeq, RevisionSource, RiskLevel, UnixTimestamp,
 };
 
+/// Room reserved inside one IPC frame for everything that is not the file:
+/// the envelope (operation, ids, class, token), the mutation payload's own
+/// fields, and JSON punctuation. Generous on purpose — the cost of over-
+/// reserving is a slightly smaller allowed file, the cost of under-reserving
+/// is a refusal from the wrong layer.
+const IMPORT_ENVELOPE_HEADROOM_BYTES: usize = 16 * 1024;
+
 /// Maximum permitted raw rules file size for a controlled import.
 ///
 /// Files exceeding this limit must be rejected during acquisition (before
 /// parsing), not inside the domain pipeline.
-pub const IMPORT_FILE_SIZE_LIMIT_BYTES: u64 = 1_024 * 1_024; // 1 MiB
+///
+/// DERIVED from the transport ceiling rather than set beside it. A preset
+/// travels base64-wrapped inside a JSON envelope, so the wire costs 4 bytes
+/// per 3 bytes of file. While this was a flat 1 MiB — the frame limit itself —
+/// every file above roughly three quarters of it passed the domain check and
+/// was then refused by the transport as "frame too large": a refusal from the
+/// wrong layer, in the wrong words, for a file the product said was fine.
+pub const IMPORT_FILE_SIZE_LIMIT_BYTES: u64 =
+    ((nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES - IMPORT_ENVELOPE_HEADROOM_BYTES) / 4 * 3)
+        as u64;
 
 /// The user-facing action that triggered this import.
 ///
@@ -337,8 +353,25 @@ mod tests {
         assert_eq!(ImportTrigger::CurrentFile.slug(), "current-file");
     }
 
+    /// The cap must be small enough that the file, base64-wrapped, still
+    /// leaves room for the envelope inside ONE frame. Otherwise the domain says
+    /// yes and the transport says "frame too large" — the exact split the
+    /// derivation exists to close. The realistic envelope is measured in
+    /// `nrr-service-runtime`, which is where a frame is actually built; this
+    /// crate keeps no JSON or base64 dependency to do it here.
     #[test]
-    fn import_file_size_limit_is_one_mib() {
-        assert_eq!(IMPORT_FILE_SIZE_LIMIT_BYTES, 1_024 * 1_024);
+    fn the_largest_accepted_import_still_fits_one_frame() {
+        const FRAME: usize = nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
+        // base64 emits 4 characters per 3 input bytes, rounded up.
+        let encoded = (IMPORT_FILE_SIZE_LIMIT_BYTES as usize).div_ceil(3) * 4;
+        assert!(
+            encoded + IMPORT_ENVELOPE_HEADROOM_BYTES <= FRAME,
+            "a maximum-size import encodes to {encoded} bytes, which with the              {IMPORT_ENVELOPE_HEADROOM_BYTES} byte envelope allowance exceeds the              {FRAME} byte frame"
+        );
+
+        // Positive control: the flat one-frame cap this replaced does NOT fit,
+        // so the assertion above tests the derivation rather than a frame limit
+        // roomy enough to swallow anything.
+        assert!(FRAME.div_ceil(3) * 4 + IMPORT_ENVELOPE_HEADROOM_BYTES > FRAME);
     }
 }

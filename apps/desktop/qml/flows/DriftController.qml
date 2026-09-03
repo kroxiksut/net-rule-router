@@ -76,13 +76,25 @@ QtObject {
         return String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
     }
 
+    /// The file this route's "file leg" actually reads.
+    ///
+    /// The same answer the Rules screen shows as the source, and for the same
+    /// reason: reading only `lastSavedPath*` made a user who only ever LOADS
+    /// rule sets have no file leg at all — the comparison ran against nothing
+    /// while the interface named a path, and the read that did happen reported
+    /// `import-read-failed` for a file the user could see listed.
+    function _rememberedRulesPath(route) {
+        return String(Pure.rememberedRulesPathFor(
+            root.prefs, route, root.prefs.userPresetsDir) || "")
+    }
+
     /// Read both bound files into `root._merge*Text` and run one
     /// `rules.merge-preview` pass. `done(result, errorCode)` — `result` is
     /// null on failure. Split out of `_openMergeDialog` so the same pass can
     /// answer "does merging change anything at all" before any dialog opens.
     function _fetchMergePreview(resolutions, done) {
-        var primaryPath = String(root.prefs.lastSavedPathPrimary || "")
-        var secondaryPath = String(root.prefs.lastSavedPathSecondary || "")
+        var primaryPath = _rememberedRulesPath("primary")
+        var secondaryPath = _rememberedRulesPath("secondary")
         var primB64 = primaryPath
             ? String(nrrNativeBridge.readFileBytes(primaryPath) || "") : ""
         var secB64 = secondaryPath
@@ -183,10 +195,8 @@ QtObject {
             return
         }
         var override = paths || {}
-        var primaryPath = String(override.primary
-            || root.prefs.lastSavedPathPrimary || "")
-        var secondaryPath = String(override.secondary
-            || root.prefs.lastSavedPathSecondary || "")
+        var primaryPath = String(override.primary || _rememberedRulesPath("primary"))
+        var secondaryPath = String(override.secondary || _rememberedRulesPath("secondary"))
         var primB64 = primaryPath
             ? nrrNativeBridge.readFileBytes(primaryPath) : ""
         var secB64 = secondaryPath
@@ -343,7 +353,7 @@ QtObject {
 
     /// Dialog action: clear ALL rules from
     /// the app AND push an empty revision to the service. Gated upstream
-    /// by `driftClearAllConfirmDialog`. Reuses `_applyEmptyRulesForReset`
+    /// by `driftClearAllConfirmDialog`. Reuses `FullResetController.applyEmptyRules`
     /// (the full-reset helper) — under a non-admin GUI its confirm phase
     /// is Forbidden and the launcher's R3 path elevates via UAC. On
     /// success the service refetch recaptures a clean (empty) baseline so
@@ -353,7 +363,7 @@ QtObject {
             "Clearing all rules…")
         Pure.clearModel(root.rulesModel)
         root.clearAllUnsavedChanges()
-        root._applyEmptyRulesForReset(function(ok) {
+        root.fullResetController.applyEmptyRules(function(ok) {
             if (ok) {
                 root._refreshRulesFromService({ silent: true })
                 root.statusLine = root.tr("status.drift-cleared-all",
@@ -475,9 +485,7 @@ QtObject {
     /// file. Async (RPC chain). Calls `done()` when the leg state
     /// reflects current disk content.
     function _driftRefreshFileHash(route, done) {
-        var path = (route === "secondary")
-            ? String(root.prefs.lastSavedPathSecondary || "")
-            : String(root.prefs.lastSavedPathPrimary || "")
+        var path = _rememberedRulesPath(route)
         var setExists = function(v) {
             if (route === "secondary") root._driftFileExistsSecondary = v
             else                       root._driftFileExistsPrimary = v
@@ -820,8 +828,8 @@ QtObject {
                 "gui-whole-book": String(guiHash || "")
             },
             "paths": {
-                "primary": String(root.prefs.lastSavedPathPrimary || ""),
-                "secondary": String(root.prefs.lastSavedPathSecondary || "")
+                "primary": _rememberedRulesPath("primary"),
+                "secondary": _rememberedRulesPath("secondary")
             },
             "merge-buckets": {
                 "file-only": (res && res["file-only"]) || [],
@@ -875,7 +883,7 @@ QtObject {
             root._driftFileCachedPathSecondary = ""
             _driftRecheckNow(false)
         }, true)
-        root._addPushNotice({
+        root.notificationsController._addPushNotice({
             "id": "rules-file-converged:" + _driftPairKey(),
             "kind": "rules-file-converged",
             "severity": "info",

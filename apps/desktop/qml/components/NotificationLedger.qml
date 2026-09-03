@@ -97,7 +97,10 @@ QtObject {
         if (!stat || !stat.exists) return
         var stamp = String(stat.mtime) + ":" + String(stat.size)
         if (stamp === _seenStamp) return
-        _seenStamp = stamp
+        // The stamp is recorded only once the file has actually been read: it
+        // means "this content is known", and claiming that after a failed read
+        // short-circuits every later poll until the file changes again — one
+        // transient failure and the surface stops seeing decisions for good.
         if (typeof nrrNativeBridge.readFileBytes !== "function"
                 || typeof nrrNativeBridge.decodeBase64Utf8 !== "function") {
             return
@@ -114,6 +117,7 @@ QtObject {
             return
         }
         if (!parsed || typeof parsed !== "object") return
+        _seenStamp = stamp
         var merged = {}
         for (var known in _entries) merged[known] = _entries[known]
         var fresh = []

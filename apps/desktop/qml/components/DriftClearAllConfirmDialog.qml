@@ -48,9 +48,18 @@ Dialog {
                 + "This cannot be undone.")
         }
         CheckBox {
+            id: driftClearAllAck
             Layout.fillWidth: true
-            checked: root._ack
-            onCheckedChanged: root._ack = checked
+            // A click writes `checked`, which destroys a plain binding to it.
+            // The box then shows the last gesture while the gate below reads
+            // the flag — a reopened dialog renders ticked and refuses to
+            // proceed, saying nothing. A Binding element keeps re-asserting.
+            Binding {
+                target: driftClearAllAck
+                property: "checked"
+                value: root._ack
+            }
+            onToggled: root._ack = checked
             text: root.tr("dialog.drift-clear-all.ack",
                 "I understand this removes all rules everywhere")
             Accessible.role: Accessible.CheckBox

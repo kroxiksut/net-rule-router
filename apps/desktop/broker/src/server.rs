@@ -19,6 +19,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nrr_ipc_client::wire::{read_frame, write_frame};
@@ -73,6 +74,19 @@ const ALLOWED_SERVICE_ACTIONS: &[&str] = &[
     // implementation of "undo what we applied".
     "cleanup",
 ];
+
+/// Verbs whose first act is to stop a running service. This process is the one
+/// the UAC prompt started, so its first such run is the one that must not begin
+/// while the desktop is still switching back from the prompt.
+const ACTIONS_THAT_STOP_THE_SERVICE: &[&str] = &["stop", "restart", "reinstall", "uninstall"];
+
+/// The settle belongs to the prompt, not to every command after it.
+static SETTLE_SPENT: AtomicBool = AtomicBool::new(false);
+
+/// Whether this run owes the post-elevation wait, marking it spent if so.
+fn claim_post_elevation_settle(action: &str, spent: &AtomicBool) -> bool {
+    ACTIONS_THAT_STOP_THE_SERVICE.contains(&action) && !spent.swap(true, Ordering::SeqCst)
+}
 
 /// Path of the broker's own lifecycle log.
 ///
@@ -265,6 +279,10 @@ fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
         return BrokerResponse::err("malformed-request", reason);
     }
     broker_log(&format!("service-control: {action} via {service_exe}"));
+    if claim_post_elevation_settle(action, &SETTLE_SPENT) {
+        broker_log("service-control: settling after the prompt before the first stop");
+        nrr_platform_api::elevation::settle_after_elevation();
+    }
     let mut cmd = Command::new(service_exe);
     cmd.arg(action);
     // The elevated child derives its state root from `%PROGRAMDATA%`, and this
@@ -329,19 +347,44 @@ pub fn run_broker_server(args: BrokerServerArgs) -> ExitCode {
         args.pipe_name, args.parent_pid
     ));
 
+    // ── Holding the name ─────────────────────────────────────────────────
+    //
+    // A named pipe exists only while at least one instance of it is open. The
+    // first instance is created with `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a name
+    // already taken is a loud failure here rather than a race; from then on the
+    // name must never fall to zero instances, or another process of this user
+    // could claim it in the gap, win the next accept, read the nonce out of the
+    // first frame and answer `ok` to a policy write the service never saw.
+    //
+    // So the NEXT instance is created before the served one is released. The
+    // DACL cannot help with this: the broker runs as the same user it is
+    // guarding against, and a mask that let the broker add an instance would let
+    // that user's other processes add one too.
+    let mut pending = match create_owner_restricted_pipe(&args.pipe_name, &args.client_sid, true) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[nrr-broker] fatal: cannot create pipe instance: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     loop {
-        let pipe = match create_owner_restricted_pipe(&args.pipe_name, &args.client_sid, false) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("[nrr-broker] fatal: cannot create pipe instance: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-
-        match accept_with_parent_watch(pipe.raw(), parent.raw()) {
+        match accept_with_parent_watch(pending.raw(), parent.raw()) {
             AcceptResult::Connected => {
-                let outcome = serve_connection(pipe.raw(), &args, &nonce, &service, started);
-                disconnect_and_close(pipe.into_raw());
+                // Claimed before the served instance is closed, so the name is
+                // continuously held. A failure here is fatal: carrying on would
+                // mean serving this connection and then releasing the last
+                // instance of the name.
+                let next =
+                    match create_owner_restricted_pipe(&args.pipe_name, &args.client_sid, false) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[nrr-broker] fatal: cannot create pipe instance: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                let outcome = serve_connection(pending.raw(), &args, &nonce, &service, started);
+                disconnect_and_close(pending.into_raw());
+                pending = next;
                 if let Served::Shutdown = outcome {
                     broker_log("shutdown requested — retiring");
                     return ExitCode::SUCCESS;
@@ -352,10 +395,21 @@ pub fn run_broker_server(args: BrokerServerArgs) -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             AcceptResult::Failed(e) => {
-                // Transient: drop this instance and loop. A tight failure
-                // loop is throttled so a persistent error doesn't spin.
+                // Transient. The instance is replaced the same way round — new
+                // one first — so the name is not released even for the moment
+                // this takes. A tight failure loop is throttled so a persistent
+                // error doesn't spin.
                 eprintln!("[nrr-broker] accept failed: {e}");
-                drop(pipe);
+                let next =
+                    match create_owner_restricted_pipe(&args.pipe_name, &args.client_sid, false) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("[nrr-broker] fatal: cannot create pipe instance: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                drop(pending);
+                pending = next;
                 std::thread::sleep(Duration::from_millis(200));
             }
         }
@@ -509,7 +563,10 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::{broker_log_path, check_service_binary, rotate_broker_log};
+    use super::{
+        broker_log_path, check_service_binary, claim_post_elevation_settle, rotate_broker_log,
+        AtomicBool,
+    };
     use nrr_shared::product_identity::BinaryRole;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -574,6 +631,28 @@ mod tests {
         let candidate = Path::new("C:/anywhere").join(service_name());
         assert!(check_service_binary(&candidate, None).is_ok());
         assert!(check_service_binary(Path::new("C:/anywhere/other.exe"), None).is_err());
+    }
+
+    #[test]
+    fn the_settle_is_owed_once_and_only_by_a_stop() {
+        let spent = AtomicBool::new(false);
+        assert!(claim_post_elevation_settle("stop", &spent));
+        assert!(
+            !claim_post_elevation_settle("restart", &spent),
+            "one prompt, one wait — later commands run straight away"
+        );
+
+        let fresh = AtomicBool::new(false);
+        for action in ["start", "set-start-auto", "cleanup", "install"] {
+            assert!(
+                !claim_post_elevation_settle(action, &fresh),
+                "{action} stops nothing"
+            );
+        }
+        assert!(
+            claim_post_elevation_settle("uninstall", &fresh),
+            "the ones that stop nothing must not spend the wait"
+        );
     }
 
     #[test]

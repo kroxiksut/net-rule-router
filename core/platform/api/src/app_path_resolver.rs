@@ -51,16 +51,54 @@ pub fn glob_match(pattern: &str, name: &str) -> bool {
     glob_chars(&pat, &txt)
 }
 
+/// Iterative wildcard match with a single backtrack point.
+///
+/// Deliberately not the recursive `(0..=txt.len()).any(...)` form: that
+/// re-explores the same suffixes once per `*` and goes exponential on a pattern
+/// like `*a*a*a*a*b`. Patterns arrive from imported rule sets — someone else's
+/// file — and this runs on the connection-observation path, so a pathological
+/// pattern would wedge that thread rather than merely be slow.
+///
+/// The algorithm walks both strings once, remembering where the last `*` was
+/// and how much text it had consumed; on a mismatch it hands the `*` one more
+/// character and resumes. Consecutive stars collapse, since `**` matches
+/// exactly what `*` matches.
 pub fn glob_chars(pat: &[char], txt: &[char]) -> bool {
-    match pat.first() {
-        None => txt.is_empty(),
-        // `*` — try consuming 0..=len characters of the text.
-        Some('*') => (0..=txt.len()).any(|i| glob_chars(&pat[1..], &txt[i..])),
-        // `?` — consume exactly one character.
-        Some('?') => !txt.is_empty() && glob_chars(&pat[1..], &txt[1..]),
-        Some(&pc) => txt
-            .first()
-            .is_some_and(|&tc| tc == pc && glob_chars(&pat[1..], &txt[1..])),
+    let (mut p, mut t) = (0usize, 0usize);
+    // Where to resume from if the current attempt fails: the pattern index just
+    // after the last `*`, and the text index that `*` had reached.
+    let mut star: Option<(usize, usize)> = None;
+
+    loop {
+        if p < pat.len() && pat[p] == '*' {
+            while p < pat.len() && pat[p] == '*' {
+                p += 1;
+            }
+            if p == pat.len() {
+                // A trailing `*` matches whatever is left.
+                return true;
+            }
+            star = Some((p, t));
+            continue;
+        }
+        let matched = t < txt.len() && p < pat.len() && (pat[p] == '?' || pat[p] == txt[t]);
+        if matched {
+            p += 1;
+            t += 1;
+            continue;
+        }
+        if p == pat.len() && t == txt.len() {
+            return true;
+        }
+        match star {
+            // Give the last `*` one more character and try again.
+            Some((resume_p, resume_t)) if resume_t < txt.len() => {
+                p = resume_p;
+                t = resume_t + 1;
+                star = Some((resume_p, t));
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -222,5 +260,31 @@ mod tests {
         let r = MockAppPathResolver::new().with("vk.exe", vec![p(r"C:\Apps\vk.exe")]);
         assert!(r.resolve("").is_empty());
         assert!(r.resolve("   ").is_empty());
+    }
+    /// The same answers as the recursive form, without its blow-up.
+    ///
+    /// The last case is the one that mattered: under the old
+    /// `(0..=txt.len()).any(...)` it re-explored every suffix once per star and
+    /// took exponential time on a pattern a shared rules file can carry.
+    #[test]
+    fn glob_matches_the_same_things_and_returns_promptly() {
+        assert!(glob_match("*.exe", "chrome.exe"));
+        assert!(glob_match("chrome.exe", "CHROME.EXE"));
+        assert!(glob_match("c*e.exe", "chrome.exe"));
+        assert!(glob_match("chrom?.exe", "chrome.exe"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("**", "anything"));
+        assert!(glob_match("*chrome*", "c:/x/chrome.exe"));
+        assert!(!glob_match("*.exe", "chrome.dll"));
+        assert!(!glob_match("chrom?.exe", "chrome2.exe"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+
+        let started = std::time::Instant::now();
+        assert!(!glob_match("*a*a*a*a*a*a*a*a*a*a*b", &"a".repeat(64)));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "wildcard match must not backtrack exponentially",
+        );
     }
 }

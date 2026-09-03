@@ -656,9 +656,9 @@ impl RulesApplyDispatcher for NoopRulesApplyDispatcher {
 /// `apply_for_sid` calls `PerSidApplyOrchestrator::recompile_for_sid` with the
 /// new rules; `revert_for_sid` is the same primitive with the previous rules.
 ///
-/// `dry_run_for_sid` and `pre_flight_for_sid` both go through
-/// `PerSidApplyOrchestrator::preview_for_sid`, which derives what the apply
-/// would do without touching the engine or any live status. Two consequences
+/// `dry_run_for_sid`, `pre_flight_for_sid` and `plan_with_pre_flight_for_sid`
+/// all go through `PerSidApplyOrchestrator::preview_for_sid`, which derives what
+/// the apply would do without touching the engine or any live status. Two consequences
 /// worth knowing: the add/remove counts are an id-level DIFF (an unchanged
 /// policy previews as 0/0, which is what "already on baseline" reads), and
 /// `routing_actions` stays 0 because the route plan is owned by the route
@@ -706,6 +706,33 @@ impl ProductionRulesApplyDispatcher {
             }
         }
         Some(snapshot)
+    }
+}
+
+/// The summary a SID with no reportable plan contributes.
+fn zero_plan_summary(sid: &str) -> SidActionPlanSummary {
+    SidActionPlanSummary {
+        sid: sid.to_string(),
+        filter_additions: 0,
+        filter_removals: 0,
+        routing_actions: 0,
+    }
+}
+
+/// Project a computed preview onto the coordinator's per-SID summary.
+///
+/// Routing actions live in the route coordinator's plan, not in the filter
+/// compute. Reporting 0 says "not counted here"; a guess would be worse than a
+/// known gap.
+fn plan_summary_of(
+    sid: &str,
+    preview: &crate::per_sid_orchestrator::SidApplyPreview,
+) -> SidActionPlanSummary {
+    SidActionPlanSummary {
+        sid: sid.to_string(),
+        filter_additions: u32::try_from(preview.additions).unwrap_or(u32::MAX),
+        filter_removals: u32::try_from(preview.removals).unwrap_or(u32::MAX),
+        routing_actions: 0,
     }
 }
 
@@ -773,31 +800,17 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
         sid: &str,
         rules_json: &str,
     ) -> Result<SidActionPlanSummary, DispatchFailure> {
-        let zero = SidActionPlanSummary {
-            sid: sid.to_string(),
-            filter_additions: 0,
-            filter_removals: 0,
-            routing_actions: 0,
-        };
         // Content that will not decode has no plan to report. Pre-flight names
         // that as a blocker; a dry run stays quiet and lets it.
         let Some(snapshot) = self.snapshot_for_dispatch(sid, rules_json, "dry-run") else {
-            return Ok(zero);
+            return Ok(zero_plan_summary(sid));
         };
         match self.orchestrator.preview_for_sid(sid, &snapshot) {
-            Ok(preview) => Ok(SidActionPlanSummary {
-                sid: sid.to_string(),
-                filter_additions: u32::try_from(preview.additions).unwrap_or(u32::MAX),
-                filter_removals: u32::try_from(preview.removals).unwrap_or(u32::MAX),
-                // Routing actions live in the route coordinator's plan, not in
-                // the filter compute. Reporting 0 says "not counted here"; a
-                // guess would be worse than a known gap.
-                routing_actions: 0,
-            }),
+            Ok(preview) => Ok(plan_summary_of(sid, &preview)),
             // A SID that cannot be previewed (baseline principal, empty SID) is
             // not a verdict on the revision — the coordinator dispatches per
             // active SID and one odd member must not sink the summary.
-            Err(_) => Ok(zero),
+            Err(_) => Ok(zero_plan_summary(sid)),
         }
     }
 
@@ -818,6 +831,37 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
         match self.orchestrator.preview_for_sid(sid, &snapshot) {
             Ok(preview) => Ok(preview_to_warnings(sid, &preview)),
             Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// One compute, both answers — see the trait method's own documentation for
+    /// why the preview path stopped asking twice. Each branch answers exactly
+    /// what the two methods above answer separately, so the summary a user sees
+    /// does not depend on which path produced it.
+    fn plan_with_pre_flight_for_sid(
+        &self,
+        sid: &str,
+        rules_json: &str,
+    ) -> (
+        Result<SidActionPlanSummary, DispatchFailure>,
+        Vec<PreFlightWarning>,
+    ) {
+        let Some(snapshot) = self.snapshot_for_dispatch(sid, rules_json, "preview") else {
+            return (
+                Ok(zero_plan_summary(sid)),
+                vec![PreFlightWarning {
+                    sid: sid.to_string(),
+                    category: PreFlightCategory::InvalidRulesContent,
+                    message: "rules content failed to decode".to_string(),
+                }],
+            );
+        };
+        match self.orchestrator.preview_for_sid(sid, &snapshot) {
+            Ok(preview) => (
+                Ok(plan_summary_of(sid, &preview)),
+                preview_to_warnings(sid, &preview),
+            ),
+            Err(_) => (Ok(zero_plan_summary(sid)), Vec::new()),
         }
     }
 

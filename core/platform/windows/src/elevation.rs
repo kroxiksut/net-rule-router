@@ -28,6 +28,22 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use nrr_platform_api::elevation::{ElevatedRun, PrivilegedRelaunchPort};
+/// Absolute path of the system PowerShell.
+///
+/// The bare name resolves through the process search path, which on Windows
+/// includes the current directory. This runs as LocalSystem (the DNS redirect)
+/// or raises a UAC prompt (the relaunch), so which binary answers to the name
+/// is not a detail. `%SystemRoot%` names the one Windows means.
+fn system_powershell() -> std::path::PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) => std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+        None => std::path::PathBuf::from("powershell.exe"),
+    }
+}
 
 /// The script's answer for "elevation did not happen": the prompt was dismissed,
 /// or `Start-Process` refused before creating anything. Chosen far above the
@@ -60,7 +76,7 @@ impl PrivilegedRelaunchPort for UacRelaunch {
 
     fn relaunch_and_wait(&self, program: &Path, args: &[String]) -> ElevatedRun {
         let script = relaunch_script(program, args);
-        let mut command = Command::new("powershell");
+        let mut command = Command::new(system_powershell());
         command
             .args(["-NoProfile", "-NonInteractive", "-Command", &script])
             .stdin(Stdio::null())

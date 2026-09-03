@@ -121,6 +121,13 @@ pub struct MockWindowsApi {
     pub adapter_infos: Mutex<Vec<crate::adapters::AdapterInfo>>,
     /// If `Some`, all mutable calls return this error.
     pub force_error: Mutex<Option<PlatformError>>,
+    /// If `Some`, only `create_ip_forward_entry` returns this error.
+    ///
+    /// Separate from `force_error` because the interesting route failures are
+    /// asymmetric: an update deletes and then adds, and the case worth testing
+    /// is the one where the delete succeeded and the add did not — the moment
+    /// the destination has no route at all.
+    fail_route_create: Mutex<Option<PlatformError>>,
     /// Makes the route-table READ fail with a transient error carrying this
     /// detail. Separate from `force_error`, which covers mutations: a caller
     /// that treats an unreadable table as an empty one is a distinct failure,
@@ -153,6 +160,7 @@ impl MockWindowsApi {
             wfp_filters: Mutex::new(Vec::new()),
             adapter_infos: Mutex::new(Vec::new()),
             force_error: Mutex::new(None),
+            fail_route_create: Mutex::new(None),
             fail_route_table_read: Mutex::new(None),
             fail_add_ids: Mutex::new(std::collections::HashSet::new()),
             fail_add_win32: Mutex::new(None),
@@ -203,44 +211,53 @@ impl MockWindowsApi {
         *self.force_error.lock().unwrap() = err;
     }
 
+    /// Fail only route CREATION, leaving deletes working.
+    pub fn set_route_create_error(&self, err: Option<PlatformError>) {
+        *self.fail_route_create.lock().unwrap() = err;
+    }
+
     fn check_error(&self) -> Result<(), PlatformError> {
         if let Some(e) = &*self.force_error.lock().unwrap() {
-            return Err(match e {
-                PlatformError::AccessDenied { operation } => {
-                    PlatformError::AccessDenied { operation }
-                }
-                PlatformError::NotYetImplemented { block } => {
-                    PlatformError::NotYetImplemented { block }
-                }
-                PlatformError::Transient { operation, detail } => PlatformError::Transient {
-                    operation,
-                    detail: detail.clone(),
-                },
-                PlatformError::Win32 {
-                    operation,
-                    code,
-                    message,
-                } => PlatformError::Win32 {
-                    operation,
-                    code: *code,
-                    message: message.clone(),
-                },
-                PlatformError::StateCorrupted { detail } => PlatformError::StateCorrupted {
-                    detail: detail.clone(),
-                },
-                PlatformError::NotSupported { reason } => PlatformError::NotSupported { reason },
-                PlatformError::Errno {
-                    operation,
-                    code,
-                    message,
-                } => PlatformError::Errno {
-                    operation,
-                    code: *code,
-                    message: message.clone(),
-                },
-            });
+            return Err(copy_error(e));
         }
         Ok(())
+    }
+}
+
+/// `PlatformError` is not `Clone` (it carries `&'static str` operation names
+/// alongside owned messages), and the mock has to hand the same error out more
+/// than once. Written by hand so a new variant is a compile error here rather
+/// than a silently dropped test knob.
+fn copy_error(e: &PlatformError) -> PlatformError {
+    match e {
+        PlatformError::AccessDenied { operation } => PlatformError::AccessDenied { operation },
+        PlatformError::NotYetImplemented { block } => PlatformError::NotYetImplemented { block },
+        PlatformError::Transient { operation, detail } => PlatformError::Transient {
+            operation,
+            detail: detail.clone(),
+        },
+        PlatformError::Win32 {
+            operation,
+            code,
+            message,
+        } => PlatformError::Win32 {
+            operation,
+            code: *code,
+            message: message.clone(),
+        },
+        PlatformError::StateCorrupted { detail } => PlatformError::StateCorrupted {
+            detail: detail.clone(),
+        },
+        PlatformError::NotSupported { reason } => PlatformError::NotSupported { reason },
+        PlatformError::Errno {
+            operation,
+            code,
+            message,
+        } => PlatformError::Errno {
+            operation,
+            code: *code,
+            message: message.clone(),
+        },
     }
 }
 
@@ -269,6 +286,9 @@ impl RouteTablePort for MockWindowsApi {
 
     fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
         self.check_error()?;
+        if let Some(e) = &*self.fail_route_create.lock().unwrap() {
+            return Err(copy_error(e));
+        }
         self.route_table.lock().unwrap().push(entry.clone());
         Ok(())
     }

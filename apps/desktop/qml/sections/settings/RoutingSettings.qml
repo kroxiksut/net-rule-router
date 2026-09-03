@@ -720,7 +720,7 @@ ColumnLayout {
             // mirror in step so a later offline launch shows them.
             panel._rememberRoutePolicy(req)
             if (killSwitchReArmed) {
-                root.killSwitchRestoredNoticeActive = true
+                root.notificationsController.killSwitchRestoredNoticeActive = true
                 root.statusLine = root.tr("status.kill-switch-restored-from-prefs",
                     "Leak protection was restored from your saved settings.")
             } else {
@@ -1303,7 +1303,7 @@ ColumnLayout {
             panel._rememberStability(payload, ["secondary-liveness-window-secs"])
             // Re-seeding a wiped service used to happen HERE, for this one
             // field, by pushing the remembered value back on every connect.
-            // That is now `root.replayServiceIntentToService()`, which covers
+            // That is now `root.serviceIntentController.replayServiceIntentToService()`, which covers
             // the whole stability group at once and runs before the panels
             // read. The single-field version was actively harmful: its
             // read-modify-write carried the wiped service's defaults for every
@@ -2864,7 +2864,7 @@ ColumnLayout {
                     wrapMode: Text.WordWrap
                     verticalAlignment: Text.AlignVCenter
                 }
-                onToggled: root.updatePrefs({ warnKillSwitchBlockAll: checked })
+                onToggled: { root.updatePrefs({ warnKillSwitchBlockAll: checked }); root.emitPrefs() }
             }
             Label {
                 Layout.fillWidth: true

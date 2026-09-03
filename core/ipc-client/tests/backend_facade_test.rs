@@ -156,11 +156,11 @@ fn diagnostics_status_response(stale: bool) -> SnapshotDiagnosticsResponse {
             cache_health: CacheHealthCard {
                 entry_count: 7,
                 healthy: true,
-                rebuilding: false,
             },
             log_health: LogHealthCard {
                 dir_writable: true,
                 total_size_bytes: 1024,
+                audit_size_bytes: 0,
                 file_count: 1,
                 dropped_count: 0,
                 last_cleanup_at: None,

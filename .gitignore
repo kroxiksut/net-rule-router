@@ -77,6 +77,8 @@ errors/
 .vscode/
 .codex/
 .claude/
+# Local copy of the assistant skills; the working copy lives in .claude/.
+.agents/skills/book-notes/
 # Visual Studio's own workspace state: a multi-megabyte content index, a
 # SQLite browse database and per-user window layout. Local by nature.
 .vs/

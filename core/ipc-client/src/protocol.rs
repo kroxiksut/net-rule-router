@@ -20,9 +20,10 @@ use nrr_shared::ipc_payloads::ContractNegotiateClientKind;
 
 use crate::connection::NegotiateInfo;
 
-/// Local protocol version. Mirrors `nrr_service_runtime::IPC_PROTOCOL_VERSION = 1`.
-/// Hardcoded here so the client doesn't take a dep on service-runtime.
-pub(crate) const CLIENT_PROTOCOL_VERSION: u32 = 1;
+/// Protocol version this client speaks. Read from the SSOT in `nrr-shared`,
+/// which both ends already depend on — a local copy meant a bump on the
+/// service side compiled green here and then failed every call.
+pub(crate) use nrr_shared::ipc::IPC_PROTOCOL_VERSION as CLIENT_PROTOCOL_VERSION;
 
 /// Outcome of one request/response exchange, delivered back to the caller
 /// thread. Neutral: carries only wire types (`Value`, `IpcOperationName`,

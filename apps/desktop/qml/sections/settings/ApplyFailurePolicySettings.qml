@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "../../components"
 
 // Mock-state panel for ApplyFailurePolicy. Slug values match
 // `nrr-storage::policy_settings::VALID_POLICY_SLUGS` so a later revision can swap the
@@ -62,7 +63,8 @@ GroupBox {
             delegate: ColumnLayout {
                 Layout.fillWidth: true
                 spacing: 0
-                RadioButton {
+                ThemedRadioButton {
+                    theme: root.uiTheme
                     Layout.fillWidth: true
                     ButtonGroup.group: policyGroup
                     checked: group.currentSlug === modelData.slug

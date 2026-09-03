@@ -6,7 +6,7 @@ rust-version = "1.94.1"
 publish = false
 license = "MPL-2.0"
 
-# Block 16.QoL+ — session elevation broker ("one UAC per session").
+# Session elevation broker ("one UAC per session").
 #
 # A long-lived ELEVATED copy of the launcher binary
 # (`NetRuleRouter.exe --nrr-elevated-broker`) that holds one privileged
@@ -22,7 +22,7 @@ license = "MPL-2.0"
 # into service internals.
 #
 # Dependency direction (CLAUDE.md): apps/launcher -> apps/broker;
-# apps/broker -> nrr-ipc-client + nrr-shared.
+# apps/broker -> nrr-ipc-client + nrr-shared + nrr-platform-api.
 
 [lib]
 name = "nrr_broker"
@@ -30,6 +30,7 @@ path = "src/lib.rs"
 
 [dependencies]
 nrr-ipc-client = { path = "../../../core/ipc-client" }
+nrr-platform-api = { path = "../../../core/platform/api" }
 nrr-shared = { path = "../../../shared/contracts" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

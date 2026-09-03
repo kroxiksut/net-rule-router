@@ -185,14 +185,13 @@ mod tests {
         sidecar_disk_footprint(db.path())
     }
 
-    /// Inflate the database past `target_bytes` by writing a large
-    /// `pending_apply.rules_json` row. We then delete it — SQLite
-    /// retains the freed pages until VACUUM, so the file stays large
-    /// while the live data is tiny, which is exactly the situation
-    /// VACUUM is meant to clean up.
+    /// Inflate the database past `target_bytes` with one large row, then
+    /// delete it — SQLite retains the freed pages until VACUUM, so the file
+    /// stays large while the live data is tiny, which is exactly the
+    /// situation VACUUM is meant to clean up.
     fn inflate_then_free(db: &SidecarDb, target_bytes: u64) -> SidecarResult<()> {
         let blob = "x".repeat(target_bytes as usize);
-        db.write_pending_apply_at(&blob, "{}", "hash", 1)?;
+        db.write_pending_apply_at(&blob, "hash", 1)?;
         db.clear_pending_apply()?;
         Ok(())
     }

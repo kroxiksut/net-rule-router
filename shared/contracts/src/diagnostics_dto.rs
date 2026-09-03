@@ -97,11 +97,11 @@ impl DiagnosticsStatusDto {
             cache_health: CacheHealthCard {
                 entry_count: 0,
                 healthy: false,
-                rebuilding: false,
             },
             log_health: LogHealthCard {
                 dir_writable: false,
                 total_size_bytes: 0,
+                audit_size_bytes: 0,
                 file_count: 0,
                 dropped_count: 0,
                 last_cleanup_at: None,
@@ -140,10 +140,14 @@ pub struct SecurityStatusCard {
 pub struct CacheHealthCard {
     /// Approximate number of cached hostname→IP entries.
     pub entry_count: u64,
-    /// Whether the cache is healthy (not corrupt, not in rebuild).
+    /// Whether the cache is healthy (not corrupt).
+    ///
+    /// There was a `rebuilding` flag beside this. Nothing ever set it: a
+    /// corrupt FQDN cache is deleted and rebuilt during bootstrap, before the
+    /// IPC server is listening, so no client can be told about a rebuild that
+    /// is under way. It was removed rather than left constant — the window had
+    /// four branches on a value that could not occur.
     pub healthy: bool,
-    /// Whether a cache rebuild is in progress.
-    pub rebuilding: bool,
 }
 
 /// Log storage health card.
@@ -153,6 +157,15 @@ pub struct LogHealthCard {
     pub dir_writable: bool,
     /// Total size of operational log files in bytes.
     pub total_size_bytes: u64,
+    /// Total size of audit NDJSON files in bytes.
+    ///
+    /// Separate from `total_size_bytes` because the two have separate retention
+    /// budgets and separate rules — audit files are never removed by a user
+    /// cleanup — so one combined number would answer neither question. Defaults
+    /// to 0 for a service that predates the field: an unknown size reads as
+    /// "nothing measured", never as a size somebody could act on.
+    #[serde(default)]
+    pub audit_size_bytes: u64,
     /// Number of log files on disk.
     pub file_count: u32,
     /// Events dropped due to write failures since service start.
@@ -419,11 +432,11 @@ mod tests {
             cache_health: CacheHealthCard {
                 entry_count: 42,
                 healthy: true,
-                rebuilding: false,
             },
             log_health: LogHealthCard {
                 dir_writable: true,
                 total_size_bytes: 1024,
+                audit_size_bytes: 0,
                 file_count: 1,
                 dropped_count: 0,
                 last_cleanup_at: None,

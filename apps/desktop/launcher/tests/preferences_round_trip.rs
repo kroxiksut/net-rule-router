@@ -632,3 +632,29 @@ fn an_unparsable_payload_writes_nothing() {
         "a payload that cannot be applied must not trigger a write"
     );
 }
+
+#[test]
+fn stopping_the_install_offer_round_trips_and_an_older_build_keeps_the_offer() {
+    // "Stop offering" is the only answer that holds indefinitely, so it has to
+    // survive the GUI→launcher parse. A QML build that does not emit the key
+    // must leave the offer ON: without the service nothing is enforced, and a
+    // missing field must not be read as "the user said never".
+    let baseline = UiPreferences::default();
+    let mut object: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
+    object.insert(
+        "serviceInstallPromptSuppressed".into(),
+        serde_json::json!(true),
+    );
+    let updated =
+        apply_qt_preferences_payload(&baseline, &serde_json::Value::Object(object).to_string())
+            .expect("payload must parse");
+    assert!(updated.service_install_prompt_suppressed);
+
+    let silent = apply_qt_preferences_payload(&baseline, &payload_with_theme("dark", false))
+        .expect("payload without the key must parse");
+    assert!(
+        !silent.service_install_prompt_suppressed,
+        "an absent key must not silence the offer"
+    );
+}

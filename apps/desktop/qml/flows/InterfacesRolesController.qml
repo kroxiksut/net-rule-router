@@ -17,6 +17,11 @@ QtObject {
 
     function rebuildInterfacesModel() {
         Pure.clearModel(root.interfacesModel)
+        // Collected first, appended once. A per-row `append` makes the view
+        // recount, re-layout and re-evaluate every delegate binding on each
+        // row, and this rebuild runs on every adapter refresh — the same reason
+        // the rules table has `_appendRowsChunked`.
+        var kept = []
         for (var r = 0; r < root.interfacesRowsAll.length; r += 1) {
             var row = root.interfacesRowsAll[r]
             if (!root.prefs.showBluetoothAdapters && row.isBluetoothLike) continue
@@ -34,8 +39,9 @@ QtObject {
             if (row.selectedRole === null || row.selectedRole === undefined) {
                 row.selectedRole = ""
             }
-            root.interfacesModel.append(row)
+            kept.push(row)
         }
+        if (kept.length > 0) root.interfacesModel.append(kept)
     }
 
     // Live adapter refresh. The adapter list is
@@ -107,6 +113,9 @@ QtObject {
             if (mappedRow) mapped.push(mappedRow)
         }
         if (mapped.length === 0) return
+        // The service reports what it actually enumerated. Carrying the verdict
+        // is what keeps a placeholder list from being drawn as this machine.
+        root.interfacesDataSource = String(payload["data-source"] || "fallback-mock")
         root.interfacesRowsAll = mapped
         _reapplyInterfaceRolesFromPrefs()
         rebuildInterfacesModel()
@@ -189,16 +198,29 @@ QtObject {
             var row = mapped[i]
             var of = row.observedFacts || {}
             var ip = String(of.externalIp || "")
-            if (ip === "") continue
             var key = Pure.externalIpCacheKey(row.persistentId, row.name)
+            var role = String(row.selectedRole || "")
+            var roleKey = (role === "primary" || role === "secondary")
+                ? Pure.externalIpRoleCacheKey(role) : ""
+            // A live answer with no address is an answer: the service dropped
+            // it (the adapter's local IP changed), so the cached one is no
+            // longer this machine's. An empty address deletes the row rather
+            // than leaving a "last known" that is not known at all.
+            if (ip === "") {
+                entries.push({ key: key, "external-ip": "", "observed-at-ms": nowMs })
+                delete cache[key]
+                if (roleKey !== "") {
+                    entries.push({ key: roleKey, "external-ip": "", "observed-at-ms": nowMs })
+                    delete cache[roleKey]
+                }
+                continue
+            }
             entries.push({ key: key, "external-ip": ip, "observed-at-ms": nowMs })
             cache[key] = { ip: ip, observedAtMs: nowMs }
             // A second entry under the ROLE. The tray shows these addresses by
             // route and, with the service stopped, has no way to learn which
             // adapter carries which role — it would have nothing to look up.
-            var role = String(row.selectedRole || "")
-            if (role === "primary" || role === "secondary") {
-                var roleKey = Pure.externalIpRoleCacheKey(role)
+            if (roleKey !== "") {
                 entries.push({ key: roleKey, "external-ip": ip, "observed-at-ms": nowMs })
                 cache[roleKey] = { ip: ip, observedAtMs: nowMs }
             }
@@ -401,6 +423,13 @@ QtObject {
         root.prefs.selectedSecondaryInterfaceId = String(r.persistentId || "")
         root.prefs.selectedSecondaryInterfaceName = String(r.name || r.description || "")
         root.prefs.secondaryRoleUserConfirmed = true
+        // Writing INTO the object leaves the property itself unchanged, so no
+        // binding re-evaluates: the amber "additional adapter not found" banner
+        // outlived the re-confirmation that had just fixed it. Bumping the
+        // revision is how every other reader of `prefs` learns about a change;
+        // this path deliberately skips `updatePrefs` (see above) and therefore
+        // has to do it itself.
+        root.uiRevision += 1
         root.emitPrefs()
         _reapplyInterfaceRolesFromPrefs()
         rebuildInterfacesModel()

@@ -180,11 +180,23 @@ QWidget *createStartupSplash(const QString &applicationDir) {
     return splash;
 }
 
+/// Absolute path of the Windows shell.
+///
+/// A bare `explorer.exe` is resolved against a PATH any process of this user
+/// can prepend to; `%SystemRoot%` names the one Windows means.
+QString systemExplorerPath() {
+    const QString root = qEnvironmentVariable("SystemRoot");
+    if (root.isEmpty()) {
+        return QStringLiteral("explorer.exe");
+    }
+    return QDir(root).filePath(QStringLiteral("explorer.exe"));
+}
+
 QString resolveDefaultQmlRelativePath(const QString &applicationFilePath) {
     if (isTrayProductExecutable(applicationFilePath)) {
-        return QStringLiteral("apps/windows/qml/Tray.qml");
+        return QStringLiteral("apps/desktop/qml/Tray.qml");
     }
-    return QStringLiteral("apps/windows/qml/Main.qml");
+    return QStringLiteral("apps/desktop/qml/Main.qml");
 }
 
 QString resolveQmlPath(const LaunchOptions &options,
@@ -383,7 +395,7 @@ public:
     explicit NrrNativeBridge(const QString &applicationDir, QObject *parent = nullptr)
         : QObject(parent),
           applicationDir_(applicationDir),
-          mainQmlPath_(findUpwardFile(applicationDir, QStringLiteral("apps/windows/qml/Main.qml"))),
+          mainQmlPath_(findUpwardFile(applicationDir, QStringLiteral("apps/desktop/qml/Main.qml"))),
           mainGuiExecutable_(resolveMainGuiExecutable(applicationDir)),
           trayGuiExecutable_(resolveTrayGuiExecutable(applicationDir)),
           guiActivationRequestPath_(guiActivationRequestFilePath()),
@@ -632,13 +644,13 @@ public:
         QFileInfo info(path);
         if (info.exists()) {
             // `/select,` highlights the file inside its folder.
-            QProcess::startDetached(QStringLiteral("explorer.exe"),
+            QProcess::startDetached(systemExplorerPath(),
                                     {QStringLiteral("/select,") + native});
         } else {
             // File gone — fall back to opening the parent directory.
             const QString dir = info.absolutePath();
             if (!dir.isEmpty()) {
-                QProcess::startDetached(QStringLiteral("explorer.exe"),
+                QProcess::startDetached(systemExplorerPath(),
                                         {QDir::toNativeSeparators(dir)});
             }
         }
@@ -1595,6 +1607,15 @@ public:
         if (relativePath.isEmpty()) {
             return QString();
         }
+        // The caller names a set inside a preset root; a relative path that
+        // climbs out of it names something else entirely, and this result is
+        // handed straight to a file read.
+        if (relativePath.contains(QStringLiteral(".."))
+            || QDir::isAbsolutePath(relativePath)) {
+            qWarning() << "resolvePresetPath: refusing to leave the preset root:"
+                       << relativePath;
+            return QString();
+        }
         const QString userRoot = rootOverride.trimmed();
         if (!userRoot.isEmpty()) {
             const QDir userDir(userRoot);
@@ -2311,11 +2332,9 @@ public:
                               QJsonObject());
     }
 
-    Q_INVOKABLE QString rpcSidecarPendingApplyWrite(const QString &rulesJson,
-                                                    const QString &summaryJson,
+    Q_INVOKABLE QString rpcSidecarPendingApplyWrite(const QString &summaryJson,
                                                     const QString &contentHash) {
         QJsonObject obj;
-        obj.insert(QStringLiteral("rules-json"), rulesJson);
         obj.insert(QStringLiteral("summary-json"), summaryJson);
         obj.insert(QStringLiteral("content-hash"), contentHash);
         return emitRpcRequest(QStringLiteral("sidecar.pending-apply.write"), obj);
@@ -2579,7 +2598,7 @@ private:
             return;
         }
 #ifdef Q_OS_WIN
-        if (!QProcess::startDetached(QStringLiteral("explorer.exe"), {QDir::toNativeSeparators(logsDirectory_)})) {
+        if (!QProcess::startDetached(systemExplorerPath(), {QDir::toNativeSeparators(logsDirectory_)})) {
             qWarning() << "Failed to open logs folder via explorer.exe.";
         }
 #else
@@ -2952,6 +2971,8 @@ class NrrServiceController : public QObject {
     // `activeOperation` names the leg currently in flight.
     Q_PROPERTY(bool busy READ busy NOTIFY busyChanged)
     Q_PROPERTY(QString activeOperation READ activeOperation NOTIFY busyChanged)
+    // Answered from a cache; `refreshStartMode()` refills it off the GUI thread.
+    Q_PROPERTY(QString startMode READ startMode NOTIFY startModeChanged)
 public:
     enum Status {
         Unknown = 0,
@@ -2966,26 +2987,38 @@ public:
     explicit NrrServiceController(const QString &applicationDir,
                                   QObject *parent = nullptr)
         : QObject(parent) {
-        // The service executable is `nrr-service.exe` on every layout —
-        // the crate name states the platform, the binary name states the
-        // role. Dev paths first (target/debug, target/release), then
-        // sibling-to-GUI for a production install.
-        const QStringList candidates = {
-            QStringLiteral("target/debug/nrr-service.exe"),
-            QStringLiteral("target/release/nrr-service.exe"),
-        };
-        for (const QString &rel : candidates) {
-            servicePath_ = findUpwardFile(applicationDir, rel);
-            if (!servicePath_.isEmpty()) { break; }
+        // The service executable is `nrr-service.exe` on every layout — the
+        // crate name states the platform, the binary name states the role.
+        //
+        // ONLY the binary sitting next to this host is accepted. This path ends
+        // at `ShellExecuteExW` with an administrator token, so the directory it
+        // reads from is a trust boundary: a search that climbs the tree from an
+        // installed GUI reaches the root of the system drive, where a default
+        // Windows ACL lets any authenticated user create a directory and own
+        // it. The broker branch draws the same line (`check_service_binary`
+        // requires the directory to match its own); the direct branch must not
+        // be the softer of the two.
+        //
+        // A dev tree whose host and service are not siblings sets
+        // NRR_SERVICE_BINARY, honoured in debug builds only.
+        const QString sibling =
+            QDir(applicationDir).filePath(QStringLiteral("nrr-service.exe"));
+        if (QFileInfo::exists(sibling)) {
+            servicePath_ = QDir::cleanPath(sibling);
         }
+#ifndef NDEBUG
+        // Debug builds run out of `target/debug`, where the host and the
+        // service are already siblings; this covers the layouts where they are
+        // not. Absent from a release build entirely, so no shipped binary can
+        // be talked into it.
         if (servicePath_.isEmpty()) {
-            // Production install: sibling to the GUI binary.
-            const QString sibling =
-                QDir(applicationDir).filePath(QStringLiteral("nrr-service.exe"));
-            if (QFileInfo::exists(sibling)) {
-                servicePath_ = QDir::cleanPath(sibling);
+            const QString override =
+                normalizeLocalPath(qEnvironmentVariable("NRR_SERVICE_BINARY"));
+            if (!override.isEmpty() && QFileInfo::exists(override)) {
+                servicePath_ = QDir::cleanPath(override);
             }
         }
+#endif
 
         // Worker thread for elevated operations.
         worker_ = new NrrServiceWorker();
@@ -3121,36 +3154,63 @@ public:
         dispatch(verb, verb);
     }
 
-    /// Read the current start mode for the toggle.
-    /// Runs the UNELEVATED `query-start-mode` verb (SERVICE_QUERY_CONFIG is open
-    /// to authenticated users) and returns its slug ("with-windows" /
-    /// "on-app-launch"), or an empty string when the service isn't installed or
-    /// is unreadable. Synchronous + short — the binary just reads one SCM field.
-    Q_INVOKABLE QString queryServiceStartMode() {
-        if (servicePath_.isEmpty()) { return QString(); }
-        QProcess proc;
+    /// Last known start mode: the slug the UNELEVATED `query-start-mode` verb
+    /// printed ("with-windows" / "on-app-launch"), or empty when the service is
+    /// not installed, unreadable, or has not been asked yet.
+    QString startMode() const { return startMode_; }
+
+    /// Ask the service binary for its start mode, WITHOUT blocking.
+    ///
+    /// Spawning a process and waiting for it is not something a GUI thread may
+    /// do: the wait was budgeted at three seconds, and every one of them is a
+    /// frozen window — on exactly the machine where the service is unwell and
+    /// the binary is slow to answer. The answer arrives through
+    /// `startModeChanged` instead; readers bind to `startMode`.
+    ///
+    /// Re-entrant by design: a refresh already in flight is left to finish
+    /// rather than restarted, so a burst of requests costs one process.
+    Q_INVOKABLE void refreshStartMode() {
+        if (servicePath_.isEmpty() || startModeProc_ != nullptr) {
+            return;
+        }
+        auto *proc = new QProcess(this);
+        startModeProc_ = proc;
 #ifdef Q_OS_WIN
         // The service binary is console-subsystem; suppress the conhost flash
         // (CREATE_NO_WINDOW, mirroring the broker's exec).
-        proc.setCreateProcessArgumentsModifier(
+        proc->setCreateProcessArgumentsModifier(
             [](QProcess::CreateProcessArguments *args) {
                 args->flags |= 0x08000000; // CREATE_NO_WINDOW
             });
 #endif
-        proc.start(servicePath_, QStringList{QStringLiteral("query-start-mode")});
-        if (!proc.waitForFinished(3000)) {
-            proc.kill();
-            return QString();
-        }
-        if (proc.exitStatus() != QProcess::NormalExit || proc.exitCode() != 0) {
-            return QString();
-        }
-        return QString::fromUtf8(proc.readAllStandardOutput()).trimmed();
+        connect(proc, &QProcess::finished, this,
+                [this, proc](int exitCode, QProcess::ExitStatus status) {
+                    QString slug;
+                    if (status == QProcess::NormalExit && exitCode == 0) {
+                        slug = QString::fromUtf8(proc->readAllStandardOutput()).trimmed();
+                    }
+                    startModeProc_ = nullptr;
+                    proc->deleteLater();
+                    if (slug != startMode_) {
+                        startMode_ = slug;
+                        emit startModeChanged();
+                    }
+                });
+        connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
+            startModeProc_ = nullptr;
+            proc->deleteLater();
+            if (!startMode_.isEmpty()) {
+                startMode_.clear();
+                emit startModeChanged();
+            }
+        });
+        proc->start(servicePath_, QStringList{QStringLiteral("query-start-mode")});
     }
 
 signals:
     void statusChanged();
     void busyChanged();
+    void startModeChanged();
     /// Emitted right before an elevated leg is dispatched to the worker.
     /// Fires once per leg, so a restart raises it twice ("stop" then
     /// "start") and an install raises it for "install" then "start".
@@ -3334,6 +3394,10 @@ private:
     }
 
     QString servicePath_;
+    /// Cache behind the `startMode` property, and the refresh in flight (null
+    /// when none is).
+    QString startMode_;
+    QProcess *startModeProc_ = nullptr;
     Status status_ = Unknown;
     QString statusReason_;
     bool busy_ = false;
@@ -3401,6 +3465,13 @@ public:
     /// until the destructor fires a `QThread: Destroyed while thread
     /// is still running` qFatal.
     void requestStopAndCloseStdin() {
+        // Called from `aboutToQuit` AND from the shutdown path, and everything
+        // below closes handles. A second pass would close descriptors the CRT
+        // may have handed to something else by then, so the first pass is the
+        // only one that does anything.
+        if (stdinClosed_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
         stop_.store(true, std::memory_order_release);
 #ifdef Q_OS_WIN
         DWORD tid = readerThreadId_.load(std::memory_order_acquire);
@@ -3459,6 +3530,7 @@ protected:
 private:
     NrrNativeBridge *bridge_ = nullptr;
     std::atomic<bool> stop_{false};
+    std::atomic<bool> stdinClosed_{false};
 #ifdef Q_OS_WIN
     // Win32 thread id captured at the start of `run()`. Used by
     // `requestStopAndCloseStdin` to call `CancelSynchronousIo` against
@@ -3729,6 +3801,19 @@ int main(int argc, char *argv[]) {
         &application, &QCoreApplication::aboutToQuit, &application,
         [&rpcStdinReader]() { rpcStdinReader.requestStopAndCloseStdin(); });
 
+    // Service Control Manager bridge. Q_INVOKABLE methods drive the Settings →
+    // Service Management panel, the tray status badge, and the first-launch
+    // install dialog.
+    //
+    // Declared BEFORE the engine, and therefore destroyed after it. It is a
+    // context property of that engine, so the reverse order left the QML tree
+    // being torn down with a context property that had already died — any
+    // binding re-evaluated during teardown read a dangling pointer.
+    NrrServiceController serviceController(applicationDir);
+    // Let a non-elevated GUI route service
+    // control through the session elevation broker (one UAC per session).
+    serviceController.setBridge(&nativeBridge);
+
     QQmlApplicationEngine engine;
     QObject::connect(
         &engine,
@@ -3737,13 +3822,6 @@ int main(int argc, char *argv[]) {
         [](const QUrl &) { QCoreApplication::exit(1); },
         Qt::QueuedConnection);
     engine.rootContext()->setContextProperty(QStringLiteral("nrrNativeBridge"), &nativeBridge);
-    // Service Control Manager bridge. Q_INVOKABLE
-    // methods drive the Settings → Service Management panel, the
-    // tray status badge, and the first-launch install dialog.
-    NrrServiceController serviceController(applicationDir);
-    // Let a non-elevated GUI route service
-    // control through the session elevation broker (one UAC per session).
-    serviceController.setBridge(&nativeBridge);
     engine.rootContext()->setContextProperty(
         QStringLiteral("nrrServiceController"), &serviceController);
     if (!contextFilePath.isEmpty()) {

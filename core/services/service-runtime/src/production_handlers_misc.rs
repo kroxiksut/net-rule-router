@@ -154,7 +154,7 @@ impl ProductionRulesSnapshotProvider {
                 if row.rule_type != "application" || row.target_route != "secondary" {
                     continue;
                 }
-                let held: Vec<String> =
+                let mut held: Vec<String> =
                     crate::app_observation_lookup::AppObservationLookup::ips_for_app(
                         store.as_ref(),
                         &row.match_value,
@@ -162,7 +162,15 @@ impl ProductionRulesSnapshotProvider {
                     .into_iter()
                     .map(|ip| ip.to_string())
                     .collect();
-                row.pinned_destinations = (!held.is_empty()).then_some(held);
+                if held.is_empty() {
+                    continue;
+                }
+                // The list is the only unbounded part of this response, and the
+                // whole response has to fit one frame.
+                let total = held.len();
+                held.truncate(nrr_shared::ipc_payloads::MAX_PINNED_DESTINATIONS_PER_ROW);
+                row.pinned_destinations = Some(held);
+                row.pinned_destinations_total = Some(total);
             }
         }
     }
@@ -336,6 +344,7 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
         origin: dto.origin.clone(),
         // Filled with the other annotations, once per snapshot.
         pinned_destinations: None,
+        pinned_destinations_total: None,
     }
 }
 
@@ -1031,6 +1040,7 @@ impl MutationExecutor for NoopMutationExecutor {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         }
     }
 
@@ -1635,6 +1645,7 @@ mod hosts_override_tests {
             hosts_override: None,
             origin: None,
             pinned_destinations: None,
+            pinned_destinations_total: None,
         }
     }
 

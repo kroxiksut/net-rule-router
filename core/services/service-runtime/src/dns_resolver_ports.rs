@@ -1088,6 +1088,9 @@ impl crate::dns_resolver::SecondaryOwnedIps for ActiveSecondaryOwnedIps {
 pub struct HookSyncReconciler {
     hook: RouteRecomputeHook,
     state: Arc<(Mutex<ReconcileWorkerState>, std::sync::Condvar)>,
+    /// Duration of the last completed hook run, in milliseconds; `0` until one
+    /// has finished. Read by [`SyncReconciler::typical_run`].
+    last_run_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(Default)]
@@ -1109,6 +1112,7 @@ impl HookSyncReconciler {
                 Mutex::new(ReconcileWorkerState::default()),
                 std::sync::Condvar::new(),
             )),
+            last_run_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1117,6 +1121,7 @@ impl HookSyncReconciler {
     fn worker_loop(
         hook: RouteRecomputeHook,
         state: Arc<(Mutex<ReconcileWorkerState>, std::sync::Condvar)>,
+        last_run: Arc<std::sync::atomic::AtomicU64>,
     ) {
         let (lock, cv) = &*state;
         loop {
@@ -1138,6 +1143,12 @@ impl HookSyncReconciler {
             let started = std::time::Instant::now();
             hook();
             let took = started.elapsed();
+            // Published so the answer gate can tell a wait that can succeed
+            // from one that cannot — see `SyncReconciler::typical_run`.
+            last_run.store(
+                took.as_millis().min(u128::from(u64::MAX)) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let mut guard = lock.lock().unwrap_or_else(|p| p.into_inner());
             let credited = target.saturating_sub(guard.completed);
             let queued = guard.requested.saturating_sub(target);
@@ -1178,7 +1189,8 @@ impl SyncReconciler for HookSyncReconciler {
                 guard.worker_spawned = true;
                 let hook = Arc::clone(&self.hook);
                 let state = Arc::clone(&self.state);
-                std::thread::spawn(move || Self::worker_loop(hook, state));
+                let last_run = Arc::clone(&self.last_run_ms);
+                std::thread::spawn(move || Self::worker_loop(hook, state, last_run));
             }
             cv.notify_all();
             guard.requested
@@ -1203,6 +1215,40 @@ impl SyncReconciler for HookSyncReconciler {
                 return ReconcileOutcome::DeadlineExceeded;
             }
         }
+    }
+
+    fn typical_run(&self) -> Option<Duration> {
+        match self.last_run_ms.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+}
+
+/// Production [`crate::dns_resolver::EnforcedAddressView`]: the routing-active
+/// principal's slice of what the last apply installed.
+///
+/// Keyed on the active SID rather than a union across principals — an address
+/// enforced for somebody else says nothing about the connection this answer is
+/// about to enable. With nobody routing-active nothing is enforced, which is
+/// the truth: no principal's filters are installed.
+pub struct ActiveSidEnforcedAddresses {
+    active_sid: crate::supervised_runtime::ActiveRoutingSidFn,
+    register: Arc<crate::enforced_addresses::EnforcedAddressRegister>,
+}
+
+impl ActiveSidEnforcedAddresses {
+    pub fn new(active_sid: crate::supervised_runtime::ActiveRoutingSidFn) -> Self {
+        Self {
+            active_sid,
+            register: crate::enforced_addresses::global_enforced_addresses(),
+        }
+    }
+}
+
+impl crate::dns_resolver::EnforcedAddressView for ActiveSidEnforcedAddresses {
+    fn is_enforced(&self, ip: std::net::Ipv4Addr) -> bool {
+        (self.active_sid)().is_some_and(|sid| self.register.is_enforced(&sid, ip))
     }
 }
 

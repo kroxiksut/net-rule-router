@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use nrr_domain::enforcement_mode::EnforcementMode;
-use nrr_platform_api::dns_redirect::SystemDnsRedirectPort;
+use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
 
 use crate::dns_listener::DnsInterceptListener;
 
@@ -48,12 +48,19 @@ pub enum DnsResolverRunOutcome {
     CancelledBeforeRedirect,
 }
 
+/// How often the guard re-checks that the redirect is still configured and
+/// the table around it is sane. The check is a registry read; the failure it
+/// catches (a rule vanishing, a half-written rule from another process) left
+/// the machine resolving past us for minutes without a single log line.
+const REDIRECT_GUARD_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Owns the Mode-B intercept listener plus the system-DNS redirect port and
 /// drives their combined lifecycle in one blocking call.
 pub struct DnsResolverService {
     listener: DnsInterceptListener,
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
+    guard_interval: Duration,
 }
 
 impl DnsResolverService {
@@ -66,6 +73,62 @@ impl DnsResolverService {
             listener,
             redirect,
             listen_addr,
+            guard_interval: REDIRECT_GUARD_INTERVAL,
+        }
+    }
+
+    /// Guard cadence override for tests.
+    pub fn with_guard_interval(mut self, interval: Duration) -> Self {
+        self.guard_interval = interval;
+        self
+    }
+
+    /// Re-installs the redirect whenever `inspect` finds it missing or the
+    /// table damaged, until `stop`. Runs beside the serve loop.
+    fn guard(
+        redirect: Arc<dyn SystemDnsRedirectPort>,
+        handle: RedirectHandle,
+        interval: Duration,
+        stop: Arc<AtomicBool>,
+    ) {
+        let slice = Duration::from_millis(50).min(interval);
+        loop {
+            let mut waited = Duration::ZERO;
+            while waited < interval && !stop.load(Ordering::SeqCst) {
+                std::thread::sleep(slice);
+                waited += slice;
+            }
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
+            match redirect.inspect(&handle) {
+                Ok(RedirectState::Active) => {}
+                Ok(RedirectState::Inactive) => {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        "Mode B: the system-DNS redirect is no longer configured as written — \
+                         re-installing it",
+                    );
+                    match redirect.redirect_to(handle.listener) {
+                        Ok(_) => {
+                            let _ = redirect.flush_cache();
+                            tracing::info!(
+                                target: "nrr::dns-resolver",
+                                "Mode B: system-DNS redirect re-installed",
+                            );
+                        }
+                        Err(error) => tracing::warn!(
+                            target: "nrr::dns-resolver",
+                            "Mode B: re-installing the system-DNS redirect failed ({error}); \
+                             names resolve past the resolver until the next check",
+                        ),
+                    }
+                }
+                Err(error) => tracing::debug!(
+                    target: "nrr::dns-resolver",
+                    "Mode B: redirect self-check unavailable ({error})",
+                ),
+            }
         }
     }
 
@@ -139,7 +202,26 @@ impl DnsResolverService {
             "Mode B: DNS resolver active — system DNS redirected to the loopback listener",
         );
 
+        let guard_stop = Arc::new(AtomicBool::new(false));
+        let guard = std::thread::Builder::new()
+            .name("nrr-dns-redirect-guard".to_string())
+            .spawn({
+                let redirect = Arc::clone(&self.redirect);
+                let handle = handle.clone();
+                let interval = self.guard_interval;
+                let stop = Arc::clone(&guard_stop);
+                move || Self::guard(redirect, handle, interval, stop)
+            })
+            .ok();
+
         let serve_result = self.listener.serve_udp(&socket, stop);
+
+        // The guard must be gone before the restore, or it re-installs what
+        // the restore just removed.
+        guard_stop.store(true, Ordering::SeqCst);
+        if let Some(guard) = guard {
+            let _ = guard.join();
+        }
 
         // Fail-safe teardown: restore no matter how the serve loop ended.
         if let Err(error) = self.redirect.restore(&handle) {
@@ -487,10 +569,23 @@ mod tests {
     struct RecordingRedirect {
         calls: Mutex<Vec<&'static str>>,
         flip_stop: Option<Arc<AtomicBool>>,
+        /// How many self-checks answer "gone" before the redirect reads as
+        /// intact again — the guard's re-install is what the count buys.
+        damaged_checks: std::sync::atomic::AtomicUsize,
+        /// Set once the guard has re-installed the redirect at least once, so
+        /// a test can stop the serve loop at that moment.
+        reinstalled: Option<Arc<AtomicBool>>,
     }
     impl SystemDnsRedirectPort for RecordingRedirect {
         fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
-            self.calls.lock().unwrap().push("redirect_to");
+            let mut calls = self.calls.lock().unwrap();
+            calls.push("redirect_to");
+            if calls.iter().filter(|c| **c == "redirect_to").count() > 1 {
+                if let Some(flag) = self.reinstalled.as_ref() {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+            drop(calls);
             if let Some(stop) = self.flip_stop.as_ref() {
                 stop.store(true, Ordering::SeqCst);
             }
@@ -498,6 +593,15 @@ mod tests {
                 marker: "test".to_string(),
                 listener,
             })
+        }
+        fn inspect(&self, _handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+            self.calls.lock().unwrap().push("inspect");
+            let left = self.damaged_checks.load(Ordering::SeqCst);
+            if left > 0 {
+                self.damaged_checks.store(left - 1, Ordering::SeqCst);
+                return Ok(RedirectState::Inactive);
+            }
+            Ok(RedirectState::Active)
         }
         fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
             self.calls.lock().unwrap().push("restore");
@@ -522,6 +626,39 @@ mod tests {
             Duration::from_millis(150),
             Duration::from_millis(500),
         )
+    }
+
+    #[test]
+    fn the_guard_reinstalls_a_redirect_that_went_missing() {
+        // The first self-check finds the redirect gone; the re-install it
+        // triggers is the moment the test stops the serve loop.
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            damaged_checks: std::sync::atomic::AtomicUsize::new(1),
+            reinstalled: Some(Arc::clone(&stop)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap())
+                .with_guard_interval(Duration::from_millis(20));
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+
+        let calls = redirect.calls.lock().unwrap().clone();
+        let installs: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c == "redirect_to")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(installs.len(), 2, "one arm, one re-install: {calls:?}");
+        let restore = calls
+            .iter()
+            .position(|c| *c == "restore")
+            .expect("restored");
+        assert!(
+            installs[1] < restore,
+            "the re-install happens while serving, never after the restore: {calls:?}"
+        );
     }
 
     #[test]

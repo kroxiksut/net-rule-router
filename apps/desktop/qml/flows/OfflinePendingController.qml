@@ -243,7 +243,7 @@ QtObject {
                 }
                 if (rows.length === 0) {
                     // Everything already matches the service — drop the park.
-                    root._writePendingOffline({})
+                    _clearAppliedNamespaces()
                 }
                 finish(rows)
             }
@@ -299,6 +299,22 @@ QtObject {
         })
     }
 
+    /// Clear the two namespaces this controller owns, leaving the rest of the
+    /// store alone.
+    ///
+    /// Writing `{}` wiped `binding` as collateral, and `deliverParkedBinding`
+    /// is careful to zero only its own section for a reason: a binding whose
+    /// delivery failed stays parked to be re-offered on the next connect. If an
+    /// unrelated settings apply landed first, the adapter choice vanished with
+    /// it — silently, and precisely in the case where the service had just
+    /// refused it.
+    function _clearAppliedNamespaces() {
+        var obj = root._readPendingOffline()
+        obj["route-policy"] = {}
+        obj["stability"] = {}
+        root._writePendingOffline(obj)
+    }
+
     function _applyOfflinePending(fallbackRows) {
         var obj = root._readPendingOffline()
         var rp = obj["route-policy"] || {}
@@ -306,7 +322,7 @@ QtObject {
         var haveRp = Object.keys(rp).length > 0
         var haveSt = Object.keys(st).length > 0
         if (!haveRp && !haveSt) {
-            root._writePendingOffline({})
+            _clearAppliedNamespaces()
             _releasePendingDialogFlag()
             return
         }
@@ -323,7 +339,7 @@ QtObject {
         var settle = function() {
             if (!state.rpDone || !state.stDone) return
             if (state.rpOk && state.stOk) {
-                root._writePendingOffline({})
+                _clearAppliedNamespaces()
                 root.statusLine = fallbackRows
                     ? root.tr("status.offline-pending-auto-applied",
                         "Applied the changes made while the service was stopped.")
@@ -340,7 +356,7 @@ QtObject {
                 // dialog, pre-filled with the rows computed at offer time, and
                 // keep `_offlinePendingDialogActive` set until the user
                 // answers it.
-                root._showOfflineBacklogDialog(false, fallbackRows)
+                root.offlineBacklogCollector._showOfflineBacklogDialog(false, fallbackRows)
                 return
             }
             root.statusLine = root.tr("status.offline-pending-apply-failed",
@@ -376,7 +392,7 @@ QtObject {
     /// Discard the parked intents (non-destructive to the service) and reload
     /// the routing panels from the service so they show the live values.
     function _discardOfflinePending() {
-        root._writePendingOffline({})
+        _clearAppliedNamespaces()
         root.statusLine = root.tr("status.offline-pending-discarded",
             "Your saved changes were discarded.")
         root.offlinePendingApplied()

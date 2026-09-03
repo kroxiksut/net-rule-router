@@ -39,8 +39,8 @@ use windows::Win32::Security::{
     TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+    CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
+    FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
 };
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
@@ -183,12 +183,19 @@ pub fn create_owner_restricted_pipe(
 
     let name_wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
     // `PIPE_REJECT_REMOTE_CLIENTS` blocks any over-the-network connection.
-    // First instance uses default open mode; the `first_instance` flag is
-    // reserved for callers that want FILE_FLAG_FIRST_PIPE_INSTANCE to fail
-    // fast on a name squatted by another process (off here to keep the
-    // re-create-per-accept loop simple; the random suffix already guards
-    // against a stale broker).
-    let _ = first_instance;
+    //
+    // `FILE_FLAG_FIRST_PIPE_INSTANCE` on the FIRST create is what makes a
+    // squatted name a loud failure instead of a race. Without it a process of
+    // the same user could hold the name already, win the accept, read the nonce
+    // out of the first frame and answer `ok` to a policy write the service
+    // never saw — the launcher would report "applied" for nothing. The random
+    // name suffix makes that hard to aim at; this makes it impossible to do
+    // silently. Later instances of a name we already own must NOT set the flag.
+    let open_mode = if first_instance {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE
+    } else {
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
+    };
     // SAFETY: name_wide is null-terminated UTF-16; attrs points at a valid
     // SECURITY_ATTRIBUTES whose descriptor stays alive until after this call
     // (freed by _sd_guard at end of scope). Buffer sizes are the same as the
@@ -196,7 +203,7 @@ pub fn create_owner_restricted_pipe(
     let pipe = unsafe {
         CreateNamedPipeW(
             PCWSTR(name_wide.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            open_mode,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             PIPE_BUFFER_SIZE,

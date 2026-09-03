@@ -258,7 +258,17 @@ GroupBox {
                     Switch {
                         id: diagnosticModeSwitch
                         text: root.tr("diag.diagnostic-mode.toggle-label", "Extended diagnostics")
-                        checked: !!group.modeState.active
+                        // The session expires on its own, and the refreshed
+                        // state is the only thing that knows it. A plain
+                        // `checked` binding dies on the first click, so from
+                        // then on the switch shows the user's last gesture
+                        // rather than the machine — the toggle would sit on
+                        // hours after diagnostics had stopped.
+                        Binding {
+                            target: diagnosticModeSwitch
+                            property: "checked"
+                            value: !!group.modeState.active
+                        }
                         Accessible.role: Accessible.CheckBox
                         Accessible.name: text
                         Accessible.description: root.tr("settings.experimental.in-development",
@@ -284,29 +294,47 @@ GroupBox {
                     Layout.fillWidth: true
                     enabled: diagnosticModeSwitch.checked
                     spacing: root.uiTheme.spacingSm
+                    // Same reason as the switch, doubled: a ButtonGroup
+                    // writes `checked` on its members, so a plain binding here
+                    // dies before the user has touched anything.
                     ButtonGroup { id: ttlGroup }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: ttlRadio1h
                         text: root.tr("diag.diagnostic-mode.ttl-1h", "1 hour")
                         ButtonGroup.group: ttlGroup
-                        checked: Number(group.modeState.selectedTtlMs || 3600000) === 3600000
+                        Binding {
+                            target: ttlRadio1h
+                            property: "checked"
+                            value: Number(group.modeState.selectedTtlMs || 3600000) === 3600000
+                        }
                         // Re-arm the session with the new TTL if active.
                         onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
                             group._applyDiagnosticMode(true)
                     }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: ttlRadio4h
                         text: root.tr("diag.diagnostic-mode.ttl-4h", "4 hours")
                         ButtonGroup.group: ttlGroup
-                        checked: Number(group.modeState.selectedTtlMs || 0) === 14400000
+                        Binding {
+                            target: ttlRadio4h
+                            property: "checked"
+                            value: Number(group.modeState.selectedTtlMs || 0) === 14400000
+                        }
                         onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
                             group._applyDiagnosticMode(true)
                     }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: ttlRadioRestart
                         text: root.tr("diag.diagnostic-mode.ttl-restart", "Until restart")
                         ButtonGroup.group: ttlGroup
-                        checked: Number(group.modeState.selectedTtlMs || 0) === 0
+                        Binding {
+                            target: ttlRadioRestart
+                            property: "checked"
+                            value: Number(group.modeState.selectedTtlMs || 0) === 0
+                        }
                         onClicked: if (diagnosticModeSwitch.checked && !group._diagModeApplying)
                             group._applyDiagnosticMode(true)
                     }

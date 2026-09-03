@@ -874,6 +874,76 @@ fn deduplicate_set(
     out
 }
 
+/// One rule named in both route sets, with both copies enabled.
+///
+/// Both copies name the same traffic and each sends it to a different route, so
+/// which one wins is decided by evaluation order rather than by the user. The
+/// pair is reported, never resolved here: the domain cannot know which route
+/// the user meant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrossSetDuplicate {
+    pub primary_rule_id: RuleId,
+    pub secondary_rule_id: RuleId,
+    /// What the two copies match, as the user wrote it — the only part of the
+    /// pair a person can recognise on screen.
+    pub match_summary: String,
+}
+
+/// Rules present and ENABLED in both route sets.
+///
+/// Enabled on both sides is the whole condition: a disabled copy is exactly the
+/// state the user is offered as the resolution, so reporting it again would ask
+/// the same question forever.
+pub fn enabled_duplicates_across_sets(book: &CanonicalRuleBook) -> Vec<CrossSetDuplicate> {
+    let primary: Vec<&CanonicalRule> = book
+        .primary
+        .rules()
+        .iter()
+        .filter(|rule| rule.enabled)
+        .collect();
+    if primary.is_empty() {
+        return Vec::new();
+    }
+    let by_match: std::collections::HashMap<MatchKey, &CanonicalRule> = primary
+        .iter()
+        .map(|rule| (MatchKey::from_rule(rule), *rule))
+        .collect();
+
+    let mut found = Vec::new();
+    for secondary in book.secondary.rules().iter().filter(|rule| rule.enabled) {
+        if let Some(primary) = by_match.get(&MatchKey::from_rule(secondary)) {
+            found.push(CrossSetDuplicate {
+                primary_rule_id: primary.id.clone(),
+                secondary_rule_id: secondary.id.clone(),
+                match_summary: describe_match(secondary),
+            });
+        }
+    }
+    found.sort_by(|a, b| {
+        a.match_summary
+            .cmp(&b.match_summary)
+            .then_with(|| a.primary_rule_id.as_str().cmp(b.primary_rule_id.as_str()))
+    });
+    found
+}
+
+/// What a rule matches, spelled for a person. Falls back to the rule id when a
+/// rule carries neither an address nor an app filter — it cannot be described,
+/// but it can still be named.
+///
+/// Public because the merge reports the same fact about the same pair, and two
+/// spellings of one rule on two screens is how a user stops believing either.
+pub fn describe_match(rule: &CanonicalRule) -> String {
+    match (&rule.address_match, &rule.app_match) {
+        (Some(address), Some(app)) => {
+            format!("{} + {}", address.to_display_string(), app.pattern.as_str())
+        }
+        (Some(address), None) => address.to_display_string(),
+        (None, Some(app)) => app.pattern.as_str().to_string(),
+        (None, None) => rule.id.as_str().to_string(),
+    }
+}
+
 /// Detects rules with identical match conditions across the primary and secondary
 /// sets. These are not auto-resolved — a warning is emitted so the GUI
 /// can prompt the user to choose which list to keep the rule in.
@@ -1741,5 +1811,51 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn a_rule_enabled_in_both_sets_is_reported_once_with_what_it_matches() {
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![
+                rule_with("R-0001", "example.com", true),
+                rule_with("R-0002", "only-primary.com", true),
+            ]),
+            secondary: CanonicalRuleSet::from_rules(vec![rule_with("R-0003", "example.com", true)]),
+        };
+
+        let found = enabled_duplicates_across_sets(&book);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].primary_rule_id.as_str(), "R-0001");
+        assert_eq!(found[0].secondary_rule_id.as_str(), "R-0003");
+        assert_eq!(found[0].match_summary, "example.com");
+    }
+
+    #[test]
+    fn a_copy_the_user_already_disabled_is_not_asked_about_again() {
+        // Disabling one copy is the resolution offered for this exact pair, so
+        // reporting the pair afterwards would re-open a settled question.
+        let book = CanonicalRuleBook {
+            primary: CanonicalRuleSet::from_rules(vec![rule_with("R-0001", "example.com", true)]),
+            secondary: CanonicalRuleSet::from_rules(vec![rule_with(
+                "R-0003",
+                "example.com",
+                false,
+            )]),
+        };
+        assert!(enabled_duplicates_across_sets(&book).is_empty());
+    }
+
+    /// One enabled/disabled domain rule. The route comes from the set the rule
+    /// is placed in, so it is not part of the rule itself.
+    fn rule_with(id: &str, host: &str, enabled: bool) -> CanonicalRule {
+        CanonicalRule {
+            id: RuleId(id.to_string()),
+            enabled,
+            address_match: Some(CanonicalAddressMatch::ExactFqdn(host.to_string())),
+            app_match: None,
+            comment: String::new(),
+            action: crate::canonical::RuleAction::Route,
+            origin: None,
+        }
     }
 }

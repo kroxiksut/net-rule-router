@@ -156,7 +156,13 @@ pub fn restore_engine_options() {
     let Some(prior) = prior else {
         return;
     };
-    if ENGINE_OPTIONS_RESTORED.swap(true, Ordering::AcqRel) {
+    // NOT latched here. Claiming the restore before the engine has even been
+    // opened means one failed open — a wedged BFE, the documented reason this
+    // project budgets its WFP calls at all — permanently short-circuits every
+    // later attempt, including the observer's own `drop`. The machine is then
+    // left collecting a net event for every classify of every process, with
+    // nobody reading them. The latch is set once the options are actually back.
+    if ENGINE_OPTIONS_RESTORED.load(Ordering::Acquire) {
         return;
     }
     let mut engine = HANDLE::default();
@@ -183,6 +189,7 @@ pub fn restore_engine_options() {
         restore_engine_options_with(engine, prior);
         let _ = FwpmEngineClose0(engine);
     }
+    ENGINE_OPTIONS_RESTORED.store(true, Ordering::Release);
     clear_prior_options_note();
 }
 

@@ -352,6 +352,10 @@ mod windows_impl {
     }
 }
 
+/// Identity of our TUN adapter for the driver; fixed for the product's lifetime.
+#[cfg(target_os = "windows")]
+const NRR_TUN_ADAPTER_GUID: u128 = 0x7A3E_1C55_0B6D_4F82_9E14_2D6C_8B0A_5F31;
+
 #[cfg(target_os = "windows")]
 impl TunAdapterPort for WintunTunAdapter {
     fn is_available(&self) -> bool {
@@ -368,11 +372,14 @@ impl TunAdapterPort for WintunTunAdapter {
         })?;
         let wintun = windows_impl::load_wintun(&path)?;
 
+        // A fixed GUID: the driver reuses one device record across restarts
+        // instead of minting a new adapter each time and leaving the previous
+        // one to be found and deleted on the next start.
         let adapter = wintun_bindings::Adapter::create(
             &wintun,
             &config.adapter_name,
             &config.adapter_name,
-            None,
+            Some(NRR_TUN_ADAPTER_GUID),
         )
         .map_err(|err| PlatformError::Transient {
             operation: "wintun::Adapter::create",

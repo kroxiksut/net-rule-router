@@ -201,11 +201,17 @@ pub(crate) fn build_runtime_deps(
         active_routing_sid: None,
         dns_observation_source: None,
         dns_observation_consumer: None,
+        sign_in_gate: None,
+        fake_ip_shutdown: None,
         conn_observation_source: None,
         conn_observation_consumer: None,
         // The same engine the observation consumer feeds, so the slow proposal
         // tick and anything reading suggestions see one state rather than two.
         auto_rules_engine: auto_rules,
+        // The automatic main-link pass is Windows-only for now: it needs the
+        // probe wiring the Windows deps build, and the Linux daemon has no
+        // equivalent yet. `None` leaves the check to the GUI button.
+        auto_rule_probe: None,
         secondary_external_address: None,
         dns_resolver_controller: None,
         // Reactive: the local resolver is a Windows mechanism today, so booting
@@ -295,6 +301,7 @@ pub(crate) fn build_ipc_server(
                 artifacts.topology.state_db_path.clone(),
                 artifacts.topology.cache_db_path.clone(),
                 artifacts.audit_writer.clone(),
+                artifacts.log_writer.clone(),
                 Arc::new(nrr_platform_linux::LinuxApi),
                 Arc::clone(&stack.cycle),
                 Arc::clone(&health),

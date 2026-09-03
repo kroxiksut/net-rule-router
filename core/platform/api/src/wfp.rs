@@ -319,6 +319,25 @@ impl WfpSession {
                         Err(e) if e.classify() == ErrorClass::Idempotent => {
                             // Already gone — idempotent success.
                         }
+                        // Under best-effort, one filter that refuses to go must
+                        // not keep every OTHER block armed. This is the
+                        // anti-lockout path: a user whose machine is already
+                        // cut off, with the service gone or going, and the
+                        // whole point is to remove as much of the block set as
+                        // the engine will let us. Aborting the transaction
+                        // there removes NOTHING and leaves them offline.
+                        Err(e) if mode == FilterFailureMode::BestEffort => {
+                            tracing::warn!(
+                                target: "nrr::wfp",
+                                filter_id = format_args!("{:016x}", id.raw),
+                                error = %e,
+                                "filter delete failed — continuing so the rest of the set still comes off"
+                            );
+                            outcome.skipped.push(SkippedFilter {
+                                id: *id,
+                                reason: e.to_string(),
+                            });
+                        }
                         Err(e) => return Err(e),
                     }
                 }
@@ -342,8 +361,12 @@ impl WfpSession {
             .into_iter()
             .map(|f| WfpFilterAction::DeleteFilter(f.id))
             .collect();
-        self.execute_wfp_plan(&delete_actions)?;
-        Ok(count)
+        // Best-effort, not strict: this is a teardown, and one filter that will
+        // not go must not leave the other several thousand installed. The
+        // return counts what actually came off.
+        let outcome =
+            self.execute_wfp_plan_resilient(&delete_actions, FilterFailureMode::BestEffort)?;
+        Ok(count.saturating_sub(outcome.skipped.len()))
     }
 
     /// Delete only **block** filters registered under our provider GUID,
@@ -368,9 +391,12 @@ impl WfpSession {
         if count == 0 {
             return Ok(0);
         }
-        // Delete all matched blocks in one transaction (or in batches if > cap).
-        self.execute_wfp_plan(&delete_actions)?;
-        Ok(count)
+        // Best-effort for the same reason as `cleanup_all`, and more sharply:
+        // every action here removes a BLOCK. One that sticks must not keep the
+        // rest of them armed on a machine whose service is already gone.
+        let outcome =
+            self.execute_wfp_plan_resilient(&delete_actions, FilterFailureMode::BestEffort)?;
+        Ok(count.saturating_sub(outcome.skipped.len()))
     }
 
     // ── Low-level accessors ───────────────────────────────────────────────────

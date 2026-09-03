@@ -377,6 +377,36 @@ pub trait RulesApplyDispatcher: Send + Sync {
         rules_json: &str,
     ) -> Result<Vec<PreFlightWarning>, DispatchFailure>;
 
+    /// Both answers a preview needs, from ONE compute.
+    ///
+    /// [`Self::dry_run_for_sid`] and [`Self::pre_flight_for_sid`] read the same
+    /// per-SID plan, and deriving that plan IS the cost of a preview — the whole
+    /// filter set for the SID, one FQDN-cache query per rule. Asking twice
+    /// doubled every "save and review" click for nothing, and the preview holds
+    /// the client's single in-flight slot while it runs. So the preview path
+    /// asks once, here.
+    ///
+    /// The pre-flight half returns warnings rather than a `Result`: a SID whose
+    /// checks cannot run contributes nothing, which is what the caller already
+    /// did with the error. The plan half keeps its `Err` — the caller turns it
+    /// into an `InvalidRulesContent` warning that names the SID.
+    ///
+    /// Default: the two separate calls, so an implementation with nothing to
+    /// share needs no change.
+    fn plan_with_pre_flight_for_sid(
+        &self,
+        sid: &str,
+        rules_json: &str,
+    ) -> (
+        Result<SidActionPlanSummary, DispatchFailure>,
+        Vec<PreFlightWarning>,
+    ) {
+        (
+            self.dry_run_for_sid(sid, rules_json),
+            self.pre_flight_for_sid(sid, rules_json).unwrap_or_default(),
+        )
+    }
+
     /// Apply `rules_json` to `sid` (Phase 2). Real impl: recompile per
     /// `PerSidApplyOrchestrator::recompile_for_sid`.
     fn apply_for_sid(&self, sid: &str, rules_json: &str) -> Result<(), DispatchFailure>;
@@ -777,7 +807,10 @@ impl ActivationCoordinator {
         let mut action_plans: Vec<SidActionPlanSummary> = Vec::with_capacity(sids.len());
         let mut warnings: Vec<PreFlightWarning> = Vec::new();
         for sid in &sids {
-            match self.dispatcher.dry_run_for_sid(sid, rules_json) {
+            let (plan, sid_warnings) = self
+                .dispatcher
+                .plan_with_pre_flight_for_sid(sid, rules_json);
+            match plan {
                 Ok(plan) => action_plans.push(plan),
                 Err(failure) => warnings.push(PreFlightWarning {
                     sid: failure.sid,
@@ -785,9 +818,7 @@ impl ActivationCoordinator {
                     message: failure.message,
                 }),
             }
-            if let Ok(more) = self.dispatcher.pre_flight_for_sid(sid, rules_json) {
-                warnings.extend(more);
-            }
+            warnings.extend(sid_warnings);
         }
         DryRunSummary {
             revision_id: None,
@@ -2454,6 +2485,139 @@ mod tests {
             summary.revision_id.is_none(),
             "a preview describes rules, not a stored revision"
         );
+    }
+
+    /// Records which of the dispatcher's three preview entry points the
+    /// coordinator actually used. The combined one answers with different
+    /// numbers than the two singles, so a test can tell them apart by the
+    /// summary alone as well as by the log.
+    struct CountingDispatcher {
+        calls: Mutex<Vec<String>>,
+    }
+
+    // Test double: lock-poisoning `expect()` is acceptable scaffolding.
+    #[allow(clippy::expect_used)]
+    impl RulesApplyDispatcher for CountingDispatcher {
+        fn dry_run_for_sid(
+            &self,
+            sid: &str,
+            _rules_json: &str,
+        ) -> Result<SidActionPlanSummary, DispatchFailure> {
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push(format!("dry-run:{sid}"));
+            Ok(SidActionPlanSummary {
+                sid: sid.to_string(),
+                filter_additions: 1,
+                filter_removals: 0,
+                routing_actions: 0,
+            })
+        }
+
+        fn pre_flight_for_sid(
+            &self,
+            sid: &str,
+            _rules_json: &str,
+        ) -> Result<Vec<PreFlightWarning>, DispatchFailure> {
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push(format!("pre-flight:{sid}"));
+            Ok(Vec::new())
+        }
+
+        fn plan_with_pre_flight_for_sid(
+            &self,
+            sid: &str,
+            _rules_json: &str,
+        ) -> (
+            Result<SidActionPlanSummary, DispatchFailure>,
+            Vec<PreFlightWarning>,
+        ) {
+            self.calls
+                .lock()
+                .expect("calls mutex")
+                .push(format!("combined:{sid}"));
+            (
+                Ok(SidActionPlanSummary {
+                    sid: sid.to_string(),
+                    filter_additions: 3,
+                    filter_removals: 2,
+                    routing_actions: 0,
+                }),
+                vec![PreFlightWarning {
+                    sid: sid.to_string(),
+                    category: PreFlightCategory::BindingUnresolved,
+                    message: "from the combined call".to_string(),
+                }],
+            )
+        }
+
+        fn apply_for_sid(&self, _sid: &str, _rules_json: &str) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+
+        fn revert_for_sid(&self, _sid: &str, _previous: &str) -> Result<(), DispatchFailure> {
+            Ok(())
+        }
+    }
+
+    /// A preview asks each SID for ONE plan.
+    ///
+    /// Deriving a SID's plan is the entire cost of a preview — the whole filter
+    /// set, one FQDN-cache query per rule — and the review dialog wants two
+    /// things out of it. Asking through the two single methods derived it twice:
+    /// 18.7 s on a real rule set, during which the GUI's one connection sat
+    /// behind the call and its own 1 s health poll timed out into a "no
+    /// connection to the service" banner.
+    #[test]
+    fn a_preview_asks_each_sid_for_one_plan_not_two() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_connection(&dir.path().join("state.db")).expect("open");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        runner.run_pending_migrations().expect("migrate");
+        let conn = Arc::new(Mutex::new(runner.into_connection()));
+
+        let registry = Arc::new(ActiveSidRegistry::new());
+        let dispatcher = Arc::new(CountingDispatcher {
+            calls: Mutex::new(Vec::new()),
+        });
+        let coordinator = ActivationCoordinator::new(
+            conn,
+            registry.clone(),
+            dispatcher.clone() as Arc<dyn RulesApplyDispatcher>,
+            Arc::new(InMemoryMarkerStore::new()) as Arc<dyn ApplyMarkerStore>,
+            Arc::new(RecordingAudit::new()) as Arc<dyn ActivationAuditEmitter>,
+            FixedClock::new(1_700_000_000) as Arc<dyn Clock>,
+            Arc::new(CounterIds::new()) as Arc<dyn IdGenerator>,
+            ApplyFailurePolicy::AllOrNothing,
+        );
+        registry.on_connect("S-1-5-21-A", IpcClientProfile::TrayLightweight);
+        registry.on_connect("S-1-5-21-B", IpcClientProfile::TrayLightweight);
+
+        let summary = coordinator.dry_run_rules(
+            nrr_storage::BASELINE_PRINCIPAL,
+            r#"{"schema-version":1,"primary":[],"secondary":[]}"#,
+            "corr-once",
+        );
+
+        let calls = dispatcher.calls.lock().expect("calls mutex").clone();
+        assert_eq!(calls.len(), 2, "one plan per SID, got {calls:?}");
+        assert!(
+            calls.iter().all(|c| c.starts_with("combined:")),
+            "the preview must not fall back to the two single calls: {calls:?}",
+        );
+
+        // Positive control: the combined answer is the one that reached the
+        // summary, warnings included. A guard that only counts calls would pass
+        // just as happily on a preview that returned nothing at all.
+        assert_eq!(summary.action_plans.len(), 2);
+        assert!(summary
+            .action_plans
+            .iter()
+            .all(|p| p.filter_additions == 3 && p.filter_removals == 2));
+        assert_eq!(summary.pre_flight_warnings.len(), 2);
     }
 
     /// The baseline is written only to users who still inherit it. The set is

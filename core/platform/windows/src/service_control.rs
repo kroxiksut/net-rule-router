@@ -78,8 +78,19 @@ impl ServiceControlPort for WindowsServiceControl {
         &self,
         spec: &ServiceInstallSpec,
     ) -> Result<ServiceInstallReport, ServiceControlError> {
-        // Step 1 — data directories. Done before registration so a failure here
-        // leaves no half-registered service behind.
+        // Step 1 — the privileged handle, before anything is written.
+        //
+        // Registration is what this install cannot do without, and it is the
+        // step that refuses an unelevated caller. Taken first, an access-denied
+        // leaves the machine exactly as it was; taken after the directory tree,
+        // it left a `%ProgramData%` tree behind for an install that never
+        // happened, which the next attempt then treats as pre-existing and
+        // declines to lock down.
+        let manager =
+            open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
+
+        // Step 2 — data directories. Still before `create_service`, so a
+        // failure here leaves no half-registered service behind.
         let mut dirs_created = Vec::new();
         if spec.create_data_dirs {
             let root = service_data_root()?;
@@ -98,9 +109,6 @@ impl ServiceControlPort for WindowsServiceControl {
             }
         }
 
-        // Step 2 — SCM registration.
-        let manager =
-            open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
         let info = ServiceInfo {
             name: OsString::from(WINDOWS_SERVICE_NAME),
             display_name: OsString::from(WINDOWS_SERVICE_DISPLAY_NAME),
@@ -172,9 +180,23 @@ impl ServiceControlPort for WindowsServiceControl {
             .map_err(map_service_error)?;
 
         let status = service.query_status().map_err(map_service_error)?;
-        if status.current_state != ServiceState::Stopped {
-            let _ = service.stop();
-            let _ = wait_for_stopped(&service, UNINSTALL_STOP_BUDGET);
+        let mut stopped = status.current_state == ServiceState::Stopped;
+        if !stopped {
+            // The stop request's own refusal matters: a service that will not
+            // accept control right now, or one this caller may not stop, never
+            // reaches STOPPED, and waiting out the full budget to discover that
+            // just turns a clear refusal into a timeout.
+            if service.stop().is_ok() {
+                stopped = wait_for_stopped(&service, UNINSTALL_STOP_BUDGET).is_ok();
+            } else {
+                // The request itself was refused. It can still be mid-stop from
+                // somebody else's request, so give the state one look rather
+                // than the whole budget.
+                stopped = service
+                    .query_status()
+                    .map(|s| s.current_state == ServiceState::Stopped)
+                    .unwrap_or(false);
+            }
         }
 
         // Between the stop and the delete is the only moment this can be done:
@@ -183,7 +205,18 @@ impl ServiceControlPort for WindowsServiceControl {
         // sweep that heals them dies with the registration. Missing it leaves a
         // machine with no internet or no name resolution and nothing installed
         // that could put it right.
-        let machine_state_cleared = Some(sweep_enforcement_state());
+        //
+        // ONLY when the service really did stop. Sweeping under a live service
+        // is worse than not sweeping at all: its next pass puts everything back,
+        // the delete then succeeds, and the machine keeps orphaned filters and
+        // an NRPT rule pointing at a resolver that no longer exists — with
+        // nothing installed that would sweep them at boot. The report says which
+        // of the two happened rather than claiming the machine is clean.
+        let machine_state_cleared = if stopped {
+            Some(sweep_enforcement_state())
+        } else {
+            Some(false)
+        };
 
         service.delete().map_err(map_service_error)?;
 
@@ -220,11 +253,11 @@ impl ServiceControlPort for WindowsServiceControl {
             )
             .map_err(map_service_error)?;
 
+        // Already running: nothing to do. A start already in flight is NOT
+        // "done" — the poll below waits for it, so a caller that asked for a
+        // running service gets one or an error, never a maybe.
         let status = service.query_status().map_err(map_service_error)?;
-        if matches!(
-            status.current_state,
-            ServiceState::Running | ServiceState::StartPending
-        ) {
+        if status.current_state == ServiceState::Running {
             return Ok(());
         }
 
@@ -240,14 +273,26 @@ impl ServiceControlPort for WindowsServiceControl {
         // Poll so an elevated child can confirm the transition before it exits,
         // which gives whoever polls status afterwards a clean hand-off instead
         // of a race.
+        //
+        // Only RUNNING ends the wait. `StartPending` is the state `start()`
+        // has just put the service into, so accepting it made the first poll
+        // succeed unconditionally: a service wedged in START_PENDING, or one
+        // that died a second later, reported itself started and the timeout
+        // branch was unreachable. STOPPED is equally terminal, and sooner —
+        // the service ran and gave up, and no amount of further waiting
+        // changes that.
         let deadline = Instant::now() + timeout;
         loop {
             let status = service.query_status().map_err(map_service_error)?;
-            if matches!(
-                status.current_state,
-                ServiceState::Running | ServiceState::StartPending
-            ) {
-                return Ok(());
+            match status.current_state {
+                ServiceState::Running => return Ok(()),
+                ServiceState::Stopped => {
+                    return Err(ServiceControlError::Mechanism {
+                        detail: "start: the service stopped again on its own;                                  its own log says why"
+                            .to_string(),
+                    })
+                }
+                _ => {}
             }
             if Instant::now() >= deadline {
                 return Err(ServiceControlError::Timeout {
@@ -438,30 +483,68 @@ fn configure_recovery(
         })
 }
 
-/// Restrict the service-owned data directory to the security baseline:
-/// SYSTEM and Administrators full control, Users read+execute, inheritance
-/// replaced rather than augmented.
+/// Restrict the service-owned data directory to the security baseline.
+///
+/// The ROOT gets SYSTEM and Administrators only — no `Users` entry at all —
+/// with inheritance replaced rather than augmented. `logs` alone is then
+/// granted `Users:RX`: a readable log directory is what the diagnostics story
+/// needs, and it is the only thing under this tree a normal user has any
+/// business reading.
+///
+/// Granting `Users:(OI)(CI)RX` on the root instead inherited down onto
+/// everything: the service state DB carries every SID rule set, their route
+/// bindings and their session list, and the audit directory is the
+/// tamper-evident record of who changed what. `storage::bootstrap` states the
+/// intended shape in so many words — "Users (none)" — and this is the code
+/// that has to make it true.
 ///
 /// `icacls.exe` ships with every supported Windows release and its command line
 /// is human-auditable in an install log, which is worth more here than saving a
 /// process spawn on a once-per-install operation.
-fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
-    use std::process::Command;
+/// Absolute path of a `System32` tool.
+///
+/// `Command::new("icacls")` resolves through the process search path, which on
+/// Windows includes the current directory — and this runs elevated, during an
+/// install. `%SystemRoot%` names the directory Windows means; the bare name is
+/// only a fallback for an environment stripped of it.
+fn system32_tool(exe: &str) -> std::path::PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) => std::path::PathBuf::from(root).join("System32").join(exe),
+        None => std::path::PathBuf::from(exe),
+    }
+}
 
+pub fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
     let root_str = root
         .to_str()
         .ok_or_else(|| ServiceControlError::Mechanism {
             detail: format!("non-UTF8 data dir path: {}", root.display()),
         })?;
-    let output = Command::new("icacls")
-        .arg(root_str)
-        .arg("/inheritance:r")
-        .arg("/grant")
-        .arg("NT AUTHORITY\\SYSTEM:(OI)(CI)F")
-        .arg("/grant")
-        .arg("BUILTIN\\Administrators:(OI)(CI)F")
-        .arg("/grant")
-        .arg("BUILTIN\\Users:(OI)(CI)RX")
+    run_icacls(&[
+        root_str,
+        "/inheritance:r",
+        "/grant",
+        "NT AUTHORITY\\SYSTEM:(OI)(CI)F",
+        "/grant",
+        "BUILTIN\\Administrators:(OI)(CI)F",
+    ])?;
+
+    // Read access is granted where reading is the point, and nowhere else.
+    let logs = root.join("logs");
+    let logs_str = logs
+        .to_str()
+        .ok_or_else(|| ServiceControlError::Mechanism {
+            detail: format!("non-UTF8 logs dir path: {}", logs.display()),
+        })?;
+    run_icacls(&[logs_str, "/grant", "BUILTIN\\Users:(OI)(CI)RX"])
+}
+
+/// One `icacls` invocation, with its output folded into an error on failure.
+fn run_icacls(args: &[&str]) -> Result<(), ServiceControlError> {
+    use std::process::Command;
+
+    let output = Command::new(system32_tool("icacls.exe"))
+        .args(args)
         .output()
         .map_err(|e| ServiceControlError::Mechanism {
             detail: format!("invoke icacls: {e}"),
@@ -586,6 +669,7 @@ fn sweep_enforcement_state() -> bool {
         );
     }
     let dns_swept =
-        crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::PowerShellRunner).is_ok();
+        crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::TransactedNrptStore)
+            .is_ok();
     filters_swept && dns_swept
 }

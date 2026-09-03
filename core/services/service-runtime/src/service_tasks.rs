@@ -991,10 +991,50 @@ pub fn build_dns_observe_task(
 /// computation walks the whole candidate table and the exclusions read the rule
 /// book, neither of which belongs on a per-observation path. Optional class —
 /// the discovery pass is a convenience and its failure must never affect routing.
+/// How often a principal's automatic main-link pass may run, and whether they
+/// asked for one at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AutoProbeCadence {
+    pub enabled: bool,
+    pub repeat: Duration,
+}
+
+/// The automatic "does it answer on the main link?" pass.
+///
+/// The manual button and this share one runner: the pass is the same question,
+/// only the trigger differs. Without it the verdict on a suggestion stays
+/// `Unknown` for as long as the additional route is down — which is exactly
+/// when there is no traffic to learn from and the user is asked to decide with
+/// no evidence.
+#[derive(Clone)]
+pub struct AutoProbeWiring {
+    pub runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>,
+    pub cadence: Arc<dyn Fn(&str) -> AutoProbeCadence + Send + Sync>,
+}
+
+/// Is this principal's automatic pass due?
+///
+/// `last` is when their previous pass started. Off means never; a pass that
+/// just ran waits out the whole window, so a busy tick cannot turn a courtesy
+/// check into a stream of connections.
+fn auto_probe_is_due(cadence: AutoProbeCadence, last: Option<Instant>, now: Instant) -> bool {
+    if !cadence.enabled {
+        return false;
+    }
+    match last {
+        None => true,
+        Some(previous) => now.saturating_duration_since(previous) >= cadence.repeat,
+    }
+}
+
 pub fn build_auto_rules_task(
     engine: Arc<crate::auto_rules::AutoRulesEngine>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    auto_probe: Option<AutoProbeWiring>,
 ) -> ServiceTask {
+    // Per principal, when their last automatic pass started.
+    let probed_at: Mutex<std::collections::HashMap<String, Instant>> =
+        Mutex::new(std::collections::HashMap::new());
     ServiceTask::periodic(
         TASK_ID_AUTO_RULES,
         TaskClass::Optional,
@@ -1009,6 +1049,29 @@ pub fn build_auto_rules_task(
                 return TaskOutcome::Continue;
             };
             let summary = engine.tick(&sid, SystemTime::now());
+            if let Some(probe) = auto_probe.as_ref() {
+                let cadence = (probe.cadence)(&sid);
+                let now = Instant::now();
+                let due = {
+                    let mut seen = probed_at.lock().unwrap_or_else(|p| p.into_inner());
+                    let due = auto_probe_is_due(cadence, seen.get(&sid).copied(), now);
+                    if due {
+                        seen.insert(sid.clone(), now);
+                    }
+                    due
+                };
+                // Only when something is actually waiting on an answer: a pass
+                // over an empty inbox leaves the machine for nothing.
+                if due && !engine.candidates(&sid).is_empty() {
+                    let accepted = probe.runner.probe(&sid, &[], &[]).accepted;
+                    tracing::debug!(
+                        target: "nrr::auto-rules",
+                        sid = %sid,
+                        accepted,
+                        "main-link pass started for parked suggestions",
+                    );
+                }
+            }
             if summary.parked > 0 || summary.authored > 0 {
                 tracing::info!(
                     target: "nrr::auto-rules",
@@ -1359,6 +1422,34 @@ mod tests {
     use crate::ipc_handlers::operation_status_store::OperationStatusStore;
     use crate::managers::{AcceptError, AcceptErrorCategory};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn the_automatic_pass_runs_on_the_users_window_and_not_at_all_without_consent() {
+        let off = AutoProbeCadence {
+            enabled: false,
+            repeat: Duration::from_secs(300),
+        };
+        let on = AutoProbeCadence {
+            enabled: true,
+            repeat: Duration::from_secs(300),
+        };
+        let now = Instant::now();
+
+        assert!(
+            !auto_probe_is_due(off, None, now),
+            "no opt-in, no connections leaving the machine"
+        );
+        assert!(auto_probe_is_due(on, None, now), "first pass is due");
+        assert!(
+            !auto_probe_is_due(on, Some(now), now + Duration::from_secs(299)),
+            "inside the window the pass waits"
+        );
+        assert!(auto_probe_is_due(
+            on,
+            Some(now),
+            now + Duration::from_secs(300)
+        ));
+    }
 
     fn fresh_health() -> Arc<HealthAggregator> {
         Arc::new(HealthAggregator::new())

@@ -114,6 +114,7 @@ impl MutationExecutor for FakeExecutor {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         }
     }
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
@@ -151,6 +152,7 @@ impl MutationExecutor for FailingExecutor {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         }
     }
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
@@ -196,11 +198,11 @@ impl FakeDiagnostics {
                 cache_health: CacheHealthCard {
                     entry_count: 0,
                     healthy: true,
-                    rebuilding: false,
                 },
                 log_health: LogHealthCard {
                     dir_writable: true,
                     total_size_bytes: 0,
+                    audit_size_bytes: 0,
                     file_count: 0,
                     dropped_count: 0,
                     last_cleanup_at: None,
@@ -811,6 +813,12 @@ fn production_handlers_register_every_operation_in_catalog() {
                     "mode": "prefer-primary",
                     "block-secondary-when-unavailable": false,
                     "binding-source": "user-assigned",
+                    // Required, no wire default: a protection toggle must not
+                    // be turnable off by omission.
+                    "kill-switch-enabled": false,
+                    "kill-switch-block-all": false,
+                    "kill-switch-strict-shared-ips": false,
+                    "doh-lockdown-enabled": false,
                 }),
                 Some((IpcOperationClass::UserScopedConfiguration, None)),
             ),

@@ -93,6 +93,31 @@ Then press **Apply**: rules only take effect after applying. You do this
 once — from then on the list travels with your rule set, including across
 reinstalls.
 
+### Application rules need a restart of the program
+
+An application rule names a program to watch: the addresses it contacts are
+learned as it connects, and the route follows from the next connection onward.
+A program that is **already running** when you add its rule will therefore see
+its first attempts fail — installers and updaters in particular often give up
+at that point and report that there is no connection.
+
+So: add the rule, press **Apply**, then restart the program. If you also know
+the site the program uses, an ordinary domain rule (`*.example.com`) is the
+better tool — it takes effect as soon as the name is looked up, with nothing to
+learn first.
+
+### Suggestions you are not interrupted about
+
+While you work, the app notices further hosts the sites you route actually
+need, and offers to add them. A host that already answers over your main
+connection is **not** raised in the tray: it works without the additional
+route, and interrupting you about it would be noise.
+
+It is still in the suggestions list, marked as reachable on the main
+connection. Answering is not the same as serving — some sites answer a
+main-connection address with a refusal — so the decision stays yours: open the
+list and add it if the site is not actually working for you.
+
 ### If you have no additional connection
 
 You may not have a VPN or a second line — then simply **do not assign** an

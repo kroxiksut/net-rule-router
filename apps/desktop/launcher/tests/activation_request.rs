@@ -140,7 +140,6 @@ fn cold_start_context_carries_the_launch_action() {
         &path,
         &shell,
         AppSection::Rules,
-        ActivationSource::Tray,
         preferences,
         &first_run,
         &request,

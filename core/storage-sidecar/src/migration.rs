@@ -23,14 +23,14 @@ use std::time::SystemTime;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{SidecarError, SidecarResult};
-use crate::schema::{SIDECAR_DB_V1_DDL, SIDECAR_DB_V2_DDL};
+use crate::schema::{SIDECAR_DB_V1_DDL, SIDECAR_DB_V2_DDL, SIDECAR_DB_V3_DDL};
 
 /// Latest schema version this binary knows how to produce or open.
 ///
 /// Incrementing this constant **must** be paired with adding a new
 /// entry at the tail of [`MIGRATIONS`] — the runner refuses to start
 /// if the on-disk version exceeds the highest registered migration.
-pub const LATEST_SCHEMA_VERSION: u32 = 2;
+pub const LATEST_SCHEMA_VERSION: u32 = 3;
 
 /// Bootstrap DDL for the `schema_migrations` bookkeeping table.
 /// Idempotent so the runner can call it on every open without
@@ -69,6 +69,11 @@ const MIGRATIONS: &[MigrationDef] = &[
         version: 2,
         name: "external_ip_cache",
         stmts: SIDECAR_DB_V2_DDL,
+    },
+    MigrationDef {
+        version: 3,
+        name: "pending_apply_without_rules_snapshot",
+        stmts: SIDECAR_DB_V3_DDL,
     },
 ];
 
@@ -270,7 +275,11 @@ mod tests {
         assert_eq!(summary.to_version, LATEST_SCHEMA_VERSION);
         assert_eq!(
             summary.migrations_applied,
-            vec!["initial_sidecar_schema", "external_ip_cache"]
+            vec![
+                "initial_sidecar_schema",
+                "external_ip_cache",
+                "pending_apply_without_rules_snapshot",
+            ]
         );
         // Every table across both migrations exists.
         for table in [

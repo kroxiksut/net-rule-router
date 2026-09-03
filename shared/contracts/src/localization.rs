@@ -10,7 +10,7 @@ const RESERVED_ROOT_NAMESPACES: &[&str] = &["_system", "_service", "_internal"];
 const ALLOWED_METADATA_FIELDS: &[&str] =
     &["language", "label", "nativeLabel", "version", "fallbacks"];
 const MAX_RECOMMENDED_LOCALE_VALUE_LEN: usize = 2000;
-const MANAGED_ROOT_FOLDER: &str = "NetRuleRouter";
+const MANAGED_ROOT_FOLDER: &str = crate::product_identity::PRODUCT_NAME;
 const MANAGED_SUBFOLDER: &str = "managed";
 const USER_LOCALES_SUBFOLDER: &str = "locales";
 
@@ -130,11 +130,17 @@ pub fn resolve_catalog_text(
     fallback.to_string()
 }
 
+/// Everything one pass over the locale files yields.
+///
+/// Public because a caller that needs more than one of these — the QML context
+/// emitter needs all three — would otherwise pay for the whole load once per
+/// field: reading, parsing and validating both locale files three times to
+/// build a single JSON document.
 #[derive(Clone, Debug)]
-struct LocaleLoadState {
-    catalog: BTreeMap<String, BTreeMap<String, String>>,
-    descriptors: Vec<LocaleDescriptor>,
-    reports: Vec<LocaleLoadReport>,
+pub struct LocaleLoadState {
+    pub catalog: BTreeMap<String, BTreeMap<String, String>>,
+    pub descriptors: Vec<LocaleDescriptor>,
+    pub reports: Vec<LocaleLoadReport>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,7 +176,12 @@ impl LocaleCandidate {
 static REPORTED_MISSING_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static REPORTED_LOCALE_ISSUES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn load_locale_state() -> LocaleLoadState {
+/// Load the locale files once and return all three views of them.
+///
+/// Deliberately not cached: the bundled and user locale directories come from
+/// the environment, and a process that changes them expects the next load to
+/// see the change.
+pub fn load_locale_state() -> LocaleLoadState {
     let mut candidates = load_locale_candidates();
     validate_cross_locale_rules(&mut candidates);
     add_missing_baseline_coverage_warnings(&mut candidates);
@@ -251,13 +262,27 @@ fn load_locale_state() -> LocaleLoadState {
         });
     }
 
-    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    let descriptors = sorted_unique_descriptors(descriptors);
 
     LocaleLoadState {
         catalog,
         descriptors,
         reports,
     }
+}
+
+/// One entry per LANGUAGE, ordered by id.
+///
+/// The list is built from `reports`, which holds a row per FILE — and a user
+/// override is a second file for a language the bundle already ships. This
+/// module creates the `managed/locales` directory on every run, so the moment
+/// anyone put a file there the language dropdown grew a second, byte-identical
+/// "Русский". Both rows resolve to the same descriptor (precedence is settled
+/// in `build_effective_locale_bundles`), so collapsing them loses nothing.
+fn sorted_unique_descriptors(mut descriptors: Vec<LocaleDescriptor>) -> Vec<LocaleDescriptor> {
+    descriptors.sort_by(|left, right| left.id.cmp(&right.id));
+    descriptors.dedup_by(|left, right| left.id == right.id);
+    descriptors
 }
 
 fn load_locale_candidates() -> Vec<LocaleCandidate> {
@@ -436,10 +461,12 @@ fn validate_metadata(
             let normalized = normalize_locale_id(&item);
             if normalized == candidate.id {
                 if candidate.id == "en" {
-                    candidate.warnings.push(
-                        "self-reference 'en' in fallback chain is ignored for baseline locale"
-                            .to_string(),
-                    );
+                    // Not a defect, and not worth telling anyone about: the
+                    // schema refuses an EMPTY `fallbacks`, so the baseline
+                    // locale — which has nothing to fall back to — can only be
+                    // spelled as a self-reference. The chain ignores it. It was
+                    // reported as a warning on every single launch, which is
+                    // noise the user can neither act on nor silence.
                 } else {
                     candidate.errors.push(format!(
                         "fallback chain contains self-reference '{}'",
@@ -562,17 +589,22 @@ fn flatten_locale_object_validated(
                 .iter()
                 .any(|reserved| reserved == &key.as_str())
         {
-            candidate.errors.push(format!(
-                "reserved namespace '{key}' is not allowed in locale translation payload"
+            candidate.warnings.push(format!(
+                "reserved namespace '{key}' is not allowed in locale translation payload;                  the namespace is ignored"
             ));
             continue;
         }
 
+        // One bad segment costs one key, never the file. This used to push an
+        // error, and a single typo among two thousand keys dropped the whole
+        // locale to English with no signal a user could see. Structural
+        // failures below stay errors; this is a defect in one entry.
         if !is_valid_key_segment(key) {
-            candidate.errors.push(format!(
-                "invalid key segment '{key}' in namespace '{}'",
+            candidate.warnings.push(format!(
+                "invalid key segment '{key}' in namespace '{}'; the key is ignored",
                 if prefix.is_empty() { "<root>" } else { prefix }
             ));
+            continue;
         }
 
         let merged_key = if prefix.is_empty() {
@@ -582,8 +614,8 @@ fn flatten_locale_object_validated(
         };
 
         if is_root && !nested.is_object() {
-            candidate.errors.push(format!(
-                "root translation key '{key}' must be a namespace object"
+            candidate.warnings.push(format!(
+                "root translation key '{key}' must be a namespace object; it is ignored"
             ));
             continue;
         }
@@ -617,8 +649,8 @@ fn flatten_locale_object_validated(
             continue;
         }
 
-        candidate.errors.push(format!(
-            "translation key '{merged_key}' has invalid value type; only string/object are allowed"
+        candidate.warnings.push(format!(
+            "translation key '{merged_key}' has invalid value type; only string/object are              allowed, so the key is ignored"
         ));
     }
 }
@@ -1038,11 +1070,101 @@ mod tests {
     use super::{
         add_missing_baseline_coverage_warnings, build_effective_locale_bundles,
         normalize_locale_id, read_locale_candidate, reject_fallback_cycles,
-        require_metadata_string, resolve_catalog_text, strip_utf8_bom, validate_cross_locale_rules,
-        LocaleCandidate, LocaleDescriptor, LocaleLoadStatus, LocaleSource,
+        require_metadata_string, resolve_catalog_text, sorted_unique_descriptors, strip_utf8_bom,
+        validate_candidate_root, validate_cross_locale_rules, LocaleCandidate, LocaleDescriptor,
+        LocaleLoadStatus, LocaleSource,
     };
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    /// One malformed key must cost that key, not the language.
+    ///
+    /// A structural failure inside a single entry used to be an error, and the
+    /// bundle builder drops any candidate with errors — so one typo among two
+    /// thousand keys silently switched the whole interface to English, with the
+    /// only signal an `eprintln!` in a process that has no console.
+    #[test]
+    fn one_malformed_key_does_not_cost_the_whole_locale() {
+        let payload = r#"{
+            "metadata": {
+                "language": "ru",
+                "label": "Russian",
+                "nativeLabel": "Русский",
+                "version": "1.0",
+                "fallbacks": ["en"]
+            },
+            "menu": {
+                "file": "Файл",
+                "Bad_Segment": "не должен утащить файл",
+                "quit": "Выход"
+            },
+            "status": { "ready": 42 }
+        }"#;
+        let parsed: serde_json::Value = serde_json::from_str(payload).expect("fixture parses");
+        let mut subject = candidate("ru", &["en"], &[]);
+        subject.entries.clear();
+        validate_candidate_root(&parsed, &mut subject);
+
+        assert!(
+            subject.errors.is_empty(),
+            "a per-key defect must not be a file-level error: {:?}",
+            subject.errors
+        );
+        assert_eq!(
+            subject.entries.get("menu.file").map(String::as_str),
+            Some("Файл")
+        );
+        assert_eq!(
+            subject.entries.get("menu.quit").map(String::as_str),
+            Some("Выход"),
+            "keys after the bad one must survive"
+        );
+        assert!(
+            !subject.entries.contains_key("menu.Bad_Segment"),
+            "the malformed key itself must not be admitted"
+        );
+        assert!(
+            !subject.entries.contains_key("status.ready"),
+            "a non-string leaf must not be admitted"
+        );
+        assert!(
+            subject.warnings.iter().any(|w| w.contains("Bad_Segment")),
+            "the defect must still be reported: {:?}",
+            subject.warnings
+        );
+
+        // Positive control: a file that cannot be parsed at all is still a
+        // file-level error, so partial acceptance did not disarm the check.
+        let mut broken = candidate("ru", &["en"], &[]);
+        broken.entries.clear();
+        validate_candidate_root(&serde_json::json!([1, 2, 3]), &mut broken);
+        assert!(!broken.errors.is_empty());
+    }
+
+    /// A user override is a second FILE for a language the bundle already
+    /// ships, and the picker lists languages, not files.
+    #[test]
+    fn the_language_list_has_one_entry_per_language() {
+        let ru = || LocaleDescriptor {
+            id: "ru".to_string(),
+            label: "Russian".to_string(),
+            native_label: "Русский".to_string(),
+            fallbacks: vec!["en".to_string()],
+        };
+        let en = LocaleDescriptor {
+            id: "en".to_string(),
+            label: "English".to_string(),
+            native_label: "English".to_string(),
+            fallbacks: Vec::new(),
+        };
+        let listed = sorted_unique_descriptors(vec![ru(), en.clone(), ru()]);
+        let ids: Vec<&str> = listed.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids, vec!["en", "ru"]);
+
+        // Positive control: two DIFFERENT languages are both kept.
+        let listed = sorted_unique_descriptors(vec![ru(), en]);
+        assert_eq!(listed.len(), 2);
+    }
 
     fn candidate(id: &str, fallbacks: &[&str], entries: &[(&str, &str)]) -> LocaleCandidate {
         candidate_with_source(id, LocaleSource::Bundled, fallbacks, entries)

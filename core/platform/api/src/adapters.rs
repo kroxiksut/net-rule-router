@@ -237,7 +237,14 @@ pub fn names_indicate_virtual_machine_network(description: &str, friendly_name: 
 /// Availability classification of one network adapter.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdapterAvailability {
-    /// Interface up, has IPv4 address and gateway. Traffic can flow.
+    /// Interface up and holding an IPv4 address. Traffic can flow.
+    ///
+    /// A gateway is deliberately NOT required. A tunnel link (OpenVPN,
+    /// WireGuard) routinely exposes none: it installs split-default routes via
+    /// its peer instead of setting a gateway on the adapter, and the route
+    /// coordinator derives that peer from the OS route table. Demanding a
+    /// gateway here would classify a working tunnel as unusable and arm
+    /// fail-closed against the very link the user routes through.
     Available,
     /// Interface up but no IPv4 address (e.g. DHCP pending or no lease).
     /// This is the **Fail-Closed signal**: secondary has no IP →
@@ -263,8 +270,10 @@ impl AdapterAvailability {
 
 /// Classify a single adapter's availability.
 ///
-/// Returns `None` when the adapter should be excluded from tracking entirely
-/// (virtual, loopback, tunnel).
+/// `None` means EXCLUDED FROM TRACKING (virtual, loopback, tunnel) — not
+/// "unusable". The two readings are opposite in effect: a caller that treats
+/// `None` as unusable tears down the routing for a tunnel that is working
+/// perfectly well, which is the normal shape of a secondary link.
 pub fn classify_availability(info: &AdapterInfo) -> Option<AdapterAvailability> {
     if is_virtual_adapter(info) {
         return None;
@@ -550,28 +559,6 @@ impl AdapterMonitor {
 
         changes
     }
-
-    /// High-level snapshot of the last confirmed state for primary/secondary
-    /// adapters.
-    pub fn snapshot(&self) -> AdapterAvailabilitySnapshot {
-        AdapterAvailabilitySnapshot {
-            primary_index: 0,
-            primary_availability: AdapterAvailability::Absent,
-            secondary_index: None,
-            secondary_availability: None,
-        }
-    }
-}
-
-// ── AdapterAvailabilitySnapshot ───────────────────────────────────────────────
-
-/// Snapshot of primary and secondary adapter availability.
-#[derive(Clone, Debug)]
-pub struct AdapterAvailabilitySnapshot {
-    pub primary_index: u32,
-    pub primary_availability: AdapterAvailability,
-    pub secondary_index: Option<u32>,
-    pub secondary_availability: Option<AdapterAvailability>,
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

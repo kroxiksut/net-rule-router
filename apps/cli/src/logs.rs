@@ -27,9 +27,22 @@ pub enum Outcome {
     NoLogDirectory,
     /// The directory exists but holds no operational log yet.
     NoLogFile { directory: PathBuf },
-    /// The directory could not be read — on a locked-down install this is the
-    /// ordinary answer for a non-elevated console, not a fault.
+    /// Access was refused — on a locked-down install this is the ordinary
+    /// answer for a non-elevated console, not a fault, and elevation fixes it.
+    Forbidden { directory: PathBuf, detail: String },
+    /// The log could not be read for any other reason: the file is held open
+    /// exclusively, the disk failed, the bytes are not text. Elevation changes
+    /// none of those, and advising it sends the user off to prove it.
     Unreadable { directory: PathBuf, detail: String },
+}
+
+/// Split an I/O failure by what the user can actually do about it.
+fn classify(directory: PathBuf, detail: String, kind: std::io::ErrorKind) -> Outcome {
+    if kind == std::io::ErrorKind::PermissionDenied {
+        Outcome::Forbidden { directory, detail }
+    } else {
+        Outcome::Unreadable { directory, detail }
+    }
 }
 
 /// Read the tail of the newest operational log.
@@ -40,10 +53,8 @@ pub fn read_tail(directory: Option<PathBuf>, lines: usize) -> Outcome {
     let entries = match std::fs::read_dir(&directory) {
         Ok(entries) => entries,
         Err(e) => {
-            return Outcome::Unreadable {
-                directory,
-                detail: e.to_string(),
-            }
+            let kind = e.kind();
+            return classify(directory, e.to_string(), kind);
         }
     };
     let names: Vec<String> = entries
@@ -54,13 +65,48 @@ pub fn read_tail(directory: Option<PathBuf>, lines: usize) -> Outcome {
         return Outcome::NoLogFile { directory };
     };
     let path = directory.join(newest);
-    match std::fs::read_to_string(&path) {
+    match read_tail_bytes(&path) {
         Ok(text) => Outcome::Lines(tail_lines(&text, lines)),
-        Err(e) => Outcome::Unreadable {
-            directory,
-            detail: format!("{}: {e}", path.display()),
-        },
+        Err(e) => {
+            let kind = e.kind();
+            classify(directory, format!("{}: {e}", path.display()), kind)
+        }
     }
+}
+
+/// How much of the end of a log file is read to find the tail.
+///
+/// The whole file was read for it before, and retention allows fifty megabytes
+/// — a hundred and fifty in memory once decoded, at the exact moment the
+/// machine is already in trouble and someone is asking why. [`MAX_TAIL`] lines
+/// of NDJSON fit in this comfortably; a line that does not fit is truncated at
+/// its head, which is visible and harmless, unlike an allocation that is not.
+const TAIL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read the last [`TAIL_WINDOW_BYTES`] of `path` as text.
+///
+/// The window is cut at a byte boundary, so its first line may start
+/// mid-character; the leading partial line is dropped rather than rendered as
+/// replacement characters. A file smaller than the window is read whole and
+/// keeps its first line.
+fn read_tail_bytes(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len <= TAIL_WINDOW_BYTES {
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
+        return Ok(text);
+    }
+    file.seek(SeekFrom::Start(len - TAIL_WINDOW_BYTES))?;
+    let mut buf = Vec::with_capacity(TAIL_WINDOW_BYTES as usize);
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Ok(match text.find('\n') {
+        Some(idx) => text[idx + 1..].to_string(),
+        None => text,
+    })
 }
 
 /// The newest operational log among the file names in a directory.
@@ -120,12 +166,17 @@ pub fn report(outcome: Outcome, exe: &str) -> u8 {
             println!("The service writes one once it has started at least once.");
             exit::SUCCESS
         }
-        Outcome::Unreadable { directory, detail } => {
+        Outcome::Forbidden { directory, detail } => {
             eprintln!("Could not read the log directory {}.", directory.display());
             eprintln!("  {detail}");
             eprintln!("The directory is readable by the service account; try an elevated console:");
             eprintln!("  {exe} diag logs");
             exit::NEEDS_PRIVILEGE
+        }
+        Outcome::Unreadable { directory, detail } => {
+            eprintln!("Could not read the log in {}.", directory.display());
+            eprintln!("  {detail}");
+            exit::FAILED
         }
     }
 }

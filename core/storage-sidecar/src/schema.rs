@@ -29,11 +29,12 @@
 ///   so a single preset round-trip preserves every block the GUI
 ///   itself does not understand.
 ///
-/// * `pending_apply` — single-row table (`CHECK(id = 1)`) holding
-///   the last `_buildRulesJson()` snapshot the user "parked"
-///   because the service was unreachable, plus a precomputed
-///   summary for the "Apply pending changes?" toast. TTL via
-///   `expires_at`; DAO treats expired rows as absent.
+/// * `pending_apply` — single-row table (`CHECK(id = 1)`) marking that
+///   the user parked changes because the service was unreachable:
+///   content hash plus a precomputed summary for the "Apply pending
+///   changes?" toast. TTL via `expires_at`; an expired row is deleted
+///   on the next read. The rules themselves are not stored — see the
+///   `pending_apply` module docs.
 ///
 /// Indexes are limited to what we actually need:
 /// * `idx_rule_metadata_updated_at` for GC sweeps that filter by
@@ -104,3 +105,27 @@ pub(crate) const SIDECAR_DB_V2_DDL: &[&str] = &["CREATE TABLE external_ip_cache 
         external_ip TEXT    NOT NULL,
         observed_at INTEGER NOT NULL
     ) STRICT"];
+
+// ── v3: the park stops carrying a copy of the rules ───────────────────────────
+
+/// Rebuilds `pending_apply` without `rules_json`.
+///
+/// The column held a full serialised rule set on every park — host names and
+/// executable paths — that no reader ever opened: the toast works off the
+/// content hash and the summary, and the rules it applies are rebuilt from the
+/// live model. Expired rows only hid, so the copies accumulated for the life of
+/// the file. Parked state is at most seven days old and re-parked on the next
+/// offline edit, so the table is recreated rather than copied across.
+pub(crate) const SIDECAR_DB_V3_DDL: &[&str] = &[
+    "DROP INDEX IF EXISTS idx_pending_apply_expires_at",
+    "DROP TABLE pending_apply",
+    "CREATE TABLE pending_apply (
+        id           INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+        summary_json TEXT    NOT NULL,
+        content_hash TEXT    NOT NULL,
+        modified_at  INTEGER NOT NULL,
+        expires_at   INTEGER NOT NULL
+    ) STRICT",
+    "CREATE INDEX idx_pending_apply_expires_at
+        ON pending_apply(expires_at)",
+];

@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtQuick.Dialogs
+import "../lib/pure.js" as Pure
 
 // VPN-client onboarding.
 //
@@ -190,10 +191,7 @@ Window {
     /// Strip a `file:///` URL down to a plain local path (Windows-aware), then
     /// derive a friendly display name from the executable basename.
     function _localPathFromUrl(urlValue) {
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
     function _nameFromPath(p) {
         var s = String(p || "")

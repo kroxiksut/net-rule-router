@@ -465,12 +465,26 @@ pub trait SyncReconciler: Send + Sync {
     fn reconcile_now(&self, deadline: Duration) -> ReconcileOutcome;
 
     /// Kick the reconcile WITHOUT waiting for it (the fast-answers path:
-    /// every answered address is already cached-routable, so the answer does
-    /// not need to block on confirmation, but the facts just recorded should
-    /// still converge promptly). Default: a zero-deadline `reconcile_now`,
-    /// which registers the request and returns immediately.
+    /// every answered address is already enforced, so the answer does not need
+    /// to block on confirmation, but the facts just recorded should still
+    /// converge promptly). Default: a zero-deadline `reconcile_now`, which
+    /// registers the request and returns immediately.
     fn request_reconcile(&self) {
         let _ = self.reconcile_now(Duration::ZERO);
+    }
+
+    /// How long a reconcile run has been taking lately, when the implementation
+    /// measures it. `None` = unknown.
+    ///
+    /// The answer path uses it to tell a wait that can succeed from one that
+    /// cannot. A reconcile that runs an order of magnitude past the answer
+    /// deadline never installs anything inside it, so waiting buys nothing and
+    /// spends the deadline on every query — measured on the reporting machine
+    /// as 0 successful holds out of 215, at 900 ms each. Reporting the real
+    /// duration lets the gate skip a futile wait and start waiting again by
+    /// itself if the reconcile ever gets cheap.
+    fn typical_run(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -484,9 +498,19 @@ pub enum ReconcileOutcome {
     /// (fail-open on latency); the async safety tick converges shortly after.
     DeadlineExceeded,
     /// Fast-answers path: the answer was returned immediately because every
-    /// answered address was already cached-routable; the reconcile was
-    /// requested but deliberately not awaited.
+    /// answered address is already enforced; the reconcile was requested but
+    /// deliberately not awaited.
     Deferred,
+    /// The answer carried an address the policy does not carry yet, and the
+    /// reconcile that would carry it runs far past the answer deadline — so no
+    /// wait was attempted. The answer goes out ahead of its own enforcement and
+    /// the client's first connect to that address can be dropped; the
+    /// learn-from-drops path is what recovers it.
+    ///
+    /// Distinct from [`Self::DeadlineExceeded`] on purpose: that one waited and
+    /// was disappointed, this one knew better than to wait. Collapsing them
+    /// would hide which of the two the machine is actually doing.
+    AheadOfEnforcement,
 }
 
 /// Why an upstream resolution did not yield addresses.
@@ -557,14 +581,34 @@ fn describe_resolve_failure(err: &ResolveError) -> String {
 
 /// How long a rule-host answer may be held for the enforcement reconcile, and
 /// whether the fast-answers path may skip the hold entirely when every
-/// answered address is already cached-routable.
+/// answered address is already enforced.
 #[derive(Clone, Copy, Debug)]
 pub struct AnswerHold {
     /// Upper bound on the synchronous reconcile wait.
     pub deadline: Duration,
-    /// When `true`, an answer whose addresses are all cached-routable is
-    /// returned immediately (reconcile requested, not awaited).
+    /// When `true`, an answer whose addresses are all enforced is returned
+    /// immediately (reconcile requested, not awaited).
     pub fast_answers: bool,
+}
+
+/// Which destination addresses the installed policy carries right now.
+///
+/// The question the answer path has to settle is "will a connection to this
+/// address be carried, or dropped". The FQDN cache cannot answer it — it
+/// records what a name resolved to, not what the machine enforces — and the two
+/// diverge by a whole apply cycle. See [`crate::enforced_addresses`].
+pub trait EnforcedAddressView: Send + Sync {
+    fn is_enforced(&self, ip: Ipv4Addr) -> bool;
+}
+
+/// View for callers with no enforcement of their own (tests, platforms without
+/// an apply path). Reports nothing as enforced, which is the truth for them.
+pub struct NoEnforcement;
+
+impl EnforcedAddressView for NoEnforcement {
+    fn is_enforced(&self, _ip: Ipv4Addr) -> bool {
+        false
+    }
 }
 
 /// Handle a single `A` query.
@@ -591,6 +635,7 @@ pub fn handle_a_query(
     reconciler: &dyn SyncReconciler,
     fake_ip: &dyn FakeIpAnswerer,
     leak_guard: &dyn LeakGuardPosture,
+    enforced_view: &dyn EnforcedAddressView,
 ) -> QueryOutcome {
     // Upstream resolve is needed for BOTH paths — do it first.
     let resolved = match upstream.resolve_a(hostname) {
@@ -725,34 +770,64 @@ pub fn handle_a_query(
         };
     }
 
-    // Fast answers: hold the answer for the reconcile deadline
-    // ONLY when it introduces an address the routable cache has never seen —
-    // the one case where the app's first connect can race the route install.
-    // When every answered address is already cached (the steady state:
-    // `stable_answer_subset` prefers cached addresses by design), answer
-    // immediately and let the reconcile converge in the background. Field
-    // measurement: holding every answer blew the deadline on
-    // 57% of queries and 1359 clients abandoned the query entirely — a
-    // page-wide stall that bought nothing for already-routed addresses.
-    let first_contact = answered.iter().any(|ip| !cached.contains(ip));
-    let reconcile = if hold.fast_answers && !first_contact {
+    // Hold the answer for the reconcile ONLY when it introduces an address the
+    // policy does not carry yet — the one case where the app's first connect
+    // can race the install. When every answered address is already enforced,
+    // answer immediately and let the reconcile converge in the background.
+    // Field measurement: holding every answer blew the deadline on 57% of
+    // queries and 1359 clients abandoned the query entirely — a page-wide stall
+    // that bought nothing for already-routed addresses.
+    //
+    // The question is asked of what is INSTALLED, not of the FQDN cache. The
+    // cache answers "has this name ever resolved to this address", and using it
+    // here read every rotated CDN address as covered: on the reporting machine
+    // 2158 rule-host answers went out in a day, not one of them enforced, while
+    // the gate reported the steady state.
+    let unenforced: Vec<Ipv4Addr> = answered
+        .iter()
+        .copied()
+        .filter(|ip| !enforced_view.is_enforced(*ip))
+        .collect();
+    let all_enforced = unenforced.is_empty();
+    // A reconcile that runs past the deadline cannot install anything inside
+    // it, so waiting spends the budget on every query and installs nothing.
+    let futile_wait = reconciler
+        .typical_run()
+        .is_some_and(|typical| typical > hold.deadline);
+    let reconcile = if hold.fast_answers && all_enforced {
         reconciler.request_reconcile();
         ReconcileOutcome::Deferred
+    } else if futile_wait {
+        reconciler.request_reconcile();
+        ReconcileOutcome::AheadOfEnforcement
     } else {
         reconciler.reconcile_now(hold.deadline)
     };
-    let enforced = matches!(reconcile, ReconcileOutcome::Installed);
+    let enforced = all_enforced || matches!(reconcile, ReconcileOutcome::Installed);
     tracing::debug!(
         target: "nrr::dns-resolver",
         host = %hostname,
         rule_host = true,
         addresses = ?answered,
         upstream_count,
-        first_contact,
+        unenforced = unenforced.len(),
         enforced,
         reconcile = ?reconcile,
         "Mode B: rule host resolved and reconciled before answering",
     );
+    // The answer is about to hand a client an address the policy does not
+    // carry. Said once per host per occurrence, at INFO: this is the moment a
+    // user's first connect gets dropped, and it must not be discoverable only
+    // by whoever thinks to turn on debug logging.
+    if !all_enforced {
+        tracing::info!(
+            target: "nrr::dns-resolver",
+            host = %hostname,
+            addresses = ?unenforced,
+            waited = !futile_wait,
+            "answering ahead of enforcement: the policy does not carry these addresses yet — the first connect to them can be dropped and re-learned",
+        );
+    }
     // Fail-open on latency is the right trade while the additional link is UP:
     // the worst case is a fraction of a second on the wrong route. It is the
     // wrong one while the guard is blocking a link it could not resolve —
@@ -944,6 +1019,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -994,6 +1070,7 @@ mod tests {
             },
             &answerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
 
         match out {
@@ -1032,6 +1109,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1075,6 +1153,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1113,8 +1192,31 @@ mod tests {
         }
     }
 
+    /// A view that enforces exactly the listed addresses.
+    struct Enforcing(Vec<Ipv4Addr>);
+    impl EnforcedAddressView for Enforcing {
+        fn is_enforced(&self, ip: Ipv4Addr) -> bool {
+            self.0.contains(&ip)
+        }
+    }
+
+    /// Reconciler whose runs are known to outlast any answer deadline — the
+    /// measured production shape (seconds against a 900 ms budget).
+    struct SlowReconciler<'a>(&'a CallLog);
+    impl SyncReconciler for SlowReconciler<'_> {
+        fn reconcile_now(&self, _deadline: Duration) -> ReconcileOutcome {
+            panic!("a wait known to be futile must not be attempted");
+        }
+        fn request_reconcile(&self) {
+            self.0.push("request_reconcile");
+        }
+        fn typical_run(&self) -> Option<Duration> {
+            Some(Duration::from_secs(10))
+        }
+    }
+
     #[test]
-    fn fast_answers_skips_the_hold_when_every_answered_address_is_cached() {
+    fn fast_answers_skips_the_hold_when_every_answered_address_is_enforced() {
         let log = CallLog::default();
         let addr = ip(172, 64, 155, 209);
         let out = handle_a_query(
@@ -1134,9 +1236,88 @@ mod tests {
             &RequestOnlyReconciler(&log),
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &Enforcing(vec![addr]),
         );
-        // Answered immediately; not `enforced` (install was not awaited), but
-        // the reconcile was still requested so the facts converge.
+        // Answered immediately, and honestly enforced: the policy carries this
+        // address right now. The reconcile is still requested so the facts
+        // converge.
+        assert_eq!(
+            out,
+            QueryOutcome::Answer {
+                ips: vec![addr],
+                enforced: true,
+            }
+        );
+        assert_eq!(log.snapshot(), ["record", "request_reconcile"]);
+    }
+
+    #[test]
+    fn a_cached_address_the_policy_does_not_carry_is_not_the_fast_path() {
+        // The defect this gate had: the FQDN cache remembers every address the
+        // name ever resolved to, so a rotated CDN address read as covered and
+        // the answer went out ahead of its enforcement. Cached is not enforced.
+        let log = CallLog::default();
+        let addr = ip(172, 64, 154, 50);
+        let out = handle_a_query(
+            "static.licdn.com",
+            AnswerHold {
+                deadline: Duration::from_millis(150),
+                fast_answers: true,
+            },
+            &oracle(&["static.licdn.com"]),
+            &FakeUpstream {
+                answer: Ok(resolved(&[addr])),
+            },
+            &CachedSink {
+                log: &log,
+                cached: vec![addr],
+            },
+            &FakeReconciler {
+                log: &log,
+                outcome: ReconcileOutcome::Installed,
+            },
+            &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
+            &NoEnforcement,
+        );
+        // It took the hold instead of the fast path, and only the reconcile's
+        // own confirmation makes it enforced.
+        assert_eq!(
+            out,
+            QueryOutcome::Answer {
+                ips: vec![addr],
+                enforced: true,
+            }
+        );
+        assert_eq!(log.snapshot(), ["record", "reconcile"]);
+    }
+
+    #[test]
+    fn a_wait_that_cannot_finish_is_not_attempted() {
+        // The reconcile runs an order of magnitude past the deadline, so a hold
+        // installs nothing and only spends the budget. Answer, say so, and let
+        // the learn-from-drops path recover the first connect.
+        let log = CallLog::default();
+        let addr = ip(172, 64, 154, 50);
+        let out = handle_a_query(
+            "static.licdn.com",
+            AnswerHold {
+                deadline: Duration::from_millis(900),
+                fast_answers: true,
+            },
+            &oracle(&["static.licdn.com"]),
+            &FakeUpstream {
+                answer: Ok(resolved(&[addr])),
+            },
+            &CachedSink {
+                log: &log,
+                cached: vec![addr],
+            },
+            &SlowReconciler(&log),
+            &NoopFakeIpAnswerer,
+            &OpenLeakGuard,
+            &NoEnforcement,
+        );
         assert_eq!(
             out,
             QueryOutcome::Answer {
@@ -1169,6 +1350,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1204,6 +1386,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1235,6 +1418,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1269,6 +1453,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         // Fail-open on latency: still answer, but flagged unenforced. The fact
         // was recorded, so the async safety tick converges shortly after.
@@ -1306,6 +1491,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &|| true,
+            &NoEnforcement,
         );
         assert_eq!(out, QueryOutcome::Withheld);
         // The fact is still recorded: the next reconcile builds the filter, and
@@ -1340,6 +1526,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &|| true,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1408,6 +1595,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         match out {
             QueryOutcome::Answer { ips, enforced } => {
@@ -1444,6 +1632,7 @@ mod tests {
                 fake: ip(198, 18, 0, 5),
             },
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         // The app gets the FAKE address, flagged enforced (the TUN + relay carry
         // the flow, no per-IP install needed).
@@ -1485,6 +1674,7 @@ mod tests {
                 fake: ip(198, 18, 0, 5),
             },
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,
@@ -1588,6 +1778,7 @@ mod tests {
             },
             &NoopFakeIpAnswerer,
             &OpenLeakGuard,
+            &NoEnforcement,
         );
         assert_eq!(
             out,

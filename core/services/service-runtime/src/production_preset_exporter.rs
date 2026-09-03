@@ -19,12 +19,14 @@
 //! canonicalization. When `include_metadata = true`, the exporter writes
 //! a bare preset version header with no key/value lines.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use nrr_domain::rules_file::{
-    canonical_rule_set_to_rules_file_parsed, write_rules_file, PresetMetadata, RulesFileSection,
+    canonical_rule_set_to_rules_file_parsed, write_rules_file_with_passthrough, PassthroughSection,
+    PresetMetadata, RulesFileSection,
 };
 use nrr_domain::rules_json_codec;
 use nrr_shared::rules_json;
@@ -44,11 +46,17 @@ pub trait PresetExportSource: Send + Sync {
     /// first, falling back to the shared admin baseline — mirroring the
     /// enforcement read path — so the export reflects the rules the
     /// service is actually enforcing for that user.
+    ///
+    /// `passthrough` carries the sections this build does not parse, as raw
+    /// bodies keyed by section name. The revision store retains none, so
+    /// without them the export silently drops every foreign-OS and
+    /// forward-compatibility block the imported file held.
     fn export_rules_file(
         &self,
         principal: &str,
         route: RouteRole,
         include_metadata: bool,
+        passthrough: &BTreeMap<String, String>,
     ) -> Result<PresetExportOutput, PresetExportError>;
 }
 
@@ -146,6 +154,7 @@ impl PresetExportSource for ProductionPresetExporter {
         principal: &str,
         route: RouteRole,
         include_metadata: bool,
+        passthrough: &BTreeMap<String, String>,
     ) -> Result<PresetExportOutput, PresetExportError> {
         let guard = self
             .conn
@@ -190,7 +199,15 @@ impl PresetExportSource for ProductionPresetExporter {
             None
         };
 
-        let file_bytes_utf8 = write_rules_file(&parsed, &[], metadata.as_ref());
+        let carried: Vec<PassthroughSection> = passthrough
+            .iter()
+            .map(|(name, body)| PassthroughSection {
+                name: name.clone(),
+                body: body.clone(),
+            })
+            .collect();
+        let file_bytes_utf8 =
+            write_rules_file_with_passthrough(&parsed, &[], &carried, metadata.as_ref());
         let mut hasher = Sha256::new();
         hasher.update(file_bytes_utf8.as_bytes());
         let content_hash_hex = format!("{:x}", hasher.finalize());
@@ -306,8 +323,12 @@ mod tests {
         let conn = open_state_db_in_memory();
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
             .with_host_app_section(RulesFileSection::Windows);
-        let result =
-            exporter.export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false);
+        let result = exporter.export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &Default::default(),
+        );
         assert_eq!(result, Err(PresetExportError::NoActiveRevision));
     }
 
@@ -337,13 +358,18 @@ mod tests {
         // Sanity: the baseline partition is empty, so the OLD baseline-only
         // path still returns NoActiveRevision here.
         assert_eq!(
-            exporter.export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false),
+            exporter.export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default()
+            ),
             Err(PresetExportError::NoActiveRevision),
             "baseline partition must be empty for this regression"
         );
         // The fix: exporting as the caller SID resolves their own revision.
         let out = exporter
-            .export_rules_file(CALLER_SID, RouteRole::Primary, false)
+            .export_rules_file(CALLER_SID, RouteRole::Primary, false, &Default::default())
             .expect("caller-SID export must succeed via per-SID read-through");
         assert!(
             out.file_bytes_utf8.contains("per-sid.example"),
@@ -372,7 +398,7 @@ mod tests {
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
             .with_host_app_section(RulesFileSection::Windows);
         let out = exporter
-            .export_rules_file(CALLER_SID, RouteRole::Primary, false)
+            .export_rules_file(CALLER_SID, RouteRole::Primary, false, &Default::default())
             .expect("undiverged caller must read through to baseline");
         assert!(
             out.file_bytes_utf8.contains("baseline.example"),
@@ -383,11 +409,11 @@ mod tests {
 
     /// App-authored rules must survive the service round-trip.
     ///
-    /// The exporter deliberately passes `&[]` for unknown sections — a
-    /// revision blob carries no passthrough text — so anything the writer does
-    /// not know as a first-class section is lost here. `--- Auto` being a
-    /// first-class section is what keeps these rules (and their provenance) in
-    /// the exported file.
+    /// A revision blob carries no passthrough text, so anything the writer does
+    /// not know as a first-class section survives only when the caller hands it
+    /// back. `--- Auto` being a first-class section is what keeps these rules
+    /// (and their provenance) in the exported file with no help from the
+    /// caller.
     #[test]
     fn export_preserves_app_authored_rules_and_their_provenance() {
         use nrr_shared::auto_rule::{AutoRuleReason, RuleOrigin};
@@ -419,7 +445,12 @@ mod tests {
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
             .with_host_app_section(RulesFileSection::Windows);
         let out = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
             .expect("export");
 
         assert!(
@@ -469,7 +500,12 @@ mod tests {
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
             .with_host_app_section(RulesFileSection::Windows);
         let out = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
             .expect("export");
         assert!(
             out.file_bytes_utf8
@@ -512,10 +548,20 @@ mod tests {
 
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
         let primary = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
             .expect("export primary");
         let secondary = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Secondary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Secondary,
+                false,
+                &Default::default(),
+            )
             .expect("export secondary");
         assert!(primary.file_bytes_utf8.contains("primary.example"));
         assert!(!primary.file_bytes_utf8.contains("secondary.example"));
@@ -539,7 +585,12 @@ mod tests {
 
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
         let out = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, true)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                true,
+                &Default::default(),
+            )
             .expect("export");
         assert!(
             out.file_bytes_utf8.starts_with(&format!(
@@ -566,10 +617,20 @@ mod tests {
 
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn));
         let a = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
             .expect("a");
         let b = exporter
-            .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
             .expect("b");
         assert_eq!(a, b);
     }
@@ -580,5 +641,91 @@ mod tests {
         let encoded = encode_file_bytes_b64(original);
         let decoded = BASE64_STANDARD.decode(encoded.as_bytes()).expect("decode");
         assert_eq!(String::from_utf8(decoded).expect("utf8"), original);
+    }
+    /// A foreign-OS or unsupported block the caller carried must come back out
+    /// of the export. The store keeps only rules this build understands, so
+    /// without the caller's copy the user's `--- Linux` and `--- CIDR` sections
+    /// vanish on the first export — the loss the preservation guarantee on
+    /// `UnknownSection` exists to prevent.
+    #[test]
+    fn carried_passthrough_sections_come_back_out_of_the_export() {
+        let conn = open_state_db_in_memory();
+        seed_active_revision(
+            &conn,
+            RulesRevisionContent::new(CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![rule(
+                    "r-1",
+                    CanonicalAddressMatch::ExactFqdn("keep.example".to_string()),
+                    "",
+                )]),
+                secondary: CanonicalRuleSet::default(),
+            }),
+        );
+        let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
+            .with_host_app_section(RulesFileSection::Windows);
+
+        let mut carried = BTreeMap::new();
+        carried.insert(
+            "Linux".to_string(),
+            "firefox
+"
+            .to_string(),
+        );
+        carried.insert(
+            "CIDR".to_string(),
+            "10.0.0.0/8
+"
+            .to_string(),
+        );
+
+        let out = exporter
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &carried,
+            )
+            .expect("export");
+
+        assert!(
+            out.file_bytes_utf8.contains(
+                "--- Linux
+firefox
+"
+            ),
+            "foreign-OS section lost:
+{}",
+            out.file_bytes_utf8
+        );
+        assert!(
+            out.file_bytes_utf8.contains(
+                "--- CIDR
+10.0.0.0/8
+"
+            ),
+            "unsupported section lost:
+{}",
+            out.file_bytes_utf8
+        );
+        assert!(
+            out.file_bytes_utf8.contains("keep.example"),
+            "known rules must still be there:
+{}",
+            out.file_bytes_utf8
+        );
+
+        // Positive control: the same export WITHOUT the caller's copy has
+        // neither section, so the assertions above test the plumbing and not a
+        // fixture that always contained them.
+        let bare = exporter
+            .export_rules_file(
+                nrr_storage::BASELINE_PRINCIPAL,
+                RouteRole::Primary,
+                false,
+                &Default::default(),
+            )
+            .expect("export");
+        assert!(!bare.file_bytes_utf8.contains("--- Linux"));
+        assert!(!bare.file_bytes_utf8.contains("--- CIDR"));
     }
 }

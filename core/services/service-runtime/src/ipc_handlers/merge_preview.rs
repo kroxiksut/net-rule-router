@@ -164,6 +164,7 @@ mod tests {
             service_only: Vec::new(),
             conflicts: Vec::new(),
             merged_rules_json: "{\"schema-version\":1,\"primary\":[],\"secondary\":[]}".into(),
+            normalized_duplicates: Vec::new(),
         }
     }
 

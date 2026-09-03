@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
 import "../../components"
+import "../../lib/pure.js" as Pure
 
 // Settings → «Presets / Settings» subsection.
 // Provides full route-matrix Import/Export plus the read-only
@@ -370,10 +371,7 @@ GroupBox {
     }
 
     function _localPath(urlValue) {
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
 
     // Inverse of `_localPath`: a local path back into the file URL the folder

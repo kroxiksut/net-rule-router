@@ -52,9 +52,14 @@ impl SidecarDb {
         Ok(out)
     }
 
-    /// Upsert every entry in one transaction. The GUI hands over the
-    /// whole snapshot's worth of resolved addresses in a single RPC
-    /// rather than one round trip per adapter.
+    /// Write every entry in one transaction: an address upserts, an EMPTY
+    /// address deletes.
+    ///
+    /// The delete half is what keeps the cache honest. The service drops an
+    /// external address the moment the adapter's local IP changes, and a row
+    /// left behind is then shown to the user as "last known" — an address the
+    /// machine no longer has. The GUI hands over the whole snapshot in one
+    /// RPC, so "resolved nothing for this adapter" has to be expressible.
     pub fn write_external_ip_cache_entries(
         &self,
         entries: &[(String, String, i64)],
@@ -72,8 +77,13 @@ impl SidecarDb {
                      external_ip = excluded.external_ip,
                      observed_at = excluded.observed_at",
             )?;
+            let mut forget = tx.prepare("DELETE FROM external_ip_cache WHERE adapter_key = ?1")?;
             for (key, ip, observed_at_ms) in entries {
-                stmt.execute(params![key, ip, observed_at_ms])?;
+                if ip.is_empty() {
+                    forget.execute(params![key])?;
+                } else {
+                    stmt.execute(params![key, ip, observed_at_ms])?;
+                }
             }
         }
         tx.commit()?;
@@ -161,5 +171,29 @@ mod tests {
         let all = db.read_all_external_ip_cache()?;
         assert_eq!(all["name:Беспроводная сеть"].external_ip, "203.0.113.55");
         Ok(())
+    }
+
+    #[test]
+    fn an_empty_address_forgets_the_row_instead_of_storing_a_blank() {
+        // The service drops an external address when the adapter's local IP
+        // changes. A row kept past that point is drawn as "last known" — an
+        // address the machine does not have any more.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = open_sidecar(&tmp).expect("open");
+        db.write_external_ip_cache_entries(&[("nic-1".into(), "203.0.113.7".into(), 10)])
+            .expect("write");
+        assert!(db
+            .read_all_external_ip_cache()
+            .expect("read")
+            .contains_key("nic-1"));
+
+        db.write_external_ip_cache_entries(&[("nic-1".into(), String::new(), 20)])
+            .expect("forget");
+        assert!(
+            !db.read_all_external_ip_cache()
+                .expect("read")
+                .contains_key("nic-1"),
+            "an unresolved adapter must leave no row behind"
+        );
     }
 }

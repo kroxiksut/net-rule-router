@@ -17,6 +17,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::{Command, Stdio};
 
 /// Outcome of attempting to spawn the elevated broker.
@@ -64,11 +65,39 @@ pub fn broker_temp_dir() -> PathBuf {
 /// Write the nonce to a freshly named token file and return its path. The
 /// caller passes the path to the broker; the broker reads and deletes it.
 pub fn write_token_file(launcher_pid: u32, suffix: &str, nonce: &str) -> io::Result<PathBuf> {
+    use std::io::Write;
+
     let dir = broker_temp_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("broker-{launcher_pid}-{suffix}.token"));
-    std::fs::write(&path, nonce)?;
+    // `create_new`, not a plain write: the directory is the user's own temp
+    // root, readable by exactly the process class this nonce is meant to keep
+    // out. A file already sitting at this name is not ours — writing into it
+    // would hand the nonce to whoever placed it and keep their ACL. Failing is
+    // the right answer; the suffix is random, so a collision means someone is
+    // waiting for us.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(nonce.as_bytes())?;
     Ok(path)
+}
+
+/// Absolute path of the system PowerShell.
+///
+/// `%SystemRoot%` rather than a literal `C:\Windows`: the directory is where
+/// Windows says it is, and the fallback is only for an environment that has
+/// been stripped of it.
+#[cfg(windows)]
+fn system_powershell() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join("System32")
+        .join("WindowsPowerShell")
+        .join("v1.0")
+        .join("powershell.exe")
 }
 
 /// Read and consume (delete) the nonce token file. Called by the broker on
@@ -89,6 +118,10 @@ pub fn read_and_delete_token_file(path: &Path) -> io::Result<String> {
 /// (no `-Wait`). Returns [`SpawnOutcome::Launched`] when the elevation
 /// succeeded, [`SpawnOutcome::Declined`] when the UAC prompt was dismissed,
 /// and [`SpawnOutcome::Failed`] when PowerShell itself could not run.
+/// Elevation is a Windows path: the broker exists to answer a UAC prompt, and
+/// there is no cross-platform meaning for this call. On other systems the
+/// elevated verb goes through `platform-api::elevation` instead.
+#[cfg(windows)]
 pub fn spawn_elevated_broker(exe: &Path, argv: &[String]) -> SpawnOutcome {
     let exe_ps = ps_single_quote(&exe.to_string_lossy());
     let arg_list = argv
@@ -103,7 +136,11 @@ pub fn spawn_elevated_broker(exe: &Path, argv: &[String]) -> SpawnOutcome {
         "$ErrorActionPreference='Stop'; \
          Start-Process -FilePath {exe_ps} -ArgumentList @({arg_list}) -Verb RunAs"
     );
-    let mut cmd = Command::new("powershell");
+    // Absolute, never the bare name. This is the process that RAISES the UAC
+    // prompt, so which binary answers to "powershell" decides what the user is
+    // about to approve — and a bare name is resolved against a PATH that any
+    // process of this user can prepend to.
+    let mut cmd = Command::new(system_powershell());
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

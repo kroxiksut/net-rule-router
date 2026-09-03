@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::sync::mpsc;
 use std::thread;
+
+use nrr_shared::product_identity::BinaryRole;
 use std::time::{Duration, Instant};
 
 use nrr_application::backend_facade::{mock_scenario_from_env, tray_status_for_mock_scenario};
@@ -93,9 +95,15 @@ fn diag_log_path(surface_tag: &str) -> PathBuf {
 /// double-click launches.
 pub(crate) fn diag_log(surface_tag: &str, message: &str) {
     let path = diag_log_path(surface_tag);
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
+    // The directory is created once per process, not once per line. This is
+    // called for every line the child writes that is not a protocol marker, and
+    // a chatty child turned one log line into a directory syscall as well.
+    static DIR_READY: std::sync::Once = std::sync::Once::new();
+    DIR_READY.call_once(|| {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+    });
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
         // Best-effort timestamp using std::time. chrono is not a dep.
         let ts = std::time::SystemTime::now()
@@ -155,8 +163,9 @@ pub enum LauncherSurface {
 #[derive(Clone, Debug)]
 pub struct LauncherConfig {
     pub surface: LauncherSurface,
+    /// Which binary this is, for diagnostics. Taken from the identity SSOT so
+    /// a renamed role cannot leave the message naming a binary that is gone.
     pub app_name: &'static str,
-    pub app_user_model_id: &'static str,
     pub single_instance_key: &'static str,
 }
 
@@ -164,8 +173,7 @@ impl LauncherConfig {
     pub fn main_gui() -> Self {
         Self {
             surface: LauncherSurface::MainGui,
-            app_name: "NetRuleRouter",
-            app_user_model_id: "NetRuleRouter.NetRuleRouter",
+            app_name: BinaryRole::Gui.host_file_name(),
             single_instance_key: "gui-shell-v1",
         }
     }
@@ -173,8 +181,7 @@ impl LauncherConfig {
     pub fn tray() -> Self {
         Self {
             surface: LauncherSurface::Tray,
-            app_name: "NetRuleRouterTray",
-            app_user_model_id: "NetRuleRouter.NetRuleRouterTray",
+            app_name: BinaryRole::Tray.host_file_name(),
             single_instance_key: "tray-shell-v1",
         }
     }
@@ -829,7 +836,6 @@ fn emit_main_gui_context(
         &context_path,
         &shell,
         section_to_open,
-        request.source,
         preferences.clone(),
         &first_run,
         request,
@@ -1123,20 +1129,50 @@ fn apply_no_window(command: &mut Command) -> &mut Command {
     command
 }
 
+/// Longest child stdout line this pump will hold.
+///
+/// The lines that matter are the `NRR_PREFS_JSON:` payloads, and a whole
+/// preferences document is far below this. A child that emits a line without a
+/// newline — a wedged writer, a binary stream on the wrong pipe — would
+/// otherwise grow one `String` until the process dies of it, and the reader is
+/// the one part of the launcher that must survive a misbehaving child.
+const MAX_CHILD_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 fn spawn_line_reader<R>(reader: R, sender: mpsc::Sender<String>)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let buffered = BufReader::new(reader);
-        for line in buffered.lines() {
-            match line {
-                Ok(line) => {
-                    if sender.send(line).is_err() {
-                        break;
-                    }
-                }
+        let mut buffered = BufReader::new(reader);
+        let mut line = Vec::with_capacity(256);
+        loop {
+            line.clear();
+            // Byte-oriented and capped, rather than `lines()`: the cap is the
+            // point, and a child is free to emit bytes that are not UTF-8.
+            let mut limited = (&mut buffered).take(MAX_CHILD_LINE_BYTES as u64);
+            match limited.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
                 Err(_) => break,
+            }
+            // Nothing but a full cap and no terminator: the line is oversized,
+            // so drop it and resynchronise on the next newline rather than
+            // reassembling something no consumer can use.
+            if line.len() == MAX_CHILD_LINE_BYTES && !line.ends_with(b"\n") {
+                let mut discard = Vec::new();
+                if buffered.read_until(b'\n', &mut discard).is_err() {
+                    break;
+                }
+                continue;
+            }
+            while line.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+                line.pop();
+            }
+            if sender
+                .send(String::from_utf8_lossy(&line).into_owned())
+                .is_err()
+            {
+                break;
             }
         }
     });
@@ -1456,8 +1492,7 @@ mod tests {
     fn launcher_config_main_gui_uses_canonical_names() {
         let config = LauncherConfig::main_gui();
         assert_eq!(config.surface, LauncherSurface::MainGui);
-        assert_eq!(config.app_name, "NetRuleRouter");
-        assert_eq!(config.app_user_model_id, "NetRuleRouter.NetRuleRouter");
+        assert_eq!(config.app_name, super::BinaryRole::Gui.host_file_name());
         assert_eq!(config.single_instance_key, "gui-shell-v1");
     }
 
@@ -1465,8 +1500,7 @@ mod tests {
     fn launcher_config_tray_uses_canonical_names() {
         let config = LauncherConfig::tray();
         assert_eq!(config.surface, LauncherSurface::Tray);
-        assert_eq!(config.app_name, "NetRuleRouterTray");
-        assert_eq!(config.app_user_model_id, "NetRuleRouter.NetRuleRouterTray");
+        assert_eq!(config.app_name, super::BinaryRole::Tray.host_file_name());
         assert_eq!(config.single_instance_key, "tray-shell-v1");
     }
 

@@ -1253,6 +1253,17 @@ pub struct IpcContractVersionPolicy {
     pub compatibility_matrix_required: bool,
 }
 
+/// The wire protocol version both ends speak.
+///
+/// The one number the dispatcher hard-rejects a request on (`InvalidVersion`)
+/// belongs where every peer reads it from. It lived twice — once in the
+/// service, once in the client with a "mirrors ..." comment — so a bump on
+/// either side compiled green and dropped 100 % of calls, with the client's
+/// mismatch branch turning that into an endless reconnect instead of a
+/// message. Bump only for an incompatible wire-format change, and record it in
+/// [`IPC_VERSION_COMPATIBILITY_MATRIX`].
+pub const IPC_PROTOCOL_VERSION: u32 = 1;
+
 pub const IPC_CONTRACT_VERSION_POLICY: IpcContractVersionPolicy = IpcContractVersionPolicy {
     contract_version_in_envelope: true,
     explicit_negotiation_required: true,

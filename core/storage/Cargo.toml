@@ -25,6 +25,9 @@ hmac = "0.12"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: the block-policy defaults are pinned against the GUI's own
+# declaration of the same defaults, which is a JSON literal.
+serde_json = "1"
 
 [lints]
 workspace = true

@@ -81,6 +81,11 @@ pub enum ParseError {
         verb: &'static str,
         flag: &'static str,
     },
+    /// The same flag was given twice.
+    RepeatedFlag {
+        verb: &'static str,
+        flag: &'static str,
+    },
     /// The value is not one this flag accepts.
     InvalidValue {
         verb: &'static str,
@@ -121,6 +126,9 @@ impl std::fmt::Display for ParseError {
             }
             Self::UnexpectedValue { verb, flag } => {
                 write!(f, "`{verb} --{flag}` does not take a value")
+            }
+            Self::RepeatedFlag { verb, flag } => {
+                write!(f, "`{verb} --{flag}` was given more than once")
             }
             Self::InvalidValue { verb, flag, value } => {
                 write!(f, "`{verb} --{flag}`: `{value}` is not a valid value")
@@ -223,6 +231,16 @@ fn collect_flags(spec: &'static VerbSpec, rest: &[String]) -> Result<Vec<ParsedF
                 })
             }
             _ => {}
+        }
+        // A repeated flag is a typo or a mistaken assumption about which one
+        // wins, and both are worth saying out loud: silently keeping the first
+        // means `--start-mode=on-demand --start-mode=with-windows` installs the
+        // opposite of what the line ends with.
+        if parsed.iter().any(|seen: &ParsedFlag| seen.name == name) {
+            return Err(ParseError::RepeatedFlag {
+                verb: spec.name,
+                flag: flag.name,
+            });
         }
         parsed.push(ParsedFlag { name, value });
     }
@@ -588,5 +606,29 @@ mod tests {
                 argument: "extra".to_string()
             })
         );
+    }
+
+    /// A flag given twice is refused rather than silently resolved. The install
+    /// verb is the one that matters: the two spellings of `--start-mode` mean
+    /// opposite things, and keeping the first is the answer nobody expects.
+    #[test]
+    fn a_repeated_flag_is_a_usage_error() {
+        let err = parse(&[
+            "install".to_string(),
+            "--start-mode=on-demand".to_string(),
+            "--start-mode=with-windows".to_string(),
+        ])
+        .expect_err("a repeated flag must not parse");
+        assert!(
+            matches!(
+                err,
+                ParseError::RepeatedFlag {
+                    flag: "start-mode",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 }

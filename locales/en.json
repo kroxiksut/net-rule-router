@@ -30,8 +30,13 @@
     "service-stop-running": "Stopping the service…",
     "service-stop-ok": "Service stopped.",
     "service-restart-running": "Restarting the service…",
+    "service-restart-ok": "Service restarted.",
     "service-uninstall-running": "Uninstalling the service…",
     "service-uninstall-ok": "Service uninstalled.",
+    "service-reinstall-running": "Reinstalling the service…",
+    "service-reinstall-ok": "Service reinstalled.",
+    "service-cleanup-running": "Restoring the network state the service applied…",
+    "service-cleanup-ok": "Network state restored.",
     "service-failed": "Service operation failed",
     "service-uac-declined": "Administrator prompt declined — operation cancelled.",
     "first-run-provisioned": "Setup answers were supplied before launch; applying them."
@@ -104,7 +109,8 @@
     "pause-rules": "Disable rules",
     "resume-rules": "Enable rules",
     "collapse-submenu": "Collapse submenu",
-    "expand-submenu": "Expand submenu"
+    "expand-submenu": "Expand submenu",
+    "open-rules": "Open rules"
   },
   "label": {
     "mode": "Mode",
@@ -201,6 +207,10 @@
       "stale-process": {
         "description": "The service program file was updated, but the service is still running the previous version. Restart it to run the update.",
         "tooltip": "Needs administrator rights. Routing pauses for a moment while the service restarts."
+      },
+      "offer-install": {
+        "label": "Offer to install the service when it is missing",
+        "description": "Without the background service the app applies no rules at all, so it offers to install one. Dismissing the offer holds it back for a week; turning this off stops it entirely."
       }
     },
     "console": {
@@ -273,7 +283,8 @@
       "experimental": "Experimental features",
       "updates": "Check for updates",
       "presets": "Preset import",
-      "block-notices": "Blocked-connection notices"
+      "block-notices": "Blocked-connection notices",
+      "tray-notifications": "Tray notifications"
     },
     "note": {
       "logs-diagnostics": "Preview controls are available on dedicated screens.",
@@ -318,7 +329,8 @@
       "show-other-os-rules": "Show rules for other operating systems",
       "import-both-files-together": "Import both route files together",
       "tray-notice-opacity": "Tray notification opacity, %",
-      "tray-notice-opacity-note": "Applies to notifications shown from the tray. Restart the tray for it to take effect."
+      "tray-notice-opacity-note": "Applies to notifications shown from the tray. Restart the tray for it to take effect.",
+      "notify-rule-duplicates": "Tell me when a rule is set on both routes"
     },
     "system-font": {
       "option-system-default": "System default",
@@ -852,6 +864,9 @@
     },
     "theme": {
       "system-undetected": "The system theme could not be determined — using the light theme."
+    },
+    "language": {
+      "diagnostics-summary": "%1 locale file(s) reported problems. The affected keys fall back to English; everything else in the file is used."
     }
   },
   "vpn-onboarding": {
@@ -1138,7 +1153,9 @@
       "apply-from-preview": "Apply…",
       "apply-from-preview-description": "Close the preview and open the activation flow for these parked changes",
       "no-elevation-warning": "NetRuleRouter is not running as Administrator. When you apply, Windows will ask for administrator approval once — after you approve it, this and later changes apply without prompting again until you close the app.",
-      "session-elevation-active": "You granted administrator approval for this session. Changes apply without another prompt. This temporary approval ends when you close NetRuleRouter."
+      "session-elevation-active": "You granted administrator approval for this session. Changes apply without another prompt. This temporary approval ends when you close NetRuleRouter.",
+      "duplicates-heading": "Rules written into both routes",
+      "duplicates-hint": "Each of these is enabled on both routes, so which one carries the traffic is decided by evaluation order rather than by you. Pick the route that should keep it — the other copy stays in your list, switched off."
     },
     "reload-from-service": {
       "title": "Load active rules from the service?",
@@ -1269,7 +1286,8 @@
       "body-3": "You can skip this step and use NetRuleRouter in read-only preview mode, but routing rules will not apply.",
       "install-button": "Install and start service (recommended)",
       "skip-button": "Continue without service (limited)",
-      "learn-more": "Learn more"
+      "learn-more": "Learn more",
+      "stop-offering": "Stop offering"
     },
     "third-party": {
       "tab": "Third-party components",
@@ -1494,6 +1512,8 @@
     "route-binding-uac-declined": "Administrator approval was declined; the adapter binding was not saved to the service, so routing will not be enforced.",
     "route-binding-failed": "Could not save the adapter binding to the service: ",
     "route-policy-read-failed": "Could not read the current routing policy, so nothing was changed. The setting is saved and will be sent again: ",
+    "route-policy-uac-declined": "Administrator approval was declined; the setting was not changed.",
+    "route-policy-failed": "Could not save the setting to the service: ",
     "full-reset-running": "Performing full reset…",
     "bundled-preset-empty": "Could not read the selected bundled preset.",
     "user-presets-folder-empty": "No rule sets found in your folder — showing the sets that come with the app.",
@@ -1788,13 +1808,19 @@
     "clear-failed": "Could not clear: ",
     "rules-overlap-removed": "{n} rule(s) removed as already covered. Apply to put the change into effect.",
     "zone-priority-on": "A zone rule now wins over an exact address rule inside it.",
-    "zone-priority-off": "An exact address rule now wins over the zone it sits in."
+    "zone-priority-off": "An exact address rule now wins over the zone it sits in.",
+    "service-install-offer-stopped": "The service install offer is off. Turn it back on in Settings.",
+    "duplicate-rule-resolved": "The other copy of the rule was switched off. Review the changes again to apply them."
   },
   "interfaces": {
     "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
     "fail-closed": {
       "banner-title": "Fail-Closed mode active",
       "banner-body": "Secondary route is unavailable. Matched traffic is being blocked instead of leaking to the primary."
+    },
+    "placeholder-rows": {
+      "banner-title": "These are not your adapters",
+      "banner-body": "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a route here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives."
     },
     "secondary-absent": {
       "banner-title": "The additional route is not available",
@@ -2423,7 +2449,6 @@
       "audit-chain-mismatch": "Audit chain mismatch detected",
       "cache-healthy": "Cache healthy",
       "cache-stale": "Cache entries stale",
-      "cache-rebuilding": "Cache rebuild in progress",
       "stale-data-warning": "Status data may be outdated"
     },
     "alert": {
@@ -2957,6 +2982,14 @@
     "service-refused": {
       "title": "The service will not accept this app",
       "body": "The background service is running, but it refused a connection from this account. That usually means the service was installed by a different user, or it is already serving as many connections as it allows. Reinstalling the service as an administrator, or signing in as the account that installed it, restores the link."
+    },
+    "rule-duplicates": {
+      "title": "A rule is set on both routes",
+      "body": "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order."
+    },
+    "app-rule-learning": {
+      "title": "New application rule is settling in",
+      "body": "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open."
     }
   },
   "route": {

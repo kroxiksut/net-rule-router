@@ -49,7 +49,7 @@ QtObject {
                     // plainly what did and did not happen: the file is up to
                     // date, the service is not, and "Apply" stays lit because
                     // of the second half — not because the save failed.
-                    root._parkPendingApply(rulesJson, contentHash,
+                    root._parkPendingApply(contentHash,
                         root.rulesModel ? root.rulesModel.count : 0)
                     root.setStatus(
                         root.tr("status.rules-saved-not-applied-short",
@@ -79,7 +79,7 @@ QtObject {
             console.log("review-flow: bridge unavailable, aborting")
             return
         }
-        var corr = Pure.newCorrelationId()
+        var corr = Pure.newCorrelationId("review-save")
         var payload = {
             "rules-json": String(rulesJson || ""),
             "content-hash": String(contentHash || ""),
@@ -103,7 +103,7 @@ QtObject {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, true /* dryRun */, ""
         )
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("review-flow: dry-run failed:", code, msg)
                 // Release the guard without navigating.
@@ -230,7 +230,7 @@ QtObject {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, false /* dryRun */, token
         )
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok && code === "confirmation-expired") {
                 // Re-issue the dry-run; the dirty flag must stay
                 // set because the user hasn't successfully confirmed
@@ -392,7 +392,7 @@ QtObject {
             console.log("reset-flow: bridge unavailable, aborting")
             return
         }
-        var corr = Pure.newCorrelationId()
+        var corr = Pure.newCorrelationId("reset-to-baseline")
         var payload = { "correlation-id": corr }
         root.pendingReviewState = {
             rulesJson: "",
@@ -404,7 +404,7 @@ QtObject {
         root._activeReviewKind = "rules-reset-to-baseline"
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-reset-to-baseline", payload, true /* dryRun */, "")
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 root.statusLine = root.tr("status.reset-baseline-failed",
                     "Could not start reset to baseline: ") +
@@ -447,7 +447,7 @@ QtObject {
         var payload = { "correlation-id": root.pendingReviewState.correlationId }
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-reset-to-baseline", payload, false /* dryRun */, token)
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok && code === "confirmation-expired") {
                 root.reviewExpiredDialog.open()
                 return
@@ -478,10 +478,27 @@ QtObject {
     /// attempt distinctly.
     function _retryReviewFlow() {
         if (root._activeReviewKind === "preset-import") {
-            root.presetImportController.startPresetImportReviewFlow(
-                root.pendingPresetImportState.targetRoute,
-                root.pendingPresetImportState.bytesB64,
-                root.pendingPresetImportState.sourcePath)
+            var state = root.pendingPresetImportState || {}
+            // A both-routes import is re-issued as a both-routes import. Sent
+            // through the single-route entry it arrived as `targetRoute:
+            // "both"`, which that path does not understand, and `bytesB64` —
+            // the PRIMARY file, kept for exactly this fallback — landed in
+            // `secondary-bytes-b64`: the retry of a two-file import wrote the
+            // primary file's rules onto the additional route.
+            if (String(state.targetRoute) === "both") {
+                root.presetImportController.startBothRoutesPresetImportReviewFlow(
+                    state.primaryBytesB64,
+                    state.secondaryBytesB64,
+                    state.primaryPath,
+                    state.secondaryPath,
+                    { mode: state.mode, hydration: state.hydration })
+            } else {
+                root.presetImportController.startPresetImportReviewFlow(
+                    state.targetRoute,
+                    state.bytesB64,
+                    state.sourcePath,
+                    state.mode)
+            }
         } else if (root._activeReviewKind === "rules-reset-to-baseline") {
             startResetToBaselineFlow()
         } else {

@@ -2,7 +2,8 @@
 // fully closed for it to take effect on next launch; this offers to do that
 // now. Extracted from Main.qml (thin-shell
 // refactor). Emits `closeAllRequested()`; the caller (Main.qml) runs
-// `_fullResetCloseAll()`. Shared state comes in through `ownerRoot`.
+// `fullResetController.closeAllProcesses()`. Shared state comes in through
+// `ownerRoot`.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15

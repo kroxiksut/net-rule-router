@@ -364,20 +364,26 @@ pub fn exceeds_free_rule_cap(rules_json: &str) -> bool {
 /// the service computed alongside it was empty, because by then both sides were
 /// folded.
 ///
-/// Identity that carries no routing (`id`, `comment`) is dropped, and both
-/// buckets are ordered, so the result depends on the rules alone and not on the
-/// order they arrived in.
+/// Identity that carries no routing (`id`, `comment`, `origin`) is dropped, and
+/// both buckets are ordered, so the result depends on the rules alone and not
+/// on the order they arrived in. `origin` belongs in that list even though it
+/// is not user-typed: an auto-rule's reason, anchor host and discovery date say
+/// where a rule came from, not where the traffic goes, and two sides that
+/// learned the same host on different days were reported as diverged.
 pub fn fold_for_comparison(dto: &mut CanonicalRulesJsonV1) {
     for rule in dto.primary.iter_mut().chain(dto.secondary.iter_mut()) {
         fold_rule(rule);
     }
-    dto.primary.sort_by_key(comparison_key);
-    dto.secondary.sort_by_key(comparison_key);
+    // `sort_by_cached_key`, not `sort_by_key`: the key is an owned String and
+    // this runs on every edit and every 30 s poll.
+    dto.primary.sort_by_cached_key(comparison_key);
+    dto.secondary.sort_by_cached_key(comparison_key);
 }
 
 fn fold_rule(rule: &mut RuleDto) {
     rule.id.clear();
     rule.comment.clear();
+    rule.origin = None;
     if let Some(address) = rule.address_match.as_mut() {
         match address {
             AddressMatchDto::ExactFqdn { value } => *value = fold_host(value),
@@ -418,33 +424,49 @@ fn fold_suffix(raw: &str) -> String {
 
 /// Order key for a folded rule: the routing it describes, nothing else. NUL
 /// separates the parts because an application pattern may contain spaces.
+///
+/// EVERY field that distinguishes two rules has to be in here. The sort is
+/// stable, so two rules the key cannot tell apart keep the order they arrived
+/// in — and two sides holding the same set in a different order then produce
+/// different canonical bytes, which is the permanent amber divergence banner
+/// this folding exists to prevent.
 fn comparison_key(rule: &RuleDto) -> String {
-    let (kind, value) = match (&rule.address_match, &rule.app_match) {
-        (Some(AddressMatchDto::ExactFqdn { value }), _) => ("exact-fqdn", value.as_str()),
-        (Some(AddressMatchDto::SuffixDomain { suffix }), _) => ("suffix-domain", suffix.as_str()),
-        (Some(AddressMatchDto::Zone { name }), _) => ("zone", name.as_str()),
-        (Some(AddressMatchDto::ExactIpv4 { address }), _) => ("exact-ipv4", address.as_str()),
-        (None, Some(app)) => match &app.pattern {
-            AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
-            AppPatternDto::Glob { value } => ("app:glob", value.as_str()),
-        },
-        (None, None) => ("", ""),
+    let (kind, value) = match &rule.address_match {
+        Some(AddressMatchDto::ExactFqdn { value }) => ("exact-fqdn", value.as_str()),
+        Some(AddressMatchDto::SuffixDomain { suffix }) => ("suffix-domain", suffix.as_str()),
+        Some(AddressMatchDto::Zone { name }) => ("zone", name.as_str()),
+        Some(AddressMatchDto::ExactIpv4 { address }) => ("exact-ipv4", address.as_str()),
+        None => ("", ""),
     };
-    let app_suffix = match (&rule.address_match, &rule.app_match) {
-        (Some(_), Some(app)) => match &app.pattern {
-            AppPatternDto::Exact { value } | AppPatternDto::Glob { value } => value.as_str(),
-        },
-        _ => "",
-    };
-    format!(
-        "{kind}\0{value}\0{app_suffix}\0{}\0{}",
-        u8::from(rule.enabled),
-        if rule.action.is_route() {
-            "route"
-        } else {
-            "block"
+    // The app side keeps its own discriminator: an `Exact` and a `Glob` of the
+    // same text are different rules, and folding them into one slot left input
+    // order to decide which came first.
+    let (app_kind, app_value, app_children) = match &rule.app_match {
+        Some(app) => {
+            let (k, v) = match &app.pattern {
+                AppPatternDto::Exact { value } => ("app:exact", value.as_str()),
+                AppPatternDto::Glob { value } => ("app:glob", value.as_str()),
+            };
+            (k, v, app.include_child_processes)
         }
-    )
+        None => ("", "", false),
+    };
+    let mut key =
+        String::with_capacity(kind.len() + value.len() + app_kind.len() + app_value.len() + 12);
+    for part in [kind, value, app_kind, app_value] {
+        key.push_str(part);
+        key.push('\0');
+    }
+    for flag in [app_children, rule.enabled] {
+        key.push(if flag { '1' } else { '0' });
+        key.push('\0');
+    }
+    key.push_str(if rule.action.is_route() {
+        "route"
+    } else {
+        "block"
+    });
+    key
 }
 
 #[cfg(test)]
@@ -563,6 +585,69 @@ mod tests {
             to_canonical_string(&dto).expect("canonical")
         };
         assert_ne!(fold_one("api.example.com"), fold_one("api.example.org"));
+    }
+
+    /// The whole point of ordering before hashing is that arrival order stops
+    /// mattering. A key that cannot tell two rules apart hands that decision
+    /// back to the stable sort, and the two sides diverge forever over nothing.
+    #[test]
+    fn the_same_rules_in_a_different_order_fold_to_the_same_bytes() {
+        let fold = |rules: Vec<RuleDto>| {
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: rules,
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        // Pairs the key used to collapse: same text, different pattern kind;
+        // same process, different child-process flag.
+        let glob = RuleDto {
+            app_match: Some(AppMatchDto {
+                pattern: AppPatternDto::Glob {
+                    value: "chrome.exe".into(),
+                },
+                include_child_processes: false,
+            }),
+            ..sample_app_rule("r-001", "chrome.exe", false)
+        };
+        let exact = sample_app_rule("r-002", "chrome.exe", false);
+        let with_children = sample_app_rule("r-003", "chrome.exe", true);
+
+        let forward = vec![glob.clone(), exact.clone(), with_children.clone()];
+        let reversed = vec![with_children, exact, glob];
+        assert_eq!(fold(forward), fold(reversed));
+    }
+
+    /// Provenance is not routing: the same host learned on two different days
+    /// must not read as a difference between the app and the service.
+    #[test]
+    fn provenance_does_not_survive_folding() {
+        let fold = |origin: Option<RuleOriginDto>| {
+            let mut rule = sample_exact_fqdn("r-001", "cdn.example.com");
+            rule.origin = origin;
+            let mut dto = CanonicalRulesJsonV1 {
+                schema_version: RULES_JSON_SCHEMA_VERSION,
+                primary: vec![rule],
+                secondary: vec![],
+            };
+            fold_for_comparison(&mut dto);
+            to_canonical_string(&dto).expect("canonical")
+        };
+        use crate::auto_rule::AutoRuleReason;
+        let authored = RuleOriginDto::auto(
+            AutoRuleReason::SiteCompanion,
+            "anchor.example.com",
+            "2026-08-30",
+        );
+        let later = RuleOriginDto::auto(
+            AutoRuleReason::SiteCompanion,
+            "anchor.example.com",
+            "2026-09-01",
+        );
+        assert_eq!(fold(Some(authored)), fold(Some(later.clone())));
+        assert_eq!(fold(None), fold(Some(later)));
     }
 
     #[test]

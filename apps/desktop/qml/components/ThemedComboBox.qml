@@ -1,5 +1,6 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Window 2.15
 
 // Themed ComboBox wrapper. Native style ignores palette for the closed
 // combobox and the dropdown popup. Override contentItem, background,
@@ -10,6 +11,17 @@ ComboBox {
     id: root
     property var theme
     property var labelResolver: null
+
+    // Accessible baseline, declared once here instead of at 34 call sites.
+    // Qt derives a name from `text` only for `AbstractButton`, and a combo box
+    // has no `text`, so without this a screen reader announces a bare "combo
+    // box" and the user is told nothing about which one. The tooltip is
+    // mirrored into the description for the same reason a tooltip may never be
+    // the only carrier of meaning: it is unreachable from the keyboard.
+    // A caller that sets either property overrides what is declared here.
+    Accessible.role: Accessible.ComboBox
+    Accessible.name: root.displayText
+    Accessible.description: root.ToolTip.text
 
     function _labelFor(item) {
         if (typeof labelResolver === "function") return labelResolver(item)
@@ -75,9 +87,22 @@ ComboBox {
     }
 
     popup: Popup {
+        id: themedPopup
         y: root.height - 1
         width: root.width
-        implicitHeight: contentItem.implicitHeight
+        // The default popup is clamped to the window; a custom one whose height
+        // is only ever `contentHeight` is not, so a long list runs off the
+        // bottom of the screen with no way to reach the end of it. Cap at the
+        // space actually below the field (or above it, whichever is larger),
+        // and let the list scroll inside that.
+        readonly property real _below: root.Window.window
+            ? root.Window.window.height - root.mapToItem(null, 0, root.height).y - 8
+            : 320
+        readonly property real _above: root.Window.window
+            ? root.mapToItem(null, 0, 0).y - 8
+            : 320
+        readonly property real _room: Math.max(120, Math.max(_below, _above))
+        height: Math.min(contentItem.implicitHeight + topPadding + bottomPadding, _room)
         padding: theme.spacingXxs
         background: Rectangle {
             color: theme.colorPanel
@@ -90,7 +115,13 @@ ComboBox {
             implicitHeight: contentHeight
             model: root.popup.visible ? root.delegateModel : null
             currentIndex: root.highlightedIndex
-            ScrollIndicator.vertical: ScrollIndicator { }
+            // Only meaningful once the popup can be shorter than its content,
+            // which is what the height cap above establishes.
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollIndicator.vertical: ScrollIndicator {
+                active: true
+                visible: parent.contentHeight > parent.height
+            }
         }
     }
 }

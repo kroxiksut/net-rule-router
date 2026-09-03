@@ -189,7 +189,6 @@ fn handle_pending_apply_read(db: &SidecarDb) -> SidecarHandlerResult {
     let entry = db.read_pending_apply()?;
     let value = entry.map(|e| {
         json!({
-            "rules-json":     e.rules_json,
             "summary-json":   e.summary_json,
             "content-hash":   e.content_hash,
             "modified-at-ms": e.modified_at_ms,
@@ -200,10 +199,6 @@ fn handle_pending_apply_read(db: &SidecarDb) -> SidecarHandlerResult {
 }
 
 fn handle_pending_apply_write(db: &SidecarDb, payload: &Value) -> SidecarHandlerResult {
-    let rules_json = payload
-        .get("rules-json")
-        .and_then(Value::as_str)
-        .ok_or_else(|| missing("rules-json"))?;
     let summary_json = payload
         .get("summary-json")
         .and_then(Value::as_str)
@@ -212,7 +207,7 @@ fn handle_pending_apply_write(db: &SidecarDb, payload: &Value) -> SidecarHandler
         .get("content-hash")
         .and_then(Value::as_str)
         .ok_or_else(|| missing("content-hash"))?;
-    db.write_pending_apply(rules_json, summary_json, content_hash)?;
+    db.write_pending_apply(summary_json, content_hash)?;
     Ok(json!({}))
 }
 
@@ -304,7 +299,9 @@ fn read_signature(payload: &Value) -> Result<RuleSignature, SidecarError> {
         .get("route")
         .and_then(Value::as_str)
         .ok_or_else(|| missing("route"))?;
-    Ok(RuleSignature::build(rule_type, value, route))
+    RuleSignature::build(rule_type, value, route).ok_or_else(|| SidecarError::PathResolution {
+        reason: "rule signature components must be non-empty and free of `|`".to_string(),
+    })
 }
 
 fn missing(field: &str) -> SidecarError {
@@ -522,5 +519,17 @@ mod tests {
         )
         .expect("gc");
         assert_eq!(res["removed"], 2);
+    }
+
+    #[test]
+    fn both_parks_expire_on_the_same_window() {
+        // The rules park (sidecar) and the routing-intent park (preferences)
+        // record the same thing — work the service has not seen. Two windows
+        // meant one lapsed while the other applied a month later. This crate is
+        // the only one that can see both declarations.
+        assert_eq!(
+            nrr_storage_sidecar::PENDING_APPLY_TTL_SECONDS,
+            nrr_shared::PARKED_INTENT_TTL_SECONDS
+        );
     }
 }

@@ -95,10 +95,10 @@ GroupBox {
         || (auditMaxSize.value * group._sizeUnitMultiplier(auditSizeUnitCombo.currentIndex))
             !== _logRetentionBaselineAuditMaxSizeBytes
     function _sizeUnitMultiplier(idx) {
-        // combo order: 0=kb, 1=mb (MiB), 2=gb (GiB).
-        if (idx === 0) return 1024
-        if (idx === 2) return 1073741824
-        return 1048576
+        // combo order: 0=kb, 1=mb (MiB). GB is not offered for either budget:
+        // the spin box caps the NUMBER, so a gigabyte unit turned the same cap
+        // into a limit a thousand times larger — a value nobody can have meant.
+        return idx === 0 ? 1024 : 1048576
     }
     function _captureLogRetentionBaseline() {
         _logRetentionBaselineLogsMaxAgeDays = logsMaxAge.value
@@ -718,7 +718,7 @@ GroupBox {
                 rowSpacing: root.uiTheme.spacingSm
 
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.logs-max-age-label", "Keep logs for"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-age-label", "Keep logs for") : ""
                     color: root.textColor
                 }
                 ThemedSpinBox {
@@ -736,13 +736,13 @@ GroupBox {
                     ToolTip.text: "1–3650"
                 }
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.logs-max-age-unit", "days"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-age-unit", "days") : ""
                     color: root.mutedTextColor
                     Layout.preferredWidth: 100
                 }
 
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.logs-max-size-label", "Maximum log storage"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.logs-max-size-label", "Maximum log storage") : ""
                     color: root.textColor
                 }
                 ThemedSpinBox {
@@ -778,7 +778,7 @@ GroupBox {
                 }
 
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.audit-max-age-label", "Keep audit trail for"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-age-label", "Keep audit trail for") : ""
                     color: root.textColor
                 }
                 ThemedSpinBox {
@@ -796,13 +796,13 @@ GroupBox {
                     ToolTip.text: "1–3650"
                 }
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.audit-max-age-unit", "days"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-age-unit", "days") : ""
                     color: root.mutedTextColor
                     Layout.preferredWidth: 100
                 }
 
                 Label {
-                    text: (root.uiRevision, root.tr("diag.retention.audit-max-size-label", "Maximum audit storage"))
+                    text: root.uiRevision >= 0 ? root.tr("diag.retention.audit-max-size-label", "Maximum audit storage") : ""
                     color: root.textColor
                 }
                 ThemedSpinBox {
@@ -811,20 +811,22 @@ GroupBox {
                     Layout.preferredWidth: 140
                     Layout.minimumWidth: 140
                     from: 1
-                    to: 100000
+                    // Cap depends on the unit, exactly as the log budget above:
+                    // one cap for a number whose unit varies bounds nothing.
+                    to: auditSizeUnitCombo.currentIndex === 0 ? 1048576 : 1024
                     value: Number(retentionCtx.auditMaxSizeMb !== undefined
                         ? retentionCtx.auditMaxSizeMb : defaultAuditMaxSizeMb)
                     editable: true
                     ToolTip.visible: hovered
                     ToolTip.delay: 400
-                    ToolTip.text: "1–100000"
+                    ToolTip.text: "1–" + (auditSizeUnitCombo.currentIndex === 0 ? "1048576" : "1024")
                 }
                 ThemedComboBox {
                     id: auditSizeUnitCombo
                     theme: root.uiTheme
                     Layout.preferredWidth: 100
                     Layout.minimumWidth: 100
-                    model: [ "kb", "mb", "gb" ]
+                    model: [ "kb", "mb" ]
                     function unitLabel(id) { return root.tr("diag.retention.size-unit." + id, id.toUpperCase()) }
                     labelResolver: function(item) { return auditSizeUnitCombo.unitLabel(item) }
                     displayText: root.uiRevision >= 0 && currentIndex >= 0
@@ -887,7 +889,8 @@ GroupBox {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
                     ButtonGroup { id: archiveLevelGroup }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: archiveLevelStandardRadio
                         text: root.tr("diag.archive.level.standard", "Standard (recommended)")
                         ButtonGroup.group: archiveLevelGroup
@@ -898,7 +901,8 @@ GroupBox {
                             value: group.root.diagnosticsArchiveRedactionLevel === "standard"
                         }
                     }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: archiveLevelDiagnosticsRadio
                         text: root.tr("diag.archive.level.diagnostics", "Full diagnostics")
                         ButtonGroup.group: archiveLevelGroup

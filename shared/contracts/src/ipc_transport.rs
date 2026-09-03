@@ -100,6 +100,13 @@ pub const IPC_TRANSPORT_KIND: IpcTransportKind = IpcTransportKind::UnixDomainSoc
 /// - Unix: a filesystem socket under `/run/netrulerouter/` (the parent dir
 ///   carries the `0700` owner-only protection the pipe DACL provides on
 ///   Windows).
+///
+/// The product name inside both spellings is the one in
+/// [`crate::product_identity`]. It is written out here because a `const` string
+/// cannot be concatenated on stable Rust without pulling in another crate, and
+/// `the_endpoint_address_is_built_from_the_product_identity` is what holds the
+/// two together — this crate IS the identity SSOT, so its own address
+/// disagreeing with it is the one drift no other module can catch.
 #[cfg(windows)]
 pub const SERVICE_ENDPOINT_ADDRESS: &str = r"\\.\pipe\NetRuleRouter\service-v1";
 #[cfg(unix)]
@@ -124,10 +131,12 @@ pub const RULES_LOCKED_CLIENT_SLUG: &str = "rules-locked";
 /// Set to 1 MiB because `MutationSubmit` with `MutationKind::PresetImport`
 /// carries the raw preset bytes (base64-wrapped) in the payload, and
 /// `PresetExportGet` / `SettingsExportFull` responses ship base64-wrapped
-/// file content. The ceiling mirrors
-/// `nrr_domain::import::IMPORT_FILE_SIZE_LIMIT_BYTES` — the parse-stage
-/// validator rejects files exceeding that cap before they reach the wire,
-/// so the two boundaries agree.
+/// file content.
+///
+/// This is the OUTER limit: `nrr_domain::import::IMPORT_FILE_SIZE_LIMIT_BYTES`
+/// is derived from it, backing out the base64 expansion and envelope overhead,
+/// so a file the domain accepts always fits a frame and the refusal a user sees
+/// comes from the layer that understands what they did.
 ///
 /// Re-exported as `nrr_service_runtime::IPC_MAX_MESSAGE_BYTES` to keep
 /// the import path stable for existing callers.
@@ -308,8 +317,8 @@ pub fn canonical_operation_class(
         // steers the class here; the target principal is always resolved by the
         // service, never carried in the payload.
         let admin_baseline = payload
-            .get("payload")
-            .and_then(|p| p.get("admin-baseline"))
+            .get(MUTATION_PAYLOAD_FIELD)
+            .and_then(|p| p.get(ADMIN_BASELINE_FIELD))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if admin_baseline {
@@ -318,10 +327,22 @@ pub fn canonical_operation_class(
         // Per-principal rules / preset edits: two-phase but NOT elevation-gated,
         // so a non-admin session can commit its own rules. Everything else stays
         // service-global.
-        let kind = payload.get("mutation-kind").and_then(|v| v.as_str());
+        //
+        // Decided on the DESERIALISED variant, never on a hand-typed spelling:
+        // the wire names come from `#[serde(rename_all = "kebab-case")]`, so a
+        // renamed variant used to compile green here and silently reclassify
+        // the operation. A kind that does not deserialise falls through to the
+        // stricter class below.
+        let kind: Option<crate::ipc_payloads::MutationKind> = payload
+            .get(MUTATION_KIND_FIELD)
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         if matches!(
             kind,
-            Some("rules-update") | Some("preset-import") | Some("rules-reset-to-baseline")
+            Some(
+                crate::ipc_payloads::MutationKind::RulesUpdate
+                    | crate::ipc_payloads::MutationKind::PresetImport
+                    | crate::ipc_payloads::MutationKind::RulesResetToBaseline
+            )
         ) {
             return IpcOperationClass::UserScopedMutation;
         }
@@ -330,10 +351,24 @@ pub fn canonical_operation_class(
     fixed_operation_class(op)
 }
 
+/// Wire field names this classifier reads out of a raw payload.
+///
+/// Named constants rather than inline literals so the test below can point at
+/// the same strings it checks against a serialised `MutationSubmitRequest`.
+/// The classifier works on `serde_json::Value` because it runs BEFORE the
+/// payload is typed — it decides which gates apply, so it cannot wait for the
+/// handler that would parse it.
+const DRY_RUN_FIELD: &str = "dry-run";
+const MUTATION_KIND_FIELD: &str = "mutation-kind";
+const MUTATION_PAYLOAD_FIELD: &str = "payload";
+/// Not a field of `MutationSubmitRequest` — it lives inside the kind-specific
+/// payload, whose schema the wire layer deliberately does not own.
+const ADMIN_BASELINE_FIELD: &str = "admin-baseline";
+
 /// `dry-run: true` in the envelope payload.
 fn dry_run_flag(payload: &serde_json::Value) -> bool {
     payload
-        .get("dry-run")
+        .get(DRY_RUN_FIELD)
         .and_then(|v| v.as_bool())
         .unwrap_or(false)
 }
@@ -853,5 +888,85 @@ mod tests {
                 "{class:?}: elevation and an authorization action must agree",
             );
         }
+    }
+    /// The classifier reads a RAW payload, so it names wire fields by hand.
+    /// This is the other end of that: the names must be the ones serde
+    /// actually emits for `MutationSubmitRequest`, or every gate the class
+    /// selects is chosen from fields that are never there.
+    #[test]
+    fn the_wire_fields_the_classifier_reads_exist_on_the_request() {
+        let request = crate::ipc_payloads::MutationSubmitRequest {
+            mutation_kind: crate::ipc_payloads::MutationKind::RulesUpdate,
+            payload: serde_json::json!({}),
+            dry_run: true,
+        };
+        let value = serde_json::to_value(&request).expect("request serialises");
+        let object = value.as_object().expect("request is an object");
+        for field in [
+            super::DRY_RUN_FIELD,
+            super::MUTATION_KIND_FIELD,
+            super::MUTATION_PAYLOAD_FIELD,
+        ] {
+            assert!(
+                object.contains_key(field),
+                "`{field}` is not a field of a serialised MutationSubmitRequest;                  keys are {:?}",
+                object.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Every kind that must classify as user-scoped, addressed by its wire
+    /// spelling rather than its variant — the direction a peer sends.
+    #[test]
+    fn per_principal_kinds_classify_as_user_scoped_by_their_wire_spelling() {
+        use crate::ipc_payloads::MutationKind;
+        for kind in [
+            MutationKind::RulesUpdate,
+            MutationKind::PresetImport,
+            MutationKind::RulesResetToBaseline,
+        ] {
+            let payload = serde_json::json!({
+                "mutation-kind": serde_json::to_value(kind).expect("kind serialises"),
+                "payload": {},
+                "dry-run": false,
+            });
+            assert_eq!(
+                super::canonical_operation_class(IpcOperationName::MutationSubmit, &payload),
+                IpcOperationClass::UserScopedMutation,
+                "{kind:?}"
+            );
+        }
+        // Positive control on the other direction: a kind outside the list, and
+        // an unparsable one, both land on the stricter class.
+        for payload in [
+            serde_json::json!({"mutation-kind": "route-bindings-update", "payload": {}}),
+            serde_json::json!({"mutation-kind": "no-such-kind", "payload": {}}),
+            serde_json::json!({"payload": {}}),
+        ] {
+            assert_eq!(
+                super::canonical_operation_class(IpcOperationName::MutationSubmit, &payload),
+                IpcOperationClass::MutationRequest,
+                "{payload}"
+            );
+        }
+    }
+    /// The endpoint address carries the product name. Both are declared in this
+    /// crate, and nothing outside it can notice when they part company.
+    #[test]
+    fn the_endpoint_address_is_built_from_the_product_identity() {
+        use crate::product_identity::{PRODUCT_NAME, PRODUCT_NAME_UNIX};
+
+        #[cfg(windows)]
+        {
+            let expected = format!(r"\\.\pipe\{PRODUCT_NAME}\service-v1");
+            assert_eq!(super::SERVICE_ENDPOINT_ADDRESS, expected);
+        }
+        #[cfg(unix)]
+        {
+            let expected = format!("/run/{PRODUCT_NAME_UNIX}/service-v1.sock");
+            assert_eq!(super::SERVICE_ENDPOINT_ADDRESS, expected);
+        }
+        // Referenced on both platforms so neither name goes unused.
+        assert!(!PRODUCT_NAME.is_empty() && !PRODUCT_NAME_UNIX.is_empty());
     }
 }

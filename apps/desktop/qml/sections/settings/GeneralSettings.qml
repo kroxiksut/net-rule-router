@@ -184,6 +184,16 @@ GroupBox {
             checked: root.prefs.minimizeToTrayInsteadOfClose
             onToggled: root.updatePrefs({ minimizeToTrayInsteadOfClose: checked })
         }
+        // Everything the tray may raise, under one heading and one master
+        // switch — a user who wants fewer interruptions should not have to
+        // hunt for the kinds one screen at a time.
+        Label {
+            Layout.fillWidth: true
+            Layout.topMargin: root.uiTheme.spacingSm
+            text: root.tr("settings.group.tray-notifications", "Tray notifications")
+            color: root.textColor
+            font.bold: true
+        }
         CheckBox {
             Layout.fillWidth: true
             text: root.tr("settings.field.show-notifications", "Show notifications")
@@ -198,7 +208,7 @@ GroupBox {
             text: root.tr("settings.field.notify-suggestion-changes",
                 "Tell me when the suggested-addresses list changes")
             checked: root.prefs.notifySuggestionChanges !== false
-            onToggled: root.updatePrefs({ notifySuggestionChanges: checked })
+            onToggled: { root.updatePrefs({ notifySuggestionChanges: checked }); root.emitPrefs() }
         }
         CheckBox {
             Layout.fillWidth: true
@@ -207,7 +217,16 @@ GroupBox {
             text: root.tr("settings.field.notify-block-notices",
                 "Tell me when a connection gets blocked")
             checked: root.prefs.notifyBlockNotices !== false
-            onToggled: root.updatePrefs({ notifyBlockNotices: checked })
+            onToggled: { root.updatePrefs({ notifyBlockNotices: checked }); root.emitPrefs() }
+        }
+        CheckBox {
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            enabled: root.prefs.showNotifications !== false
+            text: root.tr("settings.field.notify-rule-duplicates",
+                "Tell me when a rule is set on both routes")
+            checked: root.prefs.notifyRuleDuplicates !== false
+            onToggled: root.updatePrefs({ notifyRuleDuplicates: checked })
         }
         // Tray notices are our own window, not system balloons, so their
         // opacity is ours to offer. Indented with the mutes above: it is the
@@ -485,7 +504,7 @@ GroupBox {
             text: root.tr("settings.field.hide-block-notice-addresses",
                 "Hide addresses in these notifications")
             checked: root.prefs.hideBlockNoticeAddresses === true
-            onToggled: root.updatePrefs({ hideBlockNoticeAddresses: checked })
+            onToggled: { root.updatePrefs({ hideBlockNoticeAddresses: checked }); root.emitPrefs() }
         }
         Label {
             Layout.fillWidth: true

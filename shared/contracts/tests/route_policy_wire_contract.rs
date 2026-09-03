@@ -32,7 +32,27 @@ const KEYS_NOT_IN_DEFAULTS_TABLE: [&str; 3] = ["primary", "secondary", "binding-
 /// Fields with no wire default at all (required in every request), so the QML
 /// table's entry for them is a GUI-side fallback for an empty snapshot rather
 /// than a mirror of a Rust value. Presence is pinned; the value is not.
-const KEYS_WITHOUT_WIRE_DEFAULT: [&str; 2] = ["mode", "block-secondary-when-unavailable"];
+///
+/// The four kill-switch/DoH toggles are here on purpose: a field that TURNS
+/// PROTECTION OFF must not be expressible by omission, so the request refuses a
+/// message that leaves one out instead of reading it as "off".
+const KEYS_WITHOUT_WIRE_DEFAULT: [&str; 6] = [
+    "mode",
+    "block-secondary-when-unavailable",
+    "kill-switch-enabled",
+    "kill-switch-block-all",
+    "kill-switch-strict-shared-ips",
+    "doh-lockdown-enabled",
+];
+
+/// The protection toggles above, each paired with the field name a peer would
+/// have to omit to reach the old silent-disarm behaviour.
+const PROTECTION_TOGGLES: [&str; 4] = [
+    "kill-switch-enabled",
+    "kill-switch-block-all",
+    "kill-switch-strict-shared-ips",
+    "doh-lockdown-enabled",
+];
 
 fn qml_pure_js() -> String {
     let path: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -101,6 +121,10 @@ fn request_at_wire_defaults() -> Map<String, Value> {
         "mode": "prefer-primary",
         "block-secondary-when-unavailable": false,
         "binding-source": "user-assigned",
+        "kill-switch-enabled": true,
+        "kill-switch-block-all": true,
+        "kill-switch-strict-shared-ips": true,
+        "doh-lockdown-enabled": true,
     });
     let parsed: RoutePolicyUpdateRequest =
         serde_json::from_value(minimal).unwrap_or_else(|e| panic!("minimal request: {e}"));
@@ -208,4 +232,30 @@ fn qml_binding_source_is_stamped_not_defaulted() {
         qml_pure_js().contains(r#"req["binding-source"] = "user-assigned""#),
         "buildFullRoutePolicyReq must stamp binding-source on every payload"
     );
+}
+
+/// A message that leaves a protection toggle out must be REJECTED, not read as
+/// "the user turned it off". `#[serde(default)]` on these `bool`s meant a peer
+/// that forgot one disarmed the kill switch on the next full replace, silently
+/// and with a success response.
+#[test]
+fn a_request_that_omits_a_protection_toggle_is_refused() {
+    for omitted in PROTECTION_TOGGLES {
+        let mut body = request_at_wire_defaults();
+        assert!(
+            body.remove(omitted).is_some(),
+            "`{omitted}` is not a field of the request any more"
+        );
+        let parsed: Result<RoutePolicyUpdateRequest, _> =
+            serde_json::from_value(Value::Object(body.clone()));
+        assert!(
+            parsed.is_err(),
+            "omitting `{omitted}` was accepted — a missing protection toggle must not read as off"
+        );
+        // Positive control: the same body WITH the field parses, so the refusal
+        // above is about that field and not about a fixture that never parsed.
+        body.insert(omitted.to_string(), Value::Bool(true));
+        serde_json::from_value::<RoutePolicyUpdateRequest>(Value::Object(body))
+            .unwrap_or_else(|e| panic!("restoring `{omitted}` must make the request valid: {e}"));
+    }
 }

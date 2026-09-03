@@ -7,8 +7,8 @@
 //! neutral. Per the policy/mechanism seam only the PORT lives here; each backend
 //! impls it:
 //!
-//! - **Windows** — NRPT (Name Resolution Policy Table) via the
-//!   `*-DnsClientNrptRule` cmdlets (in `nrr-platform-windows`).
+//! - **Windows** — NRPT (Name Resolution Policy Table), a rule written into
+//!   the registry in one transaction (in `nrr-platform-windows`).
 //! - **Linux / macOS** — systemd-resolved / `resolv.conf`, `scutil` (future).
 
 use std::net::SocketAddr;
@@ -45,8 +45,18 @@ pub trait SystemDnsRedirectPort: Send + Sync {
     /// Undo the redirect identified by `handle`, restoring the prior config.
     /// Idempotent: restoring an already-restored handle succeeds (no-op).
     fn restore(&self, handle: &RedirectHandle) -> Result<(), PlatformError>;
-    /// Report whether our redirect is currently active.
+    /// Report whether our redirect is currently active — read from the
+    /// configuration the OS is actually using, which can cost a process.
     fn verify(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError>;
+    /// Cheap self-check of what we CONFIGURED: our redirect is present and
+    /// intact, and nothing sits beside it that makes the OS reject the whole
+    /// configuration. Meant for a periodic guard, where `verify`'s cost is not.
+    /// Default: `Active` (platforms whose redirect cannot be damaged from
+    /// outside).
+    fn inspect(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+        let _ = handle;
+        Ok(RedirectState::Active)
+    }
     /// Flush the OS DNS resolver cache so already-cached names re-query through
     /// our listener the instant the redirect activates (and re-query the real
     /// servers again once it is restored). Best-effort — a failure is not fatal.

@@ -3,12 +3,8 @@ use nrr_application::backend_facade::rules::RulesScreenRequest;
 use nrr_application::backend_facade::{
     BackendConnectionStatus, BackendFacade, BackendProviderKind,
 };
-use nrr_application::route_bindings::{
-    format_route_bindings_export, route_bindings_export_snapshot,
-};
 use nrr_shared::{
-    load_locale_catalog, load_locale_descriptors, load_locale_reports, resolve_catalog_text,
-    ActivationSource, AppSection, AppShellModel, LocaleLoadStatus, RouteBehaviorMode, ThemeMode,
+    resolve_catalog_text, AppSection, AppShellModel, LocaleLoadStatus, RouteBehaviorMode, ThemeMode,
 };
 use nrr_ui_support::first_run::FirstRunFlowSnapshot;
 use nrr_ui_support::theme::resolve_theme;
@@ -218,16 +214,19 @@ pub fn write_qt_context_file_at(
     file_path: &Path,
     shell: &AppShellModel,
     section_to_open: AppSection,
-    source: ActivationSource,
     preferences: UiPreferences,
     first_run: &FirstRunFlowSnapshot,
     request: &crate::app_shell::LaunchRequest,
     backend: &dyn BackendFacade,
     backend_status: &BackendConnectionStatus,
 ) -> Result<(), String> {
-    let locale_catalog = load_locale_catalog();
-    let locale_descriptors = load_locale_descriptors();
-    let locale_reports = load_locale_reports();
+    // One pass over the locale files, not three: each of the old calls loaded,
+    // parsed and validated both files in full, and this emitter needs all three
+    // of their results.
+    let locales = nrr_shared::load_locale_state();
+    let locale_catalog = locales.catalog;
+    let locale_descriptors = locales.descriptors;
+    let locale_reports = locales.reports;
     let rejected_locales = locale_reports
         .iter()
         .filter(|report| report.status == LocaleLoadStatus::Rejected)
@@ -318,26 +317,6 @@ pub fn write_qt_context_file_at(
         )
     };
     timed("interfaces", t);
-    // Derived from the snapshot just taken rather than asked for separately:
-    // the checks read nothing but the rows, so a second round-trip bought only
-    // another wait before the window and a second enumeration describing a
-    // different instant. Bluetooth-like adapters are dropped here because the
-    // list request asks for them and the checks request did not.
-    let t = std::time::Instant::now();
-    let checks_rows: Vec<_> = interfaces_snapshot
-        .rows
-        .iter()
-        .filter(|row| {
-            base_route_selection_request.include_bluetooth_adapters || !row.is_bluetooth_like
-        })
-        .cloned()
-        .collect();
-    let diagnostics_checks_snapshot =
-        nrr_application::mock_backend::network_interfaces::interface_diagnostics_checks_from_rows(
-            interfaces_snapshot.data_source,
-            &checks_rows,
-        );
-    timed("adapter-checks", t);
     let t = std::time::Instant::now();
     let rules_snapshot = if budget_left(&cold_start_started) {
         backend.rules_snapshot(RulesScreenRequest::default())
@@ -398,9 +377,6 @@ pub fn write_qt_context_file_at(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let bindings_snapshot =
-        route_bindings_export_snapshot(&preferences, security_snapshot.active_revision);
-    let bindings_export_text = format_route_bindings_export(&bindings_snapshot);
     let about = nrr_application::about_window_info();
     let resolved_theme = resolve_theme(preferences.theme_mode);
     let icon_file_url = resolve_icon_path()
@@ -635,7 +611,6 @@ pub fn write_qt_context_file_at(
     let context = json!({
         "windowTitle": shell.main_window_shell.window_title,
         "entrySection": section_to_open.slug(),
-        "activationSource": source.slug(),
         "backendStatus": backend_status_payload,
         // Whether the cold-start facade actually talks to the service. A
         // mock/preview launch reports `backendStatus.kind == "connected"`
@@ -667,6 +642,7 @@ pub fn write_qt_context_file_at(
             "showNotifications": preferences.show_notifications,
             "notifySuggestionChanges": preferences.notify_suggestion_changes,
             "notifyBlockNotices": preferences.notify_block_notices,
+            "notifyRuleDuplicates": preferences.notify_rule_duplicates,
             "trayNoticeOpacityPercent": preferences.tray_notice_opacity_percent,
             "hideBlockNoticeAddresses": preferences.hide_block_notice_addresses,
             "routingDetailedMode": preferences.routing_detailed_mode,
@@ -813,6 +789,8 @@ pub fn write_qt_context_file_at(
                 preferences.service_install_uac_declined_at_epoch,
             "serviceInstallUacDeclinedCount":
                 preferences.service_install_uac_declined_count,
+            "serviceInstallPromptSuppressed":
+                preferences.service_install_prompt_suppressed,
             "autoLoadRulesOnLaunch": preferences.auto_load_rules_on_launch,
             "exportIncludeComments": preferences.export_include_comments,
             "importOnlyActive": preferences.import_only_active,
@@ -910,39 +888,14 @@ pub fn write_qt_context_file_at(
             ),
             "dataSource": interfaces_snapshot.data_source.title(),
             "selectedBehaviorMode": interfaces_snapshot.selected_behavior_mode.slug(),
-            "recommendationPolicyNote": interfaces_snapshot.recommendation_policy_note,
             "roleAssignmentAdvisory": interfaces_role_assignment_advisory,
             "supportedBehaviorModes": interfaces_snapshot.supported_behavior_modes.iter().map(|mode| json!({
                 "id": mode.slug(),
                 "label": mode.user_label(),
             })).collect::<Vec<_>>(),
             "rows": interface_rows_json,
-            "routeBindings": {
-                "activeRevision": bindings_snapshot.active_revision,
-                "behaviorMode": bindings_snapshot.behavior_mode.slug(),
-                "changeClass": bindings_snapshot.change_class.title(),
-                "primary": {
-                    "persistentId": bindings_snapshot.primary.persistent_id,
-                    "adapterName": bindings_snapshot.primary.adapter_name,
-                    "userConfirmed": bindings_snapshot.primary.user_confirmed,
-                    "resolutionState": bindings_snapshot.primary.resolution_state.title(),
-                },
-                "secondary": {
-                    "persistentId": bindings_snapshot.secondary.persistent_id,
-                    "adapterName": bindings_snapshot.secondary.adapter_name,
-                    "userConfirmed": bindings_snapshot.secondary.user_confirmed,
-                    "resolutionState": bindings_snapshot.secondary.resolution_state.title(),
-                },
-                "exportPreview": bindings_export_text,
-            },
         },
         "rules": {
-            "previewNotice": resolve_catalog_text(
-                &locale_catalog,
-                &preferences.language,
-                "rules.preview-notice",
-                rules_snapshot.preview_notice,
-            ),
             "supportedRuleTypes": supported_rule_types,
             "rows": rules_rows_json,
         },
@@ -974,7 +927,6 @@ pub fn write_qt_context_file_at(
             "cacheHealth": {
                 "entryCount": diagnostics_status.cache_health.entry_count,
                 "healthy": diagnostics_status.cache_health.healthy,
-                "rebuilding": diagnostics_status.cache_health.rebuilding,
             },
             "logHealth": {
                 "dirWritable": diagnostics_status.log_health.dir_writable,
@@ -996,19 +948,6 @@ pub fn write_qt_context_file_at(
             // because explain output is per-decision, not a bootstrap
             // snapshot.
             "explainSample": null,
-            "adapterChecksIntegrationNote": diagnostics_checks_snapshot.integration_note,
-            "adapterChecks": diagnostics_checks_snapshot.rows.iter().map(|row| json!({
-                "persistentId": row.persistent_id,
-                "name": row.windows_name,
-                "checks": row.checks.iter().map(|check| json!({
-                    "id": check.action.slug(),
-                    "title": check.action.title(),
-                    "status": check.status.title(),
-                    "explanation": check.explanation,
-                    "readOnly": check.read_only,
-                    "requiresServiceMediation": check.requires_service_mediation,
-                })).collect::<Vec<_>>(),
-            })).collect::<Vec<_>>(),
         },
         "logs": {
             "entries": logs_page.items.iter().map(|entry| json!({
@@ -1049,7 +988,7 @@ pub fn write_qt_context_file_at(
             },
             "storageHealth": {
                 "logsSizeBytes": diagnostics_status.log_health.total_size_bytes,
-                "auditSizeBytes": 1_120_000_u64,
+                "auditSizeBytes": diagnostics_status.log_health.audit_size_bytes,
                 "logFileCount": diagnostics_status.log_health.file_count,
                 "droppedEvents": diagnostics_status.log_health.dropped_count,
                 "lastCleanup": diagnostics_status.log_health.last_cleanup_at,
@@ -1113,8 +1052,11 @@ pub fn write_qt_context_file_at(
         },
     });
 
+    // Compact, not pretty: exactly one reader — the Qt host's JSON parser —
+    // and the indentation was roughly a third of a ~600 KB file written on
+    // every launch.
     let payload =
-        serde_json::to_string_pretty(&context).map_err(|error| format!("JSON error: {error}"))?;
+        serde_json::to_string(&context).map_err(|error| format!("JSON error: {error}"))?;
     // Exclusive, owner-only creation rather than `fs::write`: the file carries
     // the user's settings, and on Unix the coordination directory can sit in a
     // shared `/tmp`, where a planted symlink would redirect the write.
@@ -1180,6 +1122,10 @@ struct QtPreferencesPayload {
     /// block-notice notification enabled, which is the pre-existing behaviour.
     #[serde(default = "default_true")]
     notify_block_notices: bool,
+    /// Additive: a payload written before this notice existed leaves it
+    /// enabled — the condition it reports is invisible everywhere else.
+    #[serde(default = "default_true")]
+    notify_rule_duplicates: bool,
     /// Additive: a payload written before this existed leaves addresses
     /// visible, which is the pre-existing behaviour.
     #[serde(default)]
@@ -1423,6 +1369,11 @@ struct QtPreferencesPayload {
     service_install_uac_declined_at_epoch: Option<i64>,
     #[serde(default)]
     service_install_uac_declined_count: u32,
+    /// "Stop offering to install the service". Absent from an older QML build
+    /// reads as `false` — the offer keeps working, which is the safe default
+    /// for the one thing without which nothing is enforced.
+    #[serde(default)]
+    service_install_prompt_suppressed: bool,
 
     // The two bools default to `true` (matching `UiPreferences::default`)
     // via explicit default fns so a QML build that omits them never
@@ -1536,6 +1487,7 @@ impl QtPreferencesPayload {
         }
         current.notify_suggestion_changes = self.notify_suggestion_changes;
         current.notify_block_notices = self.notify_block_notices;
+        current.notify_rule_duplicates = self.notify_rule_duplicates;
         current.hide_block_notice_addresses = self.hide_block_notice_addresses;
         current.tray_notice_opacity_percent = self.tray_notice_opacity_percent.clamp(
             nrr_ui_support::ui_preferences::TRAY_NOTICE_OPACITY_MIN_PERCENT,
@@ -1799,6 +1751,7 @@ impl QtPreferencesPayload {
         current.last_file_synced_hash_secondary = self.last_file_synced_hash_secondary;
         current.service_install_uac_declined_at_epoch = self.service_install_uac_declined_at_epoch;
         current.service_install_uac_declined_count = self.service_install_uac_declined_count;
+        current.service_install_prompt_suppressed = self.service_install_prompt_suppressed;
         current.auto_load_rules_on_launch = self.auto_load_rules_on_launch;
         current.export_include_comments = self.export_include_comments;
         current.import_only_active = self.import_only_active;

@@ -34,30 +34,6 @@ use crate::route_reconciler::{
 };
 use crate::secondary_liveness::SecondaryLivenessTracker;
 
-/// Resolve the [`SecondaryRouteTarget`] (gateway + interface index) for a
-/// principal from its per-SID secondary binding and live adapter info.
-///
-/// Returns `None` when the principal has no secondary bound, the bound
-/// adapter is not present / has no usable IPv4 + gateway, i.e. there is
-/// nowhere to route. The coordinator treats `None` as "tear down routes".
-pub fn resolve_secondary_target(
-    secondary_stable_id: &str,
-    adapter_infos: &[AdapterInfo],
-) -> Option<SecondaryRouteTarget> {
-    let info = adapter_infos
-        .iter()
-        .find(|i| adapter_binding_matches(i, secondary_stable_id))?;
-    // Only route when the adapter is actually usable (up + has IPv4).
-    if classify_availability(info) != Some(AdapterAvailability::Available) {
-        return None;
-    }
-    let gateway = info.gateways.first().copied()?;
-    Some(SecondaryRouteTarget {
-        gateway,
-        interface_index: info.index,
-    })
-}
-
 /// Match a stored route-binding id against a live [`AdapterInfo`].
 ///
 /// The binding stores the GUI **snapshot persistent id**
@@ -3622,27 +3598,6 @@ mod tests {
             },
             gateways: gw.map(|g| vec![Ipv4Addr::from(g)]).unwrap_or_default(),
         }
-    }
-
-    #[test]
-    fn resolve_secondary_target_picks_gateway_and_ifindex_for_usable_adapter() {
-        let a = adapter("wifi", 12, true, true, Some([10, 0, 0, 1]));
-        let sid = a.stable_id();
-        let t = resolve_secondary_target(&sid, std::slice::from_ref(&a)).unwrap();
-        assert_eq!(t.interface_index, 12);
-        assert_eq!(t.gateway, Ipv4Addr::new(10, 0, 0, 1));
-    }
-
-    #[test]
-    fn resolve_secondary_target_none_when_down_or_no_gateway_or_unknown() {
-        let down = adapter("d", 1, false, true, Some([10, 0, 0, 1]));
-        assert!(resolve_secondary_target(&down.stable_id(), std::slice::from_ref(&down)).is_none());
-        let no_gw = adapter("g", 2, true, true, None);
-        assert!(
-            resolve_secondary_target(&no_gw.stable_id(), std::slice::from_ref(&no_gw)).is_none()
-        );
-        let usable = adapter("u", 3, true, true, Some([10, 0, 0, 1]));
-        assert!(resolve_secondary_target("no-such-id", std::slice::from_ref(&usable)).is_none());
     }
 
     fn route_entry(
