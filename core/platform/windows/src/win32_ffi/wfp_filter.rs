@@ -119,11 +119,14 @@ use crate::types::{
 use super::wfp_engine::token_to_handle;
 use super::wfp_sublayer::{ensure_sublayer, NRR_SUBLAYER_GUID};
 
-const ADD_OP: &str = "FwpmFilterAdd0";
+// Shared with the classifiers in `nrr-platform-api`: they key on the NAME, so
+// a rename here has to be a compile error there rather than a policy that
+// silently stops applying.
+const ADD_OP: &str = nrr_platform_api::error::win32_ops::FILTER_ADD;
 const DELETE_OP: &str = "FwpmFilterDeleteByKey0";
 const ENUM_CREATE_OP: &str = "FwpmFilterCreateEnumHandle0";
 const ENUM_OP: &str = "FwpmFilterEnum0";
-const SDDL_OP: &str = "ConvertStringSecurityDescriptorToSecurityDescriptorW";
+const SDDL_OP: &str = nrr_platform_api::error::win32_ops::SDDL_TO_SECURITY_DESCRIPTOR;
 
 /// Namespace signature `data1` — the high 4 bytes of every filterKey
 /// GUID we emit. ASCII `"NRRF"` (NetRuleRouter Filter); the enumeration
@@ -453,11 +456,46 @@ pub fn enumerate_our_filters(
     // the two V6 twins. Cleanup, rollback and verify all enumerate through
     // this fn — missing any layer would LEAK that layer's filters across
     // apply cycles.
-    let mut out = enumerate_layer(handle, FWPM_LAYER_ALE_AUTH_CONNECT_V4)?;
-    out.extend(enumerate_layer(handle, FWPM_LAYER_OUTBOUND_IPPACKET_V4)?);
-    out.extend(enumerate_layer(handle, FWPM_LAYER_ALE_AUTH_CONNECT_V6)?);
-    out.extend(enumerate_layer(handle, FWPM_LAYER_OUTBOUND_IPPACKET_V6)?);
-    out.extend(enumerate_layer(handle, FWPM_LAYER_OUTBOUND_TRANSPORT_V4)?);
+    //
+    // A layer that will not enumerate does not discard the layers that did.
+    // Joining them with `?` meant one transient failure on the third layer
+    // returned nothing at all — and the caller that matters most here is the
+    // anti-lockout cleanup, which then removed nothing and left the user
+    // offline. The first error is kept and returned only when NO layer
+    // answered; otherwise it is logged and the partial set is used, which is
+    // strictly more than the alternative.
+    let mut out = Vec::new();
+    let mut answered = 0usize;
+    let mut first_error: Option<PlatformError> = None;
+    for layer in [
+        FWPM_LAYER_ALE_AUTH_CONNECT_V4,
+        FWPM_LAYER_OUTBOUND_IPPACKET_V4,
+        FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        FWPM_LAYER_OUTBOUND_IPPACKET_V6,
+        FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+    ] {
+        match enumerate_layer(handle, layer) {
+            Ok(records) => {
+                answered += 1;
+                out.extend(records);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "nrr::wfp",
+                    error = %e,
+                    "a WFP layer would not enumerate; continuing with the layers that did"
+                );
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    if answered == 0 {
+        if let Some(e) = first_error {
+            return Err(e);
+        }
+    }
     Ok(out)
 }
 

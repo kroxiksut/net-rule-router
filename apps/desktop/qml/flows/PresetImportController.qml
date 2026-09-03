@@ -703,7 +703,7 @@ QtObject {
                     // park is skipped.
                     if (parkJson) {
                         var parkHash = nrrNativeBridge.sha256Hex(parkJson)
-                        root._parkPendingApply(parkJson, parkHash, root.rulesModel.count)
+                        root._parkPendingApply(parkHash, root.rulesModel.count)
                         root._offlineRulesPendingPush = true
                     }
                 }
@@ -760,7 +760,7 @@ QtObject {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, true /* dryRun */, ""
         )
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("preset-import: dry-run failed:", code, msg)
                 if (String(code) === "transport-disconnected") {
@@ -822,6 +822,9 @@ QtObject {
     /// The difference matters offline: a user's import is work to be pushed
     /// once the service is up, while hydration is only a view of the bound
     /// files and must never be offered back as "changes you made".
+    /// `options.mode` is the same replace/merge choice the single-route entry
+    /// takes as its own parameter; both-routes had none at all, so the loader's
+    /// "Merge" silently cleared the very rules it promised to keep.
     function startBothRoutesPresetImportReviewFlow(primaryBytesB64, secondaryBytesB64, primaryPath, secondaryPath, options) {
         if (!root.bridgeAvailable) {
             console.log("preset-import-both: bridge unavailable, aborting")
@@ -852,16 +855,18 @@ QtObject {
             secondaryBytesB64: String(secondaryBytesB64 || ""),
             primaryPath: String(primaryPath || ""),
             secondaryPath: String(secondaryPath || ""),
+            mode: (options && String(options.mode) === "merge") ? "merge" : "replace",
             correlationId: corr,
             summary: null,
-            confirmationToken: ""
+            confirmationToken: "",
+            hydration: !!(options && options.hydration)
         }
         root._activeReviewKind = "preset-import"
         var startedAtMs = Date.now()
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, true /* dryRun */, ""
         )
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("preset-import-both: dry-run failed:", code, msg)
                 if (String(code) === "transport-disconnected") {
@@ -942,7 +947,7 @@ QtObject {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "preset-import", payload, false /* dryRun */, token
         )
-        root.rpc.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        root.rpc.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok && code === "confirmation-expired") {
                 root.reviewExpiredDialog.open()
                 return

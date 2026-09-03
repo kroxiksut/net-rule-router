@@ -87,6 +87,9 @@ pub mod dns_wire;
 // Built incrementally alongside the current `wfp_codegen` path; see the
 // module doc.
 pub mod doh_seed;
+/// What the machine ENFORCES right now, published by the apply and read by the
+/// resolver — the answer the FQDN cache cannot give.
+pub mod enforced_addresses;
 pub mod enforcement_planner;
 pub mod explain_snapshot_sink;
 // Fake-IP neutral relay: flow parsing, per-flow routing

@@ -16,8 +16,8 @@ use crate::windows_api::WindowsApiPort;
 
 pub use nrr_platform_api::adapters::{
     classify_availability, is_virtual_adapter, AdapterAvailability, AdapterAvailabilityChange,
-    AdapterAvailabilitySnapshot, AdapterEventSource, AdapterInfo, AdapterMonitor, IfOperStatus,
-    InterfaceType, MockAdapterEventSource,
+    AdapterEventSource, AdapterInfo, AdapterMonitor, IfOperStatus, InterfaceType,
+    MockAdapterEventSource,
 };
 
 /// Production source: delegates to `WindowsApiPort::get_adapter_infos()`.

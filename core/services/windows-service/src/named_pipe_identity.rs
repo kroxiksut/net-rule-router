@@ -42,6 +42,7 @@ use windows::Win32::System::Threading::{
 };
 
 use nrr_shared::ipc::IpcClientProfile;
+use nrr_shared::product_identity::BinaryRole;
 
 /// Result of an identity check on an accepted pipe connection.
 pub struct ClientIdentity {
@@ -102,17 +103,26 @@ impl std::fmt::Display for ClientRejectReason {
 /// Whitelist mapping from exe basename to client profile.
 /// Case-insensitive. `nrr-service.exe` and any other name are rejected
 /// (returns `None`).
+///
+/// Names come from [`BinaryRole`], never from literals here: this is a
+/// security control keyed on file names the product identity owns, and a
+/// rename there would otherwise compile green while locking the GUI, tray and
+/// console out of the service with no test failing.
 fn classify_exe_basename(basename: &str) -> Option<IpcClientProfile> {
     let lower = basename.to_ascii_lowercase();
-    match lower.as_str() {
-        "netrulerouter.exe" => Some(IpcClientProfile::GuiInteractive),
-        "netruleroutertray.exe" => Some(IpcClientProfile::TrayLightweight),
+    let matches = |role: BinaryRole| lower == role.windows_file_name().to_ascii_lowercase();
+    if matches(BinaryRole::Gui) {
+        Some(IpcClientProfile::GuiInteractive)
+    } else if matches(BinaryRole::Tray) {
+        Some(IpcClientProfile::TrayLightweight)
+    } else if matches(BinaryRole::Console) {
         // The administrative console. Admitted so it can collect diagnostics
         // through the same code path the application uses; the profile is what
         // keeps it to reading — it cannot invoke a policy change even by bug.
-        "nrr-cli.exe" => Some(IpcClientProfile::AdminConsole),
-        // Includes "nrr-service.exe" — explicitly rejected.
-        _ => None,
+        Some(IpcClientProfile::AdminConsole)
+    } else {
+        // Includes `BinaryRole::Service` — explicitly rejected.
+        None
     }
 }
 
@@ -443,6 +453,28 @@ mod tests {
     fn whitelist_rejects_service_exe() {
         assert_eq!(classify_exe_basename("nrr-service.exe"), None);
         assert_eq!(classify_exe_basename("NRR-Service.exe"), None);
+    }
+
+    /// The names above are the SPELLING this build ships; this is the LINK to
+    /// the identity that owns them. Renaming a role in the SSOT used to compile
+    /// green here and lock every client out of the service — with the pair, one
+    /// of the two fails and says which.
+    #[test]
+    fn every_admitted_role_is_classified_under_its_ssot_name() {
+        for role in BinaryRole::ALL {
+            let expected = match role {
+                BinaryRole::Gui => Some(IpcClientProfile::GuiInteractive),
+                BinaryRole::Tray => Some(IpcClientProfile::TrayLightweight),
+                BinaryRole::Console => Some(IpcClientProfile::AdminConsole),
+                BinaryRole::Service => None,
+            };
+            assert_eq!(
+                classify_exe_basename(role.windows_file_name()),
+                expected,
+                "{role:?} ({})",
+                role.windows_file_name()
+            );
+        }
     }
 
     #[test]

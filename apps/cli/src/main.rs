@@ -19,13 +19,13 @@ mod parse;
 mod platform;
 mod verbs;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use nrr_platform_api::service_control::{
-    ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceStatusReport,
-    ServiceUninstallSpec,
+    ServiceControlError, ServiceControlPort, ServiceInstallSpec, ServiceStartMode,
+    ServiceStatusReport, ServiceUninstallSpec,
 };
 use nrr_shared::product_identity::{BinaryRole, PRODUCT_NAME};
 
@@ -115,7 +115,7 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
             logs::report(logs::read_tail(logs::log_directory(), tail), exe)
         }
         Command::DiagExport => export::run(exe),
-        Command::ResetNetwork { confirmed } => reset_network(confirmed, exe),
+        Command::ResetNetwork { confirmed } => reset_network(confirmed, ctx),
         Command::Install { start_mode } => with_port(exe, "install", |port| {
             let binary_path = match service_binary_path() {
                 Ok(path) => path,
@@ -149,6 +149,10 @@ fn run(command: Command, ctx: &Ctx<'_>) -> u8 {
                             "  system event log:  source not registered; lifecycle records will                              show without their description"
                         );
                     }
+                    println!(
+                        "  launcher may start: {}",
+                        yes_no(apply_on_demand_grant(start_mode, &spec.binary_path))
+                    );
                     exit::SUCCESS
                 }
                 Err(err) => report_failure("install", &err, ctx, "install"),
@@ -255,6 +259,13 @@ reset-network` elevated, or reboot"
             println!("Re-registered the {PRODUCT_NAME} service.");
             println!("  binary:            {}", spec.binary_path.display());
             println!("  start mode:        {}", spec.start_mode.slug());
+            // The removal took the grant with the old registration, so an
+            // on-demand service comes back unstartable by the launcher unless
+            // it is re-issued here.
+            println!(
+                "  launcher may start: {}",
+                yes_no(apply_on_demand_grant(spec.start_mode, &spec.binary_path))
+            );
             match port.start(TRANSITION_TIMEOUT) {
                 Ok(()) => {
                     println!("  service:           started");
@@ -304,6 +315,15 @@ fn status(port: &dyn ServiceControlPort) -> u8 {
 fn print_status(report: &ServiceStatusReport) {
     println!("{PRODUCT_NAME} service: installed");
     println!("  state:             {}", report.run_state.slug());
+    // The console and the service are shipped and replaced together, so this
+    // console's version IS the installed version — with one exception, which
+    // the next line names rather than leaving the operator to assume: replacing
+    // the binary does not restart the process already loaded from it, so the
+    // version that is REGISTERED and the version that is RUNNING can differ.
+    println!("  version:           {}", env!("CARGO_PKG_VERSION"));
+    if running_predates_binary(report) {
+        println!("  running build:     older than the installed binary — restart to run it");
+    }
     match report.start_mode {
         Some(mode) => println!("  starts:            {}", mode.slug()),
         None => println!("  starts:            unknown"),
@@ -312,6 +332,43 @@ fn print_status(report: &ServiceStatusReport) {
         Some(path) => println!("  binary:            {}", path.display()),
         None => println!("  binary:            unknown"),
     }
+}
+
+/// Give the interactive user the `SERVICE_START` grant an on-demand service
+/// needs, by running the service binary's own start-mode verb.
+///
+/// Registering a service as demand-start says WHEN it may run, not WHO may
+/// start it: without the grant the unelevated launcher can never bring it up,
+/// which is the entire point of choosing on-demand. The grant is a DACL edit on
+/// the service object, and the service binary already owns that code — this
+/// console asks it rather than growing a second implementation that can drift
+/// from the one the application uses.
+///
+/// Returns whether the grant is in place. `true` for start-with-Windows, where
+/// no grant is wanted: the SCM starts it and nothing else needs the right.
+fn apply_on_demand_grant(start_mode: ServiceStartMode, binary: &Path) -> bool {
+    if start_mode != ServiceStartMode::OnAppLaunch {
+        return true;
+    }
+    std::process::Command::new(binary)
+        .arg("set-start-demand")
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Whether the running service process was started from an older file than the
+/// one registered now.
+///
+/// Both facts have to be present to answer: a manager that reports no start
+/// time, or a binary that cannot be stat'ed, means "not known", and the caller
+/// says nothing rather than guessing in either direction.
+fn running_predates_binary(report: &ServiceStatusReport) -> bool {
+    let (Some(started), Some(path)) = (report.running_since, report.binary_path.as_ref()) else {
+        return false;
+    };
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .is_ok_and(|modified| modified > started)
 }
 
 /// Print an actionable failure and pick its exit code. Access denied gets the
@@ -349,12 +406,14 @@ fn report_failure(
 /// only thing that knows every piece of it; a second implementation here would
 /// be a copy that drifts, and the copy that runs during an outage is the worst
 /// place to discover the drift.
-fn reset_network(confirmed: bool, exe: &str) -> u8 {
+fn reset_network(confirmed: bool, ctx: &Ctx<'_>) -> u8 {
+    let exe = ctx.exe;
     let Some(verb) = platform::offline_reset_verb() else {
-        println!("There is nothing to reset on this platform.");
-        println!(
-            "The service does not apply network state here yet, so a crash leaves none behind."
+        eprintln!("This build has no network reset.");
+        eprintln!(
+            "The service applies network state on this platform, but its binary carries no              reset verb yet, so there is nothing for this command to run."
         );
+        eprintln!("Stop the service, and reboot if the machine is still cut off.");
         return exit::UNSUPPORTED;
     };
     if !confirmed {
@@ -375,23 +434,48 @@ fn reset_network(confirmed: bool, exe: &str) -> u8 {
     // report is the useful part of running this at all.
     match std::process::Command::new(&binary).arg(verb).status() {
         Ok(status) if status.success() => exit::SUCCESS,
+        // The reset verb answers with this console's own privilege code when
+        // the engine refused it, so the answer arrives already classified: no
+        // guessing from a generic failure, and the elevation offer in `main`
+        // fires for the one command a locked-out user was told to run.
+        Ok(status) if status.code() == Some(i32::from(exit::NEEDS_PRIVILEGE)) => {
+            needs_elevation("reset-network", ctx, "reset-network --confirm")
+        }
         Ok(status) => {
             eprintln!(
                 "The service binary could not finish the reset ({}).",
                 describe_exit(&status)
             );
-            // The one failure worth naming: this needs an elevated console, the
-            // same as every other verb that changes machine state.
-            eprintln!(
-                "If it reported an access error, re-run from a console started as administrator."
-            );
             exit::FAILED
+        }
+        // Windows refuses to start a binary that demands elevation
+        // (`ERROR_ELEVATION_REQUIRED`) rather than starting it and letting it
+        // fail, so the refusal can arrive here instead of as an exit code.
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            needs_elevation("reset-network", ctx, "reset-network --confirm")
         }
         Err(err) => {
             eprintln!("could not run `{} {verb}`: {err}", binary.display());
             exit::FAILED
         }
     }
+}
+
+/// Report a refusal for privilege the same way every other verb does, and
+/// return the code that lets `main` offer to re-run elevated.
+///
+/// The repeat command is suppressed when elevation is about to be offered:
+/// telling someone to go and type it elsewhere is advice for a situation that
+/// is not theirs.
+fn needs_elevation(operation: &str, ctx: &Ctx<'_>, repeat_as: &str) -> u8 {
+    eprintln!("{operation} requires an elevated console.");
+    if !ctx.elevation.acts() {
+        eprintln!(
+            "Open a console as administrator and run: {} {repeat_as}",
+            ctx.exe
+        );
+    }
+    exit::NEEDS_PRIVILEGE
 }
 
 /// Human-readable form of a child process's exit status.

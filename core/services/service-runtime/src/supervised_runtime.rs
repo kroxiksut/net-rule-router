@@ -254,6 +254,10 @@ pub struct SupervisedRuntimeDeps {
     /// proposal tick and the tray see one state. `None` when the observation
     /// path isn't available; the tick is then not spawned.
     pub auto_rules_engine: Option<Arc<crate::auto_rules::AutoRulesEngine>>,
+    /// Automatic main-link pass over the parked suggestions, run from the
+    /// auto-rules tick when the principal opted in. `None` leaves the check to
+    /// the GUI button — the same runner, a different trigger.
+    pub auto_rule_probe: Option<crate::service_tasks::AutoProbeWiring>,
     /// Cross-session memory of the destinations an application rule
     /// routes over the additional link. Warm-loaded by the wiring layer before
     /// the first apply; this field only drives the periodic write-back. `None`
@@ -326,6 +330,13 @@ pub struct SupervisedRuntimeDeps {
     /// per-user task covers every logged-in user rather than the first.
     pub present_principals:
         Option<Arc<dyn nrr_platform_api::active_principals::ActivePrincipalSource>>,
+    /// Machine-wide network work that waits for a signed-in user (fake-IP
+    /// bring-up, the OS DNS-cache seed and flush). Fired by the sign-in event
+    /// beside the Mode-B re-arm; `None` runs nothing on sign-in.
+    pub sign_in_gate: Option<Arc<crate::logon_rearm::SignInGate>>,
+    /// Stops the fake-IP datapath on teardown, so the TUN adapter is closed
+    /// by the process that created it rather than found by the next one.
+    pub fake_ip_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// A cheap, idempotent "recompute the active user's routes now" callback.
@@ -553,12 +564,12 @@ pub fn run_supervised_runtime(
 
         // What actually arms Mode B on a cold boot: the resolver refuses to arm
         // while no one is signed in (no principal, hence no rules), so the boot
-        // apply above is a deliberate no-op until this fires.
-        if let (Some(observer), Some(controller)) = (
-            deps.logon_session_observer.as_ref(),
-            resolver_controller.as_ref(),
-        ) {
-            let controller = Arc::clone(controller);
+        // apply above is a deliberate no-op until this fires. The gate's work
+        // waits for the same reason: it changes the machine's network for a
+        // user who is not there yet, inside the OS's own sign-in phase.
+        if let Some(observer) = deps.logon_session_observer.as_ref() {
+            let controller = resolver_controller.clone();
+            let gate = deps.sign_in_gate.clone();
             match crate::logon_rearm::LogonSessionRearm::start(
                 observer.as_ref(),
                 Arc::new(move || {
@@ -566,7 +577,12 @@ pub fn run_supervised_runtime(
                         target: "nrr::dns-resolver",
                         "user signed in — applying the persisted enforcement mode",
                     );
-                    controller.apply(resolver_boot_mode);
+                    if let Some(controller) = controller.as_ref() {
+                        controller.apply(resolver_boot_mode);
+                    }
+                    if let Some(gate) = gate.as_ref() {
+                        gate.fire();
+                    }
                 }),
                 crate::logon_rearm::LOGON_DEBOUNCE,
             ) {
@@ -654,6 +670,12 @@ pub fn run_supervised_runtime(
             teardown_step("dns-resolver-stop", RESOLVER_STOP_BUDGET, move || {
                 resolver.shutdown();
             });
+        }
+        // The TUN adapter is closed by the process that created it; left open,
+        // the driver keeps a dead device that the next start has to find and
+        // delete first.
+        if let Some(shutdown) = deps.fake_ip_shutdown.clone() {
+            teardown_step("fake-ip-stop", RESOLVER_STOP_BUDGET, move || shutdown());
         }
         // stop the network-change observer next: its guard
         // cancels the OS notifications (blocking until any in-flight callback
@@ -1049,6 +1071,7 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_auto_rules_task(
             Arc::clone(engine),
             Arc::clone(active_sid),
+            deps.auto_rule_probe.clone(),
         )) {
             tracing::warn!(
                 target: "nrr::supervisor",
@@ -1161,6 +1184,7 @@ mod tests {
         ));
         SupervisedRuntimeDeps {
             auto_rules_engine: None,
+            auto_rule_probe: None,
             app_destination_memory: None,
             secondary_external_address: None,
             health: Arc::new(HealthAggregator::new()),
@@ -1189,6 +1213,8 @@ mod tests {
             conn_observation_consumer: None,
             dns_resolver_controller: None,
             dns_resolver_boot_mode: nrr_domain::enforcement_mode::EnforcementMode::default(),
+            sign_in_gate: None,
+            fake_ip_shutdown: None,
             event_bus: None,
             network_change_observer: None,
             secondary_liveness_hook: None,

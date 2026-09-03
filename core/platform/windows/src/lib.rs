@@ -124,8 +124,8 @@ pub use win32_browser_history::WindowsBrowserHistoryRead;
 
 pub use adapters::{
     classify_availability, is_virtual_adapter, AdapterAvailability, AdapterAvailabilityChange,
-    AdapterAvailabilitySnapshot, AdapterEventSource, AdapterInfo, AdapterMonitor, IfOperStatus,
-    InterfaceType, MockAdapterEventSource, WindowsApiAdapterSource,
+    AdapterEventSource, AdapterInfo, AdapterMonitor, IfOperStatus, InterfaceType,
+    MockAdapterEventSource, WindowsApiAdapterSource,
 };
 #[cfg(target_os = "windows")]
 pub use app_group_discovery::WindowsAppGroupDiscovery;

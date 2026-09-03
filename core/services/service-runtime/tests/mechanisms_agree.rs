@@ -397,6 +397,7 @@ fn the_neutral_planner_reads_the_same_arbiter() {
 fn only_the_arbiter_reads_the_observation_store() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
+    let (mut scanned, mut stripped) = (0usize, 0usize);
     let mut stack = vec![src];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("src is readable") {
@@ -422,22 +423,30 @@ fn only_the_arbiter_reads_the_observation_store() {
                 continue;
             }
             let body = std::fs::read_to_string(&path).expect("readable source");
-            // Test modules declare their own fixtures against the raw store.
-            let production = body
-                .split(
-                    "
-#[cfg(test)]
-",
-                )
-                .next()
-                .unwrap_or_default();
-            for (n, line) in production.lines().enumerate() {
+            scanned += 1;
+            // Test modules declare their own fixtures against the raw store, so
+            // stop at the first one. Walking lines rather than splitting on a
+            // literal keeps the strip honest on a CRLF checkout, where the
+            // literal never matches and the whole file reads as production.
+            for (n, line) in body.lines().enumerate() {
+                let head = line.trim_start();
+                if head.starts_with("#[cfg(test)]") || head.starts_with("#[cfg(all(test") {
+                    stripped += 1;
+                    break;
+                }
                 if line.contains(".ips_for_app(") || line.contains(".destination_used_outside(") {
                     offenders.push(format!("{}:{}", file, n + 1));
                 }
             }
         }
     }
+    // Positive control: a guard that reads nothing, or that never recognises a
+    // test module, passes for the wrong reason.
+    assert!(scanned > 0, "the guard read no sources — it is blind");
+    assert!(
+        stripped > 0,
+        "no test module was recognised in {scanned} files: the strip is broken, so every fixture would count as production",
+    );
     assert!(
         offenders.is_empty(),
         "these read the observation store without going through AppDestinationGate, so nothing          forces them to apply both ownership and the census: {offenders:?}",

@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+/// The managed-configuration root beside the product name it is named after.
+/// Two independent copies of this path existed in this file alone, and a third
+/// in `nrr-shared::localization`; all three now read the identity SSOT.
+const MANAGED_ROOT_FOLDER: &str = nrr_shared::product_identity::PRODUCT_NAME;
+const MANAGED_SUBFOLDER: &str = "managed";
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -88,6 +94,10 @@ pub struct UiPreferences {
     /// [`Self::show_notifications`] switch. Default `true` — this is the
     /// kind of event a user wants to know about unless they opt out.
     pub notify_block_notices: bool,
+    /// Show the tray notice when the active rules name the same traffic on
+    /// both routes. Default `true`: the condition is invisible everywhere else,
+    /// and evaluation order — not the user — is deciding.
+    pub notify_rule_duplicates: bool,
     /// Redacts the destination host/IP from the "connection blocked" notice
     /// body while still showing that a block happened. Default `false`.
     pub hide_block_notice_addresses: bool,
@@ -463,6 +473,11 @@ pub struct UiPreferences {
     /// with success) or when the GUI process restarts. `0` ⇒ never
     /// declined since last successful state.
     pub service_install_uac_declined_count: u32,
+    /// The user said "stop offering to install the service". A deliberate
+    /// answer, unlike closing the dialog, so it holds until they turn the offer
+    /// back on in Settings. Separate from the decline budget on purpose: three
+    /// dismissals mean "not now", not "never".
+    pub service_install_prompt_suppressed: bool,
 
     /// When `false`, the GUI does NOT auto-open the last-saved / auto-open
     /// rules files on startup even if `last_saved_path_*` is populated.
@@ -609,6 +624,7 @@ impl Default for UiPreferences {
             show_notifications: true,
             notify_suggestion_changes: true,
             notify_block_notices: true,
+            notify_rule_duplicates: true,
             hide_block_notice_addresses: false,
             tray_notice_opacity_percent: 100,
             reopen_last_section_on_startup: true,
@@ -697,6 +713,7 @@ impl Default for UiPreferences {
             last_file_synced_hash_secondary: None,
             service_install_uac_declined_at_epoch: None,
             service_install_uac_declined_count: 0,
+            service_install_prompt_suppressed: false,
             // New toggles default to the pre-existing behaviour (auto-load
             // on, comments on, banner auto, no custom URL).
             auto_load_rules_on_launch: true,
@@ -938,7 +955,10 @@ impl UiPreferencesStore {
         match fs::read_to_string(&self.path) {
             Ok(content) if has_preference_lines(&content) => {
                 check_schema_version_compat(&content);
-                Ok(parse_preferences(&content))
+                Ok(without_expired_parked_intents(
+                    parse_preferences(&content),
+                    unix_now_ms(),
+                ))
             }
             // The file exists but holds no `key=value` line: a dirty-shutdown
             // artifact (power cut after the rename committed but before the
@@ -964,7 +984,10 @@ impl UiPreferencesStore {
             return None;
         }
         check_schema_version_compat(&content);
-        Some(parse_preferences(&content))
+        Some(without_expired_parked_intents(
+            parse_preferences(&content),
+            unix_now_ms(),
+        ))
     }
 
     fn backup_path(&self) -> PathBuf {
@@ -1065,7 +1088,7 @@ fn resolve_storage_location() -> io::Result<StorageLocation> {
 
     let mut last_error = None;
     for (base, is_profile_persistent) in candidates {
-        let managed_path = base.join("NetRuleRouter").join("managed");
+        let managed_path = base.join(MANAGED_ROOT_FOLDER).join(MANAGED_SUBFOLDER);
         match fs::create_dir_all(&managed_path) {
             Ok(_) => {
                 return Ok(StorageLocation {
@@ -1094,7 +1117,9 @@ fn legacy_preference_paths(root: PathBuf) -> Vec<PathBuf> {
         .iter()
         .map(|name| root.join(name))
         .collect::<Vec<_>>();
-    let temp_root = env::temp_dir().join("NetRuleRouter").join("managed");
+    let temp_root = env::temp_dir()
+        .join(MANAGED_ROOT_FOLDER)
+        .join(MANAGED_SUBFOLDER);
     paths.extend(
         LEGACY_PREFERENCES_FILE_NAMES
             .iter()
@@ -1188,6 +1213,11 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "notify_block_notices" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.notify_block_notices = parsed;
+                }
+            }
+            "notify_rule_duplicates" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.notify_rule_duplicates = parsed;
                 }
             }
             "hide_block_notice_addresses" => {
@@ -1486,6 +1516,11 @@ fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.service_install_uac_declined_count = parsed;
                 }
             }
+            "service_install_prompt_suppressed" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.service_install_prompt_suppressed = parsed;
+                }
+            }
             "auto_load_rules_on_launch" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.auto_load_rules_on_launch = parsed;
@@ -1732,6 +1767,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "last_file_synced_hash_secondary={}\n",
             "service_install_uac_declined_at_epoch={}\n",
             "service_install_uac_declined_count={}\n",
+            "service_install_prompt_suppressed={}\n",
             "auto_load_rules_on_launch={}\n",
             "export_include_comments={}\n",
             "import_only_active={}\n",
@@ -1775,6 +1811,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "last_loaded_path_primary={}\n",
             "last_loaded_path_secondary={}\n",
             "notify_block_notices={}\n",
+            "notify_rule_duplicates={}\n",
             "hide_block_notice_addresses={}\n",
             "tray_notice_opacity_percent={}\n"
         ),
@@ -1824,6 +1861,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         optional_string_field(&preferences.last_file_synced_hash_secondary),
         optional_i64_field(preferences.service_install_uac_declined_at_epoch),
         preferences.service_install_uac_declined_count,
+        preferences.service_install_prompt_suppressed,
         preferences.auto_load_rules_on_launch,
         preferences.export_include_comments,
         preferences.import_only_active,
@@ -1867,6 +1905,7 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         optional_string_field(&preferences.last_loaded_path_primary),
         optional_string_field(&preferences.last_loaded_path_secondary),
         preferences.notify_block_notices,
+        preferences.notify_rule_duplicates,
         preferences.hide_block_notice_addresses,
         preferences.tray_notice_opacity_percent
     )
@@ -1966,6 +2005,28 @@ fn parse_font_scale_percent(value: &str) -> Option<u16> {
 /// Non-policy UI preferences (theme, language, fonts, route labels,
 /// section selections, rules-view filters, …) are **not** touched.
 #[allow(deprecated)]
+/// Drop parked offline intents the user made more than
+/// [`PARKED_INTENT_TTL_SECONDS`] ago.
+///
+/// Applied on load rather than on read: an intent nobody will act on should not
+/// reach the GUI at all, and the next save writes the store out empty.
+fn without_expired_parked_intents(mut prefs: UiPreferences, now_ms: i64) -> UiPreferences {
+    if nrr_shared::parked_intents_expired(&prefs.route_pending_offline_json, now_ms) {
+        prefs.route_pending_offline_json.clear();
+    }
+    prefs
+}
+
+/// Current Unix epoch in milliseconds; `0` when the clock is before the epoch,
+/// which only makes every park look fresh.
+fn unix_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 pub fn cleanup_legacy_policy_fields(prefs: &mut UiPreferences) {
     prefs.selected_primary_interface_id = String::new();
     prefs.selected_primary_interface_name = String::new();
@@ -2043,9 +2104,9 @@ mod tests {
     }
     use super::{
         check_schema_version_compat, cleanup_legacy_policy_fields, has_legacy_policy_fields,
-        parse_preferences, preferred_available_language, SystemFontFamily, UiPreferences,
-        UiPreferencesStore, CURRENT_UI_PREFS_SCHEMA_VERSION, LEGACY_PREFERENCES_FILE_NAMES,
-        STABLE_PREFERENCES_FILE_NAME,
+        parse_preferences, preferred_available_language, without_expired_parked_intents,
+        SystemFontFamily, UiPreferences, UiPreferencesStore, CURRENT_UI_PREFS_SCHEMA_VERSION,
+        LEGACY_PREFERENCES_FILE_NAMES, STABLE_PREFERENCES_FILE_NAME,
     };
     use nrr_shared::{
         AppSection, RouteBehaviorMode, RulesEnabledFilter, RulesFileChangeBehavior,
@@ -2210,8 +2271,11 @@ mod tests {
             minimize_to_tray_instead_of_close: true,
             show_notifications: false,
             notify_suggestion_changes: false,
+            // Non-default (default is false) — proves the field persists.
+            service_install_prompt_suppressed: true,
             // Non-default (default is true) — proves the field persists.
             notify_block_notices: false,
+            notify_rule_duplicates: false,
             // Non-default (default is false) — proves the field persists.
             hide_block_notice_addresses: true,
             // Non-default (default is 100) — proves the field persists.
@@ -2932,6 +2996,28 @@ service_install_uac_declined_count=1
         assert!(!prefs.tooltips_enabled);
         assert_eq!(prefs.last_opened_section, AppSection::Diagnostics);
         assert_eq!(prefs.rules_view_sort, RulesViewSort::ByMatchValue);
+    }
+
+    #[test]
+    fn a_parked_intent_past_its_window_does_not_survive_the_load() {
+        let day_ms = 24 * 60 * 60 * 1000_i64;
+        let prefs = UiPreferences {
+            route_pending_offline_json:
+                r#"{"parked-at-ms":1000,"route-policy":{"kill-switch":true}}"#.to_string(),
+            ..UiPreferences::default()
+        };
+
+        let fresh = without_expired_parked_intents(prefs.clone(), 1000 + day_ms);
+        assert!(
+            !fresh.route_pending_offline_json.is_empty(),
+            "a day-old intent is still the decision the user made"
+        );
+
+        let stale = without_expired_parked_intents(prefs, 1000 + 8 * day_ms);
+        assert!(
+            stale.route_pending_offline_json.is_empty(),
+            "a week-old 'block everything' must not land on the next connect"
+        );
     }
 
     #[test]

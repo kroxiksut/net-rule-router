@@ -71,8 +71,10 @@ windows = { version = "0.58", features = [
     "Win32_Networking_WinSock",
     # Operator-facing records in the Application event log.
     "Win32_System_EventLog",
-    # Block 16.9.4: HKCU\...\Run autostart helper.
+    # HKCU\...\Run autostart helper; transacted NRPT rule writes.
     "Win32_System_Registry",
+    # CreateTransaction / CommitTransaction (KTM) behind the NRPT rule store.
+    "Win32_Storage_FileSystem",
     # Block 16.12.A.0: FwpmEngineOpen0 takes a SEC_WINNT_AUTH_IDENTITY_W
     # parameter and we use the RPC_C_AUTHN_WINNT constant.
     "Win32_System_Rpc",

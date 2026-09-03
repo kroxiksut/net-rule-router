@@ -101,8 +101,16 @@ Dialog {
         CheckBox {
             id: understandCheckbox
             visible: root.isCritical()
-            checked: root._understandChecked
-            onCheckedChanged: root._understandChecked = checked
+            // A click writes `checked`, which destroys a plain binding to it.
+            // The box then shows the last gesture while the gate below reads
+            // the flag — a reopened dialog renders ticked and refuses to
+            // proceed, saying nothing. A Binding element keeps re-asserting.
+            Binding {
+                target: understandCheckbox
+                property: "checked"
+                value: root._understandChecked
+            }
+            onToggled: root._understandChecked = checked
             text: root.tr(
                 "dialog.confirm-activate.checkbox-understand",
                 "I understand the risk and want to proceed"

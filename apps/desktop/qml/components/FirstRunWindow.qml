@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtQuick.Dialogs
+import "../lib/pure.js" as Pure
 
 // First-run wizard (extracted from Main.qml).
 //
@@ -214,8 +215,8 @@ Window {
         }
         // The choices above are parked when the service is not up yet, and the
         // collect that delivers them refuses to run while this window is open.
-        if (typeof root.scheduleOfflineBacklogCollect === "function") {
-            root.scheduleOfflineBacklogCollect()
+        if (root.offlineBacklogCollector) {
+            root.offlineBacklogCollector.scheduleOfflineBacklogCollect()
         }
     }
 
@@ -317,10 +318,7 @@ Window {
     }
 
     function _localPathFromUrl(urlValue) {
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
 
     // Read the picked file(s) and dispatch the

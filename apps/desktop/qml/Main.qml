@@ -37,7 +37,7 @@ ApplicationWindow {
         if (!platformProfile || !platformProfile.supports) return true
         return platformProfile.supports[feature] !== false
     }
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     property string statusLine: ""
     /// Long form of the current status message, shown on hover. The footer is
@@ -82,8 +82,19 @@ ApplicationWindow {
     property string currentLanguage: ""
     property bool quittingToTray: false
     property var localeCatalog: ({})
+    // Per-file locale load report from the launcher: { acceptedWithWarnings,
+    // rejected, reports: [{ id, fileName, source, status, warnings, errors }] }.
+    // Rendered in Settings -> Language; a locale problem otherwise reached the
+    // user as a status line telling them to read logs the GUI does not write.
+    property var localeDiagnostics: ({})
     property var availableLanguages: []
     property var interfacesRowsAll: []
+    /// Where the adapter rows came from: `"windows-live"` when the service
+    /// enumerated the machine, anything else (including an unknown spelling)
+    /// when they are placeholders. Starts pessimistic — until a source says
+    /// otherwise, rows must not be presented as this machine's adapters.
+    property string interfacesDataSource: "fallback-mock"
+    readonly property bool interfacesAreLive: interfacesDataSource === "windows-live"
     // Sidecar-backed cache of the last external IP the service resolved per
     // adapter (key -> {ip, observedAtMs}). Populated once at cold start via
     // `interfacesRolesController.loadExternalIpCache()` and kept current by
@@ -363,7 +374,7 @@ ApplicationWindow {
     // is the list rendered by NotificationCenterPopup and counted by the footer
     // bell chip. To add a notice: push { id, severity: "warning"|"info", title,
     // body, actionKey?, actionText? }; `actionKey` is dispatched by
-    // `runNotificationAction`, dismissal routed through `dismissNotification`.
+    // `notificationsController.runNotificationAction`, dismissal routed through `notificationsController.dismissNotification`.
     readonly property var activeNotifications: {
         var out = []
         if (appUnresolvedNoticeActive) {
@@ -436,7 +447,7 @@ ApplicationWindow {
         // user's saved settings after the service state was reset (e.g. a fresh
         // build wiped the per-SID DB). Surface it so a restored kill-switch is never
         // a silent surprise. Dismissible info notice; the user can turn it off.
-        if (killSwitchRestoredNoticeActive) {
+        if (notificationsController.killSwitchRestoredNoticeActive) {
             out.push({
                 "id": "kill-switch-restored",
                 "severity": "info",
@@ -453,349 +464,10 @@ ApplicationWindow {
         // live state and clears itself; a push describes something that already
         // happened, so it is held until the user answers it (here or in the
         // tray). Appended last so a standing warning stays on top.
-        for (var p = 0; p < _pushNotices.length; p += 1) out.push(_pushNotices[p])
+        for (var p = 0; p < notificationsController._pushNotices.length; p += 1) out.push(notificationsController._pushNotices[p])
         return out
     }
 
-    // ── Push-driven notices ──────────────────────────────────────────────────
-    //
-    // The tray is the surface that can speak while this window is closed, so it
-    // owns these notices in the general case. The window keeps its own copy as
-    // insurance: a tray that never started, was killed, or had notifications
-    // turned off would otherwise swallow the message entirely. Both copies
-    // carry the SAME id, and `NotificationLedger` guarantees that answering one
-    // retires the other.
-    property var _pushNotices: []
-
-    /// `false` when the user silenced this kind of notice on its own. The
-    /// master switch is checked by the surfaces that raise OS notifications;
-    /// this is the per-kind layer under it.
-    function noticeKindEnabled(kind) {
-        if (String(kind || "") === "suggestions-changed")
-            return prefs.notifySuggestionChanges !== false
-        if (String(kind || "") === "block-notice")
-            return prefs.notifyBlockNotices !== false
-        return true
-    }
-
-    /// Silences one kind for good — the "don't show these again" affordance on
-    /// the notice itself, so the user never has to find the setting to stop a
-    /// stripe that is bothering them right now.
-    function muteNoticeKind(kind) {
-        var k = String(kind || "")
-        if (k === "suggestions-changed") {
-            updatePrefs({ notifySuggestionChanges: false })
-            emitPrefs()
-        } else if (k === "block-notice") {
-            updatePrefs({ notifyBlockNotices: false })
-            emitPrefs()
-        }
-    }
-
-    function _addPushNotice(notice) {
-        if (!notice || String(notice.id || "") === "") return
-        if (!noticeKindEnabled(notice.kind)) return
-        // `refractoryMs` is for notices whose id carries a counter the SERVICE
-        // restarts (the push id): a permanent record of one silences the id's
-        // next incarnation, which is a different event entirely.
-        var refractory = Number(notice.refractoryMs || 0)
-        if (refractory > 0) {
-            var answeredAt = noticeLedger.decidedAt(String(notice.id))
-            if (answeredAt > 0 && (Date.now() - answeredAt) < refractory) return
-        } else if (noticeLedger.isDecided(String(notice.id))) {
-            return
-        }
-        for (var i = 0; i < _pushNotices.length; i += 1) {
-            if (_pushNotices[i].id === notice.id) return
-        }
-        var entry = notice
-        var ttl = Number(notice.autoDismissMs || 0)
-        // A notice that carries no decision must not sit over the user's work
-        // until it is clicked. Expiry is NOT an answer: nothing goes into the
-        // ledger, so a surface that shows the same event can still offer it.
-        if (ttl > 0) entry = Object.assign({}, notice, { "expiresAt": Date.now() + ttl })
-        _pushNotices = _pushNotices.concat([entry])
-    }
-
-    // ── Suggested addresses ──────────────────────────────────────────────────
-    //
-    // The service parks addresses a routed site appears to need. The tray asks
-    // about them; this window is where the ones nobody answered can still be
-    // turned into rules. Lives as a section (`RuleSuggestionsSection.qml`,
-    // sidebar → Rules → Suggested addresses) rather than a dialog, merged with
-    // the dismissed-suggestions history into one table.
-
-    /// Wire rows from the last `autorules.candidates.list`.
-    property var autoRuleCandidates: []
-    /// How many the service is holding — drives the chip in the Rules header.
-    property int autoRuleCandidatesPending: 0
-    property bool _autoRuleFetchInFlight: false
-    /// Id of the banner currently on screen, so a newer push can replace it.
-    property string _autoRuleNoticeId: ""
-
-    /// Companions the last service pass declined to offer, and a few of their
-    /// names — the suggestions screen turns them into a reason for an empty
-    /// list. Zero means the pass had nothing to drop either.
-    property int autoRuleInertDropped: 0
-    property var autoRuleInertSample: []
-
-    function refreshAutoRuleCandidates() {
-        if (!bridgeAvailable || _autoRuleFetchInFlight) return
-        var corr = rpcTransport.rpcAutoRuleCandidatesList()
-        if (!corr || corr === "") return
-        _autoRuleFetchInFlight = true
-        rpcTransport.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            window._autoRuleFetchInFlight = false
-            if (!ok || !payload) {
-                console.log("auto-rule candidates fetch failed:", code, msg)
-                return
-            }
-            var list = payload.candidates || payload["candidates"] || []
-            window.autoRuleCandidates = list
-            window.autoRuleCandidatesPending = list.length
-            // Why the list is empty, when it is: companions the service saw but
-            // did not offer because they already travel the same route.
-            window.autoRuleInertDropped = Number(payload["inert-dropped"] || 0)
-            window.autoRuleInertSample = payload["inert-sample"] || []
-        })
-    }
-
-    /// Navigate to the suggestions section with whatever the service holds
-    /// RIGHT NOW — a list cached before the user browsed on would offer
-    /// stale addresses.
-    function openAutoRuleSuggestions() {
-        requestSectionChange("rule-suggestions")
-        if (bridgeAvailable) {
-            refreshAutoRuleCandidates()
-            refreshAutoRuleDismissed()
-        }
-    }
-
-    function acceptAutoRuleCandidates(ids) {
-        if (!ids || ids.length === 0 || !bridgeAvailable) return
-        var corr = rpcTransport.rpcAutoRuleCandidatesAccept({ "ids": ids })
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.log("auto-rule accept failed:", code, msg)
-                return
-            }
-            window._noteAutoRulePending(p)
-        })
-    }
-
-    function dismissAutoRuleCandidates(ids) {
-        if (!ids || ids.length === 0 || !bridgeAvailable) return
-        var corr = rpcTransport.rpcAutoRuleCandidatesDismiss({ "ids": ids })
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.log("auto-rule dismiss failed:", code, msg)
-                return
-            }
-            window._noteAutoRulePending(p)
-        })
-    }
-
-    /// Rows from the last `autorules.dismissed.list`.
-    property var autoRuleDismissed: []
-
-    function refreshAutoRuleDismissed() {
-        if (!bridgeAvailable) return
-        var corr = rpcTransport.rpcAutoRuleDismissedList()
-        if (!corr || corr === "") return
-        rpcTransport.registerRpcCallback(corr, function(ok, payload, code, msg) {
-            if (!ok || !payload) {
-                console.log("auto-rule dismissed fetch failed:", code, msg)
-                return
-            }
-            window.autoRuleDismissed = payload.dismissed || payload["dismissed"] || []
-        })
-    }
-
-    /// Lifts a refusal and puts the offer back on the pending list, so both
-    /// lists are re-read: the row moves from declined to waiting.
-    function restoreAutoRuleDismissed(ids) {
-        if (!ids || ids.length === 0 || !bridgeAvailable) return
-        var corr = rpcTransport.rpcAutoRuleDismissedRestore({ "ids": ids })
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.log("auto-rule restore failed:", code, msg)
-                return
-            }
-            window.refreshAutoRuleDismissed()
-            window.refreshAutoRuleCandidates()
-        })
-    }
-
-    /// Erases the service's memory of these suggestions entirely, so the host
-    /// is offered again from scratch. Both lists are re-read — the row can be
-    /// leaving either one.
-    function forgetAutoRuleCandidates(ids) {
-        if (!ids || ids.length === 0 || !bridgeAvailable) return
-        var corr = rpcTransport.rpcAutoRuleCandidatesForget({ "ids": ids })
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) {
-                console.log("auto-rule forget failed:", code, msg)
-                return
-            }
-            window.refreshAutoRuleDismissed()
-            window._noteAutoRulePending(p)
-        })
-    }
-
-    /// The answer says what is left; take the banner down once nothing is.
-    function _noteAutoRulePending(payload) {
-        var left = (payload || {}).pending
-        if (left === undefined) left = (payload || {})["pending"]
-        if (left === undefined) return
-        autoRuleCandidatesPending = Number(left)
-        if (autoRuleCandidatesPending <= 0) {
-            autoRuleCandidates = []
-            _dropPushNotice(_autoRuleNoticeId)
-        } else {
-            refreshAutoRuleCandidates()
-        }
-    }
-
-    /// Id of the failure notice currently shown per service operation, so a
-    /// repeated press replaces its own notice instead of stacking five.
-    property var _serviceFailureNoticeIds: ({})
-
-    /// Surface a failed service operation where the user cannot miss it.
-    ///
-    /// The id carries a timestamp: the notice ledger silences an id for good
-    /// once answered, and "the stop failed" is a NEW event every time it
-    /// happens, not the same one returning.
-    function _noteServiceOperationFailed(operation, errorMessage) {
-        var op = String(operation || "")
-        var previous = String(_serviceFailureNoticeIds[op] || "")
-        if (previous !== "") _dropPushNotice(previous)
-        var id = "service-op-failed:" + op + ":" + String(Date.now())
-        var ids = _serviceFailureNoticeIds
-        ids[op] = id
-        _serviceFailureNoticeIds = ids
-        var reason = String(errorMessage || "").trim()
-        var body = tr("notifications.service-operation-failed.body",
-            "The service did not carry out this action, so nothing changed. Open Settings to try again, or check the logs for the reason.")
-        if (reason !== "") body += " (" + reason + ")"
-        _addPushNotice({
-            "id": id,
-            "kind": "service-control",
-            "severity": "warning",
-            "dismissible": true,
-            "title": tr("notifications.service-operation-failed.title",
-                "Service action failed: {operation}").replace("{operation}", op),
-            "body": body,
-            "actionKey": "open-routing-settings",
-            "actionText": tr("notifications.service-operation-failed.action",
-                "Open Settings")
-        })
-    }
-
-    function _expirePushNotices() {
-        var now = Date.now()
-        var kept = []
-        for (var i = 0; i < _pushNotices.length; i += 1) {
-            var n = _pushNotices[i]
-            if (Number(n.expiresAt || 0) > 0 && Number(n.expiresAt) <= now) continue
-            kept.push(n)
-        }
-        if (kept.length !== _pushNotices.length) _pushNotices = kept
-    }
-
-    /// Take a notice down without recording an answer — used when the OTHER
-    /// surface already recorded one.
-    function _dropPushNotice(noticeId) {
-        var id = String(noticeId || "")
-        var kept = []
-        for (var i = 0; i < _pushNotices.length; i += 1) {
-            if (_pushNotices[i].id !== id) kept.push(_pushNotices[i])
-        }
-        if (kept.length !== _pushNotices.length) _pushNotices = kept
-    }
-    // Set by RoutingSettings._reseedTogglesFromPrefs when it
-    // restores an enabled kill-switch the service had lost; cleared on dismiss.
-    property bool killSwitchRestoredNoticeActive: false
-    readonly property int notificationCount: activeNotifications.length
-    // Highest severity present drives the footer chip colour.
-    readonly property string notificationTopSeverity: {
-        var sev = ""
-        for (var i = 0; i < activeNotifications.length; i += 1) {
-            if (activeNotifications[i].severity === "warning") return "warning"
-            if (activeNotifications[i].severity === "info") sev = "info"
-        }
-        return sev
-    }
-    /// `actionArg` is the notice's own subject — the host a block notice names,
-    /// for instance. Optional: every older action ignores it.
-    function runNotificationAction(actionKey, actionArg) {
-        if (actionKey === "explain-host") explainHostInDiagnostics(String(actionArg || ""))
-        else if (actionKey === "open-auto-rule-suggestions") openAutoRuleSuggestions()
-        else if (actionKey === "open-interfaces") section = "interfaces-routes"
-        else if (actionKey === "open-rules") section = "rules"
-        else if (actionKey === "open-routing-settings") section = "settings"
-        else if (actionKey === "open-release-page") {
-            // Release URL from the update-check cache; fall
-            // back to the project's releases page.
-            var u = ((window.context || {}).updateCheck || {}).url || ""
-            if (u === "") {
-                var base = ((window.context || {}).about || {}).projectUrl || ""
-                if (base !== "") u = base + "/releases"
-            }
-            Pure.openExternalUrl(u)
-        }
-    }
-    /// Answer "why did this not open?" where the question was asked.
-    ///
-    /// The explain probe has existed in Diagnostics for a while, and it still
-    /// left the user guessing: nothing pointed at it from the moment the problem
-    /// appeared. This carries the host from the block notice into the probe and
-    /// runs it, so the answer arrives instead of a search.
-    function explainHostInDiagnostics(host) {
-        var subject = String(host || "").trim()
-        if (subject === "") return
-        pendingExplainHost = subject
-        section = "diagnostics"
-    }
-
-    /// Host handed to the Diagnostics panel on its next load. Cleared by the
-    /// panel once consumed, so re-opening the page does not re-probe.
-    property string pendingExplainHost: ""
-
-    function dismissNotification(notificationId) {
-        if (notificationId === "app-unresolved") {
-            // UNION with the previously-acknowledged set so an
-            // app that temporarily left the set (resolved while running) stays
-            // acknowledged when it returns after its process exits.
-            _unenforcedAppRulesAckSig = _unenforcedAckUnionSig()
-            // Persist the ack so the notice stays dismissed
-            // across GUI restarts until a NEW unresolved app appears.
-            updatePrefs({ unenforcedAppsAckSig: _unenforcedAppRulesAckSig })
-            emitPrefs()
-        } else if (notificationId === "kill-switch-restored") {
-            killSwitchRestoredNoticeActive = false
-        }
-        // A push notice is answered for good, on every surface: record it before
-        // dropping it so the tray stops offering the same thing. The
-        // state-derived notices above are deliberately NOT recorded — they are
-        // recomputed from live state and are meant to come back when that state
-        // says so.
-        var isPushNotice = false
-        for (var i = 0; i < _pushNotices.length; i += 1) {
-            if (_pushNotices[i].id === notificationId) { isPushNotice = true; break }
-        }
-        if (!isPushNotice) return
-        noticeLedger.record(String(notificationId))
-        _dropPushNotice(notificationId)
-    }
-
-    // Reactive mirror of the strict kill-switch
-    // (block-all) setting for the notifications centre. `prefs.routeKillSwitchBlockAll`
-    // is mutated IN PLACE by `applyKillSwitchBlockAll` (which does NOT emit
-    // `prefsChanged`) and is reassigned wholesale on prefs (re)load — so neither
-    // path alone reliably re-evaluates a `prefs.*`-reading binding. This bool is a
-    // real property (its own change signal) driven in BOTH: `onPrefsChanged` (every
-    // prefs reassignment — load / reseed / restore) and `applyKillSwitchBlockAll`
-    // (the in-place live toggle). `activeNotifications` gates the strict notice on it.
     property bool strictKillSwitchActive: false
     onPrefsChanged: {
         strictKillSwitchActive = !!(prefs && prefs.routeKillSwitchBlockAll === true)
@@ -1041,7 +713,6 @@ ApplicationWindow {
     property alias rulesModel: rulesModel
     property alias logsModel: logsModel
     property alias ruleDialog: ruleDialog
-    property alias fullResetConfirmDialog: fullResetConfirmDialog
     property alias loadListWindow: loadListWindow
     property alias refreshAction: refreshAction
     property alias logsFolderAction: logsFolderAction
@@ -1049,19 +720,6 @@ ApplicationWindow {
     // Generic in-flight mutation tracker, shared
     // with every section that has submit-style buttons.
     property alias mutationsModel: mutationsModel
-    // Review-flow dialogs. Sections invoke them
-    // via `startRulesReviewFlow(rulesJson, contentHash)`.
-    property alias reviewDiffDialog: reviewDiffDialog
-    property alias reviewExpiredDialog: reviewExpiredDialog
-    // Exposed for flows/DriftController (drift + merge dialogs it drives).
-    property alias driftDetectionDialog: driftDetectionDialog
-    property alias mergeReviewDialog: mergeReviewDialog
-    property alias rulesOverlapCleanupDialog: rulesOverlapCleanupDialog
-    // The single post-connect "what piled up while the service was stopped"
-    // dialog, driven by the window's backlog collector.
-    property alias offlineBacklogDialog: offlineBacklogDialog
-    // Exposed for flows/PresetImportController (the duplicate/reclassify review dialog).
-    property alias presetImportReviewDialog: presetImportReviewDialog
     // Transient toast stack pinned to the
     // bottom-right corner.
     property alias operationToastStack: operationToastStack
@@ -1071,21 +729,19 @@ ApplicationWindow {
     // `requestSectionChange` / `requestWindowClose` /
     // `requestApplicationQuit` helpers.
     property alias unsavedChangesGuard: unsavedChangesGuard
-    // Tray-initiated safe-disable confirmation
-    // dialog. Opened from `applyGuiActivationRequest` when the
-    // secondary launcher writes `action: "safe-disable"` into the
-    // gui-activation.json hand-off.
-    property alias safeDisableConfirmDialog: safeDisableConfirmDialog
-    // Guardrail dialog for an additional adapter that cannot carry traffic
-    // out. Opened through `confirmUnroutableSecondary(...)` from the
-    // interfaces role flow and from the leak-protection toggle.
-    property alias unroutableSecondaryConfirmDialog: unroutableSecondaryConfirmDialog
     // Exposed so Settings can re-trigger onboarding.
     property alias firstRunWindow: firstRunWindow
     // Exposed so the extracted FirstRunWindow can reach the sibling
     // Licenses window (View EULA button + transient-parent hand-off).
     property alias licenseWindow: licenseWindow
-    property alias firstLaunchInstallDialog: firstLaunchInstallDialog
+    // Reached by flows/StartupController for the `startupDialog: "about"` entry.
+    // An id is not a property: without the alias `root.aboutWindow` is undefined
+    // and the About-on-launch path opens nothing.
+    property alias aboutWindow: aboutWindow
+    // Same reason: the extracted startup and backlog controllers re-arm these
+    // two timers, and an id alone is not reachable from another file.
+    property alias _offlineBacklogCollectTimer: _offlineBacklogCollectTimer
+    property alias _driftConnectComparePrimeTimer: _driftConnectComparePrimeTimer
     property alias eulaAgreementWindow: eulaAgreementWindow
 
     readonly property bool darkTheme: uiTheme.isDark
@@ -1402,6 +1058,20 @@ ApplicationWindow {
         uiRevision >= 0 ? !!unsavedChangesRegistry["rules"] : false
     readonly property bool rulesNotSavedToFile:
         _filesSyncDirtyPrimary || _filesSyncDirtySecondary
+    /// Any OTHER section holding dirty draft state.
+    ///
+    /// The footer already commits and reverts these (`_applyDirtySectionCallbacks`
+    /// and its mirror in `cancelPendingChanges`), and the navigation guard
+    /// already counts them — only the buttons did not, so a dirty panel got a
+    /// warning on the way out and a greyed-out Apply on the way in.
+    readonly property bool otherSectionsUnsaved: {
+        var rev = uiRevision
+        for (var id in unsavedChangesRegistry) {
+            if (id === "rules") continue
+            if (unsavedChangesRegistry[id]) return true
+        }
+        return false
+    }
     /// Raised by the guard's "Discard": the user has been warned once and
     /// chose to continue, so the modal stands down until the next rule edit.
     /// The state itself is NOT cleared — the orange "Save to file" chip and
@@ -1477,6 +1147,18 @@ ApplicationWindow {
             if (unsavedChangesRegistry[k]) return k
         }
         return rulesGuardDirty() ? "rules" : ""
+    }
+    /// Every dirty section, in registry order, with `rules` last when it is
+    /// dirty too — the guard saves them all, and the rule apply is the one that
+    /// can open its own review flow.
+    function dirtySectionIds() {
+        var ids = []
+        for (var k in unsavedChangesRegistry) {
+            if (k === "rules") continue
+            if (unsavedChangesRegistry[k]) ids.push(k)
+        }
+        if (rulesGuardDirty()) ids.push("rules")
+        return ids
     }
     function clearAllUnsavedChanges() {
         // The rule state survives a Discard (the table is not reverted), so
@@ -2186,54 +1868,24 @@ ApplicationWindow {
     }
     function cancelPendingPrefs() {
         if (prefsSnapshot === null) return
-        var restored = normalizePrefs(prefsSnapshot)
-        // The routing/blocking toggles are
-        // committed to the service IMMEDIATELY on click (apply* + route.policy
-        // RPC) and mirrored to prefs at once; they are NOT part of the pending
-        // prefs Apply/Cancel buffer. If an UNRELATED field armed the snapshot
-        // earlier, restoring it verbatim would revert a committed routing choice
-        // to a stale value AND re-emit it (which _reseedTogglesFromPrefs would
-        // then push back to the service). Preserve the live values instead.
-        restored.routeIncludeSubdomains = prefs.routeIncludeSubdomains
-        restored.routeSharedIpPolicy = prefs.routeSharedIpPolicy
-        restored.routeKillSwitchBlockAll = prefs.routeKillSwitchBlockAll
-        restored.routeKillSwitchFailClosed = prefs.routeKillSwitchFailClosed
-        restored.routeKillSwitchProtocols = prefs.routeKillSwitchProtocols
-        // Same commit-immediately semantics for the remaining mirrors.
-        restored.routeKillSwitchEnabled = prefs.routeKillSwitchEnabled
-        restored.routeAllowDnsOverPrimary = prefs.routeAllowDnsOverPrimary
-        restored.routeModeACoverageStrategy = prefs.routeModeACoverageStrategy
-        restored.routeResolveHostsBypass = prefs.routeResolveHostsBypass
-        restored.routeEnforcementMode = prefs.routeEnforcementMode
-        restored.routeLivenessWindowSecs = prefs.routeLivenessWindowSecs
-        restored.routeBehaviorMode = prefs.routeBehaviorMode
-        // Offline pending intents are committed to their own
-        // store immediately (never part of the Apply/Cancel prefs buffer), so
-        // preserve the live value rather than reverting it.
-        restored.routePendingOfflineJson = prefs.routePendingOfflineJson
-        // The mirror of the last-known service-owned values is a read-path cache
-        // written outside the Apply/Cancel buffer; reverting it would resurrect
-        // values the service has since replaced.
-        restored.serviceBackedMirrorJson = prefs.serviceBackedMirrorJson
-        // Intent is committed as the user makes each change (never part of the
-        // Apply/Cancel buffer), so preserve the live value — reverting it would
-        // re-open the door for a wiped service DB to win.
-        restored.serviceIntentJson = prefs.serviceIntentJson
-        // The support-archive export options are committed on pick (they are
-        // never part of the Apply/Cancel prefs buffer), so preserve the live
-        // values rather than reverting a choice the user already made.
-        restored.diagnosticsArchiveRedactionLevel = prefs.diagnosticsArchiveRedactionLevel
-        restored.diagnosticsArchiveSessionOnly = prefs.diagnosticsArchiveSessionOnly
-        restored.archiveLogBudgetMib = prefs.archiveLogBudgetMib
-        // The user's own rule-set folder is committed on pick too, so preserve
-        // the live value rather than reverting a folder the user just chose.
-        restored.userPresetsDir = prefs.userPresetsDir
-        // The quick-load selection is a navigation gesture committed on pick;
-        // Cancel must not drag the dropdown back to a set the user left.
-        restored.selectedPresetSet = prefs.selectedPresetSet
-        restored.allowSavingIntoBundledPresets = prefs.allowSavingIntoBundledPresets
-        restored.rulesFolderSuggestionDismissed = prefs.rulesFolderSuggestionDismissed
-        prefs = restored
+        // Restore ONLY the keys the buffer owns.
+        //
+        // Everything else commits the moment it is written — a routing toggle
+        // has already reached the service, a folder has been picked, the
+        // licence has been accepted — so a wholesale restore reverted work
+        // Cancel was never asked about, and re-emitted it. That was held back
+        // by a hand-kept list of exceptions, which could only ever fall behind
+        // the app: every key added anywhere else had to be remembered here, and
+        // a forgotten one silently undid a committed decision. An allow-list
+        // cannot fall behind — a key that is not buffered is not restorable, by
+        // construction, and `_bufferedPrefKeys` is the same list that decides
+        // what arms the snapshot in the first place.
+        var snapshot = normalizePrefs(prefsSnapshot)
+        var restored = Object.assign({}, prefs)
+        for (var key in _bufferedPrefKeys) {
+            if (snapshot.hasOwnProperty(key)) restored[key] = snapshot[key]
+        }
+        prefs = normalizePrefs(restored)
         currentLanguage = prefs.language
         uiRevision += 1
         prefsSnapshot = null
@@ -2546,7 +2198,7 @@ ApplicationWindow {
     property alias noticeLedger: noticeLedger
     NotificationLedger {
         id: noticeLedger
-        onDecidedElsewhere: function(noticeId) { window._dropPushNotice(noticeId) }
+        onDecidedElsewhere: function(noticeId) { notificationsController._dropPushNotice(noticeId) }
     }
     // "Import only active rules" choice consumed by every preset-import
     // payload. Tracks the persisted default (`prefs.importOnlyActive`, set in
@@ -2613,6 +2265,53 @@ ApplicationWindow {
         id: driftController
         root: window
     }
+    // Full reset: the two dialogs stay here (they are what the user sees), the
+    // order the steps run in lives in the controller.
+    property alias fullResetController: fullResetController
+    FullResetController {
+        id: fullResetController
+        root: window
+    }
+    // Post-connect backlog: the ONE question covering everything parked while
+    // the service was down. The dialog stays here; the collection does not.
+    property alias offlineBacklogCollector: offlineBacklogCollector
+    OfflineBacklogCollector {
+        id: offlineBacklogCollector
+        root: window
+    }
+    // Rule-set catalog: what sets exist, which is selected, which files back it.
+    property alias ruleSetCatalog: ruleSetCatalog
+    RuleSetCatalog {
+        id: ruleSetCatalog
+        root: window
+    }
+    // Startup after the licence gate, and what a provisioned answer set means
+    // for the first-run wizard.
+    property alias startupController: startupController
+    StartupController {
+        id: startupController
+        root: window
+    }
+    // Suggested addresses: what the service parked, and what becomes of it.
+    property alias autoRuleSuggestionsController: autoRuleSuggestionsController
+    AutoRuleSuggestionsController {
+        id: autoRuleSuggestionsController
+        root: window
+    }
+    // Push-driven notices: composing them, retiring them, and running what they
+    // offer. The push DISPATCHER stays in this shell.
+    property alias notificationsController: notificationsController
+    NotificationsController {
+        id: notificationsController
+        root: window
+    }
+    // Service intent: what the user decided about service-owned settings, and
+    // replaying it into a service that disagrees.
+    property alias serviceIntentController: serviceIntentController
+    ServiceIntentController {
+        id: serviceIntentController
+        root: window
+    }
     // "Apply the routing changes you made while the service was stopped?" flow:
     // offer/apply/discard + localized value labels. The shell keeps the shared
     // park-storage primitives and the `offlinePendingApplied()` signal; this owns
@@ -2673,9 +2372,6 @@ ApplicationWindow {
     // dialog instances. Reached as `root.boundFilesController` from the close-dialog
     // wiring, footer chip, and ReviewFlowController.
     property alias boundFilesController: boundFilesController
-    property alias saveBeforeCloseDialog: saveBeforeCloseDialog
-    property alias saveRuleSetDialog: saveRuleSetDialog
-    property alias factoryPresetSaveDialog: factoryPresetSaveDialog
     BoundFilesController {
         id: boundFilesController
         root: window
@@ -2835,7 +2531,7 @@ ApplicationWindow {
                     // own defaults, and whoever reads first wins: without this
                     // the panels adopt those defaults, write them into the
                     // display mirror, and the user's settings are gone.
-                    Qt.callLater(replayServiceIntentToService)
+                    Qt.callLater(serviceIntentController.replayServiceIntentToService)
                     // Re-pull the unresolved-app set so the
                     // "app not enforced" banner reflects the live service state
                     // after a reconnect (state DB may have been wiped/re-applied).
@@ -2844,8 +2540,8 @@ ApplicationWindow {
                     // sitting on that section while the service was down kept
                     // staring at an empty list after it came up.
                     Qt.callLater(function() {
-                        window.refreshAutoRuleCandidates()
-                        window.refreshAutoRuleDismissed()
+                        autoRuleSuggestionsController.refreshAutoRuleCandidates()
+                        autoRuleSuggestionsController.refreshAutoRuleDismissed()
                     })
                     // Service came back online.
                     // Priority 1: if the user just clicked Start /
@@ -2861,13 +2557,13 @@ ApplicationWindow {
                         // here, so neither the marker nor the collector may
                         // raise the same question on top of the review the user
                         // just triggered. Settings are still collected below.
-                        _offlineRulesHandledByResume = true
-                        _clearPendingApplyPark()
+                        offlineBacklogCollector._offlineRulesHandledByResume = true
+                        offlineBacklogCollector._clearPendingApplyPark()
                         Qt.callLater(function() {
                             reviewFlowController._guardApplyRules(function(ok) {
                                 // The review has settled either way, so the
                                 // collector may speak about rules again.
-                                _offlineRulesHandledByResume = false
+                                offlineBacklogCollector._offlineRulesHandledByResume = false
                                 driftController._driftRecheckNow()
                             })
                         })
@@ -2944,6 +2640,21 @@ ApplicationWindow {
             var kind = "disconnected"
             var code = String(errorCode || "")
             if (code === "timeout" || code === "rpc-timed-out") {
+                // One of OUR OWN long calls holds the client's single in-flight
+                // slot. The health poll's one-second budget then measures the
+                // queue in front of it, and every poll for the duration times
+                // out without ever reaching the pipe — a rules preview took
+                // 18.7 s and the GUI reported an outage it had caused itself.
+                // Say nothing about the service until we stop occupying the
+                // lane; a service that really died is still caught by the first
+                // poll after that.
+                if (rpcTransport.longCallInFlight) {
+                    // Learned nothing, so keep no streak: a run of timeouts
+                    // that spans the long call must not have its two halves
+                    // counted as one.
+                    _healthTimeoutStreak = 0
+                    return
+                }
                 // A lone timeout is as likely to be queue contention on a
                 // perfectly healthy pipe (see `_healthTimeoutStreak` above)
                 // as a real outage. Require two IN A ROW before painting the
@@ -3110,7 +2821,7 @@ ApplicationWindow {
         interval: 2500
         repeat: false
         running: false
-        onTriggered: _startOfflineBacklogCollect()
+        onTriggered: offlineBacklogCollector._startOfflineBacklogCollect()
     }
 
     // The tray's "Open and compare" hand-off: re-measure the legs once the
@@ -3246,24 +2957,24 @@ ApplicationWindow {
                 // its notice retires itself. So the window keeps the count and
                 // a way in — otherwise an unanswered offer is unreachable until
                 // the service happens to announce it again.
-                autoRuleCandidatesPending = Number(event["pending-count"] || 0)
+                autoRuleSuggestionsController.autoRuleCandidatesPending = Number(event["pending-count"] || 0)
                 console.log("push: auto-rule candidates pending",
-                    autoRuleCandidatesPending)
+                    autoRuleSuggestionsController.autoRuleCandidatesPending)
                 // Re-read on EVERY announcement, not just a growing one: a set
                 // that shrank to nothing is exactly when a suggestions page
                 // left on screen would otherwise keep showing rows the service
                 // no longer holds.
-                refreshAutoRuleCandidates()
-                refreshAutoRuleDismissed()
-                if (autoRuleCandidatesPending > 0) {
+                autoRuleSuggestionsController.refreshAutoRuleCandidates()
+                autoRuleSuggestionsController.refreshAutoRuleDismissed()
+                if (autoRuleSuggestionsController.autoRuleCandidatesPending > 0) {
                     // Keyed on the push, not on a constant: dismissing writes
                     // to the ledger, and one fixed id would retire the banner
                     // for the life of the install. Only one is on screen at a
                     // time — the newer count supersedes the older.
-                    _dropPushNotice(_autoRuleNoticeId)
-                    _autoRuleNoticeId = "auto-rule-candidates:" + String(eventId || "")
-                    _addPushNotice({
-                        "id": _autoRuleNoticeId,
+                    notificationsController._dropPushNotice(autoRuleSuggestionsController._autoRuleNoticeId)
+                    autoRuleSuggestionsController._autoRuleNoticeId = "auto-rule-candidates:" + String(eventId || "")
+                    notificationsController._addPushNotice({
+                        "id": autoRuleSuggestionsController._autoRuleNoticeId,
                         "severity": "info",
                         "dismissible": true,
                         // The inbox keeps everything, so this is a "something
@@ -3276,11 +2987,54 @@ ApplicationWindow {
                             "Addresses waiting to be added"),
                         "body": tr("notifications.auto-rule-candidates.body",
                             "The service found {count} addresses the sites you routed need.")
-                            .replace("{count}", String(autoRuleCandidatesPending)),
+                            .replace("{count}", String(autoRuleSuggestionsController.autoRuleCandidatesPending)),
                         "actionKey": "open-auto-rule-suggestions",
                         "actionText": tr("rules.suggestions.open", "Review")
                     })
                 }
+                break
+            case "app-rule-learning-destinations":
+                // The route for an application is built from addresses the
+                // service has seen it use, so a brand-new app rule spends its
+                // first minutes learning — and a program that gives up on the
+                // first refusal looks broken with nothing on screen to explain
+                // it.
+                notificationsController._dropPushNotice(autoRuleSuggestionsController._appRuleLearningNoticeId)
+                autoRuleSuggestionsController._appRuleLearningNoticeId = "app-rule-learning:" + String(eventId || "")
+                notificationsController._addPushNotice({
+                    "id": autoRuleSuggestionsController._appRuleLearningNoticeId,
+                    "severity": "info",
+                    "dismissible": true,
+                    "kind": "app-rule-learning",
+                    "autoDismissMs": 12000,
+                    "title": tr("notifications.app-rule-learning.title",
+                        "New application rule is settling in"),
+                    "body": tr("notifications.app-rule-learning.body",
+                        "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open.")
+                        .replace("{apps}", String((event["apps"] || []).join(", ")))
+                })
+                break
+            case "rule-duplicates-detected":
+                // The rules are valid; they simply claim the same traffic for
+                // two routes, and evaluation order — not the user — settles
+                // it. Nothing on any screen shows that, hence a notice.
+                notificationsController._dropPushNotice(autoRuleSuggestionsController._ruleDuplicateNoticeId)
+                autoRuleSuggestionsController._ruleDuplicateNoticeId = "rule-duplicates:" + String(eventId || "")
+                notificationsController._addPushNotice({
+                    "id": autoRuleSuggestionsController._ruleDuplicateNoticeId,
+                    "severity": "warning",
+                    "dismissible": true,
+                    "kind": "rule-duplicates",
+                    "muteKind": "rule-duplicates",
+                    "title": tr("notifications.rule-duplicates.title",
+                        "A rule is set on both routes"),
+                    "body": tr("notifications.rule-duplicates.body",
+                        "{count} of your rules are enabled on both routes, starting with {sample}. Which one carries the traffic is decided by evaluation order.")
+                        .replace("{count}", String(Number(event["count"] || 0)))
+                        .replace("{sample}", String(event["sample"] || "")),
+                    "actionKey": "open-rules",
+                    "actionText": tr("action.open-rules", "Open rules")
+                })
                 break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event, eventId)
@@ -3350,7 +3104,7 @@ ApplicationWindow {
             body = body + " " + tr("tray.external-address.adapter", "Adapter: {name}")
                 .replace("{name}", adapter)
         }
-        _addPushNotice({
+        notificationsController._addPushNotice({
             "id": "secondary-external-address:" + String(eventId || "") + ":" + address,
             "severity": "info",
             "dismissible": true,
@@ -3372,7 +3126,7 @@ ApplicationWindow {
     /// while the channel was down keeps its error until it is reloaded, so the
     /// user is left thinking nothing changed.
     function _noteEnforcementRestored() {
-        _addPushNotice({
+        notificationsController._addPushNotice({
             "id": "enforcement-restored",
             "severity": "info",
             "dismissible": true,
@@ -3396,7 +3150,7 @@ ApplicationWindow {
         var role = String(event.role || "")
         var status = String(event.status || "")
         var noticeId = "enforcement-status:" + role
-        _dropPushNotice(noticeId)
+        notificationsController._dropPushNotice(noticeId)
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
             if (wasDown) {
@@ -3453,7 +3207,7 @@ ApplicationWindow {
             body = tr("notifications.enforcement.unknown.body",
                 "The service reported a state this version does not recognise. Open interfaces and routes to check the setup.")
         }
-        _addPushNotice({
+        notificationsController._addPushNotice({
             "id": noticeId,
             "severity": "warning",
             "dismissible": true,
@@ -3518,7 +3272,7 @@ ApplicationWindow {
             }
             // Muted kind: still acknowledged. Keeping entries nobody will ever
             // be shown would just age out silently a week later.
-            if (noticeKindEnabled("block-notice")) {
+            if (notificationsController.noticeKindEnabled("block-notice")) {
                 _addBlockNoticeBacklogCard(entries.length, shown, throughId)
             }
             if (throughId > 0) {
@@ -3549,7 +3303,7 @@ ApplicationWindow {
             body = body + " " + tr("notifications.block-notice.backlog.destinations",
                 "Destinations: {list}.").replace("{list}", list)
         }
-        _addPushNotice({
+        notificationsController._addPushNotice({
             "id": "block-notice-backlog:" + String(throughId),
             "severity": "warning",
             "dismissible": true,
@@ -3570,7 +3324,7 @@ ApplicationWindow {
     function _onBlockNoticeRaised(event, eventId) {
         var destination = String(event.destination || "")
         if (destination === "" || String(eventId || "") === "") return
-        if (!noticeKindEnabled("block-notice")) return
+        if (!notificationsController.noticeKindEnabled("block-notice")) return
         var app = String(event.app || "")
         var attempts = Number(event.attempts || 0)
         var destDisplay = prefs.hideBlockNoticeAddresses === true
@@ -3584,7 +3338,7 @@ ApplicationWindow {
             .replace("{destination}", destDisplay)
             .replace("{app}", appDisplay)
             .replace("{attempts}", String(attempts))
-        _addPushNotice({
+        notificationsController._addPushNotice({
             "id": "block-notice:" + String(eventId),
             "severity": "warning",
             "dismissible": true,
@@ -3862,7 +3616,7 @@ ApplicationWindow {
         themeRevision += 1
         uiRevision += 1
         section = context.entrySection || prefs.lastOpenedSection || "interfaces-routes"
-        var localeDiagnostics = context.localeDiagnostics || {}
+        localeDiagnostics = context.localeDiagnostics || {}
         if (Number(localeDiagnostics.rejected || 0) > 0) {
             statusLine = tr("status.locale-files-rejected", "Some locale files were rejected. See logs for details.")
         } else if (Number(localeDiagnostics.acceptedWithWarnings || 0) > 0) {
@@ -3870,6 +3624,7 @@ ApplicationWindow {
         }
 
         interfacesRowsAll = ((context.interfaces || {}).rows) || []
+        interfacesDataSource = String((context.interfaces || {}).dataSource || "fallback-mock")
         interfacesRolesController.rebuildInterfacesModel()
         interfacesRolesController.loadExternalIpCache()
         Pure.clearModel(behaviorModeModel)
@@ -4183,6 +3938,10 @@ ApplicationWindow {
     /// Persist the parked-intents store (compact JSON; "" when empty) through
     /// the same prefs mechanism every applier uses (in-place mutate + emitPrefs).
     function _writePendingOffline(obj) {
+        // Stamped on every write: the park expires on the same seven-day
+        // window as the rules park, and prefs is read back long after the
+        // session that wrote it.
+        if (obj && Pure.pendingOfflineCount(obj) > 0) obj["parked-at-ms"] = Date.now()
         var s = (Pure.pendingOfflineCount(obj) === 0) ? "" : JSON.stringify(obj)
         prefs.routePendingOfflineJson = s
         emitPrefs()
@@ -4203,7 +3962,7 @@ ApplicationWindow {
         if (ns === "stability") {
             var decided = {}
             decided[key] = value
-            _recordServiceIntent(decided)
+            serviceIntentController._recordServiceIntent(decided)
         }
         console.log("offline change recorded:", ns, key, "=", value)
         statusLine = tr("status.offline-change-recorded",
@@ -4278,43 +4037,6 @@ ApplicationWindow {
         }
         if (!changed) return
         prefs.serviceBackedMirrorJson = JSON.stringify(mirror)
-        emitPrefs()
-    }
-
-    /// The service-owned settings the user has actually decided about, as a
-    /// map of WIRE key -> value. Distinct from the display mirror above: the
-    /// mirror records what the service last said, this records what the user
-    /// asked for. Only the second one may be replayed back to the service.
-    /// Degrades to "nothing recorded" on any parse error.
-    function _readServiceIntent() {
-        var raw = String((prefs && prefs.serviceIntentJson) || "")
-        if (raw === "") return {}
-        try {
-            var o = JSON.parse(raw)
-            if (!o || typeof o !== "object") return {}
-            return (o["stability"] && typeof o["stability"] === "object") ? o["stability"] : {}
-        } catch (e) {
-            return {}
-        }
-    }
-
-    /// Record what the user asked a service-owned setting to be. Called from
-    /// the single write path (`applyServiceStabilityPatch`) for user-originated
-    /// changes only, so a read-back, a replay or an internal re-seed can never
-    /// masquerade as a decision the user made.
-    function _recordServiceIntent(values) {
-        if (!values || typeof values !== "object") return
-        var intent = _readServiceIntent()
-        var changed = false
-        for (var key in values) {
-            var value = values[key]
-            if (value === undefined) continue
-            if (JSON.stringify(intent[key]) === JSON.stringify(value)) continue
-            intent[key] = value
-            changed = true
-        }
-        if (!changed) return
-        prefs.serviceIntentJson = JSON.stringify({ "stability": intent })
         emitPrefs()
     }
 
@@ -4419,135 +4141,6 @@ ApplicationWindow {
     /// agrees with the user.
     signal serviceIntentReplayed()
 
-    /// Push the user's recorded decisions back into a service that disagrees
-    /// with them. This is what makes a service the source of truth about
-    /// *state* without making it the source of truth about *intent*: a wiped
-    /// or freshly installed state DB answers with its own defaults, and
-    /// without this the GUI would adopt those defaults and the user's settings
-    /// would silently disappear.
-    ///
-    /// Keys the user parked while offline are skipped — the pending-changes
-    /// dialog owns those, and replaying them here would apply changes the user
-    /// has not confirmed yet.
-    /// Attempts left in the current replay run, and the backoff between them.
-    /// A connect lands while the service is still migrating its database and
-    /// arming enforcement, so its IPC is at its slowest exactly when we ask —
-    /// a single attempt loses the user's settings to that window.
-    property int _serviceIntentAttemptsLeft: 0
-    readonly property var _serviceIntentBackoffMs: [2000, 6000, 15000]
-    property var _serviceIntentRetryTimer: null
-
-    /// Set when the user changes a service-owned setting themselves. A replay
-    /// that fires afterwards would push the older recorded value over the
-    /// fresher one, so it stands down instead.
-    property bool _serviceIntentSupersededByUser: false
-
-    function replayServiceIntentToService() {
-        _serviceIntentSupersededByUser = false
-        _serviceIntentAttemptsLeft = _serviceIntentBackoffMs.length
-        _attemptServiceIntentReplay()
-    }
-
-    function _attemptServiceIntentReplay() {
-        var intent = _readServiceIntent()
-        var hasIntent = false
-        for (var probe in intent) { hasIntent = true; break }
-        if (!hasIntent) {
-            // Not a failure, but not nothing either: it means no setting the
-            // user changed while the service was down is waiting to be
-            // delivered. Told apart from "the replay ran" only by this line —
-            // and telling them apart is the whole triage.
-            console.log("service-intent replay: nothing recorded to replay")
-            serviceIntentReplayed()
-            return
-        }
-        var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!bridgeAvailable || bridge === null
-                || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
-            _scheduleServiceIntentRetry("bridge-unavailable")
-            return
-        }
-        var parked = (typeof _readPendingOffline === "function")
-            ? (_readPendingOffline()["stability"] || {}) : {}
-        var getCorr = bridge.rpcServiceStabilityConfigGet()
-        rpcTransport.registerRpcCallback(getCorr, function(ok, payload, code, msg) {
-            if (!ok) {
-                _scheduleServiceIntentRetry("read-failed:" + String(code || ""))
-                return
-            }
-            var live = payload || {}
-            var patch = {}
-            var diverged = false
-            for (var key in intent) {
-                if (parked.hasOwnProperty(key)) continue
-                if (JSON.stringify(live[key]) === JSON.stringify(intent[key])) continue
-                patch[key] = intent[key]
-                diverged = true
-            }
-            if (!diverged) {
-                console.log("service-intent replay: the service already holds every",
-                            "recorded intent — nothing to push")
-                _serviceIntentAttemptsLeft = 0
-                serviceIntentReplayed()
-                return
-            }
-            console.log("service-intent replay: pushing", JSON.stringify(patch))
-            applyServiceStabilityPatch(patch, function(ok2, code2) {
-                if (ok2) {
-                    _serviceIntentAttemptsLeft = 0
-                    serviceIntentReplayed()
-                    return
-                }
-                _scheduleServiceIntentRetry("write-failed:" + String(code2 || ""))
-            }, "intent-replay")
-        })
-    }
-
-    /// Retry unless we are out of attempts or the reason to replay is gone.
-    /// Emits `serviceIntentReplayed()` on the last failure too: the panels
-    /// wait on that signal to re-read, and leaving them waiting forever would
-    /// be worse than reporting a service we could not reconcile with.
-    function _scheduleServiceIntentRetry(reason) {
-        var attemptsMade = _serviceIntentBackoffMs.length - _serviceIntentAttemptsLeft
-        if (_serviceIntentSupersededByUser) {
-            console.log("service-intent replay stood down after", attemptsMade,
-                        "attempt(s): the user changed the setting themselves")
-            _serviceIntentAttemptsLeft = 0
-            serviceIntentReplayed()
-            return
-        }
-        if (_serviceIntentAttemptsLeft <= 1 || !_routingBackendConnected()) {
-            console.log("service-intent replay gave up after", attemptsMade + 1,
-                        "attempt(s), last reason:", reason)
-            _serviceIntentAttemptsLeft = 0
-            serviceIntentReplayed()
-            return
-        }
-        var delay = _serviceIntentBackoffMs[attemptsMade]
-        _serviceIntentAttemptsLeft -= 1
-        console.log("service-intent replay attempt", attemptsMade + 1, "failed (",
-                    reason, ") — retrying in", delay, "ms")
-        if (_serviceIntentRetryTimer === null) {
-            _serviceIntentRetryTimer = Qt.createQmlObject(
-                "import QtQuick 2.15; Timer { repeat: false }", window,
-                "serviceIntentRetryTimer")
-            _serviceIntentRetryTimer.triggered.connect(function() {
-                if (_serviceIntentSupersededByUser || !_routingBackendConnected()) {
-                    console.log("service-intent replay: retry abandoned —",
-                                _serviceIntentSupersededByUser
-                                    ? "the user changed the setting themselves"
-                                    : "the service is not connected")
-                    _serviceIntentAttemptsLeft = 0
-                    serviceIntentReplayed()
-                    return
-                }
-                _attemptServiceIntentReplay()
-            })
-        }
-        _serviceIntentRetryTimer.interval = delay
-        _serviceIntentRetryTimer.restart()
-    }
-
     /// The declared default of one `route.policy.update` wire field. The single
     /// declaration lives in `lib/pure.js` (shared with the tray process and
     /// pinned against the Rust DTO by a contract test); every panel that needs
@@ -4622,7 +4215,7 @@ ApplicationWindow {
         // must never write intent or they would launder service defaults into
         // "what the user wanted".
         if (originText.indexOf("user:") === 0 || originText === "offline-pending-apply") {
-            _recordServiceIntent(partial)
+            serviceIntentController._recordServiceIntent(partial)
             // A pending replay carries values recorded BEFORE this write, so
             // letting it run now would undo what the user just chose.
             _serviceIntentSupersededByUser = true
@@ -4660,7 +4253,7 @@ ApplicationWindow {
             // service has not accepted yet (delivery failed, state DB wiped)
             // would otherwise be cancelled by the next unrelated save.
             var merged = Pure.mergeStabilityWrite(payload || {},
-                                                  window._readServiceIntent(),
+                                                  serviceIntentController._readServiceIntent(),
                                                   window._readPendingOffline()["stability"] || {},
                                                   job.partial || {})
             var setCorr = bridge.rpcServiceStabilityConfigSet(merged, job.origin || "")
@@ -4873,6 +4466,24 @@ ApplicationWindow {
         }
         return n
     }
+    /// Switch one rule off by id. Returns false when the id is not in the
+    /// table — the review summary names ids the service saw, and a stale one
+    /// must not silently disable the wrong row.
+    function _disableRuleById(ruleId) {
+        var wanted = String(ruleId || "")
+        if (wanted === "") return false
+        for (var i = 0; i < rulesModel.count; i += 1) {
+            var row = rulesModel.get(i)
+            if (!row || String(row.id || "") !== wanted) continue
+            if (row.enabled === false) return false
+            rulesModel.setProperty(i, "enabled", false)
+            rulesModelEdited()
+            _recomputeRulesDirty()
+            return true
+        }
+        return false
+    }
+
     function nextFreeRuleId() {
         // Max of existing numeric suffixes + 1, falling back to 1 when the
         // model is empty. Avoids the previous `100 + count + 1` quirk that
@@ -4996,6 +4607,7 @@ ApplicationWindow {
             showNotifications: true,
             notifySuggestionChanges: true,
             notifyBlockNotices: true,
+            notifyRuleDuplicates: true,
             hideBlockNoticeAddresses: false,
             routingDetailedMode: false,
             reopenLastSectionOnStartup: true,
@@ -5023,7 +4635,18 @@ ApplicationWindow {
             showRememberedAdapters: true,
             autoConfirmAdapterIdChange: true,
             // Show the block-all warning banner (default on).
-            warnKillSwitchBlockAll: true
+            warnKillSwitchBlockAll: true,
+            // Tray notification opacity. Left out, "restore defaults" kept a
+            // value the user had tuned — a reset that skips a key is a reset
+            // the user cannot trust.
+            trayNoticeOpacityPercent: 100,
+            // Parked work and the service-owned mirrors go with the settings
+            // they belong to. Left behind, an offline intent recorded against
+            // the OLD values replays on the next connect and quietly undoes
+            // the reset the user just asked for.
+            routePendingOfflineJson: "",
+            serviceBackedMirrorJson: "",
+            serviceIntentJson: ""
         })
         statusLine = tr("status.defaults-restored", "Defaults restored")
     }
@@ -5032,173 +4655,6 @@ ApplicationWindow {
     // NOT uninstall the service; that stays on the app uninstaller / the
     // "Service management" button). Steps: clear service operational logs
     // (audit trail untouched) + sidecar + GUI logs (local/fast), reset all
-    // GUI prefs + file bindings + first-run flag, clear the local rules
-    // model, then clear the service's active rules to an empty revision
-    // (async two-phase mutation — under a non-admin GUI the confirm is
-    // Forbidden and the launcher's R3 path transparently elevates via UAC).
-    // The completion dialog offers to close the program + tray so the reset
-    // takes effect on the next launch (fresh first-run).
-    function fullReset(allPrincipals) {
-        statusLine = tr("status.full-reset-running", "Performing full reset…")
-        if (bridgeAvailable && typeof nrrNativeBridge.rpcLogsClear === "function") {
-            var cl = nrrNativeBridge.rpcLogsClear(false, true)
-            rpcTransport.registerRpcCallback(cl, function() {})
-        }
-        if (bridgeAvailable && typeof nrrNativeBridge.rpcSidecarReset === "function") {
-            var cs = nrrNativeBridge.rpcSidecarReset()
-            rpcTransport.registerRpcCallback(cs, function() {})
-        }
-        if (bridgeAvailable && typeof nrrNativeBridge.clearGuiLogs === "function") {
-            nrrNativeBridge.clearGuiLogs()
-        }
-        resetDefaults()
-        updatePrefs({
-            lastSavedPathPrimary: "",
-            lastSavedPathSecondary: "",
-            lastLoadedPathPrimary: "",
-            lastLoadedPathSecondary: "",
-            autoOpenOnLaunchPathPrimary: "",
-            autoOpenOnLaunchPathSecondary: "",
-            firstRunCompleted: false,
-            // "Reset everything" means the state a fresh install starts from,
-            // and that includes not having agreed to anything yet.
-            acceptedEulaVersion: 0
-        })
-        emitPrefs()
-        Pure.clearModel(rulesModel)
-        clearAllUnsavedChanges()
-        // Purge auxiliary state FIRST: disjoint tables from the rules-apply
-        // step, but this order survives a declined UAC prompt below.
-        _purgePrincipalDataForReset(allPrincipals === true, function(purgeOk) {
-            _applyEmptyRulesForReset(function(rulesOk) {
-                // Stop the service LAST: it tears its filters down on the way
-                // out, and everything above needs it answering. A machine left
-                // in the post-reset state has nothing to enforce, so a running
-                // service would only be a process with no policy.
-                _stopServiceForReset(function(stopOk) {
-                    fullResetCompleteDialog.serviceCleared =
-                        !!purgeOk && !!rulesOk && !!stopOk
-                    fullResetCompleteDialog.open()
-                })
-            })
-        })
-    }
-
-    // Stop the background service as the last step of a full reset. Elevation
-    // goes through the same broker the Settings button uses, so a declined UAC
-    // prompt reports itself instead of failing silently. Best-effort: the reset
-    // itself already happened, so a service that refuses to stop downgrades the
-    // completion notice rather than aborting anything.
-    function _stopServiceForReset(onComplete) {
-        if (typeof nrrServiceController === "undefined" || !nrrServiceController
-                || typeof nrrServiceController.stopService !== "function") {
-            onComplete(false)
-            return
-        }
-        nrrServiceController.stopService()
-        _resetServiceStopWatch.attempts = 0
-        _resetServiceStopWatch.onDone = onComplete
-        _resetServiceStopWatch.restart()
-    }
-
-    // The controller reports status asynchronously; poll it a few times rather
-    // than block the reset on a signal that may already have fired.
-    Timer {
-        id: _resetServiceStopWatch
-        interval: 700
-        repeat: true
-        property int attempts: 0
-        property var onDone: null
-        onTriggered: {
-            attempts += 1
-            var busy = (typeof nrrServiceController !== "undefined" && nrrServiceController)
-                ? nrrServiceController.busy === true
-                : false
-            // 4 = running in the controller's status vocabulary; anything else
-            // (stopped, not installed) means it is no longer enforcing.
-            var stopped = (typeof nrrServiceController !== "undefined" && nrrServiceController)
-                ? parseInt(nrrServiceController.status) !== 4
-                : false
-            if (!busy && (stopped || attempts >= 8)) {
-                stop()
-                var cb = onDone
-                onDone = null
-                if (typeof cb === "function") cb(stopped)
-            }
-        }
-    }
-
-    // Full-reset auxiliary-state purge via `principal-data.purge`. Caller's own
-    // principal and non-elevated by default; `allPrincipals` clears every OS
-    // user's routing and the service demands elevation for it.
-    function _purgePrincipalDataForReset(allPrincipals, onComplete) {
-        if (!bridgeAvailable || typeof nrrNativeBridge.rpcPrincipalDataPurge !== "function") {
-            onComplete(false)
-            return
-        }
-        // Full reset means the service keeps nothing of ours either — its own
-        // copy of the rules goes with the auxiliary state.
-        var c = nrrNativeBridge.rpcPrincipalDataPurge(true, allPrincipals === true)
-        rpcTransport.registerRpcCallback(c, function(ok) { onComplete(!!ok) })
-    }
-
-    /// How many OTHER OS users the service holds rules for. `done(count)`; a
-    /// service that cannot answer reports 0, which keeps full reset on its
-    /// single-user path rather than offering a choice it cannot honour.
-    function countOtherPrincipals(done) {
-        var finish = function(n) { if (typeof done === "function") done(n | 0) }
-        if (!bridgeAvailable || !_routingBackendConnected()
-                || typeof nrrNativeBridge.rpcPrincipalDataCount !== "function") {
-            finish(0)
-            return
-        }
-        var c = nrrNativeBridge.rpcPrincipalDataCount()
-        rpcTransport.registerRpcCallback(c, function(ok, p) {
-            finish(ok && p ? parseInt(p["other-principals"] || 0) : 0)
-        })
-    }
-
-    // Silent two-phase empty PresetImport: makes the service's active
-    // revision empty (post-install state) WITHOUT opening the review dialog
-    // (the Full-reset confirm already gated the action). Same payload shape
-    // as `startBothRoutesPresetImportReviewFlow`; the confirm phase carries
-    // the dry-run token. Non-admin → confirm Forbidden → launcher R3 elevates
-    // (UAC) and retries; `onComplete(false)` on UAC-decline / failure.
-    function _applyEmptyRulesForReset(onComplete) {
-        if (!bridgeAvailable || typeof nrrNativeBridge.rpcMutationSubmit !== "function") {
-            onComplete(false)
-            return
-        }
-        var emptyB64 = Qt.btoa("--- Zones\n\n--- Domains\n\n--- IP\n\n--- Windows\n\n--- Linux\n\n--- MacOS\n")
-        var corr = "full-reset-" + (new Date().getTime())
-        var payload = {
-            "include-child-processes": false,
-            "correlation-id": corr,
-            "primary-bytes-b64": emptyB64,
-            "secondary-bytes-b64": emptyB64
-        }
-        var c1 = nrrNativeBridge.rpcMutationSubmit("preset-import", payload, true, "")
-        rpcTransport.registerRpcCallback(c1, function(ok, p, code, msg) {
-            if (!ok || !p) { onComplete(false); return }
-            var token = (p && p["confirmation-token"]) || ""
-            var c2 = nrrNativeBridge.rpcMutationSubmit("preset-import", payload, false, token)
-            rpcTransport.registerRpcCallback(c2, function(ok2) { onComplete(!!ok2) })
-        })
-    }
-
-    // Close every NetRuleRouter process so the reset takes effect on the
-    // next launch. The main GUI closes itself directly; `requestTrayShutdown`
-    // writes the dedicated tray-shutdown flag the tray polls and quits on.
-    function _fullResetCloseAll() {
-        if (bridgeAvailable && typeof nrrNativeBridge.requestTrayShutdown === "function") {
-            nrrNativeBridge.requestTrayShutdown()
-        }
-        quittingToTray = true
-        clearAllUnsavedChanges()
-        window.close()
-        Qt.quit()
-    }
-
     Action { id: exitAction; text: tr("action.exit-application", "Exit"); shortcut: StandardKey.Quit; icon.source: uiIconSource("exit"); onTriggered: window.close() }
     Action { id: aboutAction; text: tr("action.open-about-window", "About"); shortcut: "F1"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(aboutWindow) }
     Action { id: licenseAction; text: tr("action.open-license-window", "License"); shortcut: "Ctrl+Shift+L"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(licenseWindow) }
@@ -5321,225 +4777,12 @@ ApplicationWindow {
         // EULA gate — the user must accept the license agreement before any
         // other startup dialog runs. When acceptance is missing/outdated the
         // modal agreement window opens and its `accepted` handler resumes the
-        // normal startup via `_runPostEulaStartup()`; `declined` quits. When
+        // normal startup via `startupController._runPostEulaStartup()`; `declined` quits. When
         // already accepted we run the post-EULA startup immediately.
-        if (_eulaNeedsAcceptance()) {
+        if (startupController._eulaNeedsAcceptance()) {
             eulaAgreementWindow.open()
         } else {
-            _runPostEulaStartup()
-        }
-    }
-
-    /// Whether the license agreement must be shown before the app can be used:
-    /// the persisted `acceptedEulaVersion` is below the version the current
-    /// build ships (`context.eula.currentVersion`), and there is agreement text
-    /// to display. A missing/zero current version (older context) disables the
-    /// gate rather than trapping the user in an empty dialog.
-    function _eulaNeedsAcceptance() {
-        var eula = (context || {}).eula || {}
-        var current = (eula.currentVersion | 0)
-        if (current <= 0) return false
-        if (String(eula.text || "").trim() === "") return false
-        var accepted = ((prefs || {}).acceptedEulaVersion | 0)
-        return accepted < current
-    }
-
-    /// The pre-launch answer sheet, or an empty stand-in. Shape mirrors
-    /// `provisioning.rs`; `present: false` is the ordinary case.
-    readonly property var provisioning: (context && context.provisioning)
-        ? context.provisioning : ({ present: false, completesFirstRun: false })
-
-    function _provisioningCompletesFirstRun() {
-        return provisioning.present === true && provisioning.completesFirstRun === true
-    }
-
-    /// Apply a complete answer sheet in place of the wizard. Deliberately the
-    /// same calls the wizard's own handlers make, so provisioned and
-    /// hand-answered installs land in one state, not two.
-    function _applyProvisionedFirstRun() {
-        logProgress(tr("progress.first-run-provisioned",
-            "Setup answers were supplied before launch; applying them."), "progress")
-        var rp = routePolicyController
-        if (rp) {
-            if (typeof rp.applyKillSwitchEnabled === "function") {
-                rp.applyKillSwitchEnabled(provisioning.killSwitch === true)
-            }
-            if (typeof rp.applyDohLockdownEnabled === "function") {
-                rp.applyDohLockdownEnabled(provisioning.dohLockdown === true)
-            }
-        }
-        if (typeof applyServiceStabilityPatch === "function") {
-            applyServiceStabilityPatch({ "fake-ip-enabled": provisioning.fakeIp === true },
-                function() {}, "provisioning")
-        }
-        _applyProvisionedConnections()
-        _loadBundledRuleSet(String(provisioning.ruleSet || "none"))
-        updatePrefs({ firstRunCompleted: true })
-        emitPrefs()
-    }
-
-    /// Import a bundled rule set named as `<country>/<pack>`, the same two
-    /// files and the same review flow the wizard's country option uses.
-    /// `"none"` (or an unreadable set) leaves the table empty.
-    function _loadBundledRuleSet(packPath) {
-        if (packPath === "" || packPath === "none") return
-        if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.resolvePresetPath !== "function") return
-        var primRel = packPath + "/rules_primary.txt"
-        var secRel = packPath + "/rules_secondary.txt"
-        var primAbs = String(nrrNativeBridge.resolvePresetPath(primRel) || "")
-        var secAbs = String(nrrNativeBridge.resolvePresetPath(secRel) || "")
-        var primB64 = primAbs !== "" ? nrrNativeBridge.readFileBytes(primAbs) : ""
-        var secB64 = secAbs !== "" ? nrrNativeBridge.readFileBytes(secAbs) : ""
-        if (!primB64 && !secB64) {
-            statusLine = tr("status.provisioned-rule-set-missing",
-                "The rule set named in the setup answers was not found: ") + packPath
-            return
-        }
-        presetImportController.startBothRoutesPresetImportReviewFlow(
-            primB64, secB64, primAbs, secAbs)
-    }
-
-    /// Bind the named connections, when the live adapter list has them. A name
-    /// that is not there yet (a VPN adapter appears on first connect) simply
-    /// leaves the slot empty — the missing-connection banner then asks.
-    function _applyProvisionedConnections() {
-        var byName = function(wanted) {
-            var w = String(wanted || "")
-            if (w === "") return -1
-            for (var i = 0; i < interfacesModel.count; i += 1) {
-                var row = interfacesModel.get(i)
-                if (String(row.name || "") === w || String(row.description || "") === w) return i
-            }
-            return -1
-        }
-        var p = byName(provisioning.primaryConnection)
-        if (p >= 0) interfacesRolesController.assignRole(p, "primary")
-        var s = byName(provisioning.secondaryConnection)
-        if (s >= 0) interfacesRolesController.assignRole(s, "secondary")
-    }
-
-    /// The normal startup-dialog chain, gated behind EULA acceptance. Called
-    /// directly when the agreement is already accepted, or from the EULA
-    /// window's `accepted` handler otherwise.
-    function _runPostEulaStartup() {
-        if ((context.startupDialog || "") === "about") {
-            openChildWindow(aboutWindow)
-        } else if ((context.startupDialog || "") === "license") {
-            openChildWindow(licenseWindow)
-        } else if (!prefs.firstRunCompleted && _provisioningCompletesFirstRun()) {
-            // Every question the wizard asks was answered before launch — by an
-            // installer, or by a file shipped next to a portable copy. Apply
-            // them and never show the window.
-            _applyProvisionedFirstRun()
-        } else if (!prefs.firstRunCompleted) {
-            logProgress(tr("progress.first-run-wizard-shown",
-                "Showing first-run setup (not completed yet)."), "progress")
-            // Show the service install dialog FIRST
-            // when the service isn't registered yet. After the user
-            // picks Install or Skip, the existing preset
-            // wizard opens (chained via the install dialog's signals).
-            // Skip-budget: if the user declined UAC 3+ times we keep
-            // them out of the modal trap and jump straight to the
-            // preset wizard.
-            if (_serviceNeedsInstallPrompt()) {
-                firstLaunchInstallDialog.open()
-            } else {
-                openChildWindow(firstRunWindow)
-            }
-        } else {
-            // Auto-open-on-launch. When the user has
-            // opted in (Save As → "Open these rules on next launch"
-            // checkbox), the path is stored in
-            // `prefs.autoOpenOnLaunchPath*`. On startup we read each
-            // file's bytes and route them through the standard
-            // PresetImport review flow — same diff dialog as a manual
-            // Import action. Missing file surfaces a toast and clears
-            // the auto-open path so the user isn't re-prompted next
-            // launch.
-            //
-            // Gated behind `autoLoadRulesOnLaunch`
-            // (default ON). When the user turns it off, the remembered
-            // paths are kept but not auto-loaded; they see whatever the
-            // service already has.
-            //
-            // When CONNECTED, the service's
-            // active revision is the source of truth for what is actually
-            // applied. Refetch it so applied rules persist across launches
-            // and across elevation / Windows-account changes (the per-SID
-            // storage key is the user SID, identical elevated vs not). Only
-            // fall back to the remembered file when offline, so a user
-            // without a running service still sees their rules; drift
-            // detection reconciles file-vs-service once the service connects.
-            _forgetStaleFactoryRulesBinding()
-            _hydrateRulesOnLaunch()
-        }
-        // Cold-start check for offline work parked in a previous session.
-        // refreshBackendStatus only fires the same check on a
-        // disconnect→connect transition; when the cold-start snapshot
-        // arrives with the service already running there's no
-        // transition, so we'd miss the prompt without this one-shot.
-        // (`firstRunCompleted` is re-checked inside the collector so the
-        // first-launch wizards are never buried under a modal.)
-        if (((backendStatus || {}).kind) === "connected") {
-            _offlineBacklogCollectTimer.restart()
-        }
-        // Cold-start re-sync of the adapter binding
-        // into the service when it has none but prefs do (e.g. service DB was
-        // wiped). No-op when already in sync or no binding is selected.
-        if (((backendStatus || {}).kind) === "connected") {
-            // A connection assignment made before the service was up is
-            // delivered first — the resync below only acts on an EMPTY service
-            // binding, so on its own it would leave the parked choice behind.
-            Qt.callLater(offlinePendingController.deliverParkedBinding)
-            Qt.callLater(routePolicyController._resyncRouteBindingIfMissing)
-            // Cold-start counterpart of the reconnect replay: when the service
-            // is already up at launch there is no disconnected→connected edge
-            // to hang it on.
-            Qt.callLater(replayServiceIntentToService)
-            // Same edge problem for the drift compare: the file legs are only
-            // measured by a recheck, and the cold-start capture does not do one.
-            // Without this the window says nothing about a diverged rules file
-            // for the first 30 s of every launch — which is exactly when the
-            // user who came from the tray notice is looking at it.
-            _driftConnectRetryCount = 0
-            _driftConnectComparePrimeTimer.restart()
-        }
-        // Populate the compatibility banner state
-        // from the launcher's `local.service-info` snapshot. Runs
-        // unconditionally on cold-start; the banner only paints when
-        // a protocol mismatch is actually detected.
-        Qt.callLater(_refreshServiceInfo)
-        // Cold-start read of the local segments waiting for an answer; the
-        // daily timer takes over from here.
-        Qt.callLater(refreshPendingLocalNetworks)
-        // Cold-start counterpart of the reconnect read above. Unconditional:
-        // with no service reachable it falls back to the last value the
-        // service reported, so a locked machine does not present an editable
-        // Rules section for the first few seconds of every launch.
-        Qt.callLater(refreshRuleEditPermission)
-        // The tray is the application's presence: it carries the notices the
-        // service raises and the "Exit" that winds everything down, so it comes
-        // up WITH the window, not only when the window is closed to it. A
-        // duplicate launch is a no-op — the tray holds its own single-instance
-        // lock. Skipped for the timed runs used to capture screenshots. The
-        // autostart checkbox governs the SIGN-IN entry only, not this path.
-        if (autoCloseMs <= 0 && typeof nrrNativeBridge !== "undefined"
-                && nrrNativeBridge && nrrNativeBridge.ensureTrayRunning) {
-            Qt.callLater(function() { nrrNativeBridge.ensureTrayRunning() })
-        }
-        // A launch started BY the tray carries an intent slug. With a window
-        // already open it arrives in the activation-request file; a cold launch
-        // has no window to hand it to, so it rides the context and is dispatched
-        // here through the same one entry point.
-        var coldAction = String((context || {}).launchAction || "")
-        if (coldAction !== "") {
-            Qt.callLater(function() {
-                applyGuiActivationRequest({
-                    action: coldAction,
-                    reason: String((context || {}).launchReason || "")
-                })
-            })
+            startupController._runPostEulaStartup()
         }
     }
 
@@ -5663,7 +4906,7 @@ ApplicationWindow {
     function rulesSourcePathFor(route) {
         var remembered = _rememberedRulesPathFor(route)
         if (remembered !== "") return remembered
-        return defaultRuleSetPathFor(route)
+        return ruleSetCatalog.defaultRuleSetPathFor(route)
     }
 
     /// Steps 1–4 above: a path the user's own actions put on record. Split out
@@ -5699,7 +4942,7 @@ ApplicationWindow {
             }
         }
         if (String(prefs.selectedPresetSet || "").indexOf("bundled:") === 0
-                && _ruleSetEnum().userOwned) {
+                && ruleSetCatalog._ruleSetEnum().userOwned) {
             patch.selectedPresetSet = ""
         }
         var touched = false
@@ -5730,198 +4973,6 @@ ApplicationWindow {
     /// left with an empty dropdown — `userOwned` records which root won so the
     /// hydration can tell those two cases apart.)
     ///
-    /// Cached on the folder path: this is filesystem work and
-    /// `rulesSourcePathFor` runs on every prefs write via the Source row's
-    /// binding. `invalidateRuleSetCache()` drops it when the folder contents may
-    /// have changed under us.
-    /// Held INSIDE a box and mutated in place: a plain `property var` written
-    /// from here notifies, and every binding that reaches this enumeration —
-    /// the Source row, the empty-state text — re-evaluates because of the very
-    /// call it made. That is the "Binding loop detected" the rules table logged
-    /// on each repaint. An in-place field write on a `var` object notifies
-    /// nobody, which is exactly what a cache should do.
-    property var _ruleSetCacheBox: ({ v: null })
-
-    function _ruleSetEnum() {
-        var dir = userPresetsDir
-        var cached = _ruleSetCacheBox.v
-        if (cached && cached.dir === dir) return cached
-        var res = { dir: dir, userOwned: false, entries: [], paths: {} }
-        if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
-                && typeof nrrNativeBridge.listAllPresets === "function") {
-            if (dir !== "") {
-                try {
-                    res.entries = JSON.parse(
-                        String(nrrNativeBridge.listAllPresets(dir) || "[]"))
-                } catch (e) { res.entries = [] }
-                res.userOwned = res.entries.length > 0
-            }
-            if (res.entries.length === 0) {
-                try {
-                    res.entries = JSON.parse(
-                        String(nrrNativeBridge.listAllPresets() || "[]"))
-                } catch (e2) { res.entries = [] }
-                res.userOwned = false
-            }
-        }
-        _ruleSetCacheBox.v = res
-        return res
-    }
-
-    function invalidateRuleSetCache() { _ruleSetCacheBox.v = null }
-
-    /// Display label of the set at `index`. Shipped sets read "<cc>_<pack>";
-    /// a set of the user's own carries no country, so it must not gain a
-    /// leading underscore.
-    function ruleSetLabelAt(index) {
-        var e = _ruleSetEnum()
-        if (index < 0 || index >= e.entries.length) return ""
-        var entry = e.entries[index]
-        var country = String(entry.country || "")
-        var pack = String(entry.pack || "")
-        var fallback = country !== "" ? (country + "_" + pack) : pack
-        return String(entry.label || fallback)
-    }
-
-    /// `<source>:<label>`, the form persisted in `prefs.selectedPresetSet`. The
-    /// source prefix matters: the user's own folder and the shipped tree can
-    /// hold sets with identical labels, and a choice made in one list must not
-    /// be restored into the other.
-    function ruleSetSelectionKey(index) {
-        var label = ruleSetLabelAt(index)
-        if (label === "") return ""
-        return (_ruleSetEnum().userOwned ? "user:" : "bundled:") + label
-    }
-
-    /// Index of the remembered set within the CURRENT list, or -1 when nothing
-    /// is remembered, the remembered choice belongs to the other source, or the
-    /// set itself is gone (renamed / deleted folder) — each of which falls back
-    /// to the default pick rather than stranding on a dead entry.
-    function ruleSetRememberedIndex() {
-        var want = String(prefs.selectedPresetSet || "")
-        if (want === "") return -1
-        var e = _ruleSetEnum()
-        for (var i = 0; i < e.entries.length; i += 1) {
-            if (ruleSetSelectionKey(i) === want) return i
-        }
-        return -1
-    }
-
-    /// Default pick when the user never chose a set: match the preset's country
-    /// code against the system locale's region, then its language. Sets shaped
-    /// by the user carry no country, so the heuristic cannot say anything about
-    /// them — those default to the first entry.
-    function ruleSetPreferredIndex() {
-        var arr = _ruleSetEnum().entries
-        if (!arr || arr.length === 0) return -1
-        // The test is the DATA, not where it was enumerated from: a user who
-        // points the folder at the sets shipped with the app still gets the
-        // country/language pick, because those entries do carry a country.
-        var hasCountry = false
-        for (var c = 0; c < arr.length; c += 1) {
-            if (String(arr[c].country || "") !== "") { hasCountry = true; break }
-        }
-        if (!hasCountry) return 0
-        var loc = ""
-        try { loc = String(Qt.locale().name || "") } catch (e) { loc = "" }
-        var parts = loc.toLowerCase().split(/[_-]/)
-        var lang = parts.length > 0 ? parts[0] : ""
-        var region = parts.length > 1 ? parts[1] : ""
-        for (var pass = 0; pass < 2; pass += 1) {
-            var want = (pass === 0) ? region : lang
-            if (want === "") continue
-            for (var i = 0; i < arr.length; i += 1) {
-                if (String(arr[i].country || "").toLowerCase() === want) return i
-            }
-        }
-        return 0
-    }
-
-    /// Absolute path of `route`'s rules file inside the set at `index`, or ""
-    /// when that set has no file for the route (a set with only one of the two
-    /// files is normal).
-    function ruleSetFilePath(index, route) {
-        var e = _ruleSetEnum()
-        if (index < 0 || index >= e.entries.length) return ""
-        if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
-                || typeof nrrNativeBridge.resolvePresetPath !== "function") {
-            return ""
-        }
-        var cacheKey = String(index) + ":" + String(route)
-        if (e.paths[cacheKey] !== undefined) return e.paths[cacheKey]
-        var entry = e.entries[index]
-        // Shipped sets live at `<cc>/<pack>/`; a user set is either `<set>/` or
-        // the folder root itself, so join only the segments that are present.
-        var segments = []
-        if (String(entry.country || "") !== "") segments.push(String(entry.country))
-        if (String(entry.pack || "") !== "") segments.push(String(entry.pack))
-        var file = (String(route) === "primary") ? "rules_primary.txt"
-                                                 : "rules_secondary.txt"
-        var rel = segments.concat([file]).join("/")
-        // Empty override = the shipped tree; non-empty = the user's own folder.
-        var abs = String(nrrNativeBridge.resolvePresetPath(
-            rel, e.userOwned ? e.dir : "") || "")
-        e.paths[cacheKey] = abs
-        return abs
-    }
-
-    /// The set to fall back on when no file path is remembered at all, per the
-    /// user's rule: a configured rule-set folder is the ONLY source — sets in
-    /// it load, an empty folder loads nothing (we do not silently substitute a
-    /// shipped set for someone who told us where their rules live). With no
-    /// folder configured we show the set matching the system locale, which is
-    /// what a fresh install has always done.
-    function defaultRuleSetIndex() {
-        var e = _ruleSetEnum()
-        if (userPresetsDir !== "" && !e.userOwned) return -1
-        var idx = ruleSetRememberedIndex()
-        if (idx < 0) idx = ruleSetPreferredIndex()
-        return idx
-    }
-
-    function defaultRuleSetPathFor(route) {
-        return ruleSetFilePath(defaultRuleSetIndex(), route)
-    }
-
-    /// Index of the rule set `path` belongs to, or -1 for a file outside every
-    /// known set (a rules .txt the user opened from somewhere of their own).
-    /// Windows paths compare case-insensitively and separator-agnostically.
-    function _ruleSetIndexForPath(path) {
-        var want = String(path || "").replace(/\\/g, "/").toLowerCase()
-        if (want === "") return -1
-        var e = _ruleSetEnum()
-        for (var i = 0; i < e.entries.length; i += 1) {
-            for (var r = 0; r < 2; r += 1) {
-                var p = String(ruleSetFilePath(i, r === 0 ? "primary" : "secondary") || "")
-                if (p !== "" && p.replace(/\\/g, "/").toLowerCase() === want) return i
-            }
-        }
-        return -1
-    }
-
-    /// Make the quick-load dropdown name the set whose rules are actually on
-    /// screen. Derived from the loaded path when there is one — a remembered
-    /// path is the stronger fact, and without this step the dropdown would go
-    /// on showing its default pick while different rules sit below it.
-    /// A choice the user made by hand is never overwritten, and a rules file
-    /// outside every known set leaves the dropdown alone. With no path
-    /// remembered at all this persists NOTHING: the dropdown already shows the
-    /// default pick, and freezing that pick into prefs recorded a choice the
-    /// user never made (it then outlived the hydration and overrode the
-    /// folder they configured later).
-    function _rememberHydratedRuleSet() {
-        if (String(prefs.selectedPresetSet || "") !== "") return
-        var primary = _rememberedRulesPathFor("primary")
-        var secondary = _rememberedRulesPathFor("secondary")
-        if (primary === "" && secondary === "") return
-        var idx = _ruleSetIndexForPath(primary)
-        if (idx < 0) idx = _ruleSetIndexForPath(secondary)
-        var key = ruleSetSelectionKey(idx)
-        if (key === "") return
-        updatePrefs({ selectedPresetSet: key })
-        emitPrefs()
-    }
-
     function _runAutoOpenOnLaunch() {
         if (typeof nrrNativeBridge === "undefined"
                 || !nrrNativeBridge
@@ -5960,7 +5011,7 @@ ApplicationWindow {
         if (primB64 === "" && secB64 === "") return
         // Files read successfully — make the quick-load dropdown name the set
         // these rules came from (no-op when the user picked one by hand).
-        _rememberHydratedRuleSet()
+        ruleSetCatalog._rememberHydratedRuleSet()
         statusLine = tr("status.auto-open-loading",
             "Loading rules from {path}...")
             .replace("{path}", primaryPath !== "" ? primaryPath : secondaryPath)
@@ -6049,7 +5100,11 @@ ApplicationWindow {
             // because the holding is machine-wide: a route cannot be scoped to
             // a process, so these addresses travel the additional link for
             // every program, not just the one the rule names.
-            pinnedCount: (w["pinned-destinations"] || []).length,
+            // The count is the service's own total, not the length of what
+            // arrived: the wire list is capped, and a truncated length would
+            // understate what the rule is actually holding.
+            pinnedCount: Number(w["pinned-destinations-total"]
+                || (w["pinned-destinations"] || []).length),
             pinnedSample: (w["pinned-destinations"] || [])
                 .slice(0, 20).join(", ")
         }
@@ -6158,7 +5213,7 @@ ApplicationWindow {
                 refreshUnenforcedAppRules()
                 // Same reason: the offer the tray may have shown while this
                 // window was closed has to be countable the moment it opens.
-                refreshAutoRuleCandidates()
+                autoRuleSuggestionsController.refreshAutoRuleCandidates()
                 // An explicit pull replaced the table with what the service
                 // enforces, so the linked file is now behind it — mirror it.
                 // Silent cold-start/post-connect refreshes deliberately do NOT:
@@ -6661,8 +5716,8 @@ ApplicationWindow {
             // enforcement gap). Amber-tinted when a warning is present.
             Rectangle {
                 id: notificationsChip
-                readonly property bool warn: window.notificationTopSeverity === "warning"
-                visible: window.notificationCount > 0
+                readonly property bool warn: notificationsController.notificationTopSeverity === "warning"
+                visible: notificationsController.notificationCount > 0
                 Layout.preferredHeight: 24
                 implicitWidth: notificationsChipRow.implicitWidth + uiTheme.spacingSm * 2
                 radius: uiTheme.radiusSm
@@ -6690,7 +5745,7 @@ ApplicationWindow {
                     }
                     Label {
                         text: window.tr("notifications.chip-label", "Alerts")
-                            + " (" + window.notificationCount + ")"
+                            + " (" + notificationsController.notificationCount + ")"
                         color: window.textColor
                         verticalAlignment: Text.AlignVCenter
                         font.pixelSize: Math.max(11, window.font.pixelSize - 1)
@@ -6709,7 +5764,7 @@ ApplicationWindow {
                 }
                 Accessible.role: Accessible.Button
                 Accessible.name: window.tr("notifications.title", "Notifications")
-                Accessible.description: window.notificationCount + " "
+                Accessible.description: notificationsController.notificationCount + " "
                     + window.tr("notifications.title", "Notifications")
             }
             RoutingStatusChip {
@@ -6734,6 +5789,7 @@ ApplicationWindow {
                 readonly property bool hasPendingChanges:
                     window.prefsHaveUnsavedChanges
                     || window.rulesNotAppliedToService
+                    || window.otherSectionsUnsaved
                 enabled: footerApplyButton.hasPendingChanges
                 highlighted: footerApplyButton.hasPendingChanges
                 ToolTip.visible: hovered && window.prefs.tooltipsEnabled
@@ -6776,7 +5832,9 @@ ApplicationWindow {
             ThemedButton {
                 theme: uiTheme
                 text: tr("action.cancel", "Cancel")
-                enabled: window.prefsHaveUnsavedChanges || window.rulesNotAppliedToService
+                enabled: window.prefsHaveUnsavedChanges
+                    || window.rulesNotAppliedToService
+                    || window.otherSectionsUnsaved
                 onClicked: window.cancelPendingChanges()
             }
             ThemedButton {
@@ -6800,7 +5858,7 @@ ApplicationWindow {
 
     // Notifications centre. Opened by the footer bell chip;
     // renders `window.activeNotifications` and routes actions/dismissal back
-    // through `runNotificationAction` / `dismissNotification`.
+    // through `notificationsController.runNotificationAction` / `notificationsController.dismissNotification`.
     NotificationCenterPopup {
         id: notificationCenterPopup
         ownerRoot: window
@@ -6938,19 +5996,51 @@ ApplicationWindow {
     // Extracted to
     // components/RuleDuplicateDialog.qml. The ruleDialog manipulation
     // stays here because ruleDialog is still inline (extraction deferred).
-    RuleDuplicateDialog {
-        id: ruleDuplicateDialog
+    // Every modal this window shows lives in `components/DialogHost.qml`.
+    // The ids stay reachable under their own names through the aliases below,
+    // so nothing that drives a dialog had to change.
+    DialogHost {
+        id: dialogHost
         ownerRoot: window
-        onOpenExistingRequested: function(idx) {
-            ruleDialog.close()
-            if (idx >= 0 && idx < rulesModel.count) {
-                selectedRule = idx
-                editingRule = idx
-                ruleDialog.resetForEdit()
-                ruleDialog.open()
-            }
-        }
     }
+    property alias ruleDuplicateDialog: dialogHost.ruleDuplicateDialog
+    // Review-flow dialogs, invoked via `startRulesReviewFlow(rulesJson, contentHash)`.
+    property alias reviewDiffDialog: dialogHost.reviewDiffDialog
+    property alias fullResetConfirmDialog: dialogHost.fullResetConfirmDialog
+    property alias fullResetCompleteDialog: dialogHost.fullResetCompleteDialog
+    property alias infoNoticeDialog: dialogHost.infoNoticeDialog
+    // Driven by flows/PresetImportController (duplicate/reclassify review).
+    property alias presetImportReviewDialog: dialogHost.presetImportReviewDialog
+    property alias reviewExpiredDialog: dialogHost.reviewExpiredDialog
+    property alias firstLaunchInstallDialog: dialogHost.firstLaunchInstallDialog
+    property alias uacRequiredDialog: dialogHost.uacRequiredDialog
+    property alias reloadFromServiceConfirmDialog: dialogHost.reloadFromServiceConfirmDialog
+    // Guardrail for an additional adapter that cannot carry traffic out. Opened
+    // through `confirmUnroutableSecondary(...)` from the interfaces role flow and
+    // from the leak-protection toggle.
+    property alias unroutableSecondaryConfirmDialog: dialogHost.unroutableSecondaryConfirmDialog
+    property alias emptyServiceRulesConfirmDialog: dialogHost.emptyServiceRulesConfirmDialog
+    // The single post-connect "what piled up while the service was stopped"
+    // dialog, driven by the window's backlog collector.
+    property alias offlineBacklogDialog: dialogHost.offlineBacklogDialog
+    property alias vpnOnboardingDialog: dialogHost.vpnOnboardingDialog
+    property alias appGroupRoutingDialog: dialogHost.appGroupRoutingDialog
+    property alias serviceUpdateDialog: dialogHost.serviceUpdateDialog
+    property alias serviceNotRunningDialog: dialogHost.serviceNotRunningDialog
+    // Drift + merge dialogs, driven by flows/DriftController.
+    property alias driftDetectionDialog: dialogHost.driftDetectionDialog
+    property alias driftClearAllConfirmDialog: dialogHost.driftClearAllConfirmDialog
+    property alias mergeReviewDialog: dialogHost.mergeReviewDialog
+    property alias rulesOverlapCleanupDialog: dialogHost.rulesOverlapCleanupDialog
+    property alias saveBeforeCloseDialog: dialogHost.saveBeforeCloseDialog
+    property alias factoryPresetSaveDialog: dialogHost.factoryPresetSaveDialog
+    property alias saveRuleSetDialog: dialogHost.saveRuleSetDialog
+    property alias rulesSaveFolderDialog: dialogHost.rulesSaveFolderDialog
+    // Tray-initiated safe-disable confirmation, opened from
+    // `applyGuiActivationRequest` when the secondary launcher writes
+    // `action: "safe-disable"` into the gui-activation.json hand-off.
+    property alias safeDisableConfirmDialog: dialogHost.safeDisableConfirmDialog
+    property alias safeRollbackConfirmDialog: dialogHost.safeRollbackConfirmDialog
 
     // ── Rules review/confirm flow ───────────────
     //
@@ -7457,7 +6547,7 @@ ApplicationWindow {
         var hash = (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
                 && typeof nrrNativeBridge.sha256Hex === "function")
             ? nrrNativeBridge.sha256Hex(json) : ""
-        _parkPendingApply(json, hash, rulesModel ? rulesModel.count : 0)
+        _parkPendingApply(hash, rulesModel ? rulesModel.count : 0)
     }
 
     /// Let the UnsavedChangesGuard offer
@@ -7542,89 +6632,21 @@ ApplicationWindow {
             "Those changes were already applied, so there is nothing left to review.")
     }
 
-    ReviewDiffDialog {
-        id: reviewDiffDialog
-        ownerRoot: window
-        // Single-step apply. The review
-        // dialog now applies directly: the separate ConfirmActivateDialog
-        // hop was removed and its Critical-risk acknowledgement checkbox
-        // moved into ReviewDiffDialog. Dispatch by active flow kind — the
-        // two pending-state structs (rules-update vs preset-import) carry
-        // the confirmation token issued on the dry-run pass.
-        onApproved: {
-            var state = (_activeReviewKind === "preset-import")
-                ? pendingPresetImportState
-                : pendingReviewState
-            var token = state.confirmationToken
-            if (_activeReviewKind === "preset-import") {
-                presetImportController._executePresetImportActivation(token)
-            } else if (_activeReviewKind === "rules-reset-to-baseline") {
-                // Reset shares the review dialog.
-                reviewFlowController._executeResetToBaselineActivation(token)
-            } else {
-                reviewFlowController._executeRulesActivation(token)
-            }
-        }
-        // User clicked "Apply…" in the read-only preview. Leave preview and
-        // re-enter the standard rules review flow with the very payload the
-        // preview was built from; that re-runs the dry-run and re-opens this
-        // dialog Apply-enabled.
-        onPreviewApplyRequested: {
-            var p = _pendingPreviewPayload
-            _pendingPreviewPayload = null
-            if (p) reviewFlowController.startRulesReviewFlow(p.rulesJson, p.contentHash)
-        }
-        onCancelled: {
-            // User dismissed the review dialog; release the guard
-            // (if it drove this apply) so its Save button re-enables and the
-            // user can Cancel/Discard. No-op for non-guard flows.
-            reviewFlowController._resolveGuardRulesApply(false)
-        }
-    }
     // Full reset: strong destructive confirm
-    // (acknowledgement checkbox gates the action) → window.fullReset().
+    // (acknowledgement checkbox gates the action) → the full-reset controller.
     // Extracted to
     // components/FullResetConfirmDialog.qml (thin-shell refactor).
-    FullResetConfirmDialog {
-        id: fullResetConfirmDialog
-        ownerRoot: window
-        onConfirmed: function(allPrincipals) { window.fullReset(allPrincipals) }
-    }
     // Full reset complete → offer to close
     // the program + tray so the reset takes effect on next launch.
     // Extracted to
     // components/FullResetCompleteDialog.qml.
-    FullResetCompleteDialog {
-        id: fullResetCompleteDialog
-        ownerRoot: window
-        onCloseAllRequested: window._fullResetCloseAll()
-    }
     // Generic informational alert. Used by
     // `showNotice(title, body)`; e.g. an "Apply" with no pending changes
     // surfaces a clear notice instead of an empty review dialog.
-    InfoNoticeDialog {
-        id: infoNoticeDialog
-        ownerRoot: window
-    }
     // Preset import review (duplicates +
     // unknown sections). Opens when the parser surfaces decisions
     // the user has to make. See `_handlePresetParseResolved` for
     // how the user's choices are folded back into the import.
-    PresetImportReviewDialog {
-        id: presetImportReviewDialog
-        ownerRoot: window
-        onApproved: function(decisions) {
-            presetImportController._applyPresetReviewDecisions(decisions)
-        }
-        onCancelled: {
-            // User aborted — discard the pending parse result; the
-            // caller's `onComplete` callback is never invoked, so no
-            // status banner update / sidecar write happens.
-            _pendingPresetReview = null
-            statusLine = tr("status.preset-review-cancelled",
-                "Preset import cancelled by user.")
-        }
-    }
 
     /// In-flight review state captured between the parser callback
     /// and the user's decision in `PresetImportReviewDialog`. `null`
@@ -7632,42 +6654,9 @@ ApplicationWindow {
     /// so the dialog's signal handlers can reach it.
     property var _pendingPresetReview: null
 
-    ReviewExpiredDialog {
-        id: reviewExpiredDialog
-        ownerRoot: window
-        onRetry: reviewFlowController._retryReviewFlow()
-        onCancelled: { /* no-op */ }
-    }
     // Service install wizard. Fires at first-launch
     // when the service isn't registered yet AND the user hasn't burnt
     // through the UAC re-prompt budget (3 declines).
-    FirstLaunchInstallDialog {
-        id: firstLaunchInstallDialog
-        ownerRoot: window
-        onInstallRequested: {
-            if (typeof nrrServiceController !== "undefined"
-                    && nrrServiceController) {
-                nrrServiceController.installService()
-            }
-            // After the install attempt completes (success OR UAC
-            // declined), continue into the preset wizard.
-            openChildWindow(firstRunWindow)
-        }
-        onSkipRequested: {
-            // User explicitly chose preview mode; continue into the
-            // preset wizard so they can pick demo / file / empty.
-            openChildWindow(firstRunWindow)
-        }
-        onLearnMoreRequested: {
-            // Single source of truth — same URL the About dialog uses
-            // (seeded from `nrr_shared::ShellAbout::project_url` via
-            // ui_surface.rs).
-            var url = String((context.about || {}).projectUrl || "")
-            if (url !== "") {
-                Pure.openExternalUrl(url)
-            }
-        }
-    }
 
     // EULA acceptance gate — shown on first launch (and on agreement-version
     // bumps) before every other startup dialog. Accept persists
@@ -7700,7 +6689,7 @@ ApplicationWindow {
             }
             window.logProgress(window.tr("progress.eula-accepted",
                 "License agreement accepted."), "info")
-            window._runPostEulaStartup()
+            startupController._runPostEulaStartup()
         }
         onDeclined: {
             window.logProgress(window.tr("progress.eula-declined",
@@ -7709,10 +6698,6 @@ ApplicationWindow {
         }
     }
 
-    UacRequiredDialog {
-        id: uacRequiredDialog
-        ownerRoot: window
-    }
 
     // "administrator required" advisory shown when a non-elevated
     // GUI tries to apply a mutation (apply / clear / preset-import). Applying
@@ -7758,7 +6743,7 @@ ApplicationWindow {
                 // easy to miss, and it scrolls away. A refused stop pressed five
                 // times read as "nothing happens". The notice centre keeps it
                 // until the user answers it, and names the reason.
-                window._noteServiceOperationFailed(operation, errorMessage)
+                notificationsController._noteServiceOperationFailed(operation, errorMessage)
             }
         }
         function onUacDeclined(operation) {
@@ -7780,195 +6765,29 @@ ApplicationWindow {
     // from service" (RulesSection toolbar) discards unsaved local edits.
     // In-overlay themed popup (popupType: Popup.Item), same idiom as the
     // other dialogs.
-    ReloadFromServiceConfirmDialog {
-        id: reloadFromServiceConfirmDialog
-        ownerRoot: window
-        onConfirmed: _refreshRulesFromService({ silent: false })
-    }
 
     // Warn before an additional adapter that has no way out to the network is
     // put in charge of the additional route, or before leak protection is armed
     // over such an adapter. Confirming proceeds exactly as before; cancelling
     // leaves the previous state untouched.
-    UnroutableSecondaryConfirmDialog {
-        id: unroutableSecondaryConfirmDialog
-        ownerRoot: window
-        onConfirmed: {
-            var proceed = unroutableSecondaryConfirmDialog.pendingAction
-            unroutableSecondaryConfirmDialog.pendingAction = null
-            unroutableSecondaryConfirmDialog.pendingCancelAction = null
-            if (typeof proceed === "function") proceed()
-        }
-        onCancelled: {
-            var abort = unroutableSecondaryConfirmDialog.pendingCancelAction
-            unroutableSecondaryConfirmDialog.pendingAction = null
-            unroutableSecondaryConfirmDialog.pendingCancelAction = null
-            if (typeof abort === "function") abort()
-        }
-    }
 
     // Warn before an empty service state wipes the GUI rule list.
-    EmptyServiceRulesConfirmDialog {
-        id: emptyServiceRulesConfirmDialog
-        ownerRoot: window
-        onConfirmed: {
-            var opts = Object.assign({}, window._pendingEmptyReloadOpts || {})
-            opts.confirmedEmpty = true
-            _refreshRulesFromService(opts)
-        }
-        // The user picked "Apply application state" from this very
-        // dialog instead of clearing. Drop the pending empty-reload (so nothing
-        // re-wipes rulesModel afterwards) and push the current GUI rules to the
-        // empty service via the existing review/apply flow.
-        onApplyAppStateRequested: {
-            window._pendingEmptyReloadOpts = ({})
-            driftController._driftApplyGuiState()
-        }
-    }
 
     // The single post-connect question: rules AND routing settings that were
     // changed while the service was stopped, collected by
     // `_startOfflineBacklogCollect` and offered once.
-    OfflineBacklogDialog {
-        id: offlineBacklogDialog
-        ownerRoot: window
-        onApplyAllRequested: {
-            // Settings first (one RPC, no further prompts), then the rules
-            // review flow, which owns the rest of the interaction.
-            if (offlineBacklogDialog.settingsRows.length > 0) {
-                offlinePendingController._applyOfflinePending()
-            }
-            if (offlineBacklogDialog.rulesPending) {
-                _clearPendingApplyPark()
-                reviewFlowController._guardApplyRules(function(ok) {
-                    driftController._driftRecheckNow()
-                })
-            }
-        }
-        onDiscardAllRequested: {
-            if (offlineBacklogDialog.settingsRows.length > 0) {
-                offlinePendingController._discardOfflinePending()
-            }
-            if (offlineBacklogDialog.rulesPending) {
-                _offlineRulesPendingPush = false
-                _clearPendingApplyPark()
-                statusLine = tr("status.pending-apply-discarded",
-                    "Parked changes discarded.")
-            }
-        }
-        // "Later" and any dismissal keep everything parked; the next connect
-        // asks again.
-        onLaterRequested: { /* nothing to undo — the parks are untouched */ }
-        onPreviewRulesRequested: window._previewCurrentRulesAgainstService()
-        // The guard flag only means "an offer is on screen", so any close
-        // re-arms the offer.
-        onClosed: offlinePendingController._offlinePendingDialogActive = false
-    }
 
     // VPN-client onboarding. Captures WHICH installed/
     // running program the user treats as their VPN so its traffic keeps flowing
     // over the primary link while leak protection is on (an
     // "Application -> primary route" rule is already a kill-switch exemption).
     // Opened from `openVpnOnboarding()` (Settings -> Routing -> Leak protection).
-    VpnOnboardingDialog {
-        id: vpnOnboardingDialog
-        ownerRoot: window
-        onVpnConfirmed: function(displayName, exePath) {
-            // Single add (the manual file picker). We store the confirmed
-            // executable as a device-local preference (the offline display
-            // fallback) AND write it to the service-side SSOT via
-            // route.link-provider.set below — that write registers the per-app
-            // kill-switch exemption and triggers a server-side recompile, which
-            // supersedes the old "make it an Application->primary rule" intent.
-            var path = String(exePath || "")
-            window.updatePrefs({
-                confirmedVpnExePath: path,
-                confirmedVpnExePaths: path
-            })
-            window.emitPrefs()
-            var shownName = String(displayName || "")
-            window.statusLine = (path !== "")
-                ? window.tr("vpn-onboarding.confirmed-status",
-                    "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-                    .replace("{name}", shownName)
-                : window.tr("vpn-onboarding.confirmed-status-no-path",
-                    "Noted {name} as your VPN. Pick its program file to finish setup.")
-                    .replace("{name}", shownName)
-            if (path !== "") {
-                var lpName = (shownName !== "")
-                    ? shownName
-                    : String(path.split(/[\\/]/).pop() || "")
-                window._writeLinkProviderSet([{ "exe-path": path, "display-name": lpName }])
-            }
-        }
-        onVpnConfirmedMulti: function(displayNames, exePaths) {
-            // Multi-select confirm: persist the FULL set of confirmed VPN
-            // executables (semicolon-joined) and mirror the first non-empty path
-            // into the single-path preference for back-compat with readers like
-            // Settings -> Routing's VPN-client display (the offline fallback).
-            // The same set is written to the service-side SSOT via
-            // route.link-provider.set below (per-app kill-switch exemptions +
-            // server-side recompile), superseding the old "Application->primary
-            // rules" intent.
-            var names = displayNames || []
-            var raw = exePaths || []
-            var paths = []
-            var lpApps = []
-            for (var i = 0; i < raw.length; i += 1) {
-                var p = String(raw[i] || "")
-                if (p !== "") {
-                    paths.push(p)
-                    var nm = String((i < names.length ? names[i] : "") || "")
-                    if (nm === "") nm = String(p.split(/[\\/]/).pop() || "")
-                    lpApps.push({ "exe-path": p, "display-name": nm })
-                }
-            }
-            window.updatePrefs({
-                confirmedVpnExePaths: paths.join(";"),
-                confirmedVpnExePath: paths.length > 0 ? paths[0] : ""
-            })
-            window.emitPrefs()
-            window._writeLinkProviderSet(lpApps)
-            if (paths.length > 1) {
-                window.statusLine = window.tr("vpn-onboarding.confirmed-status-multi",
-                    "NetRuleRouter will keep your {count} VPN programs working over your main link while leak protection is on.")
-                    .replace("{count}", String(paths.length))
-            } else if (paths.length === 1) {
-                window.statusLine = window.tr("vpn-onboarding.confirmed-status",
-                    "NetRuleRouter will keep {name} working over your main link while leak protection is on.")
-                    .replace("{name}", String(names.length > 0 ? names[0] : ""))
-            } else {
-                // Everything selected was name-only (no resolved path).
-                window.statusLine = window.tr("vpn-onboarding.confirmed-status-no-path",
-                    "Noted {name} as your VPN. Pick its program file to finish setup.")
-                    .replace("{name}", String(names.length > 0 ? names[0] : ""))
-            }
-        }
-        onSkipped: {
-            window.statusLine = window.tr("vpn-onboarding.skipped-status",
-                "No VPN set up. You can set one up later from Settings -> Routing.")
-        }
-        onManualPickRequested: {
-            // The dialog opens a native file picker itself; this
-            // just notes the action in the status line.
-            window.statusLine = window.tr("vpn-onboarding.manual-pick-status",
-                "Choose your VPN program file…")
-        }
-    }
 
     // App-group routing dialog. Scans installed/running programs,
     // groups them into popular categories, and lets the user send a whole group
     // over primary (default) or secondary. On confirm, only the secondary
     // assignments materialize application rules; primary removes any prior rule
     // for that exe (see `_applyAppGroupRoutes`). Opened via `openAppGroupRouting()`.
-    AppGroupRoutingDialog {
-        id: appGroupRoutingDialog
-        ownerRoot: window
-        onAppGroupRoutesConfirmed: function(assignments) {
-            window._applyAppGroupRoutes(assignments)
-        }
-        onSkipped: { /* no-op; user closed the dialog without applying */ }
-    }
 
     // Gate dialog opened before the review-flow when
     // the service isn't connected. Three outcomes wired below: start /
@@ -7977,112 +6796,26 @@ ApplicationWindow {
     // Shared by every "start the service" affordance: starting a registration
     // that points at another folder would launch the copy being replaced, so
     // those paths offer the re-registration instead.
-    ServiceUpdateConfirmDialog {
-        id: serviceUpdateDialog
-        ownerRoot: window
-        onConfirmed: {
-            if (typeof nrrServiceController !== "undefined" && nrrServiceController) {
-                nrrServiceController.reinstallService()
-            }
-        }
-    }
 
-    ServiceNotRunningDialog {
-        id: serviceNotRunningDialog
-        ownerRoot: window
-        onStartServiceRequested: {
-            window.startServiceOrOfferUpdate()
-            _armOfflineServiceStartTimer()
-        }
-        onInstallServiceRequested: {
-            if (typeof nrrServiceController !== "undefined"
-                    && nrrServiceController) {
-                nrrServiceController.installService()
-            }
-            // The UAC-elevated installService also starts the service
-            // on success. Wait for the same connect window — if UAC
-            // is declined, the timer expires and we surface the same
-            // failure message.
-            _armOfflineServiceStartTimer()
-        }
-        onWorkWithoutServiceRequested: {
-            if (!_pendingOfflinePark) return
-            var p = _pendingOfflinePark
-            _parkPendingApply(p.rulesJson, p.contentHash, p.totalRules)
-            _pendingReviewAfterConnect = null
-            _pendingOfflinePark = null
-            statusLine = tr(
-                "status.pending-apply-parked",
-                "Changes parked. They will be applied when the service is running again.")
-            // Dirty flag intentionally kept — close-guard still warns
-            // the user even though the work is persisted in sidecar.
-            // The status banner above signals the parked-state.
-        }
-        // Saving the rules to disk needs no service at all, so the gate offers
-        // it: the user's work is kept even when the service will not start.
-        onSaveToFileRequested: {
-            _pendingReviewAfterConnect = null
-            _pendingOfflinePark = null
-            boundFilesController.saveRulesToFiles(true, null)
-        }
-        onCancelled: {
-            _pendingReviewAfterConnect = null
-            _pendingOfflinePark = null
-        }
-    }
 
     // Drift detection dialog. Opened from the
     // amber drift banner. The four resolution paths are wired below
     // to existing flows (preset import, review-flow, snapshot
     // rollback) so this stays a thin dispatcher with no business
     // logic of its own.
-    DriftDetectionDialog {
-        id: driftDetectionDialog
-        ownerRoot: window
-        primaryDetails:       window._driftDetailsPrimary
-        secondaryDetails:     window._driftDetailsSecondary
-        fileExistsPrimary:    window._driftFileExistsPrimary
-        fileExistsSecondary:  window._driftFileExistsSecondary
-        onLoadFromFileRequested:        driftController._driftLoadFromFile()
-        onApplyGuiStateRequested:       driftController._driftApplyGuiState()
-        onAcceptServiceStateRequested:  driftController._driftAcceptServiceState()
-        onShowDiffRequested:            driftController._driftShowDiff()
-        onClearAllRequested:            driftClearAllConfirmDialog.open()
-        onCancelled:                    { /* banner stays */ }
-    }
 
     // Destructive confirm for the drift
     // dialog's "Clear everything". Mirrors the full-reset confirm: an
     // acknowledgement checkbox gates the action, which wipes all rules
     // locally and pushes an empty revision to the service.
-    DriftClearAllConfirmDialog {
-        id: driftClearAllConfirmDialog
-        ownerRoot: window
-        onConfirmed: driftController._driftClearAll()
-    }
 
     // File↔service merge review dialog. Opened from the quiet
     // "Merge available" banner. Renders the `rules.merge-preview` buckets +
     // per-conflict picks; on confirm the caller re-runs the op with the picks
     // and hands the merged rules-json to the standard review + apply flow.
-    MergeReviewDialog {
-        id: mergeReviewDialog
-        ownerRoot: window
-        onCancelled: { /* banner stays until resolved */ }
-        onConfirmed: function(resolutions) { driftController._applyMerge(resolutions) }
-    }
 
     // Cleanup for exact rules a wildcard already covers. Opened from the rules
     // screen; the pairs come from `local.rules-overlaps`.
-    RulesOverlapCleanupDialog {
-        id: rulesOverlapCleanupDialog
-        ownerRoot: window
-        onRemoveRequested: function(keys) { window.removeOverlapPairs(keys) }
-        onKeepRequested: function(keys) {
-            window.keepOverlapPairs(keys)
-            rulesOverlapCleanupDialog.selectAllActionable()
-        }
-    }
 
 
     /// Read-only diff of the rules ON SCREEN against the service's active
@@ -8126,7 +6859,7 @@ ApplicationWindow {
             // eventually connect — so park the changes here too.
             var p = _pendingReviewAfterConnect
             _pendingReviewAfterConnect = null
-            _parkPendingApply(p.rulesJson, p.contentHash, p.totalRules || 0)
+            _parkPendingApply(p.contentHash, p.totalRules || 0)
             statusLine = tr(
                 "status.pending-apply-timeout",
                 "Could not connect to the service. Changes parked; see logs for details.")
@@ -8151,7 +6884,11 @@ ApplicationWindow {
             "Waiting for the service to come online…")
     }
 
-    function _parkPendingApply(rulesJson, contentHash, totalRules) {
+    /// Record that the user parked changes: the hash of the rules they hold
+    /// and how many there are. The rules themselves are not stored — the
+    /// post-connect offer rebuilds them from the live model, which is what
+    /// the user has been looking at all along.
+    function _parkPendingApply(contentHash, totalRules) {
         if (typeof nrrNativeBridge === "undefined"
                 || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcSidecarPendingApplyWrite !== "function") {
@@ -8171,7 +6908,7 @@ ApplicationWindow {
             "total-rules":    parseInt(totalRules || 0)
         })
         var corr = nrrNativeBridge.rpcSidecarPendingApplyWrite(
-            String(rulesJson || ""), summaryJson, String(contentHash || ""))
+            summaryJson, String(contentHash || ""))
         rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok) {
                 console.log("pending-apply.write failed:", code, msg)
@@ -8329,7 +7066,7 @@ ApplicationWindow {
             rulesJson:   String(rulesJson || ""),
             contentHash: String(contentHash || "")
         }
-        var corr = Pure.newCorrelationId()
+        var corr = Pure.newCorrelationId("pending-apply-preview")
         var payload = {
             "rules-json":     String(rulesJson || ""),
             "content-hash":   String(contentHash || ""),
@@ -8339,7 +7076,7 @@ ApplicationWindow {
         var rpcCorr = nrrNativeBridge.rpcMutationSubmit(
             "rules-update", payload, true /* dryRun */, ""
         )
-        rpcTransport.registerRpcCallback(rpcCorr, function(ok, p, code, msg) {
+        rpcTransport.registerLongRpcCallback(rpcCorr, function(ok, p, code, msg) {
             if (!ok) {
                 statusLine = tr(
                     "status.pending-apply-preview-failed",
@@ -8399,182 +7136,6 @@ ApplicationWindow {
             serviceRegisteredElsewhere = payload["service-registered-elsewhere"] === true
             serviceOlderThanApp        = payload["service-older-than-app"] === true
             serviceRestartNeeded       = payload["service-restart-needed"] === true
-        })
-    }
-
-    // ──────────────────────────────────────────────────────────────
-    // Post-connect backlog — ONE question for everything parked
-    //
-    // Rules and routing settings are parked by two independent
-    // mechanisms (the rules sidecar, and `prefs.routePendingOfflineJson`),
-    // and each used to prompt on its own: two modal dialogs a second
-    // apart about the same interruption. Both halves are now collected in
-    // parallel and the dialog opens only once both have reported.
-    //
-    // The rules half deliberately does NOT apply the parked snapshot. That
-    // snapshot was written once and never refreshed, so it could be older
-    // than the table — applying it silently resurrected rules the user had
-    // since deleted, and the preview built from it showed nothing while a
-    // rule was demonstrably missing. The park is a MARKER ("there is
-    // offline rule work"); what gets previewed and applied is always the
-    // table as it stands, compared against the live service revision.
-    // ──────────────────────────────────────────────────────────────
-
-    /// Both halves of one collect run: `{ rulesReady, rules, settingsReady,
-    /// settingsRows }`. Non-null only while a run is in flight — the runs are
-    /// idempotent and several triggers (cold start, reconnect) can coincide.
-    property var _offlineBacklogRun: null
-
-    /// One-shot: the rules half is already being applied by a review the user
-    /// triggered from the "service not running" gate, so the collector must
-    /// not ask about it a second time. Settings are unaffected.
-    property bool _offlineRulesHandledByResume: false
-
-    /// Ask for a post-connect backlog collect. Public because the first-run
-    /// wizard has to re-arm it: the collect it skipped while the wizard was up
-    /// is the one carrying the protections chosen IN that wizard.
-    function scheduleOfflineBacklogCollect() {
-        if (((backendStatus || {}).kind) !== "connected") return
-        _offlineBacklogCollectTimer.restart()
-    }
-
-    function _startOfflineBacklogCollect() {
-        // Don't stack a modal over the first-launch wizards — come back once
-        // it is answered rather than dropping the parked work.
-        if (!prefs.firstRunCompleted) { _offlineBacklogCollectTimer.restart(); return }
-        if (offlinePendingController._offlinePendingDialogActive) return
-        if (_offlineBacklogRun !== null) return
-        if (!_routingBackendConnected()) return
-        // A table caught mid-repopulate would diff as "rules removed".
-        if (rulesBulkLoading === true) { _offlineBacklogCollectTimer.restart(); return }
-        _offlineBacklogRun = {
-            rulesReady: false, rules: null, settingsReady: false, settingsRows: []
-        }
-        offlinePendingController._offlinePendingDialogActive = true
-        _collectOfflineRulesBacklog(function(rules) {
-            if (!_offlineBacklogRun) return
-            _offlineBacklogRun.rules = rules
-            _offlineBacklogRun.rulesReady = true
-            _settleOfflineBacklogCollect()
-        })
-        offlinePendingController.collectSettingsBacklog(function(rows) {
-            if (!_offlineBacklogRun) return
-            _offlineBacklogRun.settingsRows = rows || []
-            _offlineBacklogRun.settingsReady = true
-            _settleOfflineBacklogCollect()
-        })
-    }
-
-    function _settleOfflineBacklogCollect() {
-        var run = _offlineBacklogRun
-        if (!run || !run.rulesReady || !run.settingsReady) return
-        _offlineBacklogRun = null
-        var hasRules = run.rules !== null
-        var hasSettings = run.settingsRows.length > 0
-        if (!hasRules && !hasSettings) {
-            offlinePendingController._offlinePendingDialogActive = false
-            return
-        }
-        // Settings reconcile without a click whenever the service accepts
-        // them: the parked keys are per-SID and need no elevation in the
-        // common case. Only a refusal surfaces the dialog, through
-        // `_applyOfflinePending`'s own fallback.
-        //
-        // They go through even when rules are ALSO pending. Bundling them into
-        // the rules dialog made a protection the user switched on in the wizard
-        // wait for an answer about something else — that is how a kill-switch
-        // chosen before the service existed stayed off in the service for ten
-        // minutes while the additional link was already down.
-        if (!hasRules) {
-            offlinePendingController._applyOfflinePending(run.settingsRows)
-            return
-        }
-        _showOfflineBacklogDialog(run.rules, [])
-        // No fallback rows: a refusal must not paint a second dialog over the
-        // one just opened. The keys stay parked and the next collect re-offers.
-        if (hasSettings) offlinePendingController._applyOfflinePending(null)
-    }
-
-    /// Open the shared post-connect dialog. `rules` is `{added, removed}` or a
-    /// falsy value when only settings are pending (the fallback entry used by
-    /// `_applyOfflinePending`).
-    function _showOfflineBacklogDialog(rules, settingsRows) {
-        offlinePendingController._offlinePendingDialogActive = true
-        offlineBacklogDialog.rulesPending = !!rules
-        offlineBacklogDialog.rulesAdded = rules ? parseInt(rules.added || 0) : 0
-        offlineBacklogDialog.rulesRemoved = rules ? parseInt(rules.removed || 0) : 0
-        offlineBacklogDialog.settingsRows = settingsRows || []
-        offlineBacklogDialog.open()
-    }
-
-    /// Rules half: is there offline rule work, and how much? `done(null)` when
-    /// there is nothing to offer — including when a marker exists but the
-    /// table already matches the service, in which case the stale marker is
-    /// dropped so it can never resurface.
-    function _collectOfflineRulesBacklog(done) {
-        var finish = function(v) { if (typeof done === "function") done(v || null) }
-        // A review the user already triggered is answering this exact
-        // question; it clears the flag when it settles.
-        if (_offlineRulesHandledByResume) { finish(null); return }
-        if (!bridgeAvailable
-                || typeof nrrNativeBridge === "undefined"
-                || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcSidecarPendingApplyRead !== "function") {
-            finish(null)
-            return
-        }
-        var corr = nrrNativeBridge.rpcSidecarPendingApplyRead()
-        // A dropped correlation id never gets a callback, so the collector
-        // would wait for a reply that cannot arrive.
-        if (!corr || String(corr) === "") { finish(null); return }
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            var entry = ok && p && p.entry
-            // No marker and no in-flight offline import: any divergence left
-            // is the drift banner's business, not a modal on every connect.
-            if (!entry && !_offlineRulesPendingPush) { finish(null); return }
-            _diffRulesAgainstService(function(counts) {
-                if (!counts || (counts.added === 0 && counts.removed === 0)) {
-                    if (entry) _clearPendingApplyPark()
-                    finish(null)
-                    return
-                }
-                finish(counts)
-            })
-        })
-    }
-
-    /// `{added, removed}` for the CURRENT table against the service's live
-    /// revision, or `null` when the service cannot be read.
-    function _diffRulesAgainstService(done) {
-        var finish = function(v) { if (typeof done === "function") done(v || null) }
-        if (!bridgeAvailable
-                || typeof nrrNativeBridge === "undefined"
-                || nrrNativeBridge === null
-                || typeof nrrNativeBridge.rpcRulesList !== "function") {
-            finish(null)
-            return
-        }
-        var corr = nrrNativeBridge.rpcRulesList()
-        if (!corr || String(corr) === "") { finish(null); return }
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok || !p) { finish(null); return }
-            var serviceRows = (p.rows || []).map(Rules.driftRowFromServiceWire)
-            finish(Rules.diffRuleRowCounts(
-                _rulesModelToRowArray(), serviceRows, _aceEncodeHost))
-        })
-    }
-
-    /// Clear the sidecar pending-apply marker (best-effort). Shared by the
-    /// dialog's Discard action and the obsolete-marker auto-drop.
-    function _clearPendingApplyPark() {
-        if (typeof nrrNativeBridge === "undefined"
-                || !nrrNativeBridge
-                || typeof nrrNativeBridge.rpcSidecarPendingApplyClear !== "function") {
-            return
-        }
-        var corr = nrrNativeBridge.rpcSidecarPendingApplyClear()
-        rpcTransport.registerRpcCallback(corr, function(ok, p, code, msg) {
-            if (!ok) console.log("pending-apply.clear failed:", code, msg)
         })
     }
 
@@ -8675,7 +7236,8 @@ ApplicationWindow {
     // it is closed, so re-showing it needs no flag reset.
     function restartFirstRunFlow() {
         updatePrefs({
-            serviceInstallUacDeclinedCount: 0
+            serviceInstallUacDeclinedCount: 0,
+            serviceInstallPromptSuppressed: false
         })
         if (_serviceNeedsInstallPrompt()) {
             firstLaunchInstallDialog.open()
@@ -8684,6 +7246,12 @@ ApplicationWindow {
         }
     }
 
+    /// Should the install offer open?
+    ///
+    /// Closing the dialog three times means "not now", not "never" — and
+    /// without the service the app enforces nothing, so the offer comes back,
+    /// at most once a week after the budget is spent. Only "Stop offering"
+    /// holds indefinitely, and Settings takes it back.
     function _serviceNeedsInstallPrompt() {
         if (typeof nrrServiceController === "undefined"
                 || nrrServiceController === null) {
@@ -8692,8 +7260,12 @@ ApplicationWindow {
         var status = parseInt(nrrServiceController.status)
         // status === 1 ⇒ NotInstalled
         if (status !== 1) return false
+        if (prefs.serviceInstallPromptSuppressed === true) return false
         var declines = parseInt(prefs.serviceInstallUacDeclinedCount || 0)
-        return declines < 3
+        if (declines < 3) return true
+        var lastAt = parseInt(prefs.serviceInstallUacDeclinedAtEpoch || 0)
+        if (!(lastAt > 0)) return false
+        return (Math.floor(Date.now() / 1000) - lastAt) >= 7 * 24 * 60 * 60
     }
 
     // Listen for UAC decline signal to track the budget
@@ -8731,14 +7303,6 @@ ApplicationWindow {
     // UnsavedChangesGuard cleared, only on real close (X / tray Exit),
     // never on close-to-tray. Lets the user persist active rule edits
     // back to the imported file paths or roll them back.
-    SaveBeforeCloseDialog {
-        id: saveBeforeCloseDialog
-        ownerRoot: window
-        onSaveSelected: boundFilesController._handleSaveSelectedFromCloseDialog()
-        onSaveAs: boundFilesController._handleSaveAsFromCloseDialog()
-        onDiscardAndRollback: boundFilesController._handleDiscardAndRollback()
-        onCancelled: { _resumeCloseAfterSaveBefore = false }
-    }
 
     // Save-As target picker for the queue in BoundFilesController: one route at
     // a time, written from the local rules table (no service involved) and
@@ -8747,49 +7311,12 @@ ApplicationWindow {
     // is warned about — not refused — and the warning offers both ways out.
     // Every handler is a one-liner into BoundFilesController, which owns the
     // held write and its resume.
-    FactoryPresetSaveDialog {
-        id: factoryPresetSaveDialog
-        ownerRoot: window
-        onSaveHereRequested: boundFilesController.factorySaveHereConfirmed()
-        onChooseFolderRequested: {
-            // The `hasRulesFolder` guard matters — writing an empty URL into
-            // `currentFolder` points the dialog at the process working
-            // directory instead of "use the default".
-            if (hasRulesFolder) rulesSaveFolderDialog.currentFolder = rulesFolderUrl
-            rulesSaveFolderDialog.open()
-        }
-        onCancelled: boundFilesController.cancelFactoryPathRebind()
-    }
 
     // "Save rules as a set" from the Rules toolbar. A set is a folder with one
     // file per route, so the question is a name plus a place.
-    SaveRuleSetDialog {
-        id: saveRuleSetDialog
-        root: window
-        onSetAccepted: function(name, folder) {
-            boundFilesController.writeSetNamed(folder, name)
-        }
-        // A dismissed dialog is an answer too: the caller that asked for the
-        // save (a close-flow, say) waits on the callback and would hang
-        // without it.
-        onSetDismissed: boundFilesController._handleSaveAsCancelled()
-    }
 
     // Folder picker for the refusal above. Same title as the rule-set folder
     // picker in Settings — it is the same choice, reached from the save.
-    FolderDialog {
-        id: rulesSaveFolderDialog
-        title: tr("settings.presets.user-folder.dialog-title",
-            "Choose the folder with your rule sets")
-        onAccepted: {
-            var s = String(selectedFolder || "")
-            var path = (s.indexOf("file:///") === 0)
-                ? s.substring(8)
-                : ((s.indexOf("file://") === 0) ? s.substring(7) : s)
-            boundFilesController.rebindBlockedRoutesTo(path)
-        }
-        onRejected: boundFilesController.cancelFactoryPathRebind()
-    }
 
     // Tracks whether the divergence dialog interrupted a close-flow;
     // re-emits onClosing semantics after Save / Discard completes.
@@ -8824,24 +7351,8 @@ ApplicationWindow {
     // Tray "Safe disable" lands here. The dialog
     // collects an audit reason and emits `confirmed(reason)`; the
     // host wires the next step.
-    SafeDisableConfirmDialog {
-        id: safeDisableConfirmDialog
-        ownerRoot: window
-        onConfirmed: function(reason) {
-            window._handleSafeDisableConfirmed(reason)
-        }
-        onCancelled: {
-            window.statusLine = window.tr("status.safe-disable.cancelled",
-                "Safe disable cancelled")
-        }
-    }
 
     // Safe rollback confirm → RollbackRequest recovery action.
-    SafeRollbackConfirmDialog {
-        id: safeRollbackConfirmDialog
-        ownerRoot: window
-        onConfirmed: window.boundFilesController._performSafeRollback()
-    }
 
     AboutWindow { id: aboutWindow; root: window }
 

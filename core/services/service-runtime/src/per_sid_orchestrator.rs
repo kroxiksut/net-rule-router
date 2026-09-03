@@ -668,6 +668,14 @@ pub struct PerSidApplyOrchestrator {
     /// block-all (or IPv6 cut) takes ICMP and IPv6 away from everyone logged
     /// in. The others are told rather than left to discover it.
     machine_wide_cut_state: Mutex<HashMap<String, bool>>,
+    /// Last reported set of rules this SID names on BOTH routes, as a
+    /// fingerprint. The state persists until the user resolves it, so the
+    /// notice fires on a CHANGE — repeating it on every apply would teach them
+    /// to dismiss it unread.
+    cross_set_duplicate_state: Mutex<HashMap<String, String>>,
+    /// App-match patterns already announced to this SID. A rule is only news
+    /// the first time it is delivered; every later apply carries it again.
+    announced_app_rules: Mutex<HashMap<String, std::collections::BTreeSet<String>>>,
     /// Push bus for those notices. `None` in tests that do not care.
     events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
     /// last LOGGED kill-switch posture per SID. The
@@ -964,6 +972,8 @@ impl PerSidApplyOrchestrator {
             fail_closed_state: Mutex::new(HashMap::new()),
             fail_closed_posture_status: None,
             machine_wide_cut_state: Mutex::new(HashMap::new()),
+            cross_set_duplicate_state: Mutex::new(HashMap::new()),
+            announced_app_rules: Mutex::new(HashMap::new()),
             events: None,
             posture_log_state: Mutex::new(HashMap::new()),
             // Default: fake-IP out of the plan. Production wires a live
@@ -1436,6 +1446,7 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(sid);
+        crate::enforced_addresses::global_enforced_addresses().forget(sid);
         self.note_block_all_state(sid, false);
         self.note_fail_closed_state(sid, false);
         self.update_killswitch_registry(sid, KillswitchBlockIds::default());
@@ -1482,6 +1493,96 @@ impl PerSidApplyOrchestrator {
                 other,
                 nrr_shared::ipc_payloads::StatusUpdateEvent::ProtectionCoverageChanged {
                     reason: "machine-wide-cut-by-another-user".to_string(),
+                },
+            );
+        }
+    }
+
+    /// Tell the user when an application rule is delivered for the first time.
+    ///
+    /// Its route exists only for addresses the service has already seen the
+    /// program use, so the first contact with each new one is refused while it
+    /// is learnt. A program that gives up on that refusal looks broken until it
+    /// is restarted, and nothing on screen would explain why.
+    fn note_new_app_rules(&self, sid: &str, secondary_apps: &[String]) {
+        let current: std::collections::BTreeSet<String> = secondary_apps.iter().cloned().collect();
+        let fresh: Vec<String> = {
+            let mut announced = self
+                .announced_app_rules
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let known = announced.entry(sid.to_string()).or_default();
+            let fresh: Vec<String> = current.difference(known).cloned().collect();
+            // Replaced wholesale: a rule the user removed and adds again is news
+            // for the same reason it was the first time.
+            *known = current;
+            fresh
+        };
+        if fresh.is_empty() {
+            return;
+        }
+        tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            sid,
+            apps = %fresh.join(", "),
+            "application rules delivered for the first time — their destinations are still being learnt",
+        );
+        if let Some(bus) = self.events.as_ref() {
+            bus.publish_for(
+                sid,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::AppRuleLearningDestinations {
+                    sid: sid.to_string(),
+                    apps: fresh,
+                },
+            );
+        }
+    }
+
+    /// Say when this SID's active rules name the same traffic on both routes
+    /// with both copies enabled.
+    ///
+    /// Nothing in the running policy shows this: the rules are valid, they
+    /// simply disagree about where the traffic goes, and evaluation order
+    /// settles it instead of the user. Reported on apply and only when the set
+    /// changes — the condition lasts until they resolve it.
+    fn note_cross_set_duplicates(
+        &self,
+        sid: &str,
+        book: &nrr_domain::canonical::CanonicalRuleBook,
+    ) {
+        let found = nrr_domain::validation::enabled_duplicates_across_sets(book);
+        let fingerprint = found
+            .iter()
+            .map(|pair| pair.match_summary.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        {
+            let mut seen = self
+                .cross_set_duplicate_state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if seen.get(sid).map(String::as_str) == Some(fingerprint.as_str()) {
+                return;
+            }
+            seen.insert(sid.to_string(), fingerprint);
+        }
+        let Some(first) = found.first() else {
+            return; // resolved — nothing to announce, the state was recorded
+        };
+        tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            sid,
+            count = found.len(),
+            sample = %first.match_summary,
+            "active rules name the same traffic on both routes",
+        );
+        if let Some(bus) = self.events.as_ref() {
+            bus.publish_for(
+                sid,
+                nrr_shared::ipc_payloads::StatusUpdateEvent::RuleDuplicatesDetected {
+                    sid: sid.to_string(),
+                    count: found.len() as u64,
+                    sample: first.match_summary.clone(),
                 },
             );
         }
@@ -1765,6 +1866,7 @@ impl PerSidApplyOrchestrator {
         // as unresolved ⇒ a resolver/enumeration problem. Logged once per apply
         // (`log_unresolved`), never on a reconcile tick.
         if log_unresolved {
+            self.note_cross_set_duplicates(sid, &rules.rule_book);
             let app_pattern = |r: &nrr_domain::canonical::CanonicalRule| -> Option<String> {
                 r.app_match.as_ref().map(|a| match &a.pattern {
                     nrr_domain::canonical::CanonicalAppPattern::Exact(s)
@@ -1785,6 +1887,7 @@ impl PerSidApplyOrchestrator {
                 .iter()
                 .filter_map(app_pattern)
                 .collect();
+            self.note_new_app_rules(sid, &secondary_apps);
             if !primary_apps.is_empty() || !secondary_apps.is_empty() {
                 tracing::info!(
                     target: "nrr::per_sid_orchestrator",
@@ -3209,6 +3312,7 @@ impl PerSidApplyOrchestrator {
         // previous install BEFORE the state is replaced.
         let (destinations, secondary_resolved) = Self::coverage_of(&filters);
         self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
+        Self::publish_enforced_addresses(sid, &filters);
         self.upsert_state_with_destinations(sid, installed_ids, destinations, secondary_resolved);
         let kind = if was_known {
             PerSidApplyAuditKind::Updated
@@ -3494,6 +3598,7 @@ impl PerSidApplyOrchestrator {
         // "just came up" — a sweep of every pinned destination for nothing.
         let (destinations, secondary_resolved) = Self::coverage_of(&desired);
         self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
+        Self::publish_enforced_addresses(sid, &desired);
         let live_total = {
             let removed_ids: std::collections::HashSet<u64> =
                 removed.iter().map(|id| id.raw).collect();
@@ -3887,6 +3992,25 @@ impl PerSidApplyOrchestrator {
     /// nothing to break loose from a permit. A CIDR RULE would change that —
     /// its pin needs the same sweep a `/32` pin gets, through
     /// `StaleFlowReset::reset_flows_to(base, prefix)`.
+    /// Publish the addresses this filter set PERMITS, so the resolver can tell
+    /// "the policy carries this address" from "a name once resolved to it".
+    ///
+    /// Permits only: [`Self::coverage_of`] names every address the set touches,
+    /// blocks included — the DoH lockdown alone names ~85 — and answering a
+    /// client with a blocked address is the opposite of the question being
+    /// asked here.
+    fn publish_enforced_addresses(sid: &str, filters: &[WfpFilterSpec]) {
+        let permitted = filters
+            .iter()
+            .filter(|spec| spec.action == WfpAction::Permit)
+            .flat_map(|spec| {
+                spec.remote_ip
+                    .into_iter()
+                    .chain(spec.remote_ip_set.iter().copied())
+            });
+        crate::enforced_addresses::global_enforced_addresses().publish(sid, permitted);
+    }
+
     fn coverage_of(filters: &[WfpFilterSpec]) -> (Vec<std::net::Ipv4Addr>, bool) {
         let mut seen = std::collections::HashSet::new();
         let destinations = filters
@@ -4964,6 +5088,49 @@ mod tests {
             cache,
             Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
         ))
+    }
+
+    #[test]
+    fn only_permitted_addresses_are_published_as_enforced() {
+        let spec = |action: WfpAction, ip: Option<Ipv4Addr>, set: Vec<Ipv4Addr>| WfpFilterSpec {
+            layer: nrr_platform_api::types::WfpLayerKey::AleAuthConnectV4,
+            action,
+            remote_ip: ip,
+            remote_ip_set: set,
+            remote_port: None,
+            weight: 0,
+            id: WfpFilterId { raw: 1 },
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        };
+        let permitted = Ipv4Addr::new(172, 64, 154, 50);
+        let packed = Ipv4Addr::new(104, 18, 33, 206);
+        let doh_blocked = Ipv4Addr::new(8, 8, 4, 4);
+        let sid = "S-1-5-21-publish-test";
+
+        PerSidApplyOrchestrator::publish_enforced_addresses(
+            sid,
+            &[
+                spec(WfpAction::Permit, Some(permitted), Vec::new()),
+                // The packed form: one filter guarding a whole address set.
+                spec(WfpAction::Permit, None, vec![packed]),
+                // The DoH lockdown names ~85 addresses it BLOCKS. Answering a
+                // client with one of them would be the opposite of enforced.
+                spec(WfpAction::Block, Some(doh_blocked), Vec::new()),
+                // A catch-all carries no address and contributes nothing.
+                spec(WfpAction::Permit, None, Vec::new()),
+            ],
+        );
+
+        let register = crate::enforced_addresses::global_enforced_addresses();
+        assert!(register.is_enforced(sid, permitted));
+        assert!(register.is_enforced(sid, packed), "packed sets count too");
+        assert!(!register.is_enforced(sid, doh_blocked));
+        assert_eq!(register.snapshot(sid).len(), 2);
     }
 
     fn seeded_block_permit_block(session: &WfpSession, api: &MockWindowsApi) {

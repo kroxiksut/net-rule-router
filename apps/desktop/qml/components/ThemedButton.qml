@@ -11,6 +11,11 @@ import QtQuick.Layouts 1.15
 Button {
     id: root
     property var theme
+
+    // Qt names a button from its `text`, so only the tooltip needs mirroring:
+    // a hint reachable by mouse alone is a hint half the users never get.
+    // A caller that sets `Accessible.description` overrides this.
+    Accessible.description: root.ToolTip.text
     // Opt-in multi-line label. The default
     // single-line + ElideRight clips long labels (e.g. the full-width sidebar
     // "Revoke admin approval"); set `wrapText: true` to wrap instead.

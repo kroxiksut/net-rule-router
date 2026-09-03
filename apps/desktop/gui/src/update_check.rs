@@ -69,11 +69,30 @@ pub fn update_available_from(
     if latest.is_empty() {
         return None;
     }
-    if version_is_newer(latest, current_version) {
-        Some((latest.to_string(), cache.html_url.clone()))
-    } else {
-        None
+    if !version_is_newer(latest, current_version) {
+        return None;
     }
+    // The cache is an ordinary file in the user's own `%TEMP%`, and this URL
+    // ends up at `Qt.openUrlExternally` — which hands whatever scheme it is
+    // given to the OS handler. Anything but a release page of the repository we
+    // publish from is refused, and refused WHOLE: the tag and the link come out
+    // of the same file, so a file that lied about one has not earned belief
+    // about the other.
+    if !release_url_is_trusted(&cache.html_url) {
+        return None;
+    }
+    Some((latest.to_string(), cache.html_url.clone()))
+}
+
+/// The only thing a release link may be: an HTTPS page under the repository in
+/// [`RELEASES_REPO`].
+///
+/// A prefix test rather than a URL parse: the set of acceptable links has
+/// exactly one shape, and a parser would answer a question nobody asked while
+/// adding a dependency to a module that deliberately has none.
+fn release_url_is_trusted(url: &str) -> bool {
+    let expected = format!("https://github.com/{RELEASES_REPO}/");
+    url.starts_with(&expected)
 }
 
 /// Strict "is `candidate` newer than `current`" over `MAJOR.MINOR.PATCH
@@ -142,13 +161,41 @@ mod tests {
         let cache = UpdateCheckCache {
             checked_at_ms: 1,
             latest_tag: "v0.2.0".into(),
-            html_url: "https://example.test/rel".into(),
+            html_url: "https://github.com/kroxiksut/net-rule-router/releases/tag/v0.2.0".into(),
         };
         let hit = update_available_from(&cache, "0.1.0-prealpha").expect("newer");
         assert_eq!(hit.0, "0.2.0");
-        assert_eq!(hit.1, "https://example.test/rel");
+        assert_eq!(hit.1, cache.html_url);
         assert!(update_available_from(&cache, "0.2.0").is_none());
         assert!(update_available_from(&UpdateCheckCache::default(), "0.1.0").is_none());
+    }
+
+    #[test]
+    fn a_link_that_is_not_our_release_page_suppresses_the_whole_offer() {
+        let newer = |url: &str| UpdateCheckCache {
+            checked_at_ms: 1,
+            latest_tag: "v9.9.9".into(),
+            html_url: url.into(),
+        };
+        for hostile in [
+            "file:///C:/Windows/System32/calc.exe",
+            "ms-settings:",
+            "http://github.com/kroxiksut/net-rule-router/releases/tag/v9.9.9",
+            "https://github.com.evil.test/kroxiksut/net-rule-router/",
+            "https://github.com/someone-else/net-rule-router/releases",
+            "",
+        ] {
+            assert!(
+                update_available_from(&newer(hostile), "0.1.0").is_none(),
+                "must refuse {hostile:?}",
+            );
+        }
+        // The shape the fetcher actually writes still passes.
+        assert!(update_available_from(
+            &newer("https://github.com/kroxiksut/net-rule-router/releases/tag/v9.9.9"),
+            "0.1.0",
+        )
+        .is_some());
     }
 
     #[test]

@@ -42,7 +42,7 @@ use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
 
 use crate::error::PlatformError;
 
-const OPERATION: &str = "FwpmGetAppIdFromFileName0";
+const OPERATION: &str = nrr_platform_api::error::win32_ops::APP_ID_FROM_FILE;
 const ERROR_ACCESS_DENIED: u32 = 5;
 const ERROR_SHARING_VIOLATION: u32 = 32;
 

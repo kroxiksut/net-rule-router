@@ -15,6 +15,12 @@
 // Row shape (subset used here): { id, ruleType, matchValue, targetRoute,
 // enabled, comment }.
 
+// The preset format version this build writes. Mirrors
+// `nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION`; the Rust test
+// `the_gui_writes_the_current_preset_format_version` reads this line and fails
+// when the two drift.
+var CANONICAL_PRESET_FORMAT_VERSION = 4
+
 // True for the rule types whose match value is a hostname (so callers know to
 // apply host-specific handling such as ACE encoding at the wire boundary).
 function isHostlikeRuleType(ruleType) {
@@ -23,10 +29,24 @@ function isHostlikeRuleType(ruleType) {
         || rt === "suffix-domain" || rt === "exact-fqdn"
 }
 
+// The one spelling of a rule-type slug. `suffix-domain` and `domain` describe
+// the same wire-level kind, as do `exact-ipv4` and `exact-ip`; which spelling a
+// row carries depends only on where it came from (service snapshot vs the edit
+// dialog). Every identity built from a type has to fold them, or the same rule
+// exists twice under two names.
+function canonicalRuleTypeSlug(ruleType) {
+    var t = String(ruleType || "").toLowerCase()
+    if (t === "suffix-domain") return "domain"
+    if (t === "exact-ipv4") return "exact-ip"
+    return t
+}
+
 // Dedup key for import-merge: two rows collide when their type, lowercased
-// match value, and target route all match.
+// match value, and target route all match. The type is folded first — without
+// that, importing `suffix-domain|habr.ru` next to `domain|habr.ru` kept both,
+// and the two then shared one comment row in the sidecar.
 function mergeKey(row) {
-    return String(row.ruleType || "") + "|" +
+    return canonicalRuleTypeSlug(row.ruleType) + "|" +
         String(row.matchValue || "").toLowerCase() + "|" +
         String(row.targetRoute || "")
 }
@@ -49,9 +69,7 @@ function canonicalRuleId(id) {
 // appear under different slugs depending on origin (snapshot vs edited dialog).
 // Order: type|route|value.
 function ruleSignature(row) {
-    var t = String(row.ruleType || "").toLowerCase()
-    if (t === "suffix-domain") t = "domain"
-    if (t === "exact-ipv4") t = "exact-ip"
+    var t = canonicalRuleTypeSlug(row.ruleType)
     return t + "|"
         + String(row.targetRoute || "").toLowerCase() + "|"
         + String(row.matchValue || "").toLowerCase()
@@ -64,9 +82,7 @@ function ruleSignature(row) {
 // producing the same rule intent land on the same sidecar row.
 function sidecarRuleSignatureParts(row) {
     if (!row) return { type: "", value: "", route: "" }
-    var t = String(row.ruleType || "").toLowerCase()
-    if (t === "suffix-domain") t = "domain"
-    if (t === "exact-ipv4") t = "exact-ip"
+    var t = canonicalRuleTypeSlug(row.ruleType)
     var r = String(row.targetRoute || "").toLowerCase()
     return {
         type:  t,
@@ -159,7 +175,11 @@ function buildCanonicalRulesText(rulesModel, route, passthroughSections, include
     }
     var nameLabel = (route === "secondary") ? "Secondary Route" : "Primary Route"
     var lines = []
-    lines.push("# NetRuleRouter preset - version 1")
+    // Must match nrr_domain::rules_file::CURRENT_PRESET_FORMAT_VERSION — the
+    // file may carry version-4 constructs (`--- Auto`, `+block`), and a header
+    // that claims 1 tells the next reader they are not there. Pinned from the
+    // Rust side by `the_gui_writes_the_current_preset_format_version`.
+    lines.push("# NetRuleRouter preset — version " + CANONICAL_PRESET_FORMAT_VERSION)
     lines.push("# name: NetRuleRouter Export - " + nameLabel)
     lines.push("# description: Exported from the NetRuleRouter app on "
         + (new Date()).toISOString())

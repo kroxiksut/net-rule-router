@@ -131,6 +131,7 @@ api.jetbrains.ai  # JetBrains ecosystem
 *.intel.com  # Developer and IT services measured as unreachable from this country
 *.mongodb.com  # Developer and IT services measured as unreachable from this country
 *.notion.so  # Developer and IT services measured as unreachable from this country
+*.qt.io  # Developer and IT services measured as unreachable from this country
 *.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
 *.sentry.io  # Developer and IT services measured as unreachable from this country
 
@@ -185,6 +186,7 @@ gateway.exe  # JetBrains IDE and tooling apps
 gateway64.exe  # JetBrains IDE and tooling apps
 fleet.exe  # JetBrains IDE and tooling apps
 mps.exe  # JetBrains IDE and tooling apps
+MaintenanceTool.exe  # Qt installer and updater (Qt account and downloads are refused from this country)
 
 --- Linux
 # (reserved - not applied on Windows)

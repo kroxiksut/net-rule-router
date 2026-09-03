@@ -159,11 +159,11 @@ impl FakeDiagnostics {
             cache_health: CacheHealthCard {
                 entry_count: 0,
                 healthy: true,
-                rebuilding: false,
             },
             log_health: LogHealthCard {
                 dir_writable: true,
                 total_size_bytes: 0,
+                audit_size_bytes: 0,
                 file_count: 0,
                 dropped_count: 0,
                 last_cleanup_at: None,
@@ -334,6 +334,7 @@ impl MutationExecutor for FakeMutationExecutor {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         }
     }
 

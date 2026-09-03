@@ -282,6 +282,41 @@ mod production {
             }
         }
 
+        /// Open the key, separating "there is no such key" from every other
+        /// reason it will not open.
+        ///
+        /// `Ok(None)` means the profile has no user environment block — a
+        /// state, not a failure. Everything else IS a failure and must stay
+        /// one: read as "no PATH", a refusal or a corrupt hive would make the
+        /// caller rewrite the whole list as our single directory.
+        fn open_optional(
+            &self,
+            access: REG_SAM_FLAGS,
+        ) -> Result<Option<HKEY>, PathRegistrationError> {
+            let subkey = wide(USER_ENVIRONMENT_SUBKEY);
+            let mut hkey = HKEY::default();
+            // SAFETY: same contract as `open` above.
+            let status = unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    PCWSTR(subkey.as_ptr()),
+                    0,
+                    access,
+                    &mut hkey,
+                )
+            };
+            if status == ERROR_SUCCESS {
+                return Ok(Some(hkey));
+            }
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            Err(registry_error(
+                status,
+                &format!("RegOpenKeyExW(HKCU\\{USER_ENVIRONMENT_SUBKEY})"),
+            ))
+        }
+
         fn close(hkey: HKEY) {
             // SAFETY: `hkey` came from `RegOpenKeyExW`. A close failure is not
             // actionable from here.
@@ -299,12 +334,8 @@ mod production {
 
     impl UserEnvironmentStore for RegistryUserEnvironment {
         fn read_path(&self) -> Result<Option<UserEnvironmentValue>, PathRegistrationError> {
-            let hkey = match self.open(KEY_QUERY_VALUE) {
-                Ok(h) => h,
-                // A profile with no user environment block at all: nothing is
-                // registered, which is a state, not a failure.
-                Err(PathRegistrationError::Mechanism { .. }) => return Ok(None),
-                Err(e) => return Err(e),
+            let Some(hkey) = self.open_optional(KEY_QUERY_VALUE)? else {
+                return Ok(None);
             };
             let name = wide(PATH_VALUE_NAME);
             let mut size: u32 = 0;
@@ -351,8 +382,16 @@ mod production {
                 return Err(registry_error(status, "RegQueryValueExW (read)"));
             }
 
+            // The terminator is dropped only if there IS one. A registry value
+            // written without it is legal — `RegSetValueExW` stores whatever
+            // length the caller gave — and unconditionally cutting the last
+            // code unit ate the final character of such a value, which apply
+            // then wrote back truncated.
             let chars = (read_size as usize) / 2;
-            let end = chars.min(buf.len()).saturating_sub(1); // drop the NUL
+            let mut end = chars.min(buf.len());
+            if buf.get(end.wrapping_sub(1)) == Some(&0) {
+                end -= 1;
+            }
             Ok(Some(UserEnvironmentValue {
                 text: String::from_utf16_lossy(&buf[..end]),
                 expandable: value_type == REG_EXPAND_SZ,

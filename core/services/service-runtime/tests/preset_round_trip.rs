@@ -156,7 +156,12 @@ chrome.exe
     let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
         .with_host_app_section(RulesFileSection::Windows);
     let out = exporter
-        .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &Default::default(),
+        )
         .expect("export");
 
     // Original preset has 6 entries; exported parse must have the same
@@ -221,10 +226,20 @@ fn both_routes_import_creates_one_revision_with_both_route_rules() {
     let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
         .with_host_app_section(RulesFileSection::Windows);
     let primary = exporter
-        .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &Default::default(),
+        )
         .expect("export primary");
     let secondary = exporter
-        .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Secondary, false)
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Secondary,
+            false,
+            &Default::default(),
+        )
         .expect("export secondary");
     assert!(primary.file_bytes_utf8.contains("primary.example"));
     assert!(!primary.file_bytes_utf8.contains("secondary.example"));
@@ -343,7 +358,12 @@ fn preset_export_response_bytes_decode_to_canonical_txt() {
     let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
         .with_host_app_section(RulesFileSection::Windows);
     let out = exporter
-        .export_rules_file(nrr_storage::BASELINE_PRINCIPAL, RouteRole::Primary, false)
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &Default::default(),
+        )
         .expect("export");
 
     // The handler wraps the bytes in base64 before sending. Round-trip
@@ -354,4 +374,52 @@ fn preset_export_response_bytes_decode_to_canonical_txt() {
     assert!(decoded.contains("wire-test.example"));
     // content-hash deterministic + 64-hex.
     assert_eq!(out.content_hash_hex.len(), 64);
+}
+
+/// A preset the domain accepts must survive the wire it travels on.
+///
+/// `IMPORT_FILE_SIZE_LIMIT_BYTES` is derived from `IPC_MAX_MESSAGE_BYTES` by
+/// backing out the base64 expansion and an envelope allowance. This measures a
+/// REAL envelope at that size: while the two were both a flat 1 MiB, a preset
+/// the product called valid was refused by the transport as "frame too large",
+/// from the wrong layer and without the domain's message.
+#[test]
+fn a_maximum_size_preset_import_fits_one_ipc_frame() {
+    use base64::Engine as _;
+
+    const FRAME: usize = nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
+    let file = vec![b'a'; nrr_domain::import::IMPORT_FILE_SIZE_LIMIT_BYTES as usize];
+    let envelope = serde_json::json!({
+        "protocol-version": nrr_shared::ipc::IPC_PROTOCOL_VERSION,
+        "request-id": "req-000000",
+        "correlation-id": "corr-00000000-0000-0000-0000-000000000000",
+        "operation": "mutation.submit",
+        "operation-class": "user-scoped-mutation",
+        "confirmation-token": "t-00000000000000000000000000000000",
+        "payload": {
+            "mutation-kind": "preset-import",
+            "dry-run": false,
+            "payload": {
+                "route": "primary",
+                "source-path": "C:/Users/someone/Documents/NetRuleRouter/rules_primary.txt",
+                "file-bytes-b64": base64::engine::general_purpose::STANDARD.encode(&file),
+            },
+        },
+    });
+    let wire = serde_json::to_vec(&envelope).expect("envelope serialises");
+    assert!(
+        wire.len() <= FRAME,
+        "a maximum-size preset import serialises to {} bytes, over the {FRAME} byte frame",
+        wire.len()
+    );
+
+    // Positive control: a file one frame in size does not fit once encoded, so
+    // the assertion above is about the derived cap and not a roomy frame.
+    let oversized = vec![b'a'; FRAME];
+    assert!(
+        base64::engine::general_purpose::STANDARD
+            .encode(&oversized)
+            .len()
+            > FRAME
+    );
 }

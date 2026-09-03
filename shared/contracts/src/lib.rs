@@ -119,8 +119,8 @@ pub use ipc_transport::{
 };
 pub use localization::{
     load_locale_catalog, load_locale_descriptors, load_locale_map, load_locale_reports,
-    resolve_catalog_text, translate_or, LocaleDescriptor, LocaleLoadReport, LocaleLoadStatus,
-    LocaleSource, LOCALE_SCHEMA_PATH, LOCALE_SCHEMA_VERSION,
+    load_locale_state, resolve_catalog_text, translate_or, LocaleDescriptor, LocaleLoadReport,
+    LocaleLoadState, LocaleLoadStatus, LocaleSource, LOCALE_SCHEMA_PATH, LOCALE_SCHEMA_VERSION,
 };
 pub use settings_export::SettingsExportV1;
 pub use summary::{
@@ -1886,6 +1886,35 @@ impl FromStr for RulesDuplicateResolution {
     }
 }
 
+/// How long work the service has not seen yet stays parked.
+///
+/// One window for both parks — the rules marker in the GUI's sidecar and the
+/// routing-settings intents in preferences. They record the same fact, so a
+/// month-old "block everything" must not land on the next connect while rules
+/// parked in the same session have long since lapsed.
+pub const PARKED_INTENT_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// Key carrying the parking timestamp inside a parked-intents blob.
+pub const PARKED_AT_MS_KEY: &str = "parked-at-ms";
+
+/// Whether a parked-intents blob is past [`PARKED_INTENT_TTL_SECONDS`].
+///
+/// A blob without the stamp counts as fresh: it was written before the stamp
+/// existed, and discarding a user's work over a format detail is worse than
+/// carrying it one session longer — the next write stamps it.
+pub fn parked_intents_expired(raw: &str, now_ms: i64) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(parked_at) = value
+        .get(PARKED_AT_MS_KEY)
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return false;
+    };
+    now_ms.saturating_sub(parked_at) > PARKED_INTENT_TTL_SECONDS.saturating_mul(1000)
+}
+
 /// How the application responds when the external rules file changes on disk.
 ///
 /// Stored in `UiPreferences`. Determines the default behavior of the
@@ -2446,7 +2475,7 @@ const SHARED_SHELL_REVIEW_DIALOGS: [GuiDialog; 2] = [
 ];
 
 const MAIN_WINDOW_SHELL_CONTRACT: MainWindowShellContract = MainWindowShellContract {
-    window_title: "NetRuleRouter",
+    window_title: crate::product_identity::PRODUCT_NAME,
     layout_zones: &MAIN_WINDOW_LAYOUT_ZONES,
     sidebar_sections: &MAIN_WINDOW_SECTIONS,
     shared_shell_sections: &SHARED_SHELL_SECTIONS,
@@ -2684,7 +2713,7 @@ const SETTINGS_CONTRACT: SettingsContract = SettingsContract {
 };
 
 const ABOUT_CONTRACT: AboutContract = AboutContract {
-    product_name: "NetRuleRouter",
+    product_name: crate::product_identity::PRODUCT_NAME,
     edition: "",
     license: "MPL-2.0",
     project_url: "https://github.com/kroxiksut/net-rule-router",

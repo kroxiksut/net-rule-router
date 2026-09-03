@@ -229,6 +229,40 @@ ColumnLayout {
         return score
     }
 
+    // The rows are not this machine's. Stated before anything else on the
+    // screen, and without a dismiss: it is not advice, it is the reason every
+    // control below is inert. It clears itself the moment a live list arrives.
+    Frame {
+        Layout.fillWidth: true
+        visible: !root.interfacesAreLive
+        padding: root.uiTheme.spacingSm
+        background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: root.uiTheme.spacingXxs
+            Label {
+                Layout.fillWidth: true
+                text: root.tr("interfaces.placeholder-rows.banner-title",
+                    "These are not your adapters")
+                color: root.uiTheme.colorAccent
+                font.bold: true
+                wrapMode: Text.WordWrap
+            }
+            Label {
+                Layout.fillWidth: true
+                text: root.tr("interfaces.placeholder-rows.banner-body",
+                    "The list below did not come from this machine — the background service could not enumerate the adapters, so example rows are shown. Assigning a route here would bind it to an adapter that does not exist, so the buttons stay disabled until a real list arrives.")
+                color: root.textColor
+                wrapMode: Text.WordWrap
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("action.refresh-interfaces", "Refresh interfaces")
+                onClicked: root.interfacesRolesController.refreshInterfacesFromService()
+            }
+        }
+    }
+
     // Why traffic is being blocked, stated on the screen the user is sent to.
     // Two sources: the service's own fail-closed posture (strict mode), and the
     // plain fact that the bound additional adapter is absent -- the second
@@ -799,7 +833,7 @@ ColumnLayout {
                                        : root.uiTheme.colorWarning)
                             }
                             Label {
-                                text: (root.uiRevision, root.availabilityLabel(model.availability))
+                                text: root.uiRevision >= 0 ? root.availabilityLabel(model.availability) : ""
                                 color: root.textColor
                             }
                             Label {
@@ -959,7 +993,11 @@ ColumnLayout {
                                 // binding is stored and takes effect when
                                 // the adapter comes back up. ToolTip below
                                 // warns the user that the adapter is offline.
-                                enabled: _holdsPrimary ? true : !_someoneElseHoldsPrimary
+                                // Placeholder rows name no adapter of this
+                                // machine; binding a role to one produces an
+                                // apply that changes nothing.
+                                enabled: root.interfacesAreLive
+                                    && (_holdsPrimary ? true : !_someoneElseHoldsPrimary)
                                 text: root.uiRevision >= 0
                                     ? (_holdsPrimary
                                         ? root.tr("interfaces.action.unassign-primary",
@@ -981,7 +1019,8 @@ ColumnLayout {
                                     ? root.interfacesRolesController.adapterIndexHoldingRole("secondary") : -1
                                 readonly property bool _someoneElseHoldsSecondary:
                                     _secondaryHolderIndex >= 0 && !_holdsSecondary
-                                enabled: _holdsSecondary ? true : !_someoneElseHoldsSecondary
+                                enabled: root.interfacesAreLive
+                                    && (_holdsSecondary ? true : !_someoneElseHoldsSecondary)
                                 text: root.uiRevision >= 0
                                     ? (_holdsSecondary
                                         ? root.tr("interfaces.action.unassign-secondary",

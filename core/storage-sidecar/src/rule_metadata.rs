@@ -26,12 +26,22 @@ use crate::error::SidecarResult;
 pub struct RuleSignature(pub String);
 
 impl RuleSignature {
-    /// Build a signature from the three rule identity axes.
+    /// Build a signature from the three rule identity axes, or `None` when a
+    /// component cannot carry one.
     ///
-    /// The match value is lowercased (case-insensitive for FQDNs and
-    /// app filenames; IPv4 octets are unaffected). The `|` delimiter
-    /// is safe because canonical rule values never contain it.
-    pub fn build(rule_type: &str, match_value: &str, target_route: &str) -> Self {
+    /// The match value is lowercased (case-insensitive for FQDNs and app
+    /// filenames; IPv4 octets are unaffected). A component holding the `|`
+    /// delimiter is refused rather than joined: canonical values never contain
+    /// it, but the components arrive from an RPC payload, and a value with a
+    /// pipe in it would land on — and overwrite — another rule's comment. An
+    /// empty component is refused for the same reason.
+    pub fn build(rule_type: &str, match_value: &str, target_route: &str) -> Option<Self> {
+        if [rule_type, match_value, target_route]
+            .iter()
+            .any(|part| part.is_empty() || part.contains('|'))
+        {
+            return None;
+        }
         let mut s =
             String::with_capacity(rule_type.len() + match_value.len() + target_route.len() + 2);
         s.push_str(rule_type);
@@ -43,7 +53,7 @@ impl RuleSignature {
         }
         s.push('|');
         s.push_str(target_route);
-        Self(s)
+        Some(Self(s))
     }
 
     /// Borrow the underlying string for SQL parameter binding.
@@ -233,7 +243,8 @@ mod tests {
 
     #[test]
     fn signature_lowercases_match_value_only() {
-        let sig = RuleSignature::build("zone", "Пример.РФ", "primary");
+        let sig =
+            RuleSignature::build("zone", "Пример.РФ", "primary").expect("a signature with no pipe");
         assert_eq!(sig.as_str(), "zone|пример.рф|primary");
     }
 
@@ -266,7 +277,7 @@ mod tests {
     fn missing_comment_reads_as_none() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("zone", "ru", "primary");
+        let sig = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
         assert!(db.read_comment(&sig)?.is_none());
         Ok(())
     }
@@ -275,7 +286,7 @@ mod tests {
     fn write_then_read_roundtrip() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("zone", "рф", "primary");
+        let sig = RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe");
         db.write_comment(&sig, "Россия — зона .рф (xn--p1ai)")?;
         let got = db.read_comment(&sig)?;
         assert_eq!(got.as_deref(), Some("Россия — зона .рф (xn--p1ai)"));
@@ -286,7 +297,8 @@ mod tests {
     fn write_overwrites_previous() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("domain", "example.com", "primary");
+        let sig = RuleSignature::build("domain", "example.com", "primary")
+            .expect("a signature with no pipe");
         db.write_comment(&sig, "first")?;
         db.write_comment(&sig, "second")?;
         assert_eq!(db.read_comment(&sig)?.as_deref(), Some("second"));
@@ -297,7 +309,8 @@ mod tests {
     fn writing_empty_string_deletes_row() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("domain", "example.com", "primary");
+        let sig = RuleSignature::build("domain", "example.com", "primary")
+            .expect("a signature with no pipe");
         db.write_comment(&sig, "x")?;
         db.write_comment(&sig, "")?;
         assert!(db.read_comment(&sig)?.is_none());
@@ -308,7 +321,8 @@ mod tests {
     fn explicit_delete_is_idempotent() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("domain", "example.com", "primary");
+        let sig = RuleSignature::build("domain", "example.com", "primary")
+            .expect("a signature with no pipe");
         // Delete with no row present.
         db.delete_comment(&sig)?;
         // Write then delete then delete again.
@@ -320,12 +334,26 @@ mod tests {
     }
 
     #[test]
+    fn a_component_carrying_the_delimiter_is_refused() {
+        // The components arrive from an RPC payload. A value with a pipe in it
+        // would spell a DIFFERENT rule's signature and overwrite that rule's
+        // comment, so it is refused rather than joined.
+        assert!(RuleSignature::build("domain", "a|b", "primary").is_none());
+        assert!(RuleSignature::build("dom|ain", "example.com", "primary").is_none());
+        assert!(RuleSignature::build("domain", "example.com", "pri|mary").is_none());
+        assert!(RuleSignature::build("", "example.com", "primary").is_none());
+        assert!(RuleSignature::build("domain", "", "primary").is_none());
+        assert!(RuleSignature::build("domain", "example.com", "primary").is_some());
+    }
+
+    #[test]
     fn read_all_returns_every_non_empty_row() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let s1 = RuleSignature::build("zone", "ru", "primary");
-        let s2 = RuleSignature::build("domain", "vk.com", "secondary");
-        let s3 = RuleSignature::build("zone", "su", "primary");
+        let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
+        let s2 = RuleSignature::build("domain", "vk.com", "secondary")
+            .expect("a signature with no pipe");
+        let s3 = RuleSignature::build("zone", "su", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "ru-comment")?;
         db.write_comment(&s2, "vk-comment")?;
         // s3 written then cleared — should not surface in read_all.
@@ -351,9 +379,10 @@ mod tests {
     fn gc_orphans_removes_only_unlisted() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let s1 = RuleSignature::build("zone", "ru", "primary");
-        let s2 = RuleSignature::build("zone", "рф", "primary");
-        let s3 = RuleSignature::build("domain", "vk.com", "primary");
+        let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
+        let s2 = RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe");
+        let s3 =
+            RuleSignature::build("domain", "vk.com", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "ru")?;
         db.write_comment(&s2, "rf")?;
         db.write_comment(&s3, "vk")?;
@@ -370,8 +399,8 @@ mod tests {
     fn gc_orphans_with_empty_keep_set_clears_all() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let s1 = RuleSignature::build("zone", "ru", "primary");
-        let s2 = RuleSignature::build("zone", "рф", "primary");
+        let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
+        let s2 = RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "a")?;
         db.write_comment(&s2, "b")?;
         let removed = db.gc_orphans(&[])?;
@@ -385,7 +414,7 @@ mod tests {
     fn gc_orphans_with_no_orphans_returns_zero() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let s1 = RuleSignature::build("zone", "ru", "primary");
+        let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "a")?;
         let removed = db.gc_orphans(&[s1])?;
         assert_eq!(removed, 0);
@@ -396,7 +425,7 @@ mod tests {
     fn writing_unicode_persists_through_reopen() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let path = tmp.path().join("sidecar.db");
-        let sig = RuleSignature::build("zone", "рф", "primary");
+        let sig = RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe");
         {
             let db = SidecarDb::open(&path)?;
             db.write_comment(&sig, "中国 / 中國 / РФ")?;
@@ -410,7 +439,8 @@ mod tests {
     fn empty_table_read_returns_none() -> SidecarResult<()> {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
-        let sig = RuleSignature::build("domain", "absent.example", "secondary");
+        let sig = RuleSignature::build("domain", "absent.example", "secondary")
+            .expect("a signature with no pipe");
         assert!(db.read_comment(&sig)?.is_none());
         Ok(())
     }

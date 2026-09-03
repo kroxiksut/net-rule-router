@@ -675,6 +675,8 @@ fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
                 WfpLayerKey::AleAuthConnectV4,
                 WfpAction::Block,
                 weight,
+                // The real catch-all: no conditions, so nothing else to name.
+                "",
             ),
             user_sid,
             app_pattern: None,
@@ -815,7 +817,23 @@ pub fn lower_catch_all_kill_switch(
             // 4d — DNS-over-primary exemptions are port-scoped (remote 53).
             remote_port: flow.flow.dst_port,
             weight,
-            id: derive_catch_all_id(user_sid.as_deref(), layer, action, weight),
+            id: derive_catch_all_id(
+                user_sid.as_deref(),
+                layer,
+                action,
+                weight,
+                // Every condition that distinguishes one exemption from
+                // another. Two of these sharing an id is a phantom filter.
+                &format!(
+                    "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    df.remote_ip,
+                    flow.flow.dst_port,
+                    df.remote_subnet,
+                    df.remote_subnet_v6,
+                    ip_protocol,
+                    app_pattern,
+                ),
+            ),
             user_sid,
             app_pattern,
             local_interface_luid,
@@ -933,19 +951,30 @@ fn catch_all_weight(
     }
 }
 
-/// Deterministic id for a catch-all filter. `(layer, weight)` is unique within a
-/// catch-all set (each band uses each weight once), so this is stable + distinct;
-/// the oracle ignores ids regardless.
+/// Deterministic id for a catch-all filter.
+///
+/// `discriminator` must carry everything else that makes two filters in this
+/// band different from each other. For the true catch-all it is empty —
+/// `(sid, layer, action, weight)` really is the whole identity there, since each
+/// band uses each weight once. The exemption band is NOT like that: those
+/// filters differ by remote address, port, subnet and app, and seeding without
+/// them made two of them share an id. A colliding add returns
+/// `FWP_E_ALREADY_EXISTS`, which `execute_batch` counts as success — a phantom
+/// filter: recorded as installed, absent from WFP, enforcing nothing.
+///
+/// The behavioural oracle cannot catch this: it compares behaviour and ignores
+/// ids and weights by construction.
 fn derive_catch_all_id(
     sid: Option<&str>,
     layer: WfpLayerKey,
     action: WfpAction,
     weight: u64,
+    discriminator: &str,
 ) -> WfpFilterId {
     const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
     let seed = format!(
-        "catchall|{}|{}|{}|{weight}",
+        "catchall|{}|{}|{}|{weight}|{discriminator}",
         sid.unwrap_or(""),
         nrr_platform_api::wfp_behavioral::layer_ord(layer),
         nrr_platform_api::wfp_behavioral::action_ord(action),
@@ -1070,8 +1099,6 @@ pub struct EgressLuids {
     /// LUID of the additional link. `0` means "not resolvable right now" and
     /// the kill-switch lowering declines rather than guessing.
     pub secondary: u64,
-    /// LUID of the main link, when one is bound.
-    pub primary: u64,
 }
 
 /// One plan in, the filters that express it out.
@@ -1200,5 +1227,30 @@ mod tests {
         assert_eq!(ale.weight, pkt.weight, "mirror shares the ALE weight");
         assert_ne!(ale.id, pkt.id, "the pair must have distinct filter ids");
         assert_eq!(ale.weight, BASE_BLOCK);
+    }
+    /// Two exemptions that differ only by the conditions they carry must get
+    /// DIFFERENT ids.
+    ///
+    /// Seeded on `(sid, layer, action, weight)` alone they collided, the second
+    /// add came back `FWP_E_ALREADY_EXISTS` — which the batch counts as success
+    /// — and the result was a phantom: recorded installed, absent from WFP,
+    /// enforcing nothing. The behavioural oracle cannot see this, because it
+    /// ignores ids by construction.
+    #[test]
+    fn catch_all_ids_separate_filters_that_differ_only_in_their_conditions() {
+        let sid = Some("S-1-5-21-1-2-3-1001");
+        let base = |disc: &str| {
+            derive_catch_all_id(
+                sid,
+                WfpLayerKey::AleAuthConnectV4,
+                WfpAction::Permit,
+                100,
+                disc,
+            )
+        };
+        assert_ne!(base("1.1.1.1|53"), base("8.8.8.8|53"));
+        assert_ne!(base("1.1.1.1|53"), base("1.1.1.1|443"));
+        // Same inputs still give the same id — the whole point of deriving it.
+        assert_eq!(base("1.1.1.1|53"), base("1.1.1.1|53"));
     }
 }

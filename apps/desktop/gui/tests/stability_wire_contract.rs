@@ -226,7 +226,11 @@ fn the_stability_set_payload_is_built_only_by_the_shared_merge() {
         "the merge must produce the payload the Set RPC sends"
     );
     assert!(
-        main_qml.contains("window._readServiceIntent()"),
+        // The reader moved into `flows/ServiceIntentController.qml` when the
+        // shell was decomposed; what matters is that the Set call site still
+        // feeds the user's recorded decisions into the merge, whoever owns the
+        // function.
+        main_qml.contains("_readServiceIntent()"),
         "the merge base must include the user's recorded decisions, or a full-row write \
          re-affirms whatever default the service happens to hold"
     );

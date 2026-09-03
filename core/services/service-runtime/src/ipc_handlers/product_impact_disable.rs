@@ -117,6 +117,7 @@ impl ProductImpactDisableTemporaryHandler {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         };
 
         let stored_payload = serde_json::json!({

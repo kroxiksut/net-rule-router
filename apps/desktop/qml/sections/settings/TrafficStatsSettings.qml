@@ -632,13 +632,8 @@ GroupBox {
         }
     }
 
-    // QtQuick.Dialogs `selectedFile` is a `file:///` QUrl; strip to a plain
-    // local path for the bridge's QFile write.
     function _localPathFromUrl(urlValue) {
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
 
     // Persist the selected period as a device-local UI preference. It is a

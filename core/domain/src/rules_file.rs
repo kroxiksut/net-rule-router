@@ -456,6 +456,25 @@ pub struct UnknownSection {
     pub entries: Vec<RulesFileEntry>,
 }
 
+// ── PassthroughSection ───────────────────────────────────────────────────────
+
+/// A section this build does not parse, carried through an export as the raw
+/// body text captured when the file was imported.
+///
+/// [`UnknownSection`] is what the PARSER produces — structured entries it can
+/// still round-trip. This is what an EXPORTER has: the canonical revision store
+/// keeps no unknown sections, so the only faithful representation left is the
+/// bytes themselves. Reconstructing entries from them would drop the comments
+/// and blank lines that make the round-trip byte-exact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassthroughSection {
+    /// Section name as it appeared after `--- `, without the marker.
+    pub name: String,
+    /// The section body, no header line. A non-empty body ends in exactly one
+    /// newline; the writer does not add or remove any.
+    pub body: String,
+}
+
 // ── Parse stage ───────────────────────────────────────────────────────────────
 
 /// Format version recognised by this build.
@@ -598,19 +617,39 @@ pub struct ParseOutcome {
 ///
 /// Lines before the first section header are treated as free comments.
 /// Tries to extract the format version from a preamble line of the form
-/// `# NetRuleRouter rules file — version N` (with a Unicode em-dash).
+/// `# NetRuleRouter rules file — version N`.
 fn parse_version_header(line: &str) -> Option<u32> {
-    // The separator is an em-dash (U+2014), matching the documented format.
-    const PREFIX: &str = "# NetRuleRouter rules file \u{2014} version ";
-    line.trim().strip_prefix(PREFIX)?.trim().parse::<u32>().ok()
+    parse_dashed_header(line, "# NetRuleRouter rules file ", " version ")
+}
+
+/// Every dash a person or an editor can produce where the format documents an
+/// em-dash.
+///
+/// Only the em-dash is WRITTEN, and the docs keep saying so. Accepting only it
+/// on READ was a separate decision, and the wrong one: an ASCII hyphen is what
+/// a keyboard gives you, what an editor's autocorrect leaves behind, and what
+/// most of the presets in this repository actually contain — so their version
+/// header went unrecognised, `is_preset_file` stayed false, and the "this file
+/// is from a newer version" branch could never fire on the files it was
+/// written for.
+const HEADER_DASHES: [&str; 3] = ["\u{2014}", "\u{2013}", "-"];
+
+/// `{prefix}{dash}{infix}{number}`, for any accepted spelling of the dash.
+fn parse_dashed_header(line: &str, prefix: &str, infix: &str) -> Option<u32> {
+    let rest = line.trim().strip_prefix(prefix)?;
+    for dash in HEADER_DASHES {
+        if let Some(number) = rest.strip_prefix(dash).and_then(|t| t.strip_prefix(infix)) {
+            return number.trim().parse::<u32>().ok();
+        }
+    }
+    None
 }
 
 /// Parses a preset format header: `# NetRuleRouter preset — version N`.
 ///
 /// Returns the declared format version or `None` if the line does not match.
 fn parse_preset_header(line: &str) -> Option<u32> {
-    const PREFIX: &str = "# NetRuleRouter preset \u{2014} version ";
-    line.trim().strip_prefix(PREFIX)?.trim().parse::<u32>().ok()
+    parse_dashed_header(line, "# NetRuleRouter preset ", " version ")
 }
 
 /// Parses a metadata key-value comment from the file preamble.
@@ -1229,10 +1268,28 @@ pub fn canonical_rule_set_to_rules_file_parsed(
 ///
 /// unsupported section preservation requires the caller to thread the original
 /// `unknown_sections` through (the canonical revision store does not retain
-/// them today).
+/// them today). A caller holding them as raw text instead of parsed entries —
+/// an exporter reading that store — uses
+/// [`write_rules_file_with_passthrough`].
 pub fn write_rules_file(
     parsed: &RulesFileParsed,
     unknown: &[UnknownSection],
+    metadata: Option<&PresetMetadata>,
+) -> String {
+    write_rules_file_with_passthrough(parsed, unknown, &[], metadata)
+}
+
+/// [`write_rules_file`] plus sections carried as raw text.
+///
+/// An exporter reading the canonical revision store has no `unknown_sections`
+/// to thread through — the store does not retain them — so without this the
+/// foreign-OS and unsupported blocks a user imported are dropped on the way
+/// back out, against the preservation guarantee on [`UnknownSection`]. The
+/// caller that captured them at import time supplies them here.
+pub fn write_rules_file_with_passthrough(
+    parsed: &RulesFileParsed,
+    unknown: &[UnknownSection],
+    passthrough: &[PassthroughSection],
     metadata: Option<&PresetMetadata>,
 ) -> String {
     let mut out = String::new();
@@ -1302,6 +1359,23 @@ pub fn write_rules_file(
         out.push('\n');
         for entry in &unknown_section.entries {
             write_entry_line(&mut out, entry, false);
+        }
+    }
+
+    // Raw-text sections last, in supplied order. The body is emitted verbatim:
+    // the point of carrying bytes instead of entries is that nothing here is
+    // re-rendered.
+    for section in passthrough {
+        if !first_section {
+            out.push('\n');
+        }
+        first_section = false;
+        out.push_str("--- ");
+        out.push_str(&section.name);
+        out.push('\n');
+        out.push_str(&section.body);
+        if !section.body.is_empty() && !section.body.ends_with('\n') {
+            out.push('\n');
         }
     }
 
@@ -2411,7 +2485,115 @@ corp.example.com
         );
     }
 
+    /// The GUI writes its own preset files, so it declares the format version
+    /// itself. A file it saves can carry version-4 constructs (`--- Auto`,
+    /// `+block`) — a header claiming an older version tells the next reader
+    /// they are not there.
+    #[test]
+    fn the_gui_writes_the_current_preset_format_version() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/qml/lib/rules.js");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        const DECL: &str = "var CANONICAL_PRESET_FORMAT_VERSION = ";
+        let declared: u32 = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(DECL))
+            .unwrap_or_else(|| panic!("`{DECL}` is gone from rules.js"))
+            .trim()
+            .parse()
+            .expect("the declared version is a number");
+        assert_eq!(
+            declared, CURRENT_PRESET_FORMAT_VERSION,
+            "rules.js declares preset format version {declared}, this build writes \
+             {CURRENT_PRESET_FORMAT_VERSION}"
+        );
+
+        // The header the GUI emits must also be the one the parser reads back.
+        let header = format!(
+            "# NetRuleRouter preset \u{2014} version {declared}\n--- Domains\nexample.com\n"
+        );
+        assert_eq!(
+            parse_rules_file(&header).file_format_version,
+            Some(CURRENT_PRESET_FORMAT_VERSION)
+        );
+    }
+
+    /// Verified against the presets this repository ships: 32 of them declare
+    /// their version with an ASCII hyphen and 4 with an em-dash. Rejecting the
+    /// hyphen meant `file_format_version` was `None` on nearly every real file.
+    #[test]
+    fn a_version_header_is_read_with_any_dash_a_keyboard_produces() {
+        for dash in ["\u{2014}", "\u{2013}", "-"] {
+            let preset =
+                format!("# NetRuleRouter preset {dash} version 4\n--- Domains\nexample.com\n");
+            assert_eq!(
+                parse_rules_file(&preset).file_format_version,
+                Some(4),
+                "preset header with {dash:?}"
+            );
+
+            let rules =
+                format!("# NetRuleRouter rules file {dash} version 4\n--- Domains\nexample.com\n");
+            assert_eq!(
+                parse_rules_file(&rules).file_format_version,
+                Some(4),
+                "rules-file header with {dash:?}"
+            );
+        }
+
+        // Positive control: a dash outside the accepted set, and a line that is
+        // not the header at all, are still not a version declaration.
+        assert_eq!(
+            parse_rules_file("# NetRuleRouter preset ~ version 4\n").file_format_version,
+            None
+        );
+        assert_eq!(
+            parse_rules_file("# something else \u{2014} version 4\n").file_format_version,
+            None
+        );
+    }
+
     // ── write_rules_file ──────────────────────────────────────────────────────
+
+    /// The raw body must come back out as a section the parser recognises as
+    /// unknown — emitting bytes is only preservation if the result still reads
+    /// as a section on the next import.
+    #[test]
+    fn a_carried_passthrough_section_parses_back_as_an_unknown_section() {
+        let parsed = parse_rules_file(
+            "--- Domains
+example.com
+",
+        )
+        .parsed;
+        let carried = [PassthroughSection {
+            name: "CIDR".to_string(),
+            body: "10.0.0.0/8
+"
+            .to_string(),
+        }];
+
+        let text = write_rules_file_with_passthrough(&parsed, &[], &carried, None);
+        let outcome = parse_rules_file(&text);
+        let names: Vec<&str> = outcome
+            .unknown_sections
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["CIDR"],
+            "written text:
+{text}"
+        );
+        assert_eq!(
+            outcome.unknown_sections[0].entries[0].match_value, "10.0.0.0/8",
+            "written text:
+{text}"
+        );
+    }
 
     #[test]
     fn write_empty_parsed_returns_empty_string() {

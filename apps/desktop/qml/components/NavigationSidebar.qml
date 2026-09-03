@@ -161,7 +161,7 @@ Pane {
                             readonly property int pendingBadge:
                                 navEntry.isRulesEntry
                                     && (root.sidebarCollapsed || !navigationSidebar.rulesNavExpanded)
-                                ? root.autoRuleCandidatesPending : 0
+                                ? root.autoRuleSuggestionsController.autoRuleCandidatesPending : 0
                             Label {
                                 Layout.preferredWidth: 20
                                 Layout.fillWidth: root.sidebarCollapsed
@@ -413,7 +413,7 @@ Pane {
                         highlighted: root.section === "rule-suggestions"
                         Accessible.name: root.tr("rules.suggestions.inbox.nav-label",
                             "Suggested addresses")
-                        onClicked: root.openAutoRuleSuggestions()
+                        onClicked: root.autoRuleSuggestionsController.openAutoRuleSuggestions()
                         background: PanelSurface {
                             theme: root.uiTheme
                             cornerRadius: root.uiTheme.radiusSm
@@ -441,8 +441,8 @@ Pane {
                                 verticalAlignment: Text.AlignVCenter
                             }
                             Label {
-                                visible: root.autoRuleCandidatesPending > 0
-                                text: String(root.autoRuleCandidatesPending)
+                                visible: root.autoRuleSuggestionsController.autoRuleCandidatesPending > 0
+                                text: String(root.autoRuleSuggestionsController.autoRuleCandidatesPending)
                                 color: rulesSuggestionsInboxButton.highlighted ? palette.highlightedText : root.accentColor
                                 font.bold: true
                             }

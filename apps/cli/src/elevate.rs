@@ -155,6 +155,16 @@ pub fn relay_request(args: &[String]) -> Option<RelayRequest> {
     })
 }
 
+/// Whether the relayed verb begins by stopping the service. Those are the runs
+/// that wait out the post-elevation settle before starting; everything else (a
+/// status read, an install of a stopped service) has nothing to tear down.
+fn takes_the_service_down(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("stop" | "restart" | "uninstall")
+    )
+}
+
 /// What the elevated relay reported back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayResult {
@@ -205,6 +215,9 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
             return exit::FAILED;
         }
     };
+    if takes_the_service_down(&request.args) {
+        nrr_platform_api::elevation::settle_after_elevation();
+    }
     match std::process::Command::new(exe).args(&request.args).output() {
         Ok(output) => {
             let code = output
@@ -493,6 +506,23 @@ mod tests {
             None,
             "a code no process can return"
         );
+    }
+
+    #[test]
+    fn only_the_verbs_that_stop_the_service_wait_first() {
+        for verb in ["stop", "restart", "uninstall"] {
+            assert!(
+                takes_the_service_down(&[verb.to_string()]),
+                "{verb} stops the service"
+            );
+        }
+        for verb in ["status", "start", "install", "version"] {
+            assert!(
+                !takes_the_service_down(&[verb.to_string()]),
+                "{verb} has nothing to tear down"
+            );
+        }
+        assert!(!takes_the_service_down(&[]));
     }
 
     #[test]

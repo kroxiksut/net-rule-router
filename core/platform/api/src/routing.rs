@@ -131,20 +131,45 @@ impl RoutingTransaction {
             }
 
             RoutingAction::UpdateRoute { old, new } => {
-                // Step 1: delete the old entry.
-                self.api.delete_ip_forward_entry(old)?;
+                // Step 1: delete the old entry. An entry that is already gone is
+                // success here for the same reason it is under `DeleteRoute` —
+                // the desired end state is "the old route is not there" — and a
+                // bare `?` failed the WHOLE apply over a route somebody else had
+                // already removed.
+                match self.api.delete_ip_forward_entry(old) {
+                    Ok(()) => {}
+                    Err(e) if e.classify() == ErrorClass::Idempotent => {}
+                    Err(e) => return Err(e),
+                }
+                // The undo is journalled BEFORE the add is attempted. Recorded
+                // only on success, a failure between the two left the old route
+                // deleted with nothing in the journal that could put it back:
+                // `rollback()` knew nothing about it, and the inline restore
+                // below was the only chance — one that itself could fail, with
+                // the route then lost for good.
+                self.compensating.push(CompensatingAction::SwapRoute {
+                    delete_new: new.clone(),
+                    restore_old: old.clone(),
+                });
                 // Step 2: add the new entry.
                 match self.api.create_ip_forward_entry(new) {
-                    Ok(()) => {
-                        self.compensating.push(CompensatingAction::SwapRoute {
-                            delete_new: new.clone(),
-                            restore_old: old.clone(),
-                        });
-                    }
+                    Ok(()) => {}
+                    // A pre-existing entry under this key is the same
+                    // "somebody else's overlay" case `AddRoute` treats as
+                    // success, and for the same reason: we neither own nor undo
+                    // it, and a more specific prefix still wins.
+                    Err(e) if e.classify() == ErrorClass::Conflict => {}
                     Err(e) => {
-                        // New add failed. Best-effort: try to restore the old entry
-                        // so the system is not left without any route for this dest.
-                        let _ = self.api.create_ip_forward_entry(old);
+                        // The add failed, so there is no new route to delete on
+                        // the way back — only the old one to restore. Narrow the
+                        // journalled undo to that, then let `rollback()` run it
+                        // along with everything else, in order.
+                        if let Some(CompensatingAction::SwapRoute { restore_old, .. }) =
+                            self.compensating.pop()
+                        {
+                            self.compensating
+                                .push(CompensatingAction::AddRoute(restore_old));
+                        }
                         return Err(e);
                     }
                 }
@@ -450,5 +475,36 @@ mod tests {
         assert_eq!(table.len(), 1);
         assert_eq!(table[0].destination, r2.destination);
         assert_eq!(tx.pending_undo_count(), 2);
+    }
+    /// An update whose add fails leaves the old route RECOVERABLE.
+    ///
+    /// The delete has already happened by then, so the only thing between the
+    /// user and a destination with no route at all is the undo journal.
+    /// Recording the undo only on SUCCESS meant `rollback()` had nothing for
+    /// this case: the single inline retry was the whole recovery, and if that
+    /// failed too the route was gone for good.
+    #[test]
+    fn a_failed_update_leaves_the_old_route_in_the_undo_journal() {
+        let api = api();
+        let old = route([10, 0, 0, 0], [192, 168, 1, 1], 5, true);
+        let new_route = route([10, 0, 0, 0], [192, 168, 1, 2], 5, true);
+        // The add fails; the delete before it does not.
+        api.set_route_create_error(Some(PlatformError::Win32 {
+            operation: "CreateIpForwardEntry2",
+            code: 0x5,
+            message: "denied".to_string(),
+        }));
+        let mut tx = RoutingTransaction::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        assert!(tx
+            .execute(&[RoutingAction::UpdateRoute {
+                old: old.clone(),
+                new: new_route,
+            }])
+            .is_err());
+        assert_eq!(
+            tx.pending_undo_count(),
+            1,
+            "the old route must be restorable from the journal, not only inline",
+        );
     }
 }

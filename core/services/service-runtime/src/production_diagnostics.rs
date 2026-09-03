@@ -134,6 +134,10 @@ pub struct ProductionDiagnosticsFacade {
     /// `RevisionsRepository`. `None` when storage is degraded.
     state_conn: Option<Arc<Mutex<Connection>>>,
     diagnostic_session: DiagnosticSessionHandle,
+    /// The operational log writer, when one is installed. Its drop counter is
+    /// the only place that knows an event was lost, and `None` here is what a
+    /// caller with no writer looks like — not "nothing was dropped".
+    log_writer: Option<Arc<nrr_diagnostics::LogWriter>>,
     /// Last chain verification, keyed by the newest audit file's
     /// (path, length, mtime). The GUI polls `get_status` on a timer and each
     /// call re-read the whole current audit file and re-hashed every line;
@@ -191,8 +195,16 @@ impl ProductionDiagnosticsFacade {
             alerts_repo,
             state_conn,
             diagnostic_session: DiagnosticSessionHandle::new(),
+            log_writer: None,
             chain_cache: Mutex::new(None),
         }
+    }
+
+    /// Attach the installed log writer so the health card can report events
+    /// the service actually lost.
+    pub fn with_log_writer(mut self, writer: Option<Arc<nrr_diagnostics::LogWriter>>) -> Self {
+        self.log_writer = writer;
+        self
     }
 
     /// Hand a clone of the shared diagnostic-session handle to other
@@ -840,7 +852,6 @@ impl ProductionDiagnosticsFacade {
             return CacheHealthCard {
                 entry_count: 0,
                 healthy: false,
-                rebuilding: false,
             };
         };
         let conn = match conn_arc.lock() {
@@ -849,7 +860,6 @@ impl ProductionDiagnosticsFacade {
                 return CacheHealthCard {
                     entry_count: 0,
                     healthy: false,
-                    rebuilding: false,
                 };
             }
         };
@@ -867,10 +877,6 @@ impl ProductionDiagnosticsFacade {
             healthy: true,
             // Rebuild-in-progress tracking is a future
             // signal (DnsRefreshOrchestrator could expose it via a
-            // shared AtomicBool). For now we report false — the GUI
-            // displays "rebuilding…" only when this flag is true, so
-            // a `false` default means "stable", never "broken".
-            rebuilding: false,
         }
     }
 
@@ -878,23 +884,38 @@ impl ProductionDiagnosticsFacade {
         let reader = LogReader::new(self.logs_dir.clone());
         let files = reader.list_files();
         let file_count = files.len() as u32;
-        let total_size_bytes: u64 = files
-            .iter()
-            .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
-            .sum();
         LogHealthCard {
             dir_writable: is_dir_writable(&self.logs_dir),
-            total_size_bytes,
+            total_size_bytes: total_bytes_of(&files),
+            audit_size_bytes: total_bytes_of(
+                &AuditReader::new(self.audit_dir.clone()).list_files(),
+            ),
             file_count,
-            // Dropped-event tracking + retention cleanup
-            // timestamps land in a follow-up. For now the GUI shows
-            // "0 dropped" / "no recent cleanup" which is conservative
-            // — never misleads the operator into thinking events
-            // were lost.
-            dropped_count: 0,
+            // The writer's own counter, not a constant. A hardcoded zero was
+            // described as conservative, but "0 dropped" is not a cautious
+            // silence — it is a claim that nothing was lost, made by code that
+            // never asked. With no writer attached the count is zero for the
+            // honest reason: there is nothing writing to lose events.
+            dropped_count: self
+                .log_writer
+                .as_ref()
+                .map(|writer| writer.dropped_count())
+                .unwrap_or(0),
+            // TODO: retention has no completion timestamp to report yet; the
+            // cleanup path would have to record when it last ran.
             last_cleanup_at: None,
         }
     }
+}
+
+/// Bytes on disk for a set of files. A file that cannot be stat'ed contributes
+/// nothing: the number is a storage indicator, and a hole in it is better than
+/// refusing to show any of it.
+fn total_bytes_of(files: &[std::path::PathBuf]) -> u64 {
+    files
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum()
 }
 
 /// First-match walk over a single canonical rule set. Returns the

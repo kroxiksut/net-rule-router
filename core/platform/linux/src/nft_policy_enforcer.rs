@@ -121,20 +121,31 @@ impl PolicyEnforcer for NftPolicyEnforcer {
             .collect();
 
         let lowered = lower_scoped(&scoped);
-        let applied = lowered.ruleset.rules.len();
-        self.cli
-            .apply(&lowered.ruleset)
+        // Best-effort for the same reason as the other enforcement entry: a
+        // single rule the kernel refuses must not cost the user every other
+        // rule they have.
+        let outcome = self
+            .cli
+            .apply_best_effort(&lowered.ruleset)
             .map_err(|e| EnforcementFailure::new(e.to_string()))?;
 
-        Ok(ApplyReport {
-            applied,
-            skipped: lowered.unsupported.len(),
-            failed: 0,
-            notes: lowered
-                .unsupported
+        let mut notes: Vec<String> = lowered
+            .unsupported
+            .iter()
+            .map(crate::nft_backend::note_for)
+            .collect();
+        notes.extend(
+            outcome
+                .skipped
                 .iter()
-                .map(crate::nft_backend::note_for)
-                .collect(),
+                .map(crate::nft_backend::note_for_skipped),
+        );
+
+        Ok(ApplyReport {
+            applied: outcome.applied,
+            skipped: lowered.unsupported.len() + outcome.skipped.len(),
+            failed: 0,
+            notes,
         })
     }
 

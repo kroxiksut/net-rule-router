@@ -164,6 +164,25 @@ fn address_match(
 
 // ── The Linux-only half ──────────────────────────────────────────────────────
 
+/// One rule the kernel would not accept, dropped so the rest could apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkippedNftRule {
+    /// Position in the ruleset as it was built.
+    pub index: usize,
+    /// The rule's comment — the only human-readable thing it carries, and what
+    /// names the user rule behind it in a report.
+    pub comment: String,
+}
+
+/// What a best-effort apply actually put in place.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NftApplyOutcome {
+    /// Rules the kernel accepted.
+    pub applied: usize,
+    /// Rules dropped to get there. Empty on a clean apply.
+    pub skipped: Vec<SkippedNftRule>,
+}
+
 /// Why applying a ruleset failed. Separated from the render step so a caller
 /// can tell "we built something invalid" from "the host cannot run `nft`".
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +235,123 @@ impl NftCliEnforcement {
         nftables::helper::apply_ruleset(&batch).map_err(classify_error)
     }
 
+    /// Apply, and if the kernel refuses the batch, apply everything it does
+    /// accept — naming what it would not.
+    ///
+    /// nft applies a batch as ONE transaction, so a single rule the kernel
+    /// rejects takes the whole ruleset with it. That is the right default for a
+    /// plan we built ourselves; it is the wrong one for a plan built partly
+    /// from somebody else's imported rules, where one unexpressible rule left
+    /// the user with no policy at all instead of all-but-one. Windows already
+    /// draws that line ([`FilterFailureMode::BestEffort`]); this is the same
+    /// line here.
+    ///
+    /// The search runs on `nft --check`, which validates a batch and applies
+    /// NOTHING, so the live ruleset is untouched until the final apply. Halving
+    /// costs `log2(n)` checks per offending rule, and the whole thing only runs
+    /// on a failure.
+    ///
+    /// An environment failure (no `nft`, no privilege, no `nf_tables`) is
+    /// returned as-is: every subset would fail the same way, and searching
+    /// through them says nothing.
+    #[cfg(target_os = "linux")]
+    pub fn apply_best_effort(
+        &self,
+        ruleset: &NftRuleset,
+    ) -> Result<NftApplyOutcome, NftApplyError> {
+        match self.apply(ruleset) {
+            Ok(()) => Ok(NftApplyOutcome {
+                applied: ruleset.rules.len(),
+                skipped: Vec::new(),
+            }),
+            Err(
+                e @ (NftApplyError::NftUnavailable { .. } | NftApplyError::NotPermitted { .. }),
+            ) => Err(e),
+            Err(rejected) => {
+                let offenders = self.offending_rules(ruleset);
+                if offenders.is_empty() {
+                    // The batch is refused but no single rule is: the ruleset is
+                    // wrong as a whole, and dropping rules would be guessing.
+                    return Err(rejected);
+                }
+                let (kept, skipped) = without_rules(ruleset, &offenders);
+                self.apply(&kept)?;
+                Ok(NftApplyOutcome {
+                    applied: kept.rules.len(),
+                    skipped,
+                })
+            }
+        }
+    }
+
+    /// Indices of the rules the kernel will not accept, found by halving.
+    ///
+    /// Each probe is an `nft --check` of a ruleset built from the candidate
+    /// rules alone. Testing a subset in isolation is fair because nft rejects a
+    /// rule on its own merits — an unknown match, an interface that cannot be
+    /// named — not on its neighbours.
+    ///
+    /// Budgeted: a ruleset where a large share of the rules are bad would
+    /// otherwise turn one failed apply into hundreds of probes. Past the budget
+    /// the search gives up and reports nothing, which the caller reads as "no
+    /// single rule is at fault" and surfaces the original refusal.
+    #[cfg(target_os = "linux")]
+    fn offending_rules(&self, ruleset: &NftRuleset) -> Vec<usize> {
+        /// Enough for `log2` over a few thousand rules with room for many
+        /// offenders, and small enough that a pathological set gives up fast.
+        const PROBE_BUDGET: usize = 256;
+
+        let mut budget = PROBE_BUDGET;
+        let mut found = Vec::new();
+        let all: Vec<usize> = (0..ruleset.rules.len()).collect();
+        self.search_offenders(ruleset, &all, &mut budget, &mut found);
+        found.sort_unstable();
+        found
+    }
+
+    #[cfg(target_os = "linux")]
+    fn search_offenders(
+        &self,
+        ruleset: &NftRuleset,
+        candidates: &[usize],
+        budget: &mut usize,
+        found: &mut Vec<usize>,
+    ) {
+        if candidates.is_empty() || *budget == 0 {
+            return;
+        }
+        *budget -= 1;
+        if self.check_subset(ruleset, candidates).is_ok() {
+            return;
+        }
+        if candidates.len() == 1 {
+            found.push(candidates[0]);
+            return;
+        }
+        let (left, right) = candidates.split_at(candidates.len() / 2);
+        self.search_offenders(ruleset, left, budget, found);
+        self.search_offenders(ruleset, right, budget, found);
+    }
+
+    /// `nft --check` over the ruleset restricted to `indices`. Validates only —
+    /// the kernel is not modified.
+    #[cfg(target_os = "linux")]
+    fn check_subset(&self, ruleset: &NftRuleset, indices: &[usize]) -> Result<(), NftApplyError> {
+        let subset = NftRuleset {
+            family: ruleset.family,
+            table: ruleset.table.clone(),
+            chain: ruleset.chain.clone(),
+            rules: indices.iter().map(|&i| ruleset.rules[i].clone()).collect(),
+        };
+        let batch = render_batch(&subset);
+        nftables::helper::apply_ruleset_with_args(
+            &batch,
+            nftables::helper::DEFAULT_NFT,
+            ["--check"],
+        )
+        .map_err(classify_error)
+    }
+
     /// Remove everything this product installed, and nothing else: our table is
     /// deleted whole. A ruleset-wide flush would take other programs' rules
     /// with it.
@@ -227,7 +363,22 @@ impl NftCliEnforcement {
             name: Cow::Owned(table.to_owned()),
             handle: None,
         }));
-        nftables::helper::apply_ruleset(&batch.to_nftables()).map_err(classify_error)
+        match nftables::helper::apply_ruleset(&batch.to_nftables()) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let detail = e.to_string();
+                // A table that is already gone is the state teardown wants.
+                // Windows says so for its own delete (`FWP_E_FILTER_NOT_FOUND`
+                // classifies as `Idempotent`); here the same answer arrived as a
+                // failure, so a second stop — or a stop after somebody flushed
+                // the ruleset — reported that it could not clean up something
+                // that was already clean.
+                if is_absent_object(&detail) {
+                    return Ok(());
+                }
+                Err(classify_error(e))
+            }
+        }
     }
 
     /// Whether `nft` can be reached at all. Called at daemon start so a missing
@@ -238,6 +389,14 @@ impl NftCliEnforcement {
         nftables::helper::get_current_ruleset()
             .map(|_| ())
             .map_err(classify_error)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn apply_best_effort(
+        &self,
+        _ruleset: &NftRuleset,
+    ) -> Result<NftApplyOutcome, NftApplyError> {
+        Err(Self::not_linux())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -287,6 +446,57 @@ fn classify_error(err: nftables::helper::NftablesError) -> NftApplyError {
             }
         }
     }
+}
+
+/// The ruleset without `offenders`, plus what was taken out.
+///
+/// Pure, and separate from the search for exactly that reason: dropping the
+/// wrong rule is silent — the apply succeeds either way — so this is the part
+/// that has to be assertable without a kernel. Order is preserved; nft
+/// evaluates rules in order, and a set that keeps the right rules in the wrong
+/// sequence is a different policy.
+///
+/// `offenders` must be sorted and in range; the search that produces them
+/// guarantees both.
+///
+/// Its only caller is Linux-gated, but the function is pure and its tests run
+/// everywhere — which is the point of keeping it separate from the search.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn without_rules(ruleset: &NftRuleset, offenders: &[usize]) -> (NftRuleset, Vec<SkippedNftRule>) {
+    let skipped = offenders
+        .iter()
+        .filter_map(|&i| {
+            ruleset.rules.get(i).map(|rule| SkippedNftRule {
+                index: i,
+                comment: rule.comment.clone(),
+            })
+        })
+        .collect();
+    let kept = NftRuleset {
+        family: ruleset.family,
+        table: ruleset.table.clone(),
+        chain: ruleset.chain.clone(),
+        rules: ruleset
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !offenders.contains(i))
+            .map(|(_, rule)| rule.clone())
+            .collect(),
+    };
+    (kept, skipped)
+}
+
+/// Does this `nft` failure say the object was not there to begin with?
+///
+/// `nft` answers a delete of an absent table with `No such file or directory`
+/// (ENOENT). Teardown wants the table gone; it already is.
+#[cfg(target_os = "linux")]
+fn is_absent_object(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    lower.contains("no such file or directory")
+        || lower.contains("does not exist")
+        || lower.contains("no such table")
 }
 
 /// Does this `nft` failure describe the environment rather than our ruleset?
@@ -446,5 +656,44 @@ mod tests {
         assert!(!is_permission_or_kernel_refusal(
             "Error: syntax error, unexpected string"
         ));
+    }
+    /// Dropping a refused rule keeps every OTHER rule, in order.
+    ///
+    /// The failure this guards is silent: the apply succeeds whichever rules
+    /// survive, so an off-by-one would enforce a different policy and report
+    /// success. Order matters too — nft evaluates in sequence, and the same set
+    /// in a different order is a different policy.
+    #[test]
+    fn removing_the_refused_rules_keeps_the_rest_in_order() {
+        let rule = |comment: &str| NftRule {
+            matches: Vec::new(),
+            verdict: NftVerdict::Accept,
+            comment: comment.to_owned(),
+        };
+        let ruleset = NftRuleset {
+            family: crate::nft_ir::NftFamily::Inet,
+            table: "t".into(),
+            chain: "c".into(),
+            rules: vec![rule("a"), rule("b"), rule("c"), rule("d")],
+        };
+        let (kept, skipped) = without_rules(&ruleset, &[1, 3]);
+        assert_eq!(
+            kept.rules
+                .iter()
+                .map(|r| r.comment.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "c"],
+        );
+        assert_eq!(
+            skipped
+                .iter()
+                .map(|s| (s.index, s.comment.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "b"), (3, "d")],
+        );
+        // Nothing refused: the ruleset comes back whole.
+        let (all, none) = without_rules(&ruleset, &[]);
+        assert_eq!(all.rules.len(), 4);
+        assert!(none.is_empty());
     }
 }

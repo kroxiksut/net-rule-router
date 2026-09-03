@@ -40,11 +40,43 @@ QtObject {
         && bridge !== null
         && typeof bridge.rpcRetentionSettingsGet === "function"
 
+    // Correlation ids of calls the caller declared LONG. Reassigned wholesale
+    // for the same property-tracking reason as `pendingRpc`.
+    property var pendingLongRpc: ({})
+
+    // True while a call that may legitimately hold the client's single
+    // in-flight slot for tens of seconds is outstanding — the rules preview and
+    // the apply behind it. The service answers one request at a time per
+    // connection, so while this is true a timeout on a short poll measures the
+    // queue in front of it, not the service. Surfaces reading it must not treat
+    // such a timeout as evidence of an outage.
+    readonly property bool longCallInFlight: Object.keys(pendingLongRpc).length > 0
+
     function registerRpcCallback(correlationId, callback) {
         if (!correlationId || correlationId === "") return
         var table = pendingRpc
         table[correlationId] = { cb: callback, deadline: Date.now() + rpcTimeoutMs }
         pendingRpc = table
+    }
+
+    // Same registration, plus the "this one is long" mark. Used by every
+    // `rpcMutationSubmit` call site: a preview derives the whole per-SID filter
+    // plan and an apply installs it, and both have been measured in the tens of
+    // seconds on a real rule set.
+    function registerLongRpcCallback(correlationId, callback) {
+        if (!correlationId || correlationId === "") return
+        var longs = pendingLongRpc
+        longs[correlationId] = true
+        pendingLongRpc = longs
+        registerRpcCallback(correlationId, callback)
+    }
+
+    // Drop `correlationId` from the long-call set, if it was in it.
+    function _forgetLongRpc(correlationId) {
+        if (pendingLongRpc[correlationId] === undefined) return
+        var longs = pendingLongRpc
+        delete longs[correlationId]
+        pendingLongRpc = longs
     }
 
     // --- Bridge forwarders (guarded; return "" when the bridge is absent) ---
@@ -197,6 +229,7 @@ QtObject {
         var table = pendingRpc
         delete table[correlationId]
         pendingRpc = table
+        _forgetLongRpc(correlationId)
         try {
             entry.cb(ok, payload, errorCode, errorMessage)
         } catch (e) {
@@ -215,6 +248,7 @@ QtObject {
         for (var i = 0; i < stale.length; i++) {
             var entry = table[stale[i]]
             delete table[stale[i]]
+            _forgetLongRpc(stale[i])
             try {
                 entry.cb(false, null, "rpc-timed-out",
                     "no response within " + (rpcTimeoutMs / 1000) + " s")

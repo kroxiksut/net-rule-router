@@ -348,37 +348,48 @@ fn append_attachments(
             if !unlimited && budget == 0 {
                 break;
             }
-            let Ok(content) = fs::read(&path) else {
-                continue;
-            };
-            // Keep the TAIL when a file overflows the remaining budget — the
-            // most-recent lines are the useful ones. Trim to the next line
-            // boundary so the attachment stays valid NDJSON.
-            let truncated = !unlimited && len > budget;
-            let slice: &[u8] = if truncated {
-                let start =
-                    trim_to_line_start(&content, content.len().saturating_sub(budget as usize));
-                &content[start..]
-            } else {
-                &content
-            };
-            if truncated && slice.len() < MIN_ATTACHED_TAIL_BYTES {
-                // What is left of the budget cannot carry a usable tail, and
-                // every remaining file is older still — stop rather than write
-                // an entry whose only content is its own name.
-                break;
-            }
-            if slice.is_empty() {
-                continue;
-            }
             let entry_name = path
                 .file_name()
                 .map(|n| format!("service-logs/{}", n.to_string_lossy()))
                 .unwrap_or_else(|| "service-logs/service.ndjson".to_string());
             let options = zip_options_for_copied_file(&path);
-            if writer.start_file(entry_name, options).is_ok() && writer.write_all(slice).is_ok() {
-                any = true;
-                budget = budget.saturating_sub(slice.len() as u64);
+            let truncated = !unlimited && len > budget;
+            if truncated {
+                // Keep the TAIL — the most-recent lines are the useful ones —
+                // and read ONLY that tail. Retention allows fifty megabytes per
+                // file, and pulling a whole one into memory to keep its last
+                // few is the worst moment to do it: an archive is built when
+                // the machine is already in trouble. Trimmed to the next line
+                // boundary so the attachment stays valid NDJSON.
+                let Ok(tail) = read_tail_bytes(&path, budget) else {
+                    continue;
+                };
+                let start = trim_to_line_start(&tail, 0);
+                let slice = &tail[start..];
+                if slice.len() < MIN_ATTACHED_TAIL_BYTES {
+                    // What is left of the budget cannot carry a usable tail, and
+                    // every remaining file is older still — stop rather than write
+                    // an entry whose only content is its own name.
+                    break;
+                }
+                if writer.start_file(entry_name, options).is_ok() && writer.write_all(slice).is_ok()
+                {
+                    any = true;
+                    budget = budget.saturating_sub(slice.len() as u64);
+                }
+            } else {
+                // Whole file: streamed into the entry, never buffered.
+                let Ok(mut file) = fs::File::open(&path) else {
+                    continue;
+                };
+                if writer.start_file(entry_name, options).is_ok() {
+                    if let Ok(written) = std::io::copy(&mut file, &mut writer) {
+                        if written > 0 {
+                            any = true;
+                            budget = budget.saturating_sub(written);
+                        }
+                    }
+                }
             }
         }
     }
@@ -386,6 +397,25 @@ fn append_attachments(
         return false;
     }
     any
+}
+
+/// Read at most the last `want` bytes of `path`.
+///
+/// Seeks rather than reading the file and slicing it: the caller wants a tail,
+/// and the file it is taken from can be tens of megabytes.
+fn read_tail_bytes(path: &Path, want: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > want {
+        file.seek(SeekFrom::Start(len - want))?;
+    }
+    let mut buf = Vec::with_capacity(want.min(len) as usize);
+    file.take(want)
+        .read_to_end(&mut buf)
+        .map(|_| ())
+        .map(|()| buf)
 }
 
 /// Advance `from` to the byte after the next newline so a tail slice begins on

@@ -131,13 +131,13 @@ ColumnLayout {
     /// A few of the names the service dropped — three is enough to recognise
     /// one's own site, and the rest would only make the line longer.
     function _inertSampleText() {
-        var names = root.autoRuleInertSample || []
+        var names = root.autoRuleSuggestionsController.autoRuleInertSample || []
         return names.slice(0, 3).join(", ")
     }
 
     function _refresh() {
-        if (typeof root.refreshAutoRuleCandidates === "function") root.refreshAutoRuleCandidates()
-        if (typeof root.refreshAutoRuleDismissed === "function") root.refreshAutoRuleDismissed()
+        if (typeof root.autoRuleSuggestionsController.refreshAutoRuleCandidates === "function") root.autoRuleSuggestionsController.refreshAutoRuleCandidates()
+        if (typeof root.autoRuleSuggestionsController.refreshAutoRuleDismissed === "function") root.autoRuleSuggestionsController.refreshAutoRuleDismissed()
     }
     // Loaded lazily (see Main.qml's StackLayout) — fetch once on first show,
     // and again whenever the user comes back to this page: the service's
@@ -170,7 +170,7 @@ ColumnLayout {
         repeat: true
         onTriggered: {
             if (!section._serviceOnline || section._catchUpLeft <= 0
-                    || (root.autoRuleCandidates || []).length > 0) {
+                    || (root.autoRuleSuggestionsController.autoRuleCandidates || []).length > 0) {
                 stop()
                 return
             }
@@ -183,7 +183,7 @@ ColumnLayout {
     // sorted ONCE per UI change (sort/filter). Delegates below only ever read
     // the already-computed group objects — never re-derive anything.
     readonly property var mergedGroups: Pure.groupAutoRuleRows(
-        root.autoRuleCandidates, root.autoRuleDismissed)
+        root.autoRuleSuggestionsController.autoRuleCandidates, root.autoRuleSuggestionsController.autoRuleDismissed)
     /// Answered addresses are history, not work — off by default, and the
     /// toggle says how many are hiding behind it.
     property bool showDismissed: false
@@ -347,24 +347,24 @@ ColumnLayout {
     function _acceptIds(ids) {
         if (!ids || ids.length === 0) return
         section._rememberScrollPosition()
-        root.acceptAutoRuleCandidates(ids)
+        root.autoRuleSuggestionsController.acceptAutoRuleCandidates(ids)
     }
     function _dismissIds(ids) {
         if (!ids || ids.length === 0) return
         section._rememberScrollPosition()
-        root.dismissAutoRuleCandidates(ids)
+        root.autoRuleSuggestionsController.dismissAutoRuleCandidates(ids)
     }
     function _restoreIds(ids) {
         if (!ids || ids.length === 0) return
         section._rememberScrollPosition()
-        root.restoreAutoRuleDismissed(ids)
+        root.autoRuleSuggestionsController.restoreAutoRuleDismissed(ids)
     }
     /// Erases the answer rather than recording one, so the address comes back
     /// on its own evidence — every id of the group, answered or not.
     function _forgetIds(ids) {
         if (!ids || ids.length === 0) return
         section._rememberScrollPosition()
-        root.forgetAutoRuleCandidates(ids)
+        root.autoRuleSuggestionsController.forgetAutoRuleCandidates(ids)
     }
     function _checkedAllIds() {
         return section._checkedPendingIds().concat(section._checkedDismissedIds())
@@ -476,12 +476,12 @@ ColumnLayout {
         // drive the whole page wider than the window.
         Layout.preferredWidth: 0
         visible: section.mergedGroups.length === 0
-            && root.uiRevision >= 0 && root.autoRuleInertDropped > 0
+            && root.uiRevision >= 0 && root.autoRuleSuggestionsController.autoRuleInertDropped > 0
         wrapMode: Text.Wrap
         color: root.mutedTextColor
         text: root.tr("rules.suggestions.inbox.empty-all-inert",
                 "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.")
-            .replace("{count}", String(root.autoRuleInertDropped))
+            .replace("{count}", String(root.autoRuleSuggestionsController.autoRuleInertDropped))
             .replace("{sample}", section._inertSampleText())
         Accessible.role: Accessible.StaticText
         Accessible.name: text

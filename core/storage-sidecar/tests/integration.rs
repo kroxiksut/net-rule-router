@@ -29,18 +29,20 @@ fn full_gui_session_round_trip() -> SidecarResult<()> {
         let db = SidecarDb::open(&path)?;
         // Initial state — nothing recorded yet.
         assert!(db
-            .read_comment(&RuleSignature::build("zone", "ru", "primary"))?
+            .read_comment(
+                &RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe")
+            )?
             .is_none());
         assert!(db.read_passthrough("primary")?.is_empty());
         assert!(db.read_pending_apply_at(T0)?.is_none());
 
         // Capture comments matching the country-preset shape we ship.
         db.write_comment(
-            &RuleSignature::build("zone", "рф", "primary"),
+            &RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe"),
             &sanitize_comment("Российская Федерация (.рф, Punycode xn--p1ai)"),
         )?;
         db.write_comment(
-            &RuleSignature::build("zone", "ru", "primary"),
+            &RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe"),
             &sanitize_comment("Российская Федерация (.ru)"),
         )?;
 
@@ -57,13 +59,8 @@ fn full_gui_session_round_trip() -> SidecarResult<()> {
         );
         db.write_passthrough("primary", &passthrough)?;
 
-        // User clicks "Work without service" → park the snapshot.
-        db.write_pending_apply_at(
-            r#"{"schema-version":1,"primary":[{"id":"R-0001"}],"secondary":[]}"#,
-            r#"{"added":1,"modified":0,"removed":0}"#,
-            "abc123",
-            T0,
-        )?;
+        // User clicks "Work without service" → park the marker.
+        db.write_pending_apply_at(r#"{"added":1,"modified":0,"removed":0}"#, "abc123", T0)?;
     }
 
     // ── Session B: launcher reopens and verifies every DAO ──
@@ -71,12 +68,16 @@ fn full_gui_session_round_trip() -> SidecarResult<()> {
         let db = SidecarDb::open(&path)?;
         // Comments survive.
         let rf_comment = db
-            .read_comment(&RuleSignature::build("zone", "рф", "primary"))?
+            .read_comment(
+                &RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe"),
+            )?
             .expect("рф comment must persist across reopen");
         assert!(rf_comment.contains("Российская"));
         assert!(rf_comment.contains("xn--p1ai"));
         let ru_comment = db
-            .read_comment(&RuleSignature::build("zone", "ru", "primary"))?
+            .read_comment(
+                &RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe"),
+            )?
             .expect("ru comment must persist across reopen");
         assert!(ru_comment.contains(".ru"));
 
@@ -104,13 +105,19 @@ fn full_gui_session_round_trip() -> SidecarResult<()> {
 
         // ── GC: user removed the rf rule via the GUI; comment becomes
         //    orphan. Pass only the surviving signature. ──
-        let removed = db.gc_orphans(&[RuleSignature::build("zone", "ru", "primary")])?;
+        let removed = db.gc_orphans(&[
+            RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe")
+        ])?;
         assert_eq!(removed, 1);
         assert!(db
-            .read_comment(&RuleSignature::build("zone", "рф", "primary"))?
+            .read_comment(
+                &RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe")
+            )?
             .is_none());
         assert!(db
-            .read_comment(&RuleSignature::build("zone", "ru", "primary"))?
+            .read_comment(
+                &RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe")
+            )?
             .is_some());
 
         // ── Vacuum: explicit, no conditions. Confirms VACUUM works
@@ -136,7 +143,8 @@ fn env_override_resolution_creates_file_at_chosen_path() -> SidecarResult<()> {
     assert_eq!(resolved, override_path);
 
     let db = SidecarDb::open(&resolved)?;
-    let sig = RuleSignature::build("domain", "example.com", "primary");
+    let sig =
+        RuleSignature::build("domain", "example.com", "primary").expect("a signature with no pipe");
     db.write_comment(&sig, "round-trip")?;
     assert_eq!(db.read_comment(&sig)?.as_deref(), Some("round-trip"));
     Ok(())
@@ -146,16 +154,24 @@ fn env_override_resolution_creates_file_at_chosen_path() -> SidecarResult<()> {
 fn schema_survives_three_reopens() -> SidecarResult<()> {
     let tmp = tempfile::tempdir()?;
     let path = tmp.path().join("sidecar.db");
-    for _ in 0..3 {
+    for open in 0..3 {
         let db = SidecarDb::open(&path)?;
-        // last_migration should report a no-op after the first open.
         let summary = db.last_migration();
-        assert!(
-            summary.migrations_applied.is_empty()
-                || summary.migrations_applied
-                    == vec!["initial_sidecar_schema", "external_ip_cache"],
-            "reopen should either be a no-op or the very first open",
+        assert_eq!(
+            summary.to_version,
+            nrr_storage_sidecar::LATEST_SCHEMA_VERSION,
+            "every open lands on the current schema"
         );
+        // Naming the steps here would make this test a second copy of the
+        // migration list; what matters is that only the first open runs any.
+        if open == 0 {
+            assert!(!summary.migrations_applied.is_empty(), "first open builds");
+        } else {
+            assert!(
+                summary.migrations_applied.is_empty(),
+                "a reopen must be a no-op"
+            );
+        }
     }
     Ok(())
 }

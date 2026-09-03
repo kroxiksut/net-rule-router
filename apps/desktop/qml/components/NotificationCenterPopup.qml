@@ -96,7 +96,7 @@ Popup {
                         }
                     }
                     for (var j = 0; j < ids.length; j++) {
-                        root.ownerRoot.dismissNotification(ids[j])
+                        root.ownerRoot.notificationsController.dismissNotification(ids[j])
                     }
                 }
             }
@@ -183,7 +183,7 @@ Popup {
                                 text: card.modelData.actionText || ""
                                 onClicked: {
                                     if (root.ownerRoot) {
-                                        root.ownerRoot.runNotificationAction(card.modelData.actionKey,
+                                        root.ownerRoot.notificationsController.runNotificationAction(card.modelData.actionKey,
                                                             card.modelData.actionArg)
                                     }
                                     root.close()
@@ -202,8 +202,8 @@ Popup {
                                 Accessible.name: text
                                 onClicked: {
                                     if (root.ownerRoot) {
-                                        root.ownerRoot.muteNoticeKind(card.modelData.muteKind)
-                                        root.ownerRoot.dismissNotification(card.modelData.id)
+                                        root.ownerRoot.notificationsController.muteNoticeKind(card.modelData.muteKind)
+                                        root.ownerRoot.notificationsController.dismissNotification(card.modelData.id)
                                     }
                                 }
                             }
@@ -217,7 +217,7 @@ Popup {
                                 text: root.tr("notifications.dismiss", "Dismiss")
                                 onClicked: {
                                     if (root.ownerRoot) {
-                                        root.ownerRoot.dismissNotification(card.modelData.id)
+                                        root.ownerRoot.notificationsController.dismissNotification(card.modelData.id)
                                     }
                                 }
                             }

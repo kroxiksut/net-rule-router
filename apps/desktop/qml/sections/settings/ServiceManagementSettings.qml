@@ -448,12 +448,13 @@ GroupBox {
             visible: group._serviceAvailable()
                 && _statusSlug(nrrServiceController.status) !== "not-installed"
 
-            property string startMode: ""
+            // Bound to the controller's cache, refreshed off the GUI thread:
+            // asking for it synchronously froze the window for as long as the
+            // service binary took to answer.
+            readonly property string startMode: group._serviceAvailable()
+                ? String(nrrServiceController.startMode || "") : ""
             function refreshStartMode() {
-                if (group._serviceAvailable()) {
-                    startModeBlock.startMode =
-                        String(nrrServiceController.queryServiceStartMode() || "")
-                }
+                if (group._serviceAvailable()) nrrServiceController.refreshStartMode()
             }
             Component.onCompleted: Qt.callLater(startModeBlock.refreshStartMode)
 
@@ -489,13 +490,23 @@ GroupBox {
 
             ButtonGroup { id: startModeGroup }
 
-            RadioButton {
+            ThemedRadioButton {
+                id: startModeWithWindowsRadio
+                theme: root.uiTheme
                 Layout.fillWidth: true
                 ButtonGroup.group: startModeGroup
                 enabled: !group._busy()
-                // Default (empty) reads as start-with-Windows.
-                checked: startModeBlock.startMode === "with-windows"
-                    || startModeBlock.startMode === ""
+                // Default (empty) reads as start-with-Windows. Through a
+                // Binding element, not a plain one: the ButtonGroup writes
+                // `checked`, which would kill the binding and leave the pair
+                // showing the user's click rather than what the service is
+                // actually registered as.
+                Binding {
+                    target: startModeWithWindowsRadio
+                    property: "checked"
+                    value: startModeBlock.startMode === "with-windows"
+                        || startModeBlock.startMode === ""
+                }
                 text: root.tr("settings.service.start-mode.with-windows.label",
                     "Start with Windows (recommended)")
                 onClicked: {
@@ -505,11 +516,17 @@ GroupBox {
                     }
                 }
             }
-            RadioButton {
+            ThemedRadioButton {
+                id: startModeOnLaunchRadio
+                theme: root.uiTheme
                 Layout.fillWidth: true
                 ButtonGroup.group: startModeGroup
                 enabled: !group._busy()
-                checked: startModeBlock.startMode === "on-app-launch"
+                Binding {
+                    target: startModeOnLaunchRadio
+                    property: "checked"
+                    value: startModeBlock.startMode === "on-app-launch"
+                }
                 text: root.tr("settings.service.start-mode.on-app-launch.label",
                     "Start when the app opens")
                 onClicked: {
@@ -557,6 +574,33 @@ GroupBox {
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
             text: root.tr("settings.service.launch-tray.description",
                 "The service starts at boot before anyone logs in and cannot open the tray itself. This starts the tray icon when you sign in — the same setting as “Start the tray automatically at sign-in” in General.")
+        }
+
+        // The offer to install the service can be turned off from the offer
+        // itself; this is where it comes back. Shown always, so a user who
+        // silenced it can find the switch without reinstalling anything.
+        CheckBox {
+            id: offerInstallCheckbox
+            Layout.fillWidth: true
+            Layout.topMargin: root.uiTheme.spacingSm
+            text: root.tr("settings.service.offer-install.label",
+                "Offer to install the service when it is missing")
+            checked: (root.uiRevision >= 0)
+                ? (root.prefs.serviceInstallPromptSuppressed !== true) : true
+            onToggled: {
+                root.updatePrefs({ serviceInstallPromptSuppressed: !checked,
+                    serviceInstallUacDeclinedCount: 0 })
+                root.emitPrefs()
+            }
+        }
+        Label {
+            Layout.fillWidth: true
+            Layout.leftMargin: root.uiTheme.spacingLg
+            color: root.mutedTextColor
+            wrapMode: Text.WordWrap
+            font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            text: root.tr("settings.service.offer-install.description",
+                "Without the background service the app applies no rules at all, so it offers to install one. Dismissing the offer holds it back for a week; turning this off stops it entirely.")
         }
 
         // ── Crash recovery info ──────────────────────────────────

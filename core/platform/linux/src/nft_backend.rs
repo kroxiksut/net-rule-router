@@ -17,7 +17,7 @@ use nrr_platform_api::enforcement::{
 };
 
 use crate::lower_linux::{lower_plans, EgressNames, UnsupportedReason, UnsupportedRule};
-use crate::nft_apply::{NftApplyError, NftCliEnforcement};
+use crate::nft_apply::{NftApplyError, NftCliEnforcement, SkippedNftRule};
 
 /// Enforces a plan with nftables, driving `nft` as the mechanism.
 #[derive(Debug, Clone, Default)]
@@ -58,18 +58,24 @@ impl EnforcementBackend for NftablesEnforcement {
 
     fn reconcile_all(&self, plans: &[EnforcementPlan]) -> Result<ApplyReport, Self::Error> {
         let lowered = lower_plans(plans, &self.egress);
-        let applied = lowered.ruleset.rules.len();
 
-        self.cli.apply(&lowered.ruleset)?;
+        // Best-effort: one rule the kernel refuses must not take the user's
+        // whole policy with it — the plan is built partly from imported rules,
+        // and all-or-nothing there means "no policy at all" over somebody
+        // else's file. See `NftCliEnforcement::apply_best_effort`.
+        let outcome = self.cli.apply_best_effort(&lowered.ruleset)?;
 
         // What could not be expressed is REPORTED, never dropped in silence: a
         // backend that quietly enforces less than it was given is
-        // indistinguishable from one that enforces all of it.
-        let notes = lowered.unsupported.iter().map(note_for).collect();
+        // indistinguishable from one that enforces all of it. Two sources feed
+        // this: rules the lowering could not express at all, and rules the
+        // kernel then refused.
+        let mut notes: Vec<String> = lowered.unsupported.iter().map(note_for).collect();
+        notes.extend(outcome.skipped.iter().map(note_for_skipped));
 
         Ok(ApplyReport {
-            applied,
-            skipped: lowered.unsupported.len(),
+            applied: outcome.applied,
+            skipped: lowered.unsupported.len() + outcome.skipped.len(),
             failed: 0,
             notes,
         })
@@ -82,6 +88,16 @@ impl EnforcementBackend for NftablesEnforcement {
 
 /// Say whose rule went unenforced and what the user loses by it — this note is
 /// the only thing about it that reaches an operator.
+/// What to say about a rule the KERNEL refused, as opposed to one the lowering
+/// could not express. The comment is the only human-readable thing an nft rule
+/// carries, and it names the user rule behind it.
+pub(crate) fn note_for_skipped(rule: &SkippedNftRule) -> String {
+    format!(
+        "rule {} ({}) was refused by the kernel and is NOT applied; the rest of the ruleset is",
+        rule.index, rule.comment
+    )
+}
+
 pub(crate) fn note_for(rule: &UnsupportedRule) -> String {
     let (index, who) = (rule.index, &rule.principal);
     match &rule.reason {

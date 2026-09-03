@@ -7,6 +7,16 @@ set(CMAKE_AUTOUIC ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# A shared Qt loads its QML plugins at run time; the CMake packages describing
+# them matter only for a static link. Including them also drags in every module
+# those plugins depend on, so one absent optional module fails the whole
+# configure step — a default 6.11.1 install has no Qt TaskTree, which
+# QmlAssetDownloader requires, and `find_package(Qt6 ... Qml)` dies on it.
+# Overridable: a static build has to set this OFF.
+if(NOT DEFINED QT_SKIP_AUTO_QML_PLUGIN_INCLUSION)
+    set(QT_SKIP_AUTO_QML_PLUGIN_INCLUSION ON)
+endif()
+
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
 
 qt_standard_project_setup()

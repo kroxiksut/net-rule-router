@@ -49,9 +49,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook};
 use nrr_domain::companion_affinity::{
-    CandidateExclusions, CoActivityKind, CompanionAffinityConfig, CompanionAffinityLedger,
-    CompanionEvidenceSnapshot, CompanionProposal, CompanionSignal, PrimaryBehavior,
-    PrimaryHealthEvent,
+    registrable_domain, CandidateExclusions, CoActivityKind, CompanionAffinityConfig,
+    CompanionAffinityLedger, CompanionEvidenceSnapshot, CompanionProposal, CompanionSignal,
+    PrimaryBehavior, PrimaryHealthEvent,
 };
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto, StatusUpdateEvent,
@@ -1018,18 +1018,17 @@ impl AutoRulesEngine {
         }
         // The count stays whole — the list the user opens holds every offer.
         let pending = offered.len() as u64;
-        // "Answers on the main route" silences the WEAKEST tier only.
+        // "Answers on the main route" silences a host of someone else's brand.
         //
         // It is not proof the address is unwanted: a site can complete the
         // connection and serve a refusal — ChatGPT answers the main link with
         // "this address is not served" — so an address belonging to the routed
         // site itself (brand-related, or its own delivery name) still opens the
-        // question. What it does settle is the co-activity tier, whose members
-        // are third-party names that merely load nearby: an advertising or
-        // telemetry endpoint that works fine without the tunnel is exactly the
-        // noise this gate exists for. Held-back rows keep their place in the
-        // list, and a later stall re-opens the question — the verdict is
-        // recomputed every tick.
+        // question. What it does settle is a name of ANOTHER brand — a shared
+        // CDN, an advertising or telemetry endpoint that merely loads nearby.
+        // Those work without the tunnel, and offering them is noise. Held-back
+        // rows keep their place in the list, and a later stall re-opens the
+        // question — the verdict is recomputed every tick.
         // A site the user marked as refusing main-link addresses is the one case
         // where "it answers" says nothing: answering with a refusal is still
         // answering. Its companions keep their popup.
@@ -1038,12 +1037,9 @@ impl AutoRulesEngine {
             .as_ref()
             .map(|read| read(sid))
             .unwrap_or_default();
-        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
-            offered.into_iter().partition(|c| {
-                let quietable = c.dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
-                    && c.dto.signal == AUTO_RULE_SIGNAL_CO_ACTIVITY;
-                !quietable || refusing.contains(&c.dto.anchor)
-            });
+        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) = offered
+            .into_iter()
+            .partition(|c| !settled_by_the_main_link(&c.dto) || refusing.contains(&c.dto.anchor));
         if !settled.is_empty() {
             tracing::debug!(
                 target: "nrr::auto-rules",
@@ -1162,6 +1158,10 @@ impl AutoRulesEngine {
             .values()
             .flatten()
             .filter(|c| c.dto.route == RouteRole::Secondary.slug())
+            // A candidate the tray will not even ask about must not change
+            // where traffic goes: leaving it "pinned as if accepted" routed a
+            // host the user reaches perfectly well on the main link.
+            .filter(|c| !settled_by_the_main_link(&c.dto))
             .any(|c| {
                 let m = c.dto.proposed_match.trim_matches('.').to_ascii_lowercase();
                 if m.is_empty() {
@@ -1895,6 +1895,46 @@ fn signal_slug(signal: CompanionSignal) -> &'static str {
 
 /// Wire slug for the primary-route verdict. `Unknown` maps to the empty string:
 /// "nothing conclusive" is the absence of a verdict, not one of its values.
+/// Is this candidate answered by the main link already?
+///
+/// "It answers" is not proof the address is unwanted: a site can complete the
+/// connection and serve a refusal — ChatGPT answers main-link addresses with
+/// "this address is not served" — so a name of the ANCHOR'S OWN brand still
+/// opens the question. A name of someone else's brand does not: a shared CDN,
+/// an advertising or telemetry endpoint that loads nearby works without the
+/// tunnel, and both offering it and routing traffic for it are noise.
+///
+/// One declaration, because two callers must agree: the tray decides whether to
+/// ask, and the answer path decides whether to keep the host on the main link.
+/// A candidate that is not worth asking about must not silently re-route
+/// traffic either.
+fn settled_by_the_main_link(dto: &AutoRuleCandidateDto) -> bool {
+    if dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS {
+        return false;
+    }
+    if !matches!(
+        dto.signal.as_str(),
+        AUTO_RULE_SIGNAL_CO_ACTIVITY | AUTO_RULE_SIGNAL_DELIVERY_NAME
+    ) {
+        return false;
+    }
+    !shares_registrable_domain(&dto.anchor, &dto.proposed_match)
+}
+
+/// Same registrable domain on both sides — the candidate is the anchor's own
+/// name rather than a third party's.
+fn shares_registrable_domain(anchor: &str, proposed: &str) -> bool {
+    let anchor = anchor.trim().trim_end_matches('.');
+    let proposed = proposed
+        .trim()
+        .trim_start_matches('.')
+        .trim_end_matches('.');
+    match (registrable_domain(anchor), registrable_domain(proposed)) {
+        (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+        _ => false,
+    }
+}
+
 fn primary_behavior_slug(behavior: PrimaryBehavior) -> &'static str {
     match behavior {
         PrimaryBehavior::Responds => AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,

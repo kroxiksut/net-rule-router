@@ -1,7 +1,7 @@
 // Full-reset confirmation. Strong destructive confirm — an acknowledgement
 // checkbox gates the action. Extracted from Main.qml (thin-shell
 // refactor). The dialog is "dumb": it emits
-// `confirmed()` and the caller (Main.qml) runs `fullReset()`. Shared state
+// `confirmed()` and the caller runs `fullResetController.fullReset()`. Shared state
 // comes in through `ownerRoot` (the ApplicationWindow), never implicit scope.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
@@ -12,7 +12,7 @@ Dialog {
 
     /// ApplicationWindow injected by the caller (`ownerRoot: window`).
     property var ownerRoot: null
-    /// Fired when the user acknowledges + confirms; caller runs fullReset().
+    /// Fired when the user acknowledges + confirms; the caller runs the reset.
     /// `allPrincipals` is true when the user chose to clear every OS user's
     /// routing, not just their own.
     signal confirmed(bool allPrincipals)
@@ -52,8 +52,8 @@ Dialog {
         _ack = false
         _allPrincipals = false
         otherPrincipals = 0
-        if (ownerRoot && typeof ownerRoot.countOtherPrincipals === "function") {
-            ownerRoot.countOtherPrincipals(function(count) { root.otherPrincipals = count })
+        if (ownerRoot && ownerRoot.fullResetController) {
+            ownerRoot.fullResetController.countOtherPrincipals(function(count) { root.otherPrincipals = count })
         }
     }
     contentItem: ColumnLayout {
@@ -81,15 +81,29 @@ Dialog {
                     "Other users of this computer have rules here too ({count}). What should be cleared?")
                     .replace("{count}", String(root.otherPrincipals))
             }
+            // A click writes `checked`, which destroys a plain binding to it.
+            // On a destructive dialog that is not cosmetic: the pair then shows
+            // one scope while `confirmed(scope)` sends the other, so the reset
+            // that runs is not the one the user read.
             ThemedRadioButton {
+                id: scopeMineRadio
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                checked: !root._allPrincipals
+                Binding {
+                    target: scopeMineRadio
+                    property: "checked"
+                    value: !root._allPrincipals
+                }
                 text: root.tr("dialog.full-reset.scope-mine", "Only my data")
                 onToggled: if (checked) root._allPrincipals = false
             }
             ThemedRadioButton {
+                id: scopeEveryoneRadio
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
-                checked: root._allPrincipals
+                Binding {
+                    target: scopeEveryoneRadio
+                    property: "checked"
+                    value: root._allPrincipals
+                }
                 text: root.tr("dialog.full-reset.scope-everyone",
                     "Every user on this computer (asks for administrator approval)")
                 onToggled: if (checked) root._allPrincipals = true
@@ -98,8 +112,12 @@ Dialog {
         CheckBox {
             id: fullResetAck
             Layout.fillWidth: true
-            checked: root._ack
-            onCheckedChanged: root._ack = checked
+            Binding {
+                target: fullResetAck
+                property: "checked"
+                value: root._ack
+            }
+            onToggled: root._ack = checked
             text: root.tr("dialog.full-reset.ack",
                 "I understand this erases all settings and applied rules")
             Accessible.role: Accessible.CheckBox

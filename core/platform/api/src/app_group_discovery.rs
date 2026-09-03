@@ -289,8 +289,43 @@ pub fn classify_app(text: &str) -> Option<AppGroupKind> {
     }
     APP_GROUP_DICTIONARY
         .iter()
-        .find(|entry| entry.keywords.iter().any(|kw| lower.contains(kw)))
+        .find(|entry| entry.keywords.iter().any(|kw| keyword_matches(&lower, kw)))
         .map(|entry| entry.kind)
+}
+
+/// Whether `keyword` names `text`, matched on WORD BOUNDARIES rather than as a
+/// substring anywhere inside it.
+///
+/// A plain `contains` made `GetHelp.exe` — a Windows component — a crypto node
+/// because of `geth`, anything with "Together" likewise, "Newsletter…" a
+/// kernel virtual network because of `wsl`. The consequences are not cosmetic:
+/// the classification switches off FCrDNS learning, removes fake-IP, and
+/// `KernelVirtualNet` makes a row unassignable — so a misfire silently changes
+/// how someone's traffic is treated.
+///
+/// A boundary is anything that is not a letter or a digit, which is what
+/// separates words in both spellings this takes: an executable basename
+/// (`qemu-system-x86_64.exe`) and a display name (`Docker Desktop`). Keywords
+/// that already carry separators (`docker desktop`, `hyper-v`) work unchanged —
+/// the boundary test is applied around the whole keyword, not inside it.
+fn keyword_matches(text: &str, keyword: &str) -> bool {
+    let is_word = |c: char| c.is_ascii_alphanumeric();
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(offset) = text[from..].find(keyword) {
+        let start = from + offset;
+        let end = start + keyword.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1] as char);
+        let after_ok = end == bytes.len() || !is_word(bytes[end] as char);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= text.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// Merge discovered apps from several sources into a stable, deduplicated list.
@@ -596,5 +631,24 @@ mod tests {
             AppDiscoverySource::RunningProcess,
         )]);
         assert_eq!(m.discover_app_groups().len(), 1);
+    }
+    /// The dictionary matches WORDS, not substrings.
+    ///
+    /// Each of these was a real misfire: a Windows component read as a crypto
+    /// node, a newsletter as a kernel virtual network. The classification is
+    /// load-bearing — it switches off name learning, removes fake-IP, and can
+    /// make a row unassignable — so a false positive quietly changes how
+    /// somebody's traffic is handled.
+    #[test]
+    fn a_keyword_inside_a_longer_word_is_not_a_match() {
+        assert_eq!(classify_app("GetHelp.exe"), None);
+        assert_eq!(classify_app("Together.exe"), None);
+        assert_eq!(classify_app("Newsletter Manager"), None);
+        // The real names still classify, including the ones carrying their own
+        // separators.
+        assert!(classify_app("geth.exe").is_some());
+        assert!(classify_app("qemu-system-x86_64.exe").is_some());
+        assert!(classify_app("Docker Desktop").is_some());
+        assert!(classify_app("hyper-v").is_some());
     }
 }

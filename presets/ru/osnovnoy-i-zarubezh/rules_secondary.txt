@@ -114,11 +114,13 @@ youtu.be
 *.intel.com  # Developer and IT services measured as unreachable from this country
 *.mongodb.com  # Developer and IT services measured as unreachable from this country
 *.notion.so  # Developer and IT services measured as unreachable from this country
+*.qt.io  # Developer and IT services measured as unreachable from this country
 *.releases.hashicorp.com  # Developer and IT services measured as unreachable from this country
 *.sentry.io  # Developer and IT services measured as unreachable from this country
 
 --- Windows
 Cursor.exe
+MaintenanceTool.exe  # Qt installer and updater (Qt account and downloads are refused from this country)
 WhatsAp*.exe
 Windsurf.exe
 aqua.exe

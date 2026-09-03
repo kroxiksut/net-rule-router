@@ -81,7 +81,12 @@ impl IpcHandler for PresetExportGetHandler {
         };
         let out = self
             .source
-            .export_rules_file(principal, req.route, req.include_metadata)
+            .export_rules_file(
+                principal,
+                req.route,
+                req.include_metadata,
+                &req.passthrough_sections,
+            )
             .map_err(|e| match e {
                 PresetExportError::NoActiveRevision => {
                     precondition(OP, "no active revision to export")
@@ -160,10 +165,19 @@ mod tests {
     // ── Test source ──────────────────────────────────────────────────────────
 
     /// Configurable fake [`PresetExportSource`] that records each call's
+    /// One recorded `export_rules_file` call: principal, route, metadata flag,
+    /// and the passthrough sections the caller handed over.
+    type ExportCall = (
+        String,
+        RouteRole,
+        bool,
+        std::collections::BTreeMap<String, String>,
+    );
+
     /// `(route, include_metadata)` pair and returns a pre-seeded outcome.
     struct FakeSource {
         outcome: Mutex<Result<PresetExportOutput, PresetExportError>>,
-        calls: Mutex<Vec<(String, RouteRole, bool)>>,
+        calls: Mutex<Vec<ExportCall>>,
     }
 
     impl FakeSource {
@@ -185,7 +199,21 @@ mod tests {
         }
 
         fn calls(&self) -> Vec<(String, RouteRole, bool)> {
-            self.calls.lock().unwrap().clone()
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(p, r, m, _)| (p.clone(), *r, *m))
+                .collect()
+        }
+
+        fn passthrough_seen(&self) -> Vec<std::collections::BTreeMap<String, String>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, _, _, pt)| pt.clone())
+                .collect()
         }
     }
 
@@ -195,11 +223,14 @@ mod tests {
             principal: &str,
             route: RouteRole,
             include_metadata: bool,
+            passthrough: &std::collections::BTreeMap<String, String>,
         ) -> Result<PresetExportOutput, PresetExportError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((principal.to_string(), route, include_metadata));
+            self.calls.lock().unwrap().push((
+                principal.to_string(),
+                route,
+                include_metadata,
+                passthrough.clone(),
+            ));
             self.outcome.lock().unwrap().clone()
         }
     }
@@ -252,6 +283,64 @@ mod tests {
             source.calls(),
             vec![("S-1-5-21-test".to_string(), RouteRole::Primary, false)]
         );
+    }
+
+    /// Sections this build does not parse are the caller's to supply — the
+    /// revision store keeps none — so the handler must forward them untouched.
+    /// Dropping them here is how an imported `--- Linux` block disappears from
+    /// the file the user exports back out.
+    #[test]
+    fn passthrough_sections_reach_the_export_source() {
+        let source = Arc::new(FakeSource::ok(
+            "--- Domains
+example.com
+",
+            "deadbeef".repeat(8).as_str(),
+        ));
+        let handler = PresetExportGetHandler::new(source.clone());
+        let envelope = envelope(serde_json::json!({
+            "route": "primary",
+            "include-metadata": false,
+            "passthrough-sections": { "Linux": "firefox
+", "CIDR": "10.0.0.0/8
+" },
+        }));
+        handler.handle(&envelope, &ctx()).expect("handler success");
+        let seen = source.passthrough_seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].get("Linux").map(String::as_str),
+            Some(
+                "firefox
+"
+            )
+        );
+        assert_eq!(
+            seen[0].get("CIDR").map(String::as_str),
+            Some(
+                "10.0.0.0/8
+"
+            )
+        );
+    }
+
+    /// A caller with nothing to carry stays valid: absence means "I have no
+    /// passthrough", never "drop what you have" — the service has none either
+    /// way, so the default can only be empty.
+    #[test]
+    fn an_export_without_passthrough_sections_still_parses() {
+        let source = Arc::new(FakeSource::ok(
+            "--- Domains
+",
+            "ab".repeat(32).as_str(),
+        ));
+        let handler = PresetExportGetHandler::new(source.clone());
+        let envelope = envelope(serde_json::json!({
+            "route": "primary",
+            "include-metadata": false,
+        }));
+        handler.handle(&envelope, &ctx()).expect("handler success");
+        assert!(source.passthrough_seen()[0].is_empty());
     }
 
     #[test]

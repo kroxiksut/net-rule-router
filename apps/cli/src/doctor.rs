@@ -426,6 +426,15 @@ fn same_path(a: &Path, b: &Path, case_insensitive: bool) -> bool {
 /// to ignore its code. Failures pick the most specific code available, so a
 /// script can tell "not installed" from "broken" without reading the text.
 pub fn exit_code(findings: &[Finding], registration: &Registration) -> u8 {
+    // "The registration could not be read" is not a warning ABOUT the machine,
+    // it is this check failing to run — and it has its own code, which a script
+    // acts on by repeating the command elevated. Ranked by finding level it sat
+    // behind the warnings-are-not-failures rule below and came out as success,
+    // so the code that says "ask me again with rights" was reachable only when
+    // something unrelated had failed as well.
+    if matches!(registration, Registration::AccessDenied) {
+        return exit::NEEDS_PRIVILEGE;
+    }
     let worst = findings
         .iter()
         .map(|f| f.level)
@@ -756,6 +765,13 @@ mod tests {
             .as_ref()
             .expect("a hint")
             .contains("administrator"));
+        // And the code says so too. A warning does not fail the run, but an
+        // unanswered question is not a warning: without this the console
+        // reported success for a check it never got to make.
+        assert_eq!(
+            exit_code(&findings, &facts.registration),
+            exit::NEEDS_PRIVILEGE
+        );
     }
 
     #[test]

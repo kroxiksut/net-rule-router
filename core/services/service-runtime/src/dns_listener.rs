@@ -88,6 +88,10 @@ pub struct DnsInterceptListener {
     upstream: Arc<dyn UpstreamResolver>,
     sink: Arc<dyn FactSink>,
     reconciler: Arc<dyn SyncReconciler>,
+    /// What the installed policy carries right now — the answer gate's source
+    /// of truth for "is this address enforced". The default reports nothing as
+    /// enforced, which is the truth for a listener with no apply behind it.
+    enforced_view: Arc<dyn crate::dns_resolver::EnforcedAddressView>,
     /// П0-D — secondary-owned (pinned) addresses for direct-answer steering.
     /// The default no-op (empty set) leaves every direct reply untouched.
     secondary_owned: Arc<dyn SecondaryOwnedIps>,
@@ -194,6 +198,7 @@ impl DnsInterceptListener {
             companion_rescue: Arc::new(NoopCompanionRescue),
             resolution_observer: Arc::new(NoopResolutionObserver),
             leak_guard: Arc::new(crate::dns_resolver::OpenLeakGuard),
+            enforced_view: Arc::new(crate::dns_resolver::NoEnforcement),
             upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
             deadline,
             forward_timeout,
@@ -217,6 +222,17 @@ impl DnsInterceptListener {
 
     /// Read the live leak-guard posture, so a rule-host answer whose enforcement
     /// did not install in time is withheld rather than leaked to the main link.
+    /// Supply what the installed policy actually carries, so the answer gate
+    /// can tell an enforced address from one the FQDN cache merely remembers.
+    /// Default: [`crate::dns_resolver::NoEnforcement`].
+    pub fn with_enforced_view(
+        mut self,
+        view: Arc<dyn crate::dns_resolver::EnforcedAddressView>,
+    ) -> Self {
+        self.enforced_view = view;
+        self
+    }
+
     pub fn with_leak_guard_posture(
         mut self,
         posture: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
@@ -333,6 +349,7 @@ impl DnsInterceptListener {
             self.reconciler.as_ref(),
             self.fake_ip.as_ref(),
             self.leak_guard.as_ref(),
+            self.enforced_view.as_ref(),
         ) {
             QueryOutcome::Answer { ips, .. } => build_a_response(query, &ips, self.response_ttl)
                 .map(ListenerAction::Respond)

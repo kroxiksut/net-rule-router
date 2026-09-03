@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use nrr_ipc_client::{IpcClientError, ServiceIpcClient};
 use nrr_shared::ipc::IpcOperationName;
+use nrr_shared::ipc_payloads::{DiagnosticsExportArchiveRequest, DiagnosticsExportArchiveResponse};
 
 use crate::exit;
 
@@ -40,11 +41,23 @@ pub fn run(exe: &str) -> u8 {
         return exit::NOT_RESPONDING;
     }
 
-    let request = serde_json::json!({
-        "include-logs": true,
-        "include-audit-summary": true,
-        "include-troubleshooting-playbooks": true,
-    });
+    // Built from the SSOT type rather than a hand-written object. Every field
+    // of the request carries `serde(default)`, so a key spelled by hand is not
+    // rejected — it is dropped and replaced by the default, silently, and the
+    // archive the user attaches is missing the section they asked for. The
+    // struct cannot be spelled wrong.
+    let request = match serde_json::to_value(DiagnosticsExportArchiveRequest {
+        include_logs: true,
+        include_audit_summary: true,
+        include_troubleshooting_playbooks: true,
+        ..DiagnosticsExportArchiveRequest::default()
+    }) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!("Could not build the export request: {e}");
+            return exit::FAILED;
+        }
+    };
     match client.call(
         IpcOperationName::DiagnosticsExportArchive,
         request,
@@ -80,19 +93,22 @@ fn wait_until_connected(client: &ServiceIpcClient) -> bool {
 }
 
 fn report_archive(payload: &serde_json::Value) -> u8 {
-    let path = payload
-        .get("archive-path")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if path.is_empty() {
+    // Same reason as the request: read through the type, so a renamed field
+    // fails to compile here instead of printing an empty path at the user.
+    let response: DiagnosticsExportArchiveResponse = match serde_json::from_value(payload.clone()) {
+        Ok(response) => response,
+        Err(e) => {
+            eprintln!("The service answered with something this console cannot read: {e}");
+            return exit::FAILED;
+        }
+    };
+    if response.archive_path.is_empty() {
         eprintln!("The service reported success but named no archive.");
         return exit::FAILED;
     }
     println!("Diagnostic archive written.");
-    println!("  path:  {path}");
-    if let Some(size) = payload.get("size-bytes").and_then(|v| v.as_u64()) {
-        println!("  size:  {size} bytes");
-    }
+    println!("  path:  {}", response.archive_path);
+    println!("  size:  {} bytes", response.size_bytes);
     exit::SUCCESS
 }
 

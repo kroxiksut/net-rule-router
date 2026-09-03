@@ -95,6 +95,7 @@ mod tests {
             hosts_override: None,
             origin: None,
             pinned_destinations: None,
+            pinned_destinations_total: None,
         }
     }
 

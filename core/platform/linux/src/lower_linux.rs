@@ -199,13 +199,14 @@ pub fn lower_scoped(plans: &[ScopedPlan<'_>]) -> LoweredPlan {
     let mut unsupported = Vec::new();
 
     for (plan_idx, index, flow) in indexed {
-        match lower_flow(flow, plans[plan_idx].egress) {
-            Ok(lowered) => rules.extend(lowered),
-            Err(reason) => unsupported.push(UnsupportedRule {
+        let lowered = lower_flow(flow, plans[plan_idx].egress);
+        rules.extend(lowered.rules);
+        if let Some(reason) = lowered.unsupported {
+            unsupported.push(UnsupportedRule {
                 index,
                 principal: plans[plan_idx].plan.principal.as_stored().to_owned(),
                 reason,
-            }),
+            });
         }
     }
     let rules = prune_unreachable(rules);
@@ -246,9 +247,38 @@ fn prune_unreachable(rules: Vec<NftRule>) -> Vec<NftRule> {
     kept
 }
 
-fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, UnsupportedReason> {
+/// What one flow lowered to: the rules to emit, and the reason it could not be
+/// expressed in full.
+///
+/// Both halves at once is the case that matters: an egress pin whose interface
+/// is gone loses its `accept`, but its leak-guard `drop` must stay. Reporting
+/// the rule unsupported AND emitting nothing is fail-OPEN — the traffic the pin
+/// existed to confine follows the default route instead, which is the leak the
+/// pin was there to prevent.
+struct LoweredFlow {
+    rules: Vec<NftRule>,
+    unsupported: Option<UnsupportedReason>,
+}
+
+impl LoweredFlow {
+    fn rules(rules: Vec<NftRule>) -> Self {
+        Self {
+            rules,
+            unsupported: None,
+        }
+    }
+
+    fn unsupported(reason: UnsupportedReason) -> Self {
+        Self {
+            rules: Vec::new(),
+            unsupported: Some(reason),
+        }
+    }
+}
+
+fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> LoweredFlow {
     if let AppScope::Program { key, .. } = &flow.app {
-        return Err(UnsupportedReason::AppScoped { key: key.clone() });
+        return LoweredFlow::unsupported(UnsupportedReason::AppScoped { key: key.clone() });
     }
 
     let mut base = Vec::new();
@@ -257,12 +287,11 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, Uns
         // has to emulate with per-SID filter sets. A principal we cannot express
         // as a uid must FAIL the rule, never widen it: dropping the condition
         // turns one user's rule into a machine-wide one.
-        let uid =
-            principal
-                .as_unix_uid()
-                .ok_or_else(|| UnsupportedReason::UnresolvablePrincipal {
-                    stored: principal.as_stored().to_owned(),
-                })?;
+        let Some(uid) = principal.as_unix_uid() else {
+            return LoweredFlow::unsupported(UnsupportedReason::UnresolvablePrincipal {
+                stored: principal.as_stored().to_owned(),
+            });
+        };
         base.push(NftMatch::SkUid(uid));
     }
     base.extend(lower_flow_match(&flow.flow));
@@ -270,15 +299,33 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, Uns
     let comment = rule_comment(flow);
 
     match &flow.egress {
-        EgressConstraint::Any => Ok(vec![NftRule {
+        EgressConstraint::Any => LoweredFlow::rules(vec![NftRule {
             matches: base,
             verdict: verdict_of(flow.verdict),
             comment,
         }]),
         EgressConstraint::OnlyVia(reference) => {
-            let device = egress
-                .resolve(reference)
-                .ok_or(UnsupportedReason::UnresolvedEgress)?;
+            let Some(device) = egress.resolve(reference) else {
+                // The pinned link is gone. The `accept` cannot be built without
+                // an interface name, but the guard CAN: same destination, any
+                // interface, dropped. Emitting nothing here would let the
+                // traffic follow the default route — the leak the pin exists to
+                // prevent, appearing at exactly the moment the pinned link
+                // failed. The blanket pin (`dst == Any`) keeps its own rule:
+                // its guard is the plan's separate block-all, stated lower down
+                // so the machine's own escapes are matched first.
+                if flow.flow.dst == DstMatch::Any {
+                    return LoweredFlow::unsupported(UnsupportedReason::UnresolvedEgress);
+                }
+                return LoweredFlow {
+                    rules: vec![NftRule {
+                        matches: base,
+                        verdict: NftVerdict::Drop,
+                        comment: format!("{comment} leak-guard (pinned link absent)"),
+                    }],
+                    unsupported: Some(UnsupportedReason::UnresolvedEgress),
+                };
+            };
             let mut pinned = base.clone();
             pinned.push(NftMatch::OutInterface(device));
             let accept = NftRule {
@@ -293,9 +340,9 @@ fn lower_flow(flow: &FlowRule, egress: &EgressNames) -> Result<Vec<NftRule>, Uns
             // first. Emitting it here would put that block in the exemption
             // band, above the very rules it must not cut.
             if flow.flow.dst == DstMatch::Any {
-                return Ok(vec![accept]);
+                return LoweredFlow::rules(vec![accept]);
             }
-            Ok(vec![
+            LoweredFlow::rules(vec![
                 accept,
                 // Same destination, any other interface: dropped. Without this
                 // the pin would be advice — traffic would simply follow the
@@ -662,7 +709,15 @@ mod tests {
             secondary: None,
         };
         let lowered = lower_plan(&plan_of(vec![pinned]), &absent);
-        assert!(lowered.ruleset.rules.is_empty());
+        // Never an unpinned ACCEPT — that is what would widen the rule. What
+        // does stay is the leak guard: the destination the pin confined is
+        // dropped rather than allowed to follow the default route.
+        assert!(lowered
+            .ruleset
+            .rules
+            .iter()
+            .all(|r| r.verdict == NftVerdict::Drop));
+        assert_eq!(lowered.ruleset.rules.len(), 1);
         assert_eq!(
             lowered.unsupported,
             vec![UnsupportedRule {
@@ -713,7 +768,11 @@ mod tests {
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
         let lowered = lower_plan(&plan_of(vec![pinned]), &names);
-        assert!(lowered.ruleset.rules.is_empty());
+        // The pin cannot widen: no accept is emitted. Its guard stays, so a
+        // link that went down blocks the traffic it carried instead of handing
+        // it to the default route.
+        assert_eq!(lowered.ruleset.rules.len(), 1);
+        assert_eq!(lowered.ruleset.rules[0].verdict, NftVerdict::Drop);
         assert_eq!(
             lowered.unsupported[0].reason,
             UnsupportedReason::UnresolvedEgress
@@ -931,5 +990,35 @@ mod tests {
         let lowered = lower_plans(&[blanket(1000), blanket(1001)], &EgressNames::default());
 
         assert_eq!(lowered.ruleset.rules.len(), 2);
+    }
+    /// A pin whose interface is gone keeps its GUARD.
+    ///
+    /// Dropping both halves is fail-OPEN: the traffic the pin confined to the
+    /// tunnel follows the default route instead, at exactly the moment the
+    /// tunnel went down. Windows arms a block in the same situation, and the
+    /// neutral model's own promise is that removing a pin must not widen it.
+    #[test]
+    fn an_unresolvable_pin_still_emits_its_leak_guard() {
+        let mut pinned = rule(
+            PrecedenceClass::RouteRule(RouteRole::Secondary),
+            0,
+            DstMatch::HostV4(v4(203, 0, 113, 7)),
+            Verdict::Permit,
+        );
+        pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
+        // Nothing bound, so the secondary name does not resolve.
+        let lowered = lower_flow(&pinned, &EgressNames::default());
+        assert_eq!(
+            lowered.unsupported,
+            Some(UnsupportedReason::UnresolvedEgress),
+            "the pin itself is still reported unenforceable",
+        );
+        assert_eq!(
+            lowered.rules.len(),
+            1,
+            "the guard stands: {:?}",
+            lowered.rules
+        );
+        assert_eq!(lowered.rules[0].verdict, NftVerdict::Drop);
     }
 }

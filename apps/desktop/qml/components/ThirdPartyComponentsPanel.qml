@@ -105,12 +105,16 @@ Item {
         return root.tr("dialog.third-party.signature-not-checked", "Signature was not checked")
     }
 
+    // One branch per `required_for` slug in `nrr_shared::third_party`. Spelled
+    // out rather than composed so the localization gate can see the keys — it
+    // reads string literals, and a key built by concatenation is invisible to
+    // it. A new component needs a branch here and a key in both locale files.
     function _featureLabel(slug) {
         if (slug === "fake-ip")
             return root.tr("dialog.third-party.feature.fake-ip", "Per-site virtual addresses (fake-IP)")
         if (slug === "user-interface")
             return root.tr("dialog.third-party.feature.user-interface", "Application interface")
-        return root.tr("third-party.feature." + String(slug), String(slug))
+        return root.tr("dialog.third-party.feature." + String(slug), String(slug))
     }
 
     /// Not every component is versioned by a number: an icon set is identified

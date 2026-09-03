@@ -34,6 +34,7 @@ use nrr_domain::preset_canonicalize::canonicalize_preset_rules;
 use nrr_domain::rules_file::{parse_rules_file, HostPlatform};
 use nrr_domain::rules_json_codec;
 use nrr_domain::rules_revision::RulesRevisionContent;
+use nrr_shared::ipc_payloads::CrossSetDuplicateDto;
 use nrr_shared::merge_dto::{
     ConflictResolutionDto, ConflictRuleDto, ConflictSideDto, MergeConflictDto, MergeOriginDto,
     MergePolicyDto, MergeResultDto, MergedRuleEntryDto,
@@ -316,6 +317,17 @@ fn to_result_dto(
         .map(entry_dto)
         .collect();
     let conflicts: Vec<MergeConflictDto> = result.conflicts.iter().map(conflict_dto).collect();
+    // Same shape the review path reports, so the two screens describe one fact
+    // with one wording. `kept` is the primary-route copy by construction.
+    let normalized_duplicates: Vec<CrossSetDuplicateDto> = result
+        .normalized_duplicates
+        .iter()
+        .map(|n| CrossSetDuplicateDto {
+            primary_rule_id: n.kept.id.as_str().to_string(),
+            secondary_rule_id: n.disabled.id.as_str().to_string(),
+            match_summary: nrr_domain::validation::describe_match(&n.disabled),
+        })
+        .collect();
 
     let content = RulesRevisionContent::new(result.merged);
     let merged_rules_json = rules_json::to_canonical_string(&rules_json_codec::encode(&content))
@@ -329,6 +341,7 @@ fn to_result_dto(
         service_only,
         conflicts,
         merged_rules_json,
+        normalized_duplicates,
     })
 }
 

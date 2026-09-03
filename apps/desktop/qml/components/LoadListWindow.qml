@@ -3,6 +3,7 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
 import QtQuick.Dialogs
+import "../lib/pure.js" as Pure
 
 // Rule-list import window (extracted from Main.qml).
 //
@@ -41,10 +42,7 @@ Window {
     }
 
     function _localPathFromUrl(urlValue) {
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
 
     function _sameFileConflict() {
@@ -77,18 +75,24 @@ Window {
                 "Cannot read preset file. See logs for details.")
             return
         }
+        // The radio pair above is the whole point of this window; passing it on
+        // is what makes "Merge" merge. Without it every load arrived as the
+        // default, which CLEARS the route being imported into.
+        var mode = loadListWindow.pickedMode
         if (primPath && secPath) {
             if (typeof root.presetImportController.startBothRoutesPresetImportReviewFlow === "function") {
                 root.presetImportController.startBothRoutesPresetImportReviewFlow(
-                    primB64, secB64, primPath, secPath)
+                    primB64, secB64, primPath, secPath, { mode: mode })
             }
         } else if (primPath) {
             if (typeof root.presetImportController.startPresetImportReviewFlow === "function") {
-                root.presetImportController.startPresetImportReviewFlow("primary", primB64, primPath)
+                root.presetImportController.startPresetImportReviewFlow(
+                    "primary", primB64, primPath, mode)
             }
         } else {
             if (typeof root.presetImportController.startPresetImportReviewFlow === "function") {
-                root.presetImportController.startPresetImportReviewFlow("secondary", secB64, secPath)
+                root.presetImportController.startPresetImportReviewFlow(
+                    "secondary", secB64, secPath, mode)
             }
         }
         // Offer the folder these files came from as the rule-set folder —
@@ -160,7 +164,8 @@ Window {
                 color: root.textColor
                 font.bold: true
             }
-            RadioButton {
+            ThemedRadioButton {
+                theme: root.uiTheme
                 Layout.fillWidth: true
                 text: root.tr("dialog.load-list.mode-replace",
                     "Replace current rules with the imported set")
@@ -176,7 +181,8 @@ Window {
                 text: root.tr("dialog.load-list.mode-replace-description",
                     "Existing rules for the imported route(s) are cleared first.")
             }
-            RadioButton {
+            ThemedRadioButton {
+                theme: root.uiTheme
                 Layout.fillWidth: true
                 text: root.tr("dialog.load-list.mode-merge",
                     "Merge — add new rules, skip duplicates")

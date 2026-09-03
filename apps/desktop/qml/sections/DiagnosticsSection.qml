@@ -239,9 +239,9 @@ ScrollView {
     onVisibleChanged: if (visible) section._consumePendingExplainHost()
 
     function _consumePendingExplainHost() {
-        var host = String(root.pendingExplainHost || "").trim()
+        var host = String(root.notificationsController.pendingExplainHost || "").trim()
         if (host === "") return
-        root.pendingExplainHost = ""
+        root.notificationsController.pendingExplainHost = ""
         section._probeInputText = host
         section._runExplainProbe()
     }
@@ -1513,8 +1513,6 @@ ScrollView {
         return root.tr("diag.status.service-unavailable", "Service unavailable")
     }
     function cacheStateLabel() {
-        if (cacheHealth.rebuilding === true)
-            return root.tr("diag.status.cache-rebuilding", "Cache rebuild in progress")
         if (cacheHealth.healthy === false)
             return root.tr("diag.status.cache-stale", "Cache entries stale")
         return root.tr("diag.status.cache-healthy", "Cache healthy")
@@ -1706,7 +1704,8 @@ ScrollView {
                     Layout.fillWidth: true
                     spacing: root.uiTheme.spacingSm
                     ButtonGroup { id: archiveLevelGroup }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: archiveLevelStandardRadio
                         text: root.tr("diag.archive.level.standard", "Standard (recommended)")
                         ButtonGroup.group: archiveLevelGroup
@@ -1717,7 +1716,8 @@ ScrollView {
                             value: section.root.diagnosticsArchiveRedactionLevel === "standard"
                         }
                     }
-                    RadioButton {
+                    ThemedRadioButton {
+                        theme: root.uiTheme
                         id: archiveLevelDiagnosticsRadio
                         text: root.tr("diag.archive.level.diagnostics", "Full diagnostics")
                         ButtonGroup.group: archiveLevelGroup
@@ -1999,7 +1999,7 @@ ScrollView {
                 }
                 Label {
                     text: cacheStateLabel()
-                    color: cacheHealth.healthy === false || cacheHealth.rebuilding === true
+                    color: cacheHealth.healthy === false
                         ? root.uiTheme.colorAccent
                         : root.mutedTextColor
                 }
@@ -2070,7 +2070,6 @@ ScrollView {
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("diag.cache.clear-os-dns-button", "Clear OS DNS cache")
-                        enabled: cacheHealth.rebuilding !== true
                         onClicked: {
                             // Flushes the OS DNS resolver cache only; the app's
                             // FQDN/IP cache is left untouched.
@@ -2100,7 +2099,6 @@ ScrollView {
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("diag.cache.clear-app-button", "Clear app cache")
-                        enabled: cacheHealth.rebuilding !== true
                         onClicked: {
                             // Clears the rebuildable FQDN/IP cache; audit/state
                             // DBs untouched. OS DNS cache left alone.

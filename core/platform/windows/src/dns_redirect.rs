@@ -7,16 +7,19 @@
 //! neutral. Per the policy/mechanism seam it sits behind the
 //! [`SystemDnsRedirectPort`] trait, with per-OS impls:
 //!
-//! - **Windows** — NRPT (Name Resolution Policy Table) via the
-//!   `*-DnsClientNrptRule` cmdlets. NRPT routes a namespace (here `.`, i.e. all
-//!   names) to our loopback resolver without touching per-adapter DNS, and is
-//!   cleanly reversible — preferred over rewriting adapter DNS servers.
+//! - **Windows** — NRPT (Name Resolution Policy Table). NRPT routes a namespace
+//!   (here `.`, i.e. all names) to our loopback resolver without touching
+//!   per-adapter DNS, and is cleanly reversible — preferred over rewriting
+//!   adapter DNS servers. The rule is written straight into the registry inside
+//!   one transaction ([`NrptRuleStore`]): the DNS client re-reads the table on
+//!   every change and rejects a half-written rule — with the whole table — so
+//!   the seven values must land at once. Only the read of the table *in force*
+//!   still goes through PowerShell ([`CommandRunner`]); it has no registry form.
 //! - **Linux / macOS** — systemd-resolved / `resolv.conf`, `scutil` (future).
 //!
-//! No `unsafe`: the Windows impl drives the cmdlets through a
-//! [`CommandRunner`] (`powershell.exe`), which also makes the redirect/restore
-//! **logic unit-testable** with a fake runner — the OS is exercised only by the
-//! thin, Windows-gated [`PowerShellRunner`].
+//! Both mechanisms sit behind traits with fakes, so the redirect / restore /
+//! verify logic keeps its tests on any host; only the thin Windows-gated
+//! [`PowerShellRunner`] and [`TransactedNrptStore`] touch the OS.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -25,6 +28,22 @@ use nrr_platform_api::dns::UpstreamDnsCandidate;
 use nrr_platform_api::fake_ip::FakeIpPoolConfig;
 
 use crate::error::PlatformError;
+/// Absolute path of the system PowerShell.
+///
+/// The bare name resolves through the process search path, which on Windows
+/// includes the current directory. This runs as LocalSystem (the DNS redirect)
+/// or raises a UAC prompt (the relaunch), so which binary answers to the name
+/// is not a detail. `%SystemRoot%` names the one Windows means.
+fn system_powershell() -> std::path::PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) => std::path::PathBuf::from(root)
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe"),
+        None => std::path::PathBuf::from("powershell.exe"),
+    }
+}
 
 /// Comment stamped on OUR NRPT rule so `restore` / `verify` only ever touch the
 /// rule this service created, never a VPN client's or an admin's own rule.
@@ -50,43 +69,106 @@ pub trait CommandRunner: Send + Sync {
     fn run_powershell(&self, script: &str) -> Result<CommandOutput, PlatformError>;
 }
 
-// ── Pure PowerShell command builders (unit-tested) ────────────────────────────
-//
-// `listener_ip` is our own loopback address (never user input), and `marker` is
-// a fixed constant, so these interpolations carry no injection risk.
+/// Registry key of OUR rule under `DnsPolicyConfig`. Fixed for the product's
+/// lifetime, like the marker: the rule is created and replaced in place, and
+/// the sweep can name it without a scan.
+const NRPT_RULE_KEY: &str = "{5E0C2A17-8B3D-4F61-9C4A-2D7E6F1B0A93}";
 
-/// Idempotently install our NRPT catch-all rule pointing all names (`.`) at
-/// `listener_ip`: remove any stale rule of ours first, then add.
-fn add_script(listener_ip: &str, marker: &str) -> String {
-    format!(
-        "$ErrorActionPreference='Stop'; \
-         Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{marker}' }} | \
-         ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}; \
-         Add-DnsClientNrptRule -Namespace '.' -NameServers '{listener_ip}' -Comment '{marker}'"
-    )
+/// `ConfigOptions` bit: the rule carries generic DNS servers.
+const NRPT_CONFIG_GENERIC_DNS_SERVERS: u32 = 0x8;
+
+/// Rule schema the Windows 8+ DNS client reads.
+const NRPT_RULE_VERSION: u32 = 2;
+
+/// The three storage kinds the DNS client's rule schema uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryValueKind {
+    Sz,
+    MultiSz,
+    Dword,
 }
 
-/// Remove every NRPT rule carrying our marker (restore to prior state) and
-/// echo how many there were. The count is what lets the boot sweep report
-/// whether it healed anything — a silent sweep leaves the next crash analysis
-/// unable to tell "nothing to clean" from "never ran".
-fn remove_script(marker: &str) -> String {
-    format!(
-        "$r = @(Get-DnsClientNrptRule | Where-Object {{ $_.Comment -eq '{marker}' }}); \
-         $r | ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}; \
-         $r.Count"
-    )
+/// One registry value of an NRPT rule, bytes exactly as the DNS client reads
+/// them (UTF-16LE with the terminators the kind demands; little-endian DWORD).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegistryValue {
+    pub name: &'static str,
+    pub kind: RegistryValueKind,
+    pub data: Vec<u8>,
 }
 
-/// Parse the trailing count [`remove_script`] echoes. An unreadable answer
-/// means "removed something, count unknown" rather than an error: the removal
-/// itself already succeeded.
-fn removed_count(stdout: &str) -> usize {
-    stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.trim().parse::<usize>().ok())
-        .unwrap_or(0)
+fn utf16_bytes(text: &str, terminators: usize) -> Vec<u8> {
+    text.encode_utf16()
+        .chain(std::iter::repeat_n(0, terminators))
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+fn sz(name: &'static str, text: &str) -> RegistryValue {
+    RegistryValue {
+        name,
+        kind: RegistryValueKind::Sz,
+        data: utf16_bytes(text, 1),
+    }
+}
+
+/// A one-entry `REG_MULTI_SZ`: the entry's terminator plus the list's.
+fn multi_sz(name: &'static str, text: &str) -> RegistryValue {
+    RegistryValue {
+        name,
+        kind: RegistryValueKind::MultiSz,
+        data: utf16_bytes(text, 2),
+    }
+}
+
+fn dword(name: &'static str, value: u32) -> RegistryValue {
+    RegistryValue {
+        name,
+        kind: RegistryValueKind::Dword,
+        data: value.to_le_bytes().to_vec(),
+    }
+}
+
+/// The seven values of a catch-all rule sending every name (`.`) to
+/// `listener_ip` — the exact set `Add-DnsClientNrptRule` writes. Any subset
+/// is a rule the DNS client rejects, and it rejects the whole table with it.
+pub fn nrpt_rule_values(listener_ip: &str, marker: &str) -> Vec<RegistryValue> {
+    vec![
+        sz("Comment", marker),
+        sz("DisplayName", ""),
+        sz("IPSECCARestriction", ""),
+        multi_sz("Name", "."),
+        sz("GenericDNSServers", listener_ip),
+        dword("ConfigOptions", NRPT_CONFIG_GENERIC_DNS_SERVERS),
+        dword("Version", NRPT_RULE_VERSION),
+    ]
+}
+
+/// What a scan of the rule table found.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NrptTableScan {
+    /// Our rule is under its key with every expected value, byte for byte.
+    pub ours_intact: bool,
+    /// Rules without a `Version` — left by a writer that died mid-rule. The DNS
+    /// client rejects the whole table over one of these.
+    pub damaged: usize,
+}
+
+/// The rule table itself — the registry on Windows, a map in tests.
+///
+/// A write is atomic: the DNS client re-reads the table on every change and a
+/// rule must appear whole or not at all.
+pub trait NrptRuleStore: Send + Sync {
+    /// Create or replace the rule under `key` with exactly `values`.
+    fn write_rule(&self, key: &str, values: &[RegistryValue]) -> Result<(), PlatformError>;
+    /// Delete the rule under `key`; `Ok(false)` when there was none.
+    fn delete_rule(&self, key: &str) -> Result<bool, PlatformError>;
+    /// Check our rule under `key` against `expected` and count damaged rules.
+    fn scan(&self, key: &str, expected: &[RegistryValue]) -> Result<NrptTableScan, PlatformError>;
+    /// Delete what must not be there: every rule without a `Version`, and every
+    /// rule carrying `marker` under a key other than `keep` (copies from before
+    /// the key was fixed). Returns how many went.
+    fn sweep_orphans(&self, marker: &str, keep: &str) -> Result<usize, PlatformError>;
 }
 
 /// Flush the Windows DNS client cache so warm entries re-resolve through the
@@ -259,19 +341,14 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
 
 /// Remove any orphaned NetRuleRouter Mode-B NRPT rule left by a prior crashed
 /// Resolver session, so a dead `:53` from a previous run never lingers and
-/// breaks all name resolution. Safe to call unconditionally at EVERY boot,
-/// regardless of the current enforcement mode. Marker-scoped: never touches a
-/// VPN client's or an admin's own NRPT rule. Generic over [`CommandRunner`] for
-/// unit-testing.
-pub fn clear_orphan_redirect<R: CommandRunner>(runner: &R) -> Result<usize, PlatformError> {
-    let out = runner.run_powershell(&remove_script(NRPT_MARKER))?;
-    if !out.success {
-        return Err(PlatformError::Transient {
-            operation: "nrpt.clear_orphan",
-            detail: format!("orphan NRPT cleanup failed: {}", out.stderr.trim()),
-        });
-    }
-    Ok(removed_count(&out.stdout))
+/// breaks all name resolution — plus the debris that breaks it another way: a
+/// half-written rule makes the DNS client reject the whole table. Safe to call
+/// unconditionally at EVERY boot, regardless of the current enforcement mode.
+/// Never touches a VPN client's or an admin's own rule. Returns how many rules
+/// went, so the boot log can tell "nothing to clean" from "never ran".
+pub fn clear_orphan_redirect<S: NrptRuleStore>(store: &S) -> Result<usize, PlatformError> {
+    let own = usize::from(store.delete_rule(NRPT_RULE_KEY)?);
+    Ok(own + store.sweep_orphans(NRPT_MARKER, "")?)
 }
 
 /// Echo the namespace our redirect governs iff the OS is ACTUALLY resolving
@@ -293,40 +370,47 @@ fn effective_policy_script(listener_ip: &str) -> String {
 }
 
 /// Windows NRPT implementation of [`SystemDnsRedirectPort`], generic over the
-/// [`CommandRunner`] so the redirect/restore/verify flow is testable with a fake
-/// runner. Production wires [`PowerShellRunner`].
-pub struct NrptDnsRedirect<R: CommandRunner> {
+/// rule store and the [`CommandRunner`] so the redirect/restore/verify flow is
+/// testable with fakes. Production wires [`TransactedNrptStore`] and
+/// [`PowerShellRunner`].
+pub struct NrptDnsRedirect<R: CommandRunner, S: NrptRuleStore> {
     runner: R,
+    store: S,
 }
 
-impl<R: CommandRunner> NrptDnsRedirect<R> {
-    pub fn new(runner: R) -> Self {
-        Self { runner }
+impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
+    pub fn new(runner: R, store: S) -> Self {
+        Self { runner, store }
     }
 }
 
-impl<R: CommandRunner> SystemDnsRedirectPort for NrptDnsRedirect<R> {
+impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedirect<R, S> {
     fn redirect_to(&self, listener: SocketAddr) -> Result<RedirectHandle, PlatformError> {
         let ip = listener.ip().to_string();
-        let out = self.runner.run_powershell(&add_script(&ip, NRPT_MARKER))?;
-        if !out.success {
-            return Err(PlatformError::Transient {
-                operation: "nrpt.redirect_to",
-                detail: format!("NRPT add failed: {}", out.stderr.trim()),
-            });
+        // Debris first: a half-written rule, ours or anyone's, makes the DNS
+        // client reject the table our rule is about to join.
+        let swept = self.store.sweep_orphans(NRPT_MARKER, NRPT_RULE_KEY)?;
+        if swept > 0 {
+            tracing::warn!(
+                target: "nrr::dns-redirect",
+                swept,
+                "removed NRPT rules that would have had the DNS client reject the whole table",
+            );
         }
+        self.store
+            .write_rule(NRPT_RULE_KEY, &nrpt_rule_values(&ip, NRPT_MARKER))?;
         let handle = RedirectHandle {
             marker: NRPT_MARKER.to_string(),
             listener,
         };
-        // The cmdlet exiting 0 says the rule was WRITTEN, not that the OS honours
-        // it. Confirm against the table in force, and take a rejected rule back
-        // out: left in place it buys nothing and leaves the DNS client holding a
-        // policy it refuses, while the resolver above believes Mode B is armed.
+        // Written is not honoured. Confirm against the table in force, and take
+        // a rejected rule back out: left in place it buys nothing and leaves
+        // the DNS client holding a policy it refuses, while the resolver above
+        // believes Mode B is armed.
         match self.verify(&handle) {
             Ok(RedirectState::Active) => Ok(handle),
             Ok(RedirectState::Inactive) => {
-                let _ = self.runner.run_powershell(&remove_script(NRPT_MARKER));
+                let _ = self.store.delete_rule(NRPT_RULE_KEY);
                 Err(PlatformError::Transient {
                     operation: "nrpt.redirect_to",
                     detail: "NRPT rule was written but is absent from the policy table \
@@ -349,15 +433,20 @@ impl<R: CommandRunner> SystemDnsRedirectPort for NrptDnsRedirect<R> {
         }
     }
 
-    fn restore(&self, handle: &RedirectHandle) -> Result<(), PlatformError> {
-        let out = self.runner.run_powershell(&remove_script(&handle.marker))?;
-        if !out.success {
-            return Err(PlatformError::Transient {
-                operation: "nrpt.restore",
-                detail: format!("NRPT remove failed: {}", out.stderr.trim()),
-            });
-        }
-        Ok(())
+    fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
+        self.store.delete_rule(NRPT_RULE_KEY).map(drop)
+    }
+
+    fn inspect(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
+        let ip = handle.listener.ip().to_string();
+        let scan = self
+            .store
+            .scan(NRPT_RULE_KEY, &nrpt_rule_values(&ip, &handle.marker))?;
+        Ok(if scan.ours_intact && scan.damaged == 0 {
+            RedirectState::Active
+        } else {
+            RedirectState::Inactive
+        })
     }
 
     fn verify(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
@@ -421,7 +510,7 @@ impl CommandRunner for PowerShellRunner {
         // caller of this runner is a boot step, a stop step or a recovery
         // command. A `powershell.exe` that never returns would hang the very
         // paths that exist to unstick a machine.
-        let mut child = std::process::Command::new("powershell.exe")
+        let mut child = std::process::Command::new(system_powershell())
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
@@ -476,10 +565,428 @@ impl CommandRunner for PowerShellRunner {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub use transacted::TransactedNrptStore;
+
+/// The registry mechanism behind [`NrptRuleStore`].
+///
+/// A rule is written inside one kernel transaction (KTM): the DNS client, which
+/// re-reads `DnsPolicyConfig` on every change, sees the rule appear whole at
+/// commit and never a half-written one. Measured on the machine that reported
+/// the problem: seven separate value writes drew seven "policy table corrupt"
+/// events, one transaction held open for a second and a half drew none.
+#[cfg(target_os = "windows")]
+mod transacted {
+    #![allow(unsafe_code)]
+
+    use super::{NrptTableScan, RegistryValue, RegistryValueKind};
+    use crate::error::PlatformError;
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE, WIN32_ERROR,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CommitTransaction, CreateTransaction, RollbackTransaction,
+    };
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyTransactedW, RegDeleteTreeW, RegEnumKeyExW, RegOpenKeyExW,
+        RegQueryValueExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE, REG_DWORD,
+        REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
+    };
+
+    /// Where the DNS client keeps locally configured rules.
+    const TABLE: &str = r"SYSTEM\CurrentControlSet\Services\Dnscache\Parameters\DnsPolicyConfig";
+
+    /// Rule keys are GUID strings; anything longer is not a rule.
+    const MAX_KEY_NAME: usize = 256;
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct TransactedNrptStore;
+
+    fn win32(operation: &'static str, code: WIN32_ERROR) -> PlatformError {
+        PlatformError::Transient {
+            operation,
+            detail: format!("win32 error {}", code.0),
+        }
+    }
+
+    fn rule_path(key: &str) -> HSTRING {
+        HSTRING::from(format!("{TABLE}\\{key}"))
+    }
+
+    /// An open registry key, closed on drop.
+    struct Key(HKEY);
+
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from a successful open/create and is
+            // closed exactly once, here.
+            let _ = unsafe { RegCloseKey(self.0) };
+        }
+    }
+
+    /// `None` when the key does not exist.
+    fn open(path: &HSTRING, operation: &'static str) -> Result<Option<Key>, PlatformError> {
+        let mut hkey = HKEY::default();
+        // SAFETY: `path` is a valid NUL-terminated wide string and `hkey` a
+        // valid out-pointer for the call's duration.
+        let code = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &mut hkey) };
+        match code {
+            ERROR_SUCCESS => Ok(Some(Key(hkey))),
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            other => Err(win32(operation, other)),
+        }
+    }
+
+    fn subkeys(table: &Key) -> Result<Vec<String>, PlatformError> {
+        let mut names = Vec::new();
+        let mut buf = [0u16; MAX_KEY_NAME];
+        for index in 0.. {
+            let mut len = buf.len() as u32;
+            // SAFETY: `buf` outlives the call, `len` reports its capacity in
+            // characters and receives the name length.
+            let code = unsafe {
+                RegEnumKeyExW(
+                    table.0,
+                    index,
+                    PWSTR::from_raw(buf.as_mut_ptr()),
+                    &mut len,
+                    None,
+                    PWSTR::null(),
+                    None,
+                    None,
+                )
+            };
+            match code {
+                ERROR_SUCCESS => names.push(String::from_utf16_lossy(&buf[..len as usize])),
+                ERROR_NO_MORE_ITEMS => break,
+                other => return Err(win32("nrpt.enumerate", other)),
+            }
+        }
+        Ok(names)
+    }
+
+    /// `None` when the value does not exist.
+    fn read_value(
+        key: &Key,
+        name: &str,
+    ) -> Result<Option<(REG_VALUE_TYPE, Vec<u8>)>, PlatformError> {
+        let name = HSTRING::from(name);
+        let mut kind = REG_VALUE_TYPE::default();
+        let mut size = 0u32;
+        // SAFETY: a size query — no data pointer, `size` receives the length.
+        let code =
+            unsafe { RegQueryValueExW(key.0, &name, None, Some(&mut kind), None, Some(&mut size)) };
+        match code {
+            ERROR_SUCCESS => {}
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            other => return Err(win32("nrpt.read_value", other)),
+        }
+        let mut data = vec![0u8; size as usize];
+        // SAFETY: `data` holds exactly the `size` bytes the query reported.
+        let code = unsafe {
+            RegQueryValueExW(
+                key.0,
+                &name,
+                None,
+                Some(&mut kind),
+                Some(data.as_mut_ptr()),
+                Some(&mut size),
+            )
+        };
+        match code {
+            ERROR_SUCCESS => {
+                data.truncate(size as usize);
+                Ok(Some((kind, data)))
+            }
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            other => Err(win32("nrpt.read_value", other)),
+        }
+    }
+
+    fn kind_of(value: &RegistryValue) -> REG_VALUE_TYPE {
+        match value.kind {
+            RegistryValueKind::Sz => REG_SZ,
+            RegistryValueKind::MultiSz => REG_MULTI_SZ,
+            RegistryValueKind::Dword => REG_DWORD,
+        }
+    }
+
+    fn holds(key: &Key, expected: &RegistryValue) -> Result<bool, PlatformError> {
+        Ok(read_value(key, expected.name)?
+            .is_some_and(|(kind, data)| kind == kind_of(expected) && data == expected.data))
+    }
+
+    fn delete_tree(path: &HSTRING) -> Result<bool, PlatformError> {
+        // SAFETY: `path` is a valid NUL-terminated wide string.
+        match unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, path) } {
+            ERROR_SUCCESS => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            other => Err(win32("nrpt.delete_rule", other)),
+        }
+    }
+
+    /// A kernel transaction, rolled back on drop unless committed.
+    struct Transaction(HANDLE);
+
+    impl Transaction {
+        fn begin() -> Result<Self, PlatformError> {
+            // SAFETY: every pointer argument is documented optional (null) and
+            // the description may be null.
+            let handle = unsafe {
+                CreateTransaction(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    PCWSTR::null(),
+                )
+            }
+            .map_err(|e| PlatformError::Transient {
+                operation: "nrpt.transaction.begin",
+                detail: e.to_string(),
+            })?;
+            Ok(Self(handle))
+        }
+
+        fn commit(self) -> Result<(), PlatformError> {
+            // SAFETY: the handle is a live transaction owned by `self`.
+            let result = unsafe { CommitTransaction(self.0) };
+            let handle = self.0;
+            std::mem::forget(self);
+            // SAFETY: closed exactly once, after the commit attempt.
+            let _ = unsafe { CloseHandle(handle) };
+            result.map_err(|e| PlatformError::Transient {
+                operation: "nrpt.transaction.commit",
+                detail: e.to_string(),
+            })
+        }
+    }
+
+    impl Drop for Transaction {
+        fn drop(&mut self) {
+            // SAFETY: an uncommitted live transaction; rolling back releases
+            // every change made under it, then the handle is closed once.
+            unsafe {
+                let _ = RollbackTransaction(self.0);
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    impl super::NrptRuleStore for TransactedNrptStore {
+        fn write_rule(&self, key: &str, values: &[RegistryValue]) -> Result<(), PlatformError> {
+            let tx = Transaction::begin()?;
+            let mut hkey = HKEY::default();
+            // SAFETY: the path is a valid wide string, `hkey` a valid
+            // out-pointer, the transaction handle live for the call.
+            let code = unsafe {
+                RegCreateKeyTransactedW(
+                    HKEY_LOCAL_MACHINE,
+                    &rule_path(key),
+                    0,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_WRITE,
+                    None,
+                    &mut hkey,
+                    None,
+                    tx.0,
+                    None,
+                )
+            };
+            if code != ERROR_SUCCESS {
+                return Err(win32("nrpt.write_rule", code));
+            }
+            let rule = Key(hkey);
+            for value in values {
+                // SAFETY: `rule` is open for writing under the transaction; the
+                // data slice outlives the call.
+                let code = unsafe {
+                    RegSetValueExW(
+                        rule.0,
+                        &HSTRING::from(value.name),
+                        0,
+                        kind_of(value),
+                        Some(&value.data),
+                    )
+                };
+                if code != ERROR_SUCCESS {
+                    return Err(win32("nrpt.write_rule", code));
+                }
+            }
+            // The key must be closed before the commit, or the commit sees an
+            // open handle on the transacted key.
+            drop(rule);
+            tx.commit()
+        }
+
+        fn delete_rule(&self, key: &str) -> Result<bool, PlatformError> {
+            delete_tree(&rule_path(key))
+        }
+
+        fn scan(
+            &self,
+            key: &str,
+            expected: &[RegistryValue],
+        ) -> Result<NrptTableScan, PlatformError> {
+            let Some(table) = open(&HSTRING::from(TABLE), "nrpt.scan")? else {
+                return Ok(NrptTableScan::default());
+            };
+            let mut scan = NrptTableScan::default();
+            for name in subkeys(&table)? {
+                let Some(rule) = open(&rule_path(&name), "nrpt.scan")? else {
+                    continue;
+                };
+                if name.eq_ignore_ascii_case(key) {
+                    let mut intact = true;
+                    for value in expected {
+                        intact &= holds(&rule, value)?;
+                    }
+                    scan.ours_intact = intact;
+                } else if read_value(&rule, "Version")?.is_none() {
+                    scan.damaged += 1;
+                }
+            }
+            Ok(scan)
+        }
+
+        fn sweep_orphans(&self, marker: &str, keep: &str) -> Result<usize, PlatformError> {
+            let Some(table) = open(&HSTRING::from(TABLE), "nrpt.sweep")? else {
+                return Ok(0);
+            };
+            let ours = super::sz("Comment", marker);
+            let mut removed = 0;
+            for name in subkeys(&table)? {
+                let path = rule_path(&name);
+                let Some(rule) = open(&path, "nrpt.sweep")? else {
+                    continue;
+                };
+                let half_written = read_value(&rule, "Version")?.is_none();
+                let stale_copy = !name.eq_ignore_ascii_case(keep) && holds(&rule, &ours)?;
+                drop(rule);
+                if (half_written || stale_copy) && delete_tree(&path)? {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    /// The rule table as a map; the same rules the registry store applies.
+    #[derive(Default)]
+    struct FakeStore {
+        rules: Mutex<BTreeMap<String, Vec<RegistryValue>>>,
+        writes: Mutex<Vec<String>>,
+    }
+    impl FakeStore {
+        fn with(rules: &[(&str, Vec<RegistryValue>)]) -> Self {
+            let store = Self::default();
+            for (key, values) in rules {
+                store
+                    .rules
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert((*key).to_string(), values.clone());
+            }
+            store
+        }
+        fn keys(&self) -> Vec<String> {
+            self.rules
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn writes(&self) -> Vec<String> {
+            self.writes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+    fn has(values: &[RegistryValue], expected: &RegistryValue) -> bool {
+        values.iter().any(|v| v == expected)
+    }
+    impl NrptRuleStore for FakeStore {
+        fn write_rule(&self, key: &str, values: &[RegistryValue]) -> Result<(), PlatformError> {
+            self.writes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(key.to_string());
+            self.rules
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key.to_string(), values.to_vec());
+            Ok(())
+        }
+        fn delete_rule(&self, key: &str) -> Result<bool, PlatformError> {
+            Ok(self
+                .rules
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(key)
+                .is_some())
+        }
+        fn scan(
+            &self,
+            key: &str,
+            expected: &[RegistryValue],
+        ) -> Result<NrptTableScan, PlatformError> {
+            let rules = self.rules.lock().unwrap_or_else(|p| p.into_inner());
+            let mut scan = NrptTableScan::default();
+            for (name, values) in rules.iter() {
+                if name == key {
+                    scan.ours_intact = expected.iter().all(|e| has(values, e));
+                } else if !values.iter().any(|v| v.name == "Version") {
+                    scan.damaged += 1;
+                }
+            }
+            Ok(scan)
+        }
+        fn sweep_orphans(&self, marker: &str, keep: &str) -> Result<usize, PlatformError> {
+            let ours = sz("Comment", marker);
+            let mut rules = self.rules.lock().unwrap_or_else(|p| p.into_inner());
+            let before = rules.len();
+            rules.retain(|name, values| {
+                let half_written = !values.iter().any(|v| v.name == "Version");
+                let stale_copy = name != keep && has(values, &ours);
+                !(half_written || stale_copy)
+            });
+            Ok(before - rules.len())
+        }
+    }
+
+    /// A complete rule of ours, as the pre-fixed-key cmdlet era wrote it.
+    fn ours(ip: &str) -> Vec<RegistryValue> {
+        nrpt_rule_values(ip, NRPT_MARKER)
+    }
+
+    /// Somebody else's complete rule — a VPN client's split-DNS suffix.
+    fn theirs() -> Vec<RegistryValue> {
+        vec![
+            sz("Comment", "AcmeVPN"),
+            multi_sz("Name", ".corp.example"),
+            sz("GenericDNSServers", "10.0.0.53"),
+            dword("ConfigOptions", 8),
+            dword("Version", 2),
+        ]
+    }
+
+    /// A rule whose writer died after the first value.
+    fn half_written() -> Vec<RegistryValue> {
+        vec![multi_sz("Name", ".")]
+    }
 
     struct FakeRunner {
         scripts: Mutex<Vec<String>>,
@@ -560,20 +1067,15 @@ mod tests {
         ScriptedRunner::new(vec![("Get-DnsClientNrptPolicy", ok(".\n"))])
     }
 
-    /// How many scripts are a STANDALONE withdrawal. `add_script` names the same
-    /// cmdlet to clear a stale rule of ours before adding, so a bare "mentions
-    /// Remove-DnsClientNrptRule" would be true of every redirect ever attempted.
-    fn withdrawals(scripts: &[String]) -> usize {
-        scripts
-            .iter()
-            .filter(|s| {
-                s.contains("Remove-DnsClientNrptRule") && !s.contains("Add-DnsClientNrptRule")
-            })
-            .count()
-    }
-
     fn listener() -> SocketAddr {
         "127.0.0.1:53".parse().unwrap()
+    }
+
+    fn handle() -> RedirectHandle {
+        RedirectHandle {
+            marker: NRPT_MARKER.to_string(),
+            listener: listener(),
+        }
     }
 
     #[test]
@@ -637,43 +1139,87 @@ mod tests {
     }
 
     #[test]
-    fn add_script_targets_all_names_at_the_listener_with_our_marker() {
-        let s = add_script("127.0.0.1", NRPT_MARKER);
-        assert!(s.contains("-Namespace '.'"), "catch-all namespace");
-        assert!(s.contains("-NameServers '127.0.0.1'"), "points at listener");
-        assert!(s.contains(NRPT_MARKER), "carries our marker");
-        assert!(s.contains("Add-DnsClientNrptRule"));
-        // Idempotent: removes a stale rule of ours before adding.
-        assert!(s.contains("Remove-DnsClientNrptRule"));
+    fn a_rule_is_the_seven_values_the_dns_client_requires() {
+        let values = nrpt_rule_values("127.0.0.1", NRPT_MARKER);
+        let names: Vec<_> = values.iter().map(|v| v.name).collect();
+        assert_eq!(
+            names,
+            [
+                "Comment",
+                "DisplayName",
+                "IPSECCARestriction",
+                "Name",
+                "GenericDNSServers",
+                "ConfigOptions",
+                "Version",
+            ]
+        );
+        // The catch-all namespace as a one-entry list: the entry's terminator
+        // plus the list's.
+        assert!(has(
+            &values,
+            &RegistryValue {
+                name: "Name",
+                kind: RegistryValueKind::MultiSz,
+                data: vec![b'.', 0, 0, 0, 0, 0],
+            }
+        ));
+        assert!(has(
+            &values,
+            &RegistryValue {
+                name: "GenericDNSServers",
+                kind: RegistryValueKind::Sz,
+                data: "127.0.0.1\0"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+            }
+        ));
+        assert!(has(&values, &dword("ConfigOptions", 8)));
+        assert!(has(&values, &dword("Version", 2)));
+        assert!(has(&values, &sz("Comment", NRPT_MARKER)));
     }
 
     #[test]
-    fn redirect_runs_add_and_returns_handle() {
-        let redirect = NrptDnsRedirect::new(accepting_runner());
+    fn redirect_writes_our_rule_under_its_fixed_key_and_confirms_it() {
+        let redirect = NrptDnsRedirect::new(accepting_runner(), FakeStore::default());
         let h = redirect.redirect_to(listener()).expect("redirect");
         assert_eq!(h.marker, NRPT_MARKER);
         assert_eq!(h.listener, listener());
-        let scripts = redirect.runner.scripts();
-        assert!(scripts[0].contains("Add-DnsClientNrptRule"));
+        assert_eq!(redirect.store.writes(), [NRPT_RULE_KEY]);
+        assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY]);
         assert!(
-            scripts[1].contains("Get-DnsClientNrptPolicy"),
-            "a successful add must still be confirmed against the table in force"
+            redirect.runner.scripts()[0].contains("Get-DnsClientNrptPolicy"),
+            "a successful write must still be confirmed against the table in force"
         );
     }
 
     #[test]
+    fn redirect_clears_the_debris_that_would_have_the_table_rejected() {
+        // A half-written rule (its writer died) and a copy of ours under a
+        // random key (the cmdlet era) both go; the VPN client's rule stays.
+        let store = FakeStore::with(&[
+            ("{HALF}", half_written()),
+            ("{OLD-OURS}", ours("127.0.0.1")),
+            ("{VPN}", theirs()),
+        ]);
+        let redirect = NrptDnsRedirect::new(accepting_runner(), store);
+        redirect.redirect_to(listener()).expect("redirect");
+        assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY, "{VPN}"]);
+    }
+
+    #[test]
     fn redirect_withdraws_a_rule_the_os_does_not_honour() {
-        // Add reports success (the rule IS written), the effective table comes
-        // back empty: Windows evaluated the rule and refused it.
-        let redirect = NrptDnsRedirect::new(ScriptedRunner::new(vec![(
-            "Get-DnsClientNrptPolicy",
-            ok("   \n"),
-        )]));
+        // The rule IS written; the effective table comes back empty: Windows
+        // evaluated the rule and refused it.
+        let redirect = NrptDnsRedirect::new(
+            ScriptedRunner::new(vec![("Get-DnsClientNrptPolicy", ok("   \n"))]),
+            FakeStore::default(),
+        );
         let err = redirect.redirect_to(listener()).unwrap_err();
         assert!(matches!(err, PlatformError::Transient { .. }));
-        assert_eq!(
-            withdrawals(&redirect.runner.scripts()),
-            1,
+        assert!(
+            redirect.store.keys().is_empty(),
             "a rule the OS refuses must not be left behind for the next boot to trip over"
         );
     }
@@ -682,76 +1228,96 @@ mod tests {
     fn redirect_survives_an_unreadable_policy_table() {
         // The query itself failed. That is not a rejection, and treating it as
         // one would disable Mode B on every host where the cmdlet is missing.
-        let redirect = NrptDnsRedirect::new(ScriptedRunner::new(vec![(
-            "Get-DnsClientNrptPolicy",
-            CommandOutput {
-                success: false,
-                stdout: String::new(),
-                stderr: "cmdlet not found".into(),
-            },
-        )]));
+        let redirect = NrptDnsRedirect::new(
+            ScriptedRunner::new(vec![(
+                "Get-DnsClientNrptPolicy",
+                CommandOutput {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "cmdlet not found".into(),
+                },
+            )]),
+            FakeStore::default(),
+        );
         redirect
             .redirect_to(listener())
             .expect("an unreadable answer must not tear down a working redirect");
         assert_eq!(
-            withdrawals(&redirect.runner.scripts()),
-            0,
+            redirect.store.keys(),
+            [NRPT_RULE_KEY],
             "nothing was refused, so nothing may be withdrawn"
         );
     }
 
     #[test]
-    fn redirect_maps_command_failure_to_transient() {
-        let runner = FakeRunner::new(CommandOutput {
-            success: false,
-            stdout: String::new(),
-            stderr: "Access is denied".into(),
-        });
-        let err = NrptDnsRedirect::new(runner)
-            .redirect_to(listener())
-            .unwrap_err();
-        assert!(matches!(err, PlatformError::Transient { .. }));
-        assert!(format!("{err}").contains("Access is denied"));
-    }
-
-    #[test]
-    fn clear_orphan_reports_how_many_rules_it_removed() {
-        let runner = FakeRunner::new(ok("2
-"));
-        assert_eq!(clear_orphan_redirect(&runner).expect("clear"), 2);
+    fn clear_orphan_counts_our_rule_and_the_debris_but_not_a_stranger() {
+        let store = FakeStore::with(&[
+            (NRPT_RULE_KEY, ours("127.0.0.1")),
+            ("{HALF}", half_written()),
+            ("{OLD-OURS}", ours("127.0.0.1")),
+            ("{VPN}", theirs()),
+        ]);
+        assert_eq!(clear_orphan_redirect(&store).expect("clear"), 3);
+        assert_eq!(store.keys(), ["{VPN}"]);
         // Nothing to clean is a successful sweep of zero, not a failure.
-        let empty = FakeRunner::new(ok("0"));
-        assert_eq!(clear_orphan_redirect(&empty).expect("clear"), 0);
-        // An answer we cannot parse still means the removal itself succeeded.
-        let noisy = FakeRunner::new(ok("WARNING: something
-"));
-        assert_eq!(clear_orphan_redirect(&noisy).expect("clear"), 0);
+        assert_eq!(clear_orphan_redirect(&store).expect("clear"), 0);
     }
 
     #[test]
-    fn restore_runs_remove_by_marker() {
-        let runner = FakeRunner::new(ok(""));
-        let redir = NrptDnsRedirect::new(runner);
-        let handle = RedirectHandle {
-            marker: NRPT_MARKER.to_string(),
-            listener: listener(),
-        };
-        redir.restore(&handle).expect("restore");
-        let scripts = redir.runner.scripts();
-        assert_eq!(scripts.len(), 1);
-        assert!(scripts[0].contains("Remove-DnsClientNrptRule"));
-        assert!(scripts[0].contains(NRPT_MARKER));
+    fn restore_deletes_only_our_key_and_spawns_nothing() {
+        let store = FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1")), ("{VPN}", theirs())]);
+        let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), store);
+        redirect.restore(&handle()).expect("restore");
+        assert_eq!(redirect.store.keys(), ["{VPN}"]);
+        assert!(redirect.runner.scripts().is_empty());
+        redirect
+            .restore(&handle())
+            .expect("restoring twice is a no-op");
+    }
+
+    #[test]
+    fn inspect_reads_our_configuration_and_the_table_around_it() {
+        fn inspect(store: FakeStore) -> RedirectState {
+            let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), store);
+            let state = redirect.inspect(&handle()).expect("inspect");
+            assert!(
+                redirect.runner.scripts().is_empty(),
+                "the guard's check must never cost a process"
+            );
+            state
+        }
+        assert_eq!(
+            inspect(FakeStore::with(&[
+                (NRPT_RULE_KEY, ours("127.0.0.1")),
+                ("{VPN}", theirs()),
+            ])),
+            RedirectState::Active
+        );
+        // Ours gone.
+        assert_eq!(
+            inspect(FakeStore::with(&[("{VPN}", theirs())])),
+            RedirectState::Inactive
+        );
+        // Ours intact, but a half-written stranger has the whole table rejected.
+        assert_eq!(
+            inspect(FakeStore::with(&[
+                (NRPT_RULE_KEY, ours("127.0.0.1")),
+                ("{HALF}", half_written()),
+            ])),
+            RedirectState::Inactive
+        );
+        // Ours edited to point elsewhere is not ours.
+        assert_eq!(
+            inspect(FakeStore::with(&[(NRPT_RULE_KEY, ours("10.0.0.1"))])),
+            RedirectState::Inactive
+        );
     }
 
     #[test]
     fn verify_asks_the_effective_policy_table_not_our_own_write() {
-        let handle = RedirectHandle {
-            marker: NRPT_MARKER.to_string(),
-            listener: listener(),
-        };
-        let redirect = NrptDnsRedirect::new(FakeRunner::new(ok(".\n")));
+        let redirect = NrptDnsRedirect::new(FakeRunner::new(ok(".\n")), FakeStore::default());
         assert_eq!(
-            redirect.verify(&handle).expect("verify"),
+            redirect.verify(&handle()).expect("verify"),
             RedirectState::Active
         );
         let script = &redirect.runner.scripts()[0];
@@ -770,19 +1336,22 @@ mod tests {
 
         // Nothing in force → Inactive.
         assert_eq!(
-            NrptDnsRedirect::new(FakeRunner::new(ok("")))
-                .verify(&handle)
+            NrptDnsRedirect::new(FakeRunner::new(ok("")), FakeStore::default())
+                .verify(&handle())
                 .expect("verify"),
             RedirectState::Inactive
         );
 
         // A query that could not run is an error, not "Inactive".
-        assert!(NrptDnsRedirect::new(FakeRunner::new(CommandOutput {
-            success: false,
-            stdout: String::new(),
-            stderr: "denied".into(),
-        }))
-        .verify(&handle)
+        assert!(NrptDnsRedirect::new(
+            FakeRunner::new(CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "denied".into(),
+            }),
+            FakeStore::default()
+        )
+        .verify(&handle())
         .is_err());
     }
 

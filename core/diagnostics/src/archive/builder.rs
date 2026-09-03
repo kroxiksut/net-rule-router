@@ -341,7 +341,6 @@ fn write_section(
             let summary = json!({
                 "healthy": input.health.cache_health.healthy,
                 "entry_count": input.health.cache_health.entry_count,
-                "rebuilding": input.health.cache_health.rebuilding,
             });
             write_file(
                 &path,
@@ -665,11 +664,11 @@ mod tests {
             cache_health: CacheHealthCard {
                 entry_count: 10,
                 healthy: true,
-                rebuilding: false,
             },
             log_health: LogHealthCard {
                 dir_writable: true,
                 total_size_bytes: 4096,
+                audit_size_bytes: 0,
                 file_count: 1,
                 dropped_count: 0,
                 last_cleanup_at: None,

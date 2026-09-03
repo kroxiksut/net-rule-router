@@ -190,7 +190,7 @@ pub fn write_qt_tray_context_file(
         std::process::id()
     ));
 
-    let payload = serde_json::to_string_pretty(&context)
+    let payload = serde_json::to_string(&context)
         .map_err(|error| format!("Failed to serialize Qt tray context: {error}"))?;
     let mut file = nrr_platform_api::paths::create_private_file(&file_path)
         .map_err(|error| format!("Failed to create Qt tray context file: {error}"))?;

@@ -51,7 +51,7 @@ use super::wfp_engine::token_to_handle;
 /// `PlatformError::is_sublayer_registration_failure` matches on this exact
 /// string to keep sub-layer failures distinguishable from filter-add
 /// duplicates in the apply layer.
-const ADD_OP: &str = "FwpmSubLayerAdd0";
+const ADD_OP: &str = nrr_platform_api::error::win32_ops::SUBLAYER_ADD;
 
 /// Operation name for the removal half.
 const DELETE_OP: &str = "FwpmSubLayerDeleteByKey0";

@@ -27,6 +27,30 @@ use std::fmt;
 /// never in WFP, no enforcement at all. The compiler cannot check a constant's
 /// name against Microsoft's table — centralizing the numbers here is the only
 /// structural defence.
+/// Win32 entry points whose NAME the classifiers below key on.
+///
+/// Declared here rather than spelled twice: the backend passes one of these
+/// into `PlatformError::Win32 { operation, .. }` and the classifiers match on
+/// the same constant, so a rename is a compile error instead of a silently
+/// disabled best-effort skip. A string literal on either side compiles fine
+/// and quietly turns the policy off.
+pub mod win32_ops {
+    /// Filter add. Its `FWP_E_CONDITION_NOT_FOUND` is per-filter, not fatal.
+    pub const FILTER_ADD: &str = "FwpmFilterAdd0";
+    /// Sub-layer registration, which runs before every add. A failure here
+    /// means NO filter in the batch can install.
+    pub const SUBLAYER_ADD: &str = "FwpmSubLayerAdd0";
+    /// App-id resolution for an application filter. Any failure means this one
+    /// filter cannot be built on this host.
+    pub const APP_ID_FROM_FILE: &str = "FwpmGetAppIdFromFileName0";
+    /// SDDL → security descriptor for a per-user filter condition. Same shape
+    /// as an app-id failure: the SID cannot be expressed on this host, so this
+    /// one filter is unbuildable — and losing the user's whole revision over it
+    /// is what the per-filter policy exists to prevent.
+    pub const SDDL_TO_SECURITY_DESCRIPTOR: &str =
+        "ConvertStringSecurityDescriptorToSecurityDescriptorW";
+}
+
 pub mod win32_codes {
     /// `ERROR_ACCESS_DENIED` (5) — missing privilege; not recoverable inline.
     pub const ERROR_ACCESS_DENIED: u32 = 0x5;
@@ -211,10 +235,19 @@ impl PlatformError {
             // (we hit 2/3, then 13, then 123 across test runs); the operation
             // itself is the reliable discriminator.
             Self::Win32 {
-                operation: "FwpmGetAppIdFromFileName0",
+                operation: win32_ops::APP_ID_FROM_FILE,
+                ..
+            }
+            // A SID that will not convert to a security descriptor is the same
+            // shape of failure: the per-user condition cannot be expressed on
+            // this host, so this filter is unbuildable. Left out, it reached
+            // `classify` as a bare `0x57` → `Fatal`, the transaction rolled
+            // back, and the user's entire revision was lost over one filter.
+            | Self::Win32 {
+                operation: win32_ops::SDDL_TO_SECURITY_DESCRIPTOR,
                 ..
             } | Self::Win32 {
-                operation: "FwpmFilterAdd0",
+                operation: win32_ops::FILTER_ADD,
                 code: win32_codes::FWP_E_CONDITION_NOT_FOUND,
                 ..
             }
@@ -241,7 +274,7 @@ impl PlatformError {
         matches!(
             self,
             Self::Win32 {
-                operation: "FwpmSubLayerAdd0",
+                operation: win32_ops::SUBLAYER_ADD,
                 ..
             }
         )
@@ -286,6 +319,29 @@ fn classify_errno(_code: i32) -> ErrorClass {
     ErrorClass::Fatal
 }
 
+/// A `code` field carries whatever the API returned, and the two Win32 APIs
+/// this talks to do not agree on a spelling: some hand back a bare Win32 code
+/// (`5`), some an `HRESULT` wrapping the same one (`0x80070005`), and the WFP
+/// errors are `HRESULT`s of their own facility (`0x8032xxxx`) that have no bare
+/// form at all. Normalising the wrapped-Win32 case is the only way one table
+/// can classify all three.
+///
+/// `HRESULT_FROM_WIN32(x)` is `0x8007_0000 | x` for a 16-bit `x`, so facility 7
+/// with the top bits set unwraps back to the plain code. Everything else —
+/// including every `FWP_E_*` — is returned untouched.
+///
+/// Without this, `0x80070005` (access denied, wrapped) fell past every arm into
+/// `Fatal` instead of `PrivilegeRequired`: the apply reported a broken engine
+/// where the answer was "run this elevated".
+fn unwrap_win32_hresult(code: u32) -> u32 {
+    const FACILITY_WIN32_HRESULT: u32 = 0x8007_0000;
+    if code & 0xFFFF_0000 == FACILITY_WIN32_HRESULT {
+        code & 0x0000_FFFF
+    } else {
+        code
+    }
+}
+
 /// Map well-known Win32 error codes to their classification.
 ///
 /// Every number comes from the [`win32_codes`] table — never quote a raw
@@ -296,7 +352,7 @@ fn classify_win32_error(code: u32) -> ErrorClass {
         ERROR_TRANSACTION_IN_PROGRESS, FWP_E_ALREADY_EXISTS, FWP_E_DYNAMIC_SESSION_IN_PROGRESS,
         FWP_E_FILTER_NOT_FOUND, FWP_E_TXN_IN_PROGRESS,
     };
-    match code {
+    match unwrap_win32_hresult(code) {
         // A delete that reports the object is already gone is success for an
         // idempotent reconcile. `FwpmFilterDeleteByKey0` returns
         // `FWP_E_FILTER_NOT_FOUND` (0x80320003) — NOT the generic
@@ -330,29 +386,29 @@ mod tests {
 
     #[test]
     fn unmaterializable_covers_app_not_installed() {
-        assert!(win32("FwpmGetAppIdFromFileName0", 2).is_unmaterializable_filter());
-        assert!(win32("FwpmGetAppIdFromFileName0", 3).is_unmaterializable_filter());
+        assert!(win32(win32_ops::APP_ID_FROM_FILE, 2).is_unmaterializable_filter());
+        assert!(win32(win32_ops::APP_ID_FROM_FILE, 3).is_unmaterializable_filter());
     }
 
     #[test]
     fn unmaterializable_covers_empty_app_id_blob() {
         // ERROR_INVALID_DATA (13) on the app-id op = degenerate blob.
-        assert!(win32("FwpmGetAppIdFromFileName0", 13).is_unmaterializable_filter());
+        assert!(win32(win32_ops::APP_ID_FROM_FILE, 13).is_unmaterializable_filter());
     }
 
     #[test]
     fn unmaterializable_covers_invalid_app_path_glob() {
         // ERROR_INVALID_NAME (123) — e.g. a glob pattern `disko*.exe` that
         // FwpmGetAppIdFromFileName0 cannot resolve to a concrete path.
-        assert!(win32("FwpmGetAppIdFromFileName0", 123).is_unmaterializable_filter());
+        assert!(win32(win32_ops::APP_ID_FROM_FILE, 123).is_unmaterializable_filter());
         // And any other app-id failure code is treated the same way.
-        assert!(win32("FwpmGetAppIdFromFileName0", 5).is_unmaterializable_filter());
+        assert!(win32(win32_ops::APP_ID_FROM_FILE, 5).is_unmaterializable_filter());
     }
 
     #[test]
     fn unmaterializable_covers_condition_not_found_on_add() {
         // FWP_E_CONDITION_NOT_FOUND from the filter-add itself.
-        assert!(win32("FwpmFilterAdd0", 0x8032_0002).is_unmaterializable_filter());
+        assert!(win32(win32_ops::FILTER_ADD, 0x8032_0002).is_unmaterializable_filter());
     }
 
     #[test]
@@ -363,7 +419,7 @@ mod tests {
             operation: "FwpmFilterAdd0"
         }
         .is_unmaterializable_filter());
-        assert!(!win32("FwpmFilterAdd0", 0x5).is_unmaterializable_filter());
+        assert!(!win32(win32_ops::FILTER_ADD, 0x5).is_unmaterializable_filter());
         // CONDITION_NOT_FOUND on a *different* op is not our skip case.
         assert!(!win32("FwpmTransactionCommit0", 0x8032_0002).is_unmaterializable_filter());
     }
@@ -371,7 +427,7 @@ mod tests {
     #[test]
     fn already_exists_classifies_as_conflict_not_fatal() {
         assert_eq!(
-            win32("FwpmFilterAdd0", 0x8032_0009).classify(),
+            win32(win32_ops::FILTER_ADD, 0x8032_0009).classify(),
             ErrorClass::Conflict
         );
     }
@@ -427,20 +483,67 @@ mod tests {
     /// The sub-layer registration stage must be distinguishable from a
     /// duplicate FILTER add carrying the same Win32 code — conflating them is
     /// exactly the phantom-filter bug.
+    /// A per-user filter whose SID will not convert is unbuildable, not fatal.
+    ///
+    /// Left out of the per-filter policy this reached `classify` as a bare
+    /// `ERROR_INVALID_PARAMETER` → `Fatal`, the WFP transaction rolled back and
+    /// the user's entire revision was lost over one filter — the very outcome
+    /// the app-id path was already protected from.
+    #[test]
+    fn an_sddl_conversion_failure_is_a_per_filter_skip() {
+        assert!(win32(win32_ops::SDDL_TO_SECURITY_DESCRIPTOR, 0x57).is_unmaterializable_filter());
+        assert!(win32(win32_ops::SDDL_TO_SECURITY_DESCRIPTOR, 0x539).is_unmaterializable_filter());
+        // Still not a sub-layer failure, which must keep aborting the batch.
+        assert!(
+            !win32(win32_ops::SDDL_TO_SECURITY_DESCRIPTOR, 0x57).is_sublayer_registration_failure()
+        );
+    }
+
     #[test]
     fn sublayer_registration_failure_is_detected_by_operation_not_code() {
         // Same code, different stage:
-        let sublayer = win32("FwpmSubLayerAdd0", win32_codes::FWP_E_ALREADY_EXISTS);
-        let filter = win32("FwpmFilterAdd0", win32_codes::FWP_E_ALREADY_EXISTS);
+        let sublayer = win32(win32_ops::SUBLAYER_ADD, win32_codes::FWP_E_ALREADY_EXISTS);
+        let filter = win32(win32_ops::FILTER_ADD, win32_codes::FWP_E_ALREADY_EXISTS);
         assert!(sublayer.is_sublayer_registration_failure());
         assert!(!filter.is_sublayer_registration_failure());
         // Any sub-layer stage failure counts, whatever the code:
-        assert!(win32("FwpmSubLayerAdd0", win32_codes::ERROR_ACCESS_DENIED)
-            .is_sublayer_registration_failure());
+        assert!(
+            win32(win32_ops::SUBLAYER_ADD, win32_codes::ERROR_ACCESS_DENIED)
+                .is_sublayer_registration_failure()
+        );
         // Non-Win32 variants never match.
         assert!(!PlatformError::AccessDenied {
             operation: "FwpmSubLayerAdd0"
         }
         .is_sublayer_registration_failure());
+    }
+    /// The same failure classified the same way in both spellings.
+    ///
+    /// Half the backend records a bare Win32 code and half an `HRESULT`
+    /// wrapping it — the same `PlatformError::Win32 { code }` field, two
+    /// vocabularies. Unwrapped nowhere, `0x80070005` reached `_ => Fatal` and an
+    /// access-denied read as a broken engine, so the apply gave up instead of
+    /// saying "elevate".
+    #[test]
+    fn a_win32_code_classifies_the_same_wrapped_in_an_hresult() {
+        use win32_codes::{ERROR_ACCESS_DENIED, ERROR_NOT_FOUND, FWP_E_FILTER_NOT_FOUND};
+        let wrapped = |c: u32| 0x8007_0000 | c;
+        assert_eq!(
+            classify_win32_error(wrapped(ERROR_ACCESS_DENIED)),
+            ErrorClass::PrivilegeRequired
+        );
+        assert_eq!(
+            classify_win32_error(ERROR_ACCESS_DENIED),
+            ErrorClass::PrivilegeRequired
+        );
+        assert_eq!(
+            classify_win32_error(wrapped(ERROR_NOT_FOUND)),
+            ErrorClass::Idempotent
+        );
+        // WFP errors carry their own facility and must pass through untouched.
+        assert_eq!(
+            classify_win32_error(FWP_E_FILTER_NOT_FOUND),
+            ErrorClass::Idempotent
+        );
     }
 }

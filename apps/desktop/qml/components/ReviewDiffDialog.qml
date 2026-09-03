@@ -98,6 +98,10 @@ Dialog {
     /// (`startRulesReviewFlow`) with the parked payload, which re-runs the
     /// dry-run and re-opens this dialog in normal (Apply-enabled) mode.
     signal previewApplyRequested()
+    /// The user decided which copy of a duplicated rule stays active. `keep` is
+    /// `"primary"` or `"secondary"`; the other copy is disabled, never deleted —
+    /// a rule the user wrote stays where they wrote it.
+    signal duplicateResolved(string primaryRuleId, string secondaryRuleId, string keep)
 
     function tr(key, fallback) {
         if (ownerRoot && typeof ownerRoot.tr === "function") {
@@ -156,6 +160,13 @@ Dialog {
         }
         if (signal.apex !== undefined) text = text.replace("{apex}", String(signal.apex))
         return text
+    }
+
+    /// Rules this candidate writes into BOTH route sets with both copies
+    /// enabled. The service reports them; the choice is the user's.
+    function crossSetDuplicates() {
+        if (!summary || !summary["cross-set-duplicates"]) return []
+        return summary["cross-set-duplicates"]
     }
 
     function signalsList() {
@@ -322,6 +333,78 @@ Dialog {
             }
         }
 
+        // ── The same rule in both route sets ─────────────────────
+        //
+        // Shown before the diff: it is not a change the user made in this edit,
+        // it is a question about what they meant, and the answer changes what
+        // the diff will apply.
+        Label {
+            text: root.tr("dialog.review-diff.duplicates-heading",
+                "Rules written into both routes")
+            font.bold: true
+            font.pixelSize: 13
+            color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+            visible: root.crossSetDuplicates().length > 0
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: root.crossSetDuplicates().length > 0
+            text: root.tr("dialog.review-diff.duplicates-hint",
+                "Each of these is enabled on both routes, so which one carries the traffic is decided by evaluation order rather than by you. Pick the route that should keep it — the other copy stays in your list, switched off.")
+            wrapMode: Text.Wrap
+            font.pixelSize: 12
+            color: root.ownerRoot ? root.ownerRoot.mutedTextColor : palette.text
+        }
+        ListView {
+            id: duplicatesView
+            visible: root.crossSetDuplicates().length > 0
+            Layout.fillWidth: true
+            Layout.preferredHeight: Math.min(160, contentHeight)
+            spacing: 4
+            clip: true
+            interactive: contentHeight > height
+            model: root.crossSetDuplicates()
+            ScrollBar.vertical: ScrollBar {
+                policy: duplicatesView.contentHeight > duplicatesView.height
+                    ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
+            }
+            Accessible.role: Accessible.List
+            Accessible.name: root.tr("dialog.review-diff.duplicates-heading",
+                "Rules written into both routes")
+            delegate: RowLayout {
+                width: ListView.view.width
+                spacing: 8
+                required property var modelData
+                Label {
+                    Layout.fillWidth: true
+                    text: String(modelData["match-summary"] || "")
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 12
+                    color: root.ownerRoot ? root.ownerRoot.textColor : palette.text
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.ownerRoot
+                        ? root.ownerRoot.routeLabel("primary")
+                        : root.tr("label.primary", "Primary")
+                    onClicked: root.duplicateResolved(
+                        String(modelData["primary-rule-id"] || ""),
+                        String(modelData["secondary-rule-id"] || ""),
+                        "primary")
+                }
+                ThemedButton {
+                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                    text: root.ownerRoot
+                        ? root.ownerRoot.routeLabel("secondary")
+                        : root.tr("label.secondary", "Secondary")
+                    onClicked: root.duplicateResolved(
+                        String(modelData["primary-rule-id"] || ""),
+                        String(modelData["secondary-rule-id"] || ""),
+                        "secondary")
+                }
+            }
+        }
+
         // ── Three columns ────────────────────────────────────────
         RowLayout {
             Layout.fillWidth: true
@@ -430,8 +513,18 @@ Dialog {
         CheckBox {
             id: understandCheckbox
             visible: root.isCritical() && !root.readOnly
-            checked: root._understandChecked
-            onCheckedChanged: root._understandChecked = checked
+            // `checked` is written by the click, which kills a plain
+            // binding to it — after the first use the box shows the
+            // user's last gesture and the gate reads the flag, so a
+            // dialog reopened with the flag reset renders ticked and
+            // refuses to proceed with no explanation. A Binding element
+            // keeps re-asserting from the flag.
+            Binding {
+                target: understandCheckbox
+                property: "checked"
+                value: root._understandChecked
+            }
+            onToggled: root._understandChecked = checked
             text: root.tr(
                 "dialog.confirm-activate.checkbox-understand",
                 "I understand the risk and want to proceed")

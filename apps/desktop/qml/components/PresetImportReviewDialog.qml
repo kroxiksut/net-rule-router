@@ -205,7 +205,8 @@ Dialog {
                                     exclusive: true
                                 }
 
-                                RadioButton {
+                                ThemedRadioButton {
+                                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-merge",
                                         "Merge (concatenate contents)")
                                     checked: true
@@ -216,7 +217,8 @@ Dialog {
                                         root._duplicateChoices = copy
                                     }
                                 }
-                                RadioButton {
+                                ThemedRadioButton {
+                                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-last-wins",
                                         "Use only the last occurrence")
                                     visible: !modelData["is-known-section"]
@@ -227,7 +229,8 @@ Dialog {
                                         root._duplicateChoices = copy
                                     }
                                 }
-                                RadioButton {
+                                ThemedRadioButton {
+                                    theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                     text: root._tr("dialog.preset-review.duplicate-ignore",
                                         "Skip this section entirely")
                                     ButtonGroup.group: dupGroup
@@ -311,10 +314,19 @@ Dialog {
                                             "What is this?")
                                         color: root._textColor()
                                     }
-                                    ComboBox {
+                                    ThemedComboBox {
+                                        theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                                         Layout.fillWidth: true
                                         textRole: "label"
                                         valueRole: "value"
+                                        // The wrapper paints the closed field
+                                        // itself, so the label has to be named
+                                        // rather than left to the native style.
+                                        labelResolver: function(item) {
+                                            return String((item && item.label) || "")
+                                        }
+                                        displayText: currentIndex >= 0
+                                            ? String(model[currentIndex].label) : ""
                                         model: [
                                             { value: "passthrough",
                                               label: root._tr(
@@ -361,14 +373,16 @@ Dialog {
         RowLayout {
             Layout.fillWidth: true
             Item { Layout.fillWidth: true }
-            Button {
+            ThemedButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 text: root._tr("action.cancel", "Cancel")
                 onClicked: {
                     root.cancelled()
                     root.close()
                 }
             }
-            Button {
+            ThemedButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
                 text: root._tr("dialog.preset-review.apply", "Apply")
                 highlighted: true
                 onClicked: {

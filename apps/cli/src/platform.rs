@@ -37,9 +37,12 @@ pub fn service_control() -> Option<Box<dyn ServiceControlPort>> {
 /// twice — once properly, once re-implemented here — is how the two copies
 /// drift. So this names the verb and the console just runs it.
 ///
-/// `None` where the platform has nothing to undo. On Linux enforcement is still
-/// a stub, so there is no leftover state and no verb to run; saying that plainly
-/// beats pretending the command worked.
+/// `None` where the platform's service binary has no reset verb to run. On
+/// Linux the daemon DOES apply state — nftables rules, routes, the blanket
+/// block — so there is plenty to undo; what is missing is the verb that undoes
+/// it (`nrr-serviced` knows run/install/uninstall/status/help and nothing
+/// else). Saying "nothing to reset" there would be a lie told to exactly the
+/// person who is locked out, so the caller says what is actually true.
 #[cfg(windows)]
 pub fn offline_reset_verb() -> Option<&'static str> {
     Some("cleanup")

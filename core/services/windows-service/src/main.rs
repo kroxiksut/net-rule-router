@@ -480,6 +480,19 @@ fn run_console() -> std::process::ExitCode {
     let cfg = BootstrapConfig::new(StorageProfile::ProductionService);
     eprintln!("[dbg] step=5 before-run-bootstrap");
     let artifacts = run_bootstrap(&cfg);
+    // Re-assert the data-directory lockdown every boot.
+    //
+    // Install applies it, but `acl_applied: Some(false)` is a non-fatal install
+    // outcome, and the service creates the same tree itself when it starts
+    // before one — inheriting `%ProgramData%`, where Users may create files.
+    // Either way the per-SID rule store and the audit trail would sit readable
+    // by every local account. Best-effort and idempotent: a failure here is
+    // worth a line, not a refusal to start.
+    if let Some(root) = nrr_platform_api::paths::production_data_root() {
+        if let Err(e) = nrr_platform_windows::service_control::apply_data_dir_acl(&root) {
+            eprintln!("[nrr] data-directory lockdown could not be re-applied: {e}");
+        }
+    }
     eprintln!(
         "[dbg] step=6 after-run-bootstrap log_writer_some={}",
         artifacts.log_writer.is_some()

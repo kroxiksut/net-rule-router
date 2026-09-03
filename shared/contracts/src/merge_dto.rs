@@ -150,6 +150,16 @@ pub struct MergeResultDto {
     pub conflicts: Vec<MergeConflictDto>,
     /// The merged book as canonical rules-json (feeds `startRulesReviewFlow`).
     pub merged_rules_json: String,
+    /// Matches one of the two input books named in BOTH route sets with both
+    /// copies enabled. The merge switched the secondary copy off so the book
+    /// had one answer, and says so here rather than stopping to ask — the
+    /// person merging is usually not the one who wrote the file.
+    ///
+    /// Deliberately the review path's own type: it is the same fact, so it gets
+    /// the same band, the same wording and the same one-click reversal, and the
+    /// merged book carries it into the review dialog that follows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub normalized_duplicates: Vec<crate::ipc_payloads::CrossSetDuplicateDto>,
 }
 
 /// A single per-conflict user pick, echoed back on the second preview call.
@@ -238,6 +248,11 @@ mod tests {
                 resolved: ConflictSideDto::Unresolved,
             }],
             merged_rules_json: "{}".into(),
+            normalized_duplicates: vec![crate::ipc_payloads::CrossSetDuplicateDto {
+                primary_rule_id: "r-0001".into(),
+                secondary_rule_id: "r-0002".into(),
+                match_summary: "example.com".into(),
+            }],
         };
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains("\"file-only\""));

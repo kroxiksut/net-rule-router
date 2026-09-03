@@ -1827,3 +1827,138 @@ fn a_host_already_covered_by_a_rule_is_never_offered_as_an_isp_block_candidate()
         .note_isp_blocked_host(SID, "site.example", wall_clock()));
     assert!(f.engine.candidates(SID).is_empty());
 }
+
+// ── "It already works on the main link" ──────────────────────────────────────
+
+/// A parked candidate around one DTO — the suffix form the flow always writes.
+fn pending_candidate(dto: AutoRuleCandidateDto) -> PendingCandidate {
+    PendingCandidate {
+        dto,
+        route: RouteRole::Secondary,
+        match_kind: AuthoredMatchKind::SuffixDomain,
+    }
+}
+
+/// One candidate, spelled the way the discovery flow spells it.
+fn main_link_dto(
+    anchor: &str,
+    proposed: &str,
+    signal: &str,
+    behavior: &str,
+) -> AutoRuleCandidateDto {
+    AutoRuleCandidateDto {
+        id: format!("{anchor}|{proposed}"),
+        anchor: anchor.to_string(),
+        proposed_match: proposed.to_string(),
+        match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
+        route: RouteRole::Secondary.slug().to_string(),
+        affinity: 0.9,
+        observations: 3,
+        first_seen_unix_ms: 1,
+        last_seen_unix_ms: 2,
+        signal: signal.to_string(),
+        consumers: Vec::new(),
+        consumers_changed_unix_ms: 2,
+        primary_behavior: behavior.to_string(),
+        anchor_refuses_main_link: false,
+    }
+}
+
+#[test]
+fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
+    // The reported case: cdnjs answers perfectly well without the tunnel, and
+    // the tray kept offering it because delivery names skipped the check that
+    // co-activity names already had.
+    let cdn = main_link_dto(
+        "chatgpt.com",
+        "cdnjs.cloudflare.com",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    assert!(settled_by_the_main_link(&cdn));
+
+    let ad = main_link_dto(
+        "chatgpt.com",
+        "casalemedia.com",
+        AUTO_RULE_SIGNAL_CO_ACTIVITY,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    assert!(settled_by_the_main_link(&ad));
+}
+
+#[test]
+fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
+    // Answering is not serving: ChatGPT answers main-link addresses with a
+    // refusal, so its own names stay on offer whatever the connectivity says.
+    let own = main_link_dto(
+        "chatgpt.com",
+        "cdn.chatgpt.com",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    assert!(!settled_by_the_main_link(&own));
+
+    let brand = main_link_dto(
+        "chatgpt.com",
+        "chatgpt.io",
+        AUTO_RULE_SIGNAL_BRAND_RELATED,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    assert!(
+        !settled_by_the_main_link(&brand),
+        "brand tier is never settled by connectivity"
+    );
+}
+
+#[test]
+fn a_host_that_fails_on_the_main_link_is_still_asked_about() {
+    for behavior in [
+        AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
+        AUTO_RULE_PRIMARY_BEHAVIOR_CUT,
+        "",
+    ] {
+        let dto = main_link_dto(
+            "chatgpt.com",
+            "cdnjs.cloudflare.com",
+            AUTO_RULE_SIGNAL_DELIVERY_NAME,
+            behavior,
+        );
+        assert!(
+            !settled_by_the_main_link(&dto),
+            "behavior {behavior:?} is not an answer"
+        );
+    }
+}
+
+#[test]
+fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
+    // The pair that has to agree: what the tray will not ask about must not
+    // keep steering traffic as if the user had already said yes.
+    let engine = engine_over(
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    );
+    let settled = main_link_dto(
+        "chatgpt.com",
+        "cdnjs.cloudflare.com",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    let open = main_link_dto(
+        "chatgpt.com",
+        "oaistatic.example",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
+    );
+    engine.park(
+        SID,
+        vec![pending_candidate(settled), pending_candidate(open)],
+        10,
+    );
+
+    assert!(
+        !engine.covers_pending_secondary_host("cdnjs.cloudflare.com"),
+        "a host the tray will not ask about must not be pinned as if accepted"
+    );
+    assert!(engine.covers_pending_secondary_host("oaistatic.example"));
+}

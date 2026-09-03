@@ -135,9 +135,8 @@ pub mod windows_api;
 // and are consumed under `#[cfg(windows)]`.
 pub use adapters::{
     classify_availability, description_matches_virtual_software, is_virtual_adapter,
-    AdapterAvailability, AdapterAvailabilityChange, AdapterAvailabilitySnapshot,
-    AdapterEventSource, AdapterInfo, AdapterMonitor, IfOperStatus, InterfaceType,
-    MockAdapterEventSource,
+    AdapterAvailability, AdapterAvailabilityChange, AdapterEventSource, AdapterInfo,
+    AdapterMonitor, IfOperStatus, InterfaceType, MockAdapterEventSource,
 };
 pub use app_group_discovery::{
     classify_app, merge_discovered, AppDiscoverySource, AppGroupDiscoveryPort, AppGroupEntry,

@@ -555,8 +555,8 @@ ColumnLayout {
         // and the rules loaded below must never come from two separate walks of
         // the disk. Re-reading here is a deliberate cache drop — the folder may
         // have gained or lost sets since the last look.
-        root.invalidateRuleSetCache()
-        var e = root._ruleSetEnum()
+        root.ruleSetCatalog.invalidateRuleSetCache()
+        var e = root.ruleSetCatalog._ruleSetEnum()
         section._userPresetsActive = e.userOwned
         if (root.userPresetsDir !== "" && !e.userOwned) {
             root.statusLine = root.tr("status.user-presets-folder-empty",
@@ -564,7 +564,7 @@ ColumnLayout {
         }
         var labels = []
         for (var i = 0; i < e.entries.length; i += 1) {
-            labels.push(root.ruleSetLabelAt(i))
+            labels.push(root.ruleSetCatalog.ruleSetLabelAt(i))
         }
         section._bundledPresets = e.entries
         section._bundledPresetLabels = labels
@@ -589,7 +589,7 @@ ColumnLayout {
     // on the window, which owns the format so the remembered pick means the
     // same thing to the dropdown and to the cold-start hydration.
     function _presetSelectionKey(index) {
-        return root.ruleSetSelectionKey(index)
+        return root.ruleSetCatalog.ruleSetSelectionKey(index)
     }
 
     // Index of the remembered set within the CURRENT list, or -1 when nothing
@@ -597,7 +597,7 @@ ColumnLayout {
     // set itself is gone (renamed / deleted folder) — each of which falls back
     // to the default pick rather than stranding the dropdown on a dead entry.
     function _rememberedPresetIndex() {
-        return root.uiRevision >= 0 ? root.ruleSetRememberedIndex() : -1
+        return root.uiRevision >= 0 ? root.ruleSetCatalog.ruleSetRememberedIndex() : -1
     }
 
     // Persist the pick. App bookkeeping (listed in `_nonArmingPrefKeys`), so it
@@ -614,7 +614,7 @@ ColumnLayout {
     // дальше меняет вручную) — эвристика живёт на окне (`ruleSetPreferredIndex`),
     // потому что тем же выбором пользуется гидратация при холодном старте.
     function _preferredBundledPresetIndex() {
-        return root.ruleSetPreferredIndex()
+        return root.ruleSetCatalog.ruleSetPreferredIndex()
     }
 
     // Read the selected bundled preset's primary+secondary files and route
@@ -635,8 +635,8 @@ ColumnLayout {
         section._rememberPresetSelection(index)
         // Path assembly lives on the window so the file this button reads is
         // literally the file the cold-start hydration would have loaded.
-        var primAbs = root.ruleSetFilePath(index, "primary")
-        var secAbs = root.ruleSetFilePath(index, "secondary")
+        var primAbs = root.ruleSetCatalog.ruleSetFilePath(index, "primary")
+        var secAbs = root.ruleSetCatalog.ruleSetFilePath(index, "secondary")
         var primB64 = primAbs ? String(nrrNativeBridge.readFileBytes(primAbs) || "") : ""
         var secB64 = secAbs ? String(nrrNativeBridge.readFileBytes(secAbs) || "") : ""
         if (!primB64 && !secB64) {
@@ -1493,12 +1493,7 @@ ColumnLayout {
     }
 
     function _localPathFromUrl(urlValue) {
-        // QtQuick.Dialogs.FileDialog `selectedFile` is a `QUrl` (with the
-        // file:/// scheme on Windows). Strip to a plain local path for QFile.
-        var s = String(urlValue || "")
-        if (s.indexOf("file:///") === 0) return s.substring(8)
-        if (s.indexOf("file://") === 0) return s.substring(7)
-        return s
+        return Pure.localPathFromFileUrl(urlValue)
     }
 
     function _openImportFor(route) {

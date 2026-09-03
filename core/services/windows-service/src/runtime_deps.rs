@@ -1642,6 +1642,9 @@ pub(crate) fn build_supervised_runtime_deps(
         nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
     ));
 
+    // Filled while the IPC handlers are wired (the probe runner is built
+    // there) and read when the supervised tasks are assembled below.
+    let mut auto_probe_wiring: Option<nrr_service_runtime::service_tasks::AutoProbeWiring> = None;
     let mut registry = IpcHandlerRegistry::new();
     if let (Some(conn), Some(coord)) = (settings_conn.as_ref(), pause_coordinator.as_ref()) {
         let cache_db_path = artifacts.topology.cache_db_path.clone();
@@ -1714,13 +1717,16 @@ pub(crate) fn build_supervised_runtime_deps(
                 }
             }
         };
-        let diagnostics: Arc<dyn DiagnosticsFacade> = Arc::new(ProductionDiagnosticsFacade::new(
-            artifacts.topology.logs_dir.clone(),
-            artifacts.topology.data_dir.join("audit"),
-            diagnostics_cache_conn,
-            Arc::clone(&alerts_repo),
-            Some(Arc::clone(conn)),
-        ));
+        let diagnostics: Arc<dyn DiagnosticsFacade> = Arc::new(
+            ProductionDiagnosticsFacade::new(
+                artifacts.topology.logs_dir.clone(),
+                artifacts.topology.data_dir.join("audit"),
+                diagnostics_cache_conn,
+                Arc::clone(&alerts_repo),
+                Some(Arc::clone(conn)),
+            )
+            .with_log_writer(artifacts.log_writer.clone()),
+        );
 
         // Build the sampler-backed traffic-counter provider + writer
         // from the function-scope `traffic_sampler`. `None` keeps
@@ -2209,8 +2215,9 @@ pub(crate) fn build_supervised_runtime_deps(
         // computes the exemptions also answers what it discovered, so the list
         // the user ticks and the set the enforcement applies cannot drift.
         // "Does this address answer on the main link?" — asked when the user
-        // presses Check. Bounded by their own limits; the verdicts travel the
-        // same health channel observed traffic uses.
+        // presses Check, and on the auto-rules tick when they opted in.
+        // Bounded by their own limits; the verdicts travel the same health
+        // channel observed traffic uses.
         if let (Some(engine), Some(coord), Some(cache_arc), Some(conn_for_probe)) = (
             auto_rules_engine.as_ref(),
             route_coordinator.as_ref(),
@@ -2221,7 +2228,7 @@ pub(crate) fn build_supervised_runtime_deps(
                 Arc::clone(cache_arc),
                 FreshnessThresholds::default_production(),
             ));
-            deps = deps.with_auto_rule_probe(Arc::new(
+            let probe_runner = Arc::new(
                 nrr_service_runtime::production_auto_rule_probe::ProductionAutoRuleProbe::new(
                     Arc::clone(engine),
                     fqdn_for_probe,
@@ -2256,7 +2263,34 @@ pub(crate) fn build_supervised_runtime_deps(
                     },
                 )
                 .with_verdicts(Arc::clone(&main_route_verdicts)),
-            ));
+            );
+            // The user's own opt-in decides whether the tick runs the pass; the
+            // stored repeat window is what keeps it a check rather than a
+            // stream of connections.
+            let cadence_conn = Arc::clone(conn_for_probe);
+            auto_probe_wiring = Some(nrr_service_runtime::service_tasks::AutoProbeWiring {
+                runner: Arc::clone(&probe_runner)
+                    as Arc<dyn nrr_service_runtime::ipc_handlers::providers::AutoRuleProbeRunner>,
+                cadence: Arc::new(move |sid: &str| {
+                    use nrr_service_runtime::service_tasks::AutoProbeCadence;
+                    let guard = cadence_conn.lock().unwrap_or_else(|p| p.into_inner());
+                    let repo = nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
+                    match repo.load_for_sid(sid) {
+                        Ok(record) => AutoProbeCadence {
+                            enabled: record.primary_probe_auto,
+                            repeat: std::time::Duration::from_secs(u64::from(
+                                record.primary_probe_repeat_secs,
+                            )),
+                        },
+                        // Unreadable policy is not consent.
+                        Err(_) => AutoProbeCadence {
+                            enabled: false,
+                            repeat: std::time::Duration::from_secs(300),
+                        },
+                    }
+                }),
+            });
+            deps = deps.with_auto_rule_probe(probe_runner);
         }
         // The one fact about a routed site nothing here can measure: the user
         // says it, and it only ever un-quietens that site's companions.
@@ -2820,6 +2854,22 @@ pub(crate) fn build_supervised_runtime_deps(
             }) as nrr_service_runtime::supervised_runtime::ActiveRoutingSidFn
         });
 
+    // "Is anyone signed in?" A connected tray proves a session; on a cold boot
+    // none is running yet, so the console session is what answers first.
+    let signed_in: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let reg = Arc::clone(&sid_registry);
+        Arc::new(move || {
+            !reg.active_sids().is_empty()
+                || nrr_platform_windows::win32_ffi::console_session::active_console_user_sid()
+                    .is_some()
+        })
+    };
+    // Machine-wide network work waits for that user: the resolver arm's
+    // reason, one level wider (TUN bring-up, OS cache flush).
+    let sign_in_gate = Arc::new(nrr_service_runtime::logon_rearm::SignInGate::new(
+        Arc::clone(&signed_in),
+    ));
+
     // Start the DNS-Client ETW observer that feeds the
     // observation consumer. Only when the route path is available. Failure
     // to start (no privilege, ETW unavailable) degrades gracefully: the
@@ -2837,35 +2887,44 @@ pub(crate) fn build_supervised_runtime_deps(
                     // never see), so their zone/suffix permits compile on the
                     // first recompile instead of waiting for a fresh wire query.
                     // Order matters: seed reads the cache, THEN the flush clears
-                    // it so future lookups are observable. Best-effort.
-                    let seeded = consumer.seed_from_os_cache(std::time::SystemTime::now());
-                    if seeded.matched > 0 {
-                        tracing::info!(
-                            target: "nrr::dns-observe",
-                            matched = seeded.matched,
-                            "boot seed from OS resolver cache before flush",
-                        );
-                    }
-                    // The observer only sees WIRE
-                    // queries; anything the OS resolver cached before this
-                    // service start would stay invisible until its TTL
-                    // expires (a name resolved pre-start would otherwise be
-                    // absent from the FQDN cache and its zone→primary permit
-                    // never built). Flush once at boot, right after the ETW session
-                    // is live, so every next lookup re-queries observably.
-                    use nrr_platform_windows::DnsCacheControlPort as _;
-                    match nrr_platform_windows::WindowsDnsCacheControl::new().flush_resolver_cache()
-                    {
-                        Ok(()) => tracing::info!(
-                            target: "nrr::dns-observe",
-                            "flushed OS DNS resolver cache at observer start — pre-boot cached names will re-query and become observable",
-                        ),
-                        Err(e) => tracing::warn!(
-                            target: "nrr::dns-observe",
-                            error = ?e,
-                            "OS DNS resolver cache flush at observer start failed — names cached before boot stay invisible until their TTL expires",
-                        ),
-                    }
+                    // it so future lookups are observable. Both wait for a
+                    // signed-in user: the seed reads the ACTIVE user's rules
+                    // (none before), and the flush is machine-wide churn that
+                    // must not land in the logon phase. Best-effort.
+                    let consumer = Arc::clone(consumer);
+                    sign_in_gate.defer(
+                        "dns-cache-seed-and-flush",
+                        Arc::new(move || {
+                            let seeded =
+                                consumer.seed_from_os_cache(std::time::SystemTime::now());
+                            if seeded.matched > 0 {
+                                tracing::info!(
+                                    target: "nrr::dns-observe",
+                                    matched = seeded.matched,
+                                    "seed from OS resolver cache before flush",
+                                );
+                            }
+                            // The observer only sees WIRE queries; anything the
+                            // OS resolver cached before this service start would
+                            // stay invisible until its TTL expires (its
+                            // zone→primary permit never built). Flush once, so
+                            // every next lookup re-queries observably.
+                            use nrr_platform_windows::DnsCacheControlPort as _;
+                            match nrr_platform_windows::WindowsDnsCacheControl::new()
+                                .flush_resolver_cache()
+                            {
+                                Ok(()) => tracing::info!(
+                                    target: "nrr::dns-observe",
+                                    "flushed OS DNS resolver cache — names cached before the service started will re-query and become observable",
+                                ),
+                                Err(e) => tracing::warn!(
+                                    target: "nrr::dns-observe",
+                                    error = ?e,
+                                    "OS DNS resolver cache flush failed — names cached before the service started stay invisible until their TTL expires",
+                                ),
+                            }
+                        }),
+                    );
                     Some(Arc::new(obs)
                         as Arc<dyn nrr_platform_windows::dns_observe::DnsObservationSource>)
                 }
@@ -2996,7 +3055,7 @@ pub(crate) fn build_supervised_runtime_deps(
     // regardless of the current mode, then arm the local resolver iff the
     // persisted mode is Resolver.
     match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
-        &nrr_platform_windows::dns_redirect::PowerShellRunner,
+        &nrr_platform_windows::dns_redirect::TransactedNrptStore,
     ) {
         Ok(removed) => tracing::info!(
             target: "nrr::dns-resolver",
@@ -3230,16 +3289,7 @@ pub(crate) fn build_supervised_runtime_deps(
         fake_ip_secondary_ready,
         dns_egress_policy,
         auto_rules_engine.clone(),
-        Some({
-            // A connected tray proves a session; on a cold boot none is running
-            // yet, so the console session is what answers first.
-            let reg = Arc::clone(&sid_registry);
-            Arc::new(move || {
-                !reg.active_sids().is_empty()
-                    || nrr_platform_windows::win32_ffi::console_session::active_console_user_sid()
-                        .is_some()
-            }) as Arc<dyn Fn() -> bool + Send + Sync>
-        }),
+        Some(Arc::clone(&signed_in)),
     ) {
         dns_resolver_controller.set_factory(factory);
     }
@@ -3301,8 +3351,10 @@ pub(crate) fn build_supervised_runtime_deps(
         .unwrap_or_default();
     // Boot-reconcile the fake-IP stack to the persisted state. Desired =
     // toggle ON *and* mode Resolver (fake answers ride the Mode-B resolver).
-    // Bring-up runs on its own thread so a slow driver never delays boot; the
-    // fail-open gate keeps traffic on real addresses if it fails.
+    // Bring-up waits for a signed-in user (creating an adapter is network
+    // churn the logon phase must not carry) and then runs on its own thread so
+    // a slow driver never delays the caller; the fail-open gate keeps traffic
+    // on real addresses if it fails.
     if let Some(conn) = settings_conn.as_ref() {
         let toggle = read_fake_ip_enabled(conn);
         let desired = toggle
@@ -3319,7 +3371,12 @@ pub(crate) fn build_supervised_runtime_deps(
         if desired {
             let controller = Arc::clone(&fake_ip_controller);
             let replan = Arc::clone(&fake_ip_replan);
-            std::thread::spawn(move || {
+            sign_in_gate.defer(
+                "fake-ip-bring-up",
+                Arc::new(move || {
+                    let controller = Arc::clone(&controller);
+                    let replan = Arc::clone(&replan);
+                    std::thread::spawn(move || {
                 use nrr_platform_api::DnsCacheControlPort;
                 controller.apply(true);
                 // The stack usually comes up after the first per-SID applies
@@ -3339,7 +3396,9 @@ pub(crate) fn build_supervised_runtime_deps(
                         "OS DNS resolver cache flush after fake-IP boot bring-up failed — stale real answers persist until TTL",
                     );
                 }
-            });
+                    });
+                }),
+            );
         }
     }
     // The production OS network-change observer. Always
@@ -3424,6 +3483,7 @@ pub(crate) fn build_supervised_runtime_deps(
         conn_observation_source,
         conn_observation_consumer,
         auto_rules_engine,
+        auto_rule_probe: auto_probe_wiring,
         app_destination_memory,
         dns_resolver_controller: Some(dns_resolver_controller),
         dns_resolver_boot_mode,
@@ -3436,6 +3496,11 @@ pub(crate) fn build_supervised_runtime_deps(
         // dispatches into it and the watchdog tick carries the recovery alone.
         power_event_observer: Some(Arc::new(crate::power_scm::ScmPowerEventObserver)),
         logon_session_observer: Some(Arc::new(crate::logon_scm::ScmLogonSessionObserver)),
+        sign_in_gate: Some(sign_in_gate),
+        fake_ip_shutdown: Some({
+            let controller = Arc::clone(&fake_ip_controller);
+            Arc::new(move || controller.shutdown())
+        }),
         rebind_requests: Some(rebind_requests),
         secondary_liveness_hook,
         secondary_external_address,
@@ -3669,17 +3734,32 @@ fn strip_orphaned_block_filters_blocking() {
 /// non-elevated caller, which we detect via [`ErrorClass::PrivilegeRequired`]
 /// and turn into a "re-run elevated" message (no new `unsafe` token probe).
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
-    if sweep_orphaned_machine_state() {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::from(1)
+    match sweep_orphaned_machine_state() {
+        SweepOutcome::Done => std::process::ExitCode::SUCCESS,
+        // The console relays this verbatim as its own "needs privilege" code,
+        // which is what its documented contract promises and what makes its
+        // elevation offer fire. Reported as a plain failure it was
+        // indistinguishable from a wedged engine, and the one command a locked-
+        // out user is told to run gave the wrong advice back.
+        SweepOutcome::PrivilegeRequired => std::process::ExitCode::from(3),
+        SweepOutcome::Failed => std::process::ExitCode::from(1),
     }
 }
 
-/// The sweep itself. `false` means it could not finish — the caller decides
-/// whether that is fatal (the `cleanup` verb) or a warning to carry on past
-/// (uninstall, where leaving the service registered would be worse).
-pub(crate) fn sweep_orphaned_machine_state() -> bool {
+/// Why an offline sweep stopped.
+pub(crate) enum SweepOutcome {
+    /// Everything reachable was cleared.
+    Done,
+    /// The engine refused this caller — the console has to be elevated.
+    PrivilegeRequired,
+    /// Anything else; already reported on stderr.
+    Failed,
+}
+
+/// The sweep itself. Not a `bool`: "we were refused" and "it did not work" ask
+/// opposite things of the person running it, and only the sweep knows which
+/// happened.
+pub(crate) fn sweep_orphaned_machine_state() -> SweepOutcome {
     use nrr_platform_windows::ErrorClass;
 
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
@@ -3706,7 +3786,7 @@ pub(crate) fn sweep_orphaned_machine_state() -> bool {
                  (Administrator) console (the `scripts/reset-network.ps1` wrapper \
                  self-elevates via UAC)."
             );
-            return false;
+            return SweepOutcome::PrivilegeRequired;
         }
         Err(nrr_platform_windows::PlatformError::Transient {
             operation: "budgeted start",
@@ -3721,11 +3801,11 @@ pub(crate) fn sweep_orphaned_machine_state() -> bool {
                 "  Our filters are not persistent: a REBOOT clears them and restores \
                  the network. Restarting the `BFE` service first is worth a try."
             );
-            return false;
+            return SweepOutcome::Failed;
         }
         Err(e) => {
             eprintln!("cleanup: WFP filter sweep failed: {e:?}");
-            return false;
+            return SweepOutcome::Failed;
         }
     };
 
@@ -3796,7 +3876,7 @@ pub(crate) fn sweep_orphaned_machine_state() -> bool {
     // Best-effort — the marker-scoped removal is safe to attempt regardless of
     // whether a rule exists.
     let nrpt_cleared = match nrr_platform_windows::dns_redirect::clear_orphan_redirect(
-        &nrr_platform_windows::dns_redirect::PowerShellRunner,
+        &nrr_platform_windows::dns_redirect::TransactedNrptStore,
     ) {
         Ok(removed) => Some(removed),
         Err(e) => {
@@ -3821,7 +3901,11 @@ pub(crate) fn sweep_orphaned_machine_state() -> bool {
         None => println!("  DNS redirect (NRPT) rules: <sweep failed — see above>"),
     }
     println!("Reboot to fully clear any remainder.");
-    nrpt_cleared.is_some()
+    if nrpt_cleared.is_some() {
+        SweepOutcome::Done
+    } else {
+        SweepOutcome::Failed
+    }
 }
 
 /// Persist-on-stop — read the `routing_stop_policy` FRESH from
@@ -5430,7 +5514,7 @@ fn build_dns_resolver_instance(
     signed_in: Option<&Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> Option<nrr_service_runtime::dns_resolver_service::DnsResolverService> {
     use nrr_platform_windows::dns_redirect::{
-        NrptDnsRedirect, PowerShellRunner, SystemDnsRedirectPort,
+        NrptDnsRedirect, PowerShellRunner, SystemDnsRedirectPort, TransactedNrptStore,
     };
     use nrr_service_runtime::dns_listener::DnsInterceptListener;
     use nrr_service_runtime::dns_resolver_ports::{
@@ -5538,17 +5622,26 @@ fn build_dns_resolver_instance(
         sink,
         Arc::clone(&reconciler) as Arc<dyn nrr_service_runtime::dns_resolver::SyncReconciler>,
         upstream_dns,
-        // Latency budget → fail-open on slow reconcile. Measured on real
-        // hardware, the reconcile hook takes roughly 150-900 ms; a smaller
-        // budget fails open on most rule-host answers — every first-seen
-        // host's first connect races ahead of its route and egresses the
-        // wrong link. 900 ms matches the direct-gate budget below and stalls
-        // only the querying host's own answer.
+        // Latency budget → fail-open on slow reconcile. A smaller budget fails
+        // open on most rule-host answers — every first-seen host's first
+        // connect races ahead of its route and egresses the wrong link.
+        // 900 ms matches the direct-gate budget below and stalls only the
+        // querying host's own answer. The hook was ~150-900 ms when this was
+        // chosen; it is now measured in seconds, which is why the gate consults
+        // `typical_run` instead of spending this budget on a wait that cannot
+        // finish.
         Duration::from_millis(900),
         Duration::from_millis(2000), // forward timeout for non-intercepted queries
     )
     .with_upstream_pool(Arc::clone(&upstream_pool))
-    .with_direct_answer_steering(secondary_owned);
+    .with_direct_answer_steering(secondary_owned)
+    // What the machine actually enforces, so the answer gate stops reading the
+    // FQDN cache as proof that an address is carried.
+    .with_enforced_view(Arc::new(
+        nrr_service_runtime::dns_resolver_ports::ActiveSidEnforcedAddresses::new(Arc::clone(
+            active_sid,
+        )),
+    ));
     // Withhold a rule-host answer whose enforcement missed its deadline while
     // the guard is blocking an unresolved link — handing it over is the leak
     // the guard exists to prevent.
@@ -5635,7 +5728,8 @@ fn build_dns_resolver_instance(
             ),
         ));
     }
-    let redirect: Arc<dyn SystemDnsRedirectPort> = Arc::new(NrptDnsRedirect::new(PowerShellRunner));
+    let redirect: Arc<dyn SystemDnsRedirectPort> =
+        Arc::new(NrptDnsRedirect::new(PowerShellRunner, TransactedNrptStore));
     let listen_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 53));
     tracing::info!(
         target: "nrr::dns-resolver",

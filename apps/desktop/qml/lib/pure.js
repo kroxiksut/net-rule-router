@@ -204,10 +204,47 @@ function rememberedRulesPathFor(prefs, route, userPresetsDir) {
     return autoOpen || loaded || saved
 }
 
+// ---- file URLs ----
+
+// Local path behind a `file:` URL from a Qt file/folder dialog.
+//
+// The naive form drops eight characters after `file:///`, which is right for
+// `file:///C:/x` and wrong everywhere else: on Linux `file:///home/u/rules.txt`
+// comes back as `home/u/rules.txt`, a RELATIVE path, and the read then fails
+// while the dialog reports the file the user picked. The leading slash belongs
+// to the path unless a drive letter follows it.
+//
+// Percent-escapes are decoded: a dialog hands back `%20` for a space, and every
+// caller passes the result straight to a file API.
+function localPathFromFileUrl(urlValue) {
+    var raw = String(urlValue || "")
+    var rest
+    if (raw.indexOf("file:///") === 0) {
+        rest = raw.substring(7)
+    } else if (raw.indexOf("file://") === 0) {
+        // No third slash: what follows is a host, and the path is a UNC share.
+        rest = "//" + raw.substring(7)
+    } else {
+        rest = raw
+    }
+    // `/C:/…` — a Windows drive; the slash is URL syntax, not path.
+    if (/^\/[A-Za-z]:/.test(rest)) rest = rest.substring(1)
+    try {
+        return decodeURIComponent(rest)
+    } catch (e) {
+        return rest
+    }
+}
+
 // ---- correlation id ----
 
-function newCorrelationId() {
-    return "rules-update-" + Date.now() + "-" + Math.floor(Math.random() * 1e6)
+// `origin` names the call site. Two different flows can submit a byte-identical
+// preview payload, and when both are in flight at once the service log cannot
+// tell them apart — the correlation id is the only place the difference can
+// live. Omitting it keeps the id every existing caller produced.
+function newCorrelationId(origin) {
+    var prefix = origin ? ("rules-update-" + origin) : "rules-update"
+    return prefix + "-" + Date.now() + "-" + Math.floor(Math.random() * 1e6)
 }
 
 // ---- offline-intents pure math ----

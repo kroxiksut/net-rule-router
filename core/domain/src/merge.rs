@@ -171,12 +171,26 @@ pub struct MergeResult {
     pub entries: Vec<MergedRuleEntry>,
     /// The subset of `entries` that were both-sides-differ conflicts.
     pub conflicts: Vec<MergeConflict>,
+    /// Matches that were named in both route sets of one of the two input
+    /// books, with the secondary-route copy switched off so the book had one
+    /// answer. Reported, never hidden: the merge flow does not stop to ask
+    /// (the person merging is busy with something else and often did not write
+    /// the file), so the choice is made and then shown, one click from being
+    /// changed.
+    pub normalized_duplicates: Vec<NormalizedCrossSetRule>,
 }
 
 impl MergeResult {
     /// `true` when the two books were already identical (nothing to reconcile).
+    ///
+    /// A normalised duplicate counts as something to reconcile even when every
+    /// entry came from both sides: the merged book has a rule switched off that
+    /// neither input had switched off, and reporting that as "nothing to do"
+    /// would hide the one change the user is meant to be shown.
     pub fn is_noop(&self) -> bool {
-        self.conflicts.is_empty() && self.entries.iter().all(|e| e.origin == MergeOrigin::Both)
+        self.conflicts.is_empty()
+            && self.normalized_duplicates.is_empty()
+            && self.entries.iter().all(|e| e.origin == MergeOrigin::Both)
     }
 
     /// Conflicts still awaiting a user decision (Union policy only).
@@ -195,23 +209,113 @@ struct Side {
 }
 
 /// Index a rule book by content identity. Both route sets are walked; the
-/// route role is carried alongside so a retarget can be detected. Canonical
-/// sets cannot contain the same identity twice, but if they somehow did, the
-/// first (canonical-order) wins deterministically.
+/// route role is carried alongside so a retarget can be detected.
+///
+/// One identity gets one entry — that is what makes "the same rule moved to the
+/// other route" expressible at all, and it is why the key cannot also carry the
+/// route. A book CAN name the same match in both sets (validation reports that,
+/// it does not reject it), so the choice is made here rather than left to
+/// whichever copy happened to be met first: **an enabled copy always wins**.
+/// [`normalize_cross_set_duplicates`] has already ensured at most one copy is
+/// enabled, so the rule that is actually enforced is the one that survives, and
+/// the merge cannot drop an enforced rule. Two disabled copies enforce nothing
+/// either way; the first in canonical order wins, deterministically.
 fn index(book: &CanonicalRuleBook) -> BTreeMap<String, Side> {
-    let mut map = BTreeMap::new();
+    let mut map: BTreeMap<String, Side> = BTreeMap::new();
     for (set, route) in [
         (&book.primary, RouteRole::Primary),
         (&book.secondary, RouteRole::Secondary),
     ] {
         for rule in set.rules() {
-            map.entry(rule_identity_key(rule)).or_insert_with(|| Side {
-                rule: rule.clone(),
-                route,
-            });
+            let key = rule_identity_key(rule);
+            match map.get(&key) {
+                Some(held) if held.rule.enabled || !rule.enabled => continue,
+                _ => {
+                    map.insert(
+                        key,
+                        Side {
+                            rule: rule.clone(),
+                            route,
+                        },
+                    );
+                }
+            }
         }
     }
     map
+}
+
+/// One match that was named in BOTH route sets of a single book, with both
+/// copies enabled, and the copy that was switched off to give the book one
+/// answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormalizedCrossSetRule {
+    /// Content identity of the pair.
+    pub identity_key: String,
+    /// The copy left enabled: the one on the primary route.
+    pub kept: CanonicalRule,
+    /// The secondary-route copy, as it stood BEFORE being switched off, so a
+    /// UI can offer the opposite choice with the user's own wording intact.
+    pub disabled: CanonicalRule,
+}
+
+/// Give a book one enabled copy per match: where the same match is enabled in
+/// both route sets, the secondary-route copy is switched off.
+///
+/// Two enabled copies of one match are not a merge problem — they are a problem
+/// the book already had, and the merge only exposes it. Resolving it HERE, on
+/// each side separately, keeps [`merge_rule_books`] about "file versus service"
+/// and leaves "this rule moved to the other route" meaning what it says.
+///
+/// The primary copy is the one kept. That is what the code did before, silently,
+/// and it is the safer half: a rule left enabled on the additional route turns
+/// into a block or a leak, depending on the behaviour mode, every time the
+/// tunnel is down — whereas the primary route is the one that works when
+/// nothing else does.
+///
+/// Nothing is deleted: the loser is disabled, which is exactly the state the
+/// user is offered as the resolution, so a second pass reports nothing and the
+/// user's row is still there to switch back.
+pub fn normalize_cross_set_duplicates(
+    book: &CanonicalRuleBook,
+) -> (CanonicalRuleBook, Vec<NormalizedCrossSetRule>) {
+    let enabled_primary: BTreeMap<String, &CanonicalRule> = book
+        .primary
+        .rules()
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| (rule_identity_key(rule), rule))
+        .collect();
+    if enabled_primary.is_empty() {
+        return (book.clone(), Vec::new());
+    }
+
+    let mut normalized = Vec::new();
+    let mut secondary = Vec::with_capacity(book.secondary.len());
+    for rule in book.secondary.rules() {
+        let key = rule_identity_key(rule);
+        match enabled_primary.get(&key) {
+            Some(kept) if rule.enabled => {
+                let mut off = rule.clone();
+                off.enabled = false;
+                normalized.push(NormalizedCrossSetRule {
+                    identity_key: key,
+                    kept: (*kept).clone(),
+                    disabled: rule.clone(),
+                });
+                secondary.push(off);
+            }
+            _ => secondary.push(rule.clone()),
+        }
+    }
+
+    (
+        CanonicalRuleBook {
+            primary: book.primary.clone(),
+            secondary: CanonicalRuleSet::from_rules(secondary),
+        },
+        normalized,
+    )
 }
 
 /// Place a rule into the primary or secondary accumulator by route.
@@ -262,8 +366,16 @@ pub fn merge_rule_books_with_resolutions(
     policy: MergePolicy,
     resolutions: &BTreeMap<String, ConflictSide>,
 ) -> MergeResult {
-    let file_idx = index(file);
-    let service_idx = index(service);
+    // Each side is given one enabled copy per match BEFORE anything is paired.
+    // Two enabled copies in one book are that book's problem, not a
+    // file-versus-service disagreement, and letting them reach the pairing is
+    // what made it drop one silently.
+    let (file, file_normalized) = normalize_cross_set_duplicates(file);
+    let (service, service_normalized) = normalize_cross_set_duplicates(service);
+    let normalized_duplicates = merge_normalized(file_normalized, service_normalized);
+
+    let file_idx = index(&file);
+    let service_idx = index(&service);
 
     // Union of identity keys in deterministic (sorted) order.
     let mut keys: Vec<&String> = file_idx.keys().chain(service_idx.keys()).collect();
@@ -367,7 +479,25 @@ pub fn merge_rule_books_with_resolutions(
         },
         entries,
         conflicts,
+        normalized_duplicates,
     }
+}
+
+/// One report per match across both sides. A match named in both sets of BOTH
+/// books is one thing to tell the user about, not two; the file side is kept
+/// because its rule carries the wording the user typed.
+fn merge_normalized(
+    file: Vec<NormalizedCrossSetRule>,
+    service: Vec<NormalizedCrossSetRule>,
+) -> Vec<NormalizedCrossSetRule> {
+    let mut by_key: BTreeMap<String, NormalizedCrossSetRule> = service
+        .into_iter()
+        .map(|n| (n.identity_key.clone(), n))
+        .collect();
+    for n in file {
+        by_key.insert(n.identity_key.clone(), n);
+    }
+    by_key.into_values().collect()
 }
 
 #[cfg(test)]
@@ -396,6 +526,107 @@ mod tests {
             primary: CanonicalRuleSet::from_rules(primary),
             secondary: CanonicalRuleSet::from_rules(secondary),
         }
+    }
+
+    // ── cross-set duplicates inside ONE book ────────────────────────────────
+
+    /// The pairing keys on what a rule matches, so a book naming one match in
+    /// both of its own route sets has no single answer — and used to lose one
+    /// copy without saying so. The book is normalised first instead.
+    #[test]
+    fn one_match_enabled_in_both_sets_of_a_book_keeps_the_primary_copy() {
+        let file = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "on primary")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "and on secondary")],
+        );
+        let (normalized, reported) = normalize_cross_set_duplicates(&file);
+
+        assert_eq!(reported.len(), 1, "the pair must be reported, not hidden");
+        assert_eq!(reported[0].kept.id.as_str(), "r-1");
+        assert_eq!(reported[0].disabled.id.as_str(), "r-2");
+        assert!(
+            reported[0].disabled.enabled,
+            "the report carries the copy AS IT WAS, so the choice can be reversed",
+        );
+
+        // Nothing is deleted: the losing row is still there, switched off.
+        assert!(normalized.primary.rules()[0].enabled);
+        assert_eq!(normalized.secondary.rules().len(), 1);
+        assert!(!normalized.secondary.rules()[0].enabled);
+        assert_eq!(normalized.secondary.rules()[0].id.as_str(), "r-2");
+    }
+
+    /// A disabled copy IS the resolution the user is offered, so reporting it
+    /// again would ask the same question for ever.
+    #[test]
+    fn a_copy_that_is_already_disabled_is_not_reported_again() {
+        let file = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-2", false, [1, 1, 1, 1], "")],
+        );
+        let (normalized, reported) = normalize_cross_set_duplicates(&file);
+        assert!(reported.is_empty());
+        assert_eq!(normalized, file, "an already-settled book is left alone");
+    }
+
+    /// The whole point: the copy that is actually enforced must survive the
+    /// pairing. Before normalisation the primary copy won only because it was
+    /// walked first — which meant an enabled secondary copy could be dropped in
+    /// favour of a disabled primary one.
+    #[test]
+    fn the_enabled_copy_survives_the_pairing_even_when_the_primary_one_is_off() {
+        let file = book(
+            vec![ip_rule("r-1", false, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+        );
+        let service = book(vec![], vec![]);
+        let result = merge_rule_books(&file, &service, MergePolicy::Union);
+
+        assert!(
+            result.normalized_duplicates.is_empty(),
+            "only one copy is enabled, so there is nothing to normalise",
+        );
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].route, RouteRole::Secondary);
+        assert!(result.entries[0].rule.enabled);
+        assert_eq!(result.merged.primary.len(), 0);
+        assert_eq!(result.merged.secondary.len(), 1);
+    }
+
+    /// A book that needed normalising has something to show the user, even when
+    /// the two sides agreed about everything else.
+    #[test]
+    fn a_normalised_book_is_not_a_no_op_merge() {
+        let both = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+        );
+        let result = merge_rule_books(&both, &both, MergePolicy::Union);
+        assert!(!result.normalized_duplicates.is_empty());
+        assert!(
+            !result.is_noop(),
+            "the merged book switched a rule off that neither input had off",
+        );
+    }
+
+    /// One match, both books — one thing to tell the user about.
+    #[test]
+    fn the_same_pair_on_both_sides_is_reported_once() {
+        let file = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "file wording")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+        );
+        let service = book(
+            vec![ip_rule("s-1", true, [1, 1, 1, 1], "file wording")],
+            vec![ip_rule("s-2", true, [1, 1, 1, 1], "")],
+        );
+        let result = merge_rule_books(&file, &service, MergePolicy::Union);
+        assert_eq!(result.normalized_duplicates.len(), 1);
+        assert_eq!(
+            result.normalized_duplicates[0].kept.id.as_str(),
+            "r-1",
+            "the file side is reported: it carries the wording the user typed",
+        );
     }
 
     /// A rule appearing on only one side is always kept (never dropped).

@@ -460,9 +460,31 @@ pub struct RuleRowEntry {
     /// user has no way to connect "this site went strange" to the application
     /// rule that took it. Absent for rules that are not application rules, and
     /// for those holding nothing.
+    ///
+    /// Capped at [`MAX_PINNED_DESTINATIONS_PER_ROW`]; `pinned_destinations_total`
+    /// carries the real count when the list was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_destinations: Option<Vec<String>>,
+    /// How many addresses the rule actually holds, when that is more than the
+    /// list above carries.
+    ///
+    /// The GUI renders a sample and a COUNT, and the count has to be the true
+    /// one — a user reading "12 addresses" from a truncated list would be told
+    /// something false about what their machine is doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_destinations_total: Option<usize>,
 }
+
+/// Ceiling on the addresses one rule row carries on the wire.
+///
+/// `rules.list` is deliberately NOT paginated: the window needs the whole set
+/// at once — it renders the table and hashes the set for drift detection — and
+/// the IPC client runs one request at a time, so splitting the read into pages
+/// would trade a bounded response for a chain of round-trips on the lane every
+/// other call is queued behind. What was actually unbounded is this per-row
+/// list of observed addresses, and that is what gets a ceiling. Above the 20 a
+/// row ever displays, so nothing visible is lost.
+pub const MAX_PINNED_DESTINATIONS_PER_ROW: usize = 32;
 
 /// Read-only OS `hosts`-file override annotation for one rule row.
 ///
@@ -649,6 +671,19 @@ pub struct PresetExportGetRequest {
     /// When `false`, the output starts directly with the first section.
     #[serde(default)]
     pub include_metadata: bool,
+    /// Sections this build does not parse (`--- Linux`, `--- CIDR`, ...),
+    /// keyed by section name, valued by the raw body the caller captured when
+    /// the file was imported.
+    ///
+    /// The service cannot supply these itself: the canonical revision store
+    /// keeps only rules it understands, so a plain re-export drops every
+    /// foreign-OS and forward-compatibility block the user's file carried.
+    /// The caller that holds them (the GUI's own sidecar) passes them back
+    /// here and gets a lossless file. Absent means "the caller has none",
+    /// which is the honest default — omitting it can only lose what the
+    /// service never had.
+    #[serde(default)]
+    pub passthrough_sections: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -910,6 +945,24 @@ pub struct ReviewSummaryResponse {
     /// table requires only server-side population — the GUI is ready.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extended_sections: Vec<ExtendedSectionSummaryDto>,
+    /// Rules the candidate names in BOTH route sets with both copies enabled.
+    ///
+    /// Not an error and not resolved server-side: both copies claim the same
+    /// traffic for different routes, and only the user knows which they meant.
+    /// Empty (and omitted on the wire) when there is nothing to ask about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cross_set_duplicates: Vec<CrossSetDuplicateDto>,
+}
+
+/// One rule written into both route sets, both copies enabled.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CrossSetDuplicateDto {
+    pub primary_rule_id: String,
+    pub secondary_rule_id: String,
+    /// What both copies match, as the user wrote it — what a person recognises
+    /// on screen, unlike the two ids.
+    pub match_summary: String,
 }
 
 /// One unsupported section preserved from the imported
@@ -1249,6 +1302,28 @@ pub enum StatusUpdateEvent {
         pending_count: u64,
         top_anchor: String,
     },
+    /// This SID's active rules name the same traffic on BOTH routes, with both
+    /// copies enabled. Which one wins is then decided by evaluation order
+    /// rather than by the user, and nothing in the running policy says so —
+    /// hence a notice rather than a screen they would have to visit.
+    ///
+    /// `sample` is what one of the duplicated rules matches, for a notice that
+    /// names something recognisable instead of a bare count.
+    RuleDuplicatesDetected {
+        sid: String,
+        count: u64,
+        sample: String,
+    },
+    /// An application rule reached this SID for the first time.
+    ///
+    /// The route for an application is built from the addresses the service has
+    /// SEEN it use, so the app's first contact with each new address has no
+    /// route yet, egresses the main link and is refused — that refusal is what
+    /// teaches the address. A program with a large address pool spends that as
+    /// a run of failures, and one that gives up after the first is simply
+    /// broken until it is restarted. The user is told rather than left to
+    /// guess.
+    AppRuleLearningDestinations { sid: String, apps: Vec<String> },
     /// The additional route (re)connected and the service observed the address
     /// the outside world sees behind it. The tray shows it for a few seconds —
     /// an additional link whose own client cannot report its exit address is
@@ -1340,6 +1415,8 @@ impl StatusUpdateEvent {
         match self {
             Self::RoutingPauseStateChanged { sid, .. }
             | Self::AutoRuleCandidatesChanged { sid, .. }
+            | Self::RuleDuplicatesDetected { sid, .. }
+            | Self::AppRuleLearningDestinations { sid, .. }
             | Self::SecondaryExternalAddressObserved { sid, .. }
             | Self::UnassignedTunnelDetected { sid, .. }
             | Self::BlockNoticeRaised { sid, .. }
@@ -1859,13 +1936,24 @@ pub struct RoutePolicyUpdateRequest {
     #[serde(default = "kill_switch_protocols_default")]
     pub kill_switch_protocols: u16,
     /// When `true`, split-mode fail-closed blocks ALL egress
-    /// (catch-all) instead of only cached secondary IPs (see backend). Default
-    /// `false` (per-IP). `#[serde(default)]` keeps it additive.
-    #[serde(default)]
+    /// (catch-all) instead of only cached secondary IPs (see backend).
+    ///
+    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
+    ///
+    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
     pub kill_switch_block_all: bool,
     /// MASTER kill-switch toggle (see [`RoutePolicyDto`]).
-    /// Defaults to OFF (no blocking at all) when an older GUI omits it.
-    #[serde(default)]
+    ///
+    /// REQUIRED — no wire default, deliberately. This request replaces the
+    /// caller's whole per-SID policy, and a field that TURNS PROTECTION OFF
+    /// must not be expressible by leaving it out: `#[serde(default)]` on a
+    /// `bool` made a message that forgot this field disarm the kill switch
+    /// silently. A peer that omits it now gets a malformed-request error, which
+    /// is the correct answer for an incomplete full replace — and a loud
+    /// failure is strictly better than a quiet disarm.
+    ///
+    /// Its own subordinate `kill_switch_fail_closed` already had the safe
+    /// direction (an explicit `true` default); the master toggle did not.
     pub kill_switch_enabled: bool,
     /// "Allow DNS over the primary link while blocked"
     /// (see [`RoutePolicyDto`]). Defaults to ON when
@@ -1889,9 +1977,11 @@ pub struct RoutePolicyUpdateRequest {
     /// Defaults to `true` when an older GUI omits it.
     #[serde(default = "resolve_hosts_bypass_default")]
     pub resolve_hosts_bypass: bool,
-    /// DoH/DoT lockdown toggle (see [`RoutePolicyDto`]). Defaults
-    /// to `false` (off) when an older GUI omits it.
-    #[serde(default)]
+    /// DoH/DoT lockdown toggle (see [`RoutePolicyDto`]).
+    ///
+    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
+    ///
+    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
     pub doh_lockdown_enabled: bool,
     /// DoH/DoT lockdown scope slug (see [`RoutePolicyDto`]).
     /// Defaults to `leak-protection-only` when an older GUI omits it.
@@ -1901,10 +1991,11 @@ pub struct RoutePolicyUpdateRequest {
     /// [`RoutePolicyDto`]). Defaults to `false` (off) when an older GUI omits it.
     #[serde(default)]
     pub browser_history_auto_seed: bool,
-    /// Kill-switch shared-IP strictness (see
-    /// [`RoutePolicyDto`]). Defaults to `false` ("smart") when an older GUI
-    /// omits it.
-    #[serde(default)]
+    /// Kill-switch shared-IP strictness (see [`RoutePolicyDto`]).
+    ///
+    /// REQUIRED — no wire default. See [`kill_switch_enabled`].
+    ///
+    /// [`kill_switch_enabled`]: RoutePolicyUpdateRequest::kill_switch_enabled
     pub kill_switch_strict_shared_ips: bool,
     /// Auto-rules mode slug (see [`RoutePolicyDto`]). Defaults to
     /// `suggest` when an older GUI omits it.

@@ -187,6 +187,7 @@ pub(crate) fn build_ipc_surface(
     state_db_path: PathBuf,
     cache_db_path: PathBuf,
     audit_writer: Option<Arc<nrr_diagnostics::AuditWriter>>,
+    log_writer: Option<Arc<nrr_diagnostics::LogWriter>>,
     route_table: Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
     cycle: Arc<PrincipalEnforcementCycle>,
     health: Arc<nrr_service_runtime::HealthAggregator>,
@@ -267,13 +268,16 @@ pub(crate) fn build_ipc_surface(
         Arc::new(ProductionRulesSnapshotProvider::new(Arc::clone(
             &state_conn,
         ))),
-        Arc::new(ProductionDiagnosticsFacade::new(
-            logs_dir,
-            audit_dir,
-            cache_conn,
-            alerts_repo,
-            Some(Arc::clone(&state_conn)),
-        )),
+        Arc::new(
+            ProductionDiagnosticsFacade::new(
+                logs_dir,
+                audit_dir,
+                cache_conn,
+                alerts_repo,
+                Some(Arc::clone(&state_conn)),
+            )
+            .with_log_writer(log_writer),
+        ),
         // Rule mutations travel the coordinator, which the policy manager owns;
         // the executor covers the other mutation kinds and none of them are
         // wired here yet, so it refuses rather than reports success.

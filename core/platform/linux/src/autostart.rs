@@ -48,6 +48,9 @@ pub use nrr_platform_api::autostart::{
 /// The `.desktop` basename we own. Stable across versions — renaming it would
 /// orphan existing autostart entries on user upgrades.
 pub const AUTOSTART_DESKTOP_FILE: &str = "netrulerouter-tray.desktop";
+// Held to the identity SSOT by `the_desktop_basename_is_the_tray_binary_name`:
+// a `const` cannot be concatenated on stable Rust without another dependency,
+// so the two are pinned by a test instead of derived.
 
 /// `Name=` shown in a desktop environment's "Startup Applications" list. A
 /// proper noun, so not localized. Localized `Name[ru]=` / `Comment` keys are a
@@ -296,5 +299,17 @@ mod tests {
             }
             other => panic!("expected OverriddenExternally, got {other:?}"),
         }
+    }
+    /// The basename is stable across versions, so it is written out rather than
+    /// derived — but it still has to BE the tray binary's name. Renaming the
+    /// role in the identity SSOT used to leave this file pointing at a binary
+    /// that no longer exists, and autostart would silently stop working.
+    #[test]
+    fn the_desktop_basename_is_the_tray_binary_name() {
+        use nrr_shared::product_identity::BinaryRole;
+        assert_eq!(
+            AUTOSTART_DESKTOP_FILE,
+            format!("{}.desktop", BinaryRole::Tray.unix_file_name())
+        );
     }
 }

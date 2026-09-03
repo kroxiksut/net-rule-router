@@ -31,6 +31,9 @@ Window {
 
     signal installRequested()
     signal skipRequested()
+    /// The user asked not to be offered this again — a decision, unlike closing
+    /// the dialog, and only Settings takes it back.
+    signal stopOfferingRequested()
     signal learnMoreRequested()
 
     function tr(key, fallback) {
@@ -109,6 +112,12 @@ Window {
                 text: root.tr("dialog.first-launch-install.skip-button",
                     "Continue without service (limited)")
                 onClicked: { root.skipRequested(); root.close() }
+            }
+            ThemedButton {
+                theme: root.ownerRoot ? root.ownerRoot.uiTheme : null
+                text: root.tr("dialog.first-launch-install.stop-offering",
+                    "Stop offering")
+                onClicked: { root.stopOfferingRequested(); root.close() }
             }
             ThemedButton {
                 theme: root.ownerRoot ? root.ownerRoot.uiTheme : null

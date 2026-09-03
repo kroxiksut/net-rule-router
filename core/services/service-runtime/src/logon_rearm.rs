@@ -66,6 +66,104 @@ impl LogonSessionRearm {
     }
 }
 
+/// Work that must not run before someone is signed in.
+///
+/// Same reasoning as the resolver arm above, one level wider: bringing up a
+/// TUN adapter or flushing the OS resolver cache during the logon phase lands
+/// machine-wide network churn inside the OS's own sign-in work, for a user
+/// whose rules cannot apply yet. Each action runs exactly once — at once when
+/// a user is already there (a service restart mid-session), else on the first
+/// [`fire`](Self::fire).
+pub struct SignInGate {
+    signed_in: Arc<dyn Fn() -> bool + Send + Sync>,
+    pending: std::sync::Mutex<Vec<DeferredStep>>,
+}
+
+/// A named action held back until sign-in.
+type DeferredStep = (&'static str, Arc<dyn Fn() + Send + Sync>);
+
+impl SignInGate {
+    pub fn new(signed_in: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        Self {
+            signed_in,
+            pending: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Run `action` now if a user is signed in, else hold it for `fire`.
+    pub fn defer(&self, name: &'static str, action: Arc<dyn Fn() + Send + Sync>) {
+        if (self.signed_in)() {
+            action();
+            return;
+        }
+        tracing::info!(target: "nrr::logon", step = name, "waiting for a signed-in user");
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((name, action));
+    }
+
+    /// A user signed in: run everything held, once.
+    pub fn fire(&self) {
+        let held = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        for (name, action) in held {
+            tracing::info!(target: "nrr::logon", step = name, "user signed in — running deferred step");
+            action();
+        }
+    }
+
+    /// How many actions are still waiting.
+    pub fn pending(&self) -> usize {
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::SignInGate;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn counting(runs: &Arc<AtomicUsize>) -> Arc<dyn Fn() + Send + Sync> {
+        let runs = Arc::clone(runs);
+        Arc::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn before_sign_in_the_step_waits_and_then_runs_exactly_once() {
+        let signed_in = Arc::new(AtomicBool::new(false));
+        let gate = SignInGate::new({
+            let s = Arc::clone(&signed_in);
+            Arc::new(move || s.load(Ordering::SeqCst))
+        });
+        let runs = Arc::new(AtomicUsize::new(0));
+        gate.defer("tun", counting(&runs));
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "nobody is signed in");
+        assert_eq!(gate.pending(), 1);
+
+        signed_in.store(true, Ordering::SeqCst);
+        gate.fire();
+        gate.fire();
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "a second sign-in must not repeat it"
+        );
+        assert_eq!(gate.pending(), 0);
+    }
+
+    #[test]
+    fn with_a_user_already_there_the_step_runs_at_once() {
+        let gate = SignInGate::new(Arc::new(|| true));
+        let runs = Arc::new(AtomicUsize::new(0));
+        gate.defer("flush", counting(&runs));
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.pending(), 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

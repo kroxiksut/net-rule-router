@@ -1703,4 +1703,132 @@ mod tests {
         assert!(a.is_some());
         assert!(b.is_none());
     }
+
+    // ── The third copy of the policy defaults ────────────────────────────────
+
+    /// Every wire key whose default this row owns, paired with the row's value
+    /// rendered the way the wire renders it.
+    ///
+    /// Two keys are deliberately absent. `mode` is not a block-policy field at
+    /// all, and `block-secondary-when-unavailable` has no wire default (the
+    /// request always carries it), so the GUI's entry for it is a fallback for
+    /// an empty snapshot rather than a mirror of this row.
+    fn row_defaults_as_wire() -> Vec<(&'static str, serde_json::Value)> {
+        use serde_json::json;
+        let row = BlockPolicyRow::default();
+        vec![
+            (
+                "kill-switch-fail-closed",
+                json!(row.kill_switch_fail_closed),
+            ),
+            ("kill-switch-protocols", json!(row.kill_switch_protocols)),
+            ("kill-switch-block-all", json!(row.kill_switch_block_all)),
+            ("kill-switch-enabled", json!(row.kill_switch_enabled)),
+            ("allow-dns-over-primary", json!(row.allow_dns_over_primary)),
+            ("include-subdomains", json!(row.include_subdomains)),
+            ("shared-ip-policy", json!(row.shared_ip_policy.as_slug())),
+            (
+                "mode-a-coverage-strategy",
+                json!(row.mode_a_coverage_strategy.as_slug()),
+            ),
+            ("resolve-hosts-bypass", json!(row.resolve_hosts_bypass)),
+            ("doh-lockdown-enabled", json!(row.doh_lockdown_enabled)),
+            (
+                "doh-lockdown-scope",
+                json!(row.doh_lockdown_scope.as_slug()),
+            ),
+            (
+                "browser-history-auto-seed",
+                json!(row.browser_history_auto_seed),
+            ),
+            (
+                "kill-switch-strict-shared-ips",
+                json!(row.kill_switch_strict_shared_ips),
+            ),
+            ("auto-rules-mode", json!(row.auto_rules_mode.as_slug())),
+            (
+                "auto-rules-eager-delivery-names",
+                json!(row.auto_rules_eager_delivery_names),
+            ),
+            ("primary-probe-auto", json!(row.primary_probe_auto)),
+            (
+                "primary-probe-timeout-ms",
+                json!(row.primary_probe_timeout_ms),
+            ),
+            (
+                "primary-probe-max-targets",
+                json!(row.primary_probe_max_targets),
+            ),
+            (
+                "primary-probe-repeat-secs",
+                json!(row.primary_probe_repeat_secs),
+            ),
+            (
+                "block-ipv6-when-protected",
+                json!(row.block_ipv6_when_protected),
+            ),
+            (
+                "local-networks-auto-accept",
+                json!(row.local_networks_auto_accept),
+            ),
+            ("zone-priority-over-ip", json!(row.zone_priority_over_ip)),
+        ]
+    }
+
+    /// The GUI's declaration of the same defaults, parsed from its single
+    /// source. Same literal the wire-contract test in `nrr-shared` reads.
+    fn qml_field_defaults() -> serde_json::Map<String, serde_json::Value> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../apps/desktop/qml/lib/pure.js");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let decl = "var ROUTE_POLICY_FIELD_DEFAULTS = ";
+        let start = source
+            .find(decl)
+            .expect("ROUTE_POLICY_FIELD_DEFAULTS declaration missing from lib/pure.js")
+            + decl.len();
+        let body = &source[start..];
+        let mut depth = 0usize;
+        let mut end = None;
+        for (idx, ch) in body.char_indices() {
+            if ch == '{' {
+                depth += 1;
+            } else if ch == '}' {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(idx + ch.len_utf8());
+                    break;
+                }
+            }
+        }
+        let end = end.expect("unbalanced ROUTE_POLICY_FIELD_DEFAULTS literal");
+        match serde_json::from_str(&body[..end]) {
+            Ok(serde_json::Value::Object(map)) => map,
+            other => panic!("ROUTE_POLICY_FIELD_DEFAULTS must parse as an object: {other:?}"),
+        }
+    }
+
+    /// A user with no saved row gets this row; the panel that renders their
+    /// policy gets the GUI table. The two are written out separately, in
+    /// different languages, so nothing but a test can keep them equal — and
+    /// until this one existed, changing a default here passed every gate while
+    /// the interface went on showing the other value.
+    #[test]
+    fn block_policy_defaults_match_the_gui_declaration() {
+        let declared = qml_field_defaults();
+        let mut diverged = Vec::new();
+        for (key, ours) in row_defaults_as_wire() {
+            let theirs = declared
+                .get(key)
+                .unwrap_or_else(|| panic!("ROUTE_POLICY_FIELD_DEFAULTS has no `{key}`"));
+            if theirs != &ours {
+                diverged.push(format!("{key}: storage={ours}, pure.js={theirs}"));
+            }
+        }
+        assert!(
+            diverged.is_empty(),
+            "storage defaults and apps/desktop/qml/lib/pure.js disagree: {}",
+            diverged.join("; ")
+        );
+    }
 }

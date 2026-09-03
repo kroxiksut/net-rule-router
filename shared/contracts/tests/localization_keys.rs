@@ -53,12 +53,18 @@ const ALLOWED_TOP_LEVEL_DOMAINS: &[&str] = &[
     "block-reason",
 ];
 
+/// Rust files that resolve locale keys at runtime. QML is NOT listed here: the
+/// whole tree is walked instead — naming files by hand meant `Main.qml` alone
+/// stood for a tree where it holds about a tenth of the keys, and every section,
+/// component, flow and `Tray.qml` went unchecked.
 const RUNTIME_KEY_SOURCE_FILES: &[&str] = &[
-    "apps/desktop/qml/Main.qml",
     "apps/desktop/gui/src/ui_surface.rs",
     // lib.rs because nrr-desktop-tray is a lib-only crate consumed by the launcher.
     "apps/desktop/tray/src/lib.rs",
 ];
+
+/// Root of the QML tree, walked recursively for `tr()` keys.
+const RUNTIME_KEY_QML_ROOT: &str = "apps/desktop/qml";
 
 #[test]
 fn locale_files_have_no_namespace_conflicts_or_invalid_leaf_types() {
@@ -180,25 +186,66 @@ fn is_allowed_runtime_dynamic_key(key: &str) -> bool {
 
 fn collect_runtime_locale_keys() -> Vec<String> {
     let mut keys = BTreeSet::new();
-    for relative_path in RUNTIME_KEY_SOURCE_FILES {
-        let path = workspace_root().join(relative_path);
-        let content = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
-        for literal in extract_quoted_strings(&content) {
+    let mut harvest = |content: &str| {
+        for literal in extract_quoted_strings(content) {
             if looks_like_locale_key(&literal) {
                 keys.insert(literal);
             }
         }
+    };
+    for relative_path in RUNTIME_KEY_SOURCE_FILES {
+        let path = workspace_root().join(relative_path);
+        let content = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read '{}': {error}", path.display()));
+        harvest(&content);
+    }
+    let mut qml = Vec::new();
+    collect_qml_files(&workspace_root().join(RUNTIME_KEY_QML_ROOT), &mut qml);
+    assert!(
+        !qml.is_empty(),
+        "no .qml files under '{RUNTIME_KEY_QML_ROOT}' — the walk found nothing to check"
+    );
+    for content in &qml {
+        harvest(content);
     }
     keys.into_iter().collect::<Vec<_>>()
 }
 
+fn collect_qml_files(dir: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_qml_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("qml") {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                out.push(contents);
+            }
+        }
+    }
+}
+
+/// Is this string SHAPED like a locale key?
+///
+/// The root is checked against the families the LOCALE FILES actually declare,
+/// not against `ALLOWED_TOP_LEVEL_DOMAINS`. Deciding both questions from one
+/// hand-typed list made the gate blind in both directions at once: a family
+/// missing from it was not recognised as a key in code, so every key under it
+/// went unchecked, while the locale file holding it failed the root-family
+/// test. Reading the roots from the files means a family someone adds is
+/// covered the moment it exists, and `ALLOWED_TOP_LEVEL_DOMAINS` goes back to
+/// being one side of a comparison instead of the input to both.
+///
+/// A dotted lowercase string is also how a file name and a hostname look, so
+/// the root check is what keeps `eula.en.md` and `notebooklm.google.com` out.
 fn looks_like_locale_key(value: &str) -> bool {
     let mut parts = value.split('.');
     let Some(first) = parts.next() else {
         return false;
     };
-    if !ALLOWED_TOP_LEVEL_DOMAINS.contains(&first) {
+    if !locale_root_families().contains(first) {
         return false;
     }
 
@@ -212,6 +259,33 @@ fn looks_like_locale_key(value: &str) -> bool {
     }
 
     tail.into_iter().all(is_valid_key_segment)
+}
+
+/// Root families declared by the shipped locale files, unioned with the
+/// allowlist so a family that exists only in code is still recognised — and
+/// then reported as an unknown key rather than quietly skipped.
+fn locale_root_families() -> &'static BTreeSet<String> {
+    static ROOTS: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut roots: BTreeSet<String> = ALLOWED_TOP_LEVEL_DOMAINS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        for locale_file in locale_files() {
+            let Ok(raw) = fs::read_to_string(&locale_file) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<Value>(raw.trim_start_matches('\u{feff}'))
+            else {
+                continue;
+            };
+            let Some(object) = parsed.as_object() else {
+                continue;
+            };
+            roots.extend(object.keys().filter(|k| *k != "metadata").cloned());
+        }
+        roots
+    })
 }
 
 fn is_valid_key_segment(value: &str) -> bool {

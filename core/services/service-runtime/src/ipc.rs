@@ -85,11 +85,9 @@ mod operation_serde {
 
 // ── Protocol version ─────────────────────────────────────────────────────────
 
-/// Protocol version negotiated through the `ContractNegotiate`
-/// operation. Bumped only on incompatible wire-format changes; all
-/// changes are tracked in the IPC version-compatibility matrix in
-/// `nrr-shared::ipc`.
-pub const IPC_PROTOCOL_VERSION: u32 = 1;
+/// Protocol version negotiated through the `ContractNegotiate` operation.
+/// Re-exported from the SSOT so the service and the client cannot drift apart.
+pub use nrr_shared::ipc::IPC_PROTOCOL_VERSION;
 
 /// Maximum size, in bytes, of a serialised request or response envelope.
 /// 1 MiB fits the base64-wrapped preset bytes carried by

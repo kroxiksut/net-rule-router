@@ -8,6 +8,12 @@ SpinBox {
     id: root
     property var theme
 
+    // Accessible baseline — see the note in `ThemedComboBox.qml`. A spin box
+    // has no `text` either, so the value is the only thing there is to say.
+    Accessible.role: Accessible.SpinBox
+    Accessible.name: root.displayText
+    Accessible.description: root.ToolTip.text
+
     // Compact, fixed height so Fusion's default (~36 px) does not bloat
     // multi-spinbox forms. The −/+ indicators get a fixed slot on each
     // side so digits never sit underneath them.

@@ -67,7 +67,8 @@ use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionContent, RulesRevi
 use nrr_domain::{AdapterIdentity, BindingSource, RouteBehaviorMode, RouteBinding, RouteRole};
 use nrr_shared::ipc_payloads::RiskSignalDto;
 use nrr_shared::ipc_payloads::{
-    PresetImportPayload, PresetImportPayloadError, PresetImportTarget, StatusUpdateEvent,
+    CrossSetDuplicateDto, PresetImportPayload, PresetImportPayloadError, PresetImportTarget,
+    StatusUpdateEvent,
 };
 use nrr_shared::rules_json;
 use nrr_storage::revisions::RevisionsRepository;
@@ -336,7 +337,9 @@ impl ProductionMutationExecutor {
         let summary = self
             .coordinator
             .dry_run_rules(principal, &parsed.rules_json, "ipc-dry-run");
-        dry_run_to_review_summary(&summary, scored)
+        let mut response = dry_run_to_review_summary(&summary, scored);
+        response.cross_set_duplicates = cross_set_duplicates_of(&parsed.rules_json);
+        response
     }
 
     /// Computes the [`RiskAssessment`] for the
@@ -567,6 +570,7 @@ impl ProductionMutationExecutor {
             rules_modified: Vec::new(),
             rules_retargeted: Vec::new(),
             extended_sections: Vec::new(),
+            cross_set_duplicates: Vec::new(),
         }
     }
 
@@ -989,11 +993,18 @@ impl MutationExecutor for ProductionMutationExecutor {
         // review" click. Operationally interesting events live on
         // the `execute` boundary (started / completed / warn-failed)
         // which already log via the bus and via tracing below.
+        // The correlation id names the CALL SITE (the client prefixes it), and
+        // two flows can preview a byte-identical payload at the same moment —
+        // without this, a log of two previews cannot say who asked for either.
         tracing::debug!(
             target: "nrr::mutation::preview",
             kind = ?kind,
             principal = %principal,
             payload_size = payload.to_string().len(),
+            correlation_id = payload
+                .get("correlation-id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
             "mutation preview requested",
         );
         match kind {
@@ -1263,7 +1274,28 @@ fn reset_review_summary(
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
         extended_sections: Vec::new(),
+        cross_set_duplicates: Vec::new(),
     }
+}
+
+/// The same rule written into both route sets, both copies enabled.
+///
+/// Reported with the preview rather than blocked: the candidate is valid, the
+/// two copies simply disagree about where the traffic goes, and only the user
+/// can settle that. An undecodable candidate yields nothing — the malformed
+/// path already speaks for it.
+fn cross_set_duplicates_of(rules_json: &str) -> Vec<CrossSetDuplicateDto> {
+    let Some(book) = decode_rule_book(rules_json) else {
+        return Vec::new();
+    };
+    nrr_domain::validation::enabled_duplicates_across_sets(&book)
+        .into_iter()
+        .map(|found| CrossSetDuplicateDto {
+            primary_rule_id: found.primary_rule_id.as_str().to_string(),
+            secondary_rule_id: found.secondary_rule_id.as_str().to_string(),
+            match_summary: found.match_summary,
+        })
+        .collect()
 }
 
 fn malformed_summary(message: &str) -> ReviewSummaryResponse {
@@ -1279,6 +1311,7 @@ fn malformed_summary(message: &str) -> ReviewSummaryResponse {
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
         extended_sections: Vec::new(),
+        cross_set_duplicates: Vec::new(),
     }
 }
 
@@ -1336,6 +1369,7 @@ fn preset_failure_summary(err: &OperationError) -> ReviewSummaryResponse {
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
         extended_sections: Vec::new(),
+        cross_set_duplicates: Vec::new(),
     }
 }
 
@@ -1555,6 +1589,7 @@ fn not_implemented_summary(reason: &str) -> ReviewSummaryResponse {
         rules_modified: Vec::new(),
         rules_retargeted: Vec::new(),
         extended_sections: Vec::new(),
+        cross_set_duplicates: Vec::new(),
     }
 }
 
@@ -1740,6 +1775,7 @@ fn dry_run_to_review_summary(
         rules_modified,
         rules_retargeted,
         extended_sections: Vec::new(),
+        cross_set_duplicates: Vec::new(),
     }
 }
 
@@ -1884,6 +1920,39 @@ mod tests {
         let raw = serde_json::json!({"rules-json": "{}"});
         let err = ProductionMutationExecutor::parse_rules_payload(&raw).unwrap_err();
         assert_eq!(err.code, "malformed-payload");
+    }
+
+    #[test]
+    fn a_rule_written_into_both_route_sets_is_reported_with_the_preview() {
+        // Neither copy is wrong on its own; together they claim the same
+        // traffic for two different routes, and the service cannot pick.
+        let both = serde_json::json!({
+            "schema-version": 1,
+            "primary": [{
+                "id": "r-1",
+                "enabled": true,
+                "address-match": { "kind": "exact-fqdn", "value": "example.com" },
+                "comment": "",
+                "action": "route",
+            }],
+            "secondary": [{
+                "id": "r-2",
+                "enabled": true,
+                "address-match": { "kind": "exact-fqdn", "value": "example.com" },
+                "comment": "",
+                "action": "route",
+            }],
+        })
+        .to_string();
+        let found = cross_set_duplicates_of(&both);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].primary_rule_id, "r-1");
+        assert_eq!(found[0].secondary_rule_id, "r-2");
+        assert_eq!(found[0].match_summary, "example.com");
+
+        // Undecodable input says nothing here — the malformed path speaks for
+        // it, and inventing a duplicate report would be worse than silence.
+        assert!(cross_set_duplicates_of("{").is_empty());
     }
 
     /// One rule book, two spellings of the same application name: after

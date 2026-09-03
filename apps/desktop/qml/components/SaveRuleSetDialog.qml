@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
+import "../lib/pure.js" as Pure
 
 // "Save the rules on screen as a named set."
 //
@@ -145,10 +146,7 @@ Dialog {
         title: saveRuleSetDialog.root.tr("settings.presets.user-folder.dialog-title",
             "Choose the folder with your rule sets")
         onAccepted: {
-            var s = String(selectedFolder || "")
-            saveRuleSetDialog.folder = (s.indexOf("file:///") === 0)
-                ? s.substring(8)
-                : ((s.indexOf("file://") === 0) ? s.substring(7) : s)
+            saveRuleSetDialog.folder = Pure.localPathFromFileUrl(selectedFolder)
         }
     }
 }
