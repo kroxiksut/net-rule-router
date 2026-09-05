@@ -36,7 +36,7 @@
 //! The function is pure and deterministic: identical inputs yield identical
 //! output and ordering (keys are processed in sorted order).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::{CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction};
 use crate::review::{rule_attributes_differ, rule_identity_key};
@@ -267,17 +267,23 @@ pub struct NormalizedCrossSetRule {
 /// each side separately, keeps [`merge_rule_books`] about "file versus service"
 /// and leaves "this rule moved to the other route" meaning what it says.
 ///
-/// The primary copy is the one kept. That is what the code did before, silently,
-/// and it is the safer half: a rule left enabled on the additional route turns
-/// into a block or a leak, depending on the behaviour mode, every time the
-/// tunnel is down — whereas the primary route is the one that works when
-/// nothing else does.
+/// The primary copy is the one kept by DEFAULT. That is what the code did
+/// before, silently, and it is the safer half: a rule left enabled on the
+/// additional route turns into a block or a leak, depending on the behaviour
+/// mode, every time the tunnel is down — whereas the primary route is the one
+/// that works when nothing else does.
+///
+/// `keep_secondary` names the identity keys where the user said otherwise, and
+/// there the roles swap: the secondary copy stays enabled and the primary one
+/// is switched off. It is a default being overridden, not a policy — which is
+/// why it arrives as a set of keys rather than a flag.
 ///
 /// Nothing is deleted: the loser is disabled, which is exactly the state the
 /// user is offered as the resolution, so a second pass reports nothing and the
 /// user's row is still there to switch back.
 pub fn normalize_cross_set_duplicates(
     book: &CanonicalRuleBook,
+    keep_secondary: &BTreeSet<String>,
 ) -> (CanonicalRuleBook, Vec<NormalizedCrossSetRule>) {
     let enabled_primary: BTreeMap<String, &CanonicalRule> = book
         .primary
@@ -291,27 +297,53 @@ pub fn normalize_cross_set_duplicates(
     }
 
     let mut normalized = Vec::new();
+    let mut disable_primary: BTreeSet<String> = BTreeSet::new();
     let mut secondary = Vec::with_capacity(book.secondary.len());
     for rule in book.secondary.rules() {
         let key = rule_identity_key(rule);
         match enabled_primary.get(&key) {
-            Some(kept) if rule.enabled => {
-                let mut off = rule.clone();
-                off.enabled = false;
+            Some(primary_copy) if rule.enabled => {
+                let user_keeps_secondary = keep_secondary.contains(&key);
+                let (kept, disabled) = if user_keeps_secondary {
+                    disable_primary.insert(key.clone());
+                    (rule.clone(), (*primary_copy).clone())
+                } else {
+                    ((*primary_copy).clone(), rule.clone())
+                };
                 normalized.push(NormalizedCrossSetRule {
                     identity_key: key,
-                    kept: (*kept).clone(),
-                    disabled: rule.clone(),
+                    kept,
+                    disabled,
                 });
-                secondary.push(off);
+                let mut copy = rule.clone();
+                copy.enabled = user_keeps_secondary;
+                secondary.push(copy);
             }
             _ => secondary.push(rule.clone()),
         }
     }
 
+    let primary = if disable_primary.is_empty() {
+        book.primary.clone()
+    } else {
+        CanonicalRuleSet::from_rules(
+            book.primary
+                .rules()
+                .iter()
+                .map(|rule| {
+                    let mut copy = rule.clone();
+                    if disable_primary.contains(&rule_identity_key(rule)) {
+                        copy.enabled = false;
+                    }
+                    copy
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+
     (
         CanonicalRuleBook {
-            primary: book.primary.clone(),
+            primary,
             secondary: CanonicalRuleSet::from_rules(secondary),
         },
         normalized,
@@ -342,7 +374,7 @@ pub fn merge_rule_books(
     service: &CanonicalRuleBook,
     policy: MergePolicy,
 ) -> MergeResult {
-    merge_rule_books_with_resolutions(file, service, policy, &BTreeMap::new())
+    merge_rule_books_with_resolutions(file, service, policy, &BTreeMap::new(), &BTreeSet::new())
 }
 
 /// Reconcile a linked-file rule book with the service rule book, honouring
@@ -356,8 +388,14 @@ pub fn merge_rule_books(
 /// [`ConflictSide::Unresolved`] (or any conflict absent from the map) falls
 /// back to `policy`.
 ///
+/// `keep_secondary` carries the other kind of pick made in the same dialog:
+/// identity keys where a match named in BOTH route sets of one book should keep
+/// its additional-route copy rather than the primary one (see
+/// [`normalize_cross_set_duplicates`]). Both maps travel together because both
+/// are answers to the same screen, replayed on the second call.
+///
 /// This is the second pass of the two-call merge-preview flow: the first call
-/// runs under [`MergePolicy::Union`] with an empty map (every conflict comes
+/// runs under [`MergePolicy::Union`] with empty picks (every conflict comes
 /// back [`ConflictSide::Unresolved`]); the second call replays the same inputs
 /// with the user's picks to produce the final book. Pure and deterministic.
 pub fn merge_rule_books_with_resolutions(
@@ -365,13 +403,14 @@ pub fn merge_rule_books_with_resolutions(
     service: &CanonicalRuleBook,
     policy: MergePolicy,
     resolutions: &BTreeMap<String, ConflictSide>,
+    keep_secondary: &BTreeSet<String>,
 ) -> MergeResult {
     // Each side is given one enabled copy per match BEFORE anything is paired.
     // Two enabled copies in one book are that book's problem, not a
     // file-versus-service disagreement, and letting them reach the pairing is
     // what made it drop one silently.
-    let (file, file_normalized) = normalize_cross_set_duplicates(file);
-    let (service, service_normalized) = normalize_cross_set_duplicates(service);
+    let (file, file_normalized) = normalize_cross_set_duplicates(file, keep_secondary);
+    let (service, service_normalized) = normalize_cross_set_duplicates(service, keep_secondary);
     let normalized_duplicates = merge_normalized(file_normalized, service_normalized);
 
     let file_idx = index(&file);
@@ -539,7 +578,7 @@ mod tests {
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "on primary")],
             vec![ip_rule("r-2", true, [1, 1, 1, 1], "and on secondary")],
         );
-        let (normalized, reported) = normalize_cross_set_duplicates(&file);
+        let (normalized, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
 
         assert_eq!(reported.len(), 1, "the pair must be reported, not hidden");
         assert_eq!(reported[0].kept.id.as_str(), "r-1");
@@ -564,9 +603,57 @@ mod tests {
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
             vec![ip_rule("r-2", false, [1, 1, 1, 1], "")],
         );
-        let (normalized, reported) = normalize_cross_set_duplicates(&file);
+        let (normalized, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
         assert!(reported.is_empty());
         assert_eq!(normalized, file, "an already-settled book is left alone");
+    }
+
+    /// The default is a default, not a verdict. When the user says the
+    /// additional route is the one they meant, the roles swap: the secondary
+    /// copy stays enabled and the primary one is switched off — and the report
+    /// says so, so the band the choice was made in still reads correctly.
+    #[test]
+    fn the_user_can_keep_the_additional_routes_copy_instead() {
+        let file = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+        );
+        let key = {
+            let (_, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0].kept.id.as_str(), "r-1", "primary by default");
+            reported[0].identity_key.clone()
+        };
+
+        let mut keep_secondary = BTreeSet::new();
+        keep_secondary.insert(key);
+        let (normalized, reported) = normalize_cross_set_duplicates(&file, &keep_secondary);
+
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].kept.id.as_str(), "r-2");
+        assert_eq!(reported[0].disabled.id.as_str(), "r-1");
+        // Nothing is deleted on either choice: both rows survive, one switched off.
+        assert_eq!(normalized.primary.len(), 1);
+        assert_eq!(normalized.secondary.len(), 1);
+        assert!(!normalized.primary.rules()[0].enabled);
+        assert!(normalized.secondary.rules()[0].enabled);
+    }
+
+    /// A key nobody named leaves the default alone — the set is an override
+    /// list, so an unrelated entry must not move anything.
+    #[test]
+    fn a_key_that_names_nothing_changes_nothing() {
+        let file = book(
+            vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
+            vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
+        );
+        let mut keep_secondary = BTreeSet::new();
+        keep_secondary.insert("not-a-key-in-this-book".to_string());
+        let (normalized, reported) = normalize_cross_set_duplicates(&file, &keep_secondary);
+
+        assert_eq!(reported[0].kept.id.as_str(), "r-1");
+        assert!(normalized.primary.rules()[0].enabled);
+        assert!(!normalized.secondary.rules()[0].enabled);
     }
 
     /// The whole point: the copy that is actually enforced must survive the
@@ -871,8 +958,13 @@ mod tests {
         let mut resolutions = BTreeMap::new();
         resolutions.insert(key_1, ConflictSide::Service);
         resolutions.insert(key_2, ConflictSide::File);
-        let resolved =
-            merge_rule_books_with_resolutions(&file, &service, MergePolicy::Union, &resolutions);
+        let resolved = merge_rule_books_with_resolutions(
+            &file,
+            &service,
+            MergePolicy::Union,
+            &resolutions,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(resolved.unresolved_conflicts(), 0, "all picks applied");
         for c in &resolved.conflicts {
@@ -912,8 +1004,13 @@ mod tests {
         let file = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
         let service = book(vec![], vec![ip_rule("r-1", false, [1, 1, 1, 1], "")]);
         let empty = BTreeMap::new();
-        let sw =
-            merge_rule_books_with_resolutions(&file, &service, MergePolicy::ServiceWins, &empty);
+        let sw = merge_rule_books_with_resolutions(
+            &file,
+            &service,
+            MergePolicy::ServiceWins,
+            &empty,
+            &BTreeSet::new(),
+        );
         assert_eq!(sw.conflicts[0].resolved, ConflictSide::Service);
         assert!(!sw.merged.secondary.rules()[0].enabled);
     }

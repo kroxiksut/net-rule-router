@@ -102,6 +102,32 @@ impl LogQueryFilter {
 
 // ── LogReader ─────────────────────────────────────────────────────────────────
 
+/// Whether one raw NDJSON line may be shown to `owner`, and falls inside the
+/// session window.
+///
+/// A line that cannot be parsed is dropped: it carries no owner, and a support
+/// bundle is not the place to guess. `principal` absent means the line is about
+/// the machine and belongs to everyone.
+fn raw_line_is_visible(line: &str, owner: Option<&str>, from_ms: Option<i64>) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    if let Some(cutoff) = from_ms {
+        match value.get("created_at").and_then(serde_json::Value::as_i64) {
+            Some(created_at) if created_at < cutoff => return false,
+            None => return false,
+            _ => {}
+        }
+    }
+    let Some(owner) = owner else {
+        return true;
+    };
+    match value.get("principal").and_then(serde_json::Value::as_str) {
+        None => true,
+        Some(line_owner) => line_owner == owner,
+    }
+}
+
 /// Read-only accessor for operational NDJSON log files.
 pub struct LogReader {
     logs_dir: PathBuf,
@@ -130,6 +156,63 @@ impl LogReader {
             }
         }
         results
+    }
+
+    /// Raw NDJSON lines from the newest files, newest-first, within a byte
+    /// budget — and only the ones `owner` may see.
+    ///
+    /// The archive ships these VERBATIM: the DTO listing drops payloads, and a
+    /// support bundle without them describes symptoms with the evidence
+    /// removed. `owner` is `None` for a reader entitled to the whole machine;
+    /// otherwise a line is kept when it belongs to nobody (boot, adapters,
+    /// service lifecycle) or to that principal. `from_ms` trims to a session
+    /// window the same way the wire filter does.
+    ///
+    /// Walks files newest-first and stops as soon as the budget is met, so
+    /// asking for the last few hundred KiB never pulls the whole retention cap
+    /// into memory.
+    pub fn recent_raw_lines_for(
+        &self,
+        max_bytes: usize,
+        owner: Option<&str>,
+        from_ms: Option<i64>,
+    ) -> Vec<String> {
+        if max_bytes == 0 {
+            return Vec::new();
+        }
+        let mut newest_first: Vec<String> = Vec::new();
+        let mut used: usize = 0;
+        'files: for path in self.list_files().into_iter().rev() {
+            let Ok(contents) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in contents.lines().rev() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if !raw_line_is_visible(line, owner, from_ms) {
+                    continue;
+                }
+                let cost = line.len() + 1;
+                // The newest kept line always fits, however long: a caller
+                // asking for the tail must not get an empty answer.
+                // Saturating: an unlimited caller passes `usize::MAX`, and
+                // `used + cost` would overflow on the way to comparing.
+                if !newest_first.is_empty() && used.saturating_add(cost) > max_bytes {
+                    break 'files;
+                }
+                used += cost;
+                newest_first.push(line.to_string());
+            }
+        }
+        // Newest-first is how the BUDGET is spent — walking back from the tail
+        // is what keeps the freshest evidence. It is not how a log is read.
+        // Written out unreversed, the archive's `service-logs.ndjson` ran
+        // backwards: its first line was the export itself and its last line the
+        // oldest kept event. The audit twin (`AuditReader::recent_raw_lines`)
+        // has always reversed here; this one forgot, and the two now agree.
+        newest_first.reverse();
+        newest_first
     }
 
     /// Returns the number of corrupt (unparseable) lines across all files.
@@ -207,6 +290,55 @@ mod tests {
             let line = event.to_ndjson().expect("serialize");
             writeln!(file, "{line}").expect("write");
         }
+    }
+
+    /// The archive's raw log section is read top to bottom by a human. It
+    /// shipped backwards: newest-first is how the byte budget is spent, and
+    /// nothing turned it back before writing, so the first line of
+    /// `service-logs.ndjson` was the export itself. The audit twin has always
+    /// reversed; there was no test here to notice this one did not.
+    #[test]
+    fn raw_lines_come_back_oldest_first() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_events_raw(dir.path(), 5);
+        let lines = LogReader::new(dir.path()).recent_raw_lines_for(usize::MAX, None, None);
+        assert_eq!(lines.len(), 5);
+
+        let ids: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .expect("ndjson")
+                    .get("event_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(ids, expected, "the file must read forward in time");
+    }
+
+    /// An unlimited budget is what the archive asks for when the user set no cap
+    /// of their own. Passing `usize::MAX` must not overflow the accumulator, and
+    /// must not silently drop anything.
+    #[test]
+    fn an_unlimited_budget_keeps_every_line() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_events_raw(dir.path(), 40);
+        let all = LogReader::new(dir.path()).recent_raw_lines_for(usize::MAX, None, None);
+        assert_eq!(all.len(), 40);
+
+        // Positive control for the budget itself: a small cap still trims, and
+        // trims the OLD end, keeping the newest evidence.
+        let trimmed = LogReader::new(dir.path()).recent_raw_lines_for(400, None, None);
+        assert!(trimmed.len() < all.len(), "a real budget still trims");
+        assert_eq!(
+            trimmed.last(),
+            all.last(),
+            "trimming drops the oldest, never the newest"
+        );
     }
 
     /// Appends a single event to a new rotation file.

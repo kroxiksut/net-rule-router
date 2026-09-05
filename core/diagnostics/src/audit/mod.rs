@@ -7,12 +7,14 @@
 //! - [`writer`]: `AuditWriter` — append-only NDJSON writer with rolling hash chain
 //! - [`reader`]: `AuditReader` — file scanner and chain verifier
 
+pub mod actor;
 pub mod alert;
 pub mod anchor;
 pub mod kind;
 pub mod reader;
 pub mod writer;
 
+pub use actor::actor_id_hash;
 pub use alert::{
     InMemorySecurityAlertsRepository, SecurityAlert, SecurityAlertState, SecurityAlertsRepository,
 };

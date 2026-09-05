@@ -27,7 +27,6 @@ ColumnLayout {
     // subdomains, and the widening only ever adds coverage towards the route
     // the rule already names. Read from the live per-SID policy on mount.
     property bool includeSubdomains: true
-    property bool zonePriorityOverIp: false
     // How a SHARED secondary IP (an address a routed domain
     // shares with other sites) is handled. Slug: majority-of-ip (default) |
     // majority-of-rules | any-rule-domain. Read from the live per-SID policy.
@@ -476,8 +475,6 @@ ColumnLayout {
             (root.prefs.routeKillSwitchProtocols === undefined)
                 ? root.routePolicyDefault("kill-switch-protocols")
                 : ((root.prefs.routeKillSwitchProtocols | 0) & 0x7F))
-        panel.zonePriorityOverIp = _offlineRoutePolicyPick(parked, mirror, "zone-priority-over-ip",
-            root.routePolicyDefault("zone-priority-over-ip"))
         panel.includeSubdomains = _offlineRoutePolicyPick(parked, mirror, "include-subdomains",
             _mirroredBool("include-subdomains", root.prefs.routeIncludeSubdomains))
         panel.sharedIpPolicy = _offlineRoutePolicyPick(parked, mirror, "shared-ip-policy",
@@ -561,7 +558,6 @@ ColumnLayout {
             panel.ksFailClosed = root._routePolicyEffective(cur, "kill-switch-fail-closed")
             panel.ksProtocols = root._routePolicyEffective(cur, "kill-switch-protocols")
             panel.includeSubdomains = root._routePolicyEffective(cur, "include-subdomains")
-            panel.zonePriorityOverIp = root._routePolicyEffective(cur, "zone-priority-over-ip")
             panel.sharedIpPolicy = root._routePolicyEffective(cur, "shared-ip-policy")
             panel.ksBlockAll = root._routePolicyEffective(cur, "kill-switch-block-all")
             panel.killSwitchEnabled = root._routePolicyEffective(cur, "kill-switch-enabled")
@@ -1724,37 +1720,6 @@ ColumnLayout {
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
                 text: root.tr("settings.routing-behavior.include-subdomains.note",
                     "On by default: a rule for a site also covers that site's subdomains, so images and scripts from “cdn.example.com” take the same route as “example.com”. Applies to all your domain rules at once. It only catches subdomains of the SAME site — an IP-check served from a different provider (a third-party domain) still won't be covered — and it sends more traffic through the additional adapter. Turn it off to match the exact domain only.")
-            }
-            CheckBox {
-                id: zonePriorityCheck
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                checked: panel.zonePriorityOverIp
-                text: root.tr("settings.routing-behavior.zone-priority.label",
-                    "Let a zone rule win over an exact address rule")
-                contentItem: Label {
-                    text: zonePriorityCheck.text
-                    leftPadding: zonePriorityCheck.indicator.width + zonePriorityCheck.spacing
-                    color: root.textColor
-                    wrapMode: Text.WordWrap
-                    verticalAlignment: Text.AlignVCenter
-                }
-                onToggled: {
-                    panel.zonePriorityOverIp = checked
-                    if (typeof root.routePolicyController.applyZonePriorityOverIp === "function")
-                        root.routePolicyController.applyZonePriorityOverIp(checked)
-                }
-            }
-            Label {
-                Layout.fillWidth: true
-                Layout.preferredWidth: 0
-                Layout.leftMargin: root.uiTheme.spacingSm
-                visible: root.routingDefaultRouteDetailsExpanded
-                color: root.mutedTextColor
-                wrapMode: Text.WordWrap
-                font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                text: root.tr("settings.routing-behavior.zone-priority.note",
-                    "Off by default: when a whole zone (say “.ru”) goes one way and a single address inside it goes another, the single address wins, because it is the more specific of the two. Turn this on to make the zone win instead — useful when the zone is the decision you care about and the address rule was only meant as a hint.")
             }
         }
     }

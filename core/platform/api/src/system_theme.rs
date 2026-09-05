@@ -18,6 +18,14 @@ pub trait SystemThemePort: Send + Sync {
     /// "light". The caller decides what to show and, crucially, gets to say
     /// that it is a fallback rather than an observation.
     fn detect(&self) -> Option<SystemAppearance>;
+
+    /// Whether the host is running an OS-level high-contrast mode.
+    ///
+    /// `None` is "cannot tell", and it is deliberately NOT the same as
+    /// `Some(false)`: a user who turned high contrast on must not be dropped
+    /// back into the ordinary palette because a probe failed. Required rather
+    /// than defaulted, so a new OS backend has to answer it on purpose.
+    fn high_contrast(&self) -> Option<bool>;
 }
 
 /// A port that never knows. The default wherever no OS implementation is
@@ -27,6 +35,10 @@ pub struct UnknownSystemTheme;
 
 impl SystemThemePort for UnknownSystemTheme {
     fn detect(&self) -> Option<SystemAppearance> {
+        None
+    }
+
+    fn high_contrast(&self) -> Option<bool> {
         None
     }
 }

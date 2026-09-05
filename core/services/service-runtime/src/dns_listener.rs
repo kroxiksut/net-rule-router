@@ -318,8 +318,7 @@ impl DnsInterceptListener {
         // our observer can see. Mode B is only active while enforcement is armed,
         // so this is correctly scoped to "leak protection engaged".
         if crate::dns_resolver::is_doh_canary(&q.qname) {
-            return build_error_response(query, RCODE_NXDOMAIN)
-                .map_or(ListenerAction::Forward, ListenerAction::Respond);
+            return negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond);
         }
         if q.qtype != QTYPE_A {
             return ListenerAction::Forward; // not an A query
@@ -355,8 +354,7 @@ impl DnsInterceptListener {
                 .map(ListenerAction::Respond)
                 // Empty answer set (nothing to route) → NXDOMAIN, else forward.
                 .unwrap_or_else(|| {
-                    build_error_response(query, RCODE_NXDOMAIN)
-                        .map_or(ListenerAction::Forward, ListenerAction::Respond)
+                    negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
                 }),
             // Withheld deliberately: SERVFAIL, never a forward. Forwarding here
             // would hand the caller the very addresses the guard is holding
@@ -364,8 +362,7 @@ impl DnsInterceptListener {
             QueryOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
                 .map_or(ListenerAction::Drop, ListenerAction::Respond),
             QueryOutcome::Upstream(ResolveError::NoRecords) => {
-                build_error_response(query, RCODE_NXDOMAIN)
-                    .map_or(ListenerAction::Forward, ListenerAction::Respond)
+                negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond)
             }
             // Our resolver could not reach upstream — fail open by forwarding the
             // raw query (the OS's configured server may still answer). No
@@ -862,6 +859,19 @@ fn reply_answers_query(query: &[u8], reply: &[u8]) -> bool {
         // there is to go on there.
         (None, _) | (_, None) => true,
     }
+}
+
+/// One "no such name" answer, carrying the SOA that lets the client remember it.
+///
+/// Every synthetic NXDOMAIN here goes through this: without the authority
+/// record a stub resolver cannot cache the negative answer and re-asks on every
+/// lookup — which for the DoH canary means a query per page load.
+fn negative_answer(query: &[u8]) -> Option<Vec<u8>> {
+    crate::dns_wire::build_negative_response(
+        query,
+        RCODE_NXDOMAIN,
+        crate::dns_wire::NEGATIVE_TTL_SECS,
+    )
 }
 
 #[cfg(test)]

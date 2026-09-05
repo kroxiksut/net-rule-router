@@ -179,6 +179,11 @@ QtObject {
             // delivered first — the resync below only acts on an EMPTY service
             // binding, so on its own it would leave the parked choice behind.
             Qt.callLater(root.offlinePendingController.deliverParkedBinding)
+            // The other direction of the same split: a slot the app has no
+            // answer for is filled from what the service enforces, and a slot
+            // where the two disagree raises the banner that asks. Runs after
+            // the parked delivery, which is the user's newer word.
+            Qt.callLater(root.routePolicyController.seedRouteBindingFromService)
             Qt.callLater(root.routePolicyController._resyncRouteBindingIfMissing)
             // Cold-start counterpart of the reconnect replay: when the service
             // is already up at launch there is no disconnected→connected edge

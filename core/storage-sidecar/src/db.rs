@@ -49,6 +49,7 @@ impl SidecarDb {
     pub fn open(path: impl AsRef<Path>) -> SidecarResult<Self> {
         let path = path.as_ref().to_path_buf();
         let mut conn = Connection::open(&path)?;
+        restrict_db_to_owner(&path);
         configure_pragmas(&conn, &path)?;
         let last_migration = migration::migrate(&mut conn)?;
         let db = Self {
@@ -118,6 +119,26 @@ impl SidecarDb {
     }
 }
 
+/// Keep the sidecar file to its owner on Unix — the same reason as the
+/// directory (see `profile::restrict_to_owner`): it holds the user's own
+/// comments and parked edits, and the default `0644` hands them to every local
+/// account. Applied on every open rather than on create only, so a file that
+/// predates this (or arrived with a roaming profile) is tightened too.
+///
+/// Best-effort: a share that cannot express the mode must not stop the sidecar
+/// from opening.
+fn restrict_db_to_owner(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Apply the baseline PRAGMAs we depend on. WAL mode is mandatory and
 /// the value is read back to guard against silent filesystem-level
 /// downgrades.
@@ -131,6 +152,10 @@ fn configure_pragmas(conn: &Connection, path: &Path) -> SidecarResult<()> {
             ),
         });
     }
+    // The service store enables this on every connection; the copy here did
+    // not, so the same schema enforced its foreign keys in one database and
+    // ignored them in the other. Nothing signalled the difference.
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.busy_timeout(Duration::from_millis(5_000))?;
     Ok(())
 }
@@ -150,6 +175,21 @@ mod tests {
         assert_eq!(db.path(), path.as_path());
         assert_eq!(db.last_migration().to_version, LATEST_SCHEMA_VERSION);
         assert_eq!(db.last_migration().from_version, 0);
+        Ok(())
+    }
+
+    /// The sidecar holds the user's own rule comments and parked edits. Created
+    /// with the default mask it lands at `0644`, so on a shared Linux box every
+    /// local account could read another user's notes.
+    #[cfg(unix)]
+    #[test]
+    fn the_database_is_readable_only_by_its_owner() -> SidecarResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir()?;
+        let path = tmp.path().join("sidecar.db");
+        let _db = SidecarDb::open(&path)?;
+        let mode = std::fs::metadata(&path)?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "group and other must have nothing");
         Ok(())
     }
 

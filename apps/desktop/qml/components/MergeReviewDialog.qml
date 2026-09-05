@@ -59,10 +59,16 @@ Dialog {
     /// the caller when the preview lands.
     property var picks: ({})
 
+    /// identity-key -> true for matches whose ADDITIONAL-route copy the user
+    /// wants kept. Absent means the default (the primary copy). Separate from
+    /// `picks` because it answers a different question: `picks` is "file or
+    /// service", this is "which route inside one book".
+    property var keepSecondary: ({})
+
     signal cancelled()
     /// Emitted on confirm with the per-conflict resolutions
     /// (`[{ "identity-key": ..., "side": "file"|"service" }]`).
-    signal confirmed(var resolutions)
+    signal confirmed(var resolutions, var keepSecondaryKeys)
 
     function tr(key, fallback) {
         if (ownerRoot && typeof ownerRoot.tr === "function") {
@@ -124,6 +130,35 @@ Dialog {
         for (var k in picks) next[k] = picks[k]
         next[String(key)] = side
         picks = next
+    }
+
+    function _normalized() {
+        return (mergeResult && mergeResult["normalized-duplicates"])
+            ? mergeResult["normalized-duplicates"] : []
+    }
+
+    /// The route this pair currently keeps enabled — the default is primary.
+    function _keptRoute(key) {
+        return keepSecondary[String(key)] === true ? "secondary" : "primary"
+    }
+
+    function _setKeptRoute(key, route) {
+        var next = {}
+        for (var k in keepSecondary) next[k] = keepSecondary[k]
+        if (route === "secondary") {
+            next[String(key)] = true
+        } else {
+            delete next[String(key)]
+        }
+        keepSecondary = next
+    }
+
+    function _buildKeepSecondary() {
+        var out = []
+        for (var k in keepSecondary) {
+            if (keepSecondary[k] === true) out.push(String(k))
+        }
+        return out
     }
 
     function _buildResolutions() {
@@ -192,6 +227,64 @@ Dialog {
             ColumnLayout {
                 width: dialog.width - 48
                 spacing: 10
+
+                // ── The same rule in both route sets ─────────────
+                //
+                // Not a file-versus-service disagreement: one of the two books
+                // named the match on both routes with both copies enabled, and
+                // the merge switched one off so the book had a single answer.
+                // The flow does not stop to ask — the person merging is often
+                // not the one who wrote the file — so the choice is made and
+                // then shown, one click from being changed.
+                Label {
+                    Layout.fillWidth: true
+                    visible: dialog._normalized().length > 0
+                    text: dialog.tr("dialog.review-diff.duplicates-heading",
+                        "Rules written into both routes")
+                        + " (" + dialog._normalized().length + ")"
+                    font.bold: true
+                    color: dialog._textColor()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    visible: dialog._normalized().length > 0
+                    text: dialog.tr("dialog.merge.duplicates-hint",
+                        "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.")
+                    wrapMode: Text.Wrap
+                    font.pixelSize: 12
+                    color: dialog._mutedColor()
+                }
+                Repeater {
+                    model: dialog._normalized()
+                    delegate: RowLayout {
+                        required property var modelData
+                        Layout.fillWidth: true
+                        spacing: 8
+                        Label {
+                            Layout.fillWidth: true
+                            text: String(modelData["match-summary"] || "")
+                            wrapMode: Text.Wrap
+                            font.pixelSize: 12
+                            color: dialog._textColor()
+                        }
+                        ThemedComboBox {
+                            theme: dialog.ownerRoot ? dialog.ownerRoot.uiTheme : null
+                            Layout.preferredWidth: 200
+                            model: [
+                                dialog._routeLabel("primary"),
+                                dialog._routeLabel("secondary")
+                            ]
+                            currentIndex: dialog._keptRoute(modelData["identity-key"]) === "secondary" ? 1 : 0
+                            displayText: currentText
+                            Accessible.name: dialog.tr("dialog.review-diff.duplicates-heading",
+                                "Rules written into both routes")
+                            onActivated: function(index) {
+                                dialog._setKeptRoute(modelData["identity-key"],
+                                    index === 1 ? "secondary" : "primary")
+                            }
+                        }
+                    }
+                }
 
                 // File-only bucket
                 Label {
@@ -405,7 +498,8 @@ Dialog {
                 Accessible.role: Accessible.Button
                 Accessible.name: text
                 onClicked: {
-                    dialog.confirmed(dialog._buildResolutions())
+                    dialog.confirmed(dialog._buildResolutions(),
+                        dialog._buildKeepSecondary())
                 }
             }
         }

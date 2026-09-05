@@ -78,7 +78,7 @@ pub fn match_rules(
     }
 
     // Tier 3: Zone/ExactIp — order per ZonePriorityPolicy
-    let effective_ip = effective_ip_for_matching(input, lookup);
+    let effective_ips = effective_ips_for_matching(input, lookup);
     for tier3_class in zone_policy.tier3_order() {
         let maybe_winner = match tier3_class {
             MatchClass::Zone => {
@@ -94,9 +94,11 @@ pub fn match_rules(
             }
             MatchClass::ExactIp => {
                 if avail.exact_ip.is_none() {
-                    effective_ip.and_then(|ip| {
-                        select_winner(collect_exact_ip(rule_book, ip, &input.app_identity))
-                    })
+                    let candidates: Vec<_> = effective_ips
+                        .iter()
+                        .flat_map(|ip| collect_exact_ip(rule_book, *ip, &input.app_identity))
+                        .collect();
+                    select_winner(candidates)
                 } else {
                     None
                 }
@@ -210,7 +212,10 @@ fn collect_zone(
                         &rule.id,
                         role,
                         MatchClass::Zone,
-                        SpecificityScore::SINGLE,
+                        // By label count, not a flat 1: `corp.intra` is
+                        // narrower than `intra` and must beat it, the same way
+                        // an exact host beats the suffix it sits under.
+                        SpecificityScore::label_count(zone_name),
                         eval_app_filter(rule, app_identity),
                         rule.action,
                     ));
@@ -270,12 +275,11 @@ fn collect_application(
                 CanonicalAppPattern::Glob(_) => SpecificityScore::APP_GLOB,
             };
             let matched = app_pattern_matches(&app_match.pattern, &app_identity.process_name);
-            // TODO: `include_child_processes` requires a process tree
-            // snapshot (parent PID → process name mapping) that is not
-            // available in `DecisionRequest`. The pure-domain layer can't
-            // synthesise it; the service-runtime adapter must wire a
-            // process-tree probe before this branch fires. Today only
-            // the current process identity is matched.
+            // TODO: `include_child_processes` requires a process-tree
+            // snapshot (parent PID -> process name) that the matcher is never
+            // given. The pure-domain layer cannot synthesise it; the caller
+            // must supply it before this branch can fire. Today only the
+            // current process identity is matched.
             if matched {
                 out.push(make_candidate(
                     &rule.id,
@@ -296,10 +300,18 @@ fn collect_application(
 /// Selects the highest-specificity eligible candidate and records any conflict.
 ///
 /// Ineligible candidates (`AppFilterResult::NotMatched`) are discarded first.
-/// Among eligible candidates, the one with the highest [`SpecificityScore`]
-/// wins. Ties are broken by ascending `rule_id` (lexicographic). When the
-/// winner ties with a candidate from a **different** route role, a
-/// [`ConflictMarker::Detected`] is attached to the winner.
+/// Among eligible candidates the highest [`SpecificityScore`] wins.
+///
+/// A tie between the two route sets is broken by ROLE — the main route wins —
+/// because that is what the enforcement layer does with the same tie: its
+/// primary weight band sits above the secondary one, so a filter for the main
+/// route is the one that fires. Breaking it by `rule_id` here made this
+/// matcher answer "additional route" for a case the service would route down
+/// the main one, purely because a name sorted first; an explain probe that
+/// disagrees with enforcement is worse than no probe. The tie is still marked
+/// [`ConflictMarker::Detected`] — the user named the same traffic twice, and
+/// only they can say which they meant. `rule_id` remains the last resort so
+/// the answer stays deterministic.
 fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCandidate> {
     candidates.retain(|c| c.app_filter_result.is_eligible());
     if candidates.is_empty() {
@@ -308,6 +320,7 @@ fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCan
     candidates.sort_by(|a, b| {
         b.specificity
             .cmp(&a.specificity)
+            .then_with(|| role_rank(a.route_role).cmp(&role_rank(b.route_role)))
             .then_with(|| a.rule_id.as_str().cmp(b.rule_id.as_str()))
     });
     let top_specificity = candidates[0].specificity;
@@ -326,24 +339,43 @@ fn select_winner(mut candidates: Vec<RuleMatchCandidate>) -> Option<RuleMatchCan
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Returns the IPv4 address to use for `ExactIp` matching.
+/// Tie-break order between the two route sets: the main route first, matching
+/// the weight bands the enforcement layer assigns.
+fn role_rank(role: RouteRole) -> u8 {
+    match role {
+        RouteRole::Primary => 0,
+        RouteRole::Secondary => 1,
+    }
+}
+
+/// The IPv4 addresses an `ExactIp` rule may be matched against: the resolved
+/// one, the observed one, or both when they disagree.
 ///
-/// Prefers `lookup.selected_ip` (the authoritative resolution from the
-/// lookup stage) when usable (`Fresh` or `StaleUsable`); falls back to the
-/// observed IPv4 from input.
-fn effective_ip_for_matching(
+/// The lookup stage's `selected_ip` is the authoritative resolution and comes
+/// first. The observed address used to be consulted only when there was no
+/// usable cache entry — so a rule naming the address the connection ACTUALLY
+/// goes to did not apply whenever the cache happened to hold a different one,
+/// silently, with the doc claiming the two were cross-checked. They are not
+/// always the same thing (CDN rotation, a stale entry that is still "usable"),
+/// and the address the traffic is going to is a fact, not a memory. Both are
+/// offered; if they name different rules, the equal-specificity conflict marker
+/// already says the pipeline saw an ambiguity.
+fn effective_ips_for_matching(
     input: &NormalizedDecisionInput,
     lookup: &LookupResult,
-) -> Option<Ipv4Addr> {
+) -> Vec<Ipv4Addr> {
+    let mut out = Vec::new();
     if let Some(selected) = &lookup.selected_ip {
         if selected.cache_state.is_usable_for_matching() {
-            return Some(selected.addr);
+            out.push(selected.addr);
         }
     }
     if let NormalizedIp::ValidIpv4(addr) = &input.ip {
-        return Some(*addr);
+        if !out.contains(addr) {
+            out.push(*addr);
+        }
     }
-    None
+    out
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -935,6 +967,120 @@ mod tests {
             prefer_primary(),
         );
         assert_eq!(matched_class(&d), Some(MatchClass::Zone));
+    }
+
+    /// The same traffic named on both routes is the user's own ambiguity — but
+    /// the answer must still be the one the service will enforce, and there the
+    /// main route's weight band wins. Before this it was whichever rule id
+    /// sorted first, so the probe could promise the additional route for a
+    /// connection the service sends down the main one.
+    #[test]
+    fn a_tie_between_the_two_routes_goes_to_the_main_one_and_is_marked() {
+        let rb = book(
+            vec![rule("z-primary", Some(zone("intra")), None)],
+            vec![rule("a-secondary", Some(zone("intra")), None)],
+        );
+        let d = match_rules(
+            &input_hostname("host.intra"),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_role(&d), Some(RouteRole::Primary));
+        assert_eq!(matched_rule_id(&d), Some("z-primary"));
+        assert_eq!(
+            matched_conflict(&d),
+            Some(ConflictMarker::Detected),
+            "naming the same traffic twice is still reported"
+        );
+    }
+
+    /// A rule naming the address the connection ACTUALLY goes to must apply,
+    /// even when the cache remembers a different one for the same host. The
+    /// two disagree routinely — CDN rotation, an entry that is stale but still
+    /// "usable" — and before this the cached address silently won, so the rule
+    /// the user wrote for the live address did nothing.
+    #[test]
+    fn a_rule_on_the_observed_address_matches_even_when_the_cache_says_another() {
+        let rb = book(
+            vec![rule(
+                "r-observed",
+                Some(CanonicalAddressMatch::ExactIp(Ipv4Addr::new(9, 9, 9, 9))),
+                None,
+            )],
+            vec![],
+        );
+        let input = input_full("example.com", Ipv4Addr::new(9, 9, 9, 9), "curl");
+        // The cache holds a DIFFERENT, perfectly fresh address for that host.
+        let d = match_rules(
+            &input,
+            &lookup_fresh_ip(1, 2, 3, 4),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::ExactIp));
+        assert_eq!(matched_rule_id(&d), Some("r-observed"));
+
+        // And the cached address still matches its own rule, unchanged.
+        let rb = book(
+            vec![rule(
+                "r-cached",
+                Some(CanonicalAddressMatch::ExactIp(Ipv4Addr::new(1, 2, 3, 4))),
+                None,
+            )],
+            vec![],
+        );
+        let d = match_rules(
+            &input,
+            &lookup_fresh_ip(1, 2, 3, 4),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_rule_id(&d), Some("r-cached"));
+    }
+
+    /// The product rule is that the narrower rule wins. Two zones over the same
+    /// host are the one place that could not express it: every zone scored the
+    /// same, so the winner fell to whichever `rule_id` sorted first — and
+    /// `intra` could take traffic the user had assigned to `corp.intra`.
+    #[test]
+    fn the_narrower_zone_wins_over_the_wider_one_it_sits_inside() {
+        // `z-wide` sorts BEFORE `a-narrow`? No — deliberately the other way
+        // round, so a lexicographic tie-break would pick the wide one and the
+        // test would fail for the reason it exists.
+        let rb = book(
+            vec![
+                rule("a-wide", Some(zone("intra")), None),
+                rule("z-narrow", Some(zone("corp.intra")), None),
+            ],
+            vec![],
+        );
+        let d = match_rules(
+            &input_hostname("db.corp.intra"),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::Zone));
+        assert_eq!(
+            matched_rule_id(&d),
+            Some("z-narrow"),
+            "the more specific zone must win regardless of rule id order"
+        );
+
+        // A host outside the narrow zone still belongs to the wide one.
+        let d = match_rules(
+            &input_hostname("db.other.intra"),
+            &empty_lookup(),
+            &rb,
+            default_zone_policy(),
+            prefer_primary(),
+        );
+        assert_eq!(matched_rule_id(&d), Some("a-wide"));
     }
 
     #[test]

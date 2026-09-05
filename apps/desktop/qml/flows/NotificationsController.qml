@@ -49,14 +49,11 @@ QtObject {
     function muteNoticeKind(kind) {
         var k = String(kind || "")
         if (k === "suggestions-changed") {
-            root.updatePrefs({ notifySuggestionChanges: false })
-            root.emitPrefs()
+            root.commitPrefs({ notifySuggestionChanges: false })
         } else if (k === "block-notice") {
-            root.updatePrefs({ notifyBlockNotices: false })
-            root.emitPrefs()
+            root.commitPrefs({ notifyBlockNotices: false })
         } else if (k === "rule-duplicates") {
-            root.updatePrefs({ notifyRuleDuplicates: false })
-            root.emitPrefs()
+            root.commitPrefs({ notifyRuleDuplicates: false })
         }
     }
 

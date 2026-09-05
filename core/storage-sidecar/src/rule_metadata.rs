@@ -67,10 +67,13 @@ impl RuleSignature {
 /// in usability past a screen-width of text.
 pub const COMMENT_MAX_LEN: usize = 1024;
 
-/// Strip characters that would break the one-line txt round-trip and
-/// trim trailing whitespace. Preserves Unicode (Cyrillic / CJK / IDN
-/// comments) and the tab character (used for column alignment in
-/// some user-authored presets).
+/// Strip characters that would break the one-line txt round-trip, or make the
+/// line read as something other than what it says, and trim trailing
+/// whitespace. Preserves Unicode (Cyrillic / CJK / IDN comments) and the tab
+/// character (used for column alignment in some user-authored presets).
+///
+/// Comments arrive from IMPORTED presets as well as from the user's own typing,
+/// so this runs on text somebody else wrote.
 pub fn sanitize_comment(input: &str) -> String {
     let mut out = String::with_capacity(input.len().min(COMMENT_MAX_LEN));
     for ch in input.chars() {
@@ -78,10 +81,21 @@ pub fn sanitize_comment(input: &str) -> String {
             // Newline variants collapse to a single space so we never
             // ship a comment that breaks the one-line preset format.
             '\r' | '\n' => out.push(' '),
+            // Beyond ASCII, Unicode has its own line terminators: NEL (U+0085),
+            // LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029). Editors
+            // and terminals break lines on them, so leaving them in put the
+            // one-line guarantee in the hands of whoever wrote the preset.
+            '\u{0085}' | '\u{2028}' | '\u{2029}' => out.push(' '),
             // Tab survives — it's useful for alignment inside comments.
             '\t' => out.push('\t'),
             // Every other ASCII control byte is stripped silently.
             c if (c as u32) < 0x20 => continue,
+            // Bidirectional overrides and isolates. They do not break the line;
+            // they make it DISPLAY differently from what it contains, so a
+            // comment shipped in a preset can read as one thing in the rules
+            // list and be another in the file. Nothing legitimate needs them in
+            // a one-line note, and dropping them leaves the text itself intact.
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => continue,
             c => out.push(c),
         }
     }
@@ -258,6 +272,28 @@ mod tests {
     fn sanitize_strips_control_chars_but_keeps_tab() {
         let out = sanitize_comment("a\x01b\tc\x1fd");
         assert_eq!(out, "ab\tcd");
+    }
+
+    /// ASCII is not the only way to end a line. A comment travels here from an
+    /// IMPORTED preset — text somebody else wrote — and NEL / LINE SEPARATOR /
+    /// PARAGRAPH SEPARATOR break a line in editors and terminals just as `\n`
+    /// does, which put the one-line guarantee in the preset author's hands.
+    #[test]
+    fn sanitize_flattens_unicode_line_terminators() {
+        let out = sanitize_comment("one\u{0085}two\u{2028}three\u{2029}four");
+        assert_eq!(out, "one two three four");
+    }
+
+    /// Bidi controls do not break the line — they make it DISPLAY as something
+    /// other than it contains, so a comment can read one way in the rules list
+    /// and be another in the file. Dropping them leaves the text itself intact.
+    #[test]
+    fn sanitize_drops_bidi_overrides_and_keeps_the_text() {
+        let out = sanitize_comment("safe\u{202E}txt.exe\u{202C} note");
+        assert_eq!(out, "safetxt.exe note");
+        // Ordinary right-to-left text is untouched — only the control
+        // characters go, never the letters.
+        assert_eq!(sanitize_comment("مرحبا note"), "مرحبا note");
     }
 
     #[test]

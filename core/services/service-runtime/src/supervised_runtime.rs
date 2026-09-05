@@ -74,8 +74,14 @@ const STOP_PROGRESS_POLL: Duration = Duration::from_millis(100);
 /// budget combined, so reaching it means the unbounded one is still going.
 const STOP_SLOW_EXPLAIN: Duration = Duration::from_secs(20);
 
-/// Budget for stopping the DNS resolver. The serve loop polls at 500 ms and
-/// then restores the NRPT redirect, which shells out and takes seconds.
+/// Budget for stopping the DNS resolver, and for closing the fake-IP TUN.
+///
+/// What it has to cover: the serve loop polls the stop flag at 500 ms, then
+/// joins the re-arm guard and restores the NRPT redirect — a single registry
+/// delete — and flushes the resolver cache through the OS API. None of that
+/// blocks for long any more; the budget stays generous because the guard join
+/// waits on a worker that may be mid-callback, and overrunning here would
+/// abandon the restore rather than delay it.
 const RESOLVER_STOP_BUDGET: Duration = Duration::from_secs(5);
 
 /// Budget for dropping a re-arm guard. Its worker can be mid-recompute; the
@@ -954,6 +960,30 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
                 target: "nrr::supervisor",
                 "spawn revisions-retention-prune failed: {e}",
             );
+        }
+    }
+
+    // 3-bis. storage-wal-checkpoint. Same cadence as the pruners above: the
+    // journals of the databases held open for the whole uptime are folded back
+    // and truncated. Skipped when a degraded boot opened none of them.
+    {
+        let checkpoints = crate::service_tasks::StorageCheckpointDeps {
+            cache: deps
+                .dns_refresh_orchestrator
+                .as_ref()
+                .map(|o| o.cache_handle()),
+            state: deps.state_db_conn.clone(),
+            traffic: deps.traffic_tick.as_ref().map(|t| Arc::clone(&t.sampler)),
+        };
+        if !checkpoints.is_empty() {
+            if let Err(e) = supervisor.spawn(crate::service_tasks::build_storage_checkpoint_task(
+                checkpoints,
+            )) {
+                tracing::warn!(
+                    target: "nrr::supervisor",
+                    "spawn storage-wal-checkpoint failed: {e}",
+                );
+            }
         }
     }
 

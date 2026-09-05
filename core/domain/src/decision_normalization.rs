@@ -42,7 +42,7 @@
 //! # `AddressMatch::ExactIp(IpAddr::V6)` in saved rules
 //!
 //! If the active rule book contains a rule with `AddressMatch::ExactIp(V6)`,
-//! that rule is treated as unsupported unsupported in Free edition:
+//! that rule is treated as unsupported in the Free edition:
 //! - The rule is preserved in storage and exported unchanged.
 //! - The GUI marks it with the extended-section badge.
 //! - The rule does **not** participate in `ExactIp` matching.
@@ -101,6 +101,13 @@ pub enum NormalizationError {
     DomainInvalidCharacters { raw: String },
     /// IDNA2008 encoding of a Unicode hostname failed.
     DomainIdnaFailed { raw: String },
+    /// The characters were all legal but the label structure was not: an empty
+    /// label (`a..b`, or the second dot in `example.com..`), a label over 63
+    /// octets, or a name over 253. Separate from
+    /// [`Self::DomainInvalidCharacters`] because nothing here is an illegal
+    /// character — a name that passes the character check can still be one no
+    /// resolver would answer.
+    DomainMalformedLabels { raw: String },
 
     // ── IP errors — block ExactIp ─────────────────────────────────────────────
     /// A native IPv6 address was observed.  Free edition does not support

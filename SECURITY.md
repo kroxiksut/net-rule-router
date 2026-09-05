@@ -116,6 +116,7 @@ The privileged control-plane boundary is fixed by these rules:
 - Caller identity must be verified before any mutating operation is accepted.
 - User/session context must be checked where operation scope depends on interactive user ownership.
 - Read-only methods and mutating methods must be separated at the API contract level (distinct method sets and authorization paths).
+- Reads are scoped to the caller, not only mutations. A user sees their own diagnostics records and the machine-level ones; the records of another account are not returned to them. An administrator sees everything on the machine. The scope is decided by the service from the connection, never taken from the request.
 
 ## Policy Data Model
 

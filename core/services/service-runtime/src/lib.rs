@@ -24,7 +24,7 @@
 //!
 //! | Domain/application function | Service direct call | GUI/tray access |
 //! |---|---|---|
-//! | `nrr-domain::decide_route`        | yes (rule engine inside the service loop) | no — GUI receives explain/decision DTOs over IPC |
+//! | `nrr-domain::match_sample`        | yes (rule matching behind the explain probe) | no — GUI asks over IPC and receives the answer |
 //! | `nrr-storage::*` open/migrate     | yes (service owns the storage profile) | no — GUI receives `StorageHealth` snapshots only |
 //! | `nrr-diagnostics::*` audit/log    | yes (service owns the writers) | no — GUI receives paginated entries / archive handles |
 //! | `nrr-platform-windows` apply      | yes (privileged mutation) | no — GUI requests via `ApplyController` IPC |
@@ -56,7 +56,6 @@
 
 pub mod activation_coordinator;
 pub mod active_sid_registry;
-pub mod adapters;
 pub mod app_destination_memory;
 pub mod app_enforcement_status;
 pub mod app_observation_lookup;
@@ -91,7 +90,6 @@ pub mod doh_seed;
 /// resolver — the answer the FQDN cache cannot give.
 pub mod enforced_addresses;
 pub mod enforcement_planner;
-pub mod explain_snapshot_sink;
 // Fake-IP neutral relay: flow parsing, per-flow routing
 // decisions and the upstream dialer port. Policy lives here; the TUN adapter
 // mechanism stays behind `nrr_platform_api::fake_ip::TunAdapterPort`.
@@ -99,7 +97,6 @@ pub mod fake_ip;
 pub mod fcrdns_learner;
 pub mod fqdn_cache_lookup;
 pub mod health;
-pub mod integration_ports;
 pub mod ipc;
 pub mod ipc_handlers;
 pub mod ipc_push;
@@ -177,6 +174,9 @@ pub mod traffic_sampler;
 pub mod verbosity_control;
 pub mod vpn_client_registry;
 pub mod vpn_endpoint_learning;
+// Every WFP weight band, ordered once. Both codegens read it; neither
+// declares a band of its own any more.
+mod wfp_bands;
 pub mod wfp_codegen;
 pub mod wfp_filter_ledger;
 // `source_watcher.rs` was removed as part of a backdoor-audit cleanup: the
@@ -295,9 +295,6 @@ pub use production_settings::{
 pub use verbosity_control::VerbosityControl;
 
 // Production ActivationCoordinator stack.
-pub use explain_snapshot_sink::{
-    ExplainSnapshotSink, NoopExplainSnapshotSink, ProductionExplainSnapshotSink,
-};
 pub use production_coordinator::{
     probe_lkg_available, run_crash_recovery_on_startup, CrashRecoveryOutcome,
     NoopRulesApplyDispatcher, ProductionActivationAuditEmitter, ProductionApplyMarkerStore,

@@ -97,6 +97,19 @@ fn risk_level_to_slug(level: RiskLevel) -> &'static str {
     }
 }
 
+/// Projects a pointer row onto the borrowed view the HMAC is computed over.
+fn pointer_fields<'a>(
+    principal: &'a str,
+    pointer: &'a ActiveRevisionPointer,
+) -> crate::revision_hmac::PointerFields<'a> {
+    crate::revision_hmac::PointerFields {
+        principal,
+        revision_id: &pointer.revision_id,
+        activated_at: pointer.activated_at,
+        apply_attempt_id: pointer.apply_attempt_id.as_deref(),
+    }
+}
+
 /// Projects a `RevisionRecord` onto the borrowed view used by
 /// [`crate::revision_hmac`]. All `Option<String>` fields are surfaced as
 /// `Option<&str>` borrows so the HMAC computation doesn't allocate.
@@ -462,6 +475,19 @@ impl<'c> RevisionsRepository<'c> {
                 report.adopted_tampered.push(id.clone());
             }
         }
+        // The pointer decides which of those revisions is ENFORCED, so an
+        // acknowledgement that left it unsigned would raise the same alert on
+        // the next start.
+        for (principal, _) in self.verify_all_pointers()? {
+            let before = self.re_sign_pointer_for(&principal)?;
+            report.re_signed += 1;
+            if matches!(
+                before,
+                Some(crate::revision_hmac::HmacVerification::Tampered)
+            ) {
+                report.adopted_tampered.push(format!("pointer:{principal}"));
+            }
+        }
         Ok(report)
     }
 
@@ -740,7 +766,8 @@ impl<'c> RevisionsRepository<'c> {
         now: i64,
     ) -> StorageResult<()> {
         if let Some(prev) = previous_id {
-            self.conn
+            let superseded = self
+                .conn
                 .execute(
                     "UPDATE revisions
                      SET status = 'superseded',
@@ -752,6 +779,18 @@ impl<'c> RevisionsRepository<'c> {
                 .map_err(|e| {
                     StorageError::Internal(format!("revisions supersede previous: {e}"))
                 })?;
+            // Zero rows means the caller named a previous revision that was not
+            // active. Retiring the old one is half of this phase, and reporting
+            // success without doing it left the caller believing history moved.
+            // The one benign case is a retry after a crash between the two
+            // statements: already superseded BY THIS TARGET, which is the state
+            // this call wanted.
+            if superseded != 1 && !self.already_superseded_by(principal, prev, target_id)? {
+                return Err(StorageError::Internal(format!(
+                    "revisions supersede previous: expected 1 row updated, got {superseded} \
+                     (revision_id={prev} principal={principal} was not the active revision)"
+                )));
+            }
         }
         let updated = self
             .conn
@@ -769,6 +808,27 @@ impl<'c> RevisionsRepository<'c> {
             )));
         }
         Ok(())
+    }
+
+    /// Was `revision_id` already retired in favour of `target_id`? Lets a
+    /// retried Phase 3a tell "nothing to do" from "the wrong revision".
+    fn already_superseded_by(
+        &self,
+        principal: &str,
+        revision_id: &str,
+        target_id: &str,
+    ) -> StorageResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM revisions
+                 WHERE principal = ?1 AND revision_id = ?2
+                   AND status = 'superseded' AND superseded_by = ?3",
+                params![principal, revision_id, target_id],
+                |_| Ok(true),
+            )
+            .optional()
+            .map(|found| found.unwrap_or(false))
+            .map_err(|e| StorageError::Internal(format!("revisions supersede check: {e}")))
     }
 
     /// Phase 3b — Candidate `target_id` becomes Rejected with the given
@@ -884,24 +944,129 @@ impl<'c> RevisionsRepository<'c> {
         principal: &str,
         pointer: &ActiveRevisionPointer,
     ) -> StorageResult<()> {
+        let row_hmac = self.pointer_hmac(principal, pointer);
         self.conn
             .execute(
                 "INSERT INTO active_revision_pointer
-                 (principal, revision_id, activated_at, apply_attempt_id)
-                 VALUES (?1, ?2, ?3, ?4)
+                 (principal, revision_id, activated_at, apply_attempt_id, row_hmac)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(principal) DO UPDATE SET
                      revision_id = excluded.revision_id,
                      activated_at = excluded.activated_at,
-                     apply_attempt_id = excluded.apply_attempt_id",
+                     apply_attempt_id = excluded.apply_attempt_id,
+                     row_hmac = excluded.row_hmac",
                 params![
                     principal,
                     pointer.revision_id,
                     pointer.activated_at,
                     pointer.apply_attempt_id,
+                    row_hmac,
                 ],
             )
             .map_err(|e| StorageError::Internal(format!("active_revision_pointer set: {e}")))?;
         Ok(())
+    }
+
+    /// Sign one pointer row, or the empty blob when the repository has no key.
+    fn pointer_hmac(&self, principal: &str, pointer: &ActiveRevisionPointer) -> Vec<u8> {
+        match self.key() {
+            Some(key) => {
+                let fields = pointer_fields(principal, pointer);
+                crate::revision_hmac::compute_pointer_hmac(&fields, key).to_vec()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Verify every pointer row, `(principal, outcome)` in principal order.
+    ///
+    /// Separate from [`Self::verify_all`] because the ids are principals, not
+    /// revision ids, and the caller's backfill has to know which table to
+    /// repair. Both feed the same alert.
+    pub fn verify_all_pointers(
+        &self,
+    ) -> StorageResult<Vec<(String, crate::revision_hmac::HmacVerification)>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT principal, revision_id, activated_at, apply_attempt_id, row_hmac
+                 FROM active_revision_pointer ORDER BY principal ASC",
+            )
+            .map_err(|e| StorageError::Internal(format!("pointer verify_all prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ActiveRevisionPointer {
+                        revision_id: row.get(1)?,
+                        activated_at: row.get(2)?,
+                        apply_attempt_id: row.get(3)?,
+                    },
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(|e| StorageError::Internal(format!("pointer verify_all query: {e}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| StorageError::Internal(format!("pointer verify_all collect: {e}")))?;
+        drop(stmt);
+
+        Ok(rows
+            .into_iter()
+            .map(|(principal, pointer, stored)| {
+                let verification = match self.key() {
+                    Some(key) => {
+                        let fields = pointer_fields(&principal, &pointer);
+                        crate::revision_hmac::verify_pointer(&fields, &stored, key)
+                    }
+                    None => crate::revision_hmac::HmacVerification::Unsigned,
+                };
+                (principal, verification)
+            })
+            .collect())
+    }
+
+    /// Recompute and persist one pointer's HMAC, returning what the stored
+    /// signature said before it was replaced. Same adoption caveat as
+    /// [`Self::re_sign_row`].
+    pub fn re_sign_pointer_for(
+        &self,
+        principal: &str,
+    ) -> StorageResult<Option<crate::revision_hmac::HmacVerification>> {
+        let Some(key) = self.key() else {
+            return Ok(None);
+        };
+        let row: Option<(ActiveRevisionPointer, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT revision_id, activated_at, apply_attempt_id, row_hmac
+                 FROM active_revision_pointer WHERE principal = ?1",
+                params![principal],
+                |row| {
+                    Ok((
+                        ActiveRevisionPointer {
+                            revision_id: row.get(0)?,
+                            activated_at: row.get(1)?,
+                            apply_attempt_id: row.get(2)?,
+                        },
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| StorageError::Internal(format!("pointer re_sign read: {e}")))?;
+        let Some((pointer, stored)) = row else {
+            return Ok(None);
+        };
+        let fields = pointer_fields(principal, &pointer);
+        let before = crate::revision_hmac::verify_pointer(&fields, &stored, key);
+        let hmac = crate::revision_hmac::compute_pointer_hmac(&fields, key).to_vec();
+        self.conn
+            .execute(
+                "UPDATE active_revision_pointer SET row_hmac = ?1 WHERE principal = ?2",
+                params![hmac, principal],
+            )
+            .map_err(|e| StorageError::Internal(format!("pointer re_sign write: {e}")))?;
+        Ok(Some(before))
     }
 
     /// Removes the baseline principal's pointer row. Used by safe-disable /
@@ -984,6 +1149,16 @@ impl<'c> RevisionsRepository<'c> {
     /// on the next integrity scan. Signed candidates are left in place
     /// for a later keyed sweep. Returns the number of rows rejected.
     pub fn reject_orphaned_candidates(&self, reason: &str, _now_ms: i64) -> StorageResult<usize> {
+        // One transaction over the whole sweep. The SELECT collects ids and the
+        // UPDATE then matches `status = 'candidate'` again — a WIDER set if a
+        // row was inserted in between. That row got flipped to `rejected` while
+        // only the collected ids were re-signed, so its signature still covered
+        // `candidate`: the next verification called it TAMPERED and blocked
+        // every mutation on a database nobody had touched.
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| StorageError::Internal(format!("reject_orphaned_candidates tx: {e}")))?;
         let signed_rows_eligible = if self.key().is_some() {
             ""
         } else {
@@ -1010,8 +1185,7 @@ impl<'c> RevisionsRepository<'c> {
             return Ok(0);
         }
 
-        let rejected = self
-            .conn
+        let rejected = tx
             .execute(
                 &format!(
                     "UPDATE revisions
@@ -1027,6 +1201,9 @@ impl<'c> RevisionsRepository<'c> {
         for id in &orphan_ids {
             self.re_sign_row(id)?;
         }
+        tx.commit().map_err(|e| {
+            StorageError::Internal(format!("reject_orphaned_candidates commit: {e}"))
+        })?;
 
         Ok(rejected)
     }
@@ -2102,6 +2279,132 @@ mod tests {
 
     fn hmac_key() -> Vec<u8> {
         vec![0x42u8; crate::revision_hmac::RECOMMENDED_KEY_BYTE_LEN]
+    }
+
+    /// Which revision is ACTIVE is part of the enforced policy. Repointing it
+    /// leaves both revisions verifying perfectly, so without a tag on the
+    /// pointer itself the swap is invisible.
+    #[test]
+    fn moving_the_active_pointer_out_of_band_is_caught() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
+        for (id, hash) in [("rev-one", "h-1"), ("rev-two", "h-2")] {
+            repo.insert_candidate(&sample_record(id, hash))
+                .expect("insert");
+        }
+        repo.set_active_pointer(&ActiveRevisionPointer {
+            revision_id: "rev-one".into(),
+            activated_at: 10,
+            apply_attempt_id: None,
+        })
+        .expect("point");
+        assert_eq!(
+            repo.verify_all_pointers().expect("verify"),
+            vec![(
+                crate::BASELINE_PRINCIPAL.to_string(),
+                crate::revision_hmac::HmacVerification::Verified
+            )],
+        );
+
+        conn.execute(
+            "UPDATE active_revision_pointer SET revision_id = 'rev-two'",
+            [],
+        )
+        .expect("hand edit");
+        assert_eq!(
+            repo.verify_all_pointers().expect("verify"),
+            vec![(
+                crate::BASELINE_PRINCIPAL.to_string(),
+                crate::revision_hmac::HmacVerification::Tampered
+            )],
+        );
+
+        // Acknowledging adopts the state — and says which row it adopted.
+        let report = repo.re_sign_all().expect("re-sign");
+        assert!(report
+            .adopted_tampered
+            .iter()
+            .any(|id| id.starts_with("pointer:")));
+        assert!(repo
+            .verify_all_pointers()
+            .expect("verify")
+            .iter()
+            .all(|(_, v)| *v == crate::revision_hmac::HmacVerification::Verified));
+    }
+
+    /// Retiring the previous revision is half of Phase 3a. Naming one that is
+    /// not active did nothing and still reported success — history then kept
+    /// two stories about which revision had been replaced.
+    #[test]
+    fn superseding_a_revision_that_is_not_active_is_an_error() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        let repo = RevisionsRepository::new(&conn);
+        for (id, hash) in [("rev-a", "h-a"), ("rev-b", "h-b")] {
+            repo.insert_candidate(&sample_record(id, hash))
+                .expect("insert");
+        }
+
+        // `rev-a` is still a candidate, so it cannot be the one being replaced.
+        let err = repo
+            .mark_apply_succeeded("rev-b", Some("rev-a"), 10)
+            .expect_err("naming a non-active predecessor must not pass silently");
+        assert!(format!("{err}").contains("was not the active revision"));
+
+        // The honest sequence works, and repeating it is idempotent — a retry
+        // after a crash between the two statements must not fail.
+        repo.mark_apply_succeeded("rev-a", None, 10).expect("first");
+        repo.mark_apply_succeeded("rev-b", Some("rev-a"), 20)
+            .expect("second");
+        repo.mark_apply_succeeded("rev-b", Some("rev-a"), 20)
+            .expect_err("rev-b is already active, not a candidate");
+    }
+
+    /// A pointer written before the column existed is unsigned, not forged.
+    #[test]
+    fn a_pointer_from_before_signing_reads_unsigned() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let conn = open_state_db(&dir);
+        RevisionsRepository::new(&conn)
+            .insert_candidate(&sample_record("rev-old", "h-old"))
+            .expect("insert");
+        conn.execute(
+            "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)
+             VALUES (?1, 'rev-old', 1)",
+            params![crate::BASELINE_PRINCIPAL],
+        )
+        .expect("legacy pointer");
+
+        let repo = RevisionsRepository::with_signing_key(&conn, hmac_key());
+        assert_eq!(
+            repo.verify_all_pointers().expect("verify")[0].1,
+            crate::revision_hmac::HmacVerification::Unsigned,
+        );
+        repo.re_sign_pointer_for(crate::BASELINE_PRINCIPAL)
+            .expect("backfill");
+        assert_eq!(
+            repo.verify_all_pointers().expect("verify")[0].1,
+            crate::revision_hmac::HmacVerification::Verified,
+        );
+    }
+
+    /// One principal's tag must not verify over another's row: a pointer
+    /// copied between users would otherwise carry its signature with it.
+    #[test]
+    fn a_pointer_tag_does_not_travel_between_principals() {
+        let key = hmac_key();
+        let pointer = ActiveRevisionPointer {
+            revision_id: "rev-one".into(),
+            activated_at: 10,
+            apply_attempt_id: None,
+        };
+        let mine =
+            crate::revision_hmac::compute_pointer_hmac(&pointer_fields("S-A", &pointer), &key);
+        assert_eq!(
+            crate::revision_hmac::verify_pointer(&pointer_fields("S-B", &pointer), &mine, &key),
+            crate::revision_hmac::HmacVerification::Tampered,
+        );
     }
 
     #[test]

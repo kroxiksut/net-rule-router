@@ -38,15 +38,74 @@ const LEGACY_PREFERENCES_FILE_NAMES: [&str; 1] = ["ui-preferences-v1.conf"];
 ///   schema version on the next save. No silent reset of any field.
 /// - **Equal to `CURRENT_UI_PREFS_SCHEMA_VERSION`**: normal load path.
 /// - **Greater than `CURRENT_UI_PREFS_SCHEMA_VERSION`** (future version):
-///   file was written by a newer build. Known fields are loaded; fields
-///   introduced in newer schema versions are silently ignored. A diagnostic
-///   is emitted to stderr. The file is **not** downgraded on save — the
-///   caller decides whether to overwrite.
+///   file was written by a newer build. Known fields are loaded; keys this
+///   build has no field for are carried verbatim in
+///   [`UiPreferences::forward_compat`] and written back on save, and the
+///   version stamp is never lowered. So the file is not downgraded, and a
+///   user who starts an older build once does not lose the settings only the
+///   newer one knows about. A diagnostic is emitted to stderr.
 pub const CURRENT_UI_PREFS_SCHEMA_VERSION: u32 = 11;
 
 /// Bounds and default for [`UiPreferences::settings_autosave_secs`]. This is the
 /// authoritative range: the spin box in the settings UI mirrors it, but any
 /// value arriving from a hand-edited file or an older build is clamped here.
+/// Ceiling for every opaque JSON blob the preferences file stores
+/// (`route_pending_offline_json`, `cache_table_column_widths`,
+/// `service_backed_mirror_json`, `service_intent_json`). One declaration: the
+/// parse side and the QML payload side both gate against it.
+/// Ceiling for the free-form string fields that GROW on their own: the
+/// acknowledgement signatures (a `|`-join of every unenforced app / kept
+/// overlap pair) and the confirmed-VPN executable list. Every other string here
+/// is something a user typed into a bounded control.
+///
+/// The file is rewritten in full every 500 ms during a settings burst, so an
+/// unbounded string is a write-amplification defect, not just disk. A value over
+/// the ceiling is refused rather than truncated: half a signature matches
+/// nothing, and a signature that matches nothing is a banner the user has to
+/// acknowledge again — a truncated one would ALSO look like a valid answer.
+pub const MAX_STORED_STRING_BYTES: usize = 16 * 1024;
+
+/// `value` when it fits on one line within [`MAX_STORED_STRING_BYTES`],
+/// otherwise `fallback` plus a diagnostic.
+pub fn storable_line_or(field: &str, value: String, fallback: String) -> String {
+    if value.len() <= MAX_STORED_STRING_BYTES && !value.contains(['\n', '\r']) {
+        return value;
+    }
+    eprintln!(
+        "nrr: keeping the stored {field}: the incoming value is {} bytes or spans lines \
+         (ceiling {MAX_STORED_STRING_BYTES})",
+        value.len()
+    );
+    fallback
+}
+
+/// Accepted slugs for the compatibility banner, and the default. Authoritative
+/// list: the parse side and the QML payload side both resolve against it, and
+/// the settings UI mirrors it.
+pub const COMPAT_BANNER_MODES: [&str; 3] = ["auto", "always", "never"];
+pub const COMPAT_BANNER_MODE_DEFAULT: &str = "auto";
+
+/// Accepted slugs for the file-to-service merge-conflict policy, and the
+/// default. Same authority as [`COMPAT_BANNER_MODES`].
+pub const MERGE_CONFLICT_POLICIES: [&str; 3] = ["union", "file-wins", "service-wins"];
+pub const MERGE_CONFLICT_POLICY_DEFAULT: &str = "union";
+
+/// `value` when it is one of `allowed`, otherwise `fallback`.
+///
+/// The two sides of the round-trip filtered differently: the QML payload wrote
+/// a slug verbatim while the parser dropped anything off the list, so a value
+/// the app honoured all session quietly reverted at the next start. One
+/// resolver, called by both, is what keeps that from coming back.
+pub fn allowed_slug_or(value: &str, allowed: &[&str], fallback: &str) -> String {
+    if allowed.contains(&value) {
+        value.to_string()
+    } else {
+        fallback.to_string()
+    }
+}
+
+pub const MAX_STORED_JSON_BLOB_BYTES: usize = 8 * 1024;
+
 pub const SETTINGS_AUTOSAVE_MIN_SECS: u32 = 15;
 
 /// Bounds and default for [`UiPreferences::admin_auto_revoke_minutes`] — how
@@ -238,19 +297,23 @@ pub struct UiPreferences {
     /// rule a wildcard already covers; a pair listed here is never offered
     /// again. Device-local UI state, never exported.
     pub rules_overlap_keep_signature: String,
-    /// Device-local record of the executable the user pointed out as their
-    /// VPN in the onboarding dialog. Captured so it can
-    /// later be turned into an "Application -> primary route" rule (which the
-    /// service already treats as a kill-switch exemption). Empty = not set.
+    /// DISPLAY only: the first of [`confirmed_vpn_exe_paths`], shown as
+    /// "Your VPN client" in Settings. Nothing keys behaviour on it — the set
+    /// below is what reseeds the service. Kept because a single name reads
+    /// better in a label than a semicolon-joined list. Empty = not set.
     /// Single line only (line-oriented prefs file). Device-local, never exported.
     pub confirmed_vpn_exe_path: String,
-    /// Multi-select companion to [`confirmed_vpn_exe_path`]: the FULL set of
-    /// executables the user confirmed as their VPN in the onboarding dialog,
-    /// as a semicolon-joined list of absolute paths (`""` = none). Users often
-    /// run several processes as one VPN setup (e.g. OpenVPN + hide.me, or a
-    /// client plus its background service and CLI); each listed exe stays
-    /// exempted from the kill-switch. `confirmed_vpn_exe_path` mirrors the
-    /// FIRST entry for back-compat with single-path readers. Single line only.
+    /// The FULL set of executables the user confirmed as their VPN in the
+    /// onboarding dialog, semicolon-joined absolute paths (`""` = none). Users
+    /// often run several processes as one VPN setup (a client plus its
+    /// background service and CLI); each listed exe stays exempted from the
+    /// kill-switch.
+    ///
+    /// The service-side `route_link_provider_apps` table is authoritative, but
+    /// this is NOT a passive mirror: when the service comes back with an empty
+    /// provider set (a schema bump wiped it), `Main.qml` reseeds the service
+    /// from this list. That is the whole reason the app keeps its own copy, and
+    /// it is why the value is behaviour, not decoration. Single line only.
     /// Device-local, never exported.
     pub confirmed_vpn_exe_paths: String,
 
@@ -302,8 +365,12 @@ pub struct UiPreferences {
     /// hosts bypassing the OS hosts/adblock file). Default `true`.
     pub route_resolve_hosts_bypass: bool,
     /// Mirror of the GLOBAL service enforcement mode (service-stability config,
-    /// not per-SID): `"reactive"` (Mode A, default) | `"resolver"` (Mode B).
-    /// See the block comment above for the seed-on-default semantics.
+    /// not per-SID): `"reactive"` (Mode A) | `"resolver"` (Mode B, default).
+    /// The default is taken from `nrr_shared::ipc_payloads::
+    /// ENFORCEMENT_MODE_DEFAULT`, not retyped: this doc used to name the other
+    /// mode, and a mirror that disagrees with the wire is how a user ends up in
+    /// a mode nobody chose. See the block comment above for the seed-on-default
+    /// semantics.
     pub route_enforcement_mode: String,
     /// Mirror of the GLOBAL service "secondary tunnel liveness window"
     /// (service-stability config, not per-SID). Active ICMP-probe liveness
@@ -356,30 +423,20 @@ pub struct UiPreferences {
     pub service_intent_json: String,
 
     // -------------------------------------------------------------------------
-    // Policy-affecting fields. The service owns the authoritative per-SID copy;
-    // these eight are still the GUI's ONLY live store of the same facts.
+    // Adapter bindings. The service owns the authoritative per-SID copy and is
+    // what actually enforces; these eight are the app's own store of the same
+    // facts and what every panel shows while the service is stopped.
     //
-    // `InterfacesRolesController.qml` writes them, `RoutePolicyController.qml`
-    // reads them, and the authoritative `route.policy.update` is built out of
-    // what it read. NOTHING seeds them back from `SnapshotInitial.routePolicy`,
-    // so clearing them blanks the interfaces screen while the service keeps
-    // enforcing bindings the user can no longer see.
-    //
-    // They carried `#[deprecated]` markers saying they had already been migrated.
-    // That was not true, and every consumer silenced them with
-    // `#[allow(deprecated)]` — so the attribute warned nobody and told whoever
-    // read it the opposite of the truth. Removed rather than kept: the migration
-    // helper (`launcher::legacy_prefs_migration`) has no production caller, and
-    // wiring one before the reverse seed exists is what the markers invited.
-    //
-    // Order of work: FIRST seed these from the service snapshot, THEN retire
-    // them. See `nrr_domain::PolicyOwnershipBoundary` for the boundary spec.
+    // The two are reconciled in one direction only: an EMPTY slot here is
+    // seeded from `SnapshotInitial.routePolicy` on cold start, and a slot that
+    // disagrees raises a banner asking the user which side stands. A snapshot
+    // never overwrites a filled slot — the app's value is the user's own
+    // choice, and only they know which of the two is the stale one.
     // -------------------------------------------------------------------------
-    /// The adapter the user picked for the main route. LIVE: the interfaces
-    /// screen writes it and `route.policy.update` is built from it. The service
-    /// holds the same fact per-SID and reports it in
-    /// `SnapshotInitial.routePolicy.primary.stableId`; nothing reconciles the
-    /// two yet, so this side is what the user actually sees.
+    /// The adapter the user picked for the main route. The interfaces screen
+    /// writes it and `route.policy.update` is built from it; the service holds
+    /// the same fact per-SID and reports it in
+    /// `SnapshotInitial.routePolicy.primary.stableId`.
     pub selected_primary_interface_id: String,
     /// Display hint for the id above. See `selected_primary_interface_id`.
     pub selected_primary_interface_name: String,
@@ -563,6 +620,34 @@ pub struct UiPreferences {
     /// - `"file-wins"`: the linked file is authoritative for conflicts.
     /// - `"service-wins"`: the active service revision is authoritative.
     pub merge_conflict_policy: String,
+    /// What the loaded file said that this build has no field for. Carried
+    /// through the round-trip so an older build saving over a newer build's
+    /// file does not silently erase its settings.
+    pub forward_compat: ForwardCompat,
+}
+
+/// The part of a preferences file this build does not understand.
+///
+/// Only populated when the file declares a schema version ABOVE
+/// [`CURRENT_UI_PREFS_SCHEMA_VERSION`]: an unknown key in a file of our own
+/// version is a leftover of a key we removed, and re-writing those forever is
+/// how a settings file never shrinks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ForwardCompat {
+    /// Version the file declared, when it was newer than ours.
+    pub newer_schema_version: Option<u32>,
+    /// Unrecognised `key=value` lines, verbatim and in file order.
+    pub unknown_lines: Vec<String>,
+}
+
+impl ForwardCompat {
+    /// Version to stamp on save: never lower than what the file already
+    /// declared, which is what "the file is not downgraded on save" means.
+    fn schema_stamp(&self) -> u32 {
+        self.newer_schema_version
+            .unwrap_or(CURRENT_UI_PREFS_SCHEMA_VERSION)
+            .max(CURRENT_UI_PREFS_SCHEMA_VERSION)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,13 +692,9 @@ impl std::str::FromStr for SystemFontFamily {
     }
 }
 
-// `Default::default()` constructs a `UiPreferences` with the deprecated
-// policy-affecting fields zeroed at their type defaults. The
-// `allow(deprecated)` is contained to this fn because
-// the policy fields are part of the struct's persisted shape; new
-// readers should use `bridge.snapshotInitial.routePolicy` from IPC,
-// not these.
-#[allow(deprecated)]
+// The route-policy fields start at their type defaults, like every other one.
+// They are the application's own store and what the window shows while the
+// service is stopped — not a legacy shape to be read past.
 impl Default for UiPreferences {
     fn default() -> Self {
         let language = detected_system_language();
@@ -686,7 +767,7 @@ impl Default for UiPreferences {
             route_mode_a_coverage_strategy: route_mode_a_coverage_strategy_default(),
             route_resolve_hosts_bypass: true,
             // Kept in sync with `EnforcementMode::default().as_slug()`.
-            route_enforcement_mode: String::from("resolver"),
+            route_enforcement_mode: nrr_shared::ipc_payloads::enforcement_mode_default(),
             route_liveness_window_secs: 0,
             route_pending_offline_json: String::new(),
             allow_saving_into_bundled_presets: false,
@@ -719,7 +800,7 @@ impl Default for UiPreferences {
             auto_load_rules_on_launch: true,
             export_include_comments: true,
             import_only_active: true,
-            compat_banner_mode: String::from("auto"),
+            compat_banner_mode: String::from(COMPAT_BANNER_MODE_DEFAULT),
             update_page_url: String::new(),
             show_bundled_presets: true,
             // Empty means "list the rule sets shipped with the app".
@@ -728,9 +809,10 @@ impl Default for UiPreferences {
             // state where the shipped-set list may choose one by system locale.
             selected_preset_set: String::new(),
             secondary_split_ack_adapter_name: String::new(),
-            // Default to the safe interactive "union" policy: the merge
-            // keeps both sides and asks the user to resolve conflicts.
-            merge_conflict_policy: String::from("union"),
+            // The safe interactive policy: the merge keeps both sides and asks
+            // the user to resolve conflicts.
+            merge_conflict_policy: String::from(MERGE_CONFLICT_POLICY_DEFAULT),
+            forward_compat: ForwardCompat::default(),
         }
     }
 }
@@ -954,11 +1036,9 @@ impl UiPreferencesStore {
         self.try_migrate_legacy_file()?;
         match fs::read_to_string(&self.path) {
             Ok(content) if has_preference_lines(&content) => {
-                check_schema_version_compat(&content);
-                Ok(without_expired_parked_intents(
-                    parse_preferences(&content),
-                    unix_now_ms(),
-                ))
+                let parsed = parse_preferences(&content);
+                warn_if_written_by_a_newer_build(&parsed);
+                Ok(without_expired_parked_intents(parsed, unix_now_ms()))
             }
             // The file exists but holds no `key=value` line: a dirty-shutdown
             // artifact (power cut after the rename committed but before the
@@ -983,11 +1063,9 @@ impl UiPreferencesStore {
         if !has_preference_lines(&content) {
             return None;
         }
-        check_schema_version_compat(&content);
-        Some(without_expired_parked_intents(
-            parse_preferences(&content),
-            unix_now_ms(),
-        ))
+        let parsed = parse_preferences(&content);
+        warn_if_written_by_a_newer_build(&parsed);
+        Some(without_expired_parked_intents(parsed, unix_now_ms()))
     }
 
     fn backup_path(&self) -> PathBuf {
@@ -1129,11 +1207,6 @@ fn legacy_preference_paths(root: PathBuf) -> Vec<PathBuf> {
     paths
 }
 
-/// Scans `content` for a `schema_version` key and emits a stderr diagnostic
-/// when the file declares a version newer than this build supports.
-///
-/// Called by [`UiPreferencesStore::load`] before the full parse pass. Absent
-/// `schema_version` means a legacy v0 file — loaded silently without warning.
 /// Whether `content` carries at least one `key=value` line — what separates a
 /// real preferences file (ours always leads with `schema_version=`, a legacy
 /// one has its settings) from the empty or NUL-filled husk a dirty shutdown
@@ -1145,34 +1218,51 @@ fn has_preference_lines(content: &str) -> bool {
     })
 }
 
-fn check_schema_version_compat(content: &str) {
+/// Says on stderr that the file came from a newer build, once per load.
+///
+/// Nothing else can be done about it and nothing needs to be: the unknown keys
+/// ride along in [`ForwardCompat`] and are written back, so the file is not
+/// downgraded. The line is here for a support archive, not for a decision.
+fn warn_if_written_by_a_newer_build(preferences: &UiPreferences) {
+    if let Some(v) = preferences.forward_compat.newer_schema_version {
+        let carried = preferences.forward_compat.unknown_lines.len();
+        eprintln!(
+            "nrr: ui-preferences file declares schema_version={v}; this build supports up to \
+             {CURRENT_UI_PREFS_SCHEMA_VERSION}. Known fields are loaded, {carried} unknown \
+             setting(s) are carried through unchanged."
+        );
+    }
+}
+
+/// The `schema_version` the file declares, if any.
+///
+/// Absent means a legacy v0 file — every known field loads as-is. Read in its
+/// own pass because the unknown-key capture in [`parse_preferences`] has to
+/// know the verdict before it reaches the first unknown key, and a hand-edited
+/// file may not lead with the version the way ours do.
+fn declared_schema_version(content: &str) -> Option<u32> {
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some(rest) = line.strip_prefix("schema_version=") {
-            if let Ok(v) = rest.trim().parse::<u32>() {
-                if v > CURRENT_UI_PREFS_SCHEMA_VERSION {
-                    eprintln!(
-                        "nrr: ui-preferences file declares schema_version={v}; \
-                         this build supports up to {CURRENT_UI_PREFS_SCHEMA_VERSION}. \
-                         Known fields will be loaded; fields from newer schema versions are ignored."
-                    );
-                }
-            }
-            return;
+            return rest.trim().parse::<u32>().ok();
         }
     }
-    // No schema_version key: legacy v0 file — load as-is, no warning.
+    None
 }
 
-// `parse_preferences` continues to deserialise the legacy policy-affecting
-// fields for backward-compat with older files. New readers should consume
-// IPC `SnapshotInitial.routePolicy` instead.
-#[allow(deprecated)]
 fn parse_preferences(content: &str) -> UiPreferences {
     let mut preferences = UiPreferences::default();
+    let newer_schema =
+        declared_schema_version(content).filter(|v| *v > CURRENT_UI_PREFS_SCHEMA_VERSION);
+    preferences.forward_compat.newer_schema_version = newer_schema;
+    // The defaults were built from the SYSTEM language, which is not the one
+    // the user picked. Whether the file carried its own values decides whether
+    // they get recomputed below.
+    let mut language_seen = false;
+    let mut labels_seen = false;
 
     for raw_line in content.lines() {
         let line = raw_line.trim();
@@ -1188,7 +1278,7 @@ fn parse_preferences(content: &str) -> UiPreferences {
 
         match key {
             "schema_version" => {
-                // Parsed by `check_schema_version_compat`; ignore here.
+                // Read ahead of the loop, and re-stamped on save.
             }
             "launch_window_on_startup" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -1280,9 +1370,13 @@ fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.tooltips_enabled = parsed;
                 }
             }
+            // Resolved against the catalog, not just canonicalised: a tag no
+            // catalog carries (`zz`, a typo) left every `tr()` on its English
+            // fallback, which reads as "the app forgot my language".
             "language" => {
-                if let Some(parsed) = canonicalize_language_id(value) {
+                if let Some(parsed) = parse_language_hint(value) {
                     preferences.language = parsed;
+                    language_seen = true;
                 }
             }
             "last_opened_section" => {
@@ -1293,11 +1387,13 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "route_primary_label" => {
                 if !value.is_empty() {
                     preferences.route_primary_label = value.to_string();
+                    labels_seen = true;
                 }
             }
             "route_secondary_label" => {
                 if !value.is_empty() {
                     preferences.route_secondary_label = value.to_string();
+                    labels_seen = true;
                 }
             }
             "show_bluetooth_adapters" => {
@@ -1315,23 +1411,21 @@ fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.admin_auto_revoke_disabled = parsed;
                 }
             }
+            // Clamped, not reverted: an out-of-range value is a user who wanted
+            // the extreme, and silently substituting the default moves a
+            // security-relevant timer to a number nobody asked for. Garbage
+            // (unparseable) keeps the current value, like every other number here.
             "admin_auto_revoke_minutes" => {
-                preferences.admin_auto_revoke_minutes = value
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|m| {
-                        (ADMIN_AUTO_REVOKE_MIN_MINUTES..=ADMIN_AUTO_REVOKE_MAX_MINUTES).contains(m)
-                    })
-                    .unwrap_or(ADMIN_AUTO_REVOKE_DEFAULT_MINUTES);
+                if let Ok(parsed) = value.parse::<u32>() {
+                    preferences.admin_auto_revoke_minutes =
+                        parsed.clamp(ADMIN_AUTO_REVOKE_MIN_MINUTES, ADMIN_AUTO_REVOKE_MAX_MINUTES);
+                }
             }
             "settings_autosave_secs" => {
-                preferences.settings_autosave_secs = value
-                    .parse::<u32>()
-                    .ok()
-                    .filter(|secs| {
-                        (SETTINGS_AUTOSAVE_MIN_SECS..=SETTINGS_AUTOSAVE_MAX_SECS).contains(secs)
-                    })
-                    .unwrap_or(SETTINGS_AUTOSAVE_DEFAULT_SECS);
+                if let Ok(parsed) = value.parse::<u32>() {
+                    preferences.settings_autosave_secs =
+                        parsed.clamp(SETTINGS_AUTOSAVE_MIN_SECS, SETTINGS_AUTOSAVE_MAX_SECS);
+                }
             }
             "allow_mode_a_killswitch" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -1419,23 +1513,39 @@ fn parse_preferences(content: &str) -> UiPreferences {
             // value (sorted exe patterns joined with `|`); empty is a valid
             // "never dismissed" state, so no non-empty gate.
             "unenforced_apps_ack_signature" => {
-                preferences.unenforced_apps_ack_signature = value.to_string();
+                preferences.unenforced_apps_ack_signature = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.unenforced_apps_ack_signature),
+                );
             }
             // Overlap pairs the user asked to keep. Free-form single-line
             // value; empty is the valid "nothing kept" state.
             "rules_overlap_keep_signature" => {
-                preferences.rules_overlap_keep_signature = value.to_string();
+                preferences.rules_overlap_keep_signature = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.rules_overlap_keep_signature),
+                );
             }
             // Confirmed VPN executable path. Free-form single-line value;
             // empty is the valid "not set" state, so no non-empty gate.
             "confirmed_vpn_exe_path" => {
-                preferences.confirmed_vpn_exe_path = value.to_string();
+                preferences.confirmed_vpn_exe_path = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.confirmed_vpn_exe_path),
+                );
             }
             // Semicolon-joined list of confirmed VPN executables. Free-form
             // single-line value; empty is the valid "none" state, so no
             // non-empty gate.
             "confirmed_vpn_exe_paths" => {
-                preferences.confirmed_vpn_exe_paths = value.to_string();
+                preferences.confirmed_vpn_exe_paths = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.confirmed_vpn_exe_paths),
+                );
             }
             "selected_primary_interface_name" => {
                 preferences.selected_primary_interface_name = value.to_string();
@@ -1537,11 +1647,8 @@ fn parse_preferences(content: &str) -> UiPreferences {
                 }
             }
             "compat_banner_mode" => {
-                // Constrain to the known slugs; anything else falls back
-                // to the default already in `preferences`.
-                if matches!(value, "auto" | "always" | "never") {
-                    preferences.compat_banner_mode = value.to_string();
-                }
+                preferences.compat_banner_mode =
+                    allowed_slug_or(value, &COMPAT_BANNER_MODES, &preferences.compat_banner_mode);
             }
             "update_page_url" => {
                 preferences.update_page_url = value.to_string();
@@ -1568,12 +1675,12 @@ fn parse_preferences(content: &str) -> UiPreferences {
             "secondary_split_ack_adapter_name" => {
                 preferences.secondary_split_ack_adapter_name = value.to_string();
             }
-            // Merge-conflict resolution policy. Constrain to the known
-            // slugs; anything else keeps the default ("union").
             "merge_conflict_policy" => {
-                if matches!(value, "union" | "file-wins" | "service-wins") {
-                    preferences.merge_conflict_policy = value.to_string();
-                }
+                preferences.merge_conflict_policy = allowed_slug_or(
+                    value,
+                    &MERGE_CONFLICT_POLICIES,
+                    &preferences.merge_conflict_policy,
+                );
             }
             // Device-local mirrors of per-SID policy toggles. Missing keys
             // fall through to the struct defaults.
@@ -1641,9 +1748,8 @@ fn parse_preferences(content: &str) -> UiPreferences {
                 }
             }
             "route_pending_offline_json" => {
-                if is_plausible_pending_offline_json(value) {
-                    preferences.route_pending_offline_json = value.to_string();
-                }
+                preferences.route_pending_offline_json =
+                    storable_json_blob_or_empty(key, value.to_string());
             }
             "allow_saving_into_bundled_presets" => {
                 if let Some(parsed) = parse_bool(value) {
@@ -1656,27 +1762,44 @@ fn parse_preferences(content: &str) -> UiPreferences {
                 }
             }
             "cache_table_column_widths" => {
-                if is_plausible_pending_offline_json(value) {
-                    preferences.cache_table_column_widths = value.to_string();
-                }
+                preferences.cache_table_column_widths =
+                    storable_json_blob_or_empty(key, value.to_string());
             }
             // Last-known service-owned values, mirrored for display while the
             // service is stopped. Same opaque single-line-object gate as the
             // two blobs above.
             "service_backed_mirror_json" => {
-                if is_plausible_pending_offline_json(value) {
-                    preferences.service_backed_mirror_json = value.to_string();
-                }
+                preferences.service_backed_mirror_json =
+                    storable_json_blob_or_empty(key, value.to_string());
             }
             // What the user decided the service-owned settings should be.
             // Same opaque single-line-object gate as the mirror above.
             "service_intent_json" => {
-                if is_plausible_pending_offline_json(value) {
-                    preferences.service_intent_json = value.to_string();
+                preferences.service_intent_json =
+                    storable_json_blob_or_empty(key, value.to_string());
+            }
+            // A key this build has none for. From a NEWER file it is a setting
+            // the user made in a build that has one, so it is kept verbatim and
+            // written back; from a file of our own version it is the residue of
+            // a key we removed, and dropping it is how the file shrinks.
+            _ => {
+                if newer_schema.is_some() {
+                    preferences
+                        .forward_compat
+                        .unknown_lines
+                        .push(line.to_string());
                 }
             }
-            _ => {}
         }
+    }
+
+    // A file that named a language but no labels was written before the labels
+    // existed; deriving them from the system language then hands a Russian-UI
+    // user "Primary"/"Secondary".
+    if language_seen && !labels_seen {
+        let (primary, secondary) = default_route_labels(&preferences.language);
+        preferences.route_primary_label = primary;
+        preferences.route_secondary_label = secondary;
     }
 
     normalize_theme_preferences(&mut preferences);
@@ -1686,17 +1809,38 @@ fn parse_preferences(content: &str) -> UiPreferences {
 /// Structural sanity gate for the opaque pending-offline JSON blob
 /// (ui-support deliberately has no JSON dependency; the QML
 /// side owns the schema). Accepts an empty string (= none) or a single-line
-/// `{…}` object up to 8 KiB — plenty for every routing field with headroom,
-/// small enough that a corrupted preferences file cannot balloon memory.
+/// `{…}` object up to [`MAX_STORED_JSON_BLOB_BYTES`] — plenty for every routing
+/// field with headroom, small enough that a corrupted preferences file cannot
+/// balloon memory. Public because the QML payload path applies the SAME gate on
+/// the way in: five hand-copied versions of it lived here and in `ui_surface`,
+/// and one threshold drifting apart from the rest loses a blob silently.
 /// Rejects any embedded newline (L3 review-fix): the value lives on ONE
 /// `key=value` line, so a `\n`/`\r` would split it into bogus extra lines on
 /// the next read — reject rather than corrupt the line-oriented file.
-fn is_plausible_pending_offline_json(value: &str) -> bool {
+pub fn is_storable_json_blob(value: &str) -> bool {
     value.is_empty()
-        || (value.len() <= 8 * 1024
+        || (value.len() <= MAX_STORED_JSON_BLOB_BYTES
             && value.starts_with('{')
             && value.ends_with('}')
             && !value.contains(['\n', '\r']))
+}
+
+/// A blob that passes [`is_storable_json_blob`], or `""` plus a diagnostic.
+///
+/// Both sides of the round-trip reduce a rejected blob to "none", and both used
+/// to do it silently — so `service_intent_json`, the only record of what the
+/// user decided, could evaporate in exactly the way the field exists to
+/// prevent. `field` names the key so the line is actionable.
+pub fn storable_json_blob_or_empty(field: &str, value: String) -> String {
+    if is_storable_json_blob(&value) {
+        return value;
+    }
+    eprintln!(
+        "nrr: dropping {field} ({} bytes): not a single-line JSON object within \
+         {MAX_STORED_JSON_BLOB_BYTES} bytes",
+        value.len()
+    );
+    String::new()
 }
 
 fn normalize_theme_preferences(preferences: &mut UiPreferences) {
@@ -1711,14 +1855,28 @@ fn normalize_theme_preferences(preferences: &mut UiPreferences) {
     preferences.accessibility_high_contrast = preferences.theme_mode == ThemeMode::HighContrast;
 }
 
-// `format_preferences` continues to write the legacy policy-affecting
-// fields. After `cleanup_legacy_policy_fields` zeroes them, the persisted
-// file carries only default values for those keys; older readers (if any
-// survive) parse them as defaults without misbehaviour. Removing the keys
-// from disk is a future concern.
-#[allow(deprecated)]
+/// Renders one preference value so it cannot become two lines.
+///
+/// The file is `key=value` per line and the parser splits on the first `=`, so
+/// a value carrying a newline used to write a SECOND, forged pair — a label of
+/// `Main` plus a newline plus `first_run_completed=false` restarted the setup
+/// wizard on the next launch. The reader rejected such values on some paths;
+/// the writer accepted every one of them. A preset directory whose name
+/// contains a newline is perfectly legal on Linux, so this is not hypothetical.
+///
+/// Control characters are replaced rather than dropped: what the user typed
+/// stays recognisable, and the file stays parseable.
+fn one_line(value: &impl std::fmt::Display) -> String {
+    let rendered = value.to_string();
+    if rendered.contains(['\r', '\n']) {
+        rendered.replace(['\r', '\n'], " ")
+    } else {
+        rendered
+    }
+}
+
 fn format_preferences(preferences: &UiPreferences) -> String {
-    format!(
+    let mut rendered = format!(
         concat!(
             "# NetRuleRouter managed UI preferences\n",
             "schema_version={}\n",
@@ -1815,42 +1973,42 @@ fn format_preferences(preferences: &UiPreferences) -> String {
             "hide_block_notice_addresses={}\n",
             "tray_notice_opacity_percent={}\n"
         ),
-        CURRENT_UI_PREFS_SCHEMA_VERSION,
-        preferences.launch_window_on_startup,
-        preferences.minimize_to_tray_instead_of_close,
-        preferences.show_notifications,
-        preferences.notify_suggestion_changes,
-        preferences.reopen_last_section_on_startup,
-        preferences.first_run_completed,
-        preferences.accepted_eula_version,
-        preferences.theme_mode,
-        preferences.accessibility_high_contrast,
-        preferences.accessibility_ui_font_scale_percent,
-        preferences.accessibility_system_font,
-        preferences.accessibility_enhanced_focus_indicator,
-        preferences.accessibility_simplified_labels,
-        preferences.tooltips_enabled,
-        preferences.language,
-        preferences.route_primary_label,
-        preferences.route_secondary_label,
-        preferences.show_bluetooth_adapters,
-        preferences.show_audit_tab,
-        preferences.admin_auto_revoke_disabled,
-        preferences.admin_auto_revoke_minutes,
-        preferences.settings_autosave_secs,
-        preferences.allow_mode_a_killswitch,
-        preferences.routing_detailed_mode,
-        preferences.show_remembered_adapters,
-        preferences.selected_primary_interface_id,
-        preferences.selected_primary_interface_name,
-        preferences.primary_role_user_confirmed,
-        preferences.selected_secondary_interface_id,
-        preferences.selected_secondary_interface_name,
-        preferences.secondary_role_user_confirmed,
-        preferences.route_behavior_mode,
-        preferences.last_opened_section,
-        preferences.rules_view_sort,
-        preferences.rules_file_change_behavior,
+        preferences.forward_compat.schema_stamp(),
+        one_line(&preferences.launch_window_on_startup),
+        one_line(&preferences.minimize_to_tray_instead_of_close),
+        one_line(&preferences.show_notifications),
+        one_line(&preferences.notify_suggestion_changes),
+        one_line(&preferences.reopen_last_section_on_startup),
+        one_line(&preferences.first_run_completed),
+        one_line(&preferences.accepted_eula_version),
+        one_line(&preferences.theme_mode),
+        one_line(&preferences.accessibility_high_contrast),
+        one_line(&preferences.accessibility_ui_font_scale_percent),
+        one_line(&preferences.accessibility_system_font),
+        one_line(&preferences.accessibility_enhanced_focus_indicator),
+        one_line(&preferences.accessibility_simplified_labels),
+        one_line(&preferences.tooltips_enabled),
+        one_line(&preferences.language),
+        one_line(&preferences.route_primary_label),
+        one_line(&preferences.route_secondary_label),
+        one_line(&preferences.show_bluetooth_adapters),
+        one_line(&preferences.show_audit_tab),
+        one_line(&preferences.admin_auto_revoke_disabled),
+        one_line(&preferences.admin_auto_revoke_minutes),
+        one_line(&preferences.settings_autosave_secs),
+        one_line(&preferences.allow_mode_a_killswitch),
+        one_line(&preferences.routing_detailed_mode),
+        one_line(&preferences.show_remembered_adapters),
+        one_line(&preferences.selected_primary_interface_id),
+        one_line(&preferences.selected_primary_interface_name),
+        one_line(&preferences.primary_role_user_confirmed),
+        one_line(&preferences.selected_secondary_interface_id),
+        one_line(&preferences.selected_secondary_interface_name),
+        one_line(&preferences.secondary_role_user_confirmed),
+        one_line(&preferences.route_behavior_mode),
+        one_line(&preferences.last_opened_section),
+        one_line(&preferences.rules_view_sort),
+        one_line(&preferences.rules_file_change_behavior),
         optional_string_field(&preferences.last_saved_path_primary),
         optional_string_field(&preferences.last_saved_path_secondary),
         optional_string_field(&preferences.auto_open_on_launch_path_primary),
@@ -1860,55 +2018,61 @@ fn format_preferences(preferences: &UiPreferences) -> String {
         optional_string_field(&preferences.last_file_synced_hash_primary),
         optional_string_field(&preferences.last_file_synced_hash_secondary),
         optional_i64_field(preferences.service_install_uac_declined_at_epoch),
-        preferences.service_install_uac_declined_count,
-        preferences.service_install_prompt_suppressed,
-        preferences.auto_load_rules_on_launch,
-        preferences.export_include_comments,
-        preferences.import_only_active,
-        preferences.compat_banner_mode,
-        preferences.update_page_url,
-        preferences.show_bundled_presets,
-        preferences.user_presets_dir,
-        preferences.selected_preset_set,
-        preferences.merge_conflict_policy,
-        preferences.auto_confirm_adapter_id_change,
-        preferences.warn_kill_switch_block_all,
-        preferences.kill_switch_banner_acknowledged,
-        preferences.missing_secondary_banner_acknowledged,
-        preferences.traffic_stats_period,
-        preferences.traffic_export_unit,
-        preferences.diagnostics_archive_redaction_level,
-        preferences.diagnostics_archive_session_only,
-        preferences.archive_log_budget_mib,
-        preferences.secondary_split_ack_adapter_name,
-        preferences.route_include_subdomains,
-        preferences.route_shared_ip_policy,
-        preferences.route_kill_switch_block_all,
-        preferences.route_kill_switch_fail_closed,
-        preferences.route_kill_switch_protocols,
-        preferences.route_kill_switch_enabled,
-        preferences.route_allow_dns_over_primary,
-        preferences.route_mode_a_coverage_strategy,
-        preferences.route_resolve_hosts_bypass,
-        preferences.route_enforcement_mode,
-        preferences.route_liveness_window_secs,
-        preferences.route_pending_offline_json,
-        preferences.allow_saving_into_bundled_presets,
-        preferences.rules_folder_suggestion_dismissed,
-        preferences.cache_table_column_widths,
-        preferences.service_backed_mirror_json,
-        preferences.service_intent_json,
-        preferences.unenforced_apps_ack_signature,
-        preferences.rules_overlap_keep_signature,
-        preferences.confirmed_vpn_exe_path,
-        preferences.confirmed_vpn_exe_paths,
+        one_line(&preferences.service_install_uac_declined_count),
+        one_line(&preferences.service_install_prompt_suppressed),
+        one_line(&preferences.auto_load_rules_on_launch),
+        one_line(&preferences.export_include_comments),
+        one_line(&preferences.import_only_active),
+        one_line(&preferences.compat_banner_mode),
+        one_line(&preferences.update_page_url),
+        one_line(&preferences.show_bundled_presets),
+        one_line(&preferences.user_presets_dir),
+        one_line(&preferences.selected_preset_set),
+        one_line(&preferences.merge_conflict_policy),
+        one_line(&preferences.auto_confirm_adapter_id_change),
+        one_line(&preferences.warn_kill_switch_block_all),
+        one_line(&preferences.kill_switch_banner_acknowledged),
+        one_line(&preferences.missing_secondary_banner_acknowledged),
+        one_line(&preferences.traffic_stats_period),
+        one_line(&preferences.traffic_export_unit),
+        one_line(&preferences.diagnostics_archive_redaction_level),
+        one_line(&preferences.diagnostics_archive_session_only),
+        one_line(&preferences.archive_log_budget_mib),
+        one_line(&preferences.secondary_split_ack_adapter_name),
+        one_line(&preferences.route_include_subdomains),
+        one_line(&preferences.route_shared_ip_policy),
+        one_line(&preferences.route_kill_switch_block_all),
+        one_line(&preferences.route_kill_switch_fail_closed),
+        one_line(&preferences.route_kill_switch_protocols),
+        one_line(&preferences.route_kill_switch_enabled),
+        one_line(&preferences.route_allow_dns_over_primary),
+        one_line(&preferences.route_mode_a_coverage_strategy),
+        one_line(&preferences.route_resolve_hosts_bypass),
+        one_line(&preferences.route_enforcement_mode),
+        one_line(&preferences.route_liveness_window_secs),
+        one_line(&preferences.route_pending_offline_json),
+        one_line(&preferences.allow_saving_into_bundled_presets),
+        one_line(&preferences.rules_folder_suggestion_dismissed),
+        one_line(&preferences.cache_table_column_widths),
+        one_line(&preferences.service_backed_mirror_json),
+        one_line(&preferences.service_intent_json),
+        one_line(&preferences.unenforced_apps_ack_signature),
+        one_line(&preferences.rules_overlap_keep_signature),
+        one_line(&preferences.confirmed_vpn_exe_path),
+        one_line(&preferences.confirmed_vpn_exe_paths),
         optional_string_field(&preferences.last_loaded_path_primary),
         optional_string_field(&preferences.last_loaded_path_secondary),
-        preferences.notify_block_notices,
-        preferences.notify_rule_duplicates,
-        preferences.hide_block_notice_addresses,
+        one_line(&preferences.notify_block_notices),
+        one_line(&preferences.notify_rule_duplicates),
+        one_line(&preferences.hide_block_notice_addresses),
         preferences.tray_notice_opacity_percent
-    )
+    );
+
+    for line in &preferences.forward_compat.unknown_lines {
+        rendered.push_str(&one_line(line));
+        rendered.push('\n');
+    }
+    rendered
 }
 
 /// Format an `Option<i64>` for the preferences file. `None` → empty
@@ -1982,29 +2146,6 @@ fn parse_font_scale_percent(value: &str) -> Option<u16> {
     }
 }
 
-/// Reset the eight policy-affecting fields that were migrated into
-/// service-owned per-SID storage. After this call every legacy policy
-/// field on `prefs` matches `Default::default()`, so a subsequent
-/// `format_preferences` produces a file without stale data (or,
-/// equivalently, with zero/empty values that older readers parse as
-/// defaults).
-///
-/// The launcher's GUI migration flow calls this **after** a successful
-/// `RoutePolicyUpdate` + `MigrationMarkComplete` round-trip. Idempotent:
-/// calling it on already-cleaned-up preferences is a no-op.
-///
-/// The eight fields covered:
-/// 1. `selected_primary_interface_id`
-/// 2. `selected_primary_interface_name`
-/// 3. `primary_role_user_confirmed`
-/// 4. `selected_secondary_interface_id`
-/// 5. `selected_secondary_interface_name`
-/// 6. `secondary_role_user_confirmed`
-/// 7. `route_behavior_mode`
-///
-/// Non-policy UI preferences (theme, language, fonts, route labels,
-/// section selections, rules-view filters, …) are **not** touched.
-#[allow(deprecated)]
 /// Drop parked offline intents the user made more than
 /// [`PARKED_INTENT_TTL_SECONDS`] ago.
 ///
@@ -2027,38 +2168,51 @@ fn unix_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn cleanup_legacy_policy_fields(prefs: &mut UiPreferences) {
-    prefs.selected_primary_interface_id = String::new();
-    prefs.selected_primary_interface_name = String::new();
-    prefs.primary_role_user_confirmed = false;
-    prefs.selected_secondary_interface_id = String::new();
-    prefs.selected_secondary_interface_name = String::new();
-    prefs.secondary_role_user_confirmed = false;
-    prefs.route_behavior_mode = RouteBehaviorMode::default_when_secondary_unbound();
-}
-
-/// Snapshot of the seven legacy policy-affecting fields, used by the
-/// launcher migration flow to decide whether the user has any
-/// pre-16.8 data worth migrating before running cleanup.
-///
-/// Returns `true` if **any** of the seven fields is set to a non-default
-/// value — i.e. the user previously configured route bindings, behavior
-/// mode, or the secondary-block flag through the legacy GUI path.
-#[allow(deprecated)]
-pub fn has_legacy_policy_fields(prefs: &UiPreferences) -> bool {
-    !prefs.selected_primary_interface_id.is_empty()
-        || !prefs.selected_primary_interface_name.is_empty()
-        || prefs.primary_role_user_confirmed
-        || !prefs.selected_secondary_interface_id.is_empty()
-        || !prefs.selected_secondary_interface_name.is_empty()
-        || prefs.secondary_role_user_confirmed
-        || prefs.route_behavior_mode != RouteBehaviorMode::default_when_secondary_unbound()
-}
-
 #[cfg(test)]
-#[allow(deprecated)] // Tests exercise the legacy policy fields directly;
-                     // new readers should use IPC SnapshotInitial.routePolicy.
 mod tests {
+
+    /// Three copies of this default disagreed: the wire said `resolver`, the
+    /// field doc said `reactive`, and the QML mirror normalised a MISSING value
+    /// to `reactive` — a mode the code itself calls an unsupported historical
+    /// fallback, saved by the next `emitPrefs()`. The mirror derives it now;
+    /// this is the test that keeps the two from drifting apart again.
+    #[test]
+    fn the_enforcement_mode_mirror_starts_at_the_wire_default() {
+        assert_eq!(
+            UiPreferences::default().route_enforcement_mode,
+            nrr_shared::ipc_payloads::ENFORCEMENT_MODE_DEFAULT,
+        );
+    }
+
+    /// The writer used to accept what the reader refuses. A value with a
+    /// newline wrote a second `key=value` pair, and the next load read it as a
+    /// setting the user never touched — the wizard flag being the loudest one.
+    #[test]
+    fn a_value_with_a_newline_cannot_forge_a_second_setting() {
+        let prefs = UiPreferences {
+            first_run_completed: true,
+            route_primary_label: "Main\nfirst_run_completed=false".to_string(),
+            user_presets_dir: "/home/u/my\rrules".to_string(),
+            ..UiPreferences::default()
+        };
+
+        let rendered = format_preferences(&prefs);
+        let parsed = parse_preferences(&rendered);
+
+        assert!(
+            parsed.first_run_completed,
+            "a label must not be able to rewrite another setting"
+        );
+        assert_eq!(parsed.route_primary_label, "Main first_run_completed=false");
+        assert_eq!(parsed.user_presets_dir, "/home/u/my rules");
+        // Every line the writer produced is still one key and one value.
+        for line in rendered.lines() {
+            assert!(
+                !line.contains(['\r', '\n']),
+                "no stray control character: {line:?}"
+            );
+        }
+    }
 
     /// Out of range must land at the nearest bound, not at the default — and
     /// the default here is the MAXIMUM, so rejecting `20` ("nearly
@@ -2103,10 +2257,12 @@ mod tests {
         }
     }
     use super::{
-        check_schema_version_compat, cleanup_legacy_policy_fields, has_legacy_policy_fields,
-        parse_preferences, preferred_available_language, without_expired_parked_intents,
-        SystemFontFamily, UiPreferences, UiPreferencesStore, CURRENT_UI_PREFS_SCHEMA_VERSION,
-        LEGACY_PREFERENCES_FILE_NAMES, STABLE_PREFERENCES_FILE_NAME,
+        declared_schema_version, format_preferences, parse_preferences,
+        preferred_available_language, without_expired_parked_intents, ForwardCompat,
+        SystemFontFamily, UiPreferences, UiPreferencesStore, ADMIN_AUTO_REVOKE_MAX_MINUTES,
+        ADMIN_AUTO_REVOKE_MIN_MINUTES, CURRENT_UI_PREFS_SCHEMA_VERSION,
+        LEGACY_PREFERENCES_FILE_NAMES, MAX_STORED_JSON_BLOB_BYTES, MAX_STORED_STRING_BYTES,
+        SETTINGS_AUTOSAVE_MIN_SECS, STABLE_PREFERENCES_FILE_NAME,
     };
     use nrr_shared::{
         AppSection, RouteBehaviorMode, RulesEnabledFilter, RulesFileChangeBehavior,
@@ -2374,6 +2530,7 @@ mod tests {
             // Non-default value so the round-trip proves the merge-conflict
             // policy persists.
             merge_conflict_policy: "service-wins".to_string(),
+            forward_compat: ForwardCompat::default(),
             // Non-default value so the round-trip proves the VPN-split
             // banner ack persists.
             secondary_split_ack_adapter_name: "hidemy.name VPN 3.0".to_string(),
@@ -2632,6 +2789,125 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_files_unknown_settings_survive_a_save_by_this_build() {
+        let future = CURRENT_UI_PREFS_SCHEMA_VERSION + 3;
+        let content = format!(
+            "schema_version={future}\ntheme_mode=dark\nsomething_from_the_future=42\n\
+             another_future_key=on\n"
+        );
+
+        let parsed = parse_preferences(&content);
+        assert_eq!(parsed.forward_compat.newer_schema_version, Some(future));
+        assert_eq!(
+            parsed.forward_compat.unknown_lines,
+            vec![
+                "something_from_the_future=42".to_string(),
+                "another_future_key=on".to_string(),
+            ]
+        );
+
+        // Saving must neither drop those settings nor lower the stamp: the next
+        // start of the newer build has to find its own file intact.
+        let rendered = format_preferences(&parsed);
+        assert!(rendered.contains(&format!("schema_version={future}\n")));
+        assert!(rendered.contains("something_from_the_future=42\n"));
+        assert!(rendered.contains("another_future_key=on\n"));
+        assert_eq!(
+            parse_preferences(&rendered).forward_compat,
+            parsed.forward_compat
+        );
+    }
+
+    #[test]
+    fn route_labels_follow_the_chosen_language_not_the_system_one() {
+        // A file from before the labels existed carries `language=` and no
+        // labels. Deriving them from the system language is how a Russian-UI
+        // user ended up with "Primary"/"Secondary".
+        let parsed = parse_preferences("language=ru\ntheme_mode=dark\n");
+        assert_eq!(parsed.route_primary_label, "Основной");
+        assert_eq!(parsed.route_secondary_label, "Дополнительный");
+
+        // Labels the user actually set are never recomputed.
+        let parsed = parse_preferences("language=ru\nroute_primary_label=Дом\n");
+        assert_eq!(parsed.route_primary_label, "Дом");
+    }
+
+    #[test]
+    fn a_language_no_catalog_carries_resolves_instead_of_being_stored() {
+        assert_eq!(parse_preferences("language=zz\n").language, "en");
+        assert_eq!(parse_preferences("language=ru-RU\n").language, "ru");
+    }
+
+    #[test]
+    fn out_of_range_numbers_clamp_and_garbage_keeps_the_current_value() {
+        // Reverting to the default moved a security-relevant timer to a number
+        // nobody chose; the range ends are what the user actually asked for.
+        let parsed = parse_preferences("admin_auto_revoke_minutes=9999\n");
+        assert_eq!(
+            parsed.admin_auto_revoke_minutes,
+            ADMIN_AUTO_REVOKE_MAX_MINUTES
+        );
+        let parsed = parse_preferences("admin_auto_revoke_minutes=0\n");
+        assert_eq!(
+            parsed.admin_auto_revoke_minutes,
+            ADMIN_AUTO_REVOKE_MIN_MINUTES
+        );
+        let parsed = parse_preferences("settings_autosave_secs=1\n");
+        assert_eq!(parsed.settings_autosave_secs, SETTINGS_AUTOSAVE_MIN_SECS);
+
+        // Unparseable is not a value at all — keep what is already there.
+        let parsed = parse_preferences("admin_auto_revoke_minutes=abc\n");
+        assert_eq!(
+            parsed.admin_auto_revoke_minutes,
+            UiPreferences::default().admin_auto_revoke_minutes
+        );
+    }
+
+    #[test]
+    fn a_signature_past_the_ceiling_keeps_the_stored_one() {
+        let oversized = "a".repeat(MAX_STORED_STRING_BYTES + 1);
+        let parsed = parse_preferences(&format!("unenforced_apps_ack_signature={oversized}\n"));
+        // Refused, not truncated: half a signature matches nothing but still
+        // looks like an answer.
+        assert!(parsed.unenforced_apps_ack_signature.is_empty());
+
+        let at_ceiling = "b".repeat(MAX_STORED_STRING_BYTES);
+        let parsed = parse_preferences(&format!("unenforced_apps_ack_signature={at_ceiling}\n"));
+        assert_eq!(parsed.unenforced_apps_ack_signature, at_ceiling);
+    }
+
+    #[test]
+    fn every_stored_blob_passes_the_same_gate() {
+        // The gate lived in five hand-copied places; the risk was one of them
+        // drifting. This pins all four keys to the single declaration.
+        let oversized = format!("{{{}}}", "x".repeat(MAX_STORED_JSON_BLOB_BYTES));
+        let content = format!(
+            "route_pending_offline_json={{\"a\":1}}\n\
+             cache_table_column_widths=not-an-object\n\
+             service_backed_mirror_json={oversized}\n\
+             service_intent_json={{\"mode\":\"resolver\"}}\n"
+        );
+        let parsed = parse_preferences(&content);
+
+        assert_eq!(parsed.route_pending_offline_json, "{\"a\":1}");
+        assert_eq!(parsed.service_intent_json, "{\"mode\":\"resolver\"}");
+        assert!(parsed.cache_table_column_widths.is_empty());
+        assert!(parsed.service_backed_mirror_json.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_current_file_is_dropped_not_carried() {
+        // Negative control for the carry above: at our own version an unknown
+        // key is the residue of a key we removed, and it must not live forever.
+        let content = format!(
+            "schema_version={CURRENT_UI_PREFS_SCHEMA_VERSION}\ntheme_mode=dark\nretired_key=1\n"
+        );
+        let parsed = parse_preferences(&content);
+        assert_eq!(parsed.forward_compat, ForwardCompat::default());
+        assert!(!format_preferences(&parsed).contains("retired_key"));
+    }
+
+    #[test]
     fn schema_version_written_on_save_is_parsed_without_panic() {
         // Verify that a freshly saved file has schema_version and loads back cleanly.
         let (_dir, path) = test_path("schema-version-roundtrip.conf");
@@ -2647,8 +2923,11 @@ mod tests {
             content.contains(&expected_version),
             "saved file must contain {expected_version}; got:\n{content}"
         );
-        // No panic and no version warning for a known version.
-        check_schema_version_compat(&content);
+        // A file of our own version carries nothing forward.
+        assert_eq!(
+            parse_preferences(&content).forward_compat,
+            ForwardCompat::default()
+        );
         // `_dir` drops here, removing the scratch directory and the conf file
         // together — no manual `fs::remove_file` needed.
     }
@@ -2799,8 +3078,9 @@ service_install_uac_declined_count=1
         let parsed = parse_preferences("theme_mode=dark\nlanguage=ru\n");
         assert_eq!(parsed.theme_mode, ThemeMode::Dark);
         assert_eq!(parsed.language, "ru");
-        // check_schema_version_compat should not panic on absent key.
-        check_schema_version_compat("theme_mode=dark\nlanguage=ru\n");
+        // An absent key is a legacy v0 file: nothing to carry, no warning.
+        assert!(declared_schema_version("theme_mode=dark\nlanguage=ru\n").is_none());
+        assert_eq!(parsed.forward_compat, ForwardCompat::default());
     }
 
     #[test]
@@ -2904,22 +3184,6 @@ service_install_uac_declined_count=1
             .unwrap_or_else(|error| panic!("failed to create temp dir: {error}"))
     }
 
-    fn populate_legacy_policy_fields(prefs: &mut UiPreferences) {
-        prefs.selected_primary_interface_id = "Wi-Fi".into();
-        prefs.selected_primary_interface_name = "Wireless".into();
-        prefs.primary_role_user_confirmed = true;
-        prefs.selected_secondary_interface_id = "TAP".into();
-        prefs.selected_secondary_interface_name = "OpenVPN TAP".into();
-        prefs.secondary_role_user_confirmed = true;
-        prefs.route_behavior_mode = RouteBehaviorMode::StrictSecondaryFailClosed;
-    }
-
-    #[test]
-    fn has_legacy_policy_fields_returns_false_for_default_preferences() {
-        let prefs = UiPreferences::default();
-        assert!(!has_legacy_policy_fields(&prefs));
-    }
-
     /// A damaged protocol mask used to be masked into meaning: `128 & 0x7F` is
     /// zero, an empty mask makes the codegen emit no filter, and the kill
     /// switch then reads as ON while blocking nothing — and the value is seeded
@@ -2937,65 +3201,6 @@ service_install_uac_declined_count=1
         // A legitimate selection still round-trips.
         let parsed = parse_preferences("route_kill_switch_protocols=5\n");
         assert_eq!(parsed.route_kill_switch_protocols, 5);
-    }
-
-    #[test]
-    fn has_legacy_policy_fields_returns_true_for_each_individually_set_field() {
-        for setter in [
-            (|p: &mut UiPreferences| p.selected_primary_interface_id = "x".into())
-                as fn(&mut UiPreferences),
-            |p| p.selected_primary_interface_name = "x".into(),
-            |p| p.primary_role_user_confirmed = true,
-            |p| p.selected_secondary_interface_id = "x".into(),
-            |p| p.selected_secondary_interface_name = "x".into(),
-            |p| p.secondary_role_user_confirmed = true,
-            |p| p.route_behavior_mode = RouteBehaviorMode::StrictSecondaryFailClosed,
-        ] {
-            let mut prefs = UiPreferences::default();
-            setter(&mut prefs);
-            assert!(
-                has_legacy_policy_fields(&prefs),
-                "setter must trigger legacy detection"
-            );
-        }
-    }
-
-    #[test]
-    fn cleanup_legacy_policy_fields_zeroes_only_eight_policy_fields() {
-        let mut prefs = UiPreferences::default();
-        // Populate every legacy policy field plus a sample of UI-only
-        // fields; the cleanup must zero the former without touching the
-        // latter.
-        populate_legacy_policy_fields(&mut prefs);
-        prefs.theme_mode = ThemeMode::Dark;
-        prefs.language = "ru".into();
-        prefs.route_primary_label = "Прямое".into();
-        prefs.tooltips_enabled = false;
-        prefs.last_opened_section = AppSection::Diagnostics;
-        prefs.rules_view_sort = RulesViewSort::ByMatchValue;
-
-        cleanup_legacy_policy_fields(&mut prefs);
-
-        // Eight fields → defaults.
-        assert!(!has_legacy_policy_fields(&prefs));
-        assert_eq!(prefs.selected_primary_interface_id, "");
-        assert_eq!(prefs.selected_primary_interface_name, "");
-        assert!(!prefs.primary_role_user_confirmed);
-        assert_eq!(prefs.selected_secondary_interface_id, "");
-        assert_eq!(prefs.selected_secondary_interface_name, "");
-        assert!(!prefs.secondary_role_user_confirmed);
-        assert_eq!(
-            prefs.route_behavior_mode,
-            RouteBehaviorMode::default_when_secondary_unbound()
-        );
-
-        // UI-only fields preserved.
-        assert_eq!(prefs.theme_mode, ThemeMode::Dark);
-        assert_eq!(prefs.language, "ru");
-        assert_eq!(prefs.route_primary_label, "Прямое");
-        assert!(!prefs.tooltips_enabled);
-        assert_eq!(prefs.last_opened_section, AppSection::Diagnostics);
-        assert_eq!(prefs.rules_view_sort, RulesViewSort::ByMatchValue);
     }
 
     #[test]
@@ -3018,15 +3223,5 @@ service_install_uac_declined_count=1
             stale.route_pending_offline_json.is_empty(),
             "a week-old 'block everything' must not land on the next connect"
         );
-    }
-
-    #[test]
-    fn cleanup_legacy_policy_fields_is_idempotent() {
-        let mut prefs = UiPreferences::default();
-        populate_legacy_policy_fields(&mut prefs);
-        cleanup_legacy_policy_fields(&mut prefs);
-        let after_first = prefs.clone();
-        cleanup_legacy_policy_fields(&mut prefs);
-        assert_eq!(prefs, after_first);
     }
 }

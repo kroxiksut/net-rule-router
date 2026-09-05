@@ -26,6 +26,11 @@ fn system_theme_port() -> Option<&'static dyn SystemThemePort> {
 pub enum SystemThemeMode {
     Light,
     Dark,
+    /// The OS is in an accessibility high-contrast mode. It outranks the
+    /// light/dark preference rather than sitting beside it: a user who turned
+    /// it on needs the high-contrast palette whichever appearance the same
+    /// system also states.
+    HighContrast,
 }
 
 impl SystemThemeMode {
@@ -33,6 +38,7 @@ impl SystemThemeMode {
         match self {
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::HighContrast => "high-contrast",
         }
     }
 }
@@ -63,6 +69,7 @@ pub fn resolve_theme_with(
         ThemeMode::System => match system_mode {
             SystemThemeMode::Light => ThemeMode::Light,
             SystemThemeMode::Dark => ThemeMode::Dark,
+            SystemThemeMode::HighContrast => ThemeMode::HighContrast,
         },
         ThemeMode::HighContrast => ThemeMode::HighContrast,
     };
@@ -79,6 +86,12 @@ fn detect_system_theme_mode(port: Option<&dyn SystemThemePort>) -> (SystemThemeM
     if let Some(from_env) = parse_system_theme_hint(env::var("NRR_SYSTEM_THEME").ok().as_deref()) {
         return (from_env, true);
     }
+    // Asked first, because it is the answer that matters most and the one the
+    // light/dark question cannot express. `Some(false)` and `None` both fall
+    // through; only a stated "on" short-circuits.
+    if port.and_then(SystemThemePort::high_contrast) == Some(true) {
+        return (SystemThemeMode::HighContrast, true);
+    }
     match port.and_then(SystemThemePort::detect) {
         Some(SystemAppearance::Dark) => (SystemThemeMode::Dark, true),
         Some(SystemAppearance::Light) => (SystemThemeMode::Light, true),
@@ -92,6 +105,7 @@ fn parse_system_theme_hint(value: Option<&str>) -> Option<SystemThemeMode> {
     match value.map(|item| item.trim().to_ascii_lowercase()) {
         Some(value) if value == "dark" => Some(SystemThemeMode::Dark),
         Some(value) if value == "light" => Some(SystemThemeMode::Light),
+        Some(value) if value == "high-contrast" => Some(SystemThemeMode::HighContrast),
         _ => None,
     }
 }
@@ -138,6 +152,9 @@ mod tests {
             fn detect(&self) -> Option<SystemAppearance> {
                 Some(SystemAppearance::Dark)
             }
+            fn high_contrast(&self) -> Option<bool> {
+                Some(false)
+            }
         }
 
         // The env hint short-circuits the probe, so it must be absent here.
@@ -153,6 +170,54 @@ mod tests {
         let dark = super::resolve_theme_with(ThemeMode::System, Some(&AlwaysDark));
         assert_eq!(dark.effective_mode, ThemeMode::Dark);
         assert!(dark.system_mode_detected);
+    }
+
+    /// The OS switch was never read: `SPI_GETHIGHCONTRAST` appears nowhere in
+    /// the repository, and `SystemThemeMode` had only light and dark — so a
+    /// user with high contrast on and the theme set to "system" stayed in the
+    /// ordinary palette, while the accessibility requirement was recorded as
+    /// met.
+    #[test]
+    fn a_high_contrast_system_is_not_answered_with_light_or_dark() {
+        use nrr_platform_api::system_theme::{SystemAppearance, SystemThemePort};
+
+        /// The shape that used to be invisible: high contrast ON while the
+        /// same system also states a light appearance.
+        struct HighContrastAndLight;
+        impl SystemThemePort for HighContrastAndLight {
+            fn detect(&self) -> Option<SystemAppearance> {
+                Some(SystemAppearance::Light)
+            }
+            fn high_contrast(&self) -> Option<bool> {
+                Some(true)
+            }
+        }
+
+        /// A host that cannot answer the question must not be read as "off".
+        struct CannotTell;
+        impl SystemThemePort for CannotTell {
+            fn detect(&self) -> Option<SystemAppearance> {
+                Some(SystemAppearance::Dark)
+            }
+            fn high_contrast(&self) -> Option<bool> {
+                None
+            }
+        }
+
+        std::env::remove_var("NRR_SYSTEM_THEME");
+
+        let hc = super::resolve_theme_with(ThemeMode::System, Some(&HighContrastAndLight));
+        assert_eq!(hc.effective_mode, ThemeMode::HighContrast);
+        assert_eq!(hc.system_mode, SystemThemeMode::HighContrast);
+        assert!(hc.system_mode_detected);
+
+        // An explicit choice still wins over what the system says.
+        let chosen = super::resolve_theme_with(ThemeMode::Dark, Some(&HighContrastAndLight));
+        assert_eq!(chosen.effective_mode, ThemeMode::Dark);
+
+        // "Cannot tell" falls through to the appearance question, unchanged.
+        let unknown = super::resolve_theme_with(ThemeMode::System, Some(&CannotTell));
+        assert_eq!(unknown.effective_mode, ThemeMode::Dark);
     }
 
     #[test]

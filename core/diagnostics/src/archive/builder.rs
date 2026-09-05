@@ -55,6 +55,10 @@ pub struct ArchiveInput {
     /// them only when the section is present, byte-capped by
     /// `request.max_audit_chain_bytes`.
     pub audit_chain_lines: Vec<String>,
+    /// Raw operational-log NDJSON lines (payloads intact), newest-first, as the
+    /// facade scoped them to the requester. `logs.ndjson` is the payload-
+    /// stripped listing; this is the evidence behind it.
+    pub raw_log_lines: Vec<String>,
     pub explain_samples: Vec<ExplainResponse>,
     /// Host system information (OS/CPU/RAM) for `system_info.json`.
     /// `None` writes a minimal record noting it was
@@ -178,6 +182,9 @@ impl ArchiveBuilder {
 /// Writes all requested sections to `dir`.  Returns list of filenames written.
 /// Name of the captured-stderr section inside the archive.
 const SERVICE_STDERR_FILENAME: &str = "nrr_service_stderr.log";
+/// Name of the raw operational-log section: the service's own NDJSON lines,
+/// verbatim, next to the payload-stripped `logs.ndjson` listing.
+const SERVICE_LOGS_RAW_FILENAME: &str = "service-logs.ndjson";
 
 fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<String>> {
     let mut written = Vec::new();
@@ -191,6 +198,26 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
         if write_section(input, dir, section)? {
             written.push(section.filename().to_string());
         }
+    }
+
+    // Also not an `ArchiveSection`: the service's own log lines, verbatim.
+    // `logs.ndjson` above is the payload-stripped listing the GUI shows; these
+    // are the lines as written, which is what a support bundle is read for.
+    // They used to be appended by the launcher reading the log directory off
+    // disk — which is why that directory had to be readable by every account on
+    // the machine, and why one user's bundle carried everyone's lines.
+    if !input.raw_log_lines.is_empty() {
+        let mut content = String::new();
+        for line in &input.raw_log_lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        std::fs::write(dir.join(SERVICE_LOGS_RAW_FILENAME), content).map_err(|e| {
+            DiagnosticsError::ExportFailed {
+                reason: format!("cannot write {SERVICE_LOGS_RAW_FILENAME}: {e}"),
+            }
+        })?;
+        written.push(SERVICE_LOGS_RAW_FILENAME.to_string());
     }
 
     // Not an `ArchiveSection`: it is not a rendering of our own data but a
@@ -705,6 +732,7 @@ mod tests {
                 has_payload_summary: false,
             }],
             audit_chain_lines: Vec::new(),
+            raw_log_lines: Vec::new(),
             explain_samples: Vec::new(),
             system_info: Some(nrr_shared::system_info::SystemInfo {
                 os: "windows".into(),
@@ -1248,6 +1276,7 @@ mod tests {
             dns_servers: "8.8.8.8, 1.1.1.1".into(),
             has_default_route: true,
             has_forwarding_path: Some(true),
+            runtime_data_unavailable: false,
             availability: "available".into(),
             selected_role: None,
             route_state: "not-selected".into(),

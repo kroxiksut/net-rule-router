@@ -154,6 +154,13 @@ pub type AutoRulesEagerDeliveryFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// DB at the composition root.
 pub type RefusingAnchorsFn = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
+/// Reads whether this principal's automatic main-link pass is switched on — i.e.
+/// whether an answer about a third-party host can still arrive. A closure over
+/// the state DB at the composition root. `None` (tests, degraded boot) behaves
+/// as "no pass is coming", which keeps the pre-existing behaviour of asking
+/// immediately.
+pub type MainLinkPassEnabledFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Reads whether a principal's additional route resolves to a usable adapter
 /// right now. A closure over the route coordinator at the composition root, so
 /// this module never learns what an adapter binding is.
@@ -424,6 +431,9 @@ pub struct AutoRulesEngine {
     /// Sites the user says refuse main-link addresses (see
     /// [`RefusingAnchorsFn`]). `None` behaves as "none marked".
     refusing_anchors: Option<RefusingAnchorsFn>,
+    /// Is an answer about the main link still coming (see
+    /// [`MainLinkPassEnabledFn`])? `None` behaves as "no", so nothing is held.
+    main_link_pass_enabled: Option<MainLinkPassEnabledFn>,
     /// Durable mirror of the ledgers. A proposal needs two windows, and a
     /// restart used to reset the count to zero — a machine that restarts a few
     /// times a day therefore never reached the second one. `None` (no state DB)
@@ -464,6 +474,7 @@ impl AutoRulesEngine {
             isp_block_candidates_enabled: Arc::new(AtomicBool::new(false)),
             secondary_ready: None,
             refusing_anchors: None,
+            main_link_pass_enabled: None,
             evidence_store: None,
             evidence_saved_at: Mutex::new(HashMap::new()),
         }
@@ -563,6 +574,13 @@ impl AutoRulesEngine {
     #[must_use]
     pub fn with_isp_block_candidates_flag(mut self, flag: Arc<AtomicBool>) -> Self {
         self.isp_block_candidates_enabled = flag;
+        self
+    }
+
+    /// Attach the reader for [`Self::main_link_pass_enabled`].
+    #[must_use]
+    pub fn with_main_link_pass_enabled(mut self, enabled: MainLinkPassEnabledFn) -> Self {
+        self.main_link_pass_enabled = Some(enabled);
         self
     }
 
@@ -754,6 +772,8 @@ impl AutoRulesEngine {
                 consumers_changed_unix_ms: 0,
                 primary_behavior: String::new(),
                 anchor_refuses_main_link: false,
+                // The block page named this host itself; nothing else was seen.
+                observed_members: Vec::new(),
             },
             route: RouteRole::Secondary,
             match_kind: AuthoredMatchKind::SuffixDomain,
@@ -1037,16 +1057,24 @@ impl AutoRulesEngine {
             .as_ref()
             .map(|read| read(sid))
             .unwrap_or_default();
-        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) = offered
-            .into_iter()
-            .partition(|c| !settled_by_the_main_link(&c.dto) || refusing.contains(&c.dto.anchor));
+        let pass_can_answer = self
+            .main_link_pass_enabled
+            .as_ref()
+            .map(|read| read(sid))
+            .unwrap_or(false);
+        let (worth_a_popup, settled): (Vec<PendingCandidate>, Vec<PendingCandidate>) =
+            offered.into_iter().partition(|c| {
+                refusing.contains(&c.dto.anchor)
+                    || (!settled_by_the_main_link(&c.dto)
+                        && !awaiting_the_main_link(&c.dto, pass_can_answer))
+            });
         if !settled.is_empty() {
             tracing::debug!(
                 target: "nrr::auto-rules",
                 sid = %sid,
                 held_back = settled.len(),
                 sample = %preview(&settled),
-                "suggestions kept out of the tray — a nearby third-party host that already answers on the main route",
+                "suggestions kept out of the tray — a nearby third-party host that answers on the main route, or one the main-link pass has not answered for yet",
             );
         }
         if worth_a_popup.is_empty() {
@@ -1843,6 +1871,7 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
             // Stamped when the list is served: the mark is the user's, lives in
             // the state DB, and can change without the evidence changing.
             anchor_refuses_main_link: false,
+            observed_members: proposal.observed_members.clone(),
         },
         route: proposal.route,
         match_kind: AuthoredMatchKind::SuffixDomain,
@@ -1908,6 +1937,31 @@ fn signal_slug(signal: CompanionSignal) -> &'static str {
 /// ask, and the answer path decides whether to keep the host on the main link.
 /// A candidate that is not worth asking about must not silently re-route
 /// traffic either.
+/// Is this candidate still waiting for the main link's answer?
+///
+/// [`settled_by_the_main_link`] one step earlier. A third party on the delivery
+/// or co-activity tier is only worth a question once we know the main link
+/// cannot serve it — and until the pass has run, `primary_behavior` is empty,
+/// which reads exactly like "unreachable". That is how a shared CDN reached the
+/// offer list: not because anything measured it as broken, but because nothing
+/// measured it at all.
+///
+/// Held only while an answer can still arrive. With the automatic pass switched
+/// off there is nothing to wait for, and holding the question forever would
+/// retire the feature behind the user's back.
+fn awaiting_the_main_link(dto: &AutoRuleCandidateDto, pass_can_answer: bool) -> bool {
+    if !pass_can_answer || !dto.primary_behavior.is_empty() {
+        return false;
+    }
+    if !matches!(
+        dto.signal.as_str(),
+        AUTO_RULE_SIGNAL_CO_ACTIVITY | AUTO_RULE_SIGNAL_DELIVERY_NAME
+    ) {
+        return false;
+    }
+    !shares_registrable_domain(&dto.anchor, &dto.proposed_match)
+}
+
 fn settled_by_the_main_link(dto: &AutoRuleCandidateDto) -> bool {
     if dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS {
         return false;

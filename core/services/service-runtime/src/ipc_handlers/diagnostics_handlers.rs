@@ -23,7 +23,9 @@
 //! Builds a zip archive via `nrr_diagnostics::archive::ArchiveBuilder`
 //! using data collected from the facade (health snapshot, log + audit
 //! pages). Writes the result to the per-user `archives/` directory
-//! (sibling of `logs/` and `audit/`, inherits the same Users:RX ACL).
+//! (sibling of `logs/` and `audit/`, closed to ordinary users like the rest
+//! of the tree — the finished file is then handed to its requester through
+//! `FileHandoffPort`).
 //! Returns the absolute path so the GUI can open the containing folder
 //! in Explorer.
 
@@ -72,6 +74,7 @@ pub type ConnTraceExpectation = (
     ActiveSidFn,
 );
 
+use crate::ipc::DiagnosticsAudience;
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
@@ -963,8 +966,8 @@ const MAX_EXPLAIN_SAMPLES: usize = 20;
 pub struct DiagnosticsExportArchiveHandler {
     diagnostics: Arc<dyn DiagnosticsFacade>,
     /// Per-user destination directory for the zip archives. Sibling
-    /// of `logs/` and `audit/`; inherits the Users:RX ACL set up by
-    /// the bootstrap.
+    /// of `logs/` and `audit/`, and closed to ordinary users like the rest of
+    /// the tree; `file_handoff` opens the finished file to its requester.
     archives_dir: PathBuf,
     /// App version string baked into the archive manifest.
     app_version: String,
@@ -981,6 +984,10 @@ pub struct DiagnosticsExportArchiveHandler {
     /// root. `None` when the state DB connection was unavailable at startup
     /// (degraded boot).
     state_schema_version: Option<u32>,
+    /// Grants the requesting principal read on the archive that was just
+    /// written. The service's own tree is closed to ordinary users, so without
+    /// this the export is a file its requester cannot open.
+    file_handoff: Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>,
 }
 
 impl DiagnosticsExportArchiveHandler {
@@ -993,6 +1000,7 @@ impl DiagnosticsExportArchiveHandler {
         adapters: Arc<dyn AdaptersSnapshotProvider>,
         route_policy: Arc<dyn RoutePolicyProvider>,
         state_schema_version: Option<u32>,
+        file_handoff: Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>,
     ) -> Self {
         Self {
             diagnostics,
@@ -1002,6 +1010,7 @@ impl DiagnosticsExportArchiveHandler {
             adapters,
             route_policy,
             state_schema_version,
+            file_handoff,
         }
     }
 
@@ -1021,11 +1030,12 @@ impl DiagnosticsExportArchiveHandler {
     /// the freshest [`MAX_PAGE_SIZE`] entries, so sampling stays on the most
     /// recent decisions rather than the stalest ones in the store. Never
     /// fails the caller — an unreadable log store yields an empty list.
-    fn recent_decision_ids(&self, limit: usize) -> Vec<String> {
-        let entries = match self
-            .diagnostics
-            .recent_log_entries(&Default::default(), MAX_PAGE_SIZE as usize)
-        {
+    fn recent_decision_ids(&self, limit: usize, audience: &DiagnosticsAudience) -> Vec<String> {
+        let entries = match self.diagnostics.recent_log_entries(
+            &Default::default(),
+            MAX_PAGE_SIZE as usize,
+            audience,
+        ) {
             Ok(items) => items,
             Err(e) => {
                 tracing::warn!(
@@ -1064,8 +1074,9 @@ impl DiagnosticsExportArchiveHandler {
         &self,
         level: ExplainDetailLevel,
         caller_sid: &str,
+        audience: &DiagnosticsAudience,
     ) -> Vec<ExplainResponse> {
-        self.recent_decision_ids(MAX_EXPLAIN_SAMPLES)
+        self.recent_decision_ids(MAX_EXPLAIN_SAMPLES, audience)
             .into_iter()
             .filter_map(|decision_id| {
                 let query = ExplainQuery::HistoricalDecision {
@@ -1205,11 +1216,16 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // stalest lines and the byte budget in the builder goes unused.
         // `recent_log_entries` returns newest-first; the builder then trims
         // to `max_log_bytes`.
+        // The archive answers to the same audience as the panels: an export is
+        // not a way around the scoping, and the person exporting it is usually
+        // about to send it to somebody else.
+        let audience = ctx.diagnostics_audience();
         let log_entries = if req.include_logs {
             self.diagnostics
                 .recent_log_entries(
                     &Default::default(),
                     archive_request.max_log_entries as usize,
+                    &audience,
                 )
                 .map_err(|e| internal(OP, format!("recent_log_entries: {e}")))?
         } else {
@@ -1224,7 +1240,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
                 page_size: MAX_PAGE_SIZE,
             };
             self.diagnostics
-                .list_audit_entries(&Default::default(), &audit_page)
+                .list_audit_entries(&Default::default(), &audit_page, &audience)
                 .map_err(|e| internal(OP, format!("list_audit_entries: {e}")))?
                 .items
         } else {
@@ -1234,7 +1250,15 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // diagnostics-tier export, where raw payload_summary_json is permitted.
         // `AuditChain` is in the diagnostics_export section set but NOT the
         // default set, so the redaction gate and the section gate agree.
-        let audit_chain_lines = if wants_diagnostics_detail && req.include_audit_summary {
+        // The RAW chain is machine-wide by construction: its value is that the
+        // hashes link every event, and a subset cannot be verified. So it ships
+        // only for a caller who may see the whole trail; everyone else gets the
+        // scoped summary above and no chain, rather than a chain that would
+        // fail its own verification.
+        let audit_chain_lines = if wants_diagnostics_detail
+            && req.include_audit_summary
+            && audience.is_machine_wide()
+        {
             self.diagnostics
                 .recent_audit_chain_lines(archive_request.max_audit_chain_bytes as usize)
                 .map_err(|e| internal(OP, format!("recent_audit_chain_lines: {e}")))?
@@ -1251,7 +1275,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             ExplainDetailLevel::CompactUi
         };
         let explain_samples = if wants_diagnostics_detail {
-            self.collect_explain_samples(explain_level, caller_sid)
+            self.collect_explain_samples(explain_level, caller_sid, &audience)
         } else {
             Vec::new()
         };
@@ -1264,6 +1288,28 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // sub-second millis, made unique against an existing file (two exports
         // in the same millisecond get a numeric suffix). The version in the
         // name lets a triager tell builds apart before even opening the zip.
+        // The lines as written, scoped like everything else. `logs.ndjson` is
+        // the payload-stripped listing; this is the evidence behind it, and it
+        // is why the log directory no longer has to be readable by every
+        // account on the machine.
+        // The user's own cap on this section. `0` means UNLIMITED, which is
+        // what the preference has always promised ("every log file inside the
+        // export's time window is attached whole") and NOT what this did: it
+        // substituted the 5 MiB default of the redacted listing, so a seven-hour
+        // session with 44 MB of logs reached the triager as its last 47 minutes.
+        // The real bound is retention (operational logs are capped at 50 MB) and
+        // the export's own window, which defaults to this session only.
+        let raw_log_budget = match req.raw_log_budget_bytes {
+            Some(bytes) if bytes > 0 => bytes as usize,
+            _ => usize::MAX,
+        };
+        let raw_log_lines = if req.include_logs {
+            self.diagnostics
+                .recent_log_lines_raw(raw_log_budget, effective_logs_from_ms, &audience)
+                .map_err(|e| internal(OP, format!("recent_log_lines_raw: {e}")))?
+        } else {
+            Vec::new()
+        };
         let dest_path = unique_archive_path(&self.archives_dir, &self.app_version, now_ms);
 
         let input = ArchiveInput {
@@ -1272,6 +1318,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             log_entries,
             audit_entries,
             audit_chain_lines,
+            raw_log_lines,
             explain_samples,
             system_info: self.system_info.clone(),
             service_stderr: self.read_service_stderr(),
@@ -1279,6 +1326,27 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         };
         let result = ArchiveBuilder::build(input, &dest_path)
             .map_err(|e| internal(OP, format!("archive build: {e}")))?;
+
+        // Hand the finished file to the caller. The service tree is closed to
+        // ordinary users — deliberately, it holds every principal's rules and
+        // the audit trail — so without this the archive the user just asked for
+        // is one they cannot open, and the GUI reports a path that only an
+        // administrator can reach. The grant is per FILE: another principal's
+        // export in the same directory stays theirs.
+        //
+        // Best-effort: an export that succeeded is not failed over the handoff.
+        // The caller finds out by the copy failing, which reports its own
+        // reason, rather than by losing the archive that was already built.
+        let caller = ctx.caller_stored();
+        if !caller.is_empty() {
+            if let Err(e) = self.file_handoff.grant_read(&result.path, caller) {
+                tracing::warn!(
+                    target: "nrr::diagnostics",
+                    error = %e,
+                    "diagnostics.export-archive: could not hand the archive to its requester",
+                );
+            }
+        }
 
         // Retention: the service dir is not
         // user-deletable (ProgramData needs elevation), so without a cap old
@@ -1941,6 +2009,7 @@ mod tests {
             fake_adapters(),
             fake_route_policy(),
             Some(29),
+            Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
         );
         let env = IpcRequestEnvelope {
             protocol_version: 1,
@@ -1968,6 +2037,64 @@ mod tests {
         );
     }
 
+    /// The archive is written into the service's own tree, which ordinary
+    /// accounts cannot read — so the export is only finished when the file has
+    /// been handed to the caller. Without this the GUI reports a path its user
+    /// cannot open, and the failure is silent on both sides.
+    #[test]
+    fn a_finished_archive_is_handed_to_the_caller_that_asked_for_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let alerts: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository> =
+            Arc::new(InMemorySecurityAlertsRepository::new());
+        let logs_dir = temp.path().join("logs");
+        let audit_dir = temp.path().join("audit");
+        let archives_dir = temp.path().join("archives");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        let facade: Arc<dyn DiagnosticsFacade> = Arc::new(
+            crate::production_diagnostics::ProductionDiagnosticsFacade::new(
+                logs_dir.clone(),
+                audit_dir.clone(),
+                None,
+                alerts,
+                None,
+            ),
+        );
+        let handoff = Arc::new(nrr_platform_api::file_handoff::MockFileHandoff::default());
+        let handler = DiagnosticsExportArchiveHandler::new(
+            facade,
+            archives_dir.clone(),
+            "test-1.0.0".into(),
+            None,
+            fake_adapters(),
+            fake_route_policy(),
+            None,
+            Arc::clone(&handoff) as Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>,
+        );
+        let env = IpcRequestEnvelope {
+            protocol_version: 1,
+            request_id: "req-handoff".into(),
+            correlation_id: None,
+            operation: IpcOperationName::DiagnosticsExportArchive,
+            operation_class: IpcOperationClass::DiagnosticAction,
+            confirmation_token: None,
+            payload: serde_json::json!({}),
+        };
+        let v = handler.handle(&env, &ctx()).expect("archive build");
+        let path = v["archive-path"]
+            .as_str()
+            .expect("archive-path")
+            .to_string();
+
+        let grants = handoff.grants.lock().expect("grants");
+        assert_eq!(grants.len(), 1, "exactly one file is handed over");
+        assert_eq!(grants[0].0, std::path::PathBuf::from(&path));
+        assert_eq!(
+            grants[0].1, "S-1-5-21-test",
+            "the grant names the caller, not the service"
+        );
+    }
+
     #[test]
     fn archive_handler_with_no_logs_flag_still_succeeds() {
         let temp = tempfile::tempdir().unwrap();
@@ -1991,6 +2118,7 @@ mod tests {
             fake_adapters(),
             fake_route_policy(),
             None,
+            Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
         );
         let env = IpcRequestEnvelope {
             protocol_version: 1,
@@ -2036,6 +2164,7 @@ mod tests {
             fake_adapters(),
             fake_route_policy(),
             Some(29),
+            Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
         );
         let names_for = |level: serde_json::Value| -> Vec<String> {
             let env = IpcRequestEnvelope {
@@ -2157,6 +2286,7 @@ mod tests {
             adapters,
             route_policy as Arc<dyn RoutePolicyProvider>,
             Some(29),
+            Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
         );
         let env = IpcRequestEnvelope {
             protocol_version: 1,
@@ -2239,6 +2369,7 @@ mod tests {
             fake_adapters(),
             fake_route_policy(),
             None,
+            Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
         );
         let env = IpcRequestEnvelope {
             protocol_version: 1,

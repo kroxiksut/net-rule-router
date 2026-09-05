@@ -826,6 +826,99 @@ function buildFullRoutePolicyReq(cur, modeFallback) {
     return req
 }
 
+// ---- adapter bindings: the service's view against the app's own ----
+
+// The two slots the app and the service each store, and the prefs keys that
+// hold them here. One declaration so the seed, the disagreement report and the
+// "take the service's side" answer cannot drift apart.
+var ROUTE_BINDING_SLOTS = [
+    { role: "primary", id: "selectedPrimaryInterfaceId",
+      name: "selectedPrimaryInterfaceName", confirmed: "primaryRoleUserConfirmed" },
+    { role: "secondary", id: "selectedSecondaryInterfaceId",
+      name: "selectedSecondaryInterfaceName", confirmed: "secondaryRoleUserConfirmed" }
+]
+
+// One slot of a policy snapshot as `{ id, name, confirmed }`, or `null` when
+// the service holds nothing there.
+function routeBindingFromSnapshot(cur, role) {
+    var b = (cur || {})[role]
+    if (!b || typeof b !== "object") return null
+    var id = String(b["stable-id"] || "")
+    var name = String(b["display-name"] || "")
+    if (id === "" && name === "") return null
+    return {
+        id: id !== "" ? id : name,
+        name: name !== "" ? name : id,
+        confirmed: b["user-confirmed"] === true
+    }
+}
+
+// What to do with the binding the service reports, given what the app holds.
+// The service is the one that enforces, so its answer fills a slot the app has
+// none for -- but a slot the user picked is NEVER overwritten from a snapshot,
+// because only the user knows which of the two is the stale one. A slot that
+// disagrees is reported instead.
+//
+// Returns `{ patch, divergence }`: `patch` is a prefs patch to apply as-is
+// (empty = nothing to seed), `divergence` is `{ role, mine, service }` rows for
+// the banner that asks.
+function routeBindingSeedPlan(prefs, cur) {
+    var p = prefs || {}
+    var patch = {}
+    var divergence = []
+    for (var i = 0; i < ROUTE_BINDING_SLOTS.length; i++) {
+        var slot = ROUTE_BINDING_SLOTS[i]
+        var theirs = routeBindingFromSnapshot(cur, slot.role)
+        if (theirs === null) continue
+        var myId = String(p[slot.id] || "")
+        var myName = String(p[slot.name] || "")
+        if (myId === "" && myName === "") {
+            patch[slot.id] = theirs.id
+            patch[slot.name] = theirs.name
+            patch[slot.confirmed] = theirs.confirmed
+            continue
+        }
+        if (myId !== "" && myId === theirs.id) {
+            // Same adapter, fresher label: the service caches the display name
+            // at write time and an adapter can be renamed between runs.
+            if (theirs.name !== myName) patch[slot.name] = theirs.name
+            continue
+        }
+        divergence.push({
+            role: slot.role,
+            mine: myName !== "" ? myName : myId,
+            service: theirs.name
+        })
+    }
+    // The behaviour mode rides along with a FIRST seed only. Prefs always carry
+    // a mode, so comparing it would report a disagreement on every start where
+    // the user simply never touched the setting.
+    if (patch.hasOwnProperty("selectedPrimaryInterfaceId")
+            || patch.hasOwnProperty("selectedSecondaryInterfaceId")) {
+        var mode = String((cur || {})["mode"] || "")
+        if (mode !== "") patch.routeBehaviorMode = mode
+    }
+    return { patch: patch, divergence: divergence }
+}
+
+// The user answered a disagreement with "keep what the service applies": every
+// slot the snapshot holds replaces the app's own. The opposite answer needs no
+// patch -- it pushes what prefs already say.
+function routeBindingAdoptPatch(cur) {
+    var patch = {}
+    for (var i = 0; i < ROUTE_BINDING_SLOTS.length; i++) {
+        var slot = ROUTE_BINDING_SLOTS[i]
+        var theirs = routeBindingFromSnapshot(cur, slot.role)
+        if (theirs === null) continue
+        patch[slot.id] = theirs.id
+        patch[slot.name] = theirs.name
+        patch[slot.confirmed] = theirs.confirmed
+    }
+    var mode = String((cur || {})["mode"] || "")
+    if (mode !== "") patch.routeBehaviorMode = mode
+    return patch
+}
+
 // ---- auto-rule suggestion grouping (domain = eTLD+1) ----
 //
 // Not a full Public Suffix List -- a compact table of the two-label suffixes
@@ -880,6 +973,18 @@ function registrableDomain(hostname) {
         return labels[labels.length - 3] + "." + lastTwo
     }
     return lastTwo
+}
+
+// Is this domain value itself a public suffix -- a registry under which
+// unrelated organisations hold their own names (`co.uk`, `com.br`, and every
+// bare TLD)? A suffix rule over one of those routes strangers, not a service,
+// which is what the `zone` rule type is for.
+function isPublicSuffixValue(value) {
+    var host = String(value || "").toLowerCase().replace(/^\*\./, "").replace(/\.$/, "")
+    if (host === "" || /^\d+\.\d+\.\d+\.\d+$/.test(host)) return false
+    var labels = host.split(".")
+    if (labels.length === 1) return true
+    return labels.length === 2 && !!AUTO_RULE_MULTI_LABEL_SUFFIXES[host]
 }
 
 // Every site relying on a suggestion row. The service puts the signing
@@ -973,6 +1078,7 @@ function groupAutoRuleRows(candidates, dismissed) {
             primaryBehavior: String(row["primary-behavior"] || row.primaryBehavior || ""),
             anchorRefusesMainLink: (row["anchor-refuses-main-link"] === true)
                 || (row.anchorRefusesMainLink === true),
+            observedMembers: (row["observed-members"] || row.observedMembers || []).map(String),
             timestampMs: ts
         })
         if (status === "pending") group.pendingIds.push(id)

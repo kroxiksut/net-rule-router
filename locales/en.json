@@ -630,11 +630,7 @@
         }
       },
       "default-mode-note": "When no additional adapter is configured, your main connection is used by default.",
-      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops.",
-      "zone-priority": {
-        "label": "Let a zone rule win over an exact address rule",
-        "note": "Off by default: when a whole zone (say “.ru”) goes one way and a single address inside it goes another, the single address wins, because it is the more specific of the two. Turn this on to make the zone win instead — useful when the zone is the decision you care about and the address rule was only meant as a hint."
-      }
+      "recommended-for-secondary-note": "For a full guarantee that nothing leaks, choose “Everything via the additional adapter — no leaks”: all traffic goes through it and is blocked if it ever drops."
     },
     "revisions": {
       "retention": {
@@ -1252,6 +1248,7 @@
       "merge-description": "Your linked rules file and the service's active rules have diverged. Merge combines both instead of choosing one side."
     },
     "merge": {
+      "duplicates-hint": "Each of these was enabled on both routes, so the merge kept the main route's copy and switched the other one off. Pick a different route if that is not what you meant — the other copy stays in your list, switched off.",
       "title": "Merge file and app rules",
       "body": "Combine your linked rules file with the rules the service is currently enforcing. Rules on only one side are always kept; rules that exist on both but differ are shown as conflicts.",
       "bucket-file-only": "Only in the file",
@@ -1384,13 +1381,11 @@
       "protection-diagnostic-logs": "Write detailed diagnostic logs (only needed to report a problem)",
       "protection-mute-block-notices": "Do not show notifications about blocked traffic (rule suggestions still arrive)",
       "close": "Continue",
-      "primary-adapter-title": "Main connection",
       "primary-adapter-description": "The connection everything travels by default. Until you name it, your rules are not applied.",
       "primary-adapter-assigned": "Main connection: {name}. You can change it later in Interfaces and routes.",
       "primary-adapter-placeholder": "Choose a connection",
       "primary-adapter-assign": "Set as main",
       "primary-adapter-unavailable": "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.",
-      "secondary-adapter-title": "Additional connection",
       "secondary-adapter-description": "The connection your rules send traffic to — a VPN or a second network. Rules that name it do nothing until it is assigned.",
       "secondary-adapter-assigned": "Additional connection: {name}. You can change it later in Interfaces and routes.",
       "secondary-adapter-assign": "Set as additional",
@@ -1554,6 +1549,12 @@
     "preset-import-failed": "Failed to import preset: ",
     "preset-import-completed": "Preset imported and activated ({count} rules).",
     "preset-import-passthrough-suffix": "Preserved foreign-OS sections: {sections}.",
+    "preset-import-newer-format": "The file declares format version {found}; this build reads version {supported}. Rules in sections it does not know were kept but not applied.",
+    "preset-import-refused": "This file cannot be imported as a rule set.",
+    "preset-import-too-large": "The file is {size} bytes, over the {limit}-byte limit for a rule set.",
+    "preset-import-too-many-rules": "The file holds {count} rules, more than the {limit} a rule set may have. Split it into two files or remove some rules.",
+    "preset-import-value-too-long": "A value in section {section} is {length} characters long, over the limit of {limit}.",
+    "preset-import-comment-too-long": "A comment in section {section} is {length} characters long, over the limit of {limit}.",
     "preset-import-section-entry": "{name} ({count} lines)",
     "preset-review-cancelled": "Preset import cancelled by user.",
     "wizard-import-failed": "First-run wizard import failed: ",
@@ -1655,7 +1656,8 @@
     "save-as-cancelled": "Save As cancelled — nothing more was saved.",
     "bound-file-none-linked": "No rules file is linked yet — you will be asked where to save.",
     "bound-file-already-current": "Your rules file already holds these rules.",
-    "vpn-split-conflict": "Your additional adapter \"{name}\" is connected, but NetRuleRouter keeps general traffic on your main connection — only your {n} rule(s) go through it. To route all traffic through it, change the routing mode in Settings → Routing behavior.",
+    "vpn-split-conflict": "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {n} rule(s) go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.",
+    "preview-data-banner": "Demo data. This window is running on a preview backend (NRR_BACKEND), so nothing shown here comes from the service and nothing changed here reaches it.",
     "vpn-split-conflict-dismiss": "Got it — don't show this for this adapter again",
     "vpn-split-conflict-fulltunnel": "Route everything through the additional adapter",
     "vpn-split-conflict-fulltunnel-description": "Switch to \"prefer secondary\" so all traffic uses the additional adapter, not just the rule-matched destinations.",
@@ -1807,10 +1809,15 @@
     },
     "clear-failed": "Could not clear: ",
     "rules-overlap-removed": "{n} rule(s) removed as already covered. Apply to put the change into effect.",
-    "zone-priority-on": "A zone rule now wins over an exact address rule inside it.",
-    "zone-priority-off": "An exact address rule now wins over the zone it sits in.",
     "service-install-offer-stopped": "The service install offer is off. Turn it back on in Settings.",
-    "duplicate-rule-resolved": "The other copy of the rule was switched off. Review the changes again to apply them."
+    "duplicate-rule-resolved": "The other copy of the rule was switched off. Review the changes again to apply them.",
+    "route-binding-divergence": "The connections shown here are not the ones the background service is applying. ",
+    "route-binding-divergence-pair": "the app shows {mine}, the service is applying {service}",
+    "route-binding-adopted": "The app now shows the connections the background service is applying.",
+    "route-binding-keep-service": "Keep what the service applies",
+    "route-binding-keep-service-description": "Show the connections the background service is applying and stop offering the ones stored in the app.",
+    "route-binding-keep-mine": "Apply what is shown here",
+    "route-binding-keep-mine-description": "Send the connections shown here to the background service, replacing the ones it is applying."
   },
   "interfaces": {
     "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
@@ -1896,7 +1903,8 @@
     },
     "row": {
       "summary": "Type: %1 | IP: %2 | Gateway: %3",
-      "summary-2": "DNS: %1 | Default route: %2 | State: %3"
+      "summary-2": "DNS: %1 | Default route: %2",
+      "readiness": "Readiness: %1"
     },
     "mode": {
       "prefer-primary": "Selected sites only (via the additional adapter)",
@@ -1913,7 +1921,11 @@
       "not-selected": "Not selected",
       "unavailable": "Unavailable",
       "requires-verification": "Requires verification",
-      "fail-closed-conflict": "Fail-Closed conflict"
+      "fail-closed-conflict": "Strict mode — traffic is blocked"
+    },
+    "role": {
+      "primary": "Main connection",
+      "secondary": "Additional connection"
     }
   },
   "rules": {
@@ -1995,7 +2007,9 @@
       "clear-selection": "Clear (Esc)"
     },
     "value": {
-      "punycode-hint": "Punycode: {ace}"
+      "punycode-hint": "Punycode: {ace}",
+      "suffix-reach": "Matches every name under {value}, including ones you did not list.",
+      "public-suffix-warning": "{value} is a public registry, not one service: the rule would route unrelated owners. Use a zone rule if that is what you want."
     },
     "dialog": {
       "import-title": "Choose preset to import",
@@ -2184,6 +2198,9 @@
         "empty-all-inert": "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.",
         "empty": "Nothing is waiting for an answer right now.",
         "needed-by": "Needed by:",
+        "reach": "The rule covers every name under {domain}.",
+        "reach-seen": "Seen so far: {hosts}.",
+        "reach-more": "+{count} more",
         "consumer-on-primary": "on the main route",
         "consumer-on-primary-hint": "This site goes through the main route. If you move the address into the tunnel, this site's traffic to it goes there too.",
         "consumer-copy-hint": "Right-click to copy this name to the clipboard.",
@@ -2398,6 +2415,7 @@
         "not-covered-by-rules": "This app is confined to a route, and no rule covers this address there.",
         "blocked-by-rule": "A rule blocks this address directly.",
         "ipv6-blocked": "IPv6 is switched off while leak protection is on, and this address is IPv6. No rule blocked it — the switch is in Settings.",
+        "dns-lockdown": "This app tried to reach a public DNS resolver of its own instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it. No rule blocked it — the switch is in Settings, under Routing.",
         "unattributed": "NetRuleRouter blocked this address, but could not identify which filter did it.",
         "unspecified": "No further detail available."
       },
@@ -2916,6 +2934,7 @@
         "not-covered-by-rules": "No rule covers this connection, so the default action blocked it.",
         "blocked-by-rule": "A rule blocks this connection.",
         "ipv6-blocked": "IPv6 is switched off while leak protection is on, so this connection did not go out.",
+        "dns-lockdown": "This app went to its own DNS resolver instead of the one NetRuleRouter provides, and encrypted-DNS blocking closed it.",
         "unattributed": "NetRuleRouter blocked this connection, but could not identify which filter did it.",
         "unknown": "This connection was blocked."
       },
@@ -3001,6 +3020,7 @@
     "not-covered-by-rules": "Addresses no rule covers",
     "blocked-by-rule": "Blocks by rule",
     "ipv6-blocked": "IPv6 blocks",
+    "dns-lockdown": "Blocks of apps using their own DNS",
     "unattributed": "Blocks without an identified filter",
     "any": "Blocks of this kind"
   }

@@ -1671,8 +1671,8 @@ ColumnLayout {
         // must not keep pointing at files whose content no longer matches
         // the (now empty) table. Clear the persisted source paths so the
         // indicator row hides until the user imports/saves again.
-        if (typeof root.updatePrefs === "function") {
-            root.updatePrefs({ lastSavedPathPrimary: "", lastSavedPathSecondary: "",
+        if (typeof root.commitPrefs === "function") {
+            root.commitPrefs({ lastSavedPathPrimary: "", lastSavedPathSecondary: "",
                                lastLoadedPathPrimary: "", lastLoadedPathSecondary: "" })
         }
         root.statusLine = root.tr("status.rules-cleared",
@@ -1720,7 +1720,8 @@ ColumnLayout {
             return
         }
         if (typeof root.reviewFlowController.startRulesReviewFlow === "function") {
-            root.reviewFlowController.startRulesReviewFlow(rulesJson, contentHash)
+            root.reviewFlowController.startRulesReviewFlow(
+                rulesJson, contentHash, false, "rules-save")
         } else {
             console.log("RulesSection: startRulesReviewFlow unavailable on root")
         }
@@ -1749,7 +1750,8 @@ ColumnLayout {
             return
         }
         if (typeof root.reviewFlowController.startRulesReviewFlow === "function") {
-            root.reviewFlowController.startRulesReviewFlow(rulesJson, contentHash, true /* adminBaseline */)
+            root.reviewFlowController.startRulesReviewFlow(
+                rulesJson, contentHash, true /* adminBaseline */, "set-baseline")
         }
     }
 

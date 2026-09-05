@@ -86,12 +86,6 @@ mod tests {
 
     #[test]
     fn block6_alignment_keeps_block5_interfaces_model_visible() {
-        let shell = gui_shell_v1();
-        assert!(shell.interfaces_routes.manual_role_confirmation_required);
-        assert!(shell
-            .interfaces_routes
-            .observed_vs_derived_boundary
-            .contains("observed_facts"));
         assert!(DTO_GROUPS_6_5.contains(&DtoGroup::Interface));
         assert!(BLOCK_6_8_CROSS_BLOCK_ALIGNMENT
             .block5_interfaces_alignment_note

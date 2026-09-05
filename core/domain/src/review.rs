@@ -425,7 +425,12 @@ pub fn compute_diff(
     let behavior_mode_changed = prev.is_some_and(|p| p.behavior_mode != candidate.behavior_mode);
     let prev_behavior_mode = prev.map(|p| p.behavior_mode);
 
-    let mut rule_changes = compute_rule_changes(prev, candidate);
+    let RuleChanges {
+        mut changes,
+        prev_distinct,
+        next_distinct,
+    } = compute_rule_changes(prev, candidate);
+    let rule_changes = &mut changes;
     rule_changes.sort_by(|a, b| {
         a.kind_order()
             .cmp(&b.kind_order())
@@ -433,13 +438,16 @@ pub fn compute_diff(
             .then_with(|| a.rule_id().0.as_str().cmp(b.rule_id().0.as_str()))
     });
 
-    let prev_total_rules = prev
-        .map(|p| (p.rule_book.primary.len() + p.rule_book.secondary.len()) as u32)
-        .unwrap_or(0);
-    let next_total_rules =
-        (candidate.rule_book.primary.len() + candidate.rule_book.secondary.len()) as u32;
+    // Counted the same way `rule_changes` is — by distinct rule identity, not by
+    // raw set length. The risk scorer divides one by the other, and a book with
+    // two copies of a rule inflated the denominator only, so a removal that
+    // cleared half the rules scored below the threshold and the warning the
+    // user needed never appeared.
+    let prev_total_rules = prev_distinct as u32;
+    let next_total_rules = next_distinct as u32;
 
-    let overlapping_apexes = collect_overlapping_apexes(candidate, &rule_changes);
+    let overlapping_apexes = collect_overlapping_apexes(candidate, rule_changes);
+    let rule_changes = changes;
 
     StructuralDiff {
         binding_changed,
@@ -539,7 +547,7 @@ fn collect_overlapping_apexes(candidate: &CanonicalProfile, changes: &[RuleChang
 /// `{:?}` over the two match `Option`s is a faithful, deterministic
 /// content key: `CanonicalAddressMatch` / `CanonicalAppMatch` derive
 /// `Eq`, so equal debug output ⟺ equal value within this crate.
-pub(crate) fn rule_identity_key(rule: &CanonicalRule) -> String {
+pub fn rule_identity_key(rule: &CanonicalRule) -> String {
     format!("{:?}\u{1}{:?}", rule.address_match, rule.app_match)
 }
 
@@ -576,12 +584,22 @@ fn build_identity_map(
         .unwrap_or_default()
 }
 
+/// The diff, plus the two counts it was computed over. They travel together
+/// because the risk scorer forms a ratio out of them: taken from anywhere else
+/// the numerator and the denominator count different things.
+struct RuleChanges {
+    changes: Vec<RuleChange>,
+    prev_distinct: usize,
+    next_distinct: usize,
+}
+
 fn compute_rule_changes(
     prev: Option<&CanonicalProfile>,
     candidate: &CanonicalProfile,
-) -> Vec<RuleChange> {
+) -> RuleChanges {
     let prev_map = build_identity_map(prev);
     let next_map = build_identity_map(Some(candidate));
+    let (prev_distinct, next_distinct) = (prev_map.len(), next_map.len());
 
     let mut changes = Vec::new();
 
@@ -618,7 +636,11 @@ fn compute_rule_changes(
         }
     }
 
-    changes
+    RuleChanges {
+        changes,
+        prev_distinct,
+        next_distinct,
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -702,6 +724,42 @@ mod tests {
     }
 
     // ── compute_diff ─────────────────────────────────────────────────────────
+
+    /// The risk scorer divides removed entries by `prev_total_rules`. The
+    /// entries are counted by rule IDENTITY (one per match, whichever route it
+    /// sits on), so the denominator has to be counted the same way — a raw set
+    /// length counts a match named on both routes twice and shrinks the ratio,
+    /// which is precisely how a removal that cleared half the rules stayed
+    /// under the threshold and warned nobody.
+    #[test]
+    fn the_rule_totals_are_counted_the_way_the_changes_are() {
+        let shared = fqdn_rule("r-1", "corp.example.com");
+        let prev = make_profile(
+            vec![shared.clone(), fqdn_rule("r-2", "other.example.com")],
+            vec![shared],
+        );
+        assert_eq!(
+            prev.rule_book.primary.rules().len() + prev.rule_book.secondary.rules().len(),
+            3,
+            "three rules in the book…",
+        );
+
+        let candidate = make_profile(vec![fqdn_rule("r-1", "corp.example.com")], vec![]);
+        let diff = compute_diff(Some(&prev), &candidate);
+        assert_eq!(diff.prev_total_rules, 2, "…but two distinct matches");
+        assert_eq!(diff.next_total_rules, 1);
+
+        let removed = diff
+            .rule_changes
+            .iter()
+            .filter(|c| matches!(c, RuleChange::Removed { .. }))
+            .count();
+        assert_eq!(removed, 1);
+        assert!(
+            removed as u32 * 100 / diff.prev_total_rules >= 50,
+            "half the distinct rules are gone — the ratio must say so",
+        );
+    }
 
     #[test]
     fn diff_identical_profiles_is_empty() {

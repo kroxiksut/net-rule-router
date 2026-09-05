@@ -709,10 +709,10 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
     SecondaryOutcome::TakeOver
 }
 
-/// Wires the OS light/dark probe into `nrr-ui-support`, which is neutral and
-/// must not name an OS itself. Without this the theme resolver answers
-/// "undetected", and the GUI shows its fail-safe light theme knowing that is
-/// what it is.
+/// Wires the OS appearance probe — light/dark and the high-contrast switch —
+/// into `nrr-ui-support`, which is neutral and must not name an OS itself.
+/// Without this the theme resolver answers "undetected", and the GUI shows its
+/// fail-safe light theme knowing that is what it is.
 fn install_system_theme_port() {
     #[cfg(windows)]
     nrr_ui_support::theme::install_system_theme_port(Box::new(

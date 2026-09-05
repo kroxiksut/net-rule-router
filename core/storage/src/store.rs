@@ -461,6 +461,85 @@ impl CacheRepository for SqliteCacheStore {
         Ok(removed as u32)
     }
 
+    fn snapshot_ipv4_resolutions(&self) -> StorageResult<Vec<(String, Ipv4Addr, SystemTime)>> {
+        let conn = self.conn.borrow();
+        // Same join, same per-hostname ordering as `get_by_hostname`; only the
+        // hostname predicate is gone. Freshness is deliberately NOT filtered
+        // here either — that path returns every cached row and lets the caller
+        // apply its own confirmation window.
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.canonical_host, a.canonical_ip, r.resolved_at
+                 FROM hostname_ip_resolutions r
+                 JOIN ip_addresses a ON a.id = r.ip_id
+                 JOIN hostnames    h ON h.id = r.hostname_id
+                 WHERE a.address_family = 'ipv4'
+                 ORDER BY h.canonical_host ASC, r.resolved_at DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (host, ip, resolved_at_ms) = row.map_err(db_err)?;
+            // A row whose address does not parse is a corrupt cell, not a
+            // reason to fail the whole snapshot: skipping it degrades exactly
+            // one address, the way the per-hostname path degrades a whole
+            // lookup on a read error.
+            let Ok(addr) = ip.parse::<Ipv4Addr>() else {
+                continue;
+            };
+            out.push((host, addr, ms_to_system_time(resolved_at_ms)));
+        }
+        Ok(out)
+    }
+
+    fn snapshot_hostnames(&self) -> StorageResult<Vec<(String, i64)>> {
+        let conn = self.conn.borrow();
+        // Same ORDER BY as `list_hostnames_under_suffix`, minus its LIKE and
+        // LIMIT: the snapshot applies those in memory.
+        let mut stmt = conn
+            .prepare(
+                "SELECT canonical_host, last_seen_at FROM hostnames
+                 ORDER BY last_seen_at DESC, canonical_host ASC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(db_err)?);
+        }
+        Ok(out)
+    }
+
+    fn shared_ip_direct_host_counts(&self) -> StorageResult<Vec<(Ipv4Addr, u32)>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare(
+                "SELECT ipv4_packed, COUNT(DISTINCT hostname) \
+                 FROM shared_ip_direct_hosts GROUP BY ipv4_packed",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (packed, count) = row.map_err(db_err)?;
+            out.push((Ipv4Addr::from(packed as u32), count.max(0) as u32));
+        }
+        Ok(out)
+    }
+
     fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> StorageResult<u32> {
         let conn = self.conn.borrow();
         let packed = ipv4_packed(ip);
@@ -480,13 +559,17 @@ impl CacheRepository for SqliteCacheStore {
         let mut stmt = conn
             .prepare("SELECT DISTINCT ipv4_packed FROM shared_ip_direct_hosts")
             .map_err(db_err)?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, i64>(0))
-            .map_err(db_err)?
-            .filter_map(|r| r.ok())
-            .map(|packed| Ipv4Addr::from(packed as u32))
-            .collect();
-        Ok(rows)
+        // A failed row is an error, not a shorter census. This list is
+        // SUBTRACTED from the kill-switch's pin/block set, so dropping entries
+        // silently blocks an address shared with a direct host — the exact
+        // collateral the census exists to spare. The caller degrades an Err to
+        // an empty census and logs it, which is the strict direction and a
+        // visible one; `.ok()` per row was neither.
+        let mut out = Vec::new();
+        for row in stmt.query_map([], |r| r.get::<_, i64>(0)).map_err(db_err)? {
+            out.push(Ipv4Addr::from(row.map_err(db_err)? as u32));
+        }
+        Ok(out)
     }
 
     fn shared_ip_census_primary_ruled_ips(&self) -> StorageResult<Vec<Ipv4Addr>> {
@@ -1044,10 +1127,9 @@ impl CacheRepository for SqliteCacheStore {
 
     fn periodic_vacuum(&self) -> StorageResult<()> {
         let conn = self.conn.borrow();
-        // WAL checkpoint with TRUNCATE mode reclaims WAL file space without a
-        // full VACUUM rebuild.  Errors are non-fatal — log in production.
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .map_err(db_err)
+        // TRUNCATE reclaims the journal without a full VACUUM rebuild. Errors
+        // are non-fatal — log in production.
+        crate::migration::checkpoint_wal_truncate(&conn)
     }
 
     fn touch_last_rebuild_at(&self, now_ms: i64) -> StorageResult<()> {
@@ -1212,20 +1294,22 @@ impl RevisionMetadataRepository for SqliteStateStore {
     /// there had been an LKG to fall back to.
     fn set_active_revision(&self, revision_id: &RevisionId) -> StorageResult<()> {
         let conn = self.conn.borrow();
-        conn.execute(
-            "INSERT INTO active_revision_pointer (principal, revision_id, activated_at)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(principal) DO UPDATE SET
-                 revision_id  = excluded.revision_id,
-                 activated_at = excluded.activated_at",
-            params![
-                crate::BASELINE_PRINCIPAL,
-                revision_id.as_str(),
-                system_time_to_ms(SystemTime::now())
-            ],
+        // Through the repository, not a raw INSERT: the pointer carries an HMAC
+        // and a hand-rolled write here would leave the recovered pointer
+        // unsigned. `apply_attempt_id` is cleared on purpose — recovery is not
+        // an apply in flight.
+        let repo = match self.signing_key() {
+            Some(key) => crate::revisions::RevisionsRepository::with_signing_key(&conn, key),
+            None => crate::revisions::RevisionsRepository::new(&conn),
+        };
+        repo.set_active_pointer_for(
+            crate::BASELINE_PRINCIPAL,
+            &crate::revisions::ActiveRevisionPointer {
+                revision_id: revision_id.as_str().to_string(),
+                activated_at: system_time_to_ms(SystemTime::now()),
+                apply_attempt_id: None,
+            },
         )
-        .map_err(db_err)?;
-        Ok(())
     }
 
     /// Derived, not stored: the rollback target is the most recent revision

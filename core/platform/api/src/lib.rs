@@ -49,6 +49,9 @@ pub mod error;
 // is no per-OS mechanism to hide behind a trait here.
 pub mod external_ip;
 pub mod fail_closed;
+// Handing ONE file the service produced to the user who asked for it, without
+// opening the service's data directory to them.
+pub mod file_handoff;
 // The neutral fake-IP contract: address pool + hostname<->fake-address map,
 // the scope policy (who gets a fake address), and the `TunAdapterPort` seam
 // whose mechanism is per-OS (Wintun / `/dev/net/tun` / `utun`). Pure and

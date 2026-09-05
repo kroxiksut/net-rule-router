@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "../lib/pure.js" as Pure
 
 // Non-visual controller for the per-SID route-policy apply handlers driven by
 // the Routing settings panel (kill-switch family, DoH lockdown, shared-IP,
@@ -300,27 +301,6 @@ QtObject {
     /// knowingly. It silences the QUESTION, not the record — every network is
     /// still listed in Settings and any of them can be refused there, and
     /// turning this back off asks again.
-    /// Zone-vs-exact-address order (the rule model's tier 3). The engine has
-    /// always taken it as a parameter; nothing supplied one until the setting
-    /// was stored per user.
-    function applyZonePriorityOverIp(enabled) {
-        var want = enabled === true
-        _applyRoutePolicyKey("zone-priority-over-ip", want, {
-            onApplied: function(v) {
-                root.updateRoutingState({ zonePriorityOverIp: v })
-            },
-            ok: want
-                ? root.tr("status.zone-priority-on",
-                    "A zone rule now wins over an exact address rule inside it.")
-                : root.tr("status.zone-priority-off",
-                    "An exact address rule now wins over the zone it sits in."),
-            uac: root.tr("status.route-policy-uac-declined",
-                "Administrator approval was declined; the setting was not saved."),
-            failPrefix: root.tr("status.route-policy-failed",
-                "Could not save the setting to the service: ")
-        })
-    }
-
     function applyLocalNetworksAutoAccept(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("local-networks-auto-accept", want, {
@@ -608,6 +588,66 @@ QtObject {
     /// it has one. Backoff alone spans 23 s, but the adapter can appear minutes
     /// later, so a topology change re-arms a run while this holds.
     property bool _bindingResyncOutstanding: false
+
+    /// Cold-start reverse seed. The service is what actually enforces, so a
+    /// slot the app has no answer for is filled from its snapshot: a lost prefs
+    /// file (or a second account on the machine) used to leave the interfaces
+    /// screen blank while routing kept working, with no way to see or change
+    /// what was being enforced.
+    ///
+    /// A slot the user already filled is never overwritten here — that is the
+    /// whole point of the split: only the user knows whether their own choice
+    /// or the service's is the stale one, so a disagreement raises the banner
+    /// and waits for an answer.
+    function seedRouteBindingFromService() {
+        if (!root.bridgeAvailable
+                || ((root.backendStatus || {}).kind) !== "connected"
+                || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") return
+        // A choice parked while the service was stopped is the user's newest
+        // word and is delivered separately; seeding over it would restore
+        // exactly what they had just changed.
+        var parked = root._readPendingOffline()["binding"] || {}
+        if (parked.pending === true) return
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok) return
+            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
+            var plan = Pure.routeBindingSeedPlan(root.prefs, cur)
+            if (Object.keys(plan.patch).length > 0) {
+                root.updatePrefs(plan.patch)
+                root.emitPrefs()
+            }
+            root.routeBindingDivergence = plan.divergence
+        })
+    }
+
+    /// The user answered the disagreement with "keep what the service applies".
+    /// Nothing is sent — the service already holds these values; the app stops
+    /// showing a binding nobody enforces.
+    function adoptServiceRouteBinding() {
+        if (!root.bridgeAvailable
+                || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") return
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok) {
+                root.statusLine = root.tr("status.route-policy-read-failed",
+                    "Could not read the current routing policy, so nothing was "
+                    + "changed. The setting is saved and will be sent again: ")
+                return
+            }
+            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
+            var patch = Pure.routeBindingAdoptPatch(cur)
+            if (Object.keys(patch).length > 0) {
+                root.updatePrefs(patch)
+                root.emitPrefs()
+            }
+            root.routeBindingDivergence = []
+            root.statusLine = root.tr("status.route-binding-adopted",
+                "The app now shows the connections the background service is applying.")
+        })
+    }
 
     /// On connect: if the service has NO binding but prefs DO, re-push it.
     /// Covers a wiped service DB (deleted ProgramData) or a migration that

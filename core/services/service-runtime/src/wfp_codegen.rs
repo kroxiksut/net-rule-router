@@ -80,25 +80,11 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
-/// Base WFP weight for `primary`-route rules. Above the secondary
-/// band so explicit primary rules outrank more general secondary
-/// rules. Each rule occupies a 256-slot range starting at
-/// `BASE_PRIMARY + pos * SLOTS_PER_RULE`.
-pub(crate) const BASE_PRIMARY: u64 = 0x0020_0000;
-/// Base WFP weight for `secondary`-route rules.
-const BASE_SECONDARY: u64 = 0x0010_0000;
-/// Base WFP weight for per-rule **Block**-action filters. Placed ABOVE the
-/// kill-switch permit band (`KILLSWITCH_PERMIT_BASE = 0x0040_0000`) so an
-/// explicit user Block beats even the kill-switch's egress-conditional permit
-/// and every route-rule Permit band. The hard veto itself comes from
-/// `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT`, which `wfp_filter.rs` stamps on every
-/// `WfpAction::Block` filter automatically. Block filters are role-independent
-/// (drop regardless of primary/secondary set membership).
-const BASE_BLOCK: u64 = 0x0070_0000;
-
-/// Width of one weight band. Every base above is a multiple of it, and a band
-/// holds [`MAX_RULE_SLOT`] + 1 rules.
-const BAND_WIDTH: u64 = 0x0010_0000;
+// Weight bands come from `wfp_bands`, which holds the complete order and
+// asserts it. This file emits filters; it does not get to invent a band.
+use crate::wfp_bands::{
+    BAND_WIDTH, BASE_BLOCK, BASE_PRIMARY, BASE_SECONDARY, DEFAULT_BLOCK_WEIGHT,
+};
 
 /// Highest rule position a band can hold. `pos` comes from the rule book and
 /// nothing upstream caps it, so without this the 8192nd primary rule would land
@@ -116,27 +102,9 @@ fn rule_weight(base: u64, pos: u64, fanout_idx: u64) -> u64 {
     base + pos.min(MAX_RULE_SLOT) * SLOTS_PER_RULE + fanout_idx.min(SLOTS_PER_RULE - 1)
 }
 
-// The bands must not overlap the kill-switch ones: our filters all live in ONE
-// sub-layer, where the highest weight wins outright. A tie or an inversion here
-// means a user's explicit Block and the kill-switch's app exemption arbitrate by
-// accident — and `FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT` does not help, since it
-// defends a Block against OTHER sub-layers, not against our own higher-weighted
-// permit.
-const _: () = {
-    assert!(BASE_BLOCK > crate::killswitch_codegen::APP_EXEMPT_BASE);
-    assert!(
-        BASE_BLOCK - crate::killswitch_codegen::APP_EXEMPT_BASE >= BAND_WIDTH,
-        "an explicit user Block must sit a full band above the app exemptions"
-    );
-    assert!(BASE_PRIMARY + BAND_WIDTH <= crate::killswitch_codegen::KILLSWITCH_PERMIT_BASE);
-    assert!(BASE_SECONDARY + BAND_WIDTH <= BASE_PRIMARY);
-};
-/// Weight of the fail-closed catch-all filter. Below every per-rule
-/// weight so a rule-driven `Permit` always wins.
-const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
 /// How many fan-out targets a single rule may emit before its weight
 /// range collides with the next rule's range.
-pub const SLOTS_PER_RULE: u64 = 256;
+pub use crate::wfp_bands::SLOTS_PER_RULE;
 /// Bounded fan-out cap for the number of resolved exe **paths** a single
 /// `Application` rule may emit an `ALE_APP_ID` filter for. A name/glob can
 /// resolve to several concrete binaries (32/64-bit installs, per-user +

@@ -18,9 +18,9 @@ use crate::error::{DiagnosticsError, DiagnosticsResult};
 use crate::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use crate::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
-    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
-    ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsAudience, DiagnosticsDataOrigin,
+    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
+    SecurityStatusCard, ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use crate::facade::pagination::{PageResult, PaginationParams};
 use crate::facade::service::DiagnosticsFacade;
@@ -72,6 +72,7 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
         &self,
         _filter: &LogEntryFilter,
         _pagination: &PaginationParams,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
         if self.scenario == MockScenario::EmptyLogs {
             return Ok(PageResult::empty());
@@ -83,6 +84,7 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
         &self,
         _filter: &AuditEntryFilter,
         _pagination: &PaginationParams,
+        _audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         Ok(PageResult::single_page(mock_audit_entries(self.scenario)))
     }
@@ -322,7 +324,11 @@ mod tests {
     fn mock_empty_logs_returns_no_entries() {
         let facade = MockDiagnosticsFacade::new(MockScenario::EmptyLogs);
         let r = facade
-            .list_log_entries(&LogEntryFilter::default(), &PaginationParams::default())
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &PaginationParams::default(),
+                &DiagnosticsAudience::Machine,
+            )
             .expect("ok");
         assert!(r.is_empty());
     }
@@ -331,7 +337,11 @@ mod tests {
     fn mock_fail_closed_has_warn_entry() {
         let facade = MockDiagnosticsFacade::new(MockScenario::FailClosedBlock);
         let r = facade
-            .list_log_entries(&LogEntryFilter::default(), &PaginationParams::default())
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &PaginationParams::default(),
+                &DiagnosticsAudience::Machine,
+            )
             .expect("ok");
         assert!(r.items.iter().any(|e| e.level == "warn"));
     }

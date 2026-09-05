@@ -37,7 +37,7 @@ ApplicationWindow {
         if (!platformProfile || !platformProfile.supports) return true
         return platformProfile.supports[feature] !== false
     }
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     property string statusLine: ""
     /// Long form of the current status message, shown on hover. The footer is
@@ -255,11 +255,44 @@ ApplicationWindow {
     readonly property bool policyInactiveKillSwitchBlocking:
         policyInactiveBannerVisible && !_policyIdlePrefsHaveSecondary
         && uiRevision >= 0 && !!prefs && prefs.routeKillSwitchEnabled === true
+    // The app and the service each store which adapters carry which role, and
+    // a disagreement between them is not ours to settle: only the user knows
+    // whether the choice in front of them or the one being enforced is the
+    // stale one. Rows of `{ role, mine, service }` from the cold-start read;
+    // empty when the two agree, which is the ordinary case.
+    property var routeBindingDivergence: []
+    readonly property bool routeBindingDivergenceVisible:
+        uiRevision >= 0 && !!routeBindingDivergence && routeBindingDivergence.length > 0
+    /// One line naming both sides, so the choice can be made from the banner
+    /// without opening anything.
+    readonly property string routeBindingDivergenceText: {
+        if (!routeBindingDivergenceVisible) return ""
+        var parts = []
+        for (var i = 0; i < routeBindingDivergence.length; i++) {
+            var d = routeBindingDivergence[i]
+            var role = (String(d.role) === "primary")
+                ? tr("interfaces.role.primary", "Main connection")
+                : tr("interfaces.role.secondary", "Additional connection")
+            parts.push(role + ": " + tr("status.route-binding-divergence-pair",
+                "the app shows {mine}, the service is applying {service}")
+                .replace("{mine}", String(d.mine)).replace("{service}", String(d.service)))
+        }
+        return tr("status.route-binding-divergence",
+            "The connections shown here are not the ones the background service is applying. ")
+            + parts.join("; ")
+    }
+    /// The user answered the disagreement in the service's favour.
+    function adoptServiceRouteBinding() {
+        routePolicyController.adoptServiceRouteBinding()
+    }
     /// Re-send the adapter binding the app already holds to a service that has
     /// none. The push reports its own failure (adapter not live, elevation
     /// declined) on the status line, which is still better than the silence
     /// this banner exists to break.
     function resendRouteBindingToService() {
+        // Also the "keep mine" answer to a binding disagreement: the push
+        // replaces what the service holds, so the question is settled.
+        routeBindingDivergence = []
         routePolicyController.pushRouteBindingToService()
         // Re-read once the push has had time to land so the notice clears on
         // the spot instead of waiting for the next watch tick. The push is
@@ -1310,7 +1343,10 @@ ApplicationWindow {
 
         var themeContext = context.theme || {}
         var systemMode = String(themeContext.systemMode || "")
-        if (systemMode === "dark" || systemMode === "light") return systemMode
+        // "high-contrast" is one of the three the system can state: the OS
+        // accessibility switch outranks its own light/dark preference.
+        if (systemMode === "dark" || systemMode === "light"
+                || systemMode === "high-contrast") return systemMode
 
         return "light"
     }
@@ -1452,8 +1488,12 @@ ApplicationWindow {
         normalized.routeKillSwitchProtocols =
             Pure.routePolicyCoerce("kill-switch-protocols",
                 normalized.routeKillSwitchProtocols)
+        // Through the same declaration as every sibling mirror. Hand-written,
+        // this was the one that answered "reactive" for a missing value — a
+        // mode the code itself calls an unsupported historical fallback — and
+        // any `emitPrefs()` on the literal below then SAVED that answer.
         normalized.routeEnforcementMode =
-            (normalized.routeEnforcementMode === "resolver") ? "resolver" : "reactive"
+            Pure.stabilityCoerce("enforcement-mode", normalized.routeEnforcementMode)
         normalized.routeKillSwitchEnabled =
             Pure.routePolicyCoerce("kill-switch-enabled", normalized.routeKillSwitchEnabled)
         normalized.routeAllowDnsOverPrimary =
@@ -1820,6 +1860,9 @@ ApplicationWindow {
         "minimizeToTrayInsteadOfClose": true,
         "reopenLastSectionOnStartup": true,
         "showNotifications": true,
+        "notifyBlockNotices": true,
+        "hideBlockNoticeAddresses": true,
+        "trayNoticeOpacityPercent": true,
         "showBluetoothAdapters": true,
         "showRememberedAdapters": true,
         "autoConfirmAdapterIdChange": true,
@@ -1859,6 +1902,20 @@ ApplicationWindow {
         // re-fire tr bindings); only a real switch propagates.
         currentLanguage = prefs.language
         uiRevision += 1
+    }
+    /// Writes a preference and persists it WITHOUT arming the global
+    /// Apply/Cancel buffer.
+    ///
+    /// For the one-click commits made OUTSIDE Settings — a notice's "don't show
+    /// these again", the first-run wizard's answers. The user has already
+    /// decided there; a footer lighting up to offer cancelling it is noise, and
+    /// on a first launch it lights before the user has touched anything.
+    /// A buffer already armed by real Settings edits is left alone.
+    function commitPrefs(patch) {
+        var hadPendingEdits = prefsSnapshot !== null
+        updatePrefs(patch)
+        if (!hadPendingEdits) prefsSnapshot = null
+        emitPrefs()
     }
     function applyPendingPrefs() {
         if (prefsSnapshot === null) return
@@ -3237,6 +3294,10 @@ ApplicationWindow {
             case "ipv6-blocked":
                 return tr("notifications.block-notice.reason.ipv6-blocked",
                     "IPv6 is switched off while leak protection is on, so this connection did not go out.")
+            case "dns-lockdown":
+                return tr("notifications.block-notice.reason.dns-lockdown",
+                    "This app went to its own DNS resolver instead of the one NetRuleRouter provides, "
+                    + "and encrypted-DNS blocking closed it.")
             case "unattributed":
                 return tr("notifications.block-notice.reason.unattributed",
                     "NetRuleRouter blocked this connection, but could not identify which filter did it.")
@@ -3895,6 +3956,24 @@ ApplicationWindow {
         return !!backendStatus && backendStatus.kind === "connected"
             && (backendServiceBacked || backendLiveServiceConfirmed)
     }
+
+    /// Is this window showing INVENTED data while claiming a healthy service?
+    ///
+    /// `NRR_BACKEND=mock` / `preview-local` hands the window a stand-in facade
+    /// that reports `connected`, so every surface paints "all fine" over
+    /// snapshots that never touched the service and over edits that never reach
+    /// it. The launcher says so in its log; the log is not what the person is
+    /// looking at.
+    ///
+    /// Deliberately NOT keyed on `backendServiceBacked` alone: the IPC
+    /// cold-start fallback sets that too, and there the connection banner
+    /// already tells the truth in red. Only the chosen preview backend claims
+    /// `connected` while nothing behind it is real, and a live health read
+    /// (`backendLiveServiceConfirmed`) ends the condition for good.
+    readonly property bool previewDataBannerVisible:
+        uiRevision >= 0
+        && !!backendStatus && backendStatus.kind === "connected"
+        && !backendServiceBacked && !backendLiveServiceConfirmed
 
     /// Parse the parked-intents store into the canonical two-namespace shape.
     /// Returns empty namespaces on any error (never throws).
@@ -4658,7 +4737,11 @@ ApplicationWindow {
     Action { id: exitAction; text: tr("action.exit-application", "Exit"); shortcut: StandardKey.Quit; icon.source: uiIconSource("exit"); onTriggered: window.close() }
     Action { id: aboutAction; text: tr("action.open-about-window", "About"); shortcut: "F1"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(aboutWindow) }
     Action { id: licenseAction; text: tr("action.open-license-window", "License"); shortcut: "Ctrl+Shift+L"; icon.source: uiIconSource("about"); onTriggered: openChildWindow(licenseWindow) }
-    Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); onTriggered: Pure.openExternalUrl(((context.about || {}).logsFolderUrl || "")) }
+    // Disabled when the service's log directory is not readable by this user:
+    // the context carries a URL only when the folder can actually be listed, and
+    // an action that opens an empty window explains nothing. Diagnostics ->
+    // export archive is the path that works without administrator rights.
+    Action { id: logsFolderAction; text: tr("action.open-logs-folder", "Open logs folder"); shortcut: "Ctrl+Shift+O"; icon.source: uiIconSource("open-file"); enabled: String(((context.about || {}).logsFolderUrl) || "") !== ""; onTriggered: Pure.openExternalUrl(((context.about || {}).logsFolderUrl || "")) }
     Action { id: interfacesAction; text: sectionTitle("interfaces-routes"); shortcut: "Ctrl+1"; icon.source: sectionIconSource("interfaces-routes"); onTriggered: requestSectionChange("interfaces-routes") }
     Action { id: rulesAction; text: sectionTitle("rules"); shortcut: "Ctrl+2"; icon.source: sectionIconSource("rules"); onTriggered: requestSectionChange("rules") }
     Action { id: diagnosticsAction; text: sectionTitle("diagnostics"); shortcut: "Ctrl+3"; icon.source: sectionIconSource("diagnostics"); onTriggered: requestSectionChange("diagnostics") }
@@ -4995,7 +5078,7 @@ ApplicationWindow {
                 statusLine = tr("status.auto-open-file-missing",
                     "Auto-open file not found at {path}. Choose a file to attach.")
                     .replace("{path}", primaryPath)
-                updatePrefs({ autoOpenOnLaunchPathPrimary: "" })
+                commitPrefs({ autoOpenOnLaunchPathPrimary: "" })
             }
         }
         var secB64 = ""
@@ -5005,7 +5088,7 @@ ApplicationWindow {
                 statusLine = tr("status.auto-open-file-missing",
                     "Auto-open file not found at {path}. Choose a file to attach.")
                     .replace("{path}", secondaryPath)
-                updatePrefs({ autoOpenOnLaunchPathSecondary: "" })
+                commitPrefs({ autoOpenOnLaunchPathSecondary: "" })
             }
         }
         if (primB64 === "" && secB64 === "") return
@@ -6192,7 +6275,8 @@ ApplicationWindow {
         } else {
             contentHash = _clientStubHash(rulesJson)
         }
-        reviewFlowController.startRulesReviewFlow(rulesJson, contentHash)
+        reviewFlowController.startRulesReviewFlow(
+            rulesJson, contentHash, false, "demo-rules")
     }
 
     /// Canonicalise an `R-NNNN` style rule id by stripping the
@@ -7235,7 +7319,7 @@ ApplicationWindow {
     // window's `onClosing` handler keeps the flag true regardless of how
     // it is closed, so re-showing it needs no flag reset.
     function restartFirstRunFlow() {
-        updatePrefs({
+        commitPrefs({
             serviceInstallUacDeclinedCount: 0,
             serviceInstallPromptSuppressed: false
         })
@@ -7279,7 +7363,7 @@ ApplicationWindow {
             if (String(operation) === "install") {
                 var current = parseInt(prefs.serviceInstallUacDeclinedCount || 0)
                 var now = Math.floor(Date.now() / 1000)
-                updatePrefs({
+                commitPrefs({
                     serviceInstallUacDeclinedCount: current + 1,
                     serviceInstallUacDeclinedAtEpoch: now
                 })
@@ -7292,7 +7376,7 @@ ApplicationWindow {
                 // Clear the decline counter on successful install so a
                 // future stop-then-uninstall flow doesn't inherit
                 // stale state.
-                updatePrefs({
+                commitPrefs({
                     serviceInstallUacDeclinedCount: 0
                 })
             }

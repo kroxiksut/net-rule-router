@@ -107,7 +107,14 @@ impl ExplainResponse {
 /// One-line summary of the routing decision outcome.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExplainSummarySection {
-    /// Localization key describing what happened (e.g., `explain.summary.route_primary`).
+    /// Localization key describing what happened (e.g.
+    /// `diag.explain.summary.route-primary`).
+    ///
+    /// Kebab-case under a root family, because the catalogue validator accepts
+    /// only lowercase letters, digits and hyphens in a segment — a key with an
+    /// underscore is not merely ignored, it makes the whole locale file be
+    /// rejected. The examples here used to be snake_case, which is the shape
+    /// nobody could ever add to `locales/`.
     pub summary_key: String,
     /// Whether this result is a diagnostic simulation, not an applied decision.
     pub is_simulation: bool,
@@ -191,7 +198,8 @@ pub struct ExplainAvailabilitySection {
 /// Final routing action section.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExplainFinalActionSection {
-    /// Localization key for the final action (e.g., `explain.final_action.route_primary`).
+    /// Localization key for the final action (e.g.
+    /// `diag.explain.final-action.route-primary`); same kebab-case rule as above.
     pub action_key: String,
     /// Route role applied (`"primary"`, `"secondary"`, or `None`).
     #[serde(skip_serializing_if = "Option::is_none")]

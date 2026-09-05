@@ -302,12 +302,22 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
     SystemdInstallPlan {
         unit_path: Path::new(SYSTEMD_UNIT_DIR).join(SYSTEMD_UNIT_NAME),
         unit_contents: render_service_unit(cfg),
-        additional_files: vec![InstallFile {
-            path: crate::logrotate::config_file(),
-            contents: crate::logrotate::render_logrotate_config(),
-            // /etc/logrotate.d configs are world-readable by convention.
-            mode: 0o644,
-        }],
+        additional_files: vec![
+            InstallFile {
+                path: crate::logrotate::config_file(),
+                contents: crate::logrotate::render_logrotate_config(),
+                // /etc/logrotate.d configs are world-readable by convention.
+                mode: 0o644,
+            },
+            // Without these action definitions polkit answers "unknown action"
+            // to every privileged request from an ordinary user, and no
+            // administrator rule can grant what was never declared.
+            InstallFile {
+                path: crate::polkit_policy::actions_file(),
+                contents: crate::polkit_policy::render_actions_file(),
+                mode: 0o644,
+            },
+        ],
         symlinks: alias_link(&cfg.binary_path).into_iter().collect(),
         post_write_commands,
     }
@@ -356,7 +366,10 @@ pub struct SystemdUninstallPlan {
 /// footprint — a dangling link to a deleted binary is exactly the kind of debris
 /// the next installer trips over.
 pub fn plan_uninstall(binary_path: Option<&Path>) -> SystemdUninstallPlan {
-    let mut files_to_remove = vec![crate::logrotate::config_file()];
+    let mut files_to_remove = vec![
+        crate::logrotate::config_file(),
+        crate::polkit_policy::actions_file(),
+    ];
     if let Some(alias) = binary_path.and_then(alias_link) {
         files_to_remove.push(alias.link_path);
     }
@@ -707,8 +720,8 @@ mod tests {
     #[test]
     fn install_plan_writes_the_logrotate_backstop_dropin() {
         let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
-        // Exactly one additional file: the logrotate drop-in.
-        assert_eq!(plan.additional_files.len(), 1);
+        // Two additional files: the logrotate drop-in and the polkit actions.
+        assert_eq!(plan.additional_files.len(), 2);
         let dropin = &plan.additional_files[0];
         assert_eq!(dropin.path, PathBuf::from("/etc/logrotate.d/netrulerouter"));
         // World-readable /etc config.
@@ -717,6 +730,30 @@ mod tests {
         // tests prove is scoped to /var/log and never audit).
         assert_eq!(dropin.contents, crate::logrotate::render_logrotate_config());
         assert!(dropin.contents.contains("/var/log/netrulerouter"));
+    }
+
+    /// Without the action file polkit answers "unknown action" and every
+    /// privileged request from an ordinary user is refused — with no rule an
+    /// administrator could write to allow it. Install has to put it there.
+    #[test]
+    fn install_plan_writes_the_polkit_action_definitions() {
+        let plan = plan_install(&sample_config(), UnitActivation::EnableNow);
+        let actions = plan
+            .additional_files
+            .iter()
+            .find(|f| f.path == crate::polkit_policy::actions_file())
+            .expect("install must write the polkit action file");
+        assert_eq!(
+            actions.path,
+            PathBuf::from("/usr/share/polkit-1/actions/netrulerouter.policy")
+        );
+        // polkit reads this as any user's session would; 0644 like the rest of
+        // /usr/share.
+        assert_eq!(actions.mode, 0o644);
+        assert_eq!(
+            actions.contents,
+            crate::polkit_policy::render_actions_file()
+        );
     }
 
     #[test]
@@ -742,7 +779,10 @@ mod tests {
         let plan = plan_uninstall(None);
         assert_eq!(
             plan.additional_files_to_remove,
-            vec![crate::logrotate::config_file()]
+            vec![
+                crate::logrotate::config_file(),
+                crate::polkit_policy::actions_file()
+            ]
         );
         assert_eq!(
             plan.unit_path,

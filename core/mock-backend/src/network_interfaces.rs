@@ -21,16 +21,8 @@ use nrr_shared::{
     RouteSelectionState,
 };
 
-pub const INTERFACES_PREVIEW_NOTICE: &str =
-    "Preview/setup mode: selecting interfaces here does not apply routing policy.";
 pub const INTERFACES_ROLE_EXPLANATION: &str =
     "Primary route is the default preferred interface; secondary route is the fallback route.";
-pub const INTERFACES_DATA_SCOPE_NOTE: &str =
-    "Interface metadata is real where available; routing-policy availability checks are placeholders in preview mode.";
-pub const RECOMMENDATION_ADVISORY_NOTE: &str =
-    "Recommendations are advisory-only and never auto-assign primary/secondary roles.";
-pub const ADAPTER_CHECKS_INTEGRATION_NOTE: &str =
-    "Adapter check results are computed in core and reused by diagnostics/explain surfaces.";
 
 const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 3] = [
     RouteBehaviorMode::PreferPrimary,
@@ -68,12 +60,9 @@ impl Default for RouteSelectionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfacesRoutesPreviewSnapshot {
     pub data_source: InterfacesDataSource,
-    pub preview_notice: &'static str,
     pub role_explanation: &'static str,
-    pub data_scope_note: &'static str,
     pub supported_behavior_modes: &'static [RouteBehaviorMode],
     pub selected_behavior_mode: RouteBehaviorMode,
-    pub recommendation_policy_note: &'static str,
     pub role_assignment_advisory: RoleAssignmentAdvisory,
     pub rows: Vec<InterfaceRouteRow>,
 }
@@ -97,7 +86,6 @@ pub struct InterfaceDiagnosticsChecksRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceDiagnosticsChecksSnapshot {
     pub data_source: InterfacesDataSource,
-    pub integration_note: &'static str,
     pub rows: Vec<InterfaceDiagnosticsChecksRow>,
 }
 
@@ -148,19 +136,24 @@ fn build_preview_snapshot(
     request: &RouteSelectionRequest,
 ) -> InterfacesRoutesPreviewSnapshot {
     if !request.include_bluetooth_adapters {
-        rows.retain(|row| !row.is_bluetooth_like);
+        // A row the user CONFIRMED for a role survives the filter whatever the
+        // toggle says. `is_bluetooth_like` is a substring guess ("pan" matches
+        // more than Bluetooth PAN), and dropping the confirmed adapter on a
+        // false positive made it vanish from the screen under "Confirmed
+        // primary adapter is currently unavailable in this snapshot" — a
+        // message about an adapter that is present and working. It also made
+        // the "confirmed primary uses Bluetooth" warning unreachable: the row
+        // it warns about had already been removed.
+        rows.retain(|row| !row.is_bluetooth_like || is_confirmed_for_a_role(row, request));
     }
     assign_recommendations(&mut rows, request);
     let role_assignment_advisory = assign_preview_roles(&mut rows, request);
 
     InterfacesRoutesPreviewSnapshot {
         data_source,
-        preview_notice: INTERFACES_PREVIEW_NOTICE,
         role_explanation: INTERFACES_ROLE_EXPLANATION,
-        data_scope_note: INTERFACES_DATA_SCOPE_NOTE,
         supported_behavior_modes: &SUPPORTED_ROUTE_BEHAVIOR_MODES,
         selected_behavior_mode: request.behavior_mode,
-        recommendation_policy_note: RECOMMENDATION_ADVISORY_NOTE,
         role_assignment_advisory,
         rows,
     }
@@ -201,11 +194,51 @@ pub fn interface_diagnostics_checks_from_rows(
         })
         .collect::<Vec<_>>();
 
-    InterfaceDiagnosticsChecksSnapshot {
-        data_source,
-        integration_note: ADAPTER_CHECKS_INTEGRATION_NOTE,
-        rows,
-    }
+    InterfaceDiagnosticsChecksSnapshot { data_source, rows }
+}
+
+/// Did the user confirm this row for either role?
+///
+/// Matched the way the resolvers match — id first, then name — so "the user
+/// picked this one" means the same thing here as where the role is assigned.
+fn is_confirmed_for_a_role(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> bool {
+    let named = |confirmed: bool, id: Option<&str>, name: Option<&str>| {
+        confirmed
+            && (id.map(str::trim).is_some_and(|value| {
+                !value.is_empty() && row.persistent_id.eq_ignore_ascii_case(value)
+            }) || name.map(str::trim).is_some_and(|value| {
+                !value.is_empty() && row.windows_name.eq_ignore_ascii_case(value)
+            }))
+    };
+    named(
+        request.primary_candidate_confirmed,
+        request.primary_candidate_id.as_deref(),
+        request.primary_candidate_name.as_deref(),
+    ) || named(
+        request.secondary_candidate_confirmed,
+        request.secondary_candidate_id.as_deref(),
+        request.secondary_candidate_name.as_deref(),
+    )
+}
+
+/// Would the router actually route through this adapter?
+///
+/// `has_forwarding_path` is the platform layer's own answer, computed for
+/// exactly the case a visible default route misses: OpenVPN / WireGuard TUN
+/// links install split-defaults pointing at the tunnel PEER and report no
+/// gateway at all, so judging them by `has_default_route` alone called a
+/// perfectly healthy tunnel degraded — the one thing
+/// `nrr_platform_api::interface_rows` promises the GUI will never do. `None`
+/// means the layer could not tell, and then the visible default route is the
+/// best evidence there is.
+fn carries_traffic(row: &InterfaceRouteRow) -> bool {
+    row.has_forwarding_path.unwrap_or(row.has_default_route)
+}
+
+/// A link that routes without advertising a gateway — the shape that made the
+/// old check wrong, kept separate so the reason reaches the user.
+fn routes_without_a_gateway(row: &InterfaceRouteRow) -> bool {
+    carries_traffic(row) && !(row.has_default_route && row.gateway != "-")
 }
 
 fn assign_preview_roles(
@@ -281,11 +314,6 @@ fn resolve_explicit_primary_index(
     }
 
     if let Some(index) = resolve_id_index(rows, request.primary_candidate_id.as_deref(), None) {
-        return Some(index);
-    }
-
-    if let Some(index) = resolve_named_index(rows, request.primary_candidate_name.as_deref(), None)
-    {
         return Some(index);
     }
 
@@ -487,10 +515,16 @@ fn evaluate_check_route(row: &InterfaceRouteRow) -> AdapterCheckResult {
             AdapterCheckResultStatus::Success,
             "The adapter reports a default route and a gateway.",
         )
+    } else if routes_without_a_gateway(row) {
+        (
+            AdapterCheckResultStatus::Success,
+            "The adapter advertises no gateway, but a usable forwarding path was found for it \
+             — the shape a VPN tunnel normally has.",
+        )
     } else {
         (
             AdapterCheckResultStatus::Degraded,
-            "The adapter reports no default route, or no gateway.",
+            "The adapter reports no default route, no gateway, and no usable forwarding path.",
         )
     };
 
@@ -605,10 +639,16 @@ struct RecommendationScore {
 }
 
 fn assign_recommendations(rows: &mut [InterfaceRouteRow], request: &RouteSelectionRequest) {
+    // The SAME resolution the role assignment uses, so the pin that scores and
+    // the pin that gets the role can never be two different adapters. Matching
+    // "id or name" here instead let a stale name out of a renamed adapter hand
+    // the +5 and the tie-break to a row that holds no role.
+    let explicit = ExplicitChoices::resolve(rows, request);
+
     let scores = rows
         .iter()
         .enumerate()
-        .map(|(index, row)| (index, evaluate_recommendation_score(row, request)))
+        .map(|(index, row)| (index, evaluate_recommendation_score(row, index, explicit)))
         .collect::<Vec<_>>();
 
     let best_primary_index = scores
@@ -617,7 +657,7 @@ fn assign_recommendations(rows: &mut [InterfaceRouteRow], request: &RouteSelecti
         .max_by_key(|(index, score)| {
             (
                 score.primary_score,
-                primary_tie_break_weight(&rows[*index], request),
+                primary_tie_break_weight(&rows[*index], *index, explicit),
             )
         })
         .map(|(index, _)| *index);
@@ -628,7 +668,7 @@ fn assign_recommendations(rows: &mut [InterfaceRouteRow], request: &RouteSelecti
         .max_by_key(|(index, score)| {
             (
                 score.secondary_score,
-                secondary_tie_break_weight(&rows[*index], request),
+                secondary_tie_break_weight(&rows[*index], *index, explicit),
             )
         })
         .map(|(index, _)| *index);
@@ -681,7 +721,8 @@ fn assign_recommendations(rows: &mut [InterfaceRouteRow], request: &RouteSelecti
 
 fn evaluate_recommendation_score(
     row: &InterfaceRouteRow,
-    request: &RouteSelectionRequest,
+    index: usize,
+    explicit: ExplicitChoices,
 ) -> RecommendationScore {
     let mut primary_score = 0;
     let mut secondary_score = 0;
@@ -692,11 +733,20 @@ fn evaluate_recommendation_score(
         blocked = true;
         key_signals.push("blocked-unavailable-interface".to_string());
     }
-    if row.local_ip == "-" {
+    if row.runtime_data_unavailable {
+        // Every row reads "-" because the query failed. Blocking here would
+        // report "no usable adapter" for a machine whose link is fine.
+        key_signals.push("adapter-data-unreadable".to_string());
+    } else if row.local_ip == "-" {
         blocked = true;
         key_signals.push("blocked-missing-local-ip".to_string());
     }
-    if row.derived_assessment.service_interface_likelihood == DerivedLikelihood::Likely {
+    // Two of the three signals behind the service-interface verdict are "no
+    // gateway, no IP" and "connectivity unknown" — exactly what an unreadable
+    // query looks like — so it cannot block when the data never arrived.
+    if row.derived_assessment.service_interface_likelihood == DerivedLikelihood::Likely
+        && !row.runtime_data_unavailable
+    {
         blocked = true;
         key_signals.push("blocked-service-interface-likely".to_string());
     }
@@ -732,6 +782,29 @@ fn evaluate_recommendation_score(
     if row.has_default_route {
         primary_score += 3;
         key_signals.push("has-default-route".to_string());
+    } else if carries_traffic(row) {
+        // A gateway-less tunnel routes as well as anything; it just says so
+        // differently. Scoring it as "no default route" pushed a healthy
+        // WireGuard link down by 2 and handed the +1 to whatever else was
+        // around.
+        primary_score += 3;
+        key_signals.push("forwarding-path-without-gateway".to_string());
+    } else if row.has_forwarding_path == Some(false)
+        && row.derived_assessment.vpn_tunnel_likelihood != DerivedLikelihood::Likely
+    {
+        // The platform layer looked and found no way out through this adapter,
+        // and it does not look like a tunnel either — a host-only virtual
+        // switch, an adapter with no usable next hop. Preferring THAT as the
+        // secondary is the worst outcome available: rules would be routed into
+        // a link that reaches nothing.
+        //
+        // A VPN-shaped adapter is deliberately exempt: at the moment the user
+        // is choosing their secondary the tunnel is usually still down, which
+        // is the same `Some(false)`. Penalising it there would stop the app
+        // recommending the very adapter the user came to bind.
+        primary_score -= 2;
+        secondary_score -= 3;
+        key_signals.push("no-forwarding-path".to_string());
     } else {
         primary_score -= 2;
         secondary_score += 1;
@@ -783,11 +856,11 @@ fn evaluate_recommendation_score(
         key_signals.push("bluetooth-adapter-nondefault-routing-profile".to_string());
     }
 
-    if is_explicit_primary_choice(row, request) {
+    if explicit.is_primary(index) {
         primary_score += 5;
         key_signals.push("manual-primary-pin".to_string());
     }
-    if is_explicit_secondary_choice(row, request) {
+    if explicit.is_secondary(index) {
         secondary_score += 5;
         key_signals.push("manual-secondary-pin".to_string());
     }
@@ -822,23 +895,31 @@ fn evaluate_recommendation_score(
     }
 }
 
-fn primary_tie_break_weight(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> i32 {
+fn primary_tie_break_weight(
+    row: &InterfaceRouteRow,
+    index: usize,
+    explicit: ExplicitChoices,
+) -> i32 {
     let mut weight = 0;
-    if is_explicit_primary_choice(row, request) {
+    if explicit.is_primary(index) {
         weight += 100;
     }
     if !row.persistent_id.trim().is_empty() {
         weight += 10;
     }
-    if row.has_default_route {
+    if carries_traffic(row) {
         weight += 5;
     }
     weight
 }
 
-fn secondary_tie_break_weight(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> i32 {
+fn secondary_tie_break_weight(
+    row: &InterfaceRouteRow,
+    index: usize,
+    explicit: ExplicitChoices,
+) -> i32 {
     let mut weight = 0;
-    if is_explicit_secondary_choice(row, request) {
+    if explicit.is_secondary(index) {
         weight += 100;
     }
     if !row.persistent_id.trim().is_empty() {
@@ -850,38 +931,29 @@ fn secondary_tie_break_weight(row: &InterfaceRouteRow, request: &RouteSelectionR
     weight
 }
 
-fn is_explicit_primary_choice(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> bool {
-    if !request.primary_candidate_confirmed {
-        return false;
-    }
-
-    request
-        .primary_candidate_id
-        .as_deref()
-        .map(|value| row.persistent_id.eq_ignore_ascii_case(value.trim()))
-        .unwrap_or(false)
-        || request
-            .primary_candidate_name
-            .as_deref()
-            .map(|value| row.windows_name.eq_ignore_ascii_case(value.trim()))
-            .unwrap_or(false)
+/// The rows the user's confirmed pins resolve to, resolved once per pass.
+#[derive(Clone, Copy, Debug, Default)]
+struct ExplicitChoices {
+    primary: Option<usize>,
+    secondary: Option<usize>,
 }
 
-fn is_explicit_secondary_choice(row: &InterfaceRouteRow, request: &RouteSelectionRequest) -> bool {
-    if !request.secondary_candidate_confirmed {
-        return false;
+impl ExplicitChoices {
+    fn resolve(rows: &[InterfaceRouteRow], request: &RouteSelectionRequest) -> Self {
+        let primary = resolve_explicit_primary_index(rows, request);
+        Self {
+            primary,
+            secondary: resolve_explicit_secondary_index(rows, request, primary),
+        }
     }
 
-    request
-        .secondary_candidate_id
-        .as_deref()
-        .map(|value| row.persistent_id.eq_ignore_ascii_case(value.trim()))
-        .unwrap_or(false)
-        || request
-            .secondary_candidate_name
-            .as_deref()
-            .map(|value| row.windows_name.eq_ignore_ascii_case(value.trim()))
-            .unwrap_or(false)
+    fn is_primary(self, index: usize) -> bool {
+        self.primary == Some(index)
+    }
+
+    fn is_secondary(self, index: usize) -> bool {
+        self.secondary == Some(index)
+    }
 }
 
 fn recommendation_summary_for_class(class: RecommendationClass) -> String {
@@ -949,6 +1021,7 @@ mod tests {
                 dns_servers: "1.1.1.1".to_string(),
                 has_default_route: true,
                 has_forwarding_path: Some(true),
+                runtime_data_unavailable: false,
                 availability_status: super::BasicAvailabilityStatus::Available,
                 observed_facts: super::build_observed_facts(
                     super::BasicAvailabilityStatus::Available,
@@ -980,6 +1053,7 @@ mod tests {
                 gateway: "-".to_string(),
                 dns_servers: "-".to_string(),
                 has_forwarding_path: Some(false),
+                runtime_data_unavailable: false,
                 has_default_route: false,
                 availability_status: super::BasicAvailabilityStatus::Unavailable,
                 observed_facts: super::build_observed_facts(
@@ -1024,10 +1098,6 @@ mod tests {
     fn snapshot_exposes_preview_contract_markers() {
         let snapshot = interfaces_routes_preview_snapshot(RouteSelectionRequest::default());
         assert!(!snapshot.rows.is_empty());
-        assert!(snapshot.preview_notice.contains("Preview/setup mode"));
-        assert!(snapshot
-            .recommendation_policy_note
-            .contains("advisory-only"));
         assert!(snapshot
             .supported_behavior_modes
             .contains(&RouteBehaviorMode::StrictSecondaryFailClosed));
@@ -1098,6 +1168,69 @@ mod tests {
         assert!(snapshot.rows.iter().all(|row| row.selected_role.is_none()));
     }
 
+    /// A failed IP Helper query leaves EVERY row at `"-"`. Read as "this
+    /// adapter has no address" it blocks all of them, and a machine with a
+    /// working link is told it has no usable adapter.
+    #[test]
+    fn a_failed_data_query_does_not_block_every_adapter() {
+        let mut row = InterfaceRouteRow {
+            persistent_id: "win-adapter:primary".to_string(),
+            adapter_name: "{PRIMARY-ADAPTER}".to_string(),
+            windows_name: "Primary".to_string(),
+            interface_description: "Primary adapter".to_string(),
+            interface_type: "Ethernet".to_string(),
+            is_bluetooth_like: false,
+            local_ip: "-".to_string(),
+            gateway: "-".to_string(),
+            dns_servers: "-".to_string(),
+            has_default_route: false,
+            has_forwarding_path: None,
+            runtime_data_unavailable: true,
+            availability_status: super::BasicAvailabilityStatus::Available,
+            observed_facts: super::build_observed_facts(
+                super::BasicAvailabilityStatus::Available,
+                "-",
+                "-",
+            ),
+            derived_assessment: super::build_derived_assessment(
+                "Primary",
+                "Ethernet",
+                "Primary adapter",
+                "{PRIMARY-ADAPTER}",
+                "-",
+                "-",
+                false,
+                ConnectivityState::Unknown,
+            ),
+            recommendation: super::unknown_recommendation(),
+            selected_role: None,
+            route_state: RouteSelectionState::NotSelected,
+        };
+
+        let explicit = super::ExplicitChoices {
+            primary: None,
+            secondary: None,
+        };
+        let unreadable = super::evaluate_recommendation_score(&row, 0, explicit);
+        assert!(
+            !unreadable.blocked,
+            "a query that failed is not evidence the adapter is unusable"
+        );
+        assert!(unreadable
+            .key_signals
+            .iter()
+            .any(|s| s == "adapter-data-unreadable"));
+
+        // The same row without the flag IS a genuine "no address" reading.
+        row.runtime_data_unavailable = false;
+        let genuine = super::evaluate_recommendation_score(&row, 0, explicit);
+        assert!(genuine.blocked);
+        assert!(genuine
+            .key_signals
+            .iter()
+            .any(|s| s == "blocked-missing-local-ip"));
+    }
+
     #[test]
     fn recommendation_engine_marks_primary_and_secondary_candidates() {
         // Fixed two-adapter fixture (strong wired link + VPN-shaped tunnel) run
@@ -1115,6 +1248,7 @@ mod tests {
             dns_servers: "1.1.1.1".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
+            runtime_data_unavailable: false,
             availability_status: super::BasicAvailabilityStatus::Available,
             observed_facts: super::build_observed_facts(
                 super::BasicAvailabilityStatus::Available,
@@ -1147,6 +1281,7 @@ mod tests {
             dns_servers: "-".to_string(),
             has_default_route: false,
             has_forwarding_path: Some(false),
+            runtime_data_unavailable: false,
             availability_status: super::BasicAvailabilityStatus::Available,
             observed_facts: super::build_observed_facts(
                 super::BasicAvailabilityStatus::Available,
@@ -1185,6 +1320,150 @@ mod tests {
             .all(|row| row.recommendation.advisory_only));
     }
 
+    /// The platform layer computes `has_forwarding_path` for exactly the link a
+    /// visible default route misses: a TUN tunnel that points its split-default
+    /// at the PEER and advertises no gateway at all. Judging it by
+    /// `has_default_route` called a healthy tunnel degraded — the one thing
+    /// `nrr_platform_api::interface_rows` promises the GUI will never do.
+    #[test]
+    fn a_gatewayless_link_with_a_forwarding_path_is_not_called_degraded() {
+        let mut rows = fallback_rows();
+        let vpn = rows
+            .iter_mut()
+            .find(|row| row.windows_name == "VPN")
+            .expect("fallback set has a VPN row");
+        vpn.has_default_route = false;
+        vpn.gateway = "-".to_string();
+        vpn.has_forwarding_path = Some(true);
+        vpn.availability_status = super::BasicAvailabilityStatus::Available;
+        vpn.observed_facts.connectivity_state = ConnectivityState::Available;
+
+        let checks = super::evaluate_adapter_checks(find_row(&rows, "VPN"));
+        let route_check = checks
+            .iter()
+            .find(|c| c.action == nrr_shared::AdapterCheckActionId::CheckRoute)
+            .expect("route check present");
+        assert_eq!(
+            route_check.status,
+            nrr_shared::AdapterCheckResultStatus::Success,
+            "a usable forwarding path is a route, gateway or not: {}",
+            route_check.explanation
+        );
+
+        // Positive control: with the platform layer reporting no way out, the
+        // same row is still degraded.
+        let mut cold = rows.clone();
+        cold.iter_mut()
+            .find(|row| row.windows_name == "VPN")
+            .expect("row")
+            .has_forwarding_path = Some(false);
+        let checks = super::evaluate_adapter_checks(find_row(&cold, "VPN"));
+        let route_check = checks
+            .iter()
+            .find(|c| c.action == nrr_shared::AdapterCheckActionId::CheckRoute)
+            .expect("route check present");
+        assert_eq!(
+            route_check.status,
+            nrr_shared::AdapterCheckResultStatus::Degraded
+        );
+    }
+
+    /// An adapter the platform layer says reaches nothing must not be the
+    /// PREFERRED secondary — rules would be routed into a link that goes
+    /// nowhere. The exemption that keeps the setup flow working is tested with
+    /// it: a VPN-shaped adapter is normally down at the moment the user binds
+    /// it, and that is the same `Some(false)`.
+    #[test]
+    fn an_adapter_with_no_way_out_is_not_recommended_unless_it_looks_like_a_tunnel() {
+        let mut rows = fallback_rows();
+        for row in rows.iter_mut() {
+            if row.windows_name == "Wi-Fi" {
+                row.has_default_route = false;
+                row.gateway = "-".to_string();
+                row.has_forwarding_path = Some(false);
+            }
+        }
+        assign_recommendations(&mut rows, &RouteSelectionRequest::default());
+        assert!(find_row(&rows, "Wi-Fi")
+            .recommendation
+            .key_signals
+            .iter()
+            .any(|s| s == "no-forwarding-path"));
+        assert_ne!(
+            find_row(&rows, "Wi-Fi").recommendation.class,
+            nrr_shared::RecommendationClass::PreferredSecondary
+        );
+
+        // The VPN row of the same fixture already carries
+        // `has_forwarding_path: Some(false)` and a tunnel likelihood — it keeps
+        // its old score, because a tunnel that is not up yet is the normal
+        // state at binding time.
+        assert!(!find_row(&rows, "VPN")
+            .recommendation
+            .key_signals
+            .iter()
+            .any(|s| s == "no-forwarding-path"));
+    }
+
+    #[test]
+    fn a_stale_name_does_not_pin_a_second_adapter() {
+        // Rename an adapter and the saved name still matches the row that took
+        // it over, while the saved id keeps pointing at the original. The role
+        // goes to the id (id-first resolution), so the scoring bonus must go
+        // there too — otherwise the GUI recommends one adapter while another
+        // holds the role.
+        let mut rows = fallback_rows();
+        let request = RouteSelectionRequest {
+            primary_candidate_id: Some("win-adapter:ethernet-fallback".to_string()),
+            primary_candidate_name: Some("Wi-Fi".to_string()),
+            primary_candidate_confirmed: true,
+            secondary_candidate_id: None,
+            secondary_candidate_name: None,
+            secondary_candidate_confirmed: false,
+            include_bluetooth_adapters: false,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        };
+        assign_preview_roles(&mut rows, &request);
+        assign_recommendations(&mut rows, &request);
+
+        assert_eq!(
+            find_row(&rows, "Ethernet").selected_role,
+            Some(RouteRole::Primary)
+        );
+        assert!(find_row(&rows, "Ethernet")
+            .recommendation
+            .key_signals
+            .iter()
+            .any(|s| s == "manual-primary-pin"));
+        assert!(!find_row(&rows, "Wi-Fi")
+            .recommendation
+            .key_signals
+            .iter()
+            .any(|s| s == "manual-primary-pin"));
+    }
+
+    #[test]
+    fn an_empty_id_is_not_an_explicit_choice() {
+        let mut rows = fallback_rows();
+        let request = RouteSelectionRequest {
+            primary_candidate_id: Some(String::new()),
+            primary_candidate_name: None,
+            primary_candidate_confirmed: true,
+            secondary_candidate_id: None,
+            secondary_candidate_name: None,
+            secondary_candidate_confirmed: false,
+            include_bluetooth_adapters: false,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        };
+        assign_recommendations(&mut rows, &request);
+
+        assert!(rows.iter().all(|row| !row
+            .recommendation
+            .key_signals
+            .iter()
+            .any(|s| s == "manual-primary-pin")));
+    }
+
     #[test]
     fn bluetooth_rows_are_hidden_by_default() {
         let mut rows = fallback_rows();
@@ -1193,6 +1472,52 @@ mod tests {
             .any(|row| row.windows_name == "Bluetooth PAN" && row.is_bluetooth_like));
         rows.retain(|row| !row.is_bluetooth_like);
         assert!(!rows.iter().any(|row| row.windows_name == "Bluetooth PAN"));
+    }
+
+    /// The row the user confirmed is never filtered away by a substring guess.
+    /// Before this, a false "pan" match made the confirmed adapter disappear
+    /// under "Confirmed primary adapter is currently unavailable in this
+    /// snapshot" — about an adapter that is present and working — and the
+    /// Bluetooth warning that exists for exactly this case could never fire.
+    #[test]
+    fn a_confirmed_adapter_survives_the_bluetooth_filter() {
+        let request = RouteSelectionRequest {
+            primary_candidate_id: None,
+            primary_candidate_name: Some("Bluetooth PAN".to_string()),
+            primary_candidate_confirmed: true,
+            secondary_candidate_id: None,
+            secondary_candidate_name: None,
+            secondary_candidate_confirmed: false,
+            include_bluetooth_adapters: false,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+        };
+        let snapshot = decorate_interface_rows(
+            fallback_rows(),
+            &request,
+            InterfacesDataSource::FallbackMock,
+        );
+
+        let kept = find_row(&snapshot.rows, "Bluetooth PAN");
+        assert_eq!(kept.selected_role, Some(RouteRole::Primary));
+        assert!(
+            snapshot
+                .role_assignment_advisory
+                .warnings
+                .iter()
+                .any(|w| w.contains("Bluetooth")),
+            "the warning about the confirmed choice must be reachable"
+        );
+
+        // Negative control: an UNCONFIRMED Bluetooth row is still filtered out.
+        let snapshot = decorate_interface_rows(
+            fallback_rows(),
+            &RouteSelectionRequest::default(),
+            InterfacesDataSource::FallbackMock,
+        );
+        assert!(!snapshot
+            .rows
+            .iter()
+            .any(|row| row.windows_name == "Bluetooth PAN"));
     }
 
     #[test]
@@ -1348,7 +1673,6 @@ mod tests {
     fn diagnostics_checks_snapshot_uses_required_status_set() {
         let snapshot = interface_diagnostics_checks_snapshot(RouteSelectionRequest::default());
         assert!(!snapshot.rows.is_empty());
-        assert!(snapshot.integration_note.contains("core"));
         let statuses = snapshot
             .rows
             .iter()

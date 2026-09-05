@@ -34,8 +34,9 @@ use nrr_service_runtime::managers::HealthReporter;
 use nrr_service_runtime::state::ServiceRuntimeState;
 use nrr_service_runtime::{
     install_ndjson_tracing, run_bootstrap, run_supervised_runtime, BootstrapConfig,
-    ContractNegotiateHandler, EventBus, HealthAggregator, IpcHandlerRegistry, ServiceController,
-    ServiceHealthHandler, StatusUpdatesSubscribeHandler, StopToken,
+    ContractNegotiateHandler, EventBus, HealthAggregator, HealthComponent, IpcHandlerRegistry,
+    ServiceController, ServiceHealthHandler, ServiceSnapshot, StatusUpdatesSubscribeHandler,
+    StopToken,
 };
 use nrr_shared::ipc::IpcOperationName;
 use nrr_storage::StorageProfile;
@@ -99,7 +100,6 @@ pub fn run() -> ExitCode {
     let interval = watchdog_interval(std::env::var("WATCHDOG_USEC").ok().as_deref())
         .unwrap_or(DEFAULT_WATCHDOG_PING);
     let stop = StopToken::new();
-    spawn_watchdog(interval, stop.clone());
 
     // Catch the stop signals before anything is enforced, so there is no window
     // in which policy is installed and the only way out of it is a kill.
@@ -119,6 +119,9 @@ pub fn run() -> ExitCode {
     // aggregation, IPC accept task, retention jobs. Until this landed the daemon
     // idled in a sleep loop, so none of those existed on Linux.
     let health = Arc::new(HealthAggregator::new());
+    // Started here, not earlier, because it now VOUCHES for the runtime instead
+    // of only proving the process exists.
+    spawn_watchdog(interval, stop.clone(), Arc::clone(&health));
     // One bus, two ends: the runtime tasks publish into it, the socket server's
     // workers drain it for their subscription. Two instances would leave a
     // subscribed client silently on poll-only.
@@ -167,17 +170,31 @@ pub fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Ping systemd on its own thread at half the declared timeout.
+/// Ping systemd on its own thread at half the declared timeout, for as long as
+/// the runtime is observably alive.
 ///
 /// Separate from the runtime on purpose: a watchdog that shares a thread with
 /// the work it is supposed to vouch for stops pinging exactly when the work
 /// wedges — which is the one moment systemd needs to hear silence.
-fn spawn_watchdog(interval: Duration, stop: StopToken) {
+///
+/// It also has to be able to STOP vouching, or the separation buys nothing: an
+/// unconditional ping says "the process is scheduled", which a wedged runtime
+/// satisfies. The evidence used is the adapter monitor's health record, the one
+/// supervisor task that runs on a fixed 1 s tick — see
+/// [`runtime_looks_alive`].
+fn spawn_watchdog(interval: Duration, stop: StopToken, health: Arc<HealthAggregator>) {
     let spawned = std::thread::Builder::new()
         .name("nrr-sd-watchdog".to_owned())
         .spawn(move || {
             while !stop.is_stop_requested() {
                 std::thread::sleep(interval);
+                if !runtime_looks_alive(&health.snapshot()) {
+                    tracing::error!(
+                        target: "nrr::lifecycle",
+                        "runtime heartbeat is stale — withholding the systemd watchdog ping",
+                    );
+                    continue;
+                }
                 let _ = notify(&[NotifyState::Watchdog]);
             }
         });
@@ -188,6 +205,35 @@ fn spawn_watchdog(interval: Duration, stop: StopToken) {
             "watchdog thread could not start; systemd may restart the unit on WatchdogSec",
         );
     }
+}
+
+/// How long the runtime's heartbeat may go unrefreshed before the watchdog
+/// stops vouching for it. The adapter monitor records health every second, so
+/// this is a sixty-fold margin: it fires on a wedge, never on a slow moment.
+const RUNTIME_LIVENESS_WINDOW_SECS: u64 = 60;
+
+/// Is the runtime still doing work, as opposed to merely being scheduled?
+///
+/// Read off the ADAPTER MONITOR's record specifically, not the snapshot's own
+/// `stale` flag. That flag is true when ANY component is old, and most
+/// components are event-driven — recorded once at spawn and then correctly
+/// silent — so a healthy service reads as stale within half a minute of
+/// starting. The adapter monitor is the one task with a fixed periodic tick,
+/// which makes its timestamp the only honest heartbeat in the snapshot.
+///
+/// Absent (no adapter monitor wired) means "no evidence either way", and the
+/// watchdog keeps pinging: withholding on missing evidence would have systemd
+/// restart a service that is running fine.
+fn runtime_looks_alive(snapshot: &ServiceSnapshot) -> bool {
+    let Some(heartbeat) = snapshot
+        .components
+        .iter()
+        .find(|c| c.component == HealthComponent::Adapters)
+    else {
+        return true;
+    };
+    snapshot.snapshot_refreshed_at_epoch_secs
+        <= heartbeat.updated_at_epoch_secs + RUNTIME_LIVENESS_WINDOW_SECS
 }
 
 /// Reports runtime state to the log, since systemd has no per-state channel the
@@ -306,4 +352,54 @@ fn build_dns_observation(
         }),
         principals: Arc::new(nrr_platform_linux::logind::LogindActivePrincipals),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrr_service_runtime::state::{ServiceHealthSeverity, ServicePolicyState};
+    use nrr_service_runtime::HealthComponentSnapshot;
+
+    fn snapshot_with(adapters_age_secs: Option<u64>) -> ServiceSnapshot {
+        let now = 1_000_000u64;
+        let components = adapters_age_secs
+            .map(|age| {
+                vec![HealthComponentSnapshot {
+                    component: HealthComponent::Adapters,
+                    severity: ServiceHealthSeverity::Ok,
+                    message: "adapter monitor tick ok".to_owned(),
+                    updated_at_epoch_secs: now - age,
+                }]
+            })
+            .unwrap_or_default();
+        ServiceSnapshot {
+            state: ServiceRuntimeState::Running,
+            worst_severity: ServiceHealthSeverity::Ok,
+            components,
+            current_revision: None,
+            policy_state: ServicePolicyState::NoState,
+            snapshot_refreshed_at_epoch_secs: now,
+            stale: false,
+        }
+    }
+
+    /// The adapter monitor ticks every second. A minute of silence from it is a
+    /// wedge, and that is the case the watchdog exists to report.
+    #[test]
+    fn a_stalled_heartbeat_withholds_the_ping() {
+        assert!(runtime_looks_alive(&snapshot_with(Some(1))));
+        assert!(runtime_looks_alive(&snapshot_with(Some(
+            RUNTIME_LIVENESS_WINDOW_SECS
+        ))));
+        assert!(!runtime_looks_alive(&snapshot_with(Some(
+            RUNTIME_LIVENESS_WINDOW_SECS + 1
+        ))));
+    }
+
+    /// No adapter monitor is no evidence, not evidence of death: withholding
+    /// here would have systemd restart a service that is running fine.
+    #[test]
+    fn a_missing_heartbeat_component_keeps_the_ping() {
+        assert!(runtime_looks_alive(&snapshot_with(None)));
+    }
 }

@@ -58,10 +58,14 @@ QtObject {
     function _fileHoldsText(path, text) {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.readFileBytes !== "function") return false
+        if (typeof nrrNativeBridge.decodeBase64Utf8 !== "function") return false
         var b64 = String(nrrNativeBridge.readFileBytes(path) || "")
         if (b64 === "") return false
-        var current = ""
-        try { current = Qt.atob(b64) } catch (e) { return false }
+        // NOT `Qt.atob`: it decodes as latin-1, so every byte of a UTF-8
+        // Cyrillic comment comes back as two characters and the comparison
+        // never matches. The file was then rewritten on every save and the
+        // drift detector woke up for nothing.
+        var current = String(nrrNativeBridge.decodeBase64Utf8(b64) || "")
         return Rules.canonicalRulesBody(current) === Rules.canonicalRulesBody(text)
     }
 

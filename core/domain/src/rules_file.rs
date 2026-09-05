@@ -946,19 +946,34 @@ fn split_inline_comment(s: &str) -> (String, Option<String>) {
 /// value and before any inline `#` comment; mirrors the `+children` convention.
 const BLOCK_FLAG: &str = "+block";
 
-/// Splits a match value into its head (the actual match value) and the parsed
-/// per-rule flags, extracting the `+block` flag token.
+/// Per-rule child-process flag, documented in the rules-file format.
 ///
-/// The first whitespace-separated token is always the match value; any
-/// subsequent `+block` token is consumed and reported as `blocked = true`.
-/// Non-flag trailing tokens are preserved in the returned head so the semantic
-/// validator can still diagnose them (e.g. accidental whitespace in a value).
+/// Consumed but not acted on: the matcher needs a process-tree snapshot it is
+/// never given (see the note in `decision_rules_matching`). Consuming it is not
+/// cosmetic — left in the value, `codex.exe +children` normalised to the
+/// executable pattern `codex.exe +children.exe`, which matches nothing, so a
+/// user following the shipped documentation got a rule that silently covered
+/// no process at all. Dropped, the rule covers the named process, which is the
+/// closest thing to what was asked for.
+const CHILDREN_FLAG: &str = "+children";
+
+/// Splits a match value into its head (the actual match value) and the parsed
+/// per-rule flags, extracting the documented flag tokens.
+///
+/// The first whitespace-separated token is always the match value; a subsequent
+/// `+block` token is consumed and reported as `blocked = true`, and
+/// `+children` is consumed as well (see [`CHILDREN_FLAG`] for why it is
+/// consumed while nothing acts on it). Non-flag trailing tokens are preserved
+/// in the returned head so the semantic validator can still diagnose them
+/// (e.g. accidental whitespace in a value).
 fn extract_rule_flags(value: &str) -> (String, bool) {
     let mut blocked = false;
     let mut kept: Vec<&str> = Vec::new();
     for (idx, token) in value.split_whitespace().enumerate() {
         if idx > 0 && token == BLOCK_FLAG {
             blocked = true;
+        } else if idx > 0 && token == CHILDREN_FLAG {
+            // Consumed, not acted on — see `CHILDREN_FLAG`.
         } else {
             kept.push(token);
         }
@@ -1898,6 +1913,45 @@ browser.exe   # browser traffic
             .expect("disabled blocked rule");
         assert!(!disabled.enabled);
         assert!(disabled.blocked);
+    }
+
+    /// `+children` is documented in the rules-file format and nothing in the
+    /// matcher can act on it yet. Left in the match value it did worse than
+    /// nothing: the application normaliser turned `codex.exe +children` into
+    /// the pattern `codex.exe +children.exe`, which matches no process, so a
+    /// user following the shipped documentation got a rule covering nothing at
+    /// all. Consumed, the rule covers the named process.
+    #[test]
+    fn the_children_flag_is_consumed_instead_of_corrupting_the_value() {
+        let input = "--- Windows\ncodex.exe +children  # AI assistant\n";
+        let parsed = parse_rules_file(input).parsed;
+        let entry = parsed
+            .entries_for(RulesFileSection::Windows)
+            .iter()
+            .find(|e| e.match_value == "codex.exe")
+            .expect("the process name survives on its own");
+        assert!(!entry.blocked);
+        assert_eq!(entry.inline_comment.as_deref(), Some("AI assistant"));
+
+        // Both documented flags on one line, in either order.
+        for line in ["codex.exe +children +block", "codex.exe +block +children"] {
+            let parsed = parse_rules_file(&format!("--- Windows\n{line}\n")).parsed;
+            let entry = parsed
+                .entries_for(RulesFileSection::Windows)
+                .iter()
+                .find(|e| e.match_value == "codex.exe")
+                .unwrap_or_else(|| panic!("value survives for {line:?}"));
+            assert!(entry.blocked, "{line:?} keeps its block flag");
+        }
+
+        // Negative control: a trailing token that is NOT a documented flag
+        // still reaches the value, so the semantic validator can complain
+        // about it instead of the parser swallowing a typo.
+        let parsed = parse_rules_file("--- Windows\ncodex.exe +childern\n").parsed;
+        assert!(parsed
+            .entries_for(RulesFileSection::Windows)
+            .iter()
+            .any(|e| e.match_value.contains("+childern")));
     }
 
     #[test]

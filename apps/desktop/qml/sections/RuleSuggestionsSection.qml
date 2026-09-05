@@ -275,6 +275,9 @@ ColumnLayout {
     // card into a page. Section-local: unlike the host list, this is a reading
     // convenience, not a place the user leaves work half-done.
     readonly property int consumersShownCollapsed: 3
+    /// Observed names spelled out before the rest are counted; enough to
+    /// recognize the client behind them, short enough to stay one line.
+    readonly property int membersShownInReach: 4
     property var expandedConsumerDomains: ({})
     function _consumersExpanded(domain) { return !!section.expandedConsumerDomains[domain] }
     function _toggleConsumers(domain) {
@@ -389,6 +392,27 @@ ColumnLayout {
                 .replace("{percent}", String(Math.round(affinity * 100))))
         }
         return parts.join(" · ")
+    }
+    /// How far the rule reaches versus how far the evidence goes.
+    ///
+    /// Every offer is written as `*.x`, so accepting one routes names nobody
+    /// has seen. Listing what WAS seen is the difference between confirming an
+    /// offer and confirming a guess — a background client's six hosts under a
+    /// third-party apex is exactly how a whole domain lands on the tunnel.
+    function _reachText(host) {
+        var scope = root.tr("rules.suggestions.inbox.reach",
+                "The rule covers every name under {domain}.")
+            .replace("{domain}", String(host.match || ""))
+        var members = host.observedMembers || []
+        if (members.length === 0) return scope
+        var shownCount = Math.min(members.length, section.membersShownInReach)
+        var shown = members.slice(0, shownCount).join(", ")
+        if (members.length > shownCount) {
+            shown += " " + root.tr("rules.suggestions.inbox.reach-more", "+{count} more")
+                .replace("{count}", String(members.length - shownCount))
+        }
+        return scope + " " + root.tr("rules.suggestions.inbox.reach-seen", "Seen so far: {hosts}.")
+            .replace("{hosts}", shown)
     }
     /// What the main route does with this address — a FACT, never advice.
     ///
@@ -920,6 +944,14 @@ ColumnLayout {
                                         font.pixelSize: 12
                                         color: root.mutedTextColor
                                         text: section._evidence(modelData)
+                                        visible: text !== ""
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.Wrap
+                                        font.pixelSize: 12
+                                        color: root.mutedTextColor
+                                        text: section._reachText(modelData)
                                         visible: text !== ""
                                     }
                                 }

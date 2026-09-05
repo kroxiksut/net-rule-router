@@ -618,7 +618,12 @@ GroupBox {
             text: root.tr("settings.service.action.open-logs",
                 "Open service logs folder")
             icon.source: root.uiIconSource("logs")
+            // Also gated on the folder being readable by THIS user: the service
+            // keeps its log directory closed to ordinary accounts, and opening a
+            // window the user cannot list explains nothing. The launch context
+            // carries a URL only when the folder can actually be listed.
             enabled: group._serviceAvailable()
+                && String(((root.context.about || {}).logsFolderUrl) || "") !== ""
             onClicked: {
                 if (!group._serviceAvailable()) { return }
                 var p = String(nrrServiceController.serviceLogsDirectoryPath() || "")

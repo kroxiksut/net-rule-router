@@ -93,13 +93,33 @@ impl IpcClientProfile {
     /// The narrower of two profiles: what the OS proved, and what the caller
     /// declared. Declaration never widens.
     pub fn narrowed_by(self, declared: Self) -> Self {
-        // Ordering is by capability, and only the console is narrower than the
-        // rest — a two-value comparison rather than a general lattice, because
-        // inventing an order over "gui vs tray" would be fiction.
-        if declared == Self::AdminConsole || self == Self::AdminConsole {
-            Self::AdminConsole
-        } else {
+        if self.capability_rank() <= declared.capability_rank() {
             self
+        } else {
+            declared
+        }
+    }
+
+    /// How much a profile may do, as a total order.
+    ///
+    /// The console is narrowest by class ([`Self::permits`]). Tray sits below
+    /// GUI because of `allowed_clients`: every operation open to the tray is
+    /// also open to the GUI, and some are GUI-only. That containment is what
+    /// makes the order real rather than invented, so it is held by
+    /// `no_operation_is_open_to_the_tray_but_closed_to_the_gui` — add a
+    /// tray-only operation and the order stops being true, which is the moment
+    /// this function has to change too.
+    ///
+    /// Why it matters that the order is total: a proven GUI that DECLARES
+    /// itself the tray used to keep GUI capabilities, because anything other
+    /// than the console fell through to "whatever the OS proved". A caller
+    /// asking to be treated more narrowly should be taken at its word — that is
+    /// the whole point of reading a declaration that can never widen.
+    const fn capability_rank(self) -> u8 {
+        match self {
+            Self::AdminConsole => 0,
+            Self::TrayLightweight => 1,
+            Self::GuiInteractive => 2,
         }
     }
 }
@@ -655,6 +675,12 @@ pub struct IpcOperationSpec {
 }
 
 const CLIENTS_GUI_ONLY: [IpcClientProfile; 1] = [IpcClientProfile::GuiInteractive];
+/// Operations every surface may invoke, the console included. Kept as
+/// `IpcClientProfile::ALL` rather than a hand-written list so a new profile is
+/// admitted to the handshake by construction — a client that cannot negotiate
+/// cannot do anything at all, and finding that out at runtime is the worst
+/// place to find it out.
+const CLIENTS_ALL: [IpcClientProfile; IpcClientProfile::ALL.len()] = IpcClientProfile::ALL;
 const CLIENTS_GUI_AND_TRAY: [IpcClientProfile; 2] = [
     IpcClientProfile::GuiInteractive,
     IpcClientProfile::TrayLightweight,
@@ -665,7 +691,7 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        allowed_clients: &CLIENTS_ALL,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -933,7 +959,9 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         // Classed as Query so it does not enter the mutation queue.
         class: IpcInteractionClass::Query,
         execution: IpcExecutionModel::SyncReply,
-        allowed_clients: &CLIENTS_GUI_AND_TRAY,
+        // The console too: asking the service for the archive is the whole
+        // reason `nrr-cli` speaks IPC at all — it must not assemble a second one.
+        allowed_clients: &CLIENTS_ALL,
         requires_service_mutation_privilege: false,
     },
     IpcOperationSpec {
@@ -1488,6 +1516,47 @@ mod tests {
             assert!(names.insert(item.name.slug()));
         }
         assert_eq!(catalog.len(), IpcOperationName::ALL.len());
+    }
+
+    /// `capability_rank` places the tray below the window, and that is only
+    /// true while every operation open to the tray is also open to the window.
+    /// The day a tray-only operation lands, the order is fiction again — and
+    /// `narrowed_by` would then quietly take a capability away from a caller
+    /// that declared itself the tray.
+    #[test]
+    fn no_operation_is_open_to_the_tray_but_closed_to_the_gui() {
+        for item in ipc_operation_catalog() {
+            if item
+                .allowed_clients
+                .contains(&IpcClientProfile::TrayLightweight)
+            {
+                assert!(
+                    item.allowed_clients
+                        .contains(&IpcClientProfile::GuiInteractive),
+                    "{} is tray-only, so the tray is no longer the narrower surface",
+                    item.name.slug(),
+                );
+            }
+        }
+    }
+
+    /// A declaration can only ever narrow. The console case always held; the
+    /// window declaring itself the tray did not — it fell through to "whatever
+    /// the OS proved" and kept window capabilities.
+    #[test]
+    fn a_declaration_narrows_and_never_widens() {
+        use IpcClientProfile::{AdminConsole, GuiInteractive, TrayLightweight};
+        // Proven window, declared tray: taken at its word.
+        assert_eq!(GuiInteractive.narrowed_by(TrayLightweight), TrayLightweight);
+        // Proven tray, declared window: the proof stands.
+        assert_eq!(TrayLightweight.narrowed_by(GuiInteractive), TrayLightweight);
+        // The console is narrowest from either side.
+        assert_eq!(GuiInteractive.narrowed_by(AdminConsole), AdminConsole);
+        assert_eq!(AdminConsole.narrowed_by(GuiInteractive), AdminConsole);
+        // A profile narrowed by itself is itself.
+        for profile in IpcClientProfile::ALL {
+            assert_eq!(profile.narrowed_by(profile), profile);
+        }
     }
 
     #[test]

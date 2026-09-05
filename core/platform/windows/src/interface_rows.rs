@@ -56,11 +56,11 @@ fn collect_windows_rows_from_snapshot(
     adapters: Vec<nrr_shared::AdapterSnapshotEntry>,
     probe_external_ip: bool,
 ) -> Vec<InterfaceRouteRow> {
-    // An IP Helper failure leaves every row without IP/gateway/DNS, which the
-    // consumers read as "this adapter has no local IP" — a temporary API
-    // failure then looks exactly like "this machine has no usable adapter".
-    // It cannot be repaired here (there is no second source for the data), so
-    // it is at least stated.
+    // An IP Helper failure leaves every row without IP/gateway/DNS. There is no
+    // second source to repair it from, so the rows say so instead: the failure
+    // is carried on the row as `runtime_data_unavailable`, and a consumer that
+    // blocks on a missing local IP can tell it from a real one.
+    let mut runtime_data_unavailable = false;
     let runtime_by_adapter = match collect_windows_runtime_data() {
         Ok(items) => items
             .into_iter()
@@ -77,6 +77,7 @@ fn collect_windows_rows_from_snapshot(
             })
             .collect::<std::collections::HashMap<_, _>>(),
         Err(error) => {
+            runtime_data_unavailable = true;
             tracing::warn!(
                 target: "nrr::interface-rows",
                 %error,
@@ -145,6 +146,7 @@ fn collect_windows_rows_from_snapshot(
                 has_forwarding_path: forwarding_known.then(|| {
                     has_default_route || forwarding_by_adapter.contains(&adapter_name_key)
                 }),
+                runtime_data_unavailable,
                 availability_status,
                 observed_facts,
                 derived_assessment,
@@ -253,29 +255,16 @@ fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String
 
 #[cfg(windows)]
 fn collect_windows_runtime_data() -> Result<Vec<WindowsRuntimeInterfaceData>, String> {
-    use std::net::IpAddr;
+    use nrr_platform_api::interface_rows::preferred_display_address;
 
     let adapters = ipconfig::get_adapters().map_err(|error| error.to_string())?;
     Ok(adapters
         .into_iter()
         .map(|adapter| {
-            let local_ip = adapter
-                .ip_addresses()
-                .iter()
-                .find_map(|ip| match ip {
-                    IpAddr::V4(v4) => Some(v4.to_string()),
-                    IpAddr::V6(_) => None,
-                })
+            let local_ip = preferred_display_address(adapter.ip_addresses())
                 .unwrap_or_else(|| "-".to_string());
-
-            let gateway = adapter
-                .gateways()
-                .iter()
-                .find_map(|ip| match ip {
-                    IpAddr::V4(v4) => Some(v4.to_string()),
-                    IpAddr::V6(_) => None,
-                })
-                .unwrap_or_else(|| "-".to_string());
+            let gateway =
+                preferred_display_address(adapter.gateways()).unwrap_or_else(|| "-".to_string());
 
             let dns_values = adapter
                 .dns_servers()

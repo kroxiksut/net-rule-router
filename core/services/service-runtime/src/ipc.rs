@@ -112,6 +112,7 @@ pub use nrr_shared::ipc_transport::{canonical_operation_class, IpcOperationClass
 
 // ── Error model ──────────────────────────────────────────────────────────────
 
+pub use nrr_shared::diagnostics_dto::DiagnosticsAudience;
 /// Canonical error codes exposed in the response envelope. Block
 /// moved the SSOT to `nrr-shared::ipc_transport` so
 /// `nrr-ipc-client` can preserve the typed code on the inbound
@@ -170,6 +171,21 @@ impl IpcRequestContext {
         self.caller_principal
             .as_ref()
             .map_or("", UserPrincipal::as_stored)
+    }
+
+    /// Whose diagnostics records this caller may read.
+    ///
+    /// The audit trail and the operational log are machine-wide files the
+    /// filesystem keeps away from ordinary users; an elevated caller has that
+    /// access already, everyone else gets their own records plus the ones that
+    /// belong to the machine rather than to a person. Derived from the
+    /// connection, so a request cannot ask to be somebody else's audience.
+    pub fn diagnostics_audience(&self) -> DiagnosticsAudience {
+        if self.caller_is_elevated {
+            DiagnosticsAudience::Machine
+        } else {
+            DiagnosticsAudience::Principal(self.caller_stored().to_owned())
+        }
     }
 }
 

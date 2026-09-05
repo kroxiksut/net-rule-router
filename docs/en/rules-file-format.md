@@ -223,6 +223,11 @@ overrides a direct rule for the child.
 > `+block` (§1.12) is the sibling per-rule flag. The two are orthogonal and
 > may appear on the same line (`codex.exe +children +block`).
 
+**Status in this release:** the flag is accepted and ignored. A rule written
+with `+children` is read as a plain application rule and covers the named
+process only; the descendant subtree is not followed yet. Writing it now costs
+nothing and starts working when subtree attribution lands.
+
 ### 1.8 Match value syntax
 
 Each section accepts specific match value patterns. Values outside the

@@ -1,4 +1,4 @@
-use nrr_shared::{format_security_visibility_summary, gui_shell_v1, VisibilityScope};
+use nrr_shared::{gui_shell_v1, VisibilityScope};
 
 #[test]
 fn security_visibility_policy_marks_global_and_screen_only_indicators() {
@@ -11,10 +11,6 @@ fn security_visibility_policy_marks_global_and_screen_only_indicators() {
         rule.indicator.title() == "Explain warnings"
             && matches!(rule.scope, VisibilityScope::ScreenOnly)
     }));
-
-    let summary = format_security_visibility_summary(&shell);
-    assert!(summary.contains("always="));
-    assert!(summary.contains("screen-only="));
 }
 
 /// Anything that puts sensitive data on disk must leave a record that it

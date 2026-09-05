@@ -11,7 +11,7 @@ use nrr_shared::ipc_payloads::{MergePreviewRequest, MergePreviewResponse};
 use crate::ipc::{
     HandlerOutcome, IpcError, IpcErrorCode, IpcHandler, IpcRequestContext, IpcRequestEnvelope,
 };
-use crate::production_merge_preview::{MergePreviewError, MergePreviewSource};
+use crate::production_merge_preview::{MergePreviewError, MergePreviewInput, MergePreviewSource};
 
 const OP: &str = "rules.merge-preview";
 
@@ -70,11 +70,14 @@ impl IpcHandler for RulesMergePreviewHandler {
             .source
             .merge_preview(
                 principal,
-                &req.primary_text,
-                &req.secondary_text,
-                req.policy,
-                &req.resolutions,
-                req.include_child_processes,
+                MergePreviewInput {
+                    primary_text: &req.primary_text,
+                    secondary_text: &req.secondary_text,
+                    policy: req.policy,
+                    resolutions: &req.resolutions,
+                    keep_secondary: &req.keep_secondary,
+                    include_child_processes: req.include_child_processes,
+                },
             )
             .map_err(|e| match e {
                 MergePreviewError::LockPoisoned => internal("state DB mutex poisoned"),
@@ -94,9 +97,7 @@ mod tests {
 
     use crate::ipc::IpcOperationClass;
     use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};
-    use nrr_shared::merge_dto::{
-        ConflictResolutionDto, MergePolicyDto, MergeResultDto, MergedRuleEntryDto,
-    };
+    use nrr_shared::merge_dto::{MergePolicyDto, MergeResultDto, MergedRuleEntryDto};
     use nrr_shared::rules_json::RuleAction;
     use nrr_shared::RouteRole;
     use std::sync::Mutex;
@@ -105,7 +106,17 @@ mod tests {
     struct FakeSource {
         outcome: Mutex<Result<MergeResultDto, MergePreviewError>>,
         #[allow(clippy::type_complexity)]
-        calls: Mutex<Vec<(String, String, String, MergePolicyDto, usize, bool)>>,
+        calls: Mutex<
+            Vec<(
+                String,
+                String,
+                String,
+                MergePolicyDto,
+                usize,
+                Vec<String>,
+                bool,
+            )>,
+        >,
     }
 
     impl FakeSource {
@@ -128,19 +139,16 @@ mod tests {
         fn merge_preview(
             &self,
             principal: &str,
-            primary_text: &str,
-            secondary_text: &str,
-            policy: MergePolicyDto,
-            resolutions: &[ConflictResolutionDto],
-            include_child_processes: bool,
+            request: MergePreviewInput<'_>,
         ) -> Result<MergeResultDto, MergePreviewError> {
             self.calls.lock().unwrap().push((
                 principal.to_string(),
-                primary_text.to_string(),
-                secondary_text.to_string(),
-                policy,
-                resolutions.len(),
-                include_child_processes,
+                request.primary_text.to_string(),
+                request.secondary_text.to_string(),
+                request.policy,
+                request.resolutions.len(),
+                request.keep_secondary.to_vec(),
+                request.include_child_processes,
             ));
             self.outcome.lock().unwrap().clone()
         }
@@ -238,6 +246,22 @@ mod tests {
         let calls = source.calls.lock().unwrap();
         assert_eq!(calls[0].3, MergePolicyDto::Union);
         assert_eq!(calls[0].4, 0);
+    }
+
+    /// The second half of the dialog's answers has to reach the merge, or the
+    /// band's buttons move nothing.
+    #[test]
+    fn the_keep_secondary_picks_reach_the_source() {
+        let source = Arc::new(FakeSource::ok(sample_result()));
+        let handler = RulesMergePreviewHandler::new(source.clone());
+        handler
+            .handle(
+                &envelope(serde_json::json!({ "keep-secondary": ["ip:1.1.1.1"] })),
+                &ctx(),
+            )
+            .expect("handler success");
+        let calls = source.calls.lock().unwrap();
+        assert_eq!(calls[0].5, vec!["ip:1.1.1.1".to_string()]);
     }
 
     #[test]

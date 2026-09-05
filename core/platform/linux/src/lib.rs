@@ -52,6 +52,9 @@ pub mod path_registration;
 /// pkexec-helper-vs-polkit-IPC model decision are deferred to the Linux session
 /// phase. See the module doc for why elevation does not port like the others.
 pub mod elevation;
+// Handing ONE service-produced file to the caller: ownership plus a
+// traversable parent, so the daemon's 0700 state directory stays closed.
+pub mod file_handoff;
 
 /// Linux IPC caller-identity via `SO_PEERCRED` — the analog of the Windows
 /// named-pipe token inspection (`windows-service/named_pipe_identity.rs`). Reads
@@ -90,6 +93,9 @@ pub mod conn_observe;
 /// through their own session — the reason no elevation broker is needed here.
 #[cfg(target_os = "linux")]
 pub mod polkit;
+// polkit ACTION DEFINITIONS — the other half of the question `polkit.rs`
+// asks. Installed under /usr/share/polkit-1/actions.
+pub mod polkit_policy;
 
 /// Graceful-stop signals (`SIGTERM`/`SIGINT`) — the Linux analog of the SCM
 /// stop control. Without it the daemon dies on the default disposition and its

@@ -139,6 +139,10 @@ pub struct FakeDiagnostics {
     pub alerts: Mutex<Vec<SecurityAlertDto>>,
     pub last_log_call: Mutex<Option<(LogEntryFilter, PaginationParams)>>,
     pub last_audit_call: Mutex<Option<(AuditEntryFilter, PaginationParams)>>,
+    /// Whose records the handler asked for. Recorded because the type system
+    /// only forces an audience to be PASSED — passing the machine-wide one from
+    /// a handler that serves ordinary users is exactly the mistake worth a test.
+    pub last_audience: Mutex<Option<nrr_shared::diagnostics_dto::DiagnosticsAudience>>,
 }
 
 impl FakeDiagnostics {
@@ -182,6 +186,7 @@ impl FakeDiagnostics {
             alerts: Mutex::new(Vec::new()),
             last_log_call: Mutex::new(None),
             last_audit_call: Mutex::new(None),
+            last_audience: Mutex::new(None),
         }
     }
 
@@ -218,16 +223,20 @@ impl DiagnosticsFacade for FakeDiagnostics {
         &self,
         filter: &LogEntryFilter,
         pagination: &PaginationParams,
+        audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
         *self.last_log_call.lock().unwrap() = Some((filter.clone(), pagination.clone()));
+        *self.last_audience.lock().unwrap() = Some(audience.clone());
         Ok(PageResult::single_page(self.logs.lock().unwrap().clone()))
     }
     fn list_audit_entries(
         &self,
         filter: &AuditEntryFilter,
         pagination: &PaginationParams,
+        audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         *self.last_audit_call.lock().unwrap() = Some((filter.clone(), pagination.clone()));
+        *self.last_audience.lock().unwrap() = Some(audience.clone());
         Ok(PageResult::single_page(self.audit.lock().unwrap().clone()))
     }
     fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {
@@ -431,6 +440,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // exercise the security alerts list/ack/resolve path build their
         // own deps and pass an `InMemorySecurityAlertsRepository`.
         alerts_repo: None,
+        other_principals_hold_revisions: None,
         // Service stability config defaults to `None`
         // so the catalog-coverage test sees the unimplemented-operation
         // stub for the two ops. Tests that exercise the production path
@@ -446,6 +456,7 @@ pub fn healthy_deps() -> Arc<crate::ipc_handlers::IpcHandlerDeps> {
         // No state DB connection
         // in test deps; `health.json`'s `state_schema_version` reads `None`.
         state_schema_version: None,
+        file_handoff: None,
         // Fail-Closed probe absent in test deps;
         // SnapshotInterfacesHandler treats `None` as "no banner".
         fail_closed_probe: None,

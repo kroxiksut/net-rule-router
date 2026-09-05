@@ -557,6 +557,26 @@ fn run_push_forwarder(
 ///
 /// Best-effort and deliberately quiet: a cache that cannot be cleared is a
 /// stale read later, never a failed mutation now.
+/// Attach the user's archive log-budget preference to an export request.
+///
+/// `0` is the preference's "no cap I chose" and is left off the wire, where it
+/// would read as "keep nothing". A payload that is not an object passes through
+/// untouched — the service rejects it on its own terms.
+fn with_raw_log_budget(payload: serde_json::Value) -> serde_json::Value {
+    let budget = crate::archive_localize::service_log_budget_bytes();
+    if budget == 0 {
+        return payload;
+    }
+    let serde_json::Value::Object(mut map) = payload else {
+        return payload;
+    };
+    map.insert(
+        "raw-log-budget-bytes".to_string(),
+        serde_json::Value::from(budget),
+    );
+    serde_json::Value::Object(map)
+}
+
 fn invalidate_cache_after_mutation(op: IpcOperationName, payload: &serde_json::Value) {
     let Some(kind) = mutation_kind_to_invalidate(op, payload) else {
         return;
@@ -607,7 +627,16 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
     // IPC-handler-side budget so the launcher and the service agree on
     // what "too slow" means.
     let timeout = ipc_operation_timeout(op);
-    match client.call(op, req.payload.clone(), timeout) {
+    // The raw service-log section is built by the SERVICE now (it reads its own
+    // files and returns only what this caller may see), so the user's byte cap
+    // has to travel with the request instead of being applied here after the
+    // fact. Only for the export, and only when the preference is actually set.
+    let payload = if op == IpcOperationName::DiagnosticsExportArchive {
+        with_raw_log_budget(req.payload.clone())
+    } else {
+        req.payload.clone()
+    };
+    match client.call(op, payload, timeout) {
         Ok(value) => {
             // Mutations travel this path, not the facade's, so the facade's
             // cache invalidation never ran: the snapshot files kept answering
@@ -635,13 +664,7 @@ fn handle_request(req: &LauncherRpcRequest, client: &dyn IpcClient) -> LauncherR
                             .get("logs-from-ms")
                             .and_then(serde_json::Value::as_i64)
                     });
-                // Raw-log attachment budget: the user's preference, mirrored
-                // in-process by every preferences round-trip (`0` = no cap).
-                crate::archive_localize::localize_export_response(
-                    value,
-                    logs_from_ms,
-                    crate::archive_localize::service_log_budget_bytes(),
-                )
+                crate::archive_localize::localize_export_response(value, logs_from_ms)
             } else if op == IpcOperationName::SnapshotInitialGet {
                 // The service's `autostart` field reflects its own system
                 // context; re-probe the interactive user's so the GUI's first

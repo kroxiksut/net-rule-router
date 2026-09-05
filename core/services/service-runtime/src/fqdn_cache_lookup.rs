@@ -43,6 +43,7 @@
 //! partial commit (a route with no matching filter, or a block with no rule
 //! behind it).
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -178,6 +179,19 @@ pub trait FqdnCacheLookup: Send + Sync {
     /// keep the historic pin-everything behaviour.
     fn shared_direct_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
         std::collections::HashSet::new()
+    }
+
+    /// A point-in-time copy of everything this lookup can answer, when the
+    /// implementation can produce one cheaply.
+    ///
+    /// One filter compute asks the cache tens of thousands of times; against
+    /// SQLite that is tens of thousands of locks and prepared statements on the
+    /// connection the live observation path is writing to. An implementation
+    /// that can hand over the whole table at once says so here, and the compute
+    /// runs against memory. `None` (the default, and what every mock keeps)
+    /// means "keep asking me directly".
+    fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
+        None
     }
 
     /// The subset of [`Self::shared_direct_ips`] whose direct tenant a MAIN-route
@@ -383,6 +397,14 @@ fn confirmed_since(resolved_at: Option<SystemTime>, cutoff: Option<SystemTime>) 
 }
 
 impl FqdnCacheLookup for SqliteFqdnCacheLookup {
+    fn snapshot_for_compute(&self) -> Option<FqdnCacheSnapshot> {
+        Some(FqdnCacheSnapshot::take(
+            self.cache.as_ref(),
+            self.confirmation_window,
+            SystemTime::now(),
+        ))
+    }
+
     fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
         self.ips_confirmed_at(hostname, SystemTime::now())
     }
@@ -447,6 +469,156 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
             .shared_ip_census_primary_ruled_ips()
             .map(|v| v.into_iter().collect())
             .unwrap_or_default()
+    }
+}
+
+// ── Snapshot ────────────────────────────────────────────────────────────────
+
+/// A [`FqdnCacheLookup`] answering entirely from memory, taken in a handful of
+/// queries.
+///
+/// The codegen asks the cache for the addresses of every rule host, every
+/// hostname under every suffix, and the census for every candidate address. Via
+/// [`SqliteFqdnCacheLookup`] each of those is a lock, a prepared statement and a
+/// query against the SAME connection the live DNS observation path is writing
+/// to, so one pass over a 229-rule book cost tens of thousands of round trips —
+/// 18.9 s on the owner's machine, against a table that reads whole in
+/// milliseconds.
+///
+/// The snapshot is also more correct than what it replaces: a compute now sees
+/// ONE state of the cache instead of a slightly different one per lookup.
+pub struct FqdnCacheSnapshot {
+    /// `canonical hostname → addresses`, filtered by the confirmation window
+    /// and kept in the `resolved_at DESC` order the per-hostname query returns,
+    /// so filter ids derive identically. Keyed by the string as STORED and
+    /// matched exactly, because the query it stands in for is
+    /// `WHERE canonical_host = ?1`.
+    by_hostname: HashMap<String, Vec<Ipv4Addr>>,
+    /// Every cached hostname in `last_seen_at DESC, canonical_host ASC` order —
+    /// what suffix fan-out walks, and the order that decides which hosts of a
+    /// capped zone earn a permit.
+    hostnames_by_recency: Vec<String>,
+    direct_host_counts: HashMap<Ipv4Addr, u32>,
+    shared_direct: std::collections::HashSet<Ipv4Addr>,
+    shared_direct_primary_ruled: std::collections::HashSet<Ipv4Addr>,
+}
+
+impl FqdnCacheSnapshot {
+    /// Takes the snapshot. A failed read yields an EMPTY snapshot for that
+    /// part, which is the same degradation the per-call adapter applies: a cold
+    /// cache, never a wrong one.
+    pub fn take(
+        cache: &Mutex<dyn CacheRepository + Send>,
+        confirmation_window: Duration,
+        now: SystemTime,
+    ) -> Self {
+        let guard = match cache.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::warn!(
+                    target: "nrr::wfp-codegen",
+                    "fqdn cache mutex poisoned; taking an empty snapshot"
+                );
+                return Self::empty();
+            }
+        };
+        let cutoff = now.checked_sub(confirmation_window);
+        let mut by_hostname: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
+        match guard.snapshot_ipv4_resolutions() {
+            Ok(rows) => {
+                for (host, addr, resolved_at) in rows {
+                    if !confirmed_since(Some(resolved_at), cutoff) {
+                        continue;
+                    }
+                    by_hostname.entry(host).or_default().push(addr);
+                }
+            }
+            Err(e) => tracing::warn!(
+                target: "nrr::wfp-codegen",
+                error = %e,
+                "fqdn cache snapshot failed; treating as cold"
+            ),
+        }
+        let hostnames_by_recency: Vec<String> = guard
+            .snapshot_hostnames()
+            .map(|rows| rows.into_iter().map(|(host, _)| host).collect())
+            .unwrap_or_default();
+        let direct_host_counts = guard
+            .shared_ip_direct_host_counts()
+            .map(|rows| rows.into_iter().collect())
+            .unwrap_or_default();
+        let shared_direct = guard
+            .shared_ip_census_ips()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        let shared_direct_primary_ruled = guard
+            .shared_ip_census_primary_ruled_ips()
+            .map(|v| v.into_iter().collect())
+            .unwrap_or_default();
+        drop(guard);
+
+        Self {
+            by_hostname,
+            hostnames_by_recency,
+            direct_host_counts,
+            shared_direct,
+            shared_direct_primary_ruled,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            by_hostname: HashMap::new(),
+            hostnames_by_recency: Vec::new(),
+            direct_host_counts: HashMap::new(),
+            shared_direct: std::collections::HashSet::new(),
+            shared_direct_primary_ruled: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Hostnames the snapshot knows an enforceable address for.
+    pub fn hostname_count(&self) -> usize {
+        self.by_hostname.len()
+    }
+}
+
+impl FqdnCacheLookup for FqdnCacheSnapshot {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+        // Exact match, like the `WHERE canonical_host = ?1` it replaces.
+        self.by_hostname.get(hostname).cloned().unwrap_or_default()
+    }
+
+    fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String> {
+        if limit == 0 || suffix.is_empty() {
+            return Vec::new();
+        }
+        let normalised = suffix.trim().trim_end_matches('.').to_ascii_lowercase();
+        if normalised.is_empty() {
+            return Vec::new();
+        }
+        // `LIKE '%.{suffix}'` in SQLite is ASCII-case-INSENSITIVE, and the
+        // stored names are not all lowercase, so a case-sensitive `ends_with`
+        // here would quietly drop hosts the query returns. The leading dot is
+        // what keeps the apex out of its own suffix.
+        let needle = format!(".{normalised}");
+        self.hostnames_by_recency
+            .iter()
+            .filter(|h| h.to_ascii_lowercase().ends_with(&needle))
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    fn direct_host_count_for_ip(&self, ip: Ipv4Addr) -> u32 {
+        self.direct_host_counts.get(&ip).copied().unwrap_or(0)
+    }
+
+    fn shared_direct_ips(&self) -> std::collections::HashSet<Ipv4Addr> {
+        self.shared_direct.clone()
+    }
+
+    fn shared_direct_ips_primary_ruled(&self) -> std::collections::HashSet<Ipv4Addr> {
+        self.shared_direct_primary_ruled.clone()
     }
 }
 
@@ -643,6 +815,153 @@ mod tests {
         assert_eq!(
             subs,
             vec!["api.example.com".to_string(), "www.example.com".to_string()]
+        );
+    }
+
+    // ── Snapshot parity ──────────────────────────────────────────────────────
+
+    /// The snapshot replaces the per-hostname path on the ENFORCEMENT path, so
+    /// "faster" is worth nothing unless the answers are identical. This is the
+    /// fixture that says so: several hosts under a shared suffix, a host with
+    /// two addresses, one address outside the confirmation window, an apex, a
+    /// host with mixed casing, and a name no rule mentions.
+    #[test]
+    fn the_snapshot_answers_exactly_what_the_per_hostname_path_answers() {
+        let store = confirmation_store();
+        let now = SystemTime::now();
+        let fresh = |secs: u64| {
+            now.checked_sub(Duration::from_secs(secs))
+                .expect("clock past the epoch")
+        };
+        seed(
+            &store,
+            "example.com",
+            Ipv4Addr::new(203, 0, 113, 1),
+            fresh(10),
+        );
+        seed(
+            &store,
+            "www.example.com",
+            Ipv4Addr::new(203, 0, 113, 2),
+            fresh(20),
+        );
+        seed(
+            &store,
+            "www.example.com",
+            Ipv4Addr::new(203, 0, 113, 3),
+            fresh(5),
+        );
+        seed(
+            &store,
+            "api.example.com",
+            Ipv4Addr::new(203, 0, 113, 4),
+            fresh(30),
+        );
+        // Beyond the window: neither path may enforce it.
+        seed(
+            &store,
+            "stale.example.com",
+            Ipv4Addr::new(203, 0, 113, 5),
+            now.checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
+                .expect("clock past the epoch"),
+        );
+        seed(
+            &store,
+            "Deep.Sub.Example.Com",
+            Ipv4Addr::new(203, 0, 113, 6),
+            fresh(40),
+        );
+        seed(
+            &store,
+            "other.test",
+            Ipv4Addr::new(198, 51, 100, 9),
+            fresh(50),
+        );
+
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let live = SqliteFqdnCacheLookup::new(
+            Arc::clone(&cache),
+            FreshnessThresholds::default_production(),
+        );
+        let snapshot = live
+            .snapshot_for_compute()
+            .expect("sqlite adapter snapshots");
+
+        for host in [
+            "example.com",
+            "www.example.com",
+            "api.example.com",
+            "stale.example.com",
+            "deep.sub.example.com",
+            "DEEP.SUB.EXAMPLE.COM",
+            "other.test",
+            "never.heard.of.it",
+        ] {
+            assert_eq!(
+                snapshot.ips_for_hostname(host),
+                live.ips_for_hostname(host),
+                "addresses differ for {host}"
+            );
+        }
+
+        for (suffix, limit) in [
+            ("example.com", 16),
+            ("sub.example.com", 16),
+            ("example.com", 1),
+            ("example.com", 0),
+            ("test", 16),
+            ("nothing.here", 16),
+            ("", 16),
+        ] {
+            assert_eq!(
+                snapshot.hostnames_under_suffix(suffix, limit),
+                live.hostnames_under_suffix(suffix, limit),
+                "suffix fan-out differs for {suffix} (limit {limit})"
+            );
+            // The suffix-domain helper is a default method over the two above,
+            // so it must agree as well — that is what the codegen actually calls.
+            assert_eq!(
+                snapshot.hostnames_for_suffix_domain(suffix, limit),
+                live.hostnames_for_suffix_domain(suffix, limit),
+                "suffix-domain expansion differs for {suffix} (limit {limit})"
+            );
+        }
+    }
+
+    /// A host whose every address aged out must read as COLD through the
+    /// snapshot too — positive control for the filter above, because a snapshot
+    /// that forgot the window would look identical on every fresh host.
+    #[test]
+    fn the_snapshot_applies_the_confirmation_window() {
+        let store = confirmation_store();
+        let now = SystemTime::now();
+        seed(
+            &store,
+            "aged.example.com",
+            Ipv4Addr::new(203, 0, 113, 77),
+            now.checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
+                .expect("clock past the epoch"),
+        );
+        seed(
+            &store,
+            "current.example.com",
+            Ipv4Addr::new(203, 0, 113, 78),
+            now,
+        );
+
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let live = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production());
+        let snapshot = live.snapshot_for_compute().expect("snapshot");
+
+        assert!(snapshot.ips_for_hostname("aged.example.com").is_empty());
+        assert_eq!(
+            snapshot.ips_for_hostname("current.example.com"),
+            vec![Ipv4Addr::new(203, 0, 113, 78)]
+        );
+        assert_eq!(
+            snapshot.hostname_count(),
+            1,
+            "only the confirmed host is in"
         );
     }
 

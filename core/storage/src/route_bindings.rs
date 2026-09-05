@@ -116,6 +116,12 @@ impl BehaviorMode {
 /// default — a true kill-switch that also cuts ICMP/ping).
 pub const KILL_SWITCH_PROTOCOLS_ALL: u16 = 0x7F;
 
+/// Column defaults for the auto-probe knobs, mirrored from the schema DDL so a
+/// value that cannot be represented falls back to what a fresh row would hold.
+pub const DEFAULT_PRIMARY_PROBE_TIMEOUT_MS: u32 = 1500;
+pub const DEFAULT_PRIMARY_PROBE_MAX_TARGETS: u32 = 8;
+pub const DEFAULT_PRIMARY_PROBE_REPEAT_SECS: u32 = 300;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePolicyRecord {
     pub primary: Option<RouteBindingRecord>,
@@ -265,9 +271,9 @@ impl RoutePolicyRecord {
             // column).
             allow_dns_over_primary: true,
             primary_probe_auto: false,
-            primary_probe_timeout_ms: 1500,
-            primary_probe_max_targets: 8,
-            primary_probe_repeat_secs: 300,
+            primary_probe_timeout_ms: DEFAULT_PRIMARY_PROBE_TIMEOUT_MS,
+            primary_probe_max_targets: DEFAULT_PRIMARY_PROBE_MAX_TARGETS,
+            primary_probe_repeat_secs: DEFAULT_PRIMARY_PROBE_REPEAT_SECS,
             block_ipv6_when_protected: true,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
@@ -412,9 +418,9 @@ impl Default for BlockPolicyRow {
             auto_rules_mode: AutoRulesMode::default(),
             auto_rules_eager_delivery_names: AUTO_RULES_EAGER_DELIVERY_NAMES_DEFAULT,
             primary_probe_auto: false,
-            primary_probe_timeout_ms: 1500,
-            primary_probe_max_targets: 8,
-            primary_probe_repeat_secs: 300,
+            primary_probe_timeout_ms: DEFAULT_PRIMARY_PROBE_TIMEOUT_MS,
+            primary_probe_max_targets: DEFAULT_PRIMARY_PROBE_MAX_TARGETS,
+            primary_probe_repeat_secs: DEFAULT_PRIMARY_PROBE_REPEAT_SECS,
             block_ipv6_when_protected: true,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
@@ -856,9 +862,17 @@ impl<'c> RouteBindingsRepository<'c> {
                             .unwrap_or_default(),
                         auto_rules_eager_delivery_names: row.get::<_, i64>(15)? != 0,
                         primary_probe_auto: row.get::<_, i64>(16)? != 0,
-                        primary_probe_timeout_ms: row.get::<_, i64>(17)? as u32,
-                        primary_probe_max_targets: row.get::<_, i64>(18)? as u32,
-                        primary_probe_repeat_secs: row.get::<_, i64>(19)? as u32,
+                        // `as u32` wraps modulo 2^32, so a value the schema
+                        // cannot reject (INTEGER, no CHECK) turned a huge
+                        // timeout into a tiny one — a probe that gives up
+                        // instantly reads as "the primary is down". Out of
+                        // range falls back to the column default instead.
+                        primary_probe_timeout_ms: u32::try_from(row.get::<_, i64>(17)?)
+                            .unwrap_or(DEFAULT_PRIMARY_PROBE_TIMEOUT_MS),
+                        primary_probe_max_targets: u32::try_from(row.get::<_, i64>(18)?)
+                            .unwrap_or(DEFAULT_PRIMARY_PROBE_MAX_TARGETS),
+                        primary_probe_repeat_secs: u32::try_from(row.get::<_, i64>(19)?)
+                            .unwrap_or(DEFAULT_PRIMARY_PROBE_REPEAT_SECS),
                         block_ipv6_when_protected: row.get::<_, i64>(20)? != 0,
                         local_networks_auto_accept: row.get::<_, i64>(21)? != 0,
                         zone_priority_over_ip: row.get::<_, i64>(22)? != 0,

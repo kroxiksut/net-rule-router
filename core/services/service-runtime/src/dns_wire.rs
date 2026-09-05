@@ -156,6 +156,53 @@ pub fn build_error_response(query: &[u8], rcode: u8) -> Option<Vec<u8>> {
     Some(response_prefix(query, q.question_end, rcode, 0))
 }
 
+/// How long a client may remember one of our synthetic "no such name" answers.
+///
+/// Without an SOA there is no negative caching at all (RFC 2308), so a stub
+/// resolver re-asks on every single lookup — the DoH canary and every rule host
+/// with no records were being answered over and over. A minute is short enough
+/// that a host which starts resolving is picked up promptly.
+pub const NEGATIVE_TTL_SECS: u32 = 60;
+
+/// Build an answer-less response carrying `rcode` WITH an SOA in the authority
+/// section, so the client is allowed to cache the negative answer.
+///
+/// The SOA owner is the queried name itself rather than a zone apex we would
+/// have to guess. That scopes the negative cache entry to exactly this name —
+/// conservative on purpose: a guessed apex would suppress lookups for every
+/// sibling name under it, including ones that do resolve.
+///
+/// `None` when `query` has no parseable question.
+pub fn build_negative_response(query: &[u8], rcode: u8, negative_ttl: u32) -> Option<Vec<u8>> {
+    const QTYPE_SOA: u16 = 6;
+    // RNAME, the zone contact. A reserved-by-RFC-2606 name, so it can never
+    // point at a real mailbox.
+    const RNAME: [u8; 16] = [
+        6, b'n', b'o', b'b', b'o', b'd', b'y', 7, b'i', b'n', b'v', b'a', b'l', b'i', b'd', 0,
+    ];
+
+    let q = parse_question(query)?;
+    let mut resp = response_prefix(query, q.question_end, rcode, 0);
+    resp[8..10].copy_from_slice(&1u16.to_be_bytes()); // NSCOUNT = 1
+
+    // MNAME reuses the question name through the 0xC00C compression pointer
+    // (the question always starts at offset 12), same as the A answers do.
+    let rdlength = 2 + RNAME.len() + 5 * 4;
+    resp.extend_from_slice(&[0xC0, 0x0C]); // NAME → the queried name
+    resp.extend_from_slice(&QTYPE_SOA.to_be_bytes());
+    resp.extend_from_slice(&[0x00, 0x01]); // CLASS IN
+    resp.extend_from_slice(&negative_ttl.to_be_bytes());
+    resp.extend_from_slice(&(rdlength as u16).to_be_bytes());
+    resp.extend_from_slice(&[0xC0, 0x0C]); // MNAME
+    resp.extend_from_slice(&RNAME); // RNAME
+    resp.extend_from_slice(&1u32.to_be_bytes()); // SERIAL
+    resp.extend_from_slice(&3600u32.to_be_bytes()); // REFRESH
+    resp.extend_from_slice(&600u32.to_be_bytes()); // RETRY
+    resp.extend_from_slice(&86400u32.to_be_bytes()); // EXPIRE
+    resp.extend_from_slice(&negative_ttl.to_be_bytes()); // MINIMUM — the negative TTL
+    Some(resp)
+}
+
 // ── Client side (HW-0714 — raw-UDP upstream pin) ─────────────────────────────
 //
 // The Mode-B intercept resolved rule hosts through the OS resolver, which
@@ -562,6 +609,47 @@ pub fn parse_a_response(expect_id: u16, expect_qname: &str, packet: &[u8]) -> AR
 
 #[cfg(test)]
 mod tests {
+    /// Without an SOA a stub resolver has nothing to cache, so it re-asks on
+    /// every lookup — the DoH canary was answered once per page load.
+    #[test]
+    fn a_negative_answer_carries_an_soa_the_client_can_cache() {
+        let query = super::build_a_query(0x1234, "canary.example.net").expect("query");
+        let resp = super::build_negative_response(&query, super::RCODE_NXDOMAIN, 60).expect("resp");
+
+        assert_eq!(resp[3] & 0x0F, super::RCODE_NXDOMAIN, "rcode preserved");
+        assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
+        assert_eq!(
+            u16::from_be_bytes([resp[8], resp[9]]),
+            1,
+            "one authority RR"
+        );
+
+        // The authority record starts right after the echoed question.
+        let q = super::parse_question(&query).expect("question");
+        let rr = &resp[q.question_end..];
+        assert_eq!(&rr[0..2], &[0xC0, 0x0C], "owner points at the queried name");
+        assert_eq!(u16::from_be_bytes([rr[2], rr[3]]), 6, "TYPE SOA");
+        assert_eq!(u16::from_be_bytes([rr[4], rr[5]]), 1, "CLASS IN");
+        assert_eq!(u32::from_be_bytes([rr[6], rr[7], rr[8], rr[9]]), 60, "TTL");
+
+        let rdlength = u16::from_be_bytes([rr[10], rr[11]]) as usize;
+        let rdata = &rr[12..];
+        assert_eq!(rdata.len(), rdlength, "RDLENGTH matches what follows");
+        let minimum = &rdata[rdlength - 4..];
+        assert_eq!(
+            u32::from_be_bytes([minimum[0], minimum[1], minimum[2], minimum[3]]),
+            60,
+            "SOA MINIMUM is the negative TTL — this is the field that caches",
+        );
+    }
+
+    /// A query with no parseable question yields nothing rather than a frame
+    /// built over garbage.
+    #[test]
+    fn a_negative_answer_needs_a_question() {
+        assert!(super::build_negative_response(&[0u8; 4], super::RCODE_NXDOMAIN, 60).is_none());
+    }
+
     use super::*;
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {

@@ -6,6 +6,7 @@
 //!
 //! These will be wired to the real log reader via the service facade.
 
+use nrr_diagnostics::facade::dto::DiagnosticsAudience;
 pub use nrr_diagnostics::facade::{
     AuditEntryDto, AuditEntryFilter, LogEntryDto, LogEntryFilter, MockDiagnosticsFacade,
     MockScenario, PageResult, PaginationParams,
@@ -25,10 +26,19 @@ pub fn preview_log_entries() -> PageResult<LogEntryDto> {
 /// The facade returns entries in natural append order (oldest-first, matching
 /// the NDJSON storage layout).  GUI consumers want newest-first, so the
 /// preview wrapper reverses the page items here.
+///
+/// Sorting AFTER the facade is only "newest first" while the facade hands back
+/// every entry in one page — paginate first and this sorts the OLDEST fifty and
+/// calls them the newest. `the_preview_sort_holds_only_while_one_page_holds_
+/// everything` fails the day that changes.
 pub fn preview_operational_logs_first_page() -> PageResult<LogEntryDto> {
     use nrr_diagnostics::DiagnosticsFacade;
     let mut page = MockDiagnosticsFacade::healthy()
-        .list_log_entries(&LogEntryFilter::default(), &PaginationParams::default())
+        .list_log_entries(
+            &LogEntryFilter::default(),
+            &PaginationParams::default(),
+            &DiagnosticsAudience::Machine,
+        )
         .unwrap_or_else(|_| PageResult::empty());
     page.items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     page
@@ -41,7 +51,11 @@ pub fn preview_operational_logs_first_page() -> PageResult<LogEntryDto> {
 pub fn preview_audit_entries_first_page() -> PageResult<AuditEntryDto> {
     use nrr_diagnostics::DiagnosticsFacade;
     let mut page = MockDiagnosticsFacade::healthy()
-        .list_audit_entries(&AuditEntryFilter::default(), &PaginationParams::default())
+        .list_audit_entries(
+            &AuditEntryFilter::default(),
+            &PaginationParams::default(),
+            &DiagnosticsAudience::Machine,
+        )
         .unwrap_or_else(|_| PageResult::empty());
     page.items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     page
@@ -58,6 +72,24 @@ mod tests {
 
     fn is_sorted_desc_by_created_at_audit(items: &[AuditEntryDto]) -> bool {
         items.windows(2).all(|w| w[0].created_at >= w[1].created_at)
+    }
+
+    /// The preview sorts what the facade already returned. That is only the
+    /// newest entries while the facade returns them all at once; the day it
+    /// paginates, this wrapper has to sort BEFORE the page is cut, and this
+    /// test is where that lands.
+    #[test]
+    fn the_preview_sort_holds_only_while_one_page_holds_everything() {
+        let logs = preview_operational_logs_first_page();
+        assert!(
+            !logs.has_next(),
+            "the facade started paginating — sort before paging, not after"
+        );
+        let audit = preview_audit_entries_first_page();
+        assert!(
+            !audit.has_next(),
+            "the facade started paginating — sort before paging, not after"
+        );
     }
 
     #[test]

@@ -20,9 +20,20 @@
 //! - `production_mutation_executor.rs` — the legitimate caller. Each
 //!   privileged method is only reached through the
 //!   `MutationSubmitHandler` IPC path.
-//! - `activation_coordinator.rs` — the impl block itself plus the
-//!   inline `#[cfg(test)]` unit tests. Internal `self.activate(...)`
-//!   recursion (rollback → activate) lives here too.
+//! - `activation_coordinator` — the impl block itself plus its unit tests.
+//!   Internal `self.activate(...)` / `self.rollback_to(...)` recursion lives
+//!   in the integrity sweep.
+//!
+//! Entries are MODULE paths relative to `src/`, and a module means the file
+//! plus everything under a directory of the same name. That is the unit the
+//! invariant is stated in ("only these two types' own code"), and it is what
+//! keeps the gate from breaking every time one of those modules is split into
+//! more files — which happened three times before the granularity was fixed.
+//!
+//! Two rejected alternatives, both of which keep the test green while removing
+//! its teeth: matching by BASENAME (then `tests.rs` has to be allowed, which
+//! exempts every `tests.rs` in the crate) and adding each new file by hand
+//! (which makes the allowlist grow silently with every refactor).
 //!
 //! ## Why a grep test, not just `pub(crate)`?
 //!
@@ -54,18 +65,25 @@ const PRIVILEGED_METHODS: &[&str] = &[
     "rollback_to",
 ];
 
-/// Files where ANY number of privileged-method calls are accepted.
-/// Names are file basenames (no path) — the test compares basenames
-/// for portability across host filesystems.
+/// Modules whose own code may call the privileged methods.
+///
+/// A MODULE, not a file: `"activation_coordinator"` covers
+/// `activation_coordinator.rs` and everything under `activation_coordinator/`.
+/// Splitting one of these into more files is a refactor; letting a third module
+/// call these is the thing being prevented.
 const ALLOWLIST: &[&str] = &[
-    // The legitimate caller: routes preview/execute/rollback through
-    // the coordinator on behalf of `MutationSubmitHandler`.
-    "production_mutation_executor.rs",
-    // The impl crate itself: internal `self.<method>` recursion in
-    // `rollback_to → activate`, plus all `#[cfg(test)] mod tests`
-    // direct calls.
-    "activation_coordinator.rs",
+    // The legitimate caller: routes preview/execute/rollback through the
+    // coordinator on behalf of `MutationSubmitHandler`.
+    "production_mutation_executor",
+    // The impl itself, its integrity sweep's `rollback_to → activate`
+    // recursion, and its unit tests.
+    "activation_coordinator",
 ];
+
+/// Whether `relative` (a path under `src/`, `/`-separated) belongs to `module`.
+fn in_module(relative: &str, module: &str) -> bool {
+    relative == format!("{module}.rs") || relative.starts_with(&format!("{module}/"))
+}
 
 fn collect_rust_files(root: &Path, acc: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(root) {
@@ -108,11 +126,12 @@ fn privileged_methods_only_called_from_allowlist() {
 
     let mut offenders: Vec<String> = Vec::new();
     for path in &files {
-        let basename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<unknown>");
-        if ALLOWLIST.contains(&basename) {
+        let relative = path
+            .strip_prefix(&src_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if ALLOWLIST.iter().any(|m| in_module(&relative, m)) {
             continue;
         }
         let body = match fs::read_to_string(path) {
@@ -157,15 +176,20 @@ fn allowlist_files_actually_exist() {
     let src_root = manifest_dir.join("src");
     let mut files = Vec::new();
     collect_rust_files(&src_root, &mut files);
-    let basenames: Vec<&str> = files
+    let relatives: Vec<String> = files
         .iter()
-        .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        .map(|p| {
+            p.strip_prefix(&src_root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect();
     for entry in ALLOWLIST {
         assert!(
-            basenames.contains(entry),
-            "ALLOWLIST entry {entry:?} does not match any file under \
-             {src_root:?}; rename the allowlist entry or update the source"
+            relatives.iter().any(|r| in_module(r, entry)),
+            "ALLOWLIST entry {entry:?} matches no module under {src_root:?}; \
+             rename the allowlist entry or update the source"
         );
     }
 }

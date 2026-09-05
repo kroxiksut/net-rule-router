@@ -202,6 +202,21 @@ pub const ACTION_DISABLE_PROTECTION: &str = "netrulerouter.disable-protection";
 pub const ACTION_CLEAR_SHARED_DATA: &str = "netrulerouter.clear-shared-data";
 
 impl IpcOperationClass {
+    /// Every class, so a caller that has to reason about all of them (the
+    /// polkit action file, an audit of the gates) cannot miss one added later.
+    pub const ALL: [Self; 10] = [
+        Self::ReadSnapshot,
+        Self::DiagnosticQuery,
+        Self::DiagnosticAction,
+        Self::MutationRequest,
+        Self::ReviewConfirmation,
+        Self::RecoveryAction,
+        Self::SafeDisable,
+        Self::UserScopedConfiguration,
+        Self::UserScopedMutation,
+        Self::MachineScopedAction,
+    ];
+
     /// Whether this class flows through the single-writer mutation queue.
     /// `false` for read-only and lightweight diagnostic queries.
     pub const fn is_mutating(self) -> bool {
@@ -218,10 +233,6 @@ impl IpcOperationClass {
         }
     }
 
-    /// Whether the caller's process token must be elevated. Read-only
-    /// operations, diagnostic actions that persist nothing (e.g. an on-demand
-    /// adapter re-enumeration), and per-SID user configuration writes are safe
-    /// for non-admin GUI sessions; everything else requires an elevated client.
     /// The authorization action an unelevated caller must be granted before
     /// this class is allowed, or `None` when no elevation is needed at all.
     ///
@@ -245,6 +256,10 @@ impl IpcOperationClass {
         }
     }
 
+    /// Whether the caller's process token must be elevated. Read-only
+    /// operations, diagnostic actions that persist nothing (e.g. an on-demand
+    /// adapter re-enumeration), and per-SID user configuration writes are safe
+    /// for non-admin GUI sessions; everything else requires an elevated client.
     pub const fn requires_elevation(self) -> bool {
         !matches!(
             self,

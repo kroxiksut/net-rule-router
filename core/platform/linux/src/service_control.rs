@@ -798,6 +798,7 @@ mod tests {
             vec![
                 "write /etc/systemd/system/netrulerouter.service 644".to_string(),
                 "write /etc/logrotate.d/netrulerouter 644".to_string(),
+                "write /usr/share/polkit-1/actions/netrulerouter.policy 644".to_string(),
                 "link /usr/lib/netrulerouter/nrr-service -> /usr/lib/netrulerouter/nrr-serviced"
                     .to_string(),
                 "run systemctl daemon-reload".to_string(),
@@ -874,6 +875,7 @@ mod tests {
                 "run systemctl disable --now netrulerouter.service".to_string(),
                 "remove /etc/systemd/system/netrulerouter.service".to_string(),
                 "remove /etc/logrotate.d/netrulerouter".to_string(),
+                "remove /usr/share/polkit-1/actions/netrulerouter.policy".to_string(),
                 "remove /usr/lib/netrulerouter/nrr-service".to_string(),
                 "run systemctl daemon-reload".to_string(),
             ]

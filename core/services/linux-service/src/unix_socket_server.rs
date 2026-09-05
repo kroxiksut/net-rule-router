@@ -22,12 +22,15 @@
 //!   and privileged operations go through polkit.
 //!   `peer_cred::classify_unix_client` resolves identity but never rejects on
 //!   an exe basis.
-//! - **Client profile defaults to `GuiInteractive`.** The Windows server derives
-//!   `IpcClientProfile` from the exe basename; peer-cred cannot, so every caller
-//!   is treated as the full-capability profile. Authorization that matters flows
-//!   through `caller_principal` (`unix:uid:<n>`), `caller_is_elevated`
-//!   (`uid == 0`) and — for privileged operations from an ordinary user — polkit,
-//!   which the router consults using the pid captured here.
+//! - **Client profile comes from the program, not from the client.** The
+//!   Windows server derives `IpcClientProfile` from the peer's exe basename;
+//!   here the same answer comes from `/proc/<pid>/exe` for the pid
+//!   `SO_PEERCRED` captured at connect. A program we cannot name gets the most
+//!   restricted profile, and the caller's own handshake can only narrow it
+//!   further. Authorization that matters still flows through
+//!   `caller_principal` (`unix:uid:<n>`), `caller_is_elevated` (`uid == 0`)
+//!   and — for privileged operations from an ordinary user — polkit, which the
+//!   router consults using the pid captured here.
 //!
 //! ## Shutdown
 //!
@@ -76,10 +79,94 @@ pub const SOCKET_PATH: &str = nrr_shared::ipc_transport::SERVICE_ENDPOINT_ADDRES
 /// Hard limit on concurrent connections (matches the Windows server).
 pub const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
-/// Profile assigned to every accepted caller — see the module doc for why the
-/// Linux transport cannot distinguish GUI from tray and defaults to the
-/// full-capability profile.
-const DEFAULT_CLIENT_PROFILE: IpcClientProfile = IpcClientProfile::GuiInteractive;
+/// Hard limit on concurrent connections held by ONE user.
+///
+/// Any local user can reach this socket — that is the design, with identity and
+/// authorization done above it — so the global cap alone let one unprivileged
+/// account hold all 32 slots and lock every other user, and the daemon's own
+/// clients, out of the service without sending a single malformed byte. A
+/// desktop session needs three (window, tray, the occasional console); eight
+/// leaves room for a reconnect storm and still leaves 24 slots for everyone
+/// else.
+pub const MAX_CONNECTIONS_PER_UID: usize = 8;
+
+/// Concurrent connections per uid. Held only while connections are open, so an
+/// idle machine keeps an empty map.
+#[derive(Debug, Default)]
+struct PerUidSlots(Mutex<std::collections::HashMap<u32, usize>>);
+
+impl PerUidSlots {
+    /// Claim a slot for `uid`, or `None` when that user is already at the cap.
+    fn claim(self: &Arc<Self>, uid: u32) -> Option<PerUidSlot> {
+        let mut map = self.0.lock().ok()?;
+        let count = map.entry(uid).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_UID {
+            return None;
+        }
+        *count += 1;
+        Some(PerUidSlot {
+            slots: Arc::clone(self),
+            uid,
+        })
+    }
+}
+
+/// Releases the per-uid slot on drop, including when the worker panics.
+struct PerUidSlot {
+    slots: Arc<PerUidSlots>,
+    uid: u32,
+}
+
+impl Drop for PerUidSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.slots.0.lock() {
+            if let Some(count) = map.get_mut(&self.uid) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.uid);
+                }
+            }
+        }
+    }
+}
+
+/// What an accepted caller may ask for when the program behind the connection
+/// cannot be named. The most restricted profile on purpose: a client the
+/// service cannot identify is not handed the full surface on the strength of
+/// its own word.
+const UNKNOWN_CLIENT_PROFILE: IpcClientProfile = IpcClientProfile::AdminConsole;
+
+/// The profile a connection starts at, derived from the program behind it.
+///
+/// Under `cfg(test)` a test may present itself as one of our surfaces: the test
+/// binary is not one, and the tests that exercise push delivery and the
+/// handshake are about those flows, not about who is allowed to open them. The
+/// override exists only in test builds — production has no way to set it.
+fn connection_profile(program: Option<&str>) -> IpcClientProfile {
+    #[cfg(test)]
+    if let Some(forced) = tests::forced_profile() {
+        return forced;
+    }
+    program
+        .and_then(profile_for_program)
+        .unwrap_or(UNKNOWN_CLIENT_PROFILE)
+}
+
+/// Which of our surfaces `program` is, by executable name. `None` for anything
+/// else — including our own daemon, which never connects to itself.
+///
+/// The Windows transport reads the peer's basename off the pipe; this is the
+/// same answer from `/proc/<pid>/exe`. Both derive the names from the
+/// product-identity SSOT rather than spelling them here.
+fn profile_for_program(program: &str) -> Option<IpcClientProfile> {
+    use nrr_shared::product_identity::BinaryRole;
+    match program {
+        p if p == BinaryRole::Gui.unix_file_name() => Some(IpcClientProfile::GuiInteractive),
+        p if p == BinaryRole::Tray.unix_file_name() => Some(IpcClientProfile::TrayLightweight),
+        p if p == BinaryRole::Console.unix_file_name() => Some(IpcClientProfile::AdminConsole),
+        _ => None,
+    }
+}
 
 /// How long a freshly accepted connection may stay silent before the slot is
 /// taken back. Generous - a GUI starting on a cold machine is slower than one
@@ -186,6 +273,7 @@ impl IpcServer for UnixDomainSocketServer {
             socket_path: self.socket_path.clone(),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
             active_count: Arc::new(AtomicUsize::new(0)),
+            per_uid: Arc::new(PerUidSlots::default()),
             worker_handles: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -205,6 +293,8 @@ pub struct UnixDomainSocketAcceptor {
     node: (u64, u64),
     shutdown_requested: Arc<AtomicBool>,
     active_count: Arc<AtomicUsize>,
+    /// Per-user share of `active_count`, so one account cannot take the lot.
+    per_uid: Arc<PerUidSlots>,
     worker_handles: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
@@ -238,6 +328,18 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
             return AcceptOutcome::Idle;
         }
 
+        // Whose connection this is, before any work is done for it: the
+        // per-user cap has to be charged at accept, not after a worker exists.
+        // An unreadable credential is not attributable and is not served.
+        let identity = match classify_unix_client(&stream) {
+            Ok(id) => id,
+            Err(_) => return AcceptOutcome::Idle,
+        };
+        let Some(uid_slot) = self.per_uid.claim(identity.uid) else {
+            let _ = write_busy_response(stream);
+            return AcceptOutcome::Idle;
+        };
+
         let router = Arc::clone(&self.router);
         let bus = self.event_bus.clone();
         // A guard, so a panic in dispatch cannot leak the slot - see
@@ -249,7 +351,8 @@ impl IpcAcceptor for UnixDomainSocketAcceptor {
             .name("nrr-ipc-worker".into())
             .spawn(move || {
                 let _slot = slot;
-                handle_connection(stream, router, bus);
+                let _uid_slot = uid_slot;
+                handle_connection(stream, identity, router, bus);
             });
 
         match spawn {
@@ -319,20 +422,17 @@ enum ReaderMsg {
 /// subscribes — until it disconnects or a frame is malformed.
 fn handle_connection(
     mut stream: UnixStream,
+    identity: nrr_platform_linux::peer_cred::UnixClientIdentity,
     router: Arc<IpcRouter>,
     event_bus: Option<Arc<EventBus>>,
 ) {
-    let identity = match classify_unix_client(&stream) {
-        Ok(id) => id,
-        Err(_) => return, // getsockopt failure — nothing we can attribute; drop.
-    };
     let principal: Option<UserPrincipal> = Some(identity.principal.clone());
-    // Peer credentials name the user, not the program, so this starts at the
-    // full profile and can only be narrowed — by what the caller declares in its
-    // handshake (see `narrow_profile_from_handshake`). A caller that declares
-    // nothing keeps the default; a caller that declares itself a console is held
-    // to a console's limits for the rest of the connection.
-    let mut profile = DEFAULT_CLIENT_PROFILE;
+    // What the OS says the program is — not what the connection claims. A
+    // client used to arrive at the full profile and could only narrow itself,
+    // so anything on the socket could ask for everything a GUI can simply by
+    // saying nothing. An unidentifiable program gets the most restricted
+    // profile; its own handshake can still narrow it further, never widen it.
+    let mut profile = connection_profile(identity.program_name.as_deref());
 
     let mut reader = match stream.try_clone() {
         Ok(r) => r,
@@ -513,6 +613,81 @@ mod tests {
     use nrr_service_runtime::{IpcAuditEmitter, IpcHandlerRegistry, NoopIpcAuditEmitter};
     use std::sync::atomic::AtomicU32;
     use std::time::{Duration, Instant};
+
+    /// The program decides the profile, so each of our surfaces has to map to
+    /// exactly the one it is allowed to be — and the mapping reads the names
+    /// from the identity SSOT, so a rename cannot silently demote a surface.
+    #[test]
+    fn each_surface_maps_to_its_own_profile() {
+        use nrr_shared::product_identity::BinaryRole;
+        assert_eq!(
+            profile_for_program(BinaryRole::Gui.unix_file_name()),
+            Some(IpcClientProfile::GuiInteractive)
+        );
+        assert_eq!(
+            profile_for_program(BinaryRole::Tray.unix_file_name()),
+            Some(IpcClientProfile::TrayLightweight)
+        );
+        assert_eq!(
+            profile_for_program(BinaryRole::Console.unix_file_name()),
+            Some(IpcClientProfile::AdminConsole)
+        );
+    }
+
+    /// Anything else — including the daemon itself, which never connects to
+    /// itself — is not one of our surfaces, and the caller that runs it falls
+    /// to the profile that may only read.
+    #[test]
+    fn an_unnamed_program_gets_the_profile_that_cannot_mutate() {
+        use nrr_shared::ipc_transport::IpcOperationClass;
+        use nrr_shared::product_identity::BinaryRole;
+        assert_eq!(profile_for_program("curl"), None);
+        assert_eq!(
+            profile_for_program(BinaryRole::Service.unix_file_name()),
+            None
+        );
+        assert!(!UNKNOWN_CLIENT_PROFILE.permits(IpcOperationClass::UserScopedMutation));
+        assert!(UNKNOWN_CLIENT_PROFILE.permits(IpcOperationClass::ReadSnapshot));
+    }
+
+    /// Profile a test connection presents as, when it needs to be one of our
+    /// surfaces. `None` (the default) leaves the real derivation in place.
+    static FORCED_PROFILE: std::sync::Mutex<Option<IpcClientProfile>> = std::sync::Mutex::new(None);
+
+    pub(super) fn forced_profile() -> Option<IpcClientProfile> {
+        FORCED_PROFILE.lock().ok().and_then(|g| *g)
+    }
+
+    /// Present as `profile` for the rest of the process. Tests that need it all
+    /// ask for the same one, so there is nothing to restore.
+    fn present_as(profile: IpcClientProfile) {
+        if let Ok(mut g) = FORCED_PROFILE.lock() {
+            *g = Some(profile);
+        }
+    }
+
+    /// One account must not be able to take every slot: the cap is per uid, and
+    /// the slot has to come back when the connection ends — a leak here would
+    /// lock the user out of their own service after eight windows.
+    #[test]
+    fn one_user_cannot_hold_more_than_its_share_of_the_slots() {
+        let slots = Arc::new(PerUidSlots::default());
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_UID {
+            held.push(slots.claim(1000).expect("under the cap"));
+        }
+        assert!(
+            slots.claim(1000).is_none(),
+            "the cap must refuse the next connection from the same uid"
+        );
+        // Another user is unaffected — that is the point of a per-uid cap.
+        assert!(slots.claim(1001).is_some());
+        drop(held.pop());
+        assert!(
+            slots.claim(1000).is_some(),
+            "a closed connection must give its slot back"
+        );
+    }
 
     /// Hand-rolled temp dir (zero dev-deps, same idiom as `peer_cred`).
     struct TempDir(PathBuf);
@@ -787,6 +962,9 @@ mod tests {
         use nrr_shared::ipc::IpcOperationName;
         use nrr_shared::ipc_payloads::{StatusUpdateEvent, StatusUpdatePushFrame};
 
+        // Push subscriptions belong to the window and the tray; this test is
+        // about delivery, so it presents as the window.
+        present_as(IpcClientProfile::GuiInteractive);
         let dir = temp_dir();
         let sock = dir.0.join("service.sock");
         let bus = Arc::new(EventBus::new());

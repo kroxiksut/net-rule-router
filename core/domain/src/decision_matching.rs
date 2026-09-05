@@ -236,7 +236,7 @@ pub enum MatchClass {
 /// |--------------|-----------------------------------------------|
 /// | `ExactFqdn`  | Number of DNS labels (e.g. `a.b.c` = 3)       |
 /// | `SuffixDomain` | Number of DNS labels in the base domain      |
-/// | `Zone`       | Always 1 (all zones are equally specific)     |
+/// | `Zone`       | Number of DNS labels (`corp.intra` = 2)       |
 /// | `ExactIp`    | Always 1 (exact match; no CIDR in Free)       |
 /// | `Application` | Exact name = 2, glob pattern = 1             |
 /// | `Default`    | Always 0                                      |
@@ -258,7 +258,14 @@ impl SpecificityScore {
         Self(label.split('.').count() as u32)
     }
 
-    /// Fixed score of 1 — used for `Zone`, `ExactIp`.
+    /// Fixed score of 1 — used for `ExactIp`, which has nothing to compare:
+    /// an address either is the one named or it is not.
+    ///
+    /// Zones do NOT use it. Scoring every zone the same made `corp.intra` and
+    /// `intra` indistinguishable, and the winner between them fell to whichever
+    /// `rule_id` sorted first — so the WIDER zone could take traffic from the
+    /// narrower one, against the product's own rule that the narrower rule
+    /// wins. Zones are scored by [`Self::label_count`] like any other domain.
     pub const SINGLE: Self = Self(1);
 
     /// Fixed score of 2 — used for exact application name match.
@@ -351,9 +358,12 @@ pub struct RuleMatchCandidate {
 
 /// Controls whether `ExactIp` or `Zone` is checked first in tier 3.
 ///
-/// Stored per principal as `secondary_block_policy.zone_priority_over_ip`
-/// (state-DB v61) and surfaced in **Settings → Routing**. It used to live in
-/// device-local UI preferences, where nothing read it.
+/// The product invariant is that the NARROWER rule wins, so the default —
+/// `ExactIp` before `Zone` — is the answer, and no GUI surface inverts it. The
+/// parameter survives because the matcher must not hardcode an ordering it can
+/// be asked to explain; the per-principal field
+/// (`secondary_block_policy.zone_priority_over_ip`) keeps that default. A host
+/// that needs the other route gets its own narrow rule, not a global flip.
 ///
 /// **This setting affects only runtime evaluation order — it has no effect on
 /// canonical storage order** (which is always `ExactFqdn < SuffixDomain <

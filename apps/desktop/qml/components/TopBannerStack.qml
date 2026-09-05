@@ -6,7 +6,8 @@ import "../lib/pure.js" as Pure
 // Top banner stack (extracted from Main.qml). The status banners
 // (backend / combined-amber / drift / merge / compat / secondary-adapter /
 // empty-rules / policy-inactive / block-all / rules-folder-suggestion /
-// revision-integrity / local-network-offer), stacked top-to-bottom
+// revision-integrity / local-network-offer / binding-divergence), stacked
+// top-to-bottom
 // and anchored to each other. The combined-amber bar merges the drift and
 // secondary-adapter warnings into one container while both apply; those two
 // stand down for its duration. Kept as ONE
@@ -20,22 +21,52 @@ Item {
     // ApplicationWindow injected by the caller (`root: window`).
     property var root: null
 
-    readonly property real totalHeight: backendBanner.height
+    readonly property real totalHeight: previewDataBanner.height
+        + backendBanner.height
         + combinedAmberBanner.height + driftBanner.height
         + mergeBanner.height + compatBanner.height + secondaryAdapterBanner.height
         + emptyRulesBanner.height + policyInactiveBanner.height
         + blockAllBanner.height
         + rulesFolderSuggestionBanner.height + revisionIntegrityBanner.height
-        + localNetworkOfferBanner.height
+        + localNetworkOfferBanner.height + bindingDivergenceBanner.height
     height: totalHeight
 
     // Expansion state of the combined amber banner. Local to the stack — the
     // window owns only the "are both warnings up?" predicate.
     property bool combinedAmberExpanded: false
 
+    // Above everything else, because it qualifies everything else: while it is
+    // up, no number on any screen came from the service. Not dismissible — it
+    // describes the nature of the data, not an event, and hiding it would put
+    // back the very claim it exists to correct.
+    Rectangle {
+        id: previewDataBanner
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.previewDataBannerVisible ? Math.max(36, previewDataLabel.implicitHeight + 2 * root.uiTheme.spacingSm) : 0
+        visible: root.previewDataBannerVisible
+        color: "#475569"     // slate — not an alarm, and not the informational blue
+        z: 101
+
+        Label {
+            id: previewDataLabel
+            anchors.fill: parent
+            anchors.leftMargin: root.uiTheme.spacingLg
+            anchors.rightMargin: root.uiTheme.spacingLg
+            verticalAlignment: Text.AlignVCenter
+            wrapMode: Text.WordWrap
+            color: "#ffffff"
+            text: root.uiRevision >= 0
+                ? root.tr("status.preview-data-banner",
+                    "Demo data. This window is running on a preview backend (NRR_BACKEND), so nothing shown here comes from the service and nothing changed here reaches it.")
+                : ""
+        }
+    }
+
     Rectangle {
         id: backendBanner
-        anchors.top: parent.top
+        anchors.top: previewDataBanner.bottom
         anchors.left: parent.left
         anchors.right: parent.right
         height: root.backendBannerHeight
@@ -512,7 +543,7 @@ Item {
                                 "The additional adapter \"{name}\" assigned to your rules isn't available right now — start it, or choose a different adapter in Interfaces and routes. While it's missing, matching traffic is blocked (leak protection) instead of leaking over your main connection.")
                                 .replace("{name}", String(root.prefs.selectedSecondaryInterfaceName || ""))
                             : root.tr("status.vpn-split-conflict",
-                                "Your additional adapter \"{name}\" is connected, but NetRuleRouter keeps general traffic on your main connection — only your {n} rule(s) go through it. To route all traffic through it, change the routing mode in Settings → Routing behavior.")
+                                "Your additional adapter \"{name}\" is up and carrying exactly what you asked it to: your {n} rule(s) go through it, everything else stays on your main connection. That is selective routing doing its job — nothing here needs fixing. If you would rather send everything through it, switch the mode in Settings → Routing behavior.")
                                 .replace("{name}", root.interfacesRolesController._vpnConflictSecondaryDisplayName())
                                 .replace("{n}", String(root.interfacesRolesController._enabledSecondaryRuleCount()))))
                     : ""
@@ -1020,6 +1051,68 @@ Item {
                     root.acceptPendingLocalNetworks()
                     root.routePolicyController.applyLocalNetworksAutoAccept(true)
                 }
+            }
+        }
+    }
+
+    // The app and the service disagree about which adapter carries which role.
+    // Amber, and never resolved silently: the app's own value is what the user
+    // last chose, the service's is what traffic is actually following, and
+    // picking for them would either hide an edit or undo one. No close button —
+    // a dismissed question leaves the two stores diverged with nothing saying so.
+    Rectangle {
+        id: bindingDivergenceBanner
+        anchors.top: localNetworkOfferBanner.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: root.routeBindingDivergenceVisible
+            ? Math.max(36, bindingDivergenceRow.implicitHeight + 2 * root.uiTheme.spacingSm)
+            : 0
+        visible: root.routeBindingDivergenceVisible
+        color: "#d4a017"
+        z: 90
+        RowLayout {
+            id: bindingDivergenceRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: root.uiTheme.spacingMd
+            anchors.rightMargin: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Label {
+                text: "⚠"
+                color: "white"
+                Layout.alignment: Qt.AlignTop
+                Accessible.ignored: true
+            }
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                color: "white"
+                text: root.routeBindingDivergenceText
+                verticalAlignment: Text.AlignVCenter
+                wrapMode: Text.WordWrap
+                Accessible.role: Accessible.StaticText
+                Accessible.name: text
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                highlighted: true
+                text: root.tr("status.route-binding-keep-service", "Keep what the service applies")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: root.tr("status.route-binding-keep-service-description",
+                    "Show the connections the background service is applying and stop offering the ones stored in the app.")
+                onClicked: root.adoptServiceRouteBinding()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("status.route-binding-keep-mine", "Apply what is shown here")
+                Accessible.role: Accessible.Button
+                Accessible.name: text
+                Accessible.description: root.tr("status.route-binding-keep-mine-description",
+                    "Send the connections shown here to the background service, replacing the ones it is applying.")
+                onClicked: root.resendRouteBindingToService()
             }
         }
     }

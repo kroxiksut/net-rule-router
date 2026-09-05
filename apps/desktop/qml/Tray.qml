@@ -917,6 +917,11 @@ SystemTrayIcon {
                 return tr("tray.block-notice.reason.ipv6-blocked",
                     "IPv6 is switched off while leak protection is on, and this address is IPv6. "
                     + "No rule blocked it — the switch is in Settings.")
+            case "dns-lockdown":
+                return tr("tray.block-notice.reason.dns-lockdown",
+                    "This app tried to reach a public DNS resolver of its own instead of the one "
+                    + "NetRuleRouter provides, and encrypted-DNS blocking closed it. "
+                    + "No rule blocked it — the switch is in Settings, under Routing.")
             case "unattributed":
                 return tr("tray.block-notice.reason.unattributed",
                     "NetRuleRouter blocked this address, but could not identify which filter did it.")
@@ -959,10 +964,11 @@ SystemTrayIcon {
         // a route — offering to add it there again would write nothing. What
         // the user can actually do is look at the route.
         var routeIsDown = (reason === "route-unavailable")
-        // A closed IPv6 family is governed by a switch, not by a rule: routing
-        // an IPv6 address would write a rule the engine cannot enforce.
-        var ipv6Closed = (reason === "ipv6-blocked")
-        var primary = ipv6Closed
+        // A closed IPv6 family and the encrypted-DNS lockdown are both governed
+        // by a switch, not by a rule: routing the address would write a rule
+        // that cannot answer either one.
+        var switchGoverned = (reason === "ipv6-blocked" || reason === "dns-lockdown")
+        var primary = switchGoverned
             ? {
                 label: tr("notifications.strict-killswitch.action", "Open settings"),
                 actionId: "block-notice-open-settings",
@@ -1393,6 +1399,8 @@ SystemTrayIcon {
                 return tr("block-reason.blocked-by-rule", "Blocks by rule")
             case "ipv6-blocked":
                 return tr("block-reason.ipv6-blocked", "IPv6 blocks")
+            case "dns-lockdown":
+                return tr("block-reason.dns-lockdown", "Blocks of apps using their own DNS")
             case "unattributed":
                 return tr("block-reason.unattributed", "Blocks without an identified filter")
             default:
