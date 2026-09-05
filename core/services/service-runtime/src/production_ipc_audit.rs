@@ -63,7 +63,7 @@ where
                 actor_kind: ActorKind::User,
                 // Hashed, never the SID itself: the trail must survive being
                 // read by someone who should not learn who is on this machine.
-                actor_id_hash: hash_actor(ctx.caller_stored()),
+                actor_id_hash: nrr_diagnostics::audit::actor_id_hash(ctx.caller_stored()),
                 revision_id: None,
                 risk_level: risk_of(request),
                 result: AuditEventResult::Success,
@@ -129,16 +129,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-fn hash_actor(stored: &str) -> Option<String> {
-    if stored.is_empty() {
-        return None;
-    }
-    use sha2::{Digest, Sha256};
-    let mut h = Sha256::new();
-    h.update(stored.as_bytes());
-    Some(format!("{:x}", h.finalize()))
 }
 
 #[cfg(test)]

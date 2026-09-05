@@ -62,7 +62,7 @@ QtObject {
             })
             return
         }
-        startRulesReviewFlow(rulesJson, contentHash)
+        startRulesReviewFlow(rulesJson, contentHash, false, "apply-guard")
     }
     function _resolveGuardRulesApply(ok) {
         var cb = root._guardRulesResume
@@ -74,12 +74,27 @@ QtObject {
     /// Entry point for sections (RulesSection's Save button). Kicks
     /// off the dry-run pass; the rpcResponse callback opens
     /// ReviewDiffDialog.
-    function startRulesReviewFlow(rulesJson, contentHash, adminBaseline) {
+    function startRulesReviewFlow(rulesJson, contentHash, adminBaseline, origin) {
         if (!root.bridgeAvailable) {
             console.log("review-flow: bridge unavailable, aborting")
+            _resolveGuardRulesApply(false)
             return
         }
-        var corr = Pure.newCorrelationId("review-save")
+        // One review at a time. A preview derives the whole per-SID filter plan
+        // and the client holds ONE request in flight, so a second start does not
+        // race the first — it queues behind it and doubles the wait the user is
+        // already staring at. A hardware run recorded two identical previews
+        // 1.8 s apart: 18.9 s + 8.8 s for one save.
+        if (root.rpc.longCallInFlight) {
+            console.log("review-flow: already in flight, ignoring start from",
+                        String(origin || "unnamed"))
+            _resolveGuardRulesApply(false)
+            return
+        }
+        // The origin travels on the wire (`correlation_id` in the service log),
+        // so the next duplicate names its own caller instead of leaving us to
+        // guess which of six paths fired it.
+        var corr = Pure.newCorrelationId(String(origin || "review-save"))
         var payload = {
             "rules-json": String(rulesJson || ""),
             "content-hash": String(contentHash || ""),
@@ -505,7 +520,8 @@ QtObject {
             // Preserve the admin-baseline intent on retry.
             startRulesReviewFlow(root.pendingReviewState.rulesJson,
                                  root.pendingReviewState.contentHash,
-                                 root.pendingReviewState.adminBaseline)
+                                 root.pendingReviewState.adminBaseline,
+                                 "review-retry")
         }
     }
 

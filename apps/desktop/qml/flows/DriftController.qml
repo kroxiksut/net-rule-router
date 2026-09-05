@@ -50,6 +50,7 @@ QtObject {
         root.mergeReviewDialog.policy = _mergePolicy()
         root.mergeReviewDialog.mergeResult = null
         root.mergeReviewDialog.picks = ({})
+        root.mergeReviewDialog.keepSecondary = ({})
         root.mergeReviewDialog.errorText = ""
         root.mergeReviewDialog.loading = true
         root.mergeReviewDialog.open()
@@ -92,7 +93,7 @@ QtObject {
     /// `rules.merge-preview` pass. `done(result, errorCode)` — `result` is
     /// null on failure. Split out of `_openMergeDialog` so the same pass can
     /// answer "does merging change anything at all" before any dialog opens.
-    function _fetchMergePreview(resolutions, done) {
+    function _fetchMergePreview(resolutions, done, keepSecondaryKeys) {
         var primaryPath = _rememberedRulesPath("primary")
         var secondaryPath = _rememberedRulesPath("secondary")
         var primB64 = primaryPath
@@ -103,7 +104,7 @@ QtObject {
         root._mergeSecondaryText = secB64 ? nrrNativeBridge.decodeBase64Utf8(secB64) : ""
         var corr = nrrNativeBridge.rpcRulesMergePreview(
             root._mergePrimaryText, root._mergeSecondaryText,
-            _mergePolicy(), resolutions || [])
+            _mergePolicy(), resolutions || [], keepSecondaryKeys || [])
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             done((ok && p && p.result) ? p.result : null, code)
         })
@@ -125,7 +126,7 @@ QtObject {
     /// user's per-conflict picks to get the final merged rules-json, then hand
     /// it to the standard review + apply flow (service = single writer). On a
     /// successful activation the bound files are re-exported so file == service.
-    function _applyMerge(resolutions) {
+    function _applyMerge(resolutions, keepSecondaryKeys) {
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcRulesMergePreview !== "function") {
             root.statusLine = root.tr("status.bridge-unavailable", "Native bridge unavailable")
@@ -133,7 +134,8 @@ QtObject {
         }
         var policy = String((root.prefs && root.prefs.mergeConflictPolicy) || "union")
         var corr = nrrNativeBridge.rpcRulesMergePreview(
-            root._mergePrimaryText, root._mergeSecondaryText, policy, resolutions || [])
+            root._mergePrimaryText, root._mergeSecondaryText, policy, resolutions || [],
+            keepSecondaryKeys || [])
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
             if (!ok || !p || !p.result) {
                 root.statusLine = root.tr("dialog.merge.error",
@@ -162,7 +164,8 @@ QtObject {
                 root._filesSyncDirtySecondary = true
             }
             root._mergeApplyPendingWrite = true
-            root.reviewFlowController.startRulesReviewFlow(mergedRulesJson, contentHash)
+            root.reviewFlowController.startRulesReviewFlow(
+                mergedRulesJson, contentHash, false, "drift-merge")
         })
     }
 
@@ -394,7 +397,8 @@ QtObject {
         } else {
             contentHash = "client-stub-" + String(Date.now())
         }
-        root.reviewFlowController.startRulesReviewFlow(rulesJson, contentHash)
+        root.reviewFlowController.startRulesReviewFlow(
+            rulesJson, contentHash, false, "drift-apply-gui")
     }
 
     /// Dialog action: discard local edits and load the

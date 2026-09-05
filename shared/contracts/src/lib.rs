@@ -66,7 +66,6 @@ pub mod product_identity;
 pub mod rules_json;
 pub mod rules_overlap;
 pub mod settings_export;
-pub mod summary;
 pub mod system_info;
 // Descriptors + integrity status of the binaries we ship from third parties
 // (today: WireGuard LLC's Wintun, Windows only). The GUI renders these, so
@@ -123,12 +122,6 @@ pub use localization::{
     LocaleLoadState, LocaleLoadStatus, LocaleSource, LOCALE_SCHEMA_PATH, LOCALE_SCHEMA_VERSION,
 };
 pub use settings_export::SettingsExportV1;
-pub use summary::{
-    format_about_summary, format_accessibility_baseline_summary, format_first_run_summary,
-    format_interfaces_routes_summary, format_main_window_shell_summary, format_rules_summary,
-    format_security_visibility_summary, format_settings_summary, format_shell_summary,
-    format_tooltip_policy_summary, format_ui_surface_contract_summary,
-};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AppSection {
@@ -311,37 +304,8 @@ pub struct NavigationModel {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MainWindowLayoutZone {
-    TitleBar,
-    MenuBar,
-    Sidebar,
-    Workspace,
-    StatusBar,
-    ActionBar,
-}
-
-impl MainWindowLayoutZone {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::TitleBar => "Title bar",
-            Self::MenuBar => "Menu bar",
-            Self::Sidebar => "Sidebar",
-            Self::Workspace => "Workspace",
-            Self::StatusBar => "Status bar",
-            Self::ActionBar => "Action bar",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MainWindowShellContract {
     pub window_title: &'static str,
-    pub layout_zones: &'static [MainWindowLayoutZone],
-    pub sidebar_sections: &'static [AppSection],
-    pub shared_shell_sections: &'static [AppSection],
-    pub shared_shell_review_dialogs: &'static [GuiDialog],
-    pub workspace_note: &'static str,
-    pub apply_cancel_actions_visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -440,8 +404,6 @@ pub struct AppShellModel {
     pub tooltip_policy: TooltipPolicyContract,
     pub accessibility_baseline: AccessibilityBaselineContract,
     pub ui_surface_contract: UiSurfaceContract,
-    pub interfaces_routes: InterfacesRoutesContract,
-    pub rules: RulesContract,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -760,103 +722,6 @@ pub struct UiSurfaceContract {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum InterfaceFieldId {
-    WindowsName,
-    InterfaceType,
-    LocalIp,
-    Gateway,
-    DnsServers,
-    HasDefaultRoute,
-    BasicAvailabilityStatus,
-}
-
-impl InterfaceFieldId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::WindowsName => "Windows name",
-            Self::InterfaceType => "Interface type",
-            Self::LocalIp => "Local IP",
-            Self::Gateway => "Gateway",
-            Self::DnsServers => "DNS servers",
-            Self::HasDefaultRoute => "Has default route",
-            Self::BasicAvailabilityStatus => "Basic availability status",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DataReadiness {
-    RealInBlock2,
-    PlaceholderUntilBlock5,
-}
-
-impl DataReadiness {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::RealInBlock2 => "real-in-block-2",
-            Self::PlaceholderUntilBlock5 => "placeholder-until-block-5",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfaceFieldReadiness {
-    pub field: InterfaceFieldId,
-    pub readiness: DataReadiness,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum SnapshotValueAvailability {
-    AlwaysPresentFromSnapshot,
-    MayBeUnknownFromSnapshot,
-}
-
-impl SnapshotValueAvailability {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::AlwaysPresentFromSnapshot => "always-present-from-snapshot",
-            Self::MayBeUnknownFromSnapshot => "may-be-unknown-from-snapshot",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfaceFieldSnapshotStatus {
-    pub field: InterfaceFieldId,
-    pub availability: SnapshotValueAvailability,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum InterfaceFieldUsageScope {
-    UiOnly,
-    DiagnosticsContract,
-    DecisionInput,
-}
-
-impl InterfaceFieldUsageScope {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::UiOnly => "ui-only",
-            Self::DiagnosticsContract => "diagnostics-contract",
-            Self::DecisionInput => "decision-input",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfaceFieldUsage {
-    pub field: InterfaceFieldId,
-    pub scope: InterfaceFieldUsageScope,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfacesDisplayFormat {
-    pub ordered_fields: &'static [InterfaceFieldId],
-    pub unknown_value_marker: &'static str,
-    pub dns_separator: &'static str,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConnectivityState {
     Available,
     Degraded,
@@ -915,16 +780,6 @@ impl DerivedLikelihood {
             Self::Unknown => "unknown",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ConnectivityChecksPolicy {
-    pub local_checks_without_network_probe: bool,
-    pub external_probe_allowed: bool,
-    pub probe_timeout_ms: u64,
-    pub max_probe_retries: u8,
-    pub min_refresh_interval_seconds: u64,
-    pub offline_mode_behavior: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1003,13 +858,6 @@ impl AdapterCheckExecutionScope {
             Self::RequiresServiceMediation => "requires-service-mediation",
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct AdapterCheckActionContract {
-    pub id: AdapterCheckActionId,
-    pub scope: AdapterCheckExecutionScope,
-    pub description: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1310,45 +1158,6 @@ impl RouteSelectionState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct InterfacesRoutesContract {
-    pub field_readiness: &'static [InterfaceFieldReadiness],
-    pub field_snapshot_status: &'static [InterfaceFieldSnapshotStatus],
-    pub field_usage_scopes: &'static [InterfaceFieldUsage],
-    pub display_format: InterfacesDisplayFormat,
-    pub enriched_fields: &'static [&'static str],
-    pub connectivity_states: &'static [ConnectivityState],
-    pub external_ip_statuses: &'static [ExternalIpStatus],
-    pub derived_likelihood_scale: &'static [DerivedLikelihood],
-    pub recommendation_classes: &'static [RecommendationClass],
-    pub recommendation_confidence_levels: &'static [RecommendationConfidence],
-    pub connectivity_checks_policy: ConnectivityChecksPolicy,
-    pub observed_vs_derived_boundary: &'static str,
-    pub vpn_tunnel_signals: &'static [&'static str],
-    pub virtual_interface_signals: &'static [&'static str],
-    pub service_interface_signals: &'static [&'static str],
-    pub derived_cache_policy: &'static str,
-    pub recommendation_tie_break_priority: &'static [&'static str],
-    pub recommendation_advisory_policy: &'static str,
-    pub recommendation_hints_catalog: &'static [&'static str],
-    pub manual_role_confirmation_required: bool,
-    pub role_conflict_policy: &'static str,
-    pub confirmed_choice_priority_policy: &'static str,
-    pub secondary_role_ux_warnings: &'static [&'static str],
-    pub show_bluetooth_adapters_default: bool,
-    pub bluetooth_detection_signals: &'static [&'static str],
-    pub bluetooth_recommendation_policy: &'static str,
-    pub adapter_check_actions: &'static [AdapterCheckActionContract],
-    pub adapter_check_result_statuses: &'static [AdapterCheckResultStatus],
-    pub diagnostics_explain_integration_note: &'static str,
-    pub supported_behavior_modes: &'static [RouteBehaviorMode],
-    pub route_state_placeholders: &'static [RouteSelectionState],
-    pub preview_only_selection: bool,
-    pub preview_notice: &'static str,
-    pub role_explanation: &'static str,
-    pub diagnostics_alignment_note: &'static str,
-}
-
 /// Free edition rule type — determines how the match value is interpreted.
 ///
 /// # Domain vs exact-FQDN vs suffix/subdomain (legacy)
@@ -1491,125 +1300,6 @@ impl FromStr for RuleScenario {
             "reorder" | "order" => Ok(Self::Reorder),
             "search" | "find" => Ok(Self::Search),
             _ => Err("unknown rule scenario"),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RuleFormFieldId {
-    RuleType,
-    MatchValue,
-    TargetRoute,
-    Enabled,
-    Comment,
-}
-
-impl RuleFormFieldId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::RuleType => "Rule type",
-            Self::MatchValue => "Match value",
-            Self::TargetRoute => "Target route",
-            Self::Enabled => "Enabled",
-            Self::Comment => "Comment",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RuleFormFieldSpec {
-    pub id: RuleFormFieldId,
-    pub required: bool,
-    pub constraint_hint: &'static str,
-    pub visible_in_gui_v1: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FreeRuleListType {
-    SingleActiveManagedList,
-    ImportedPresetReplacingActiveList,
-}
-
-impl FreeRuleListType {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::SingleActiveManagedList => "Single active managed list",
-            Self::ImportedPresetReplacingActiveList => "Imported preset replacing active list",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RuleListLoadFieldId {
-    FilePath,
-    Format,
-    SchemaVersion,
-    ParsedSummary,
-    ReplaceCurrentList,
-    LoadAction,
-    CancelAction,
-}
-
-impl RuleListLoadFieldId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::FilePath => "File path",
-            Self::Format => "Format",
-            Self::SchemaVersion => "Schema version",
-            Self::ParsedSummary => "Parsed summary",
-            Self::ReplaceCurrentList => "Replace current list",
-            Self::LoadAction => "Load",
-            Self::CancelAction => "Cancel",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RuleListEditFieldId {
-    ListName,
-    Description,
-    RulesSet,
-    RulesOrder,
-    DefaultMode,
-    SaveAction,
-    CancelAction,
-}
-
-impl RuleListEditFieldId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::ListName => "List name",
-            Self::Description => "Description",
-            Self::RulesSet => "Rules set",
-            Self::RulesOrder => "Rules order",
-            Self::DefaultMode => "Default mode",
-            Self::SaveAction => "Save",
-            Self::CancelAction => "Cancel",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum RuleReplaceReviewFieldId {
-    IncomingListName,
-    IncomingRulesCount,
-    CurrentRulesCount,
-    DefaultModeDiff,
-    NewTypesSummary,
-    ReplaceAction,
-    CancelAction,
-}
-
-impl RuleReplaceReviewFieldId {
-    pub const fn title(self) -> &'static str {
-        match self {
-            Self::IncomingListName => "Incoming list name",
-            Self::IncomingRulesCount => "Incoming rules count",
-            Self::CurrentRulesCount => "Current rules count",
-            Self::DefaultModeDiff => "Default mode difference",
-            Self::NewTypesSummary => "New rule types summary",
-            Self::ReplaceAction => "Replace",
-            Self::CancelAction => "Cancel",
         }
     }
 }
@@ -2071,58 +1761,6 @@ impl RuleValidationStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct RulesContract {
-    pub supported_free_rule_types: &'static [FreeRuleType],
-    pub placeholder_scenarios: &'static [RuleScenario],
-    pub form_fields: &'static [RuleFormFieldSpec],
-    pub supported_free_list_types: &'static [FreeRuleListType],
-    pub load_list_dialog_fields: &'static [RuleListLoadFieldId],
-    pub edit_list_dialog_fields: &'static [RuleListEditFieldId],
-    pub replace_review_dialog_fields: &'static [RuleReplaceReviewFieldId],
-    pub load_list_requires_review_before_replace: bool,
-    pub preview_notice: &'static str,
-    /// Sort modes available in the rules table view.
-    pub supported_sort_modes: &'static [RulesViewSort],
-    /// Enabled/disabled filter options available in the rules table view.
-    pub supported_enabled_filters: &'static [RulesEnabledFilter],
-    /// Rule-type filter options available in the rules table view (all variants).
-    pub supported_type_filters: &'static [RulesTypeFilter],
-    /// Subset of `supported_type_filters` that represent other-OS sections.
-    ///
-    /// The GUI hides these filters by default and reveals them only when the
-    /// user enables "Show rules for other OS" in settings.
-    pub other_os_type_filters: &'static [RulesTypeFilter],
-    /// Resolution choices for the duplicate-rule-across-sets dialog.
-    pub supported_duplicate_resolutions: &'static [RulesDuplicateResolution],
-    /// Default value for the "block secondary-targeted connections when secondary
-    /// is unavailable" setting. `false` = fail-open (reroute to primary).
-    pub block_secondary_when_unavailable_default: bool,
-    /// Supported behaviors when the external rules file changes on disk.
-    pub supported_file_change_behaviors: &'static [RulesFileChangeBehavior],
-    /// Default file-change behavior. `Notify` is the safe default — the user
-    /// reviews the diff before the service applies it.
-    pub default_file_change_behavior: RulesFileChangeBehavior,
-    /// `true` when the GUI shows a per-rule enable/disable toggle.
-    ///
-    /// Toggling a rule off in the GUI comments out its line in the rules file
-    /// (`# value`). Toggling it on removes the leading `#`.
-    pub supports_rule_enable_toggle: bool,
-    /// `true` when the GUI shows and allows editing of the per-rule inline
-    /// comment (the text after `#` on an active rule line).
-    pub supports_rule_comments: bool,
-    /// Enabled state a rule gets when the user adds it and never touches the
-    /// enable toggle. Must stay `true`: a rule the user typed in is a rule the
-    /// user wants applied, and a rule that silently lands disabled enforces
-    /// nothing while looking like it was accepted.
-    ///
-    /// The Add/Edit dialog (`apps/desktop/qml/components/RuleEditDialog.qml`)
-    /// realises this by resetting its local enabled state — and the widget
-    /// bound to it — on every open, so a toggle cleared in one dialog session
-    /// cannot survive into the next.
-    pub new_rule_enabled_default: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FirstRunStepId {
     Welcome,
     BasicScenarioSelection,
@@ -2458,31 +2096,8 @@ const NAVIGATION_MODEL: NavigationModel = NavigationModel {
     tray_opening_reuses_main_window: true,
 };
 
-const MAIN_WINDOW_LAYOUT_ZONES: [MainWindowLayoutZone; 6] = [
-    MainWindowLayoutZone::TitleBar,
-    MainWindowLayoutZone::MenuBar,
-    MainWindowLayoutZone::Sidebar,
-    MainWindowLayoutZone::Workspace,
-    MainWindowLayoutZone::StatusBar,
-    MainWindowLayoutZone::ActionBar,
-];
-
-const SHARED_SHELL_SECTIONS: [AppSection; 2] = [AppSection::Settings, AppSection::Diagnostics];
-
-const SHARED_SHELL_REVIEW_DIALOGS: [GuiDialog; 2] = [
-    GuiDialog::ReviewReplaceCurrentList,
-    GuiDialog::ConfirmReplaceCurrentList,
-];
-
 const MAIN_WINDOW_SHELL_CONTRACT: MainWindowShellContract = MainWindowShellContract {
     window_title: crate::product_identity::PRODUCT_NAME,
-    layout_zones: &MAIN_WINDOW_LAYOUT_ZONES,
-    sidebar_sections: &MAIN_WINDOW_SECTIONS,
-    shared_shell_sections: &SHARED_SHELL_SECTIONS,
-    shared_shell_review_dialogs: &SHARED_SHELL_REVIEW_DIALOGS,
-    workspace_note:
-        "Main window uses one shell frame for sections and launches review flows as dialogs.",
-    apply_cancel_actions_visible: true,
 };
 
 const INFORMATION_ARCHITECTURE: InformationArchitecture = InformationArchitecture {
@@ -2981,457 +2596,6 @@ const UI_SURFACE_CONTRACT: UiSurfaceContract = UiSurfaceContract {
     surfaces: &UI_SURFACE_SPECS,
 };
 
-const INTERFACE_FIELD_READINESS: [InterfaceFieldReadiness; 7] = [
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::WindowsName,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::InterfaceType,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::LocalIp,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::Gateway,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::DnsServers,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::HasDefaultRoute,
-        readiness: DataReadiness::RealInBlock2,
-    },
-    InterfaceFieldReadiness {
-        field: InterfaceFieldId::BasicAvailabilityStatus,
-        readiness: DataReadiness::PlaceholderUntilBlock5,
-    },
-];
-
-const INTERFACE_FIELD_SNAPSHOT_STATUS: [InterfaceFieldSnapshotStatus; 7] = [
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::WindowsName,
-        availability: SnapshotValueAvailability::AlwaysPresentFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::InterfaceType,
-        availability: SnapshotValueAvailability::AlwaysPresentFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::LocalIp,
-        availability: SnapshotValueAvailability::MayBeUnknownFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::Gateway,
-        availability: SnapshotValueAvailability::MayBeUnknownFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::DnsServers,
-        availability: SnapshotValueAvailability::MayBeUnknownFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::HasDefaultRoute,
-        availability: SnapshotValueAvailability::AlwaysPresentFromSnapshot,
-    },
-    InterfaceFieldSnapshotStatus {
-        field: InterfaceFieldId::BasicAvailabilityStatus,
-        availability: SnapshotValueAvailability::AlwaysPresentFromSnapshot,
-    },
-];
-
-const INTERFACE_FIELD_USAGE_SCOPES: [InterfaceFieldUsage; 7] = [
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::WindowsName,
-        scope: InterfaceFieldUsageScope::DiagnosticsContract,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::InterfaceType,
-        scope: InterfaceFieldUsageScope::DiagnosticsContract,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::LocalIp,
-        scope: InterfaceFieldUsageScope::DiagnosticsContract,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::Gateway,
-        scope: InterfaceFieldUsageScope::DecisionInput,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::DnsServers,
-        scope: InterfaceFieldUsageScope::UiOnly,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::HasDefaultRoute,
-        scope: InterfaceFieldUsageScope::DecisionInput,
-    },
-    InterfaceFieldUsage {
-        field: InterfaceFieldId::BasicAvailabilityStatus,
-        scope: InterfaceFieldUsageScope::DecisionInput,
-    },
-];
-
-const INTERFACE_DISPLAY_ORDERED_FIELDS: [InterfaceFieldId; 7] = [
-    InterfaceFieldId::WindowsName,
-    InterfaceFieldId::InterfaceType,
-    InterfaceFieldId::LocalIp,
-    InterfaceFieldId::Gateway,
-    InterfaceFieldId::DnsServers,
-    InterfaceFieldId::HasDefaultRoute,
-    InterfaceFieldId::BasicAvailabilityStatus,
-];
-
-const INTERFACES_DISPLAY_FORMAT: InterfacesDisplayFormat = InterfacesDisplayFormat {
-    ordered_fields: &INTERFACE_DISPLAY_ORDERED_FIELDS,
-    unknown_value_marker: "-",
-    dns_separator: ", ",
-};
-
-const ENRICHED_INTERFACE_FIELDS: [&str; 5] = [
-    "connectivity_state",
-    "external_ip_status",
-    "vpn_tunnel_likelihood",
-    "virtual_interface_likelihood",
-    "service_interface_likelihood",
-];
-
-const CONNECTIVITY_STATES: [ConnectivityState; 5] = [
-    ConnectivityState::Available,
-    ConnectivityState::Degraded,
-    ConnectivityState::Unavailable,
-    ConnectivityState::Unknown,
-    ConnectivityState::Timeout,
-];
-
-const EXTERNAL_IP_STATUSES: [ExternalIpStatus; 5] = [
-    ExternalIpStatus::Resolved,
-    ExternalIpStatus::NotChecked,
-    ExternalIpStatus::CheckFailed,
-    ExternalIpStatus::RateLimited,
-    ExternalIpStatus::Blocked,
-];
-
-const DERIVED_LIKELIHOOD_SCALE: [DerivedLikelihood; 4] = [
-    DerivedLikelihood::Likely,
-    DerivedLikelihood::Possible,
-    DerivedLikelihood::Unlikely,
-    DerivedLikelihood::Unknown,
-];
-
-const RECOMMENDATION_CLASSES: [RecommendationClass; 4] = [
-    RecommendationClass::PreferredPrimary,
-    RecommendationClass::PreferredSecondary,
-    RecommendationClass::AllowedButNotRecommended,
-    RecommendationClass::NotRecommended,
-];
-
-const RECOMMENDATION_CONFIDENCE_LEVELS: [RecommendationConfidence; 4] = [
-    RecommendationConfidence::High,
-    RecommendationConfidence::Medium,
-    RecommendationConfidence::Low,
-    RecommendationConfidence::Unknown,
-];
-
-const CONNECTIVITY_CHECKS_POLICY: ConnectivityChecksPolicy = ConnectivityChecksPolicy {
-    local_checks_without_network_probe: true,
-    external_probe_allowed: true,
-    probe_timeout_ms: 3000,
-    max_probe_retries: 1,
-    min_refresh_interval_seconds: 30,
-    offline_mode_behavior: "degrade-to-local-observations-without-infinite-retry",
-};
-
-const VPN_TUNNEL_SIGNALS: [&str; 6] = [
-    "interface_type_contains_tunnel_or_ppp",
-    "windows_name_contains_vpn_or_wireguard_or_tunnel",
-    "description_contains_tunnel_or_virtual_private",
-    "no_default_gateway_but_adapter_up",
-    "private_or_linklocal_only_addressing",
-    "adapter_name_contains_tap_tun_wg",
-];
-
-const VIRTUAL_INTERFACE_SIGNALS: [&str; 6] = [
-    "interface_type_is_loopback_or_tunnel",
-    "windows_name_contains_virtual_vmware_vbox_hyperv",
-    "description_contains_virtual_or_host_only",
-    "missing_physical_address",
-    "host_only_or_internal_address_pattern",
-    "no_external_connectivity_with_local_link_up",
-];
-
-const SERVICE_INTERFACE_SIGNALS: [&str; 6] = [
-    "windows_name_contains_loopback",
-    "description_contains_pseudo_or_isatap_or_teredo",
-    "interface_type_is_loopback",
-    "reserved_or_internal_adapter_name_pattern",
-    "missing_gateway_and_no_dns",
-    "high_likelihood_virtual_and_unavailable_connectivity",
-];
-
-const RECOMMENDATION_TIE_BREAK_PRIORITY: [&str; 5] = [
-    "manual_pin_or_user_choice",
-    "stable_identity_persistent_id",
-    "last_confirmed_choice",
-    "connectivity_score",
-    "has_default_route",
-];
-
-const RECOMMENDATION_HINTS_CATALOG: [&str; 5] = [
-    "home-wifi: usually preferred-primary when external connectivity is available and no strong tunnel markers are present.",
-    "ethernet: often preferred-primary when default route and stable connectivity are present.",
-    "wireguard-openvpn: usually preferred-secondary unless explicitly selected as primary by user.",
-    "corporate-tunnel: can be preferred-secondary when connectivity is available and service-only markers are absent.",
-    "virtual-host-only: usually not-recommended for routing roles.",
-];
-
-const SECONDARY_ROLE_UX_WARNINGS: [&str; 3] = [
-    "no-suitable-secondary-found",
-    "secondary-looks-unstable-or-not-recommended",
-    "primary-and-secondary-cannot-point-to-same-adapter",
-];
-
-const BLUETOOTH_DETECTION_SIGNALS: [&str; 4] = [
-    "windows_name_contains_bluetooth",
-    "interface_description_contains_bluetooth",
-    "adapter_name_contains_bluetooth",
-    "pan_marker_in_name_or_description",
-];
-
-const ADAPTER_CHECK_ACTIONS: [AdapterCheckActionContract; 3] = [
-    AdapterCheckActionContract {
-        id: AdapterCheckActionId::CheckRoute,
-        scope: AdapterCheckExecutionScope::ReadOnlyDiagnostics,
-        description: "Validate whether route-related fields for this adapter look usable.",
-    },
-    AdapterCheckActionContract {
-        id: AdapterCheckActionId::ShowExternalIp,
-        scope: AdapterCheckExecutionScope::ReadOnlyDiagnostics,
-        description: "Show external IP status/value from latest probe or local fallback.",
-    },
-    AdapterCheckActionContract {
-        id: AdapterCheckActionId::CheckInternetAvailability,
-        scope: AdapterCheckExecutionScope::ReadOnlyDiagnostics,
-        description: "Estimate whether internet is reachable via this adapter.",
-    },
-];
-
-const ADAPTER_CHECK_RESULT_STATUSES: [AdapterCheckResultStatus; 4] = [
-    AdapterCheckResultStatus::Success,
-    AdapterCheckResultStatus::Degraded,
-    AdapterCheckResultStatus::Unavailable,
-    AdapterCheckResultStatus::Timeout,
-];
-
-const SUPPORTED_ROUTE_BEHAVIOR_MODES: [RouteBehaviorMode; 3] = [
-    RouteBehaviorMode::PreferPrimary,
-    RouteBehaviorMode::PreferSecondaryWhenAvailable,
-    RouteBehaviorMode::StrictSecondaryFailClosed,
-];
-
-const ROUTE_STATE_PLACEHOLDERS: [RouteSelectionState; 5] = [
-    RouteSelectionState::Selected,
-    RouteSelectionState::NotSelected,
-    RouteSelectionState::Unavailable,
-    RouteSelectionState::RequiresVerification,
-    RouteSelectionState::FailClosedConflict,
-];
-
-const INTERFACES_ROUTES_CONTRACT: InterfacesRoutesContract = InterfacesRoutesContract {
-    field_readiness: &INTERFACE_FIELD_READINESS,
-    field_snapshot_status: &INTERFACE_FIELD_SNAPSHOT_STATUS,
-    field_usage_scopes: &INTERFACE_FIELD_USAGE_SCOPES,
-    display_format: INTERFACES_DISPLAY_FORMAT,
-    enriched_fields: &ENRICHED_INTERFACE_FIELDS,
-    connectivity_states: &CONNECTIVITY_STATES,
-    external_ip_statuses: &EXTERNAL_IP_STATUSES,
-    derived_likelihood_scale: &DERIVED_LIKELIHOOD_SCALE,
-    recommendation_classes: &RECOMMENDATION_CLASSES,
-    recommendation_confidence_levels: &RECOMMENDATION_CONFIDENCE_LEVELS,
-    connectivity_checks_policy: CONNECTIVITY_CHECKS_POLICY,
-    observed_vs_derived_boundary:
-        "observed_facts store measured adapter/runtime values; derived_assessment stores heuristic classification and confidence.",
-    vpn_tunnel_signals: &VPN_TUNNEL_SIGNALS,
-    virtual_interface_signals: &VIRTUAL_INTERFACE_SIGNALS,
-    service_interface_signals: &SERVICE_INTERFACE_SIGNALS,
-    derived_cache_policy:
-        "cache derived flags in snapshot for UI consistency; recompute on each manual/periodic refresh.",
-    recommendation_tie_break_priority: &RECOMMENDATION_TIE_BREAK_PRIORITY,
-    recommendation_advisory_policy:
-        "recommendation engine is advisory-only: it never auto-assigns primary/secondary and never overrides explicit user choice.",
-    recommendation_hints_catalog: &RECOMMENDATION_HINTS_CATALOG,
-    manual_role_confirmation_required: true,
-    role_conflict_policy:
-        "One adapter cannot be confirmed as both primary and secondary in default product mode.",
-    confirmed_choice_priority_policy:
-        "User-confirmed role selection has priority over heuristic recommendation.",
-    secondary_role_ux_warnings: &SECONDARY_ROLE_UX_WARNINGS,
-    show_bluetooth_adapters_default: false,
-    bluetooth_detection_signals: &BLUETOOTH_DETECTION_SIGNALS,
-    bluetooth_recommendation_policy:
-        "Bluetooth adapters are hidden by default and treated as allowed-but-not-recommended when shown.",
-    adapter_check_actions: &ADAPTER_CHECK_ACTIONS,
-    adapter_check_result_statuses: &ADAPTER_CHECK_RESULT_STATUSES,
-    diagnostics_explain_integration_note:
-        "Adapter check results are computed in core and reused by diagnostics/explain surfaces without GUI-side duplication.",
-    supported_behavior_modes: &SUPPORTED_ROUTE_BEHAVIOR_MODES,
-    route_state_placeholders: &ROUTE_STATE_PLACEHOLDERS,
-    preview_only_selection: true,
-    preview_notice:
-        "In block 2 this screen is preview/setup only: selecting interfaces does not apply routing policy.",
-    role_explanation:
-        "Primary route is the default preferred interface; secondary route is the fallback interface.",
-    diagnostics_alignment_note:
-        "Adapter field labels and unknown-value marker are shared across GUI, diagnostics, and explain payloads.",
-};
-
-const SUPPORTED_FREE_RULE_TYPES: [FreeRuleType; 4] = [
-    FreeRuleType::Application,
-    FreeRuleType::Domain,
-    FreeRuleType::Zone,
-    FreeRuleType::ExactIp,
-];
-
-const RULE_PLACEHOLDER_SCENARIOS: [RuleScenario; 5] = [
-    RuleScenario::Create,
-    RuleScenario::Edit,
-    RuleScenario::Delete,
-    RuleScenario::Reorder,
-    RuleScenario::Search,
-];
-
-const RULE_FORM_FIELDS: [RuleFormFieldSpec; 5] = [
-    RuleFormFieldSpec {
-        id: RuleFormFieldId::RuleType,
-        required: true,
-        constraint_hint:
-            "Select one supported Free type: application, domain (includes all subdomains), exact IP.",
-        visible_in_gui_v1: true,
-    },
-    RuleFormFieldSpec {
-        id: RuleFormFieldId::MatchValue,
-        required: true,
-        constraint_hint:
-            "1..255 chars; domain rules match the label and all subdomains automatically.",
-        visible_in_gui_v1: true,
-    },
-    RuleFormFieldSpec {
-        id: RuleFormFieldId::TargetRoute,
-        required: true,
-        constraint_hint:
-            "Select the route set: Primary or Secondary. Determines which rule file the rule is written to.",
-        visible_in_gui_v1: true,
-    },
-    RuleFormFieldSpec {
-        id: RuleFormFieldId::Enabled,
-        required: false,
-        constraint_hint: "Boolean toggle, enabled by default for new rule.",
-        visible_in_gui_v1: true,
-    },
-    RuleFormFieldSpec {
-        id: RuleFormFieldId::Comment,
-        required: false,
-        constraint_hint: "Optional note up to 256 chars.",
-        visible_in_gui_v1: true,
-    },
-];
-
-const FREE_RULE_LIST_TYPES: [FreeRuleListType; 2] = [
-    FreeRuleListType::SingleActiveManagedList,
-    FreeRuleListType::ImportedPresetReplacingActiveList,
-];
-
-const RULE_LIST_LOAD_DIALOG_FIELDS: [RuleListLoadFieldId; 7] = [
-    RuleListLoadFieldId::FilePath,
-    RuleListLoadFieldId::Format,
-    RuleListLoadFieldId::SchemaVersion,
-    RuleListLoadFieldId::ParsedSummary,
-    RuleListLoadFieldId::ReplaceCurrentList,
-    RuleListLoadFieldId::LoadAction,
-    RuleListLoadFieldId::CancelAction,
-];
-
-const RULE_LIST_EDIT_DIALOG_FIELDS: [RuleListEditFieldId; 7] = [
-    RuleListEditFieldId::ListName,
-    RuleListEditFieldId::Description,
-    RuleListEditFieldId::RulesSet,
-    RuleListEditFieldId::RulesOrder,
-    RuleListEditFieldId::DefaultMode,
-    RuleListEditFieldId::SaveAction,
-    RuleListEditFieldId::CancelAction,
-];
-
-const RULE_REPLACE_REVIEW_FIELDS: [RuleReplaceReviewFieldId; 7] = [
-    RuleReplaceReviewFieldId::IncomingListName,
-    RuleReplaceReviewFieldId::IncomingRulesCount,
-    RuleReplaceReviewFieldId::CurrentRulesCount,
-    RuleReplaceReviewFieldId::DefaultModeDiff,
-    RuleReplaceReviewFieldId::NewTypesSummary,
-    RuleReplaceReviewFieldId::ReplaceAction,
-    RuleReplaceReviewFieldId::CancelAction,
-];
-
-const RULES_VIEW_SORT_MODES: [RulesViewSort; 4] = [
-    RulesViewSort::ByDisplayOrder,
-    RulesViewSort::ByMatchValue,
-    RulesViewSort::ByType,
-    RulesViewSort::ByRoute,
-];
-
-const RULES_ENABLED_FILTERS: [RulesEnabledFilter; 3] = [
-    RulesEnabledFilter::All,
-    RulesEnabledFilter::EnabledOnly,
-    RulesEnabledFilter::DisabledOnly,
-];
-
-const RULES_TYPE_FILTERS: [RulesTypeFilter; 8] = [
-    RulesTypeFilter::All,
-    RulesTypeFilter::Zones,
-    RulesTypeFilter::Domain,
-    RulesTypeFilter::ExactIp,
-    RulesTypeFilter::Application,
-    RulesTypeFilter::Windows,
-    RulesTypeFilter::Linux,
-    RulesTypeFilter::MacOS,
-];
-
-const RULES_OTHER_OS_TYPE_FILTERS: [RulesTypeFilter; 2] =
-    [RulesTypeFilter::Linux, RulesTypeFilter::MacOS];
-
-const RULES_DUPLICATE_RESOLUTIONS: [RulesDuplicateResolution; 3] = [
-    RulesDuplicateResolution::KeepInPrimary,
-    RulesDuplicateResolution::KeepInSecondary,
-    RulesDuplicateResolution::KeepInBoth,
-];
-
-const RULES_FILE_CHANGE_BEHAVIORS: [RulesFileChangeBehavior; 2] = RulesFileChangeBehavior::ALL;
-
-const RULES_CONTRACT: RulesContract = RulesContract {
-    supported_free_rule_types: &SUPPORTED_FREE_RULE_TYPES,
-    placeholder_scenarios: &RULE_PLACEHOLDER_SCENARIOS,
-    form_fields: &RULE_FORM_FIELDS,
-    supported_free_list_types: &FREE_RULE_LIST_TYPES,
-    load_list_dialog_fields: &RULE_LIST_LOAD_DIALOG_FIELDS,
-    edit_list_dialog_fields: &RULE_LIST_EDIT_DIALOG_FIELDS,
-    replace_review_dialog_fields: &RULE_REPLACE_REVIEW_FIELDS,
-    load_list_requires_review_before_replace: true,
-    preview_notice:
-        "In block 2 this screen is UI preview only: rule editing scenarios are placeholders until backend validation and policy apply are connected.",
-    supported_sort_modes: &RULES_VIEW_SORT_MODES,
-    supported_enabled_filters: &RULES_ENABLED_FILTERS,
-    supported_type_filters: &RULES_TYPE_FILTERS,
-    other_os_type_filters: &RULES_OTHER_OS_TYPE_FILTERS,
-    supported_duplicate_resolutions: &RULES_DUPLICATE_RESOLUTIONS,
-    block_secondary_when_unavailable_default: false,
-    supported_file_change_behaviors: &RULES_FILE_CHANGE_BEHAVIORS,
-    default_file_change_behavior: RulesFileChangeBehavior::Notify,
-    supports_rule_enable_toggle: true,
-    supports_rule_comments: true,
-    new_rule_enabled_default: true,
-};
-
 const FIRST_RUN_STEPS: [FirstRunStepSpec; 6] = [
     FirstRunStepSpec {
         id: FirstRunStepId::Welcome,
@@ -3562,7 +2726,5 @@ pub const fn gui_shell_v1() -> AppShellModel {
         tooltip_policy: TOOLTIP_POLICY_CONTRACT,
         accessibility_baseline: ACCESSIBILITY_BASELINE_CONTRACT,
         ui_surface_contract: UI_SURFACE_CONTRACT,
-        interfaces_routes: INTERFACES_ROUTES_CONTRACT,
-        rules: RULES_CONTRACT,
     }
 }

@@ -147,6 +147,7 @@ impl DiagnosticsFacade for PaginatingFakeDiagnostics {
         &self,
         _filter: &LogEntryFilter,
         pagination: &PaginationParams,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
         // Cursor encodes the position of the last item on the previous
         // page. Decode by matching the cursor's event_id against the
@@ -184,6 +185,7 @@ impl DiagnosticsFacade for PaginatingFakeDiagnostics {
         &self,
         _f: &AuditEntryFilter,
         _p: &PaginationParams,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         Ok(PageResult::empty())
     }
@@ -301,6 +303,7 @@ fn diagnostics_export_archive_creates_real_zip_file() {
         Arc::new(NoopAdapters),
         Arc::new(NoopRoutePolicy),
         None,
+        Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff),
     );
 
     let envelope = req(

@@ -14,15 +14,14 @@
 //!    `launcher-{surface}.log` files live in;
 //! 2. append those launcher logs into the copy (GUI-side diagnostics the
 //!    service-side builder cannot see);
-//! 3. append the tail of the service's RAW operational NDJSON logs — the
-//!    archive builder's `logs.ndjson` is a payload-stripped 200-entry
-//!    stub (its "no raw files" guarantee is a SYSTEM-side rule about what the
-//!    service writes), so a 6 MiB on-disk log showed up as a tiny fragment.
-//!    The launcher runs as the user and the log dir is `Users:RX`, so it can
-//!    attach the real files (newest-first, byte-capped only when the user asks
-//!    for a cap) the user expects;
-//! 4. rewrite the response's `archive-path` to the copy, keeping the
+//! 3. rewrite the response's `archive-path` to the copy, keeping the
 //!    original under `service-archive-path`.
+//!
+//! The service's own RAW log lines used to be step 3 here, read off disk —
+//! which is why its log directory had to be readable by every account on the
+//! machine, and why one user's bundle carried everyone's lines. The service
+//! puts them in the archive itself now (`service-logs.ndjson`), scoped to
+//! whoever asked for it.
 //!
 //! Both GUI export buttons then show a folder the user owns outright.
 //! Everything is best-effort: any failure returns the response untouched
@@ -49,13 +48,6 @@ const LAUNCHER_LOG_ENTRIES: &[&str] = &["launcher-main.log", "launcher-tray.log"
 /// deliberately kept months of verbose logs; that user can pick a cap in the
 /// diagnostics panel instead of silently losing the evidence they came for.
 const DEFAULT_SERVICE_LOG_BUDGET_MIB: u32 = 0;
-
-/// Smallest tail worth attaching once the budget is nearly spent. A budgeted
-/// run used to write whatever remained — routinely zero or a few bytes — which
-/// produced archive entries that looked like collected logs but carried no
-/// recoverable record. Anything below this is omitted entirely, so an entry's
-/// presence always means it holds usable lines.
-const MIN_ATTACHED_TAIL_BYTES: usize = 4 * 1024;
 
 /// Runtime mirror of the user's "log budget in the archive" preference, in MiB
 /// (`0` = unlimited). The preference is persisted only when the UI process
@@ -104,18 +96,11 @@ fn user_archive_dir() -> PathBuf {
 /// `logs_from_ms` mirrors the request's own `logs-from-ms` cutoff (UTC
 /// milliseconds since the epoch) that trimmed the archive builder's merged
 /// `logs.ndjson` to the current session — `None` means the export covers full
-/// history. The raw service-log attachment step below applies the same
-/// cutoff so a "session" export doesn't smuggle in yesterday's rotated files.
-///
-/// `log_budget_bytes` caps the total size of those raw attachments; `0` means
-/// unlimited. Production reads it from [`service_log_budget_bytes`].
-pub fn localize_export_response(
-    value: Value,
-    logs_from_ms: Option<i64>,
-    log_budget_bytes: u64,
-) -> Value {
+/// history. The launcher's own logs are trimmed to the same window, so a
+/// "session" archive does not smuggle in an earlier run's tail.
+pub fn localize_export_response(value: Value, logs_from_ms: Option<i64>) -> Value {
     let dir = user_archive_dir();
-    localize_export_response_into(value, &dir, &dir, logs_from_ms, log_budget_bytes)
+    localize_export_response_into(value, &dir, &dir, logs_from_ms)
 }
 
 /// Testable core: `dest_dir` receives the copy, `log_dir` is scanned for
@@ -125,7 +110,6 @@ fn localize_export_response_into(
     dest_dir: &Path,
     log_dir: &Path,
     logs_from_ms: Option<i64>,
-    log_budget_bytes: u64,
 ) -> Value {
     let Some(src) = value.get("archive-path").and_then(Value::as_str) else {
         return value;
@@ -144,19 +128,7 @@ fn localize_export_response_into(
         // A path, just not a user-owned one.
         return value;
     }
-    // The service log dir sits next to the archives dir the original was
-    // built in (`…\NetRuleRouter\archives\x.zip` → `…\NetRuleRouter\logs`).
-    let service_log_dir = src_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("logs"));
-    let logs_attached = append_attachments(
-        &dest,
-        log_dir,
-        service_log_dir.as_deref(),
-        logs_from_ms,
-        log_budget_bytes,
-    );
+    let logs_attached = append_attachments(&dest, log_dir, logs_from_ms);
     let original = src.to_string();
     let mut out = value;
     if let Value::Object(map) = &mut out {
@@ -187,55 +159,6 @@ fn previous_session_log_name(name: &str) -> String {
             .into_owned(),
         None => format!("{name}.prev"),
     }
-}
-
-/// Newest-first list of raw operational NDJSON files in `log_dir`
-/// (`nrr_service_*.ndjson`), each with its size. Empty when the dir is
-/// absent/unreadable. Audit logs (`nrr_audit_*`) are deliberately excluded —
-/// they are the hash-chained security trail, not operational troubleshooting.
-///
-/// `cutoff` mirrors the export request's `logs-from-ms` (session start, UTC
-/// epoch milliseconds). NDJSON files are append-only and rotated on date-N
-/// boundaries, so a file's modification time is a sound upper bound on its
-/// newest entry: a file last written before `cutoff` cannot hold anything
-/// from the covered window and is dropped. `None` keeps full history (today's
-/// behavior, unfiltered). A file whose mtime cannot be read is kept rather
-/// than silently dropped — an unreadable timestamp is not proof the file is
-/// out of range.
-fn service_log_files(log_dir: &Path, cutoff: Option<SystemTime>) -> Vec<(PathBuf, u64)> {
-    let Ok(entries) = fs::read_dir(log_dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<(PathBuf, u64)> = entries
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-            if name.starts_with("nrr_service_") && name.ends_with(".ndjson") {
-                let len = e.metadata().ok()?.len();
-                Some((path, len))
-            } else {
-                None
-            }
-        })
-        .filter(|(path, _)| {
-            let Some(cutoff) = cutoff else {
-                return true;
-            };
-            match fs::metadata(path).and_then(|m| m.modified()) {
-                Ok(mtime) => mtime >= cutoff,
-                Err(_) => true,
-            }
-        })
-        .collect();
-    // Newest first by modification time; fall back to name order when mtime is
-    // unavailable (rotation suffixes sort lexically close enough).
-    files.sort_by(|a, b| {
-        let ma = fs::metadata(&a.0).and_then(|m| m.modified()).ok();
-        let mb = fs::metadata(&b.0).and_then(|m| m.modified()).ok();
-        mb.cmp(&ma).then_with(|| b.0.cmp(&a.0))
-    });
-    files
 }
 
 /// Converts the request's `logs-from-ms` (UTC epoch milliseconds) into a
@@ -287,17 +210,15 @@ fn zip_options_for_copied_file(path: &Path) -> zip::write::SimpleFileOptions {
         .last_modified_time(local_zip_timestamp_for_source(mtime))
 }
 
-/// Append GUI-side + raw service logs into the (already-copied) zip. Returns
+/// Append the GUI-side launcher logs into the (already-copied) zip. Returns
 /// `true` when at least one entry was written. Best-effort: a failure
 /// mid-append leaves the copy with whatever entries landed — still a valid zip
 /// (`ZipWriter::finish` finalizes the central directory).
-fn append_attachments(
-    zip_path: &Path,
-    log_dir: &Path,
-    service_log_dir: Option<&Path>,
-    logs_from_ms: Option<i64>,
-    log_budget_bytes: u64,
-) -> bool {
+///
+/// The service's own log lines are NOT read here any more: the service puts
+/// them in the archive itself, scoped to whoever asked, which is what let its
+/// log directory stop being readable by every account on the machine.
+fn append_attachments(zip_path: &Path, log_dir: &Path, logs_from_ms: Option<i64>) -> bool {
     let Ok(file) = fs::OpenOptions::new().read(true).write(true).open(zip_path) else {
         return false;
     };
@@ -336,96 +257,10 @@ fn append_attachments(
             }
         }
     }
-    // Raw service operational logs, newest-first. Stored under `service-logs/`
-    // so they never collide with the builder's stubbed `logs.ndjson`. A
-    // session-scoped export (`logs_from_ms` set) skips any rotated file that
-    // predates the session window, so a "current session" archive can't
-    // smuggle in an earlier day's rotated segments.
-    if let Some(dir) = service_log_dir {
-        let unlimited = log_budget_bytes == 0;
-        let mut budget = log_budget_bytes;
-        for (path, len) in service_log_files(dir, cutoff) {
-            if !unlimited && budget == 0 {
-                break;
-            }
-            let entry_name = path
-                .file_name()
-                .map(|n| format!("service-logs/{}", n.to_string_lossy()))
-                .unwrap_or_else(|| "service-logs/service.ndjson".to_string());
-            let options = zip_options_for_copied_file(&path);
-            let truncated = !unlimited && len > budget;
-            if truncated {
-                // Keep the TAIL — the most-recent lines are the useful ones —
-                // and read ONLY that tail. Retention allows fifty megabytes per
-                // file, and pulling a whole one into memory to keep its last
-                // few is the worst moment to do it: an archive is built when
-                // the machine is already in trouble. Trimmed to the next line
-                // boundary so the attachment stays valid NDJSON.
-                let Ok(tail) = read_tail_bytes(&path, budget) else {
-                    continue;
-                };
-                let start = trim_to_line_start(&tail, 0);
-                let slice = &tail[start..];
-                if slice.len() < MIN_ATTACHED_TAIL_BYTES {
-                    // What is left of the budget cannot carry a usable tail, and
-                    // every remaining file is older still — stop rather than write
-                    // an entry whose only content is its own name.
-                    break;
-                }
-                if writer.start_file(entry_name, options).is_ok() && writer.write_all(slice).is_ok()
-                {
-                    any = true;
-                    budget = budget.saturating_sub(slice.len() as u64);
-                }
-            } else {
-                // Whole file: streamed into the entry, never buffered.
-                let Ok(mut file) = fs::File::open(&path) else {
-                    continue;
-                };
-                if writer.start_file(entry_name, options).is_ok() {
-                    if let Ok(written) = std::io::copy(&mut file, &mut writer) {
-                        if written > 0 {
-                            any = true;
-                            budget = budget.saturating_sub(written);
-                        }
-                    }
-                }
-            }
-        }
-    }
     if writer.finish().is_err() {
         return false;
     }
     any
-}
-
-/// Read at most the last `want` bytes of `path`.
-///
-/// Seeks rather than reading the file and slicing it: the caller wants a tail,
-/// and the file it is taken from can be tens of megabytes.
-fn read_tail_bytes(path: &Path, want: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = fs::File::open(path)?;
-    let len = file.metadata()?.len();
-    if len > want {
-        file.seek(SeekFrom::Start(len - want))?;
-    }
-    let mut buf = Vec::with_capacity(want.min(len) as usize);
-    file.take(want)
-        .read_to_end(&mut buf)
-        .map(|_| ())
-        .map(|()| buf)
-}
-
-/// Advance `from` to the byte after the next newline so a tail slice begins on
-/// a whole NDJSON line (never mid-record). Returns `from` unchanged when no
-/// newline follows (single-line tail — kept as-is).
-fn trim_to_line_start(bytes: &[u8], from: usize) -> usize {
-    match bytes[from..].iter().position(|&b| b == b'\n') {
-        Some(off) => from + off + 1,
-        None => from,
-    }
 }
 
 #[cfg(test)]
@@ -468,7 +303,7 @@ mod tests {
             "size-bytes": 42,
         });
         // log_dir = src_dir here (that's where the fake launcher log lives).
-        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None, 0);
+        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None);
 
         let new_path = out["archive-path"].as_str().expect("path");
         assert!(
@@ -502,144 +337,6 @@ mod tests {
     }
 
     #[test]
-    fn attaches_raw_service_logs_newest_first_under_service_logs_dir() {
-        // Layout mirrors production: <root>\archives\x.zip + <root>\logs\*.ndjson.
-        let root = unique_test_dir("svc-root");
-        let archives = root.join("archives");
-        let logs = root.join("logs");
-        fs::create_dir_all(&archives).expect("archives");
-        fs::create_dir_all(&logs).expect("logs");
-        let src = archives.join("nrr-diagnostics-test.zip");
-        write_source_zip(&src);
-        fs::write(
-            logs.join("nrr_service_20260718-1.ndjson"),
-            b"{\"line\":1}\n",
-        )
-        .expect("svc log");
-        // A non-service file in the same dir must be ignored.
-        fs::write(logs.join("nrr_audit_20260718-1.ndjson"), b"audit\n").expect("audit");
-
-        let dest_dir = unique_test_dir("svc-dest");
-        let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        let out = localize_export_response_into(resp, &dest_dir, &dest_dir, None, 0);
-
-        let new_path = out["archive-path"].as_str().expect("path");
-        assert_eq!(out["launcher-logs-attached"], true);
-        let copied = fs::File::open(new_path).expect("open copy");
-        let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
-        let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).expect("entry").name().to_string())
-            .collect();
-        assert!(
-            names.contains(&"service-logs/nrr_service_20260718-1.ndjson".to_string()),
-            "raw service log must be attached under service-logs/, got {names:?}"
-        );
-        assert!(
-            !names.iter().any(|n| n.contains("nrr_audit_")),
-            "audit logs must NOT be attached (security trail), got {names:?}"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(dest_dir);
-    }
-
-    #[test]
-    fn session_scope_skips_rotated_files_older_than_the_cutoff_but_full_scope_keeps_them() {
-        // Regression test: a session-scoped export must not smuggle in a
-        // rotated file from an earlier day just because it still lives next
-        // to today's file in the same log directory.
-        let root = unique_test_dir("scope-root");
-        let archives = root.join("archives");
-        let logs = root.join("logs");
-        fs::create_dir_all(&archives).expect("archives");
-        fs::create_dir_all(&logs).expect("logs");
-        let src = archives.join("nrr-diagnostics-test.zip");
-
-        let old_file = logs.join("nrr_service_20260723-3.ndjson");
-        let new_file = logs.join("nrr_service_20260724-1.ndjson");
-        fs::write(&old_file, b"{\"line\":\"yesterday\"}\n").expect("old svc log");
-        fs::write(&new_file, b"{\"line\":\"today\"}\n").expect("new svc log");
-
-        // Pin explicit mtimes relative to "now" so the test can't flake on
-        // filesystem timestamp resolution: the old file is stamped a full day
-        // before the session cutoff, the new one squarely inside it.
-        let now = SystemTime::now();
-        let one_day = std::time::Duration::from_secs(24 * 60 * 60);
-        let old_mtime = now - one_day * 2;
-        let new_mtime = now;
-        // `set_modified` needs write access to the handle on Windows
-        // (`FILE_WRITE_ATTRIBUTES`) — a read-only `File::open` handle fails.
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&old_file)
-            .expect("open old for write")
-            .set_modified(old_mtime)
-            .expect("set old mtime");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&new_file)
-            .expect("open new for write")
-            .set_modified(new_mtime)
-            .expect("set new mtime");
-        let cutoff = now - one_day; // between the two mtimes.
-        let cutoff_ms = cutoff
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("cutoff after epoch")
-            .as_millis() as i64;
-
-        // Session-scoped: only the newer file is attached.
-        {
-            write_source_zip(&src);
-            let dest_dir = unique_test_dir("scope-session-dest");
-            let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-            let out = localize_export_response_into(resp, &dest_dir, &dest_dir, Some(cutoff_ms), 0);
-
-            let new_path = out["archive-path"].as_str().expect("path");
-            let copied = fs::File::open(new_path).expect("open copy");
-            let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
-            let names: Vec<String> = (0..archive.len())
-                .map(|i| archive.by_index(i).expect("entry").name().to_string())
-                .collect();
-            assert!(
-                names.contains(&"service-logs/nrr_service_20260724-1.ndjson".to_string()),
-                "in-window rotated file must be attached, got {names:?}"
-            );
-            assert!(
-                !names.contains(&"service-logs/nrr_service_20260723-3.ndjson".to_string()),
-                "out-of-window rotated file must NOT be attached for a session-scoped \
-                 export, got {names:?}"
-            );
-            let _ = fs::remove_dir_all(dest_dir);
-        }
-
-        // Full-scope (no cutoff): both files are attached, as before.
-        {
-            write_source_zip(&src);
-            let dest_dir = unique_test_dir("scope-full-dest");
-            let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-            let out = localize_export_response_into(resp, &dest_dir, &dest_dir, None, 0);
-
-            let new_path = out["archive-path"].as_str().expect("path");
-            let copied = fs::File::open(new_path).expect("open copy");
-            let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
-            let names: Vec<String> = (0..archive.len())
-                .map(|i| archive.by_index(i).expect("entry").name().to_string())
-                .collect();
-            assert!(
-                names.contains(&"service-logs/nrr_service_20260724-1.ndjson".to_string()),
-                "in-window rotated file must be attached, got {names:?}"
-            );
-            assert!(
-                names.contains(&"service-logs/nrr_service_20260723-3.ndjson".to_string()),
-                "full-scope export must keep the older rotated file too, got {names:?}"
-            );
-            let _ = fs::remove_dir_all(dest_dir);
-        }
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
     fn attaches_the_rotated_prev_log_alongside_the_current_one() {
         let src_dir = unique_test_dir("prev-src");
         let dest_dir = unique_test_dir("prev-dest");
@@ -653,7 +350,7 @@ mod tests {
         .expect("prev log");
 
         let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None, 0);
+        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None);
 
         let new_path = out["archive-path"].as_str().expect("path");
         let copied = fs::File::open(new_path).expect("open copy");
@@ -698,7 +395,7 @@ mod tests {
         let cutoff_ms = system_time_ms(SystemTime::now() - std::time::Duration::from_secs(3600));
 
         let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        let out = localize_export_response_into(resp, &dest_dir, &src_dir, Some(cutoff_ms), 0);
+        let out = localize_export_response_into(resp, &dest_dir, &src_dir, Some(cutoff_ms));
 
         let new_path = out["archive-path"].as_str().expect("path");
         let copied = fs::File::open(new_path).expect("open copy");
@@ -742,7 +439,7 @@ mod tests {
         let after = chrono::Local::now();
 
         let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None, 0);
+        let out = localize_export_response_into(resp, &dest_dir, &src_dir, None);
 
         let new_path = out["archive-path"].as_str().expect("path");
         let copied = fs::File::open(new_path).expect("open copy");
@@ -784,156 +481,13 @@ mod tests {
     }
 
     #[test]
-    fn trim_to_line_start_begins_after_next_newline() {
-        let bytes = b"aaa\nbbb\nccc";
-        // from=1 lands mid-first-line → advance past the first '\n' (index 3).
-        assert_eq!(trim_to_line_start(bytes, 1), 4);
-        assert_eq!(&bytes[trim_to_line_start(bytes, 1)..], b"bbb\nccc");
-        // No newline after `from` → unchanged (kept as a single-line tail).
-        assert_eq!(trim_to_line_start(bytes, 8), 8);
-    }
-
-    #[test]
     fn unreadable_source_leaves_response_untouched() {
         let dest_dir = unique_test_dir("dest2");
         let resp = serde_json::json!({
             "archive-path": dest_dir.join("does-not-exist.zip").to_string_lossy(),
         });
-        let out = localize_export_response_into(resp.clone(), &dest_dir, &dest_dir, None, 0);
+        let out = localize_export_response_into(resp.clone(), &dest_dir, &dest_dir, None);
         assert_eq!(out, resp, "a failed copy must not rewrite the response");
-        let _ = fs::remove_dir_all(dest_dir);
-    }
-
-    /// Build `<root>/archives/<zip>` + `<root>/logs/` and return both paths.
-    fn service_layout(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
-        let root = unique_test_dir(tag);
-        let archives = root.join("archives");
-        let logs = root.join("logs");
-        fs::create_dir_all(&archives).expect("archives");
-        fs::create_dir_all(&logs).expect("logs");
-        let src = archives.join("nrr-diagnostics-test.zip");
-        (root, logs, src)
-    }
-
-    fn entry_names(path: &str) -> Vec<String> {
-        let copied = fs::File::open(path).expect("open copy");
-        let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
-        (0..archive.len())
-            .map(|i| archive.by_index(i).expect("entry").name().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn a_zero_budget_attaches_every_service_log_whole() {
-        let (root, logs, src) = service_layout("unlimited-root");
-        // Two files, each far beyond any previously shipped cap.
-        let big = vec![b'x'; 4 * 1024 * 1024];
-        for name in [
-            "nrr_service_20260725-1.ndjson",
-            "nrr_service_20260725-2.ndjson",
-        ] {
-            let mut line = big.clone();
-            line.push(b'\n');
-            fs::write(logs.join(name), &line).expect("svc log");
-        }
-        write_source_zip(&src);
-        let dest_dir = unique_test_dir("unlimited-dest");
-        let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        // 0 == unlimited: budgeting is skipped entirely.
-        let out = localize_export_response_into(resp, &dest_dir, &dest_dir, None, 0);
-
-        let new_path = out["archive-path"].as_str().expect("path");
-        let names = entry_names(new_path);
-        assert!(
-            names.contains(&"service-logs/nrr_service_20260725-1.ndjson".to_string())
-                && names.contains(&"service-logs/nrr_service_20260725-2.ndjson".to_string()),
-            "an unlimited budget must attach every in-window file, got {names:?}"
-        );
-        let copied = fs::File::open(new_path).expect("open copy");
-        let mut archive = zip::ZipArchive::new(copied).expect("valid zip");
-        let entry = archive
-            .by_name("service-logs/nrr_service_20260725-1.ndjson")
-            .expect("entry");
-        assert_eq!(
-            entry.size(),
-            big.len() as u64 + 1,
-            "an unlimited budget must attach the file WHOLE, not a tail"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(dest_dir);
-    }
-
-    #[test]
-    fn a_spent_budget_omits_the_file_instead_of_writing_a_stub() {
-        // Regression test: the newest file consumes the whole budget, leaving
-        // the older one a remainder far below a usable tail; that remainder
-        // must be omitted rather than written as a 0-byte / few-byte entry
-        // that looks like a collected log but carries nothing.
-        let (root, logs, src) = service_layout("stub-root");
-        let newest = logs.join("nrr_service_20260725-2.ndjson");
-        let older = logs.join("nrr_service_20260725-1.ndjson");
-        // 1 MiB of whole NDJSON lines, so a tail trim lands on a line boundary
-        // rather than degenerating for want of a newline.
-        let line = format!("{}\n", "y".repeat(63));
-        let payload = line.repeat(1024 * 1024 / line.len());
-        assert_eq!(payload.len(), 1024 * 1024);
-        fs::write(&newest, &payload).expect("newest");
-        fs::write(&older, &payload).expect("older");
-        let now = SystemTime::now();
-        let hour = std::time::Duration::from_secs(3600);
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&older)
-            .expect("open older")
-            .set_modified(now - hour)
-            .expect("older mtime");
-        fs::OpenOptions::new()
-            .write(true)
-            .open(&newest)
-            .expect("open newest")
-            .set_modified(now)
-            .expect("newest mtime");
-
-        write_source_zip(&src);
-        let dest_dir = unique_test_dir("stub-dest");
-        let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        // The newest file fits whole and leaves 2 KiB — under a usable tail.
-        let out =
-            localize_export_response_into(resp, &dest_dir, &dest_dir, None, 1024 * 1024 + 2 * 1024);
-
-        let new_path = out["archive-path"].as_str().expect("path");
-        let names = entry_names(new_path);
-        assert!(
-            names.contains(&"service-logs/nrr_service_20260725-2.ndjson".to_string()),
-            "the newest file must still be attached, got {names:?}"
-        );
-        assert!(
-            !names.contains(&"service-logs/nrr_service_20260725-1.ndjson".to_string()),
-            "a sub-4-KiB remainder must be OMITTED, not written as a stub, got {names:?}"
-        );
-
-        let _ = fs::remove_dir_all(root);
-        let _ = fs::remove_dir_all(dest_dir);
-    }
-
-    #[test]
-    fn a_budget_larger_than_the_logs_still_attaches_them_whole() {
-        let (root, logs, src) = service_layout("fits-root");
-        fs::write(logs.join("nrr_service_20260725-1.ndjson"), b"{\"a\":1}\n").expect("svc log");
-        write_source_zip(&src);
-        let dest_dir = unique_test_dir("fits-dest");
-        let resp = serde_json::json!({ "archive-path": src.to_string_lossy() });
-        let out = localize_export_response_into(resp, &dest_dir, &dest_dir, None, 64 * 1024 * 1024);
-
-        let new_path = out["archive-path"].as_str().expect("path");
-        let names = entry_names(new_path);
-        assert!(
-            names.contains(&"service-logs/nrr_service_20260725-1.ndjson".to_string()),
-            "a small file well inside the budget must be attached in full, got {names:?}"
-        );
-
-        let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(dest_dir);
     }
 
@@ -961,7 +515,7 @@ mod tests {
     fn response_without_archive_path_passes_through() {
         let dest_dir = unique_test_dir("dest3");
         let resp = serde_json::json!({ "unrelated": 1 });
-        let out = localize_export_response_into(resp.clone(), &dest_dir, &dest_dir, None, 0);
+        let out = localize_export_response_into(resp.clone(), &dest_dir, &dest_dir, None);
         assert_eq!(out, resp);
         let _ = fs::remove_dir_all(dest_dir);
     }

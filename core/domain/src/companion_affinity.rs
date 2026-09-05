@@ -412,6 +412,19 @@ impl PrimaryBehavior {
 
 // ── Event model ───────────────────────────────────────────────────────────────
 
+/// Where a candidate sighting came from.
+///
+/// The look-back raises sightings parked before their anchor's window opened,
+/// and it runs WHILE that window is opening — before the page that opened it
+/// has been recorded. The two cases therefore differ in what context is
+/// knowable at the moment of attribution, and only the live one can honestly be
+/// judged against the page on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sighting {
+    Live,
+    ReplayedIntoWindow,
+}
+
 /// Classification of one observed hostname activity event.
 ///
 /// The caller decides the kind: a hostname that is a rule host in the active
@@ -565,6 +578,12 @@ pub struct CompanionProposal {
     /// "move this into the tunnel", so "it already works without one" is the
     /// single most useful thing the user can be told about it.
     pub primary_behavior: PrimaryBehavior,
+    /// For a suffix proposal, the hostnames the evidence actually covers,
+    /// ascending. A suffix rule reaches every name under the apex, most of
+    /// which were never seen — showing what WAS seen is the difference between
+    /// confirming an offer and confirming a guess. Empty for an exact host,
+    /// which covers itself and nothing else.
+    pub observed_members: Vec<String>,
 }
 
 // ── Registrable-domain heuristic ──────────────────────────────────────────────
@@ -581,18 +600,12 @@ const MULTI_PART_PUBLIC_SUFFIXES: &[&str] = &[
     "com.ar", "com.hk", "com.mx", "com.sg", "com.tw",
 ];
 
-/// Extracts the registrable domain of a hostname using a documented heuristic:
-/// the last two labels, or the last three when the last two form a known
-/// multi-part public suffix (see [`MULTI_PART_PUBLIC_SUFFIXES`]).
-///
-/// Returns `None` when no registrable domain can be extracted: single-label
-/// hosts (`localhost`, intranet flat names) and hostnames that consist of a
-/// bare multi-part suffix (`co.uk`). The suffix-table comparison is
-/// ASCII-case-insensitive; the returned slice borrows from the input
-/// unchanged.
-///
-/// This is a heuristic, not a Public Suffix List implementation — see the
-/// table's documentation for the failure mode (strictly less generalization).
+/// A suffix rule on `suffix` would route the anchor itself — the site whose
+/// companions we are proposing. `*.x` covers `x`, so equality counts.
+fn covers_the_anchor(anchor: &str, suffix: &str) -> bool {
+    anchor.eq_ignore_ascii_case(suffix) || is_under_suffix(anchor, suffix)
+}
+
 /// Whether generalizing to `*.apex` would also swallow the anchor itself.
 ///
 /// One site under a corporate umbrella says nothing about the umbrella:
@@ -601,12 +614,6 @@ const MULTI_PART_PUBLIC_SUFFIXES: &[&str] = &[
 /// apex (`vk.com` may speak for `*.vk.com`). A companion apex the anchor does
 /// not live under — a CDN, say — is unaffected and still generalizes on its
 /// own evidence.
-/// A suffix rule on `suffix` would route the anchor itself — the site whose
-/// companions we are proposing. `*.x` covers `x`, so equality counts.
-fn covers_the_anchor(anchor: &str, suffix: &str) -> bool {
-    anchor.eq_ignore_ascii_case(suffix) || is_under_suffix(anchor, suffix)
-}
-
 fn suffix_would_swallow_the_anchor(anchor: &str, apex: &str) -> bool {
     !anchor.eq_ignore_ascii_case(apex)
         && registrable_domain(anchor).is_some_and(|d| d.eq_ignore_ascii_case(apex))
@@ -658,6 +665,18 @@ fn deepest_shared_suffix<'a>(
         .map(|(suffix, _)| suffix)
 }
 
+/// Extracts the registrable domain of a hostname using a documented heuristic:
+/// the last two labels, or the last three when the last two form a known
+/// multi-part public suffix (see [`MULTI_PART_PUBLIC_SUFFIXES`]).
+///
+/// Returns `None` when no registrable domain can be extracted: single-label
+/// hosts (`localhost`, intranet flat names) and hostnames that consist of a
+/// bare multi-part suffix (`co.uk`). The suffix-table comparison is
+/// ASCII-case-insensitive; the returned slice borrows from the input
+/// unchanged.
+///
+/// This is a heuristic, not a Public Suffix List implementation — see the
+/// table's documentation for the failure mode (strictly less generalization).
 pub fn registrable_domain(hostname: &str) -> Option<&str> {
     let mut dots = hostname.rmatch_indices('.').map(|(i, _)| i);
     // Index of the dot preceding the last label; `None` => single label.
@@ -721,11 +740,40 @@ fn brand_token(hostname: &str) -> &str {
 /// register adjacent brands rather than reusing the exact one. Every label of
 /// the hostname is searched, so a brand appearing in a deeper label still counts.
 fn is_brand_related(anchor: &str, candidate: &str) -> bool {
+    brand_relation(anchor, candidate) != BrandRelation::None
+}
+
+/// What a shared brand is worth as evidence.
+///
+/// The equality branch has no length floor, and it must not get one: `vk.ru`
+/// and `login.vk.com` are kin precisely because their token matches exactly,
+/// and `vk` is below the length containment demands. But the same branch makes
+/// `t.co`/`t.me`, `x.com`/`x.ai` and `ok.ru`/`ok.com` kin as well, and a token
+/// that short is one registrar away from coincidence. So the relation stands
+/// and its REACH does not: weak evidence buys the exact host, never the apex.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrandRelation {
+    None,
+    /// Equal tokens, too short for the containment branch to have accepted them.
+    ShortToken,
+    /// A token long enough to name an operator rather than collide with one.
+    Named,
+}
+
+fn brand_relation(anchor: &str, candidate: &str) -> BrandRelation {
     let (anchor_brand, candidate_brand) = (brand_token(anchor), brand_token(candidate));
     if anchor_brand == candidate_brand {
-        return true;
+        return if anchor_brand.len() >= MIN_BRAND_TOKEN_LEN {
+            BrandRelation::Named
+        } else {
+            BrandRelation::ShortToken
+        };
     }
-    carries_brand(candidate, anchor_brand) || carries_brand(anchor, candidate_brand)
+    if carries_brand(candidate, anchor_brand) || carries_brand(anchor, candidate_brand) {
+        BrandRelation::Named
+    } else {
+        BrandRelation::None
+    }
 }
 
 /// Whether `name` carries `brand` as a label, a label's prefix, or a label's
@@ -818,7 +866,7 @@ fn is_delivery_named(hostname: &str) -> bool {
 /// the registrable apex itself or its `www.` form, and not delivery-named.
 ///
 /// Used to answer "under whose page did this load?" — see
-/// [`CompanionAffinityLedger::foreign_document_owner`].
+/// [`CompanionAffinityLedger::document_disowns`].
 fn is_document_shaped(hostname: &str) -> bool {
     if is_delivery_named(hostname) || names_one_machine(hostname) {
         return false;
@@ -1080,18 +1128,27 @@ impl CompanionAffinityLedger {
                 primary_stalls: state.primary_stalls,
                 primary_cuts: state.primary_cuts,
                 primary_completions: state.primary_completions,
-                pairs: state
-                    .pairs
-                    .iter()
-                    .map(|p| PairSnapshot {
-                        anchor_id: p.anchor_id,
-                        distinct_windows: p.distinct_windows,
-                        last_window_id: p.last_window_id,
-                        nearest_hits: p.nearest_hits,
-                        uncontested_hits: p.uncontested_hits,
-                        foreign_parent_hits: p.foreign_parent_hits,
-                    })
-                    .collect(),
+                pairs: {
+                    // By anchor id, because the pairs were APPENDED in the
+                    // order a `HashMap` happened to iterate its anchors — which
+                    // differs per process. Sorting the outer lists and leaving
+                    // this one made the claim above true for two saves in one
+                    // run and false across a restart.
+                    let mut pairs: Vec<PairSnapshot> = state
+                        .pairs
+                        .iter()
+                        .map(|p| PairSnapshot {
+                            anchor_id: p.anchor_id,
+                            distinct_windows: p.distinct_windows,
+                            last_window_id: p.last_window_id,
+                            nearest_hits: p.nearest_hits,
+                            uncontested_hits: p.uncontested_hits,
+                            foreign_parent_hits: p.foreign_parent_hits,
+                        })
+                        .collect();
+                    pairs.sort_by_key(|p| p.anchor_id);
+                    pairs
+                },
             })
             .collect();
         candidates.sort_by(|a, b| a.hostname.cmp(&b.hostname));
@@ -1167,14 +1224,26 @@ impl CompanionAffinityLedger {
         }
         // Ids must never be reissued: a restored anchor keeps its id, so the
         // next one has to start past every id in the snapshot.
-        ledger.next_anchor_id = snapshot
-            .next_anchor_id
-            .max(ledger.anchors.values().map(|a| a.id + 1).max().unwrap_or(0));
+        //
+        // Saturating, because these arrive from a file. `id + 1` over a value
+        // this process did not produce panics in a debug build and wraps in a
+        // release one — and a wrapped counter reissues ids, which hands a new
+        // anchor somebody else's pairs. Saturation cannot be reached by the
+        // live path (`u32::MAX` anchors in one session), so it only ever means
+        // "the file said something impossible".
+        ledger.next_anchor_id = snapshot.next_anchor_id.max(
+            ledger
+                .anchors
+                .values()
+                .map(|a| a.id.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+        );
         ledger.next_window_id = snapshot.next_window_id.max(
             ledger
                 .anchors
                 .values()
-                .map(|a| a.window_id + 1)
+                .map(|a| a.window_id.saturating_add(1))
                 .max()
                 .unwrap_or(0),
         );
@@ -1204,8 +1273,12 @@ impl CompanionAffinityLedger {
     pub fn observe(&mut self, at_ms: u64, hostname: &str, kind: CoActivityKind) {
         match kind {
             CoActivityKind::Anchor { route } => self.observe_anchor(at_ms, hostname, route),
-            CoActivityKind::Candidate => self.observe_candidate(at_ms, hostname, false),
-            CoActivityKind::CandidateInUse => self.observe_candidate(at_ms, hostname, true),
+            CoActivityKind::Candidate => {
+                self.observe_candidate(at_ms, hostname, false, Sighting::Live)
+            }
+            CoActivityKind::CandidateInUse => {
+                self.observe_candidate(at_ms, hostname, true, Sighting::Live)
+            }
             CoActivityKind::PrimaryHealth(event) => self.note_primary_health(hostname, event),
         }
         // After attribution, never before: a page-shaped host is the parent of
@@ -1283,6 +1356,25 @@ impl CompanionAffinityLedger {
         self.candidates.remove(hostname);
 
         let window_ms = self.config.window_ms.min(self.config.max_window_ms);
+        // A sighting that predates the window it would join means the clock
+        // moved, not that time ran backwards. Everything the ledger holds is
+        // stamped in wall-clock milliseconds, so an NTP correction, a resumed
+        // virtual machine, or a service that started before the clock was set
+        // leaves state dated in a future that has not happened — and the state
+        // is persisted, so a restart inherits it.
+        //
+        // Left alone it is permanent: the attribution filters require
+        // `at_ms >= window_start_ms`, so the anchor attributes NOTHING; the
+        // "same window" test (`at_ms <= window_end_ms`) keeps extending that
+        // window instead of opening a new one; and `last_seen_ms` never moves
+        // down, so LRU eviction never picks the poisoned entry either.
+        if self
+            .anchors
+            .get(hostname)
+            .is_some_and(|a| at_ms < a.window_start_ms)
+        {
+            self.rebase_after_clock_step(at_ms);
+        }
         if let Some(anchor) = self.anchors.get_mut(hostname) {
             anchor.route = route;
             anchor.last_seen_ms = anchor.last_seen_ms.max(at_ms);
@@ -1299,7 +1391,7 @@ impl CompanionAffinityLedger {
             } else {
                 // Previous window closed (idle gap or hard cap): open a new one.
                 anchor.window_id = self.next_window_id;
-                self.next_window_id += 1;
+                self.next_window_id = self.next_window_id.saturating_add(1);
                 anchor.window_start_ms = at_ms;
                 anchor.window_end_ms = at_ms.saturating_add(window_ms);
                 self.replay_unattributed(at_ms);
@@ -1311,9 +1403,9 @@ impl CompanionAffinityLedger {
             self.evict_least_recent_anchor();
         }
         let id = self.next_anchor_id;
-        self.next_anchor_id += 1;
+        self.next_anchor_id = self.next_anchor_id.saturating_add(1);
         let window_id = self.next_window_id;
-        self.next_window_id += 1;
+        self.next_window_id = self.next_window_id.saturating_add(1);
         self.anchors.insert(
             hostname.to_string(),
             AnchorState {
@@ -1345,15 +1437,22 @@ impl CompanionAffinityLedger {
         }
         // One sighting per host in the buffer: a page firing fifty requests
         // must not push everything else out before a window opens.
-        if let Some(slot) = self
+        //
+        // Re-seated at the back rather than refreshed in place. Both users of
+        // this buffer assume it is ordered by sighting time: the prefix
+        // clean-up above stops at the first entry that is still young, and the
+        // overflow drop below takes the front. An entry refreshed where it sat
+        // put a young timestamp in front of old ones — the clean-up then stopped
+        // immediately and left expired entries behind it, while the overflow
+        // dropped the very entry that had just been refreshed.
+        let seen_before = self
             .unattributed
-            .iter_mut()
-            .find(|(name, _, _)| name == hostname)
-        {
-            slot.1 = at_ms;
-            slot.2 |= in_use;
-            return;
-        }
+            .iter()
+            .position(|(name, _, _)| name == hostname);
+        let in_use = match seen_before.and_then(|at| self.unattributed.remove(at)) {
+            Some((_, _, was_in_use)) => in_use || was_in_use,
+            None => in_use,
+        };
         if self.unattributed.len() >= MAX_UNATTRIBUTED {
             self.unattributed.pop_front();
         }
@@ -1393,11 +1492,11 @@ impl CompanionAffinityLedger {
             if self.candidates.contains_key(&hostname) {
                 continue;
             }
-            self.observe_candidate(at_ms, &hostname, in_use);
+            self.observe_candidate(at_ms, &hostname, in_use, Sighting::ReplayedIntoWindow);
         }
     }
 
-    fn observe_candidate(&mut self, at_ms: u64, hostname: &str, in_use: bool) {
+    fn observe_candidate(&mut self, at_ms: u64, hostname: &str, in_use: bool, sighting: Sighting) {
         if self.config.max_candidates == 0 {
             return;
         }
@@ -1484,21 +1583,40 @@ impl CompanionAffinityLedger {
 
         // Whose page each attributed hit really belonged to. Computed before the
         // split borrow (it reads `last_document`), and only for endpoint-shaped
-        // names — a page is nobody's sub-resource.
-        let foreign_parent: Vec<(u32, bool)> = if is_document_shaped(hostname) {
-            Vec::new()
-        } else {
-            self.anchors
-                .iter()
-                .filter(|(_, a)| at_ms <= a.window_end_ms && at_ms >= a.window_start_ms)
-                .map(|(anchor_hostname, a)| {
-                    (
-                        a.id,
-                        self.document_disowns(at_ms, anchor_hostname, hostname),
-                    )
-                })
-                .collect()
-        };
+        // names.
+        //
+        // A page-shaped candidate is exempt because the document heuristic
+        // cannot tell what it would have to tell here: `last_document` is
+        // whatever page-shaped name was seen last, so three bare apexes fetched
+        // by ONE page load make each the parent of the next, and two of the
+        // three lose their attribution. Judging a page by its predecessor is
+        // right only when the predecessor is a page — and nothing in this data
+        // separates a navigation from a sibling sub-resource that happens to be
+        // an apex. Reach is limited at the proposal instead: co-activity alone
+        // never generalizes a suffix.
+        //
+        // A replayed sighting is exempt: the look-back runs from INSIDE
+        // `observe_anchor`, while `last_document` is only updated at the end of
+        // `observe`, so the page it names is the PREVIOUS one. Judged by it,
+        // every sighting the look-back raises reads as somebody else's — one
+        // foreign hit against one near hit already trips `mostly_someone_elses`
+        // and drops the pair. The look-back and the parent test arrived
+        // together and cancelled each other out.
+        let foreign_parent: Vec<(u32, bool)> =
+            if is_document_shaped(hostname) || sighting == Sighting::ReplayedIntoWindow {
+                Vec::new()
+            } else {
+                self.anchors
+                    .iter()
+                    .filter(|(_, a)| at_ms <= a.window_end_ms && at_ms >= a.window_start_ms)
+                    .map(|(anchor_hostname, a)| {
+                        (
+                            a.id,
+                            self.document_disowns(at_ms, anchor_hostname, hostname),
+                        )
+                    })
+                    .collect()
+            };
 
         // Split borrow: anchors read-only, one candidate mutated.
         let anchors = &self.anchors;
@@ -1598,6 +1716,33 @@ impl CompanionAffinityLedger {
         retired.len()
     }
 
+    /// Pull every timestamp that sits in the future back to `at_ms`.
+    ///
+    /// Called when an observation is seen to predate a window that is already
+    /// open — the only evidence a pure ledger can have that the clock behind
+    /// its timestamps moved. Bounded work over bounded maps, and it runs only
+    /// on that event.
+    ///
+    /// Windows are CLOSED rather than re-dated: their contents were attributed
+    /// under the old reading, and stretching one over the gap would let a
+    /// sighting minutes later count as co-active with a page from before the
+    /// correction. The next sighting opens an honest window.
+    fn rebase_after_clock_step(&mut self, at_ms: u64) {
+        for anchor in self.anchors.values_mut() {
+            if anchor.window_start_ms > at_ms {
+                anchor.window_start_ms = at_ms;
+                anchor.window_end_ms = at_ms;
+            }
+            anchor.last_seen_ms = anchor.last_seen_ms.min(at_ms);
+        }
+        for candidate in self.candidates.values_mut() {
+            candidate.first_seen_ms = candidate.first_seen_ms.min(at_ms);
+            candidate.last_seen_ms = candidate.last_seen_ms.min(at_ms);
+        }
+        self.unattributed
+            .retain(|(_, seen_at, _)| *seen_at <= at_ms);
+    }
+
     fn evict_least_recent_anchor(&mut self) {
         let victim = self
             .anchors
@@ -1613,6 +1758,10 @@ impl CompanionAffinityLedger {
             for candidate in self.candidates.values_mut() {
                 candidate.pairs.retain(|p| p.anchor_id != evicted_id);
             }
+            // Same clean-up `retain_anchors` does: a candidate whose last pair
+            // just went describes nothing, and leaving it behind holds a slot
+            // in the bounded set against candidates that still mean something.
+            self.candidates.retain(|_, c| !c.pairs.is_empty());
         }
     }
 
@@ -1836,6 +1985,7 @@ impl CompanionAffinityLedger {
                     first_seen_ms: m.first_seen_ms,
                     last_seen_ms: m.last_seen_ms,
                     primary_behavior: m.primary_behavior,
+                    observed_members: Vec::new(),
                 };
                 // Only true subdomains justify generalizing to `*.apex` — the
                 // apex alone is not evidence that a whole suffix belongs on the
@@ -1859,12 +2009,22 @@ impl CompanionAffinityLedger {
                 // (`cdninstagram.com`, `googlevideo.com`, `ytimg.com`) carries
                 // the mask itself, and that is the shape worth generalizing.
                 let generalizes_alone = subdomains.iter().any(|m| match m.signal {
-                    CompanionSignal::BrandRelated => is_brand_related(anchor_name, apex),
+                    CompanionSignal::BrandRelated => {
+                        brand_relation(anchor_name, apex) == BrandRelation::Named
+                    }
                     CompanionSignal::DeliveryName => is_delivery_named(apex),
                     CompanionSignal::CoActivity => false,
                 });
+                // Counting only the members whose NAME is the evidence.
+                // Co-activity says a host loaded at the same time; two of them
+                // say it twice, never that the apex serves the anchor — that
+                // reading put a torrent client's whole domain on the tunnel.
+                let named_subdomains = subdomains
+                    .iter()
+                    .filter(|m| m.signal != CompanionSignal::CoActivity)
+                    .count();
                 let suffix_proposed = !subdomains.is_empty()
-                    && (generalizes_alone || subdomains.len() >= SUFFIX_MIN_DISTINCT_SUBDOMAINS)
+                    && (generalizes_alone || named_subdomains >= SUFFIX_MIN_DISTINCT_SUBDOMAINS)
                     && !suffix_would_swallow_the_anchor(anchor_name, apex)
                     && !exclusions.excludes(apex);
                 // Summarize with the strongest member's evidence and the union
@@ -1892,6 +2052,13 @@ impl CompanionAffinityLedger {
                     primary_behavior: members.iter().fold(PrimaryBehavior::Unknown, |acc, m| {
                         acc.merge(m.primary_behavior)
                     }),
+                    observed_members: {
+                        let mut names: Vec<String> =
+                            members.iter().map(|m| m.hostname.to_string()).collect();
+                        names.sort();
+                        names.dedup();
+                        names
+                    },
                 };
                 if suffix_proposed {
                     per_anchor.push(summarize(&subdomains, (*apex).to_string()));
@@ -2299,9 +2466,11 @@ mod tests {
     fn a_brand_related_companion_is_proposed_once_the_relation_repeats() {
         // A brand-related subdomain generalizes to its domain; a candidate that
         // IS the domain has no subdomain to generalize from and stays exact.
+        // `vk` is two letters: the relation holds, the reach does not — see
+        // `a_short_brand_token_earns_the_host_but_not_the_apex`.
         for (anchor, candidate, expected) in [
             ("web.whatsapp.com", "crashlogs.whatsapp.net", "whatsapp.net"),
-            ("vk.ru", "login.vk.com", "vk.com"),
+            ("vk.ru", "login.vk.com", "login.vk.com"),
             ("tiktok.com", "tiktokv.com", "tiktokv.com"),
         ] {
             let mut ledger = defaults();
@@ -2578,6 +2747,81 @@ mod tests {
             proposals
                 .iter()
                 .map(|p| (p.anchor_hostname.as_str(), p.proposed.value()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The look-back and the foreign-parent test arrived together and cancelled
+    /// each other out. The look-back runs from inside `observe_anchor`, before
+    /// `observe` records the page that just opened, so every sighting it raises
+    /// was judged against the PREVIOUS page — foreign by construction. One
+    /// foreign hit against one near hit is already "mostly someone else's", so
+    /// the pair was dropped and the CDN the look-back exists to catch was never
+    /// offered.
+    #[test]
+    fn a_companion_raised_by_the_look_back_is_not_blamed_on_the_previous_page() {
+        let mut ledger = defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        for start in [0_u64, 100_000] {
+            // A page of somebody else's, which is what `last_document` holds
+            // when the next window opens.
+            ledger.observe(start, "elsewhere.test", CoActivityKind::Candidate);
+            // The browser opens the CDN connection BEFORE the one to the page —
+            // parked, because no window is open yet.
+            ledger.observe(
+                start + 1_000,
+                "assets.thirdparty-delivery.test",
+                CoActivityKind::CandidateInUse,
+            );
+            // Now the page itself: this opens the window and replays the park.
+            ledger.observe(start + 2_000, "site.test", anchor);
+        }
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            proposals.iter().any(|p| p.anchor_hostname == "site.test"
+                && p.proposed.value().contains("thirdparty-delivery")),
+            "the look-back's whole purpose is this sighting: {:?}",
+            proposals
+                .iter()
+                .map(|p| (p.anchor_hostname.as_str(), p.proposed.value()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Equal brand tokens below the length containment demands (`t.co`/`t.me`,
+    /// `x.com`/`x.ai`) are kinship one registrar away from coincidence. They
+    /// still earn the host they name; they must not earn the apex.
+    #[test]
+    fn a_short_brand_token_earns_the_host_but_not_the_apex() {
+        let mut ledger = defaults();
+        two_visits(&mut ledger, "t.co", &["img.t.me"]);
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
+        assert_eq!(
+            proposals[0].proposed,
+            ProposedCompanionMatch::ExactHost("img.t.me".to_string())
+        );
+    }
+
+    /// The other half: a token long enough to name an operator still speaks for
+    /// the whole apex on its own, which is what the tier is for.
+    #[test]
+    fn a_full_brand_token_still_speaks_for_the_apex() {
+        let mut ledger = defaults();
+        two_visits(&mut ledger, "whatsapp.com", &["static.whatsapp.net"]);
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            proposals.iter().any(|p| matches!(
+                &p.proposed,
+                ProposedCompanionMatch::SuffixDomain(d) if d == "whatsapp.net")),
+            "a named brand stopped generalizing: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.clone())
                 .collect::<Vec<_>>()
         );
     }
@@ -3251,6 +3495,65 @@ mod tests {
         );
     }
 
+    /// The `bt.co` shape: a background client's plain-named hosts under one
+    /// apex, seen beside the anchor because it is open all day. Two of them
+    /// used to earn `*.apex` — a whole third-party domain on the tunnel from
+    /// evidence that says only "these loaded at the same time".
+    #[test]
+    fn co_activity_alone_never_generalizes_to_a_suffix() {
+        let mut ledger = defaults();
+        two_visits(
+            &mut ledger,
+            "site.example",
+            &["ledger.other.example", "airdrop.other.example"],
+        );
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            !proposals
+                .iter()
+                .any(|p| matches!(p.proposed, ProposedCompanionMatch::SuffixDomain(_))),
+            "co-activity generalized: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.clone())
+                .collect::<Vec<_>>()
+        );
+        // The hosts themselves are still proposed — one at a time, which is
+        // what the evidence actually covers.
+        assert_eq!(proposals.len(), 2);
+    }
+
+    /// A suffix offer reaches every name under the apex; the user can only
+    /// judge it against the names that were actually seen.
+    #[test]
+    fn a_suffix_proposal_carries_the_hostnames_the_evidence_covers() {
+        let mut ledger = defaults();
+        two_visits(
+            &mut ledger,
+            "site.example",
+            &["media.cdnexample.net", "static.cdnexample.net"],
+        );
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        let suffix = proposals
+            .iter()
+            .find(|p| matches!(p.proposed, ProposedCompanionMatch::SuffixDomain(_)))
+            .expect("the delivery apex generalizes");
+        assert_eq!(
+            suffix.observed_members,
+            vec![
+                "media.cdnexample.net".to_string(),
+                "static.cdnexample.net".to_string()
+            ]
+        );
+        // An exact offer covers itself; listing it would be noise.
+        let mut exact = proposals
+            .iter()
+            .filter(|p| matches!(p.proposed, ProposedCompanionMatch::ExactHost(_)));
+        assert!(exact.all(|p| p.observed_members.is_empty()));
+    }
+
     #[test]
     fn a_suffix_covering_the_anchor_itself_is_never_proposed() {
         let mut ledger = defaults();
@@ -3450,6 +3753,138 @@ mod tests {
         assert_eq!(ledger.retain_anchors(|_| true), 0);
         assert_eq!(ledger.anchor_count(), 1);
         assert!(ledger.is_tracking_candidate("cdn.example"));
+    }
+
+    // ── A clock that moved ───────────────────────────────────────────────────
+
+    /// Every timestamp here is wall-clock. An NTP correction, a resumed VM or a
+    /// service that started before the clock was set leaves the ledger holding
+    /// a window that starts in a future which has not happened — and the state
+    /// is persisted, so a restart inherits it. Untreated it is permanent: the
+    /// anchor attributes nothing, its window is extended rather than reopened,
+    /// and LRU eviction never picks it because `last_seen_ms` never moves down.
+    #[test]
+    fn an_anchor_stamped_in_the_future_recovers_when_the_clock_comes_back() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        let future = 5_000_000_000_u64;
+
+        // Seen while the clock was wrong.
+        ledger.observe(future, "site.test", anchor);
+
+        // The clock is corrected; the same page loads again, now with its CDN.
+        ledger.observe(1_000, "site.test", anchor);
+        ledger.observe(
+            2_000,
+            "assets.thirdparty-delivery.test",
+            CoActivityKind::Candidate,
+        );
+        assert!(
+            ledger.is_tracking_candidate("assets.thirdparty-delivery.test"),
+            "an anchor whose window sits in the future attributes nothing at all"
+        );
+
+        let snapshot = ledger.snapshot();
+        let stored = snapshot
+            .anchors
+            .iter()
+            .find(|a| a.hostname == "site.test")
+            .expect("the anchor is still tracked");
+        assert!(
+            stored.last_seen_ms <= 2_000,
+            "a future `last_seen_ms` hides the anchor from LRU eviction for good",
+        );
+    }
+
+    /// The buffer of parked sightings is read as ordered by time from both
+    /// ends: the prefix clean-up stops at the first entry that is still young,
+    /// and the overflow drops the FRONT. Refreshing an entry where it sat put a
+    /// young timestamp in front of old ones, so the overflow threw away the
+    /// sighting that had just been refreshed — the most recent evidence in the
+    /// buffer — while the stale ones behind it stayed.
+    #[test]
+    fn refreshing_a_parked_sighting_moves_it_to_the_back() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        // Fill the park to its cap; the first host is at the front.
+        for i in 0..MAX_UNATTRIBUTED {
+            ledger.observe(
+                1_000 + i as u64,
+                &format!("host{i}.delivery.test"),
+                CoActivityKind::Candidate,
+            );
+        }
+        // The oldest is seen again — it is now the newest evidence there is.
+        ledger.observe(9_000, "host0.delivery.test", CoActivityKind::Candidate);
+        // One more host overflows the buffer by one.
+        ledger.observe(9_100, "extra.delivery.test", CoActivityKind::Candidate);
+
+        // A window opens and claims everything the look-back still holds.
+        ledger.observe(
+            9_200,
+            "site.test",
+            CoActivityKind::Anchor { route: SECONDARY },
+        );
+        assert!(
+            ledger.is_tracking_candidate("host0.delivery.test"),
+            "the refreshed sighting must survive an overflow, not be its victim",
+        );
+        assert!(
+            !ledger.is_tracking_candidate("host1.delivery.test"),
+            "the genuinely oldest entry is the one the overflow drops",
+        );
+    }
+
+    /// Dropping an anchor takes its pairs with it; a candidate left with none
+    /// describes nothing and must not hold a slot in the bounded set. This is
+    /// what `retain_anchors` already did and eviction did not.
+    #[test]
+    fn evicting_an_anchor_drops_the_candidates_it_leaves_empty() {
+        let mut ledger = CompanionAffinityLedger::new(CompanionAffinityConfig {
+            max_anchors: 1,
+            ..CompanionAffinityConfig::default()
+        });
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        ledger.observe(1_000, "first.test", anchor);
+        ledger.observe(
+            1_100,
+            "assets.thirdparty-delivery.test",
+            CoActivityKind::Candidate,
+        );
+        assert_eq!(ledger.candidate_count(), 1);
+
+        // The cap is one, so this evicts `first.test`.
+        ledger.observe(2_000, "second.test", anchor);
+        assert_eq!(ledger.anchor_count(), 1);
+        assert_eq!(
+            ledger.candidate_count(),
+            0,
+            "the candidate's only pair went with the evicted anchor",
+        );
+    }
+
+    /// The module promises a byte-deterministic snapshot. Pairs were appended
+    /// in `HashMap` iteration order, which differs per process, so two runs
+    /// over the same events could serialise the same evidence differently.
+    #[test]
+    fn snapshot_pairs_are_ordered_by_anchor_id() {
+        let mut ledger = CompanionAffinityLedger::with_defaults();
+        let anchor = CoActivityKind::Anchor { route: SECONDARY };
+        for (i, name) in ["a.test", "b.test", "c.test", "d.test"].iter().enumerate() {
+            ledger.observe(1_000 + i as u64, name, anchor);
+        }
+        ledger.observe(
+            1_500,
+            "assets.thirdparty-delivery.test",
+            CoActivityKind::Candidate,
+        );
+
+        let snapshot = ledger.snapshot();
+        for candidate in &snapshot.candidates {
+            let ids: Vec<u32> = candidate.pairs.iter().map(|p| p.anchor_id).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert_eq!(ids, sorted, "pairs must serialise in a fixed order");
+        }
     }
 
     // ── Look-back on an opening window ───────────────────────────────────────

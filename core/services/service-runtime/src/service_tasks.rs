@@ -103,6 +103,9 @@ pub const TASK_ID_OPERATION_RESULTS_GC: &str = "operation-results-gc";
 /// Periodic revisions retention pruner. Runs the same 1-hour cadence
 /// as `diagnostics-cleanup`. Optional class.
 pub const TASK_ID_REVISIONS_RETENTION: &str = "revisions-retention-prune";
+/// Periodic WAL checkpoint over every database the service holds open. Same
+/// 1-hour cadence as the retention pruners. Optional class.
+pub const TASK_ID_STORAGE_CHECKPOINT: &str = "storage-wal-checkpoint";
 pub const TASK_ID_IPC_ACCEPT_LOOP: &str = "ipc-accept-loop";
 pub const TASK_ID_IPC_SHUTDOWN_WATCHER: &str = "ipc-shutdown-watcher";
 /// Periodic DNS refresh tick. Optional class — DNS failures degrade
@@ -750,6 +753,78 @@ pub fn build_revisions_retention_task(conn: Arc<Mutex<rusqlite::Connection>>) ->
     )
 }
 
+// ── Storage WAL checkpoint ───────────────────────────────────────────────────
+
+/// Handles to the databases the service keeps open for its whole uptime.
+/// Every field is optional: a degraded boot may have opened none of them.
+#[derive(Clone, Default)]
+pub struct StorageCheckpointDeps {
+    /// `nrr_fqdn_ip_cache.db`, through the same handle the DNS refresh writes.
+    pub cache: Option<Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
+    /// `nrr_service_state.db`.
+    pub state: Option<Arc<Mutex<rusqlite::Connection>>>,
+    /// `nrr_traffic_stats.db`, through the sampler that owns it.
+    pub traffic: Option<Arc<Mutex<crate::traffic_sampler::TrafficSampler>>>,
+}
+
+impl StorageCheckpointDeps {
+    /// True when at least one database is available to check point.
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_none() && self.state.is_none() && self.traffic.is_none()
+    }
+}
+
+/// Periodic WAL checkpoint over every open database.
+///
+/// The connection factory truncates the journal on open, which is enough for
+/// a process that restarts often and nothing at all for a service that runs for
+/// weeks: SQLite's automatic checkpoint folds pages into the database but never
+/// shrinks the journal, so the ledger ends up living almost entirely in a file
+/// that a crash cleanup or a restore-from-copy drops while leaving an
+/// intact-looking database behind. `Optional` — a skipped pass costs disk, not
+/// routing. Failures are swallowed: with a second connection live SQLite
+/// declines, and the next pass retries.
+pub fn build_storage_checkpoint_task(deps: StorageCheckpointDeps) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_STORAGE_CHECKPOINT,
+        TaskClass::Optional,
+        DIAGNOSTICS_CLEANUP_INTERVAL,
+        0,
+        move |_stop| {
+            if let Some(cache) = deps.cache.as_ref() {
+                if let Ok(c) = cache.lock() {
+                    checkpoint_logged("fqdn-cache", c.periodic_vacuum());
+                }
+            }
+            if let Some(state) = deps.state.as_ref() {
+                if let Ok(c) = state.lock() {
+                    checkpoint_logged(
+                        "service-state",
+                        nrr_storage::migration::checkpoint_wal_truncate(&c),
+                    );
+                }
+            }
+            if let Some(traffic) = deps.traffic.as_ref() {
+                if let Ok(s) = traffic.lock() {
+                    checkpoint_logged("traffic-stats", s.checkpoint_wal());
+                }
+            }
+            TaskOutcome::Continue
+        },
+    )
+}
+
+fn checkpoint_logged(database: &str, outcome: nrr_storage::StorageResult<()>) {
+    if let Err(e) = outcome {
+        tracing::debug!(
+            target: "nrr::retention",
+            database,
+            error = %e,
+            "WAL checkpoint declined; retrying next pass",
+        );
+    }
+}
+
 // ── Operation-results GC ─────────────────────────────────────────────────────
 
 /// Periodic GC for the in-memory operation-results table. Operation
@@ -1027,6 +1102,20 @@ fn auto_probe_is_due(cadence: AutoProbeCadence, last: Option<Instant>, now: Inst
     }
 }
 
+/// Should this tick run the automatic main-link pass?
+///
+/// Both gates in one place so the caller cannot advance the window on a tick
+/// that did not probe — the defect this replaced. `waiting` is how many
+/// suggestions are actually queued for an answer.
+fn auto_probe_should_run(
+    cadence: AutoProbeCadence,
+    last: Option<Instant>,
+    now: Instant,
+    waiting: usize,
+) -> bool {
+    waiting > 0 && auto_probe_is_due(cadence, last, now)
+}
+
 pub fn build_auto_rules_task(
     engine: Arc<crate::auto_rules::AutoRulesEngine>,
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
@@ -1052,23 +1141,44 @@ pub fn build_auto_rules_task(
             if let Some(probe) = auto_probe.as_ref() {
                 let cadence = (probe.cadence)(&sid);
                 let now = Instant::now();
-                let due = {
-                    let mut seen = probed_at.lock().unwrap_or_else(|p| p.into_inner());
-                    let due = auto_probe_is_due(cadence, seen.get(&sid).copied(), now);
-                    if due {
-                        seen.insert(sid.clone(), now);
-                    }
-                    due
-                };
                 // Only when something is actually waiting on an answer: a pass
                 // over an empty inbox leaves the machine for nothing.
-                if due && !engine.candidates(&sid).is_empty() {
+                let waiting = engine.candidates(&sid).len();
+                let last = {
+                    let seen = probed_at.lock().unwrap_or_else(|p| p.into_inner());
+                    seen.get(&sid).copied()
+                };
+                if auto_probe_should_run(cadence, last, now, waiting) {
+                    // Stamped HERE, not at the due check. Stamping on every due
+                    // tick spent the window on ticks where no pass ran: the
+                    // inbox is empty most of the time, so the one moment a
+                    // suggestion appeared almost never coincided with a due
+                    // mark, and hosts kept being offered with no main-link
+                    // verdict at all — which is exactly what makes a shared CDN
+                    // look unreachable and land on the offer list.
+                    probed_at
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(sid.clone(), now);
                     let accepted = probe.runner.probe(&sid, &[], &[]).accepted;
                     tracing::debug!(
                         target: "nrr::auto-rules",
                         sid = %sid,
                         accepted,
+                        waiting,
                         "main-link pass started for parked suggestions",
+                    );
+                } else if waiting > 0 {
+                    // A suggestion is waiting and the pass did not run. Says
+                    // which of the two gates held it, because "no verdict" and
+                    // "verdict says unreachable" produce the same offer.
+                    tracing::debug!(
+                        target: "nrr::auto-rules",
+                        sid = %sid,
+                        waiting,
+                        enabled = cadence.enabled,
+                        repeat_secs = cadence.repeat.as_secs(),
+                        "main-link pass NOT started while suggestions wait",
                     );
                 }
             }
@@ -1448,6 +1558,53 @@ mod tests {
             on,
             Some(now),
             now + Duration::from_secs(300)
+        ));
+    }
+
+    /// The defect this pins: the window used to advance on every DUE tick,
+    /// probed or not. The inbox is empty almost all the time, so a suggestion
+    /// appearing between two due marks waited out a whole window — and while it
+    /// waited it carried no main-link verdict, which is what makes a shared CDN
+    /// that answers perfectly well look unreachable and land on the offer list.
+    #[test]
+    fn an_empty_inbox_does_not_spend_the_probe_window() {
+        let on = AutoProbeCadence {
+            enabled: true,
+            repeat: Duration::from_secs(300),
+        };
+        let start = Instant::now();
+
+        // Ticks every 10 s. Nothing is waiting for the first four minutes.
+        let mut last: Option<Instant> = None;
+        for step in 0..24 {
+            let now = start + Duration::from_secs(step * 10);
+            assert!(
+                !auto_probe_should_run(on, last, now, 0),
+                "an empty inbox never runs a pass"
+            );
+            if auto_probe_should_run(on, last, now, 0) {
+                last = Some(now);
+            }
+        }
+
+        // The moment a suggestion appears the pass runs — it did not have to
+        // wait for a window that empty ticks had already eaten.
+        let appeared = start + Duration::from_secs(240);
+        assert!(auto_probe_should_run(on, last, appeared, 1));
+        last = Some(appeared);
+
+        // And having run, it holds the user's window like before.
+        assert!(!auto_probe_should_run(
+            on,
+            last,
+            appeared + Duration::from_secs(299),
+            1
+        ));
+        assert!(auto_probe_should_run(
+            on,
+            last,
+            appeared + Duration::from_secs(300),
+            1
         ));
     }
 

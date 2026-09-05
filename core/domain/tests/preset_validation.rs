@@ -237,7 +237,7 @@ fn one_over_rule_count_limit_is_rejected() {
 
 #[test]
 fn rule_count_spans_both_free_and_extended_sections() {
-    // Split rules between a Free section and a unsupported section.
+    // Split rules between a Free section and an extended section.
     // Combined they exceed the limit.
     let half = MAX_RULES_PER_FILE as usize / 2;
     let mut content = String::from("--- Domains\n");

@@ -796,6 +796,7 @@ fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCan
         consumers_changed_unix_ms: last_seen_unix_ms,
         primary_behavior: String::new(),
         anchor_refuses_main_link: false,
+        observed_members: Vec::new(),
     }
 }
 
@@ -1861,6 +1862,72 @@ fn main_link_dto(
         consumers_changed_unix_ms: 2,
         primary_behavior: behavior.to_string(),
         anchor_refuses_main_link: false,
+        observed_members: Vec::new(),
+    }
+}
+
+/// The reported case, one step earlier than the check that was supposed to
+/// cover it: nothing had measured `cdnjs` yet, and an unmeasured host reads
+/// exactly like an unreachable one. `meduza.io` hit it after `chatgpt.com` did,
+/// because the fix had been aimed at the verdict, not at its absence.
+#[test]
+fn a_third_party_with_no_verdict_yet_waits_instead_of_asking() {
+    let unmeasured = main_link_dto(
+        "meduza.io",
+        "cdnjs.cloudflare.com",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        "", // the pass has not answered for it yet
+    );
+    assert!(
+        awaiting_the_main_link(&unmeasured, true),
+        "with an answer still coming, the question waits for it"
+    );
+
+    // With the pass switched off no answer is coming, and holding the question
+    // forever would retire the feature behind the user's back.
+    assert!(
+        !awaiting_the_main_link(&unmeasured, false),
+        "no pass, nothing to wait for"
+    );
+}
+
+/// What must NOT be held: the routed site's own names, and anything the pass
+/// has already answered for. Without this the hold would swallow the very
+/// suggestions the feature exists to make.
+#[test]
+fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
+    let own = main_link_dto(
+        "meduza.io",
+        "cdn.meduza.io",
+        AUTO_RULE_SIGNAL_DELIVERY_NAME,
+        "",
+    );
+    assert!(
+        !awaiting_the_main_link(&own, true),
+        "the site's own delivery name is asked about regardless"
+    );
+
+    let brand = main_link_dto("meduza.io", "meduza.ru", AUTO_RULE_SIGNAL_BRAND_RELATED, "");
+    assert!(
+        !awaiting_the_main_link(&brand, true),
+        "the brand tier never waits on connectivity"
+    );
+
+    for behavior in [
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+        AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
+        AUTO_RULE_PRIMARY_BEHAVIOR_CUT,
+    ] {
+        let answered = main_link_dto(
+            "meduza.io",
+            "cdnjs.cloudflare.com",
+            AUTO_RULE_SIGNAL_DELIVERY_NAME,
+            behavior,
+        );
+        assert!(
+            !awaiting_the_main_link(&answered, true),
+            "behavior {behavior:?} is an answer; the wait is over"
+        );
     }
 }
 

@@ -118,8 +118,7 @@ Window {
             }
         }
         if (wantBlockNoticesMuted) {
-            root.updatePrefs({ notifyBlockNotices: false })
-            root.emitPrefs()
+            root.commitPrefs({ notifyBlockNotices: false })
         }
         if (typeof root.applyServiceStabilityPatch !== "function") return
         var patch = { "fake-ip-enabled": wantFakeIp }
@@ -199,14 +198,18 @@ Window {
     // launch. The option/escape paths already set the flag in memory
     // before calling close(), so the `!firstRunCompleted` guard skips
     // a redundant second write (and the extra `uiRevision` bump); the
-    // X-close path falls through and sets it here. Persistence matches
-    // the option handlers — the flag is flushed by the main window's
-    // own `onClosing` emitPrefs() on exit; no explicit emit is needed.
+    // X-close path falls through and sets it here.
     onClosing: {
         _applyProtectionChoices()
         if (!root.prefs.firstRunCompleted) {
             root.updatePrefs({ firstRunCompleted: true })
         }
+        // Flushed HERE, on every close path (option buttons and Escape reach
+        // this handler through their own close()). Waiting for the main
+        // window's exit emit meant a force-kill lost the flag and the wizard
+        // greeted the user again — the very loss the debounced writer exists
+        // to prevent.
+        root.emitPrefs()
         // Hand the Licenses window back to the main window if it was
         // re-parented onto the wizard by `licenseWindow.openOnEulaTab`
         // (so a later normal open stacks correctly).
@@ -448,7 +451,7 @@ Window {
                 spacing: root.uiTheme.spacingXs
 
                 Label {
-                    text: root.tr("dialog.first-run-wizard.primary-adapter-title",
+                    text: root.tr("interfaces.role.primary",
                         "Main connection")
                     color: root.textColor
                     font.bold: true
@@ -484,7 +487,7 @@ Window {
                             : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
                                 "Choose a connection")
                         Accessible.role: Accessible.ComboBox
-                        Accessible.name: root.tr("dialog.first-run-wizard.primary-adapter-title",
+                        Accessible.name: root.tr("interfaces.role.primary",
                             "Main connection")
                     }
                     ThemedButton {
@@ -518,7 +521,7 @@ Window {
                 spacing: root.uiTheme.spacingXs
 
                 Label {
-                    text: root.tr("dialog.first-run-wizard.secondary-adapter-title",
+                    text: root.tr("interfaces.role.secondary",
                         "Additional connection")
                     color: root.textColor
                     font.bold: true
@@ -557,7 +560,7 @@ Window {
                             : root.tr("dialog.first-run-wizard.primary-adapter-placeholder",
                                 "Choose a connection")
                         Accessible.role: Accessible.ComboBox
-                        Accessible.name: root.tr("dialog.first-run-wizard.secondary-adapter-title",
+                        Accessible.name: root.tr("interfaces.role.secondary",
                             "Additional connection")
                     }
                     ThemedButton {

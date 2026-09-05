@@ -1119,6 +1119,19 @@ impl AdaptersSnapshotProvider for NoopAdaptersSnapshotProvider {
 /// `nrr_traffic_stats.db` (never a second connection to the same file).
 pub trait AdapterAddressRecorder: Send + Sync {
     fn record(&self, adapter_key: &str, local_ip: &str, external_ip: &str, observed_at_ms: i64);
+
+    /// The LOCAL address stored alongside the remembered external one, or
+    /// `None` when nothing is stored for this adapter.
+    ///
+    /// Read, not just written, because the in-memory copy of the same pair is
+    /// empty after a service restart — and "the service restarted and the
+    /// adapter was renamed meanwhile" is exactly the case that hands one
+    /// adapter's external address to another.
+    fn remembered_local_ip(&self, adapter_key: &str) -> Option<String>;
+
+    /// Drop the remembered external address, keeping `local_ip` as what this
+    /// adapter shows now.
+    fn forget_external(&self, adapter_key: &str, local_ip: &str, observed_at_ms: i64);
 }
 
 fn now_ms() -> i64 {
@@ -1213,6 +1226,22 @@ impl MonitoredAdaptersSnapshotProvider {
                     }
                 }
                 continue;
+            }
+            // The pair on DISK is what feeds the traffic screen, and it
+            // outlives this process. A stored local address that no longer
+            // matches the adapter under this name means the row belongs to
+            // some other adapter — a rename, or a reinstall that took the name
+            // back — so the external half must go before anything prints it as
+            // this adapter's. Only the external half: the local one is a fact
+            // about the adapter in front of us.
+            if let Some(recorder) = &self.address_recorder {
+                if !row.windows_name.is_empty() && !row.local_ip.is_empty() {
+                    if let Some(stored_local) = recorder.remembered_local_ip(&row.windows_name) {
+                        if stored_local != row.local_ip {
+                            recorder.forget_external(&row.windows_name, &row.local_ip, now_ms());
+                        }
+                    }
+                }
             }
             match cache.get(&key) {
                 Some(entry) if entry.local_ip == row.local_ip => {
@@ -1514,12 +1543,19 @@ mod adapters_snapshot_tests {
 
     struct FakeAddressRecorder {
         calls: Mutex<Vec<(String, String, String)>>,
+        /// What the STORE holds: `adapter_key -> (local_ip, external_ip)`.
+        /// Separate from `calls` because the guard reads the persisted pair,
+        /// not the calls made to it.
+        stored: Mutex<std::collections::HashMap<String, (String, Option<String>)>>,
+        forgotten: Mutex<Vec<String>>,
     }
 
     impl FakeAddressRecorder {
         fn new() -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                stored: Mutex::new(std::collections::HashMap::new()),
+                forgotten: Mutex::new(Vec::new()),
             }
         }
     }
@@ -1531,6 +1567,22 @@ mod adapters_snapshot_tests {
                 local_ip.to_string(),
                 external_ip.to_string(),
             ));
+        }
+
+        fn remembered_local_ip(&self, adapter_key: &str) -> Option<String> {
+            let stored = self.stored.lock().expect("lock");
+            stored.get(adapter_key).map(|pair| pair.0.clone())
+        }
+
+        fn forget_external(&self, adapter_key: &str, local_ip: &str, _ms: i64) {
+            self.forgotten
+                .lock()
+                .expect("lock")
+                .push(adapter_key.to_string());
+            self.stored
+                .lock()
+                .expect("lock")
+                .insert(adapter_key.to_string(), (local_ip.to_string(), None));
         }
     }
 
@@ -1582,6 +1634,60 @@ mod adapters_snapshot_tests {
                 "203.0.113.10".to_string(),
             )
         );
+    }
+
+    /// The stored pair belongs to whatever adapter answered to this NAME last
+    /// time. A rename — or a reinstall that took the name back — leaves the
+    /// previous adapter's external address under it, and the traffic screen
+    /// prints that pair verbatim, with no freshness or identity check of its
+    /// own. So the moment a snapshot sees a different local address under a
+    /// remembered name, the external half has to go.
+    ///
+    /// Compared against the STORE, not against the in-process cache: after a
+    /// service restart that cache is empty, and "restarted, and the adapter was
+    /// renamed meanwhile" is the likeliest way into this state.
+    #[test]
+    fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
+        let api = Arc::new(MockWindowsApi::new());
+        let recorder = Arc::new(FakeAddressRecorder::new());
+        // Someone else's pair is already on disk under "Ethernet".
+        recorder.stored.lock().expect("lock").insert(
+            "Ethernet".to_string(),
+            ("10.9.9.9".to_string(), Some("198.51.100.200".to_string())),
+        );
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
+
+        // A snapshot with NO fresh probe — the common one, and the only kind
+        // that reads the stored pair instead of overwriting it.
+        let mut rows = rows_with_fresh_ethernet_probe();
+        for row in &mut rows {
+            row.observed_facts.external_ip = None;
+        }
+        provider.fold_cached_external(&mut rows);
+
+        assert_eq!(
+            recorder.forgotten.lock().expect("lock").as_slice(),
+            ["Ethernet".to_string()],
+            "the stale external address must be dropped"
+        );
+
+        // Positive control: the same fold with a MATCHING stored local address
+        // forgets nothing — the guard must not throw away a legitimate memory.
+        let recorder = Arc::new(FakeAddressRecorder::new());
+        recorder.stored.lock().expect("lock").insert(
+            "Ethernet".to_string(),
+            ("192.168.1.20".to_string(), Some("203.0.113.10".to_string())),
+        );
+        let api = Arc::new(MockWindowsApi::new());
+        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
+            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
+        let mut rows = rows_with_fresh_ethernet_probe();
+        for row in &mut rows {
+            row.observed_facts.external_ip = None;
+        }
+        provider.fold_cached_external(&mut rows);
+        assert!(recorder.forgotten.lock().expect("lock").is_empty());
     }
 
     #[test]

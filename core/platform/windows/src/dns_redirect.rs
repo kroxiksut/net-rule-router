@@ -22,28 +22,14 @@
 //! [`PowerShellRunner`] and [`TransactedNrptStore`] touch the OS.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use nrr_platform_api::adapters::names_indicate_virtual_machine_network;
-use nrr_platform_api::dns::UpstreamDnsCandidate;
+use nrr_platform_api::dns::{DnsCacheControlPort, UpstreamDnsCandidate};
 use nrr_platform_api::fake_ip::FakeIpPoolConfig;
 
+use crate::dns::WindowsDnsCacheControl;
 use crate::error::PlatformError;
-/// Absolute path of the system PowerShell.
-///
-/// The bare name resolves through the process search path, which on Windows
-/// includes the current directory. This runs as LocalSystem (the DNS redirect)
-/// or raises a UAC prompt (the relaunch), so which binary answers to the name
-/// is not a detail. `%SystemRoot%` names the one Windows means.
-fn system_powershell() -> std::path::PathBuf {
-    match std::env::var_os("SystemRoot") {
-        Some(root) => std::path::PathBuf::from(root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe"),
-        None => std::path::PathBuf::from("powershell.exe"),
-    }
-}
 
 /// Comment stamped on OUR NRPT rule so `restore` / `verify` only ever touch the
 /// rule this service created, never a VPN client's or an admin's own rule.
@@ -169,12 +155,6 @@ pub trait NrptRuleStore: Send + Sync {
     /// rule carrying `marker` under a key other than `keep` (copies from before
     /// the key was fixed). Returns how many went.
     fn sweep_orphans(&self, marker: &str, keep: &str) -> Result<usize, PlatformError>;
-}
-
-/// Flush the Windows DNS client cache so warm entries re-resolve through the
-/// freshly-installed (or freshly-removed) redirect.
-fn flush_script() -> &'static str {
-    "Clear-DnsClientCache"
 }
 
 /// PowerShell listing candidate upstream IPv4 DNS servers as tab-separated
@@ -376,11 +356,25 @@ fn effective_policy_script(listener_ip: &str) -> String {
 pub struct NrptDnsRedirect<R: CommandRunner, S: NrptRuleStore> {
     runner: R,
     store: S,
+    /// The cache flush, which is an API call rather than a script. It sits
+    /// behind the port because the same flush is wanted from elsewhere in the
+    /// service, and two ways to flush one cache is how they drift apart.
+    cache: Arc<dyn DnsCacheControlPort>,
 }
 
 impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
     pub fn new(runner: R, store: S) -> Self {
-        Self { runner, store }
+        Self::with_cache_control(runner, store, Arc::new(WindowsDnsCacheControl::new()))
+    }
+
+    /// Same, with the cache flush injected — tests use it to observe the flush
+    /// without touching the machine's resolver cache.
+    pub fn with_cache_control(runner: R, store: S, cache: Arc<dyn DnsCacheControlPort>) -> Self {
+        Self {
+            runner,
+            store,
+            cache,
+        }
     }
 }
 
@@ -469,14 +463,17 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
     }
 
     fn flush_cache(&self) -> Result<(), PlatformError> {
-        let out = self.runner.run_powershell(flush_script())?;
-        if !out.success {
-            return Err(PlatformError::Transient {
+        // `DnsFlushResolverCache`, not `Clear-DnsClientCache` through
+        // PowerShell. This runs inside the service teardown, where it was the
+        // only step that spawned a process — and the one that made the stop
+        // budget a question at all: the NRPT restore beside it is a single
+        // registry delete. The API call is the same flush without the process.
+        self.cache
+            .flush_resolver_cache()
+            .map_err(|error| PlatformError::Transient {
                 operation: "nrpt.flush_cache",
-                detail: format!("Clear-DnsClientCache failed: {}", out.stderr.trim()),
-            });
-        }
-        Ok(())
+                detail: format!("resolver cache flush failed: {error:?}"),
+            })
     }
 }
 
@@ -510,7 +507,7 @@ impl CommandRunner for PowerShellRunner {
         // caller of this runner is a boot step, a stop step or a recovery
         // command. A `powershell.exe` that never returns would hang the very
         // paths that exist to unstick a machine.
-        let mut child = std::process::Command::new(system_powershell())
+        let mut child = std::process::Command::new(crate::system_shell::system_powershell())
             .args(["-NoProfile", "-NonInteractive", "-Command", script])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(std::process::Stdio::null())
@@ -1261,6 +1258,36 @@ mod tests {
         assert_eq!(store.keys(), ["{VPN}"]);
         // Nothing to clean is a successful sweep of zero, not a failure.
         assert_eq!(clear_orphan_redirect(&store).expect("clear"), 0);
+    }
+
+    /// The teardown's only process spawn used to be here. The NRPT restore
+    /// beside it is a single registry delete, so this flush was the whole
+    /// reason the stop step needed a multi-second budget.
+    #[test]
+    fn flushing_the_cache_calls_the_api_and_spawns_no_process() {
+        #[derive(Default)]
+        struct CountingFlush(std::sync::atomic::AtomicUsize);
+        impl DnsCacheControlPort for CountingFlush {
+            fn flush_resolver_cache(
+                &self,
+            ) -> Result<(), nrr_platform_api::dns::DnsCacheFlushError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let flush = Arc::new(CountingFlush::default());
+        let redirect = NrptDnsRedirect::with_cache_control(
+            FakeRunner::new(ok("")),
+            FakeStore::default(),
+            flush.clone(),
+        );
+        redirect.flush_cache().expect("flush");
+        assert_eq!(flush.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            redirect.runner.scripts().is_empty(),
+            "the flush must not run PowerShell"
+        );
     }
 
     #[test]

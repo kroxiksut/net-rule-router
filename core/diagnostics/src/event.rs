@@ -96,6 +96,23 @@ pub struct LogEvent {
     /// Localization key for GUI display — must not be user-visible text.
     pub message_key: String,
 
+    /// Whose activity this line is about, as the stored principal
+    /// (`S-1-5-…`, `unix:uid:<n>`), or `None` for a machine-level line —
+    /// boot, adapters, service lifecycle — that belongs to nobody in
+    /// particular.
+    ///
+    /// Read from the event's own `sid` field, which the per-principal call
+    /// sites already carry. It is what lets a read be scoped to the caller:
+    /// the operational log is one machine-wide stream, and without an owner
+    /// per line the only choices were "everybody sees everything" or "nobody
+    /// but an administrator sees anything".
+    ///
+    /// `#[serde(default)]` — lines written before this field existed read back
+    /// as machine-level, which keeps an upgraded install's log readable
+    /// instead of blanking it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+
     /// Structured event payload after redaction.
     ///
     /// `None` means no additional detail is available.  Must not contain
@@ -171,6 +188,7 @@ impl LogEvent {
                 .map(|m| m.ui_key)
                 .unwrap_or("diag.unknown.summary")
                 .to_string(),
+            principal: None,
             payload: None,
         }
     }

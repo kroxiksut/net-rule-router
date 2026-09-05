@@ -81,13 +81,56 @@ pub fn handle_sidecar_request(
 ) -> SidecarHandlerResult {
     let mut guard = handle.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        *guard = Some(SidecarDb::open_default()?);
+        match SidecarDb::open_default() {
+            Ok(db) => *guard = Some(db),
+            // The one request that has to work on a database we cannot open is
+            // the one that throws it away. It used to fail with the same error
+            // as everything else — the open happened before dispatch — so the
+            // recovery the crate documents ("let the user pick Reset
+            // application data") was unreachable exactly when it was needed.
+            Err(open_error) if operation == RESET_OPERATION => {
+                return rebuild_unopenable_sidecar(&mut guard, open_error);
+            }
+            Err(open_error) => return Err(open_error),
+        }
     }
     // SAFETY-from-`unwrap`: we just inserted `Some(...)` above.
     let db = guard.as_mut().ok_or_else(|| SidecarError::PathResolution {
         reason: "sidecar handle was unexpectedly empty after init".into(),
     })?;
     dispatch(db, operation, payload)
+}
+
+/// The operation that must survive a database it cannot open.
+const RESET_OPERATION: &str = "sidecar.reset";
+
+/// Throw away a sidecar that will not open and put a fresh one in its place.
+///
+/// Only ever reached from an explicit `sidecar.reset` — the crate's rule is
+/// that a non-empty user database is never auto-truncated, and this does not
+/// change that: the user asked. What it does change is that asking now works.
+/// The `-wal` and `-shm` companions go too; leaving them behind is how a
+/// "fresh" database inherits the journal of the broken one.
+fn rebuild_unopenable_sidecar(
+    guard: &mut Option<SidecarDb>,
+    open_error: SidecarError,
+) -> SidecarHandlerResult {
+    let path = nrr_storage_sidecar::profile::resolve_path()?;
+    for companion in ["", "-wal", "-shm"] {
+        let mut victim = path.clone().into_os_string();
+        victim.push(companion);
+        match std::fs::remove_file(std::path::PathBuf::from(victim)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Could not remove it: report the ORIGINAL failure, which is what
+            // the user is actually looking at, not a second one about a file
+            // they never heard of.
+            Err(_) => return Err(open_error),
+        }
+    }
+    let db = SidecarDb::open_default()?;
+    *guard = Some(db);
+    Ok(json!({ "reset": true, "rebuilt": true }))
 }
 
 fn dispatch(db: &SidecarDb, operation: &str, payload: &Value) -> SidecarHandlerResult {
@@ -104,7 +147,7 @@ fn dispatch(db: &SidecarDb, operation: &str, payload: &Value) -> SidecarHandlerR
         "sidecar.external-ip.read-all" => handle_external_ip_read_all(db),
         "sidecar.external-ip.write-all" => handle_external_ip_write_all(db, payload),
         "sidecar.vacuum" => handle_vacuum(db, payload),
-        "sidecar.reset" => handle_reset(db),
+        RESET_OPERATION => handle_reset(db),
         other => Err(SidecarError::PathResolution {
             reason: format!("unknown sidecar operation: {other}"),
         }),
@@ -321,6 +364,52 @@ mod tests {
         // handler doesn't try the real %APPDATA% during tests.
         let db = SidecarDb::open(env_path).expect("open sidecar");
         Arc::new(Mutex::new(Some(db)))
+    }
+
+    /// The crate documents "reset application data" as THE answer to a sidecar
+    /// that will not open. It was not an answer: the open happened before
+    /// dispatch, so `sidecar.reset` failed with the same error as every other
+    /// request and the user had no way out short of deleting the file by hand.
+    ///
+    /// Serialised on the env override (`NRR_SIDECAR_PATH` is process-global),
+    /// so this test owns it for its duration.
+    #[test]
+    fn a_sidecar_that_cannot_be_opened_is_rebuilt_by_an_explicit_reset() {
+        let tmp = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
+        let path = tmp.path().join("broken.db");
+        // Not a database at all: SQLite refuses it at open.
+        std::fs::write(&path, b"this is not a sqlite file, not even close")
+            .unwrap_or_else(|e| panic!("write: {e}"));
+
+        let previous = std::env::var_os(nrr_storage_sidecar::profile::NRR_SIDECAR_PATH_ENV);
+        std::env::set_var(nrr_storage_sidecar::profile::NRR_SIDECAR_PATH_ENV, &path);
+
+        let handle = new_handle();
+        // Any other request still reports the failure — nothing is thrown away
+        // behind the user's back.
+        let read = handle_sidecar_request(&handle, "sidecar.comment.read-all", &json!({}));
+        assert!(read.is_err(), "a broken sidecar must not read as empty");
+
+        let reset = handle_sidecar_request(&handle, "sidecar.reset", &json!({}))
+            .unwrap_or_else(|e| panic!("reset must succeed on a broken sidecar: {e}"));
+        assert_eq!(reset["reset"], json!(true));
+        assert_eq!(reset["rebuilt"], json!(true));
+
+        // And the handle now serves a working database.
+        let after = handle_sidecar_request(&handle, "sidecar.comment.read-all", &json!({}))
+            .unwrap_or_else(|e| panic!("post-reset read: {e}"));
+        assert_eq!(
+            after["comments"],
+            json!({}),
+            "a rebuilt sidecar starts empty"
+        );
+
+        match previous {
+            Some(value) => {
+                std::env::set_var(nrr_storage_sidecar::profile::NRR_SIDECAR_PATH_ENV, value)
+            }
+            None => std::env::remove_var(nrr_storage_sidecar::profile::NRR_SIDECAR_PATH_ENV),
+        }
     }
 
     #[test]

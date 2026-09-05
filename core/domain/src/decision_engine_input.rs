@@ -4,8 +4,6 @@
 //!
 //! - [`normalize_runtime_input`] — converts a raw [`RuntimeInput`] to a
 //!   [`NormalizedDecisionInput`] ready for the rule matching stage.
-//! - [`collect_input_warnings`] — derives [`DecisionWarning`] entries from
-//!   the normalised input, the lookup result, and the availability snapshot.
 //! - [`test_support`] — fixture helpers for unit tests (always compiled so
 //!   integration tests in `tests/` can use them too).
 //!
@@ -18,9 +16,6 @@
 
 use std::net::IpAddr;
 
-use crate::decision_availability::{RouteAvailabilitySnapshot, SnapshotStaleness};
-use crate::decision_engine::DecisionWarning;
-use crate::decision_lookup::{CacheEntryState, LookupResult};
 use crate::decision_normalization::{
     InputAvailabilitySignal, MatchClassAvailability, NormalizationError, NormalizationWarning,
     NormalizedAppIdentity, NormalizedDecisionInput, NormalizedHostname, NormalizedIp,
@@ -72,68 +67,6 @@ pub fn normalize_runtime_input(input: &RuntimeInput) -> NormalizedDecisionInput 
     }
 }
 
-// ── collect_input_warnings ────────────────────────────────────────────────────
-
-/// Derives [`DecisionWarning`] entries from the normalised input, lookup
-/// result, and availability snapshot.
-///
-/// Called once per decision, before the matching stage.  The returned list is
-/// stored in [`DecisionOutcome::warnings`].
-pub fn collect_input_warnings(
-    input: &NormalizedDecisionInput,
-    lookup: &LookupResult,
-    availability: &RouteAvailabilitySnapshot,
-) -> Vec<DecisionWarning> {
-    let mut warnings = Vec::new();
-
-    for signal in &input.availability_signals {
-        match signal {
-            InputAvailabilitySignal::HostnameUnavailable => {
-                warnings.push(DecisionWarning::HostnameUnavailable);
-            }
-            InputAvailabilitySignal::IpUnavailable => {
-                warnings.push(DecisionWarning::IpUnavailable);
-            }
-            InputAvailabilitySignal::AppContextUnavailable => {
-                warnings.push(DecisionWarning::AppContextUnavailable);
-            }
-        }
-    }
-
-    if let Some(identity) = &input.app_identity {
-        let is_weak = identity.warnings.iter().any(|w| {
-            matches!(
-                w,
-                NormalizationWarning::ApplicationBareProcessNameWeakIdentity { .. }
-            )
-        });
-        if is_weak {
-            warnings.push(DecisionWarning::WeakAppIdentityMatch);
-        }
-    }
-
-    if let Some(freshness) = &lookup.explain_data.standard.freshness {
-        if matches!(
-            freshness,
-            CacheEntryState::StaleUsable | CacheEntryState::StaleNotUsable
-        ) {
-            warnings.push(DecisionWarning::LookupStale);
-        }
-    }
-
-    match availability.staleness {
-        SnapshotStaleness::StaleUsable | SnapshotStaleness::StaleNotUsable => {
-            warnings.push(DecisionWarning::AvailabilityStale);
-        }
-        SnapshotStaleness::Fresh => {}
-    }
-    if availability.staleness == SnapshotStaleness::StaleNotUsable {
-        warnings.push(DecisionWarning::AvailabilityUnknown);
-    }
-
-    warnings
-}
-
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<NormalizationWarning>) {
@@ -166,6 +99,15 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
         {
+            if !dns_labels_are_well_formed(&lowercased) {
+                return (
+                    NormalizedHostname::Invalid {
+                        raw: h.to_owned(),
+                        error: NormalizationError::DomainMalformedLabels { raw: h.to_owned() },
+                    },
+                    warnings,
+                );
+            }
             (NormalizedHostname::Valid(lowercased), warnings)
         } else {
             (
@@ -184,6 +126,15 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
                         original: lowercased,
                         punycode: ascii.clone(),
                     });
+                }
+                if !dns_labels_are_well_formed(&ascii) {
+                    return (
+                        NormalizedHostname::Invalid {
+                            raw: h.to_owned(),
+                            error: NormalizationError::DomainMalformedLabels { raw: h.to_owned() },
+                        },
+                        warnings,
+                    );
                 }
                 (NormalizedHostname::Valid(ascii), warnings)
             }
@@ -216,6 +167,25 @@ fn normalize_ip_value(raw: Option<IpAddr>) -> (NormalizedIp, Vec<NormalizationWa
             }
         }
     }
+}
+
+/// Does `host` have a label structure a resolver could answer?
+///
+/// The character check above says every octet is legal; it says nothing about
+/// where the dots are. `example.com..` survives the single trailing-dot strip
+/// with an empty label still on the end, `a..b` never had one, and a 400-octet
+/// label is legal by character and impossible by DNS — all three used to reach
+/// the matcher as `Valid`, so a rule could be compared against a name that
+/// cannot exist.
+///
+/// Limits are RFC 1035: 63 octets per label, 253 for the name. Checked on the
+/// ASCII form, which is what punycode leaves behind and what the wire carries.
+fn dns_labels_are_well_formed(host: &str) -> bool {
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.')
+        .all(|label| !label.is_empty() && label.len() <= 63)
 }
 
 fn normalize_app_identity_value(
@@ -536,22 +506,12 @@ mod match_sample_tests {
 pub mod test_support {
     use std::time::SystemTime;
 
-    use crate::canonical::{CanonicalProfile, CanonicalRuleBook};
-    use crate::decision_availability::{
-        AvailabilityCheckSource, InterfaceLifecycleState, RouteAdapterAvailability,
-        RouteAvailabilitySnapshot, RouteAvailabilityState, SecondaryAvailabilityStatus,
-        SnapshotStaleness,
-    };
-    use crate::decision_engine::{DecisionRequest, DecisionWarning};
     use crate::decision_lookup::{
         LookupExplainData, LookupExtendedMetadata, LookupResult, LookupStandardSignals,
     };
-    use crate::decision_matching::ZonePriorityPolicy;
     use crate::decision_pipeline::{DecisionFeatureFlags, RuntimeInput};
     use crate::revision::RevisionId;
-    use crate::{AdapterIdentity, BindingSource, RouteBehaviorMode, RouteBinding, RouteRole};
-
-    use super::normalize_runtime_input;
+    use crate::RouteBehaviorMode;
 
     // ── LookupResult fixtures ─────────────────────────────────────────────────
 
@@ -580,242 +540,7 @@ pub mod test_support {
         }
     }
 
-    // ── RouteAvailabilitySnapshot fixtures ────────────────────────────────────
-
-    /// A fresh snapshot with primary available and no secondary configured.
-    pub fn primary_available_snapshot() -> RouteAvailabilitySnapshot {
-        RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::NotConfigured,
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 0,
-            staleness: SnapshotStaleness::Fresh,
-            check_source: AvailabilityCheckSource::TestHarness,
-        }
-    }
-
-    /// A fresh snapshot with both primary and secondary available.
-    pub fn both_available_snapshot() -> RouteAvailabilitySnapshot {
-        RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::Configured(RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            }),
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 0,
-            staleness: SnapshotStaleness::Fresh,
-            check_source: AvailabilityCheckSource::TestHarness,
-        }
-    }
-
-    /// A snapshot with secondary configured but unavailable (no IP).
-    pub fn secondary_no_ip_snapshot() -> RouteAvailabilitySnapshot {
-        use crate::decision_availability::AvailabilityReason;
-        RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::Configured(RouteAdapterAvailability {
-                state: RouteAvailabilityState::Degraded,
-                lifecycle: InterfaceLifecycleState::PresentNoIp,
-                reason: Some(AvailabilityReason::NoIpAddress),
-            }),
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 0,
-            staleness: SnapshotStaleness::Fresh,
-            check_source: AvailabilityCheckSource::TestHarness,
-        }
-    }
-
-    /// A stale-not-usable snapshot (> 30 s old) — all states downgraded to Unknown.
-    pub fn stale_snapshot() -> RouteAvailabilitySnapshot {
-        RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::NotConfigured,
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 60_000,
-            staleness: SnapshotStaleness::StaleNotUsable,
-            check_source: AvailabilityCheckSource::TestHarness,
-        }
-    }
-
-    // ── CanonicalProfile fixture ──────────────────────────────────────────────
-
-    /// A minimal [`CanonicalProfile`] with a primary binding and an empty rule book.
-    ///
-    /// Use when the test does not depend on rule content.
-    pub fn minimal_profile() -> CanonicalProfile {
-        CanonicalProfile {
-            primary: RouteBinding {
-                role: RouteRole::Primary,
-                adapter: AdapterIdentity {
-                    stable_id: "eth0-test".to_owned(),
-                    display_name: "Test Ethernet".to_owned(),
-                },
-                source: BindingSource::UserAssigned,
-            },
-            secondary: None,
-            behavior_mode: RouteBehaviorMode::PreferPrimary,
-            rule_book: CanonicalRuleBook::default(),
-        }
-    }
-
-    /// A [`CanonicalProfile`] with both primary and secondary bound and empty rules.
-    pub fn dual_route_profile() -> CanonicalProfile {
-        CanonicalProfile {
-            primary: RouteBinding {
-                role: RouteRole::Primary,
-                adapter: AdapterIdentity {
-                    stable_id: "eth0-test".to_owned(),
-                    display_name: "Test Ethernet".to_owned(),
-                },
-                source: BindingSource::UserAssigned,
-            },
-            secondary: Some(RouteBinding {
-                role: RouteRole::Secondary,
-                adapter: AdapterIdentity {
-                    stable_id: "vpn0-test".to_owned(),
-                    display_name: "Test VPN".to_owned(),
-                },
-                source: BindingSource::UserAssigned,
-            }),
-            behavior_mode: RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            rule_book: CanonicalRuleBook::default(),
-        }
-    }
-
-    // ── DecisionRequest builder ───────────────────────────────────────────────
-
-    /// Builder for constructing a [`DecisionRequest`] in unit tests.
-    ///
-    /// All fields have defaults that produce a clean, no-warnings decision:
-    /// - hostname: `"example.com"`, IP: `None`, process: `"chrome.exe"`
-    /// - empty lookup, primary available snapshot
-    /// - default zone policy (prefer IP), no experimental flags
-    pub struct DecisionRequestBuilder {
-        revision_id: RevisionId,
-        profile: CanonicalProfile,
-        runtime_input: RuntimeInput,
-        lookup: LookupResult,
-        availability: RouteAvailabilitySnapshot,
-        zone_policy: ZonePriorityPolicy,
-        feature_flags: DecisionFeatureFlags,
-    }
-
-    impl DecisionRequestBuilder {
-        /// Creates a builder with sensible defaults for happy-path tests.
-        pub fn new() -> Self {
-            Self {
-                revision_id: RevisionId::from_prefixed_string("rev-test-001".to_owned())
-                    .unwrap_or_else(|e| panic!("fixture revision id invalid: {e}")),
-                profile: minimal_profile(),
-                runtime_input: default_runtime_input(),
-                lookup: empty_lookup(),
-                availability: primary_available_snapshot(),
-                zone_policy: ZonePriorityPolicy::default(),
-                feature_flags: DecisionFeatureFlags::default(),
-            }
-        }
-
-        /// Overrides the revision ID.
-        pub fn revision(mut self, id: &str) -> Self {
-            self.revision_id = RevisionId::from_prefixed_string(id.to_owned())
-                .unwrap_or_else(|e| panic!("invalid revision id '{id}': {e}"));
-            self
-        }
-
-        /// Overrides the canonical profile (rule book + bindings).
-        pub fn profile(mut self, profile: CanonicalProfile) -> Self {
-            self.profile = profile;
-            self
-        }
-
-        /// Overrides the raw runtime input (before normalization).
-        pub fn runtime_input(mut self, input: RuntimeInput) -> Self {
-            self.runtime_input = input;
-            self
-        }
-
-        /// Overrides the lookup result.
-        pub fn lookup(mut self, lookup: LookupResult) -> Self {
-            self.lookup = lookup;
-            self
-        }
-
-        /// Overrides the route availability snapshot.
-        pub fn availability(mut self, availability: RouteAvailabilitySnapshot) -> Self {
-            self.availability = availability;
-            self
-        }
-
-        /// Overrides the zone priority policy.
-        pub fn zone_policy(mut self, policy: ZonePriorityPolicy) -> Self {
-            self.zone_policy = policy;
-            self
-        }
-
-        /// Overrides the feature flags.
-        pub fn feature_flags(mut self, flags: DecisionFeatureFlags) -> Self {
-            self.feature_flags = flags;
-            self
-        }
-
-        /// Enables the browser stub experimental flag.
-        pub fn browser_stub_experimental(mut self) -> Self {
-            self.feature_flags.browser_stub_experimental = true;
-            self
-        }
-
-        /// Consumes the builder and returns a [`DecisionRequest`].
-        pub fn build(self) -> DecisionRequest {
-            use crate::decision_explain::DecisionId;
-            let process_context = self.runtime_input.process_context.clone();
-            let observation_source = self.runtime_input.observation_source.clone();
-            let input = normalize_runtime_input(&self.runtime_input);
-            DecisionRequest {
-                decision_id: DecisionId("d-00000000-0000-0000-0000-000000000001".to_owned()),
-                revision_id: self.revision_id,
-                profile: self.profile,
-                input,
-                lookup: self.lookup,
-                availability: self.availability,
-                zone_policy: self.zone_policy,
-                feature_flags: self.feature_flags,
-                process_context,
-                observation_source,
-            }
-        }
-    }
-
-    impl Default for DecisionRequestBuilder {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
     // ── RuntimeInput helpers ──────────────────────────────────────────────────
-
-    /// A default [`RuntimeInput`] with `"example.com"` hostname, no IP, and
-    /// `"chrome.exe"` as process name.
-    pub fn default_runtime_input() -> RuntimeInput {
-        runtime_input_for("example.com", None, Some("chrome.exe"))
-    }
 
     /// Constructs a [`RuntimeInput`] with the given hostname, IP, and process name.
     ///
@@ -854,21 +579,6 @@ pub mod test_support {
             feature_flags: DecisionFeatureFlags::default(),
         }
     }
-
-    /// Produces sample [`DecisionWarning`] entries for snapshot tests.
-    pub fn all_warnings() -> Vec<DecisionWarning> {
-        vec![
-            DecisionWarning::HostnameUnavailable,
-            DecisionWarning::IpUnavailable,
-            DecisionWarning::AppContextUnavailable,
-            DecisionWarning::LookupStale,
-            DecisionWarning::AvailabilityStale,
-            DecisionWarning::ConflictDetected,
-            DecisionWarning::UnsupportedRuleSkipped,
-            DecisionWarning::WeakAppIdentityMatch,
-            DecisionWarning::AvailabilityUnknown,
-        ]
-    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -879,14 +589,6 @@ mod tests {
     use std::time::SystemTime;
 
     use super::*;
-    use crate::decision_availability::{
-        AvailabilityCheckSource, InterfaceLifecycleState, RouteAdapterAvailability,
-        RouteAvailabilityState, SecondaryAvailabilityStatus, SnapshotStaleness,
-    };
-    use crate::decision_lookup::{
-        CacheEntryState, LookupExplainData, LookupExtendedMetadata, LookupResult,
-        LookupStandardSignals,
-    };
     use crate::decision_normalization::InputAvailabilitySignal;
     use crate::decision_pipeline::{
         AdapterAvailability, InterfaceAvailabilitySnapshot, ObservationSource, ProtocolHints,
@@ -928,43 +630,6 @@ mod tests {
         }
     }
 
-    fn fresh_snapshot() -> RouteAvailabilitySnapshot {
-        RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::NotConfigured,
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 0,
-            staleness: SnapshotStaleness::Fresh,
-            check_source: AvailabilityCheckSource::TestHarness,
-        }
-    }
-
-    fn no_lookup() -> LookupResult {
-        LookupResult {
-            selected_ip: None,
-            is_multi_ip: false,
-            has_conflict: false,
-            explain_data: LookupExplainData {
-                standard: LookupStandardSignals {
-                    cache_hit: false,
-                    freshness: None,
-                    source: None,
-                    errors: vec![],
-                },
-                extended: LookupExtendedMetadata {
-                    all_resolved_ips: vec![],
-                    reverse_hostnames: vec![],
-                    selected_entry_ttl_secs: None,
-                    selected_entry_resolved_at: None,
-                },
-            },
-        }
-    }
-
     // ── normalize_hostname_value ──────────────────────────────────────────────
 
     #[test]
@@ -1000,6 +665,39 @@ mod tests {
         assert!(w
             .iter()
             .any(|x| matches!(x, NormalizationWarning::DomainTrailingDotRemoved)));
+    }
+
+    /// Every octet legal, the structure impossible. All three used to reach the
+    /// matcher as `Valid`, so a rule was compared against a name no resolver
+    /// could ever answer.
+    #[test]
+    fn hostname_with_a_legal_but_impossible_label_structure_is_invalid() {
+        let long_label = "a".repeat(64);
+        for raw in [
+            "example.com..".to_owned(),  // one dot stripped, an empty label left
+            "a..b".to_owned(),           // an empty label in the middle
+            format!("{long_label}.com"), // 64 octets in one label
+            format!("{}.com", "b".repeat(250)), // over 253 for the whole name
+        ] {
+            let (h, _) = normalize_hostname_value(Some(&raw));
+            assert!(
+                matches!(
+                    h,
+                    NormalizedHostname::Invalid {
+                        error: NormalizationError::DomainMalformedLabels { .. },
+                        ..
+                    }
+                ),
+                "{raw} must not normalize to a valid hostname, got {h:?}"
+            );
+        }
+
+        // Negative control: the exact-63 boundary and a plain name still pass.
+        let boundary = format!("{}.com", "a".repeat(63));
+        assert!(matches!(
+            normalize_hostname_value(Some(&boundary)).0,
+            NormalizedHostname::Valid(_)
+        ));
     }
 
     #[test]
@@ -1201,104 +899,5 @@ mod tests {
         assert!(n.match_class_availability.application.is_some());
         assert!(!n.match_class_availability.nothing_available());
         assert_eq!(n.availability_signals.len(), 3);
-    }
-
-    // ── collect_input_warnings ────────────────────────────────────────────────
-
-    #[test]
-    fn collect_warns_ip_unavailable_when_no_ip() {
-        let input = make_runtime_input(Some("example.com"), None, Some("chrome.exe"));
-        let n = normalize_runtime_input(&input);
-        let w = collect_input_warnings(&n, &no_lookup(), &fresh_snapshot());
-        assert!(w.contains(&DecisionWarning::IpUnavailable));
-        assert!(!w.contains(&DecisionWarning::LookupStale));
-        assert!(!w.contains(&DecisionWarning::AvailabilityStale));
-    }
-
-    #[test]
-    fn collect_warns_stale_lookup() {
-        let input = make_runtime_input(Some("example.com"), None, None);
-        let n = normalize_runtime_input(&input);
-        let stale_lookup = LookupResult {
-            selected_ip: None,
-            is_multi_ip: false,
-            has_conflict: false,
-            explain_data: LookupExplainData {
-                standard: LookupStandardSignals {
-                    cache_hit: true,
-                    freshness: Some(CacheEntryState::StaleUsable),
-                    source: None,
-                    errors: vec![],
-                },
-                extended: LookupExtendedMetadata {
-                    all_resolved_ips: vec![],
-                    reverse_hostnames: vec![],
-                    selected_entry_ttl_secs: None,
-                    selected_entry_resolved_at: None,
-                },
-            },
-        };
-        let w = collect_input_warnings(&n, &stale_lookup, &fresh_snapshot());
-        assert!(w.contains(&DecisionWarning::LookupStale));
-    }
-
-    #[test]
-    fn collect_warns_stale_and_unknown_when_snapshot_stale_not_usable() {
-        let input = make_runtime_input(Some("example.com"), None, None);
-        let n = normalize_runtime_input(&input);
-        let stale_snap = RouteAvailabilitySnapshot {
-            primary: RouteAdapterAvailability {
-                state: RouteAvailabilityState::Available,
-                lifecycle: InterfaceLifecycleState::PresentActive,
-                reason: None,
-            },
-            secondary: SecondaryAvailabilityStatus::NotConfigured,
-            taken_at: SystemTime::UNIX_EPOCH,
-            age_ms: 60_000,
-            staleness: SnapshotStaleness::StaleNotUsable,
-            check_source: AvailabilityCheckSource::TestHarness,
-        };
-        let w = collect_input_warnings(&n, &no_lookup(), &stale_snap);
-        assert!(w.contains(&DecisionWarning::AvailabilityStale));
-        assert!(w.contains(&DecisionWarning::AvailabilityUnknown));
-    }
-
-    #[test]
-    fn collect_warns_weak_identity_from_app() {
-        let input = make_runtime_input(Some("example.com"), None, Some("myapp"));
-        let n = normalize_runtime_input(&input);
-        let w = collect_input_warnings(&n, &no_lookup(), &fresh_snapshot());
-        assert!(w.contains(&DecisionWarning::WeakAppIdentityMatch));
-    }
-
-    // ── test_support fixtures ─────────────────────────────────────────────────
-
-    #[test]
-    fn decision_request_builder_produces_valid_request() {
-        use crate::decision_engine_input::test_support::DecisionRequestBuilder;
-        let req = DecisionRequestBuilder::new().build();
-        assert!(req.input.hostname.is_usable());
-    }
-
-    #[test]
-    fn decision_request_builder_respects_overrides() {
-        use crate::decision_engine_input::test_support::{
-            both_available_snapshot, DecisionRequestBuilder,
-        };
-        let req = DecisionRequestBuilder::new()
-            .availability(both_available_snapshot())
-            .browser_stub_experimental()
-            .build();
-        assert!(req.feature_flags.browser_stub_experimental);
-        assert!(req.availability.secondary.is_routable());
-    }
-
-    #[test]
-    fn all_warnings_fixture_has_all_variants() {
-        use crate::decision_engine_input::test_support::all_warnings;
-        let w = all_warnings();
-        assert!(w.contains(&DecisionWarning::HostnameUnavailable));
-        assert!(w.contains(&DecisionWarning::AvailabilityUnknown));
-        assert_eq!(w.len(), 9);
     }
 }

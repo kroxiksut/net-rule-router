@@ -39,6 +39,43 @@ impl AddressClass {
     }
 }
 
+/// Is this endpoint the machine keeping house on its own network?
+///
+/// [`AddressClass::is_local_housekeeping`] answers it from the address alone,
+/// which is enough for multicast and for the all-ones broadcast. It is NOT
+/// enough for a subnet-directed broadcast: `192.168.1.255` is the broadcast of
+/// a /24 and an ordinary host in a /23, and one address cannot say which. So a
+/// dropped NetBIOS-NS or WS-Discovery datagram to it counted as a real
+/// destination and raised a notice about an address no rule can name.
+///
+/// The port answers the question the address cannot. These are name resolution,
+/// discovery and address configuration: within a private network they are the
+/// machine talking to its own segment, whatever shape the destination address
+/// takes. The drop still reaches the trace line — only the notice is withheld.
+///
+/// Deliberately NOT covered: BitTorrent local peer discovery (6771). It is
+/// discovery too, but it is the user's own application announcing itself, and
+/// silence about a blocked P2P announcement is not ours to choose for them.
+#[must_use]
+pub fn is_local_housekeeping_endpoint(ip: IpAddr, port: u16) -> bool {
+    classify(ip).is_local_housekeeping() || (is_private(ip) && is_housekeeping_port(port))
+}
+
+/// Ports whose traffic is the machine keeping its own segment in order.
+fn is_housekeeping_port(port: u16) -> bool {
+    matches!(port, 137 | 138 | 546 | 547 | 1900 | 3702 | 5353 | 5355)
+}
+
+/// An address inside a private network — RFC1918 for v4, unique-local
+/// (`fc00::/7`) for v6. Deliberately narrow: the rule above must not quieten
+/// anything reachable on the open internet.
+fn is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 /// Classify one destination address.
 #[must_use]
 pub fn classify(ip: IpAddr) -> AddressClass {
@@ -111,9 +148,14 @@ pub fn well_known_purpose(ip: IpAddr, port: u16) -> Option<&'static str> {
     };
     fixed
         .or_else(|| {
-            matches!(class, AddressClass::Multicast | AddressClass::Broadcast)
-                .then(|| port_purpose(port))
-                .flatten()
+            // Same widening as `is_local_housekeeping_endpoint`, for the same
+            // reason: a subnet-directed broadcast is not recognisable by its
+            // address, so a NetBIOS datagram to it used to print as a bare
+            // address in the trace — withheld from the notice AND unexplained
+            // in the diagnostic, which is the worst of both.
+            let named_by_port = matches!(class, AddressClass::Multicast | AddressClass::Broadcast)
+                || is_private(ip);
+            named_by_port.then(|| port_purpose(port)).flatten()
         })
         .or(match class {
             AddressClass::Multicast => Some("multicast"),
@@ -191,6 +233,63 @@ mod tests {
                 "{addr} should be housekeeping"
             );
         }
+    }
+
+    /// The case the address alone cannot answer: a subnet-directed broadcast
+    /// looks exactly like a host address, so a dropped NetBIOS-NS to it raised
+    /// a notice about a destination no rule can name. The port settles it.
+    #[test]
+    fn a_discovery_port_inside_a_private_network_is_housekeeping() {
+        for (addr, port) in [
+            ("192.168.1.255", 137), // NetBIOS-NS to a /24 broadcast
+            ("192.168.0.255", 138), // NetBIOS datagram service
+            ("10.0.0.255", 3702),   // WS-Discovery
+            ("172.16.5.4", 5353),   // mDNS to a specific private host
+            ("192.168.1.7", 5355),  // LLMNR
+            ("fd00::1", 5353),      // unique-local v6
+        ] {
+            assert!(
+                is_local_housekeeping_endpoint(ip(addr), port),
+                "{addr}:{port} should be housekeeping"
+            );
+        }
+    }
+
+    /// What the widening must NOT swallow. A public address keeps its notice
+    /// whatever the port, an ordinary private destination keeps its notice on
+    /// an ordinary port, and BitTorrent's local peer discovery is left alone on
+    /// purpose — that is the user's own application announcing itself.
+    #[test]
+    fn the_port_rule_does_not_quieten_anything_else() {
+        for (addr, port) in [
+            ("8.8.8.8", 5353),       // public resolver, not our segment
+            ("93.184.216.34", 137),  // public host on a discovery port
+            ("192.168.1.10", 443),   // private host, ordinary traffic
+            ("192.168.1.255", 6771), // BitTorrent LPD — deliberately not ours
+            ("100.64.0.1", 5353),    // CGNAT is not a private network
+        ] {
+            assert!(
+                !is_local_housekeeping_endpoint(ip(addr), port),
+                "{addr}:{port} must keep its notice"
+            );
+        }
+    }
+
+    /// Withholding the notice must not also withhold the explanation: the drop
+    /// still reaches the trace, and the trace has to name the protocol instead
+    /// of printing a bare address.
+    #[test]
+    fn a_private_discovery_endpoint_is_named_in_the_trace() {
+        assert_eq!(
+            well_known_purpose(ip("192.168.1.255"), 137),
+            Some("netbios")
+        );
+        assert_eq!(
+            well_known_purpose(ip("10.0.0.255"), 3702),
+            Some("ws-discovery")
+        );
+        // A public address is still described by class alone — no invented label.
+        assert_eq!(well_known_purpose(ip("8.8.8.8"), 137), None);
     }
 
     #[test]

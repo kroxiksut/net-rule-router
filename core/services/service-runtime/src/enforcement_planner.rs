@@ -58,14 +58,14 @@ use nrr_shared::RouteRole;
 
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::killswitch_codegen::{
-    KillSwitchProtocols, APP_KILLSWITCH_MAX_APPS, KILLSWITCH_MAX_DESTINATIONS,
-};
+// The caps live with the bands they protect.
+use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::net_filter::is_non_routable_v4;
 use crate::route_codegen::{
     COUNTER_OVERLAY, MAX_ROUTES_PER_RULE, OVERLAY_HIGH, OVERLAY_LOW, SECONDARY_ROUTE_METRIC,
 };
 use crate::secondary_ip_policy::DenylistFilteredCache;
+use crate::wfp_bands::{APP_KILLSWITCH_MAX_APPS, KILLSWITCH_MAX_DESTINATIONS};
 use crate::wfp_codegen::{
     APP_PATH_FANOUT_CAP, PER_HOSTNAME_IP_CAP, SLOTS_PER_RULE as WFP_SLOTS_PER_RULE,
     SUFFIX_FANOUT_BACKSTOP,

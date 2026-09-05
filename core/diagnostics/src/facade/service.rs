@@ -26,7 +26,8 @@ use crate::error::DiagnosticsResult;
 use crate::explain::{ExplainQuery, ExplainResponse};
 use crate::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, ClearLogsRequest, ClearLogsResult,
-    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, SecurityAlertDto, SetDiagnosticModeRequest,
+    DiagnosticsAudience, DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, SecurityAlertDto,
+    SetDiagnosticModeRequest,
 };
 use crate::facade::pagination::{PageCursor, PageResult, PaginationParams, MAX_PAGE_SIZE};
 use crate::redaction::ExplainDetailLevel;
@@ -40,10 +41,15 @@ pub trait DiagnosticsFacade: Send + Sync {
     fn get_status(&self) -> DiagnosticsStatusDto;
 
     /// Returns a paginated list of operational log entries.
+    /// `audience` decides whose lines come back — see
+    /// [`Self::list_audit_entries`]. A principal-scoped read returns the
+    /// caller's own lines plus the machine-level ones that belong to nobody
+    /// (boot, adapters, service lifecycle).
     fn list_log_entries(
         &self,
         filter: &LogEntryFilter,
         pagination: &PaginationParams,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>>;
 
     /// Returns up to `max_entries` of the MOST RECENT operational log
@@ -64,6 +70,7 @@ pub trait DiagnosticsFacade: Send + Sync {
         &self,
         filter: &LogEntryFilter,
         max_entries: usize,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<Vec<LogEntryDto>> {
         if max_entries == 0 {
             return Ok(Vec::new());
@@ -83,6 +90,7 @@ pub trait DiagnosticsFacade: Send + Sync {
                     cursor: cursor.clone(),
                     page_size: MAX_PAGE_SIZE,
                 },
+                audience,
             )?;
             let next = page.next_cursor;
             acc.extend(page.items);
@@ -100,11 +108,40 @@ pub trait DiagnosticsFacade: Send + Sync {
     }
 
     /// Returns a paginated list of audit trail entries.
+    /// `audience` decides WHOSE events come back and is set by the service from
+    /// the connection, never from the request: the audit directory is closed to
+    /// ordinary users on disk (`SYSTEM` + `Administrators` on Windows, `0700` on
+    /// Linux), so an unscoped read here would hand out precisely what those
+    /// permissions withhold. A principal-scoped read returns that principal's
+    /// own events plus the ones the service performed on its own behalf.
     fn list_audit_entries(
         &self,
         filter: &AuditEntryFilter,
         pagination: &PaginationParams,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>>;
+
+    /// Raw operational-log NDJSON lines VERBATIM (payloads intact), newest
+    /// first, within `max_bytes` and scoped to `audience`.
+    ///
+    /// The archive's `logs.ndjson` is a payload-stripped listing; a support
+    /// bundle needs the real lines too. They used to be attached by the
+    /// LAUNCHER reading the service's log directory off disk, which required
+    /// that directory to be readable by every local account — and put every
+    /// user's lines into one user's bundle. The service reads its own files and
+    /// answers with what the requester may see.
+    ///
+    /// `from_ms` trims to a session window; `None` means the whole history.
+    /// The default returns nothing, which is right for a facade with no log
+    /// store behind it (preview/mock).
+    fn recent_log_lines_raw(
+        &self,
+        _max_bytes: usize,
+        _from_ms: Option<i64>,
+        _audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<String>> {
+        Ok(Vec::new())
+    }
 
     /// Returns raw audit NDJSON lines VERBATIM — including the `prev_hash` /
     /// `event_hash` chain fields — for the newest events, up to `max_bytes`

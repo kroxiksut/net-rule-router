@@ -160,9 +160,21 @@ pub struct PassthroughBlock {
     /// Trailing newline normalised — exactly one trailing `\n` when
     /// the content is non-empty, zero when empty.
     pub raw_text: String,
-    /// Count of non-blank, non-comment lines in `raw_text`. Surfaced
-    /// for the review dialog ("Linux (5 lines)") so the GUI doesn't
-    /// have to re-parse the raw text.
+    /// How many lines of `raw_text` are CARRIED — every non-blank one.
+    ///
+    /// Surfaced in two places the user reads: the review dialog's section row
+    /// ("--- Linux (5 lines)") and the import status line ("Preserved
+    /// foreign-OS sections: Linux (5 lines)"). Both are about what is being
+    /// preserved, so the honest measure is how much of it there is.
+    ///
+    /// It used to skip `#` lines as prose. In this format a DISABLED rule is
+    /// written exactly that way, so a section made entirely of disabled rules
+    /// reported "0 lines" while its text was non-empty and on its way to the
+    /// sidecar — the dialog called it empty and preserved it anyway. Counting
+    /// commented lines cannot be made exact either (`# (reserved)` and
+    /// `# example.com` are indistinguishable without a rule type, which an
+    /// unknown section does not have), and between over- and under-counting,
+    /// over-counting matches what the label promises.
     pub content_lines: usize,
     /// First [`PASSTHROUGH_PREVIEW_LINES`] non-blank, non-comment
     /// lines from `raw_text` for the review-dialog preview area.
@@ -467,10 +479,22 @@ impl ParserState {
 /// One predicate for both parsers of this format, so the two cannot disagree
 /// about which lines survive a round-trip.
 pub fn is_disabled_rule_value(rule_type: ParsedRuleType, value: &str) -> bool {
-    if !value.contains(char::is_whitespace) {
+    if looks_like_a_rule_value(value) {
         return true;
     }
     rule_type == ParsedRuleType::Application && has_file_extension(value)
+}
+
+/// The half of [`is_disabled_rule_value`] that needs no rule type: a value with
+/// no whitespace in it is a rule value, whatever section it came from.
+///
+/// Split out for the sections whose type we do not know — a passthrough block
+/// has no rule type by definition, and its commented-out lines still have to be
+/// told apart from prose.
+#[must_use]
+pub fn looks_like_a_rule_value(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.contains(char::is_whitespace)
 }
 
 fn has_file_extension(value: &str) -> bool {
@@ -599,11 +623,15 @@ fn extract_block_flag(value: &str) -> (String, bool) {
     (kept.join(" "), blocked)
 }
 
-/// Count non-blank, non-comment lines in `body` and return the first
-/// [`PASSTHROUGH_PREVIEW_LINES`] of them. Used to populate the
-/// review-dialog preview area without parsing the section through the
-/// rule machinery (which we can't — by definition it's not a known
-/// section).
+/// Count the non-blank lines of `body` — everything carried — and return the
+/// first [`PASSTHROUGH_PREVIEW_LINES`] non-comment lines as the preview.
+///
+/// The count and the preview answer different questions on purpose. The count
+/// says how much is being preserved, so it includes commented lines: a section
+/// of nothing but disabled rules (`# example.com`) is not empty, and saying "0
+/// lines" about text on its way to the sidecar was the defect. The preview is a
+/// sample of the section's substance, so it still leads with the lines that
+/// carry a value.
 fn summarize_passthrough(body: &str) -> (usize, Vec<String>) {
     let mut content_lines = 0usize;
     let mut preview = Vec::new();
@@ -612,11 +640,8 @@ fn summarize_passthrough(body: &str) -> (usize, Vec<String>) {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with('#') {
-            continue;
-        }
         content_lines += 1;
-        if preview.len() < PASSTHROUGH_PREVIEW_LINES {
+        if !line.starts_with('#') && preview.len() < PASSTHROUGH_PREVIEW_LINES {
             preview.push(line.to_string());
         }
     }
@@ -864,8 +889,11 @@ example.org
         assert_eq!(result.passthrough.len(), 1);
         let block = &result.passthrough[0];
         assert_eq!(block.section_name, FOREIGN_A);
-        // Content (non-blank, non-comment): firefox, chromium → 2 lines.
-        assert_eq!(block.content_lines, 2);
+        // Everything carried: the `# (reserved)` header plus firefox and
+        // chromium → 3. The count answers "how much is preserved", and the
+        // header is preserved too; the preview below still shows only the
+        // substance.
+        assert_eq!(block.content_lines, 3);
         assert_eq!(
             block.preview,
             vec!["firefox".to_string(), "chromium".to_string()]
@@ -1117,9 +1145,13 @@ example.org
         assert_eq!(result.passthrough.len(), 2);
         assert_eq!(result.passthrough[0].section_name, FOREIGN_A);
         assert_eq!(result.passthrough[1].section_name, FOREIGN_B);
-        // One content line each (firefox, Safari).
-        assert_eq!(result.passthrough[0].content_lines, 1);
-        assert_eq!(result.passthrough[1].content_lines, 1);
+        // Two carried lines each: the `# (reserved …)` header and the entry.
+        // The count says how much is preserved, and the header is preserved
+        // too — the preview below is what shows the substance.
+        assert_eq!(result.passthrough[0].content_lines, 2);
+        assert_eq!(result.passthrough[1].content_lines, 2);
+        assert_eq!(result.passthrough[0].preview, vec!["firefox".to_string()]);
+        assert_eq!(result.passthrough[1].preview, vec!["Safari".to_string()]);
 
         // No duplicates in a well-formed file.
         assert!(result.duplicate_sections.is_empty());

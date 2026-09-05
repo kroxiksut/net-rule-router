@@ -21,7 +21,7 @@ impl AuditListHandler {
 }
 
 impl IpcHandler for AuditListHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: AuditListRequest = if request.payload.is_null() {
             AuditListRequest::default()
         } else {
@@ -34,7 +34,7 @@ impl IpcHandler for AuditListHandler {
 
         let page: AuditListResponse = self
             .diagnostics
-            .list_audit_entries(&req.filter, &req.pagination)
+            .list_audit_entries(&req.filter, &req.pagination, &ctx.diagnostics_audience())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::Internal,
                 message: format!("audit.list facade error: {e}"),
@@ -100,5 +100,49 @@ mod tests {
         let parsed: AuditListResponse = serde_json::from_value(resp).unwrap();
         assert_eq!(parsed.items.len(), 3);
         assert_eq!(parsed.items[0].seq, 1);
+    }
+
+    /// The facade takes an audience, so the compiler forces one to be passed —
+    /// but passing the machine-wide one from the handler that serves ordinary
+    /// users would hand every account the whole trail, and compile fine. This
+    /// pins WHICH audience the handler asks for.
+    #[test]
+    fn an_unelevated_caller_is_scoped_to_itself_and_an_elevated_one_is_not() {
+        use nrr_domain::user_principal::UserPrincipal;
+        use nrr_shared::diagnostics_dto::DiagnosticsAudience;
+
+        let ask = |elevated: bool| {
+            let diag = Arc::new(FakeDiagnostics::with_audit(vec![entry(1)]));
+            let facade: Arc<dyn DiagnosticsFacade> =
+                Arc::clone(&diag) as Arc<dyn DiagnosticsFacade>;
+            let h = AuditListHandler::new(facade);
+            h.handle(
+                &IpcRequestEnvelope {
+                    protocol_version: IPC_PROTOCOL_VERSION,
+                    request_id: "r-al".into(),
+                    correlation_id: None,
+                    operation: IpcOperationName::AuditList,
+                    operation_class: IpcOperationClass::DiagnosticQuery,
+                    confirmation_token: None,
+                    payload: serde_json::json!({}),
+                },
+                &IpcRequestContext {
+                    client_profile: IpcClientProfile::GuiInteractive,
+                    caller_is_elevated: elevated,
+                    caller_principal: UserPrincipal::from_windows_sid("S-1-5-21-9").ok(),
+                    caller_pid: None,
+                },
+            )
+            .expect("handled");
+            let seen = diag.last_audience.lock().unwrap().clone();
+            seen.expect("the handler must name an audience")
+        };
+
+        assert_eq!(
+            ask(false),
+            DiagnosticsAudience::Principal("S-1-5-21-9".to_string()),
+            "an ordinary caller reads its own trail, not the machine's"
+        );
+        assert_eq!(ask(true), DiagnosticsAudience::Machine);
     }
 }

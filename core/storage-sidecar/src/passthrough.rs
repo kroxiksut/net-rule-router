@@ -20,6 +20,16 @@ use rusqlite::params;
 use crate::db::SidecarDb;
 use crate::error::SidecarResult;
 
+/// Longest section name kept. A `--- <name>` header longer than this is not a
+/// section any producer writes; it is a way to grow the table on someone else's
+/// disk through an imported file.
+const MAX_SECTION_NAME_CHARS: usize = 128;
+
+/// Largest raw section body kept, matching the 1 MiB cap the import path puts
+/// on a WHOLE preset file — so no legitimate import can reach it, and a caller
+/// that bypasses the file path still cannot store an unbounded blob.
+const MAX_RAW_TEXT_BYTES: usize = 1024 * 1024;
+
 impl SidecarDb {
     /// Read all passthrough sections for `route`. Returns a
     /// deterministic order (`BTreeMap`, alphabetical by section name)
@@ -64,7 +74,14 @@ impl SidecarDb {
                      VALUES (?1, ?2, ?3, ?4)",
             )?;
             for (name, raw) in sections {
-                stmt.execute(params![route, name, raw, now])?;
+                // Oversized sections are DROPPED, not truncated. The point of
+                // this table is a byte-for-byte round trip; half a section
+                // written back looks intact and is not, while a missing one is
+                // visible in the exported file.
+                if name.chars().count() > MAX_SECTION_NAME_CHARS || raw.len() > MAX_RAW_TEXT_BYTES {
+                    continue;
+                }
+                stmt.execute(params![route, name, normalize_raw_text(raw), now])?;
             }
         }
         tx.commit()?;
@@ -80,6 +97,21 @@ impl SidecarDb {
         let conn = self.conn_mut();
         conn.execute("DELETE FROM passthrough WHERE route = ?1", params![route])?;
         Ok(())
+    }
+}
+
+/// End a non-empty section body in exactly one newline.
+///
+/// The canonical writer splits on `\n` and drops one trailing empty entry, so
+/// it already assumed this — a body with none lost nothing, a body with two
+/// gained a blank line inside the exported section on every round trip. The
+/// assumption is now true where the writer said it was.
+fn normalize_raw_text(raw: &str) -> String {
+    let trimmed = raw.trim_end_matches(['\n', '\r']);
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
     }
 }
 
@@ -109,6 +141,86 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    /// The canonical writer splits on newline and drops one trailing empty
+    /// entry, saying in its own comment that the sidecar guarantees exactly one
+    /// trailing newline. It did not — so a body with two gained a blank line
+    /// inside the section on every export.
+    #[test]
+    fn a_section_body_is_stored_with_exactly_one_trailing_newline() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = open_sidecar(&tmp)?;
+        db.write_passthrough(
+            "primary",
+            &sections(&[
+                (
+                    "None", "a
+b",
+                ),
+                (
+                    "Two", "a
+b
+
+",
+                ),
+                (
+                    "Blank", "
+
+",
+                ),
+            ]),
+        )?;
+        let got = db.read_passthrough("primary")?;
+        assert_eq!(
+            got.get("None").map(String::as_str),
+            Some(
+                "a
+b
+"
+            )
+        );
+        assert_eq!(
+            got.get("Two").map(String::as_str),
+            Some(
+                "a
+b
+"
+            )
+        );
+        assert_eq!(
+            got.get("Blank").map(String::as_str),
+            Some(""),
+            "a body of only newlines has no content to preserve",
+        );
+        Ok(())
+    }
+
+    /// Dropped, not truncated: half a foreign section written back looks intact
+    /// and is not, while a missing one is visible in the exported file.
+    #[test]
+    fn an_oversized_section_is_dropped_and_its_neighbours_survive() -> SidecarResult<()> {
+        let tmp = tempfile::tempdir()?;
+        let db = open_sidecar(&tmp)?;
+        let huge = "x".repeat(MAX_RAW_TEXT_BYTES + 1);
+        let long_name = "n".repeat(MAX_SECTION_NAME_CHARS + 1);
+        let mut input = sections(&[(
+            "Linux", "firefox
+",
+        )]);
+        input.insert("Huge".to_string(), huge);
+        input.insert(
+            long_name.clone(),
+            "x
+"
+            .to_string(),
+        );
+
+        db.write_passthrough("primary", &input)?;
+        let got = db.read_passthrough("primary")?;
+        assert_eq!(got.len(), 1, "only the legitimate section is kept");
+        assert!(got.contains_key("Linux"));
+        Ok(())
     }
 
     #[test]
@@ -158,7 +270,14 @@ mod tests {
         db.write_passthrough("primary", &sections(&[("Linux", "new-linux")]))?;
         let got = db.read_passthrough("primary")?;
         assert_eq!(got.len(), 1);
-        assert_eq!(got.get("Linux").map(String::as_str), Some("new-linux"));
+        // Stored with the trailing newline the canonical writer assumes.
+        assert_eq!(
+            got.get("Linux").map(String::as_str),
+            Some(
+                "new-linux
+"
+            )
+        );
         assert!(!got.contains_key("MacOS"));
         assert!(!got.contains_key("Ports"));
         Ok(())
@@ -184,13 +303,19 @@ mod tests {
             db.read_passthrough("primary")?
                 .get("Linux")
                 .map(String::as_str),
-            Some("p-linux"),
+            Some(
+                "p-linux
+"
+            ),
         );
         assert_eq!(
             db.read_passthrough("secondary")?
                 .get("Linux")
                 .map(String::as_str),
-            Some("s-linux"),
+            Some(
+                "s-linux
+"
+            ),
         );
         // Clearing one route doesn't touch the other.
         db.clear_passthrough("primary")?;
@@ -199,7 +324,10 @@ mod tests {
             db.read_passthrough("secondary")?
                 .get("Linux")
                 .map(String::as_str),
-            Some("s-linux"),
+            Some(
+                "s-linux
+"
+            ),
         );
         Ok(())
     }

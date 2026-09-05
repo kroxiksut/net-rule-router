@@ -35,13 +35,11 @@
 //!    `tests/acceptance_gate.rs::ipc_mutation_from_unprivileged_client_is_forbidden`.
 //!    The gate test here adds a per-SID-handler reject check via the
 //!    settings writer surface.
-//! 5. **Legacy preferences migration** (legacy prefs.json
-//!    fixture → migrated → cleaned). Covered by
-//!    `nrr-ui-support` lib tests `v1_file_without_new_fields_loads_with_defaults`
-//!    plus the `cleanup_legacy_policy_fields` unit tests. The gate
-//!    test here confirms the legacy `selected_primary_interface_id`
-//!    field round-trips through the new `UiPreferences` schema
-//!    without data loss until cleanup is invoked.
+//! 5. **Preferences schema migration** (an older prefs.json loads without
+//!    losing data). Covered by the `nrr-ui-support` lib test
+//!    `v1_file_without_new_fields_loads_with_defaults`. The gate test here
+//!    confirms `selected_primary_interface_id` round-trips through the
+//!    current `UiPreferences` schema.
 //! 6. **Crash recovery mid-activate** (`ApplyAttemptMarker` mid-state
 //!    + `decide_recovery` produces a non-silent decision). Covered by
 //!    `tests/acceptance_gate.rs::no_silent_policy_activation_with_incomplete_marker`
@@ -320,7 +318,6 @@ fn block16_mutation_privileged_ops_are_command_class() {
 //   - `schema_version_constant_is_current` (pins v2)
 //   - `empty_value_for_optional_string_parses_as_none`
 //   - `nonempty_value_for_optional_string_parses_as_some`
-//   - `cleanup_legacy_policy_fields_*` (deprecated-field zeroing)
 // Run `cargo test -p nrr-ui-support --lib` to exercise the migration
 // path end-to-end.
 

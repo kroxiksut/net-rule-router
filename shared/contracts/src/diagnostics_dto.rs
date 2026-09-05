@@ -333,6 +333,44 @@ pub struct AuditEntryFilter {
     pub revision_id: Option<String>,
 }
 
+// ── Read scope ───────────────────────────────────────────────────────────────
+
+/// Whose records a diagnostics read may return.
+///
+/// The audit trail and the operational log are machine-wide files that the
+/// filesystem deliberately keeps away from ordinary users — the audit directory
+/// is `SYSTEM` + `Administrators` on Windows and `0700` on Linux. IPC reads used
+/// to hand both to any local caller, which gave away exactly what those
+/// permissions withhold. The audience is decided by the SERVICE from the
+/// connection, never by the request payload: a caller that could name its own
+/// audience would be back where it started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DiagnosticsAudience {
+    /// Everything on the machine. For a caller the platform has already
+    /// established as an administrator.
+    Machine,
+    /// Records belonging to one principal, plus the machine-level records that
+    /// belong to nobody (service lifecycle, adapters, boot). Carries the stored
+    /// principal string (`S-1-5-…`, `unix:uid:<n>`).
+    Principal(String),
+}
+
+impl DiagnosticsAudience {
+    /// The principal to scope to, or `None` when the audience is the whole
+    /// machine.
+    pub fn principal(&self) -> Option<&str> {
+        match self {
+            Self::Machine => None,
+            Self::Principal(p) => Some(p.as_str()),
+        }
+    }
+
+    /// Whether this audience sees records that belong to other principals.
+    pub fn is_machine_wide(&self) -> bool {
+        matches!(self, Self::Machine)
+    }
+}
+
 // ── Command request / response types ─────────────────────────────────────────
 
 /// Request to acknowledge a security alert.

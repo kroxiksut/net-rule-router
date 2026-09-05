@@ -75,6 +75,48 @@ function Test-CommentHygiene {
     }
 }
 
+function Test-DoubledWords {
+    # A word repeated back to back in a comment. Eight of these shipped at once
+    # when a blind find-and-replace put a replacement word into sentences that
+    # already carried it, and the hygiene gate above had no reason to look:
+    # nothing about them is a task reference or a date. The next mass rename
+    # gets caught here instead of by a reader months later.
+    #
+    # `(?!-)` keeps the legitimate "prefer under-detection over over-detection":
+    # the second "over" starts a hyphenated word, not a repeat.
+    $roots = @('apps', 'core', 'shared', 'scripts') |
+        ForEach-Object { Join-Path (Split-Path -Parent $PSScriptRoot) $_ } |
+        Where-Object { Test-Path $_ }
+    $pattern = '\b([A-Za-z]{3,})\s+\1\b(?!-)'
+    $offences = @()
+
+    Get-ChildItem -Path $roots -Recurse -File -Include '*.rs', '*.qml', '*.cpp', '*.h', '*.js', '*.ps1' |
+        Where-Object { $_.FullName -notmatch '\\target\\' } |
+        ForEach-Object {
+            $file = $_
+            $lineNo = 0
+            foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
+                $lineNo += 1
+                $prefix = if ($file.Extension -eq '.ps1') { '#' } else { '//' }
+                $commentAt = $line.IndexOf($prefix)
+                if ($commentAt -lt 0) { continue }
+                $comment = $line.Substring($commentAt)
+                $hit = [regex]::Match($comment, $pattern)
+                if ($hit.Success) {
+                    $offences += "$($file.FullName):${lineNo}: $($line.Trim())"
+                }
+            }
+        }
+
+    if ($offences.Count -gt 0) {
+        $offences | Select-Object -First 20 | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+        if ($offences.Count -gt 20) {
+            Write-Host "  ... and $($offences.Count - 20) more" -ForegroundColor Yellow
+        }
+        throw "doubled words: $($offences.Count) comment(s) repeat a word."
+    }
+}
+
 Write-Host '[check] NetRuleRouter workspace quality baseline' -ForegroundColor Cyan
 
 Write-Host '[check] sync duplicates' -ForegroundColor Cyan
@@ -82,6 +124,9 @@ Write-Host '[check] sync duplicates' -ForegroundColor Cyan
 
 Write-Host '[check] comment hygiene: no task references or dates in comments' -ForegroundColor Cyan
 Test-CommentHygiene
+
+Write-Host '[check] comment hygiene: no doubled words' -ForegroundColor Cyan
+Test-DoubledWords
 
 # Invoked as `cargo-fmt`, not `cargo fmt`: a user-level cargo alias named `fmt`
 # shadows the subcommand and makes cargo emit a warning on stderr, which this

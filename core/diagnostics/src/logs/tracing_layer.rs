@@ -145,6 +145,11 @@ fn category_of_area(area: &str) -> EventCategory {
 
 // ── Field visitor ─────────────────────────────────────────────────────────────
 
+/// The field a per-principal call site already carries. Lifting it to a column
+/// of its own is what lets a read be scoped to the caller without asking every
+/// call site to change.
+const OWNER_FIELD: &str = "sid";
+
 /// Collects fields from a `tracing::Event` for inclusion in the log payload.
 struct EventFieldVisitor {
     fields: serde_json::Map<String, serde_json::Value>,
@@ -154,6 +159,16 @@ impl EventFieldVisitor {
     fn new() -> Self {
         Self {
             fields: serde_json::Map::new(),
+        }
+    }
+
+    /// Whose line this is, read from the event's own `sid` field. The value
+    /// stays in the payload too: it is already shown in the log view, and the
+    /// column exists to be filtered on, not to hide anything.
+    fn owner(&self) -> Option<String> {
+        match self.fields.get(OWNER_FIELD) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
         }
     }
 
@@ -265,6 +280,7 @@ where
         // Collect fields.
         let mut visitor = EventFieldVisitor::new();
         event.record(&mut visitor);
+        let owner = visitor.owner();
         let mut payload = visitor.into_payload();
 
         // What this event actually discloses, read off the names of the fields
@@ -314,6 +330,7 @@ where
             privacy_class,
             message_key,
             payload,
+            principal: owner,
         };
 
         self.writer.emit(log_event);
@@ -654,6 +671,41 @@ mod tests {
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(files.len(), 1, "one log file created");
+    }
+
+    /// Scoping a read to the caller only works if the line says whose it is.
+    /// The per-principal call sites already carry `sid`; this is where it
+    /// becomes a column the reader can filter on.
+    #[test]
+    fn a_per_principal_event_records_whose_line_it_is() {
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+        let layer = NdjsonTracingLayer::new(Arc::clone(&writer));
+
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nrr::service", sid = "S-1-5-21-7", "per_user_event");
+            tracing::info!(target: "nrr::service", "machine_event");
+        });
+
+        let file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .next()
+            .expect("one log file");
+        let text = std::fs::read_to_string(file.path()).expect("read log");
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), 2, "both events written: {text}");
+
+        let owned: serde_json::Value = serde_json::from_str(lines[0]).expect("json");
+        assert_eq!(owned["principal"], serde_json::json!("S-1-5-21-7"));
+        let machine: serde_json::Value = serde_json::from_str(lines[1]).expect("json");
+        assert!(
+            machine.get("principal").is_none(),
+            "a line with no sid belongs to the machine, not to a person: {machine}"
+        );
     }
 
     #[test]

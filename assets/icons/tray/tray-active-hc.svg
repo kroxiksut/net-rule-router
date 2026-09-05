@@ -6,26 +6,15 @@
       <stop offset="1" stop-color="var(--nrr-icon-end, #7ED957)"/>
     </linearGradient>
   </defs>
+  <!-- Derived by scripts/dev/generate-high-contrast-tray-icons.py from the
+       sibling icon's own `prefers-contrast: more` branch. -->
   <style>
     :root {
-      --nrr-icon-start: #34C759;
-      --nrr-icon-end: #7ED957;
-      --nrr-icon-stroke-width: 2.2;
+      --nrr-icon-start: #000000;
+      --nrr-icon-end: #000000;
+      --nrr-icon-stroke-width: 2.8;
     }
     @media (prefers-color-scheme: dark) {
-      :root {
-        --nrr-icon-start: #6EEB84;
-        --nrr-icon-end: #A3F57B;
-      }
-    }
-    @media (prefers-contrast: more) {
-      :root {
-        --nrr-icon-start: #000000;
-        --nrr-icon-end: #000000;
-        --nrr-icon-stroke-width: 2.8;
-      }
-    }
-    @media (prefers-contrast: more) and (prefers-color-scheme: dark) {
       :root {
         --nrr-icon-start: #ffffff;
         --nrr-icon-end: #ffffff;

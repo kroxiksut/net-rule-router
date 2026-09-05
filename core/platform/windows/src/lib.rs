@@ -58,6 +58,9 @@ pub mod error;
 // runtime sink behind `SystemEventLogPort`).
 pub mod event_log;
 pub mod fail_closed;
+// Granting the caller read on ONE file the service produced (diagnostics
+// archive), without opening the service's data directory. `#![cfg]` inside.
+pub mod file_handoff;
 // Windows TUN mechanism on WireGuard LLC's signed Wintun driver, plus the
 // third-party integrity report the GUI shows.
 pub mod fake_ip;
@@ -103,6 +106,7 @@ pub mod strategy;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
 pub mod local_time;
 pub mod system_info;
+mod system_shell;
 /// Windows implementation of the system light/dark probe.
 pub mod system_theme;
 pub mod types;

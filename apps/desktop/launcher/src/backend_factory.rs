@@ -61,28 +61,59 @@ pub enum BackendChoice {
     Ipc,
 }
 
+/// Accepted `NRR_BACKEND` slugs, for the diagnostic that names them.
+const BACKEND_SLUGS: &str = "mock | preview-local | ipc";
+
 impl BackendChoice {
     /// Reads `NRR_BACKEND` from the process env. Unrecognised /
     /// unset → [`Self::Ipc`] (the production default).
+    ///
+    /// Says on the launcher log what it decided and why. Both directions used
+    /// to be silent, and they fail in opposite ways: a typo in `mock` runs the
+    /// REAL backend when the operator wanted demo data, and a correct `mock`
+    /// runs on FABRICATED data with the GUI reporting a healthy connection.
+    /// Neither is discoverable from the outside; a line each is.
     pub fn from_env() -> Self {
-        match std::env::var("NRR_BACKEND") {
-            Ok(raw) => Self::from_slug(raw.trim()),
-            Err(_) => Self::Ipc,
+        let Ok(raw) = std::env::var("NRR_BACKEND") else {
+            return Self::Ipc;
+        };
+        let raw = raw.trim();
+        let choice = Self::from_slug(raw);
+        if let Some(notice) = backend_choice_notice(raw, choice) {
+            crate::launcher::diag_log("backend", &notice);
         }
+        choice
     }
 
     /// Case-insensitive slug parser for use by `from_env` and by tests
     /// that want to override the choice without mutating env vars.
+    ///
+    /// Unknown values resolve to the production default rather than refusing to
+    /// launch — a typo must not leave the operator without a window. What it
+    /// must not do is resolve QUIETLY, which is `from_env`'s job.
     pub fn from_slug(raw: &str) -> Self {
         match raw.to_ascii_lowercase().as_str() {
             "mock" => Self::Mock,
             "preview-local" | "preview_local" | "previewlocal" => Self::PreviewLocal,
-            // empty string OR "ipc" OR anything we don't recognise →
-            // production default. We deliberately don't error on
-            // unknown values; ops sometimes typo the env var and we'd
-            // rather degrade gracefully than refuse to launch.
             _ => Self::Ipc,
         }
+    }
+}
+
+/// What to say about an `NRR_BACKEND` value, if anything. `None` is the silent
+/// case: the production default, chosen by an empty or absent variable.
+///
+/// Pure, so the wording is tested without touching the process environment or
+/// the log file.
+fn backend_choice_notice(raw: &str, choice: BackendChoice) -> Option<String> {
+    match choice {
+        BackendChoice::Ipc if raw.is_empty() || raw.eq_ignore_ascii_case("ipc") => None,
+        BackendChoice::Ipc => Some(format!(
+            "NRR_BACKEND={raw:?} is not a known mode ({BACKEND_SLUGS}); starting on the REAL service backend"
+        )),
+        BackendChoice::Mock | BackendChoice::PreviewLocal => Some(format!(
+            "NRR_BACKEND={raw:?}: this window shows FABRICATED preview data. Nothing here reflects the running service, and nothing changed here reaches it. Unset the variable for the real backend."
+        )),
     }
 }
 
@@ -264,6 +295,34 @@ mod tests {
         assert_eq!(BackendChoice::from_slug("ipc"), BackendChoice::Ipc);
         assert_eq!(BackendChoice::from_slug("real"), BackendChoice::Ipc);
         assert_eq!(BackendChoice::from_slug("typo"), BackendChoice::Ipc);
+    }
+
+    /// Both silences the review named, and they fail in opposite directions:
+    /// a typo runs the REAL backend when demo data was wanted, and a correct
+    /// `mock` runs on invented data while the window reports a healthy service.
+    #[test]
+    fn every_backend_choice_that_is_not_the_default_says_so() {
+        assert_eq!(backend_choice_notice("", BackendChoice::Ipc), None);
+        assert_eq!(backend_choice_notice("ipc", BackendChoice::Ipc), None);
+        assert_eq!(backend_choice_notice("IPC", BackendChoice::Ipc), None);
+
+        let typo = backend_choice_notice("moc", BackendChoice::Ipc)
+            .expect("an unknown value is never silent");
+        assert!(typo.contains("not a known mode"), "{typo}");
+        assert!(typo.contains("REAL"), "{typo}");
+        assert!(
+            typo.contains(BACKEND_SLUGS),
+            "the line names the alternatives"
+        );
+
+        for (raw, choice) in [
+            ("mock", BackendChoice::Mock),
+            ("preview-local", BackendChoice::PreviewLocal),
+        ] {
+            let notice =
+                backend_choice_notice(raw, choice).expect("a preview backend is never silent");
+            assert!(notice.contains("FABRICATED"), "{notice}");
+        }
     }
 
     #[test]

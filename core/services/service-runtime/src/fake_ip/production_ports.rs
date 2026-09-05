@@ -145,6 +145,12 @@ impl RelayNameResolver for ConfirmedNameResolver {
     }
 }
 
+/// How many un-processed flow notices may wait before new ones are dropped.
+///
+/// Deep enough that an ordinary page load (dozens of hosts at once) never
+/// touches it, shallow enough that a stalled worker cannot grow without bound.
+const FLOW_NOTICE_QUEUE_DEPTH: usize = 256;
+
 /// Feeds relayed flows to companion discovery as activity.
 ///
 /// The learner opens a window when it is told a routed site is in use, and its
@@ -153,9 +159,23 @@ impl RelayNameResolver for ConfirmedNameResolver {
 /// was on the page, so the CDN hosts loading beside it had no anchor to attach
 /// to and were never proposed. A relayed flow is the same fact, arriving from a
 /// channel nothing can cache away.
+///
+/// **`on_flow_opened` runs on the stack's poll thread while a TCP connection is
+/// being established.** Its contract there is to be prompt, and it was not:
+/// resolving the active SID walks the session registry, and `note_flow` then
+/// matches the hostname against both rule sets and takes the GLOBAL ledger
+/// mutex — the same mutex the discovery tick holds while it qualifies up to
+/// tens of thousands of candidate pairs. A user's connection waited on that.
+///
+/// So the hot path now only hands over the hostname and the instant. Everything
+/// else happens on this observer's own thread. The queue is bounded and a full
+/// queue DROPS the notice: an observation is optional and a connection is not.
+/// The SID is resolved by the worker rather than at the call, which is a
+/// sub-millisecond difference in attribution and takes a registry walk off the
+/// connection path.
 pub struct FlowActivityObserver {
-    engine: Arc<crate::auto_rules::AutoRulesEngine>,
-    active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    notices: std::sync::mpsc::SyncSender<(String, SystemTime)>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FlowActivityObserver {
@@ -164,16 +184,58 @@ impl FlowActivityObserver {
         engine: Arc<crate::auto_rules::AutoRulesEngine>,
         active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     ) -> Self {
-        Self { engine, active_sid }
+        let (notices, inbox) =
+            std::sync::mpsc::sync_channel::<(String, SystemTime)>(FLOW_NOTICE_QUEUE_DEPTH);
+        // The worker ends when the sender goes — i.e. when the stack drops this
+        // observer during teardown. No stop token to keep in sync.
+        let spawned = std::thread::Builder::new()
+            .name("nrr-flow-observer".to_owned())
+            .spawn(move || {
+                while let Ok((hostname, at)) = inbox.recv() {
+                    if let Some(sid) = active_sid() {
+                        engine.note_flow(&sid, &hostname, at);
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(
+                target: "nrr::fake-ip",
+                %error,
+                "could not start the flow-activity worker — companion discovery will not see relayed flows",
+            );
+        }
+        Self {
+            notices,
+            dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
     }
 }
 
 impl super::stack::FlowObserver for FlowActivityObserver {
     fn on_flow_opened(&self, _client: SocketAddr, _fake: SocketAddr, hostname: &str) {
-        let Some(sid) = (self.active_sid)() else {
+        if hostname.is_empty() {
             return;
-        };
-        self.engine.note_flow(&sid, hostname, SystemTime::now());
+        }
+        if self
+            .notices
+            .try_send((hostname.to_owned(), SystemTime::now()))
+            .is_err()
+        {
+            // Full, or the worker is gone. Either way the connection continues;
+            // the count is logged sparsely so a persistent stall is visible
+            // without a line per dropped flow.
+            let n = self
+                .dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if n == 1 || n.is_multiple_of(512) {
+                tracing::warn!(
+                    target: "nrr::fake-ip",
+                    dropped = n,
+                    "flow-activity notices are being dropped — companion discovery is behind",
+                );
+            }
+        }
     }
 }
 
@@ -248,6 +310,57 @@ mod tests {
     };
     use nrr_domain::{RouteBehaviorMode, RuleId};
     use std::net::Ipv4Addr;
+
+    /// `on_flow_opened` runs while a TCP connection is being established. It
+    /// used to resolve the SID and then take the global ledger mutex — the one
+    /// the discovery tick holds through tens of thousands of qualify calls — so
+    /// a user's connection waited on a background computation. The hot path
+    /// must hand the fact over and return, and a backlog must cost observations
+    /// rather than connections.
+    #[test]
+    fn a_flow_notice_never_waits_on_the_worker() {
+        use super::super::stack::FlowObserver;
+        use crate::auto_rules::{AutoRulesEngine, InMemoryDismissalStore, InMemoryPendingStore};
+        use crate::per_sid_orchestrator::{NoopRulesProvider, RulesProvider};
+        use nrr_storage::auto_rules::AutoRulesMode;
+        use std::sync::atomic::Ordering;
+        use std::time::{Duration, Instant};
+
+        let engine = Arc::new(AutoRulesEngine::new(
+            Arc::new(NoopRulesProvider) as Arc<dyn RulesProvider>,
+            Arc::new(|_: &str| AutoRulesMode::Off),
+            Arc::new(InMemoryDismissalStore::new()),
+            Arc::new(InMemoryPendingStore::new()),
+            SystemTime::UNIX_EPOCH,
+        ));
+
+        // A slow worker, not a stuck one: a regression here has to FAIL the
+        // time assertion below, not hang the suite waiting for a lock.
+        let active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync> = Arc::new(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            Some("S-1-5-21-test".to_owned())
+        });
+        let observer = FlowActivityObserver::new(engine, active_sid);
+
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let notices = FLOW_NOTICE_QUEUE_DEPTH * 2;
+        let started = Instant::now();
+        for _ in 0..notices {
+            observer.on_flow_opened(addr, addr, "cdn.example.net");
+        }
+        let elapsed = started.elapsed();
+
+        // Doing the work inline would have cost `notices * 20 ms` — ten seconds
+        // of connection latency for this many flows.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the connection path blocked for {elapsed:?} behind a slow observer",
+        );
+        assert!(
+            observer.dropped.load(Ordering::Relaxed) > 0,
+            "a full queue must drop notices, not wait",
+        );
+    }
 
     #[test]
     fn cache_resolver_returns_cached_v4_addresses() {

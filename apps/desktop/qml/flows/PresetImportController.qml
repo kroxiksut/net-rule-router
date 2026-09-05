@@ -71,10 +71,10 @@ QtObject {
             if (!path || String(path) === "") return
             var value = _isBundledPresetPath(path) ? "" : String(path)
             if (route === "primary") {
-                root.updatePrefs({ lastSavedPathPrimary: value,
+                root.commitPrefs({ lastSavedPathPrimary: value,
                                    lastLoadedPathPrimary: String(path) })
             } else {
-                root.updatePrefs({ lastSavedPathSecondary: value,
+                root.commitPrefs({ lastSavedPathSecondary: value,
                                    lastLoadedPathSecondary: String(path) })
             }
             bound = true
@@ -271,6 +271,7 @@ QtObject {
             var displayValue = Rules.isHostlikeRuleType(ruleType)
                 ? root._unicodeDecodeHost(matchValue)
                 : matchValue
+            var verdict = verdicts[String(r["id-hint"])]
             rows.push({
                 id: "R-" + ("0000" + String(nextId)).slice(-4),
                 enabled: true,
@@ -363,6 +364,14 @@ QtObject {
         var rules = result.rules || []
         var rows = []
         var nextId = Math.max(1, parseInt(startId || 1))
+        // The service's verdict on individual rows, by `id-hint`. Only rows it
+        // would refuse or warn about travel, so a clean file yields an empty
+        // map and every row keeps the default "valid".
+        var verdicts = {}
+        var flagged = (payload && payload.validation) || []
+        for (var v = 0; v < flagged.length; v += 1) {
+            verdicts[String(flagged[v]["id-hint"])] = flagged[v]
+        }
         for (var i = 0; i < rules.length; i += 1) {
             var r = rules[i]
             var ruleType = String(r["rule-type"] || "")
@@ -394,7 +403,16 @@ QtObject {
                 originAnchor: (r.origin && r.origin.anchor !== undefined)
                     ? String(r.origin.anchor) : "",
                 originAdded: (r.origin && r.origin.added !== undefined)
-                    ? String(r.origin.added) : ""
+                    ? String(r.origin.added) : "",
+                // Same three roles the service's own rows carry, so the table's
+                // red state works on an imported file too. Without them an
+                // IPv6 address typed into a rules file read as accepted right
+                // up to the apply that refused the whole file.
+                validationStatus: String((verdict && verdict.status) || "valid"),
+                validationMessageKey: String((verdict && verdict["message-key"]) || ""),
+                // Empty object, never null — see the note at the service-row
+                // builder in Main.qml: `null` makes ListModel warn per row.
+                validationMessageArgs: (verdict && verdict.args) ? verdict.args : ({})
             })
             nextId += 1
         }
@@ -402,8 +420,70 @@ QtObject {
             rows: rows,
             nextId: nextId,
             passthrough: result.passthrough || [],
-            duplicateSections: result["duplicate-sections"] || []
+            duplicateSections: result["duplicate-sections"] || [],
+            // The service's verdict on the same bytes, absent when the file is
+            // within every limit. Carried out of the parse rather than checked
+            // later: the dialog must not open on a file that cannot be applied.
+            rejected: (payload && payload.rejected) || null,
+            // Same channel, opposite verdict: the file imports, but its header
+            // declares a format this build does not fully read. `{found,
+            // supported}` when so, absent otherwise.
+            newerFormat: (payload && payload["format-version"]) || null
         }
+    }
+
+    // Set while a file declaring a newer format version is being imported, so
+    // the outcome banner can carry the note. A parse-time status line would be
+    // overwritten by the import result; the user has to be told at the end,
+    // beside what was actually imported.
+    property var _newerFormatNotice: null
+
+    // The " Written by a newer version…" tail of the import banner. Empty when
+    // the file is within this build's format, so the suffix disappears — the
+    // same shape as the preserved-sections suffix beside it.
+    function _formatNewerFormatSuffix() {
+        var n = _newerFormatNotice
+        if (!n) return ""
+        return " " + root.tr("status.preset-import-newer-format",
+            "The file declares format version {found}; this build reads version {supported}. Rules in sections it does not know were kept but not applied.")
+            .replace("{found}", String(n.found || ""))
+            .replace("{supported}", String(n.supported || ""))
+    }
+
+    // What to tell the user about a file the service will refuse, in their own
+    // language. The launcher sends a slug plus numbers precisely so the
+    // sentence is built here.
+    function _presetRejectionText(rejected) {
+        var code = String((rejected && rejected.code) || "")
+        var limit = String((rejected && rejected.limit) || "")
+        if (code === "too-many-rules") {
+            return root.tr("status.preset-import-too-many-rules",
+                "The file holds {count} rules, more than the {limit} a rule set may have. Split it into two files or remove some rules.")
+                .replace("{count}", String(rejected.count || ""))
+                .replace("{limit}", limit)
+        }
+        if (code === "file-too-large") {
+            return root.tr("status.preset-import-too-large",
+                "The file is {size} bytes, over the {limit}-byte limit for a rule set.")
+                .replace("{size}", String(rejected.size || ""))
+                .replace("{limit}", limit)
+        }
+        if (code === "value-too-long") {
+            return root.tr("status.preset-import-value-too-long",
+                "A value in section {section} is {length} characters long, over the limit of {limit}.")
+                .replace("{section}", String(rejected.section || ""))
+                .replace("{length}", String(rejected.length || ""))
+                .replace("{limit}", limit)
+        }
+        if (code === "comment-too-long") {
+            return root.tr("status.preset-import-comment-too-long",
+                "A comment in section {section} is {length} characters long, over the limit of {limit}.")
+                .replace("{section}", String(rejected.section || ""))
+                .replace("{length}", String(rejected.length || ""))
+                .replace("{limit}", limit)
+        }
+        return root.tr("status.preset-import-refused",
+            "This file cannot be imported as a rule set.")
     }
 
     // Refresh `rulesModel` after a successful preset
@@ -554,12 +634,31 @@ QtObject {
             root.presetImportReviewDialog.open()
         }
 
+        var refused = false
+        _newerFormatNotice = null
         var parseRoute = function(route, b64) {
             _parseCanonicalRulesAsync(
                 root._b64ToUtf8(b64 || ""),
                 route,
                 1,
                 function(result) {
+                    // A file the service would refuse stops here, before the
+                    // dialog: choosing sections and resolving duplicates in a
+                    // file that is going to be rejected whole is work thrown
+                    // away, and the refusal used to arrive only after it.
+                    if (result.rejected) {
+                        if (!refused) {
+                            refused = true
+                            root.statusLine = _presetRejectionText(result.rejected)
+                        }
+                        return
+                    }
+                    if (refused) return
+                    // First route wins: both files of a "both routes" import
+                    // come from one preset, and two identical notes are noise.
+                    if (result.newerFormat && !_newerFormatNotice) {
+                        _newerFormatNotice = result.newerFormat
+                    }
                     parsedRowsByRoute[route] = result.rows
                     passthroughByRoute[route] = result.passthrough
                     duplicatesByRoute[route] = result.duplicateSections
@@ -684,7 +783,9 @@ QtObject {
                     : root.tr("status.preset-import-offline",
                         "Imported {count} rules into the GUI. Service is unreachable — start the service and use 'Save and review...' to push them.")
                         .replace("{count}", String(summary.rulesCount))
-                root.statusLine = base + _formatImportPassthroughSuffix(summary.passthroughByRoute)
+                root.statusLine = base
+                    + _formatImportPassthroughSuffix(summary.passthroughByRoute)
+                    + _formatNewerFormatSuffix()
                 // Mark the offline import on disk so it survives BOTH a
                 // mid-session service start (the post-connect backlog dialog
                 // offers to apply it) AND a full GUI restart under admin (the
@@ -993,7 +1094,9 @@ QtObject {
                     var base = root.tr("status.preset-import-completed",
                         "Preset imported and activated ({count} rules).")
                         .replace("{count}", String(summary.rulesCount))
-                    root.statusLine = base + _formatImportPassthroughSuffix(summary.passthroughByRoute)
+                    root.statusLine = base
+                        + _formatImportPassthroughSuffix(summary.passthroughByRoute)
+                        + _formatNewerFormatSuffix()
                 }
             })
             // After successful activation the in-memory rules match

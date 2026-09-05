@@ -48,6 +48,11 @@ pub enum BlockReason {
     /// switch for it and no rule to edit, so this must never be reported as a
     /// rule blocking the site.
     Ipv6Blocked,
+    /// The application went to a public DNS resolver of its own instead of the
+    /// one policy provides, and the DoH/DoT lockdown closed it. Like the IPv6
+    /// cut this has a switch and no rule behind it — reporting it as a rule
+    /// sends the user editing a file that cannot contain the cause.
+    DnsLockdown,
     /// Ours, but the filter behind it could not be identified. Naming a cause
     /// here would send the user editing rules that may have nothing to do with
     /// it — say only what is known.
@@ -63,6 +68,7 @@ impl BlockReason {
             Self::NotCoveredByRules => "not-covered-by-rules",
             Self::BlockedByRule => "blocked-by-rule",
             Self::Ipv6Blocked => "ipv6-blocked",
+            Self::DnsLockdown => "dns-lockdown",
             Self::Unattributed => "unattributed",
         }
     }
@@ -75,6 +81,7 @@ impl BlockReason {
             "not-covered-by-rules" => Some(Self::NotCoveredByRules),
             "blocked-by-rule" => Some(Self::BlockedByRule),
             "ipv6-blocked" => Some(Self::Ipv6Blocked),
+            "dns-lockdown" => Some(Self::DnsLockdown),
             "unattributed" => Some(Self::Unattributed),
             _ => None,
         }

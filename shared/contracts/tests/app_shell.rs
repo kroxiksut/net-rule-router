@@ -1,6 +1,6 @@
 use nrr_shared::{
     gui_shell_v1, AppAction, AppSection, FirstRunScenarioId, FirstRunStepId, GuiDialog, GuiWindow,
-    MainWindowLayoutZone, MenuAvailability, MenuGroupId, NavigationStyle, SecondaryLaunchBehavior,
+    MenuAvailability, MenuGroupId, NavigationStyle, SecondaryLaunchBehavior,
     SetupActionAvailability,
 };
 
@@ -102,45 +102,6 @@ fn navigation_and_single_instance_policy_are_fixed() {
 }
 
 #[test]
-fn main_window_shell_layout_and_shared_flows_are_fixed() {
-    let shell = gui_shell_v1();
-    assert_eq!(shell.main_window_shell.window_title, "NetRuleRouter");
-    assert_eq!(
-        shell.main_window_shell.layout_zones,
-        &[
-            MainWindowLayoutZone::TitleBar,
-            MainWindowLayoutZone::MenuBar,
-            MainWindowLayoutZone::Sidebar,
-            MainWindowLayoutZone::Workspace,
-            MainWindowLayoutZone::StatusBar,
-            MainWindowLayoutZone::ActionBar
-        ]
-    );
-    assert_eq!(
-        shell.main_window_shell.sidebar_sections,
-        &[
-            AppSection::InterfacesAndRoutes,
-            AppSection::Rules,
-            AppSection::Diagnostics,
-            AppSection::Logs,
-            AppSection::Settings
-        ]
-    );
-    assert_eq!(
-        shell.main_window_shell.shared_shell_sections,
-        &[AppSection::Settings, AppSection::Diagnostics]
-    );
-    assert_eq!(
-        shell.main_window_shell.shared_shell_review_dialogs,
-        &[
-            GuiDialog::ReviewReplaceCurrentList,
-            GuiDialog::ConfirmReplaceCurrentList
-        ]
-    );
-    assert!(shell.main_window_shell.apply_cancel_actions_visible);
-}
-
-#[test]
 fn first_run_contract_covers_block_2_2_baseline() {
     let shell = gui_shell_v1();
     assert_eq!(
@@ -215,4 +176,52 @@ fn first_run_contract_covers_block_2_2_baseline() {
         .first_run
         .completion_notice
         .contains("interfaces/routes"));
+}
+
+/// A client that cannot complete the handshake cannot do anything at all, so
+/// the catalogue has to admit every profile to it. The console was not on that
+/// list: it declared itself, was refused `contract.negotiate`, and its one
+/// wired operation (asking the service for a diagnostics archive) was
+/// unreachable — a defect the profile enforcement made visible only once the
+/// Linux transport stopped handing every caller the GUI profile.
+#[test]
+fn every_client_profile_may_complete_the_handshake() {
+    use nrr_shared::ipc::{ipc_operation_spec, IpcOperationName};
+    use nrr_shared::IpcClientProfile;
+    let spec = ipc_operation_spec(IpcOperationName::ContractNegotiate)
+        .expect("contract.negotiate is in the catalogue");
+    for profile in IpcClientProfile::ALL {
+        assert!(
+            spec.allowed_clients.contains(&profile),
+            "{} cannot negotiate, so it can never reach any operation",
+            profile.slug()
+        );
+    }
+}
+
+/// Every operation a profile is allowed to invoke must also be one its class
+/// permits: two independent tables saying different things about the same
+/// caller is how the console ended up able to ask for nothing.
+#[test]
+fn the_catalogue_never_admits_a_client_its_class_rule_would_refuse() {
+    use nrr_shared::ipc::{ipc_operation_spec, IpcOperationName};
+    use nrr_shared::ipc_transport::canonical_operation_class;
+    // The dry-run phase of a two-phase operation is classified from its
+    // payload; an empty one asks for the phase that gates hardest.
+    let payload = serde_json::Value::Null;
+    for op in IpcOperationName::ALL {
+        let Some(spec) = ipc_operation_spec(op) else {
+            continue;
+        };
+        let class = canonical_operation_class(op, &payload);
+        for profile in spec.allowed_clients {
+            assert!(
+                profile.permits(class),
+                "{} is allowed to invoke {} but its class {} says otherwise",
+                profile.slug(),
+                op.slug(),
+                class.slug()
+            );
+        }
+    }
 }

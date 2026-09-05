@@ -383,6 +383,17 @@ impl SqliteTrafficStore {
         collect_rows(rows)
     }
 
+    /// Folds the write-ahead log back into the database and truncates it.
+    ///
+    /// The ledger is written a few rows at a time and read almost never, so
+    /// without this its journal carries nearly the whole dataset: 28 KB of
+    /// database behind 4.1 MB of journal on the owner's machine. Best-effort by
+    /// contract — a concurrent connection makes SQLite decline.
+    pub fn checkpoint_wal(&self) -> StorageResult<()> {
+        let conn = self.conn.borrow();
+        crate::migration::checkpoint_wal_truncate(&conn)
+    }
+
     /// SQLite structural integrity — `false` means the rebuildable DB should be
     /// deleted and recreated.
     pub fn integrity_ok(&self) -> StorageResult<bool> {

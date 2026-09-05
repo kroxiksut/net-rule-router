@@ -14,8 +14,10 @@ license = "MPL-2.0"
 #                    the service becomes reachable and the user accepts or
 #                    discards the change; TTL 7 days)
 #
-# Per-user database lives at `%APPDATA%\NetRuleRouter\gui_metadata.db` on
-# Windows. Override via `NRR_SIDECAR_PATH` for tests and headless drivers.
+# Per-user database lives at `%LOCALAPPDATA%\NetRuleRouter\gui_metadata.db` on
+# Windows — local, not roaming: a WAL database must not travel without its
+# sidecars. Override via `NRR_SIDECAR_PATH` (absolute file path) for tests and
+# headless drivers.
 #
 # Allowed deps: rusqlite (bundled), thiserror.
 # Forbidden:    nrr-storage (service-side), nrr-shared (wire schemas),

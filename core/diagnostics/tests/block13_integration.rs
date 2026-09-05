@@ -314,6 +314,7 @@ fn archive_default_export_contains_no_raw_db_files() {
         log_entries: vec![],
         audit_entries: vec![],
         audit_chain_lines: vec![],
+        raw_log_lines: vec![],
         explain_samples: vec![],
         system_info: Some(nrr_shared::system_info::SystemInfo::from_std()),
         service_stderr: None,
@@ -350,6 +351,7 @@ fn archive_default_export_no_raw_ips_in_health() {
         log_entries: vec![],
         audit_entries: vec![],
         audit_chain_lines: vec![],
+        raw_log_lines: vec![],
         explain_samples: vec![],
         system_info: Some(nrr_shared::system_info::SystemInfo::from_std()),
         service_stderr: None,
@@ -626,7 +628,7 @@ fn integration_log_emit_to_query() {
     let events = reader.scan(&filter);
 
     assert_eq!(events.len(), 5, "all emitted events must be queryable");
-    // Verify correlation correlation with event_id.
+    // Verify correlation with event_id.
     assert!(events.iter().all(|e| !e.event_id.is_empty()));
     // Verify no raw sensitive fields.
     for e in &events {

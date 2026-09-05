@@ -83,6 +83,11 @@ pub enum ValidationError {
     /// address. The rule cannot be applied and must be corrected.
     InvalidIpAddress { rule_id: RuleId, value: String },
 
+    /// A domain/zone rule's value is not a hostname: spaces, control bytes, a
+    /// path, an interior glob. Nothing it could ever match exists, so the rule
+    /// is refused rather than stored as a name no packet will carry.
+    DomainInvalidValue { rule_id: RuleId, value: String },
+
     /// A `Zone` rule has an empty name after trimming.
     ZoneEmptyName { rule_id: RuleId },
 
@@ -103,6 +108,7 @@ impl ValidationError {
             | Self::CidrNotSupported { rule_id, .. }
             | Self::IpRangeNotSupported { rule_id, .. }
             | Self::InvalidIpAddress { rule_id, .. }
+            | Self::DomainInvalidValue { rule_id, .. }
             | Self::ZoneEmptyName { rule_id }
             | Self::AppGlobTooWide { rule_id } => Some(rule_id),
         }
@@ -135,6 +141,9 @@ impl fmt::Display for ValidationError {
                     f,
                     "rule {rule_id}: '{value}' is not a valid internationalized domain name"
                 )
+            }
+            Self::DomainInvalidValue { rule_id, value } => {
+                write!(f, "rule {rule_id}: '{value}' is not a host name")
             }
             Self::Ipv6NotSupported { rule_id, value } => {
                 write!(f, "rule {rule_id}: IPv6 address '{value}' is not supported")
@@ -709,8 +718,13 @@ fn normalize_domain_label(
     // Lowercase first (IDNA processing expects lowercase input for best results).
     let lowercased = without_dot.to_lowercase();
 
-    // If purely ASCII, no further IDNA processing is needed.
+    // If purely ASCII, no further IDNA processing is needed — but it still has
+    // to BE a hostname. Nothing checked that in the production pipeline, so
+    // `hello world`, a path, a control byte or `192.168.1.0/24` from the IP
+    // section became a live `ExactFqdn` and travelled into storage and codegen,
+    // where it could never match anything.
     if lowercased.is_ascii() {
+        reject_if_not_a_hostname(&lowercased, rule_id)?;
         return Ok(lowercased);
     }
 
@@ -724,6 +738,7 @@ fn normalize_domain_label(
                     normalized: ascii.clone(),
                 });
             }
+            reject_if_not_a_hostname(&ascii, rule_id)?;
             Ok(ascii)
         }
         Err(_) => Err(ValidationError::DomainInvalidIdn {
@@ -731,6 +746,65 @@ fn normalize_domain_label(
             value: without_dot.to_string(),
         }),
     }
+}
+
+/// Refuses a domain value that is not a hostname, naming WHAT it is when the
+/// shape is recognisable.
+///
+/// The three IP-shaped answers exist because the `--- IP` section passes an
+/// unparseable value through as a domain "so the semantic validator can produce
+/// a proper diagnostic" — and it never did: `192.168.1.0/24`,
+/// `10.0.0.1-10.0.0.9` and `not-an-ip` were all accepted as domain names,
+/// silently, with zero errors and zero warnings. Their variants existed and
+/// were constructed nowhere in the repository.
+fn reject_if_not_a_hostname(value: &str, rule_id: &RuleId) -> Result<(), ValidationError> {
+    // Address-shaped FIRST, because a hostname check would pass some of these:
+    // `10.0.0.1-10.0.0.9` is made of legal hostname characters, and calling it
+    // a valid name is how a range ended up stored as one. A value with no
+    // letter at all is not a name — no top-level domain is all digits.
+    if !value.is_empty() && !value.chars().any(|c| c.is_ascii_alphabetic()) {
+        if let Some((head, _)) = value.split_once('/') {
+            if head.parse::<std::net::IpAddr>().is_ok() {
+                return Err(ValidationError::CidrNotSupported {
+                    rule_id: rule_id.clone(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        if let Some((from, to)) = value.split_once('-') {
+            if from.parse::<std::net::IpAddr>().is_ok() && to.parse::<std::net::IpAddr>().is_ok() {
+                return Err(ValidationError::IpRangeNotSupported {
+                    rule_id: rule_id.clone(),
+                    value: value.to_string(),
+                });
+            }
+        }
+        // A well-formed address in a DOMAIN rule is not a mistyped name — it is
+        // a value in the wrong section, and it would never match a host name.
+        if value.parse::<std::net::Ipv4Addr>().is_ok() {
+            return Err(ValidationError::DomainInvalidValue {
+                rule_id: rule_id.clone(),
+                value: value.to_string(),
+            });
+        }
+        return Err(ValidationError::InvalidIpAddress {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+        });
+    }
+    if value.parse::<std::net::Ipv6Addr>().is_ok() {
+        return Err(ValidationError::Ipv6NotSupported {
+            rule_id: rule_id.clone(),
+            value: value.to_string(),
+        });
+    }
+    if crate::rule_value_validation::is_valid_hostname(value) {
+        return Ok(());
+    }
+    Err(ValidationError::DomainInvalidValue {
+        rule_id: rule_id.clone(),
+        value: value.to_string(),
+    })
 }
 
 /// Validates and converts an [`IpAddr`] to [`Ipv4Addr`].
@@ -882,6 +956,10 @@ fn deduplicate_set(
 /// the user meant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossSetDuplicate {
+    /// Content identity of the pair — what a caller echoes back to say which
+    /// copy it wants kept. The two ids cannot serve: they are per-book and are
+    /// re-derived whenever the file is parsed again.
+    pub identity_key: String,
     pub primary_rule_id: RuleId,
     pub secondary_rule_id: RuleId,
     /// What the two copies match, as the user wrote it — the only part of the
@@ -913,6 +991,7 @@ pub fn enabled_duplicates_across_sets(book: &CanonicalRuleBook) -> Vec<CrossSetD
     for secondary in book.secondary.rules().iter().filter(|rule| rule.enabled) {
         if let Some(primary) = by_match.get(&MatchKey::from_rule(secondary)) {
             found.push(CrossSetDuplicate {
+                identity_key: crate::review::rule_identity_key(secondary),
                 primary_rule_id: primary.id.clone(),
                 secondary_rule_id: secondary.id.clone(),
                 match_summary: describe_match(secondary),
@@ -1856,6 +1935,82 @@ mod tests {
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
             origin: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod value_gate_tests {
+    use super::*;
+
+    fn err_for(value: &str) -> ValidationError {
+        let mut warnings = Vec::new();
+        normalize_domain_label(value, &RuleId("r-1".to_owned()), &mut warnings)
+            .expect_err("must be refused")
+    }
+
+    /// The `--- IP` section passes an unparseable value through as a domain so
+    /// the semantic validator can name the problem. It never did: a subnet, a
+    /// range and a typo were all accepted as host names, with zero errors and
+    /// zero warnings, and travelled into storage and codegen.
+    #[test]
+    fn an_address_shaped_value_is_refused_and_named() {
+        assert!(matches!(
+            err_for("192.168.1.0/24"),
+            ValidationError::CidrNotSupported { .. }
+        ));
+        assert!(matches!(
+            err_for("10.0.0.1-10.0.0.9"),
+            ValidationError::IpRangeNotSupported { .. }
+        ));
+        assert!(matches!(
+            err_for("2001:db8::1"),
+            ValidationError::Ipv6NotSupported { .. }
+        ));
+        assert!(matches!(
+            err_for("192.168.1"),
+            ValidationError::InvalidIpAddress { .. }
+        ));
+    }
+
+    /// Anything that is not a host name at all cannot match a packet, so
+    /// storing it is worse than refusing it: the rule looks live and does
+    /// nothing.
+    #[test]
+    fn a_value_that_is_not_a_host_name_is_refused() {
+        for value in ["hello world", "C:/windows/system32", "a*b.example.com"] {
+            assert!(
+                matches!(err_for(value), ValidationError::DomainInvalidValue { .. }),
+                "{value} must be refused"
+            );
+        }
+        // A control byte never reaches a DNS query either.
+        let with_nul = format!("exam{}ple.com", '\u{0}');
+        assert!(matches!(
+            err_for(&with_nul),
+            ValidationError::DomainInvalidValue { .. }
+        ));
+    }
+
+    /// The gate must not start refusing ordinary rules — including the ones
+    /// with an underscore, which the rule validator accepts on purpose.
+    #[test]
+    fn ordinary_host_names_still_pass() {
+        let mut warnings = Vec::new();
+        for value in [
+            "example.com",
+            "db_srv.corp.intra",
+            "xn--80ak6aa92e.com",
+            "a.b.c.d.example.co.uk",
+            // The bundled presets ship IDN zones; they reach the gate as
+            // punycode and must survive it.
+            "\u{440}\u{444}",
+            "\u{4e2d}\u{56fd}",
+        ] {
+            assert!(
+                normalize_domain_label(value, &RuleId("r-1".to_owned()), &mut warnings).is_ok(),
+                "{value} must be accepted"
+            );
         }
     }
 }

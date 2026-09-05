@@ -99,7 +99,8 @@ Item {
         onPreviewApplyRequested: {
             var p = ownerRoot._pendingPreviewPayload
             ownerRoot._pendingPreviewPayload = null
-            if (p) ownerRoot.reviewFlowController.startRulesReviewFlow(p.rulesJson, p.contentHash)
+            if (p) ownerRoot.reviewFlowController.startRulesReviewFlow(
+                p.rulesJson, p.contentHash, false, "preview-apply")
         }
         // The same rule sits on both routes and the user picked the one that
         // keeps it. The loser is switched OFF, never deleted: they wrote it,
@@ -450,7 +451,9 @@ Item {
         id: mergeReviewDialog
         ownerRoot: dialogHost.ownerRoot
         onCancelled: { /* banner stays until resolved */ }
-        onConfirmed: function(resolutions) { ownerRoot.driftController._applyMerge(resolutions) }
+        onConfirmed: function(resolutions, keepSecondaryKeys) {
+            ownerRoot.driftController._applyMerge(resolutions, keepSecondaryKeys)
+        }
     }
 
     RulesOverlapCleanupDialog {

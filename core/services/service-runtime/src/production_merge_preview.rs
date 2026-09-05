@@ -22,7 +22,7 @@
 //! The domain→DTO conversion lives here (not in `nrr-shared`, which must not
 //! depend on `nrr-domain`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nrr_domain::canonical::{CanonicalRule, CanonicalRuleBook, CanonicalRuleSet};
@@ -44,11 +44,28 @@ use nrr_shared::RouteRole;
 use nrr_storage::revisions::RevisionsRepository;
 use rusqlite::Connection;
 
+/// One merge-preview request, borrowed from the decoded wire payload.
+///
+/// A struct rather than six positional arguments: two of them are lists of
+/// opaque keys and one is a bool, which at the call site told a reader nothing.
+pub struct MergePreviewInput<'a> {
+    pub primary_text: &'a str,
+    pub secondary_text: &'a str,
+    pub policy: MergePolicyDto,
+    /// Per-conflict picks: which SIDE (file or service) wins.
+    pub resolutions: &'a [ConflictResolutionDto],
+    /// Identity keys whose additional-route copy the user wants kept — see
+    /// [`nrr_domain::merge::normalize_cross_set_duplicates`].
+    pub keep_secondary: &'a [String],
+    pub include_child_processes: bool,
+}
+
 /// Produces a merge preview reconciling file text with the active revision.
 pub trait MergePreviewSource: Send + Sync {
     /// Merge `primary_text` / `secondary_text` (the caller's linked bound
     /// files) against the caller's active revision under `policy`, applying
-    /// `resolutions`.
+    /// `resolutions` and `keep_secondary` (identity keys whose additional-route
+    /// copy the user wants kept — see `normalize_cross_set_duplicates`).
     ///
     /// `principal` is the caller's Windows SID (or
     /// [`nrr_storage::BASELINE_PRINCIPAL`]); the active revision is resolved
@@ -56,11 +73,7 @@ pub trait MergePreviewSource: Send + Sync {
     fn merge_preview(
         &self,
         principal: &str,
-        primary_text: &str,
-        secondary_text: &str,
-        policy: MergePolicyDto,
-        resolutions: &[ConflictResolutionDto],
-        include_child_processes: bool,
+        request: MergePreviewInput<'_>,
     ) -> Result<MergeResultDto, MergePreviewError>;
 }
 
@@ -143,36 +156,38 @@ impl MergePreviewSource for ProductionMergePreviewSource {
     fn merge_preview(
         &self,
         principal: &str,
-        primary_text: &str,
-        secondary_text: &str,
-        policy: MergePolicyDto,
-        resolutions: &[ConflictResolutionDto],
-        include_child_processes: bool,
+        request: MergePreviewInput<'_>,
     ) -> Result<MergeResultDto, MergePreviewError> {
         let service_book = self.service_book(principal)?;
         let file_book = CanonicalRuleBook {
-            primary: canonicalize_side(primary_text, RouteRole::Primary, include_child_processes)?,
+            primary: canonicalize_side(
+                request.primary_text,
+                RouteRole::Primary,
+                request.include_child_processes,
+            )?,
             secondary: canonicalize_side(
-                secondary_text,
+                request.secondary_text,
                 RouteRole::Secondary,
-                include_child_processes,
+                request.include_child_processes,
             )?,
         };
 
         let mut resolution_map: BTreeMap<String, ConflictSide> = BTreeMap::new();
-        for r in resolutions {
+        for r in request.resolutions {
             resolution_map.insert(r.identity_key.clone(), domain_side(r.side));
         }
 
-        let policy_domain = MergePolicy::from_slug(policy.slug());
+        let keep_secondary: BTreeSet<String> = request.keep_secondary.iter().cloned().collect();
+        let policy_domain = MergePolicy::from_slug(request.policy.slug());
         let result = merge_rule_books_with_resolutions(
             &file_book,
             &service_book,
             policy_domain,
             &resolution_map,
+            &keep_secondary,
         );
 
-        to_result_dto(result, policy)
+        to_result_dto(result, request.policy)
     }
 }
 
@@ -323,6 +338,7 @@ fn to_result_dto(
         .normalized_duplicates
         .iter()
         .map(|n| CrossSetDuplicateDto {
+            identity_key: n.identity_key.clone(),
             primary_rule_id: n.kept.id.as_str().to_string(),
             secondary_rule_id: n.disabled.id.as_str().to_string(),
             match_summary: nrr_domain::validation::describe_match(&n.disabled),
@@ -418,11 +434,14 @@ mod tests {
         let out = source
             .merge_preview(
                 nrr_storage::BASELINE_PRINCIPAL,
-                "--- IP\n1.2.3.4\n",
-                "",
-                MergePolicyDto::Union,
-                &[],
-                false,
+                MergePreviewInput {
+                    primary_text: "--- IP\n1.2.3.4\n",
+                    secondary_text: "",
+                    policy: MergePolicyDto::Union,
+                    resolutions: &[],
+                    keep_secondary: &[],
+                    include_child_processes: false,
+                },
             )
             .expect("merge preview");
         assert_eq!(out.file_only.len(), 1, "one file-only rule");
@@ -454,11 +473,14 @@ mod tests {
         let out = source
             .merge_preview(
                 CALLER,
-                "--- IP\n1.2.3.4\n5.5.5.5\n",
-                "",
-                MergePolicyDto::Union,
-                &[],
-                false,
+                MergePreviewInput {
+                    primary_text: "--- IP\n1.2.3.4\n5.5.5.5\n",
+                    secondary_text: "",
+                    policy: MergePolicyDto::Union,
+                    resolutions: &[],
+                    keep_secondary: &[],
+                    include_child_processes: false,
+                },
             )
             .expect("merge preview");
         // 5.5.5.5 is file-only; 9.9.9.9 is service-only; 1.2.3.4 is identical.
@@ -498,11 +520,14 @@ mod tests {
         let err = source
             .merge_preview(
                 nrr_storage::BASELINE_PRINCIPAL,
-                &file_text,
-                "",
-                MergePolicyDto::Union,
-                &[],
-                false,
+                MergePreviewInput {
+                    primary_text: &file_text,
+                    secondary_text: "",
+                    policy: MergePolicyDto::Union,
+                    resolutions: &[],
+                    keep_secondary: &[],
+                    include_child_processes: false,
+                },
             )
             .expect_err("must reject bare-glob app rule");
         assert!(matches!(

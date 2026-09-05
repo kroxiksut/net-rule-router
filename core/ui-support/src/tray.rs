@@ -349,4 +349,32 @@ mod tests {
             "assets/icons/tray/tray-warning-hc.ico"
         );
     }
+
+    /// The path was the whole of the old assertion, and the path was never the
+    /// claim: all twelve `-hc` files were byte-identical to their siblings, so
+    /// "dedicated set" named the same drawing twice. Reads the bytes.
+    #[test]
+    fn the_high_contrast_icons_are_not_the_ordinary_ones_renamed() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for kind in [
+            TrayStatusKind::PreviewMode,
+            TrayStatusKind::CheckingStatus,
+            TrayStatusKind::NoActivePolicy,
+            TrayStatusKind::ServiceUnavailable,
+        ] {
+            let plain = repo.join(kind.icon_asset_hint(false));
+            let high = repo.join(kind.icon_asset_hint(true));
+            let plain_bytes = std::fs::read(&plain)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", plain.display()));
+            let high_bytes = std::fs::read(&high)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", high.display()));
+            assert_ne!(
+                plain_bytes,
+                high_bytes,
+                "{} is {} under another name",
+                high.display(),
+                plain.display()
+            );
+        }
+    }
 }

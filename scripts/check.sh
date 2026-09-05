@@ -102,7 +102,64 @@ cyan "[check] sync duplicates"
 bash "$script_dir/clean-sync-duplicates.sh"
 
 cyan "[check] comment hygiene: no task references or dates in comments"
+# A word repeated back to back in a comment. Eight of these shipped at once when
+# a blind find-and-replace put a replacement word into sentences that already
+# carried it, and the gate above had no reason to look: nothing about them is a
+# task reference or a date. `(?!-)` spares the legitimate case where the repeat
+# starts a hyphenated word.
+check_doubled_words() {
+  local roots=()
+  local d
+  for d in apps core shared scripts; do
+    [ -d "$repo_root/$d" ] && roots+=("$repo_root/$d")
+  done
+  [ "${#roots[@]}" -eq 0 ] && return 0
+
+  local offences=() total=0
+  local hit file rest line_no content prefix after
+
+  while IFS= read -r hit; do
+    file="${hit%%:*}"
+    rest="${hit#*:}"
+    line_no="${rest%%:*}"
+    content="${rest#*:}"
+
+    case "$file" in
+      *.sh|*.ps1) prefix='#' ;;
+      *) prefix='//' ;;
+    esac
+    case "$content" in
+      *"$prefix"*) after="${content#*"$prefix"}" ;;
+      *) continue ;;
+    esac
+
+    grep -qP '\b([A-Za-z]{3,})\s+\1\b(?!-)' <<<"$after" || continue
+
+    total=$((total + 1))
+    if [ "$total" -le 20 ]; then
+      offences+=("$file:$line_no: $content")
+    fi
+  done < <(grep -RnP \
+    --include='*.rs' --include='*.qml' --include='*.cpp' --include='*.h' \
+    --include='*.js' --include='*.ps1' --include='*.sh' \
+    -e '\b([A-Za-z]{3,})\s+\1\b(?!-)' "${roots[@]}" 2>/dev/null | grep -v '/target/')
+
+  if [ "$total" -gt 0 ]; then
+    local o
+    for o in "${offences[@]}"; do
+      yellow "  $o"
+    done
+    if [ "$total" -gt 20 ]; then
+      yellow "  ... and $((total - 20)) more"
+    fi
+    echo "doubled words: $total comment(s) repeat a word." >&2
+    return 1
+  fi
+  return 0
+}
+
 check_comment_hygiene
+check_doubled_words
 
 # Invoked as `cargo-fmt`, not `cargo fmt`: a user-level cargo alias named
 # `fmt` shadows the subcommand and makes cargo emit a warning on stderr,

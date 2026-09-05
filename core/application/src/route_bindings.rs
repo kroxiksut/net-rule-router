@@ -57,14 +57,10 @@ pub struct RouteBindingsExportSnapshot {
     pub secondary: RouteRoleBindingExport,
 }
 
-// `route_bindings_export_snapshot` reads the legacy `UiPreferences`
-// policy fields for the export-snapshot path. The fields are deprecated
-// in favor of per-SID service-owned storage; after the launcher
-// migration runs they are zeroed and this function emits the empty
-// snapshot. Real route bindings now live in
-// `nrr_service_state.db::route_bindings`; the canonical export path
-// will eventually be reworked to read from there.
-#[allow(deprecated)]
+// Reads the route-policy fields the application keeps in `UiPreferences`.
+// They are its own store and the window's view while the service is stopped;
+// what the service ENFORCES lives per-SID in `nrr_service_state.db`, and the
+// canonical export path is to be reworked to read from there.
 pub fn route_bindings_export_snapshot(
     preferences: &UiPreferences,
     active_revision: &str,
@@ -130,9 +126,6 @@ fn build_binding_export(
 
 #[cfg(test)]
 mod tests {
-    // These tests deliberately populate the deprecated per-UiPreferences route
-    // fields to verify the export/migration path.
-    #![allow(deprecated)]
     use super::{
         format_route_bindings_export, route_bindings_export_snapshot, RouteBindingChangeClass,
         RouteBindingResolutionState,

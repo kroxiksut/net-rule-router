@@ -49,6 +49,14 @@ use crate::ipc_handlers::providers::{
 use crate::tamper_bootstrap::mutations_blocked_by_alert;
 use nrr_diagnostics::audit::alert::SecurityAlertsRepository;
 
+/// Answers whether any principal OTHER than the caller (and the shared
+/// baseline) holds revisions.
+///
+/// A closure over the state DB at the composition root, so this module never
+/// learns what a revision table looks like. `None` (tests, degraded boot) reads
+/// as "nobody else", which keeps the pre-existing behaviour.
+pub type OtherPrincipalsHoldRevisionsFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 pub struct MutationSubmitHandler {
     executor: Arc<dyn MutationExecutor>,
     token_store: Arc<MutationTokenStore>,
@@ -62,6 +70,9 @@ pub struct MutationSubmitHandler {
     /// Reader for the machine-wide administrative rules lock. `None` leaves
     /// the gate open (degraded boot / tests) — see `rule_edits_allowed_for`.
     stability: Option<Arc<dyn ServiceStabilityConfigProvider>>,
+    /// Reader for "would clearing this alert speak for somebody else?" — see
+    /// [`OtherPrincipalsHoldRevisionsFn`].
+    other_principals_hold_revisions: Option<OtherPrincipalsHoldRevisionsFn>,
 }
 
 impl MutationSubmitHandler {
@@ -77,6 +88,7 @@ impl MutationSubmitHandler {
             token_ttl: DEFAULT_MUTATION_TOKEN_TTL,
             alerts_repo: None,
             stability: None,
+            other_principals_hold_revisions: None,
         }
     }
 
@@ -86,6 +98,13 @@ impl MutationSubmitHandler {
     #[must_use]
     pub fn with_alerts_repo(mut self, repo: Arc<dyn SecurityAlertsRepository>) -> Self {
         self.alerts_repo = Some(repo);
+        self
+    }
+
+    /// Attach the reader for [`Self::other_principals_hold_revisions`].
+    #[must_use]
+    pub fn with_other_principals_reader(mut self, reads: OtherPrincipalsHoldRevisionsFn) -> Self {
+        self.other_principals_hold_revisions = Some(reads);
         self
     }
 
@@ -134,6 +153,31 @@ impl IpcHandler for MutationSubmitHandler {
                 return Err(IpcError {
                     code: IpcErrorCode::Forbidden,
                     message: "Verify rules and acknowledge security alert".into(),
+                    diagnostics_id: None,
+                });
+            }
+            // Clearing a blocking alert re-signs EVERY revision row, adopting
+            // whatever each holds today as legitimate. Where the caller is the
+            // only user with revisions — the ordinary single-user machine —
+            // that statement is about their own data and needs no ceremony.
+            // Where somebody else's rows would be adopted too, it is a decision
+            // taken on another person's behalf, and that is what elevation is
+            // for in this product (the same line the shared baseline sits
+            // behind). Note the write path is already administrator-only, so
+            // this is not what stops tampering; it is what stops one user
+            // silently blessing another's rows.
+            if is_alert_mutation
+                && !ctx.caller_is_elevated
+                && mutations_blocked_by_alert(repo.as_ref())
+                && self
+                    .other_principals_hold_revisions
+                    .as_ref()
+                    .is_some_and(|reads| reads(ctx.caller_stored()))
+            {
+                return Err(IpcError {
+                    code: IpcErrorCode::Forbidden,
+                    message: "Clearing this alert also adopts other users' rules —                               administrator rights required"
+                        .into(),
                     diagnostics_id: None,
                 });
             }
@@ -750,6 +794,58 @@ mod tests {
             .expect_err("must be blocked");
         assert_eq!(err.code, IpcErrorCode::Forbidden);
         assert!(err.message.contains("acknowledge"));
+    }
+
+    /// Clearing a blocking alert re-signs EVERY revision row, so on a machine
+    /// where someone else holds revisions it adopts their rules too. That is a
+    /// statement made on another person's behalf, and it costs elevation — the
+    /// same line the shared baseline sits behind.
+    ///
+    /// It is NOT what stops tampering: the state DB is administrator-writable
+    /// only. It stops one user silently blessing another's rows.
+    #[test]
+    fn clearing_the_alert_for_other_users_rows_needs_elevation() {
+        let (h, _t, _o, _e) = make_handler();
+        let h = h
+            .with_alerts_repo(alerts_with_active_tamper())
+            .with_other_principals_reader(Arc::new(|_caller: &str| true));
+        let err = h
+            .handle(
+                &dry_run_envelope(serde_json::json!({
+                    "mutation-kind": "security-alert-ack",
+                    "payload": { "alert-id": "alt-dbtamper-rev-1" },
+                    "dry-run": true,
+                })),
+                &ctx_sid("S-1-5-21-1-2-3-1001"),
+            )
+            .expect_err("an unelevated caller must not adopt another user's rows");
+        assert_eq!(err.code, IpcErrorCode::Forbidden);
+        assert!(err.message.contains("other users"), "{}", err.message);
+    }
+
+    /// The ordinary machine: one user, their own rules, no ceremony. Without
+    /// this half the gate would be indistinguishable from "always ask an
+    /// administrator", which would leave a single non-admin user unable to
+    /// clear an alert raised by nothing worse than a key reset — with every
+    /// mutation blocked until somebody with rights showed up.
+    #[test]
+    fn the_only_user_on_the_machine_clears_their_own_alert_unaided() {
+        let (h, _t, _o, _e) = make_handler();
+        let h = h
+            .with_alerts_repo(alerts_with_active_tamper())
+            .with_other_principals_reader(Arc::new(|_caller: &str| false));
+        let resp = h.handle(
+            &dry_run_envelope(serde_json::json!({
+                "mutation-kind": "security-alert-ack",
+                "payload": { "alert-id": "alt-dbtamper-rev-1" },
+                "dry-run": true,
+            })),
+            &ctx_sid("S-1-5-21-1-2-3-1001"),
+        );
+        assert!(
+            resp.is_ok(),
+            "nobody else's rows are adopted, so nothing to ask for: {resp:?}"
+        );
     }
 
     #[test]

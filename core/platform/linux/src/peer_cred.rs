@@ -95,6 +95,12 @@ pub struct UnixClientIdentity {
     pub uid: u32,
     /// The raw caller gid, retained for audit/diagnostics.
     pub gid: u32,
+    /// File name of the connecting program, read from `/proc/<pid>/exe`, or
+    /// `None` when it could not be read. The Linux answer to "which of our
+    /// surfaces is this" — the counterpart of the Windows classifier's
+    /// basename check, and the reason the client's own declaration cannot
+    /// widen what it may ask for.
+    pub program_name: Option<String>,
 }
 
 /// Classify a connected `AF_UNIX` stream into a [`UnixClientIdentity`], the
@@ -111,7 +117,34 @@ pub fn classify_unix_client(stream: &UnixStream) -> io::Result<UnixClientIdentit
         pid: cred.pid,
         uid: cred.uid,
         gid: cred.gid,
+        program_name: peer_program_name(cred.pid),
     })
+}
+
+/// File name of the program running as `pid`, from `/proc/<pid>/exe`.
+///
+/// `None` when the link cannot be read: the process already exited, or it is
+/// not ours to inspect. Callers must treat `None` as "unknown program" and
+/// pick their most restricted answer — never the most permissive one.
+///
+/// The pid comes from `SO_PEERCRED`, captured by the kernel at connect time,
+/// so it names the process that opened the connection. It can still be gone by
+/// the time this reads `/proc`, and Linux could have reused the number; that is
+/// why the result narrows what a client may ask for and never widens it, and
+/// why identity itself stays with the uid, which cannot be recycled underneath
+/// an open connection.
+pub fn peer_program_name(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let target = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    // A deleted binary reads back as "/path/to/prog (deleted)".
+    let name = target.file_name()?.to_string_lossy();
+    Some(
+        name.strip_suffix(" (deleted)")
+            .unwrap_or(name.as_ref())
+            .to_owned(),
+    )
 }
 
 /// Read the peer credentials of a connected `AF_UNIX` stream via
@@ -191,6 +224,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).expect("create temp dir");
         TempDir(p)
+    }
+
+    /// The classifier must be able to name the program behind a live pid, or
+    /// every caller would fall to the restricted profile and the GUI would stop
+    /// working — the failure mode this lookup has to avoid.
+    #[test]
+    fn the_program_name_of_this_process_is_readable() {
+        let me = peer_program_name(std::process::id() as i32);
+        assert!(me.is_some(), "/proc/self/exe must resolve for our own pid");
+        assert!(!me.unwrap_or_default().is_empty());
+    }
+
+    /// A pid nobody owns must answer "unknown" rather than a wrong program:
+    /// callers turn `None` into their most restricted profile.
+    #[test]
+    fn an_impossible_pid_has_no_program_name() {
+        assert_eq!(peer_program_name(0), None);
+        assert_eq!(peer_program_name(-1), None);
     }
 
     #[test]

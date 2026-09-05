@@ -220,6 +220,11 @@ pub struct InterfaceRowDto {
     /// Collapsing the two would let a missing signal manufacture a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_forwarding_path: Option<bool>,
+    /// The sender could not read IP / gateway / DNS for ANY adapter, so every
+    /// row's `local_ip` is `"-"` because the query failed — not because the
+    /// adapters have no address. Absent on the wire means "the data is real".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_data_unavailable: bool,
     /// `"available"` / `"unavailable"` / `"requires-check"`.
     pub availability: String,
     /// `"primary"` / `"secondary"` / `None` when unbound. The service
@@ -779,6 +784,11 @@ pub struct MergePreviewRequest {
     /// Per-conflict user picks. Empty on the first (preview) call.
     #[serde(default)]
     pub resolutions: Vec<crate::merge_dto::ConflictResolutionDto>,
+    /// Identity keys of matches named in BOTH route sets of one book where the
+    /// user wants the ADDITIONAL route's copy kept instead of the primary one.
+    /// The other half of the same dialog's answers, replayed with them.
+    #[serde(default)]
+    pub keep_secondary: Vec<String>,
     /// The current global "apply rules to child processes" setting, applied
     /// uniformly to app rules during file canonicalisation (must match the
     /// value used at import time so identity keys pair).
@@ -958,6 +968,11 @@ pub struct ReviewSummaryResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CrossSetDuplicateDto {
+    /// Content identity of the pair, echoed back by the merge dialog to say
+    /// which copy should stay enabled. Defaulted rather than required so a
+    /// window built before this field still parses the payload.
+    #[serde(default)]
+    pub identity_key: String,
     pub primary_rule_id: String,
     pub secondary_rule_id: String,
     /// What both copies match, as the user wrote it — what a person recognises
@@ -1368,8 +1383,8 @@ pub enum StatusUpdateEvent {
         /// Image name of the process that tried; empty when unknown.
         app: String,
         /// Reason slug (`"route-unavailable"` / `"not-covered-by-rules"` /
-        /// `"blocked-by-rule"` / `"ipv6-blocked"` / `"unattributed"`), drives
-        /// the notice wording.
+        /// `"blocked-by-rule"` / `"ipv6-blocked"` / `"dns-lockdown"` /
+        /// `"unattributed"`), drives the notice wording.
         reason: String,
         /// Attempts folded into this episode so far.
         attempts: u64,
@@ -2546,6 +2561,14 @@ pub struct DiagnosticsExportArchiveRequest {
     /// before (additive; older clients are unaffected).
     #[serde(default)]
     pub logs_from_ms: Option<i64>,
+    /// Byte cap for the RAW service-log section (`service-logs.ndjson`), the
+    /// lines as written. Mirrors the user's "archive log budget" preference;
+    /// `0` (and absence) means the preset default. The section used to be
+    /// attached by the launcher reading the service's log directory, which is
+    /// why the cap lived there — the service builds it now, so the cap travels
+    /// with the request. Additive: an older service ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_log_budget_bytes: Option<u64>,
 }
 
 impl Default for DiagnosticsExportArchiveRequest {
@@ -2556,6 +2579,7 @@ impl Default for DiagnosticsExportArchiveRequest {
             include_troubleshooting_playbooks: true,
             redaction_level: None,
             logs_from_ms: None,
+            raw_log_budget_bytes: None,
         }
     }
 }
@@ -3041,9 +3065,16 @@ fn secondary_liveness_window_default() -> u32 {
 /// an omitted field meant "quietly fall back to the other mode" instead of
 /// "use the default", which is how a wiped service DB ended up enforcing in a
 /// mode the user never chose.
-fn enforcement_mode_default() -> String {
-    "resolver".to_string()
+pub fn enforcement_mode_default() -> String {
+    ENFORCEMENT_MODE_DEFAULT.to_string()
 }
+
+/// The enforcement mode a service with no stored choice runs in. Public so the
+/// preference mirror and the QML shell can DERIVE it instead of retyping the
+/// slug — three hand-written copies had already drifted into two different
+/// answers, and the odd one out silently put users in a mode the code itself
+/// calls an unsupported historical fallback.
+pub const ENFORCEMENT_MODE_DEFAULT: &str = "resolver";
 
 /// Wire default for `ServiceStabilityConfigDto::cache_refresh_interval_secs`:
 /// 5 minutes. Mirrors `nrr_domain::decision_lookup::CACHE_REFRESH_DEFAULT_SECS`
@@ -3255,14 +3286,16 @@ pub struct TrafficStatsSetRequest {
     pub settings: TrafficStatsSettingsDto,
 }
 
-/// Probing bounds a peer that omits them agrees to. Declared once so the wire,
-/// the stored row and the QML defaults table cannot drift apart — the contract
-/// test compares all three.
 /// IPv6 is cut by default while protection is on — see the field docs.
 fn default_block_ipv6_when_protected() -> bool {
     true
 }
 
+// Probing bounds a peer that omits them agrees to. The same three numbers live
+// in the stored row (`nrr-storage::route_bindings`) and in the QML defaults
+// table, which cannot read Rust; `the_probe_defaults_agree_across_the_wire_and_
+// the_stored_row` and `the_qml_defaults_table_mirrors_the_wire_probe_defaults`
+// hold those copies to these.
 fn default_probe_timeout_ms() -> u32 {
     1500
 }
@@ -3550,6 +3583,13 @@ pub struct AutoRuleCandidateDto {
     /// worth adding.
     #[serde(default)]
     pub anchor_refuses_main_link: bool,
+    /// The hostnames the evidence actually covers, ascending. Every offer is
+    /// written as a suffix, so it reaches names that were never seen; this is
+    /// what WAS seen, so the user confirms an offer rather than a guess.
+    ///
+    /// Additive on the wire: empty (and omitted) for peers that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_members: Vec<String>,
 }
 
 /// `autorules.candidates.list` request — no parameters; the caller's own SID
@@ -4323,6 +4363,7 @@ mod tests {
             consumers_changed_unix_ms: 2,
             primary_behavior: AUTO_RULE_PRIMARY_BEHAVIOR_STALLS.into(),
             anchor_refuses_main_link: false,
+            observed_members: vec!["ledger.other.example".into()],
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         for key in [
@@ -4339,6 +4380,7 @@ mod tests {
             "consumers",
             "consumers-changed-unix-ms",
             "primary-behavior",
+            "observed-members",
         ] {
             assert!(json.get(key).is_some(), "missing wire key {key}");
         }
@@ -4366,6 +4408,7 @@ mod tests {
             consumers_changed_unix_ms: 0,
             primary_behavior: String::new(),
             anchor_refuses_main_link: false,
+            observed_members: Vec::new(),
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         let keys: Vec<&String> = json.as_object().expect("object").keys().collect::<Vec<_>>();

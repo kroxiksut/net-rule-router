@@ -348,19 +348,20 @@ fn reinstall_from_this_binary() -> std::process::ExitCode {
 
 /// Apply a service start mode (shared by the `set-start-auto` /
 /// `set-start-demand` verbs). For `OnAppLaunch` the targeted
-/// `SERVICE_START` grant is added BEFORE the start-type flip, so the service is
-/// never left DemandStart-without-grant (unstartable by the unprivileged
-/// launcher). For `WithWindows` the grant is revoked best-effort afterwards.
+/// `SERVICE_START` grant to `INTERACTIVE` is added BEFORE the start-type flip,
+/// so the service is never left DemandStart-without-grant (unstartable by the
+/// unprivileged launcher). For `WithWindows` the grant is revoked best-effort
+/// afterwards.
 #[cfg(windows)]
 fn apply_start_mode(target: nrr_service_runtime::ServiceStartMode) -> std::process::ExitCode {
     use nrr_service_runtime::ServiceStartMode;
     let result = match target {
-        ServiceStartMode::OnAppLaunch => service_config::grant_console_user_service_start()
+        ServiceStartMode::OnAppLaunch => service_config::grant_interactive_service_start()
             .and_then(|()| service_config::reconfigure_start_mode(target)),
         ServiceStartMode::WithWindows => {
             service_config::reconfigure_start_mode(target).map(|()| {
                 // Best-effort: drop the now-unneeded SERVICE_START grant.
-                if let Err(e) = service_config::revoke_console_user_service_start() {
+                if let Err(e) = service_config::revoke_interactive_service_start() {
                     eprintln!("warning: could not revoke SERVICE_START grant: {e}");
                 }
             })
@@ -488,6 +489,7 @@ fn run_console() -> std::process::ExitCode {
     // Either way the per-SID rule store and the audit trail would sit readable
     // by every local account. Best-effort and idempotent: a failure here is
     // worth a line, not a refusal to start.
+    #[cfg(windows)]
     if let Some(root) = nrr_platform_api::paths::production_data_root() {
         if let Err(e) = nrr_platform_windows::service_control::apply_data_dir_acl(&root) {
             eprintln!("[nrr] data-directory lockdown could not be re-applied: {e}");

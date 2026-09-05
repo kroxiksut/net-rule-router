@@ -90,6 +90,66 @@ pub struct RowFields<'a> {
     pub risk_level: Option<&'a str>,
 }
 
+/// The signed fields of an active-revision pointer.
+///
+/// Separate from [`RowFields`] because it covers a different row, but tagged
+/// through the same key and the same construction: which revision a principal
+/// has ACTIVE is as much a part of the enforced policy as the revision's own
+/// contents, and it lived unsigned while every revision around it was tagged.
+/// Moving the pointer out of band therefore switched the enforced rule set with
+/// nothing to notice — both revisions still verified.
+#[derive(Clone, Copy, Debug)]
+pub struct PointerFields<'a> {
+    pub principal: &'a str,
+    pub revision_id: &'a str,
+    pub activated_at: i64,
+    pub apply_attempt_id: Option<&'a str>,
+}
+
+/// Domain separator. Without it a pointer tag and a revision tag over the same
+/// bytes would be interchangeable.
+const POINTER_DOMAIN: &str = "active-revision-pointer-v1";
+
+/// HMAC over a pointer row, using the same key as [`compute_hmac`].
+#[must_use]
+pub fn compute_pointer_hmac(row: &PointerFields<'_>, key: &[u8]) -> [u8; HMAC_BYTE_LEN] {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        .unwrap_or_else(|_| unreachable!("HMAC accepts a key of any length"));
+    // Length-prefixed like the row tag: without it `principal="ab"` +
+    // `revision_id="c"` and `"a"` + `"bc"` would feed identical bytes.
+    for part in [
+        POINTER_DOMAIN,
+        row.principal,
+        row.revision_id,
+        &row.activated_at.to_string(),
+        row.apply_attempt_id.unwrap_or(""),
+    ] {
+        feed_label(&mut mac, part.as_bytes());
+    }
+    let out = mac.finalize().into_bytes();
+    let mut tag = [0u8; HMAC_BYTE_LEN];
+    tag.copy_from_slice(&out);
+    tag
+}
+
+/// Compare a stored pointer tag with a fresh recomputation. Same three-way
+/// answer as [`verify`]: an empty stored tag is a row written before the
+/// column existed, not a forgery.
+#[must_use]
+pub fn verify_pointer(row: &PointerFields<'_>, stored_hmac: &[u8], key: &[u8]) -> HmacVerification {
+    if stored_hmac.is_empty() {
+        return HmacVerification::Unsigned;
+    }
+    let expected = compute_pointer_hmac(row, key);
+    // Same comparison as `verify`: tamper DETECTION, not authentication of an
+    // attacker-supplied tag, so ordinary equality is enough.
+    if stored_hmac.len() == expected.len() && stored_hmac == expected.as_slice() {
+        HmacVerification::Verified
+    } else {
+        HmacVerification::Tampered
+    }
+}
+
 /// Outcome of comparing a stored HMAC with one we just recomputed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HmacVerification {

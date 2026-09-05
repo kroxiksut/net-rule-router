@@ -366,6 +366,18 @@ impl SamplerAdapterAddressRecorder {
     }
 }
 
+impl SamplerAdapterAddressRecorder {
+    fn warn(op: &str, adapter_key: &str, e: &impl std::fmt::Display) {
+        tracing::warn!(
+            target: "nrr::traffic",
+            error = %e,
+            adapter_key,
+            op,
+            "adapter address store call failed",
+        );
+    }
+}
+
 impl crate::production_handlers_misc::AdapterAddressRecorder for SamplerAdapterAddressRecorder {
     fn record(&self, adapter_key: &str, local_ip: &str, external_ip: &str, observed_at_ms: i64) {
         let sampler = lock_sampler(&self.sampler);
@@ -378,6 +390,28 @@ impl crate::production_handlers_misc::AdapterAddressRecorder for SamplerAdapterA
                 adapter_key,
                 "failed to persist observed adapter address",
             );
+        }
+    }
+
+    fn remembered_local_ip(&self, adapter_key: &str) -> Option<String> {
+        let sampler = lock_sampler(&self.sampler);
+        match sampler.adapter_address(adapter_key) {
+            Ok(row) => row.map(|r| r.local_ip),
+            Err(e) => {
+                Self::warn("read", adapter_key, &e);
+                // Unreadable reads as "nothing remembered", so the caller
+                // leaves the row alone instead of clearing on a hiccup.
+                None
+            }
+        }
+    }
+
+    fn forget_external(&self, adapter_key: &str, local_ip: &str, observed_at_ms: i64) {
+        let sampler = lock_sampler(&self.sampler);
+        if let Err(e) =
+            sampler.forget_adapter_external_address(adapter_key, local_ip, observed_at_ms)
+        {
+            Self::warn("forget-external", adapter_key, &e);
         }
     }
 }

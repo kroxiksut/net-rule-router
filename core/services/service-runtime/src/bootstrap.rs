@@ -358,7 +358,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
 
     // Phase 3a — open + migrate state DB. Service-critical.
     if !report.blocking {
-        match open_and_migrate_state(&topology.state_db_path) {
+        match open_and_migrate_state(&topology.state_db_path, &config.retry) {
             Ok(store) => {
                 // The state store is single-writer (RefCell<Connection>), shared
                 // only via `Arc` for refcount/ownership — never sent across threads.
@@ -424,7 +424,11 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
 
     // Phase 3b — open + migrate cache DB. Rebuildable.
     if !report.blocking {
-        match open_and_migrate_cache(&topology.cache_db_path, &config.freshness_thresholds) {
+        match open_and_migrate_cache(
+            &topology.cache_db_path,
+            &config.freshness_thresholds,
+            &config.retry,
+        ) {
             Ok(store) => {
                 cache_store = Some(store);
                 push(
@@ -450,6 +454,7 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
                     match open_and_migrate_cache(
                         &topology.cache_db_path,
                         &config.freshness_thresholds,
+                        &config.retry,
                     ) {
                         Ok(store) => {
                             cache_store = Some(store);
@@ -679,8 +684,14 @@ enum StateOpenFailure {
     Migrate(String),
 }
 
-fn open_and_migrate_state(path: &Path) -> Result<SqliteStateStore, StateOpenFailure> {
-    let conn = open_connection(path).map_err(|e| StateOpenFailure::Open(e.to_string()))?;
+fn open_and_migrate_state(
+    path: &Path,
+    retry: &RetryPolicy,
+) -> Result<SqliteStateStore, StateOpenFailure> {
+    // Only the OPEN retries. A migration that failed will fail the same way on
+    // the next pass, and repeating it buys nothing but a longer start.
+    let conn = retry_io(retry, || open_connection(path))
+        .map_err(|e| StateOpenFailure::Open(e.to_string()))?;
     let runner = SqliteMigrationRunner::for_state_db(conn);
     runner
         .run_pending_migrations()
@@ -805,8 +816,9 @@ pub fn sweep_signed_orphaned_candidates(
 fn open_and_migrate_cache(
     path: &Path,
     thresholds: &FreshnessThresholds,
+    retry: &RetryPolicy,
 ) -> Result<SqliteCacheStore, String> {
-    let conn = open_connection(path).map_err(|e| e.to_string())?;
+    let conn = retry_io(retry, || open_connection(path)).map_err(|e| e.to_string())?;
     let runner = SqliteMigrationRunner::for_cache_db(conn);
     runner.run_pending_migrations().map_err(|e| e.to_string())?;
     let verification = runner
@@ -863,21 +875,18 @@ fn retry_io<T, E, F>(policy: &RetryPolicy, mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
 {
-    let mut last_err = None;
-    for attempt in 0..policy.max_attempts {
+    // A policy of zero attempts is a configuration mistake, not an instruction
+    // to skip the work: reading it literally meant bootstrap never ran the
+    // operation and then panicked on the error it never collected.
+    let attempts = policy.max_attempts.max(1);
+    for attempt in 0..attempts {
         match op() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                last_err = Some(e);
-                if attempt + 1 < policy.max_attempts {
-                    std::thread::sleep(policy.delay_between_attempts);
-                }
-            }
+            Ok(value) => return Ok(value),
+            Err(e) if attempt + 1 == attempts => return Err(e),
+            Err(_) => std::thread::sleep(policy.delay_between_attempts),
         }
     }
-    // The retry loop runs at least once, so `last_err` is always `Some` here.
-    #[allow(clippy::expect_used)]
-    Err(last_err.expect("at least one attempt"))
+    unreachable!("the loop runs at least once and returns on its last attempt")
 }
 
 #[cfg(test)]
@@ -1137,6 +1146,32 @@ mod tests {
             .expect("cache phase recorded");
         assert_eq!(cache_phase.severity, ServiceHealthSeverity::Ok);
         assert!(cache_phase.message.contains("earlier phase blocking"));
+    }
+
+    /// Zero attempts is a misconfiguration, not "skip the work". Read
+    /// literally it ran nothing and then panicked on the error it never got —
+    /// during bootstrap, which is the one place a panic is fatal to the start.
+    #[test]
+    fn a_policy_of_zero_attempts_still_runs_the_operation_once() {
+        let policy = RetryPolicy {
+            max_attempts: 0,
+            delay_between_attempts: Duration::from_millis(0),
+        };
+        let mut calls = 0;
+        let ok: Result<i32, &str> = retry_io(&policy, || {
+            calls += 1;
+            Ok(7)
+        });
+        assert_eq!(ok, Ok(7));
+        assert_eq!(calls, 1, "exactly one attempt, no panic");
+
+        let mut calls = 0;
+        let err: Result<i32, &str> = retry_io(&policy, || {
+            calls += 1;
+            Err("nope")
+        });
+        assert_eq!(err, Err("nope"), "the failure is returned, not panicked on");
+        assert_eq!(calls, 1);
     }
 
     #[test]

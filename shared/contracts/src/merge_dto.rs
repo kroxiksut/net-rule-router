@@ -249,6 +249,7 @@ mod tests {
             }],
             merged_rules_json: "{}".into(),
             normalized_duplicates: vec![crate::ipc_payloads::CrossSetDuplicateDto {
+                identity_key: "ip:1.1.1.1".into(),
                 primary_rule_id: "r-0001".into(),
                 secondary_rule_id: "r-0002".into(),
                 match_summary: "example.com".into(),
@@ -258,6 +259,8 @@ mod tests {
         assert!(json.contains("\"file-only\""));
         assert!(json.contains("\"type-slug\""));
         assert!(json.contains("\"merged-rules-json\""));
+        // The merge dialog echoes this back to say which copy stays enabled.
+        assert!(json.contains("\"identity-key\""));
         let back: MergeResultDto = serde_json::from_str(&json).unwrap();
         assert_eq!(back, dto);
     }

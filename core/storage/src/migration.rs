@@ -47,8 +47,8 @@ use crate::schema::{
     STATE_DB_V48_DDL, STATE_DB_V49_DDL, STATE_DB_V4_DDL, STATE_DB_V50_DDL, STATE_DB_V51_DDL,
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
-    STATE_DB_V61_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL, STATE_DB_V9_DDL,
-    TRAFFIC_DB_V1_DDL,
+    STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
+    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
 };
 
 // ── schema_migrations bootstrap DDL ──────────────────────────────────────────
@@ -597,6 +597,11 @@ pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
         name: "add_zone_priority_over_ip",
         stmts: STATE_DB_V61_DDL,
     },
+    MigrationDef {
+        version: 62,
+        name: "sign_active_revision_pointer",
+        stmts: STATE_DB_V62_DDL,
+    },
 ];
 
 // ── Required schema elements — used by verify_schema ─────────────────────────
@@ -748,9 +753,21 @@ pub fn open_connection(path: &Path) -> StorageResult<Connection> {
     // file that a crash-cleanup or a restore-from-copy would drop while leaving
     // an intact-looking database behind. Best-effort by design: with another
     // connection open, SQLite refuses to truncate and the next open retries.
-    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+    let _ = checkpoint_wal_truncate(&conn);
 
     Ok(conn)
+}
+
+/// Folds the write-ahead log back into the database file and truncates it.
+///
+/// Same call the connection factory makes on open, exposed for the long-uptime
+/// case: a service that runs for days never re-opens its databases, and WAL's
+/// automatic checkpoint copies pages across without ever shrinking the journal.
+/// A second live connection makes SQLite refuse — the caller treats that as a
+/// no-op and retries on its next pass.
+pub fn checkpoint_wal_truncate(conn: &Connection) -> StorageResult<()> {
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| StorageError::Internal(format!("wal checkpoint: {e}")))
 }
 
 // ── Rebuildable traffic DB — open with delete + rebuild on failure ───────────
@@ -808,12 +825,14 @@ pub struct TrafficDbOpen {
 
 /// Opens the rebuildable traffic-stats database, recovering from corruption.
 ///
-/// The traffic ledger carries no service-critical data, so any first-attempt
+/// The traffic ledger carries no service-critical data, so a first-attempt
 /// failure — structural corruption, a stale migration checksum after an
 /// in-place schema edit, an unreadable file — is resolved by deleting the
 /// database together with its WAL sidecars and rebuilding it from scratch,
 /// exactly once. A failure of the rebuilt open (or of the deletion itself)
-/// is returned to the caller.
+/// is returned to the caller. The one failure that is NOT rebuilt is a
+/// database written by a newer build: it is intact, and erasing it would cost
+/// the user their whole all-time ledger for starting an older binary once.
 pub fn open_traffic_connection_or_rebuild(path: &Path) -> StorageResult<TrafficDbOpen> {
     let first_error = match open_traffic_connection_once(path) {
         Ok(connection) => {
@@ -822,6 +841,11 @@ pub fn open_traffic_connection_or_rebuild(path: &Path) -> StorageResult<TrafficD
                 rebuilt_reason: None,
             });
         }
+        // A database written by a NEWER build is intact, not corrupt: the
+        // rebuild would silently erase the user's whole all-time ledger the
+        // first time they start an older binary. Refuse instead — an
+        // installer downgrade is the caller's problem to report.
+        Err(e @ StorageError::UnsupportedSchemaVersion { .. }) => return Err(e),
         Err(e) => e,
     };
 
@@ -958,18 +982,24 @@ impl MigrationRunner for SqliteMigrationRunner {
         let from_version = {
             let conn = self.conn.borrow();
             ensure_migrations_table(&conn)?;
-            let v = current_version(&conn)?;
-            validate_applied_checksums(&conn, self.migrations, v)?;
-            v
+            current_version(&conn)?
         };
 
         let max_available = self.migrations.iter().map(|m| m.version).max().unwrap_or(0);
 
+        // Before the history is validated: a database written by a newer build
+        // carries migrations this one has never heard of, and "you are running
+        // an older binary" is the diagnosis the caller can act on.
         if from_version > max_available {
             return Err(StorageError::UnsupportedSchemaVersion {
                 found: from_version,
                 max_supported: max_available,
             });
+        }
+
+        {
+            let conn = self.conn.borrow();
+            validate_applied_checksums(&conn, self.migrations, from_version)?;
         }
 
         let pending: Vec<&MigrationDef> = self
@@ -1099,8 +1129,13 @@ fn apply_migration(conn: &mut Connection, migration: &MigrationDef) -> StorageRe
         reason,
     };
 
+    // IMMEDIATE, not the default DEFERRED: a deferred transaction takes its read
+    // snapshot first and asks for the write lock at the first DDL statement, and
+    // a concurrent writer then answers SQLITE_BUSY_SNAPSHOT — which `busy_timeout`
+    // does not retry. Taking the write lock up front puts the wait back under
+    // the timeout.
     let tx = conn
-        .transaction()
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| mk_err(format!("begin transaction: {e}")))?;
 
     for stmt in migration.stmts {
@@ -1150,20 +1185,36 @@ fn validate_applied_checksums(
                 StorageError::Internal(format!("read checksum v{}: {e}", migration.version))
             })?;
 
-        if let Some(stored_checksum) = stored {
-            let computed = checksum_of(migration.stmts);
-            if stored_checksum != computed {
-                return Err(StorageError::MigrationFailed {
-                    from_version: migration.version.saturating_sub(1),
-                    to_version: migration.version,
-                    reason: format!(
-                        "checksum mismatch for migration '{}' (v{}): \
-                         stored={stored_checksum}, computed={computed} — \
-                         migration SQL may have changed after it was applied",
-                        migration.name, migration.version,
-                    ),
-                });
-            }
+        // The version counter is MAX(version), so a row missing below the
+        // maximum means an earlier migration never ran (an interrupted upgrade,
+        // a database restored from a copy). Nothing would ever apply it — the
+        // runner only looks at versions ABOVE the maximum — and the schema is
+        // short exactly whatever that migration created.
+        let Some(stored_checksum) = stored else {
+            return Err(StorageError::MigrationFailed {
+                from_version: migration.version.saturating_sub(1),
+                to_version: migration.version,
+                reason: format!(
+                    "migration '{}' (v{}) is missing from the applied history \
+                     while v{applied_up_to} is recorded as applied — the upgrade \
+                     was interrupted and the schema is incomplete",
+                    migration.name, migration.version,
+                ),
+            });
+        };
+
+        let computed = checksum_of(migration.stmts);
+        if stored_checksum != computed {
+            return Err(StorageError::MigrationFailed {
+                from_version: migration.version.saturating_sub(1),
+                to_version: migration.version,
+                reason: format!(
+                    "checksum mismatch for migration '{}' (v{}): \
+                     stored={stored_checksum}, computed={computed} — \
+                     migration SQL may have changed after it was applied",
+                    migration.name, migration.version,
+                ),
+            });
         }
     }
     Ok(())
@@ -1374,7 +1425,7 @@ mod tests {
         // + v48 (auto_rule_dismissals.dto_json — the refused offer, kept verbatim)
         // + v49 (block_notice_mutes table — durable "do not show" choices)
         // + v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(s.to_version, 61);
+        assert_eq!(s.to_version, 62);
         assert_eq!(
             s.migrations_applied,
             [
@@ -1439,6 +1490,7 @@ mod tests {
                 "add_local_networks_auto_accept",
                 "drop_legacy_revision_singletons",
                 "add_zone_priority_over_ip",
+                "sign_active_revision_pointer",
             ]
         );
     }
@@ -1450,8 +1502,8 @@ mod tests {
 
         runner.run_pending_migrations().expect("first run");
         let s = runner.run_pending_migrations().expect("second run");
-        assert_eq!(s.from_version, 61);
-        assert_eq!(s.to_version, 61);
+        assert_eq!(s.from_version, 62);
+        assert_eq!(s.to_version, 62);
         assert!(s.migrations_applied.is_empty());
     }
 
@@ -1477,7 +1529,7 @@ mod tests {
         let v = runner.verify_schema().expect("verify");
         assert!(v.is_ok(), "state schema verification failed: {v:?}");
         // through v50 (isp_block_candidates_enabled on service_stability_config)
-        assert_eq!(v.version, 61);
+        assert_eq!(v.version, 62);
     }
 
     #[test]
@@ -1730,6 +1782,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn missing_migration_row_below_the_maximum_is_rejected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state.db");
+
+        {
+            let conn = open_connection(&path).expect("open");
+            let runner = SqliteMigrationRunner::for_state_db(conn);
+            runner.run_pending_migrations().expect("first run");
+        }
+
+        // An upgrade that died between two migrations leaves the row of the one
+        // that never committed missing while the maximum stays high.
+        {
+            let conn = open_connection(&path).expect("open for corruption");
+            conn.execute("DELETE FROM schema_migrations WHERE version = 2", [])
+                .expect("drop history row");
+        }
+
+        let conn = open_connection(&path).expect("reopen");
+        let runner = SqliteMigrationRunner::for_state_db(conn);
+        let result = runner.run_pending_migrations();
+        let Err(StorageError::MigrationFailed { reason, .. }) = result else {
+            panic!("expected MigrationFailed for the history gap, got: {result:?}");
+        };
+        assert!(
+            reason.contains("missing from the applied history"),
+            "reason must name the gap, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn complete_history_still_passes_validation() {
+        // Positive control for the gap check above: an untouched database must
+        // migrate and re-open without complaint.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state.db");
+
+        for _ in 0..2 {
+            let conn = open_connection(&path).expect("open");
+            let runner = SqliteMigrationRunner::for_state_db(conn);
+            runner.run_pending_migrations().expect("clean history");
+        }
+    }
+
     // ── traffic DB — delete + rebuild on open/migration failure ──────────────
 
     #[test]
@@ -1795,6 +1892,49 @@ mod tests {
     }
 
     #[test]
+    fn traffic_db_from_a_newer_build_is_refused_not_erased() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_traffic_stats.db");
+
+        {
+            let opened = open_traffic_connection_or_rebuild(&path).expect("first open");
+            opened
+                .connection
+                .execute(
+                    "INSERT INTO interface_identity (adapter_key, display_name, last_seen)
+                     VALUES ('eth0', 'Ethernet', 0)",
+                    [],
+                )
+                .expect("marker row");
+            // A migration this build knows nothing about — what starting the
+            // next release once and then rolling back looks like on disk.
+            opened
+                .connection
+                .execute(
+                    "INSERT INTO schema_migrations
+                     (version, name, applied_at, checksum, app_version)
+                     VALUES (99, 'from_the_future', 0, 'aaaaaaaaaaaaaaaa', '99.0')",
+                    [],
+                )
+                .expect("future migration row");
+        }
+
+        let outcome = open_traffic_connection_or_rebuild(&path).err();
+        assert!(
+            matches!(outcome, Some(StorageError::UnsupportedSchemaVersion { .. })),
+            "a newer schema must be refused, got: {outcome:?}"
+        );
+
+        // The point of refusing: the ledger is still there for the build that
+        // wrote it.
+        let conn = open_connection(&path).expect("reopen");
+        let markers: i64 = conn
+            .query_row("SELECT COUNT(*) FROM interface_identity", [], |r| r.get(0))
+            .expect("query ledger");
+        assert_eq!(markers, 1, "refusing must not erase the ledger");
+    }
+
+    #[test]
     fn traffic_db_garbage_file_is_deleted_and_rebuilt() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("nrr_traffic_stats.db");
@@ -1830,7 +1970,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v1→latest");
         assert_eq!(summary.from_version, 1);
-        assert_eq!(summary.to_version, 61);
+        assert_eq!(summary.to_version, 62);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1894,6 +2034,7 @@ mod tests {
                 "add_local_networks_auto_accept",
                 "drop_legacy_revision_singletons",
                 "add_zone_priority_over_ip",
+                "sign_active_revision_pointer",
             ]
         );
 
@@ -1933,7 +2074,7 @@ mod tests {
 
         let summary = runner.run_pending_migrations().expect("upgrade v2→latest");
         assert_eq!(summary.from_version, 2);
-        assert_eq!(summary.to_version, 61);
+        assert_eq!(summary.to_version, 62);
         assert_eq!(
             summary.migrations_applied,
             [
@@ -1996,6 +2137,7 @@ mod tests {
                 "add_local_networks_auto_accept",
                 "drop_legacy_revision_singletons",
                 "add_zone_priority_over_ip",
+                "sign_active_revision_pointer",
             ]
         );
 

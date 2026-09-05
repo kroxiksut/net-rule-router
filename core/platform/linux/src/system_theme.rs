@@ -22,6 +22,29 @@ impl SystemThemePort for LinuxSystemTheme {
         }
         parse_color_scheme(&String::from_utf8_lossy(&out.stdout))
     }
+
+    fn high_contrast(&self) -> Option<bool> {
+        let out = crate::command::output_with_timeout(
+            "gsettings",
+            &["get", "org.gnome.desktop.a11y.interface", "high-contrast"],
+            crate::command::DEFAULT_COMMAND_TIMEOUT,
+        )
+        .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        parse_boolean(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// `gsettings` prints booleans as bare `true` / `false`. Anything else is a
+/// desktop that does not have the key, which answers "cannot tell".
+fn parse_boolean(value: &str) -> Option<bool> {
+    match value.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 /// `'prefer-dark'` / `'prefer-light'` / `'default'`, quotes included.
@@ -51,6 +74,15 @@ mod tests {
             parse_color_scheme("'prefer-light'\n"),
             Some(SystemAppearance::Light)
         );
+    }
+
+    #[test]
+    fn the_high_contrast_switch_is_read_or_unknown() {
+        assert_eq!(parse_boolean("true\n"), Some(true));
+        assert_eq!(parse_boolean("false\n"), Some(false));
+        // A desktop without the key must not read as "off".
+        assert_eq!(parse_boolean("No such schema\n"), None);
+        assert_eq!(parse_boolean(""), None);
     }
 
     #[test]

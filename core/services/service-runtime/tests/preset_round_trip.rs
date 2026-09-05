@@ -376,6 +376,84 @@ fn preset_export_response_bytes_decode_to_canonical_txt() {
     assert_eq!(out.content_hash_hex.len(), 64);
 }
 
+/// A section name no host of ours parses as rules, so the assertion below means
+/// the same thing on every runner.
+const FOREIGN_SECTION: &str = if cfg!(target_os = "macos") {
+    "Linux"
+} else {
+    "MacOS"
+};
+
+/// Sections this build does not parse survive an export — and vanish when the
+/// caller does not carry them.
+///
+/// The trait spells this out in prose: a revision stores rules and NOTHING
+/// else, so foreign-OS and forward-compatibility blocks live wherever the
+/// caller kept them, and an exporter handed an empty map writes a file that
+/// silently loses them. Prose was all there was; keeping those sections is a
+/// stated product property, and nothing failed if the plumbing went away.
+#[test]
+fn foreign_sections_survive_an_export_only_because_the_caller_carries_them() {
+    let conn = open_state_db();
+    let (executor, _coord) = build_executor(Arc::clone(&conn));
+
+    let imported = format!("--- Domains\nkept.example\n--- {FOREIGN_SECTION}\n/usr/bin/curl\n");
+    let payload = serde_json::json!({
+        "primary-bytes-b64": b64(&imported),
+        "include-child-processes": false,
+    });
+    let stored = nrr_service_runtime::ipc_handlers::mutation_token_store::StoredMutation {
+        kind: MutationKind::PresetImport,
+        payload,
+        correlation_id: None,
+        issuer_sid: String::new(),
+        caller_is_elevated: true,
+    };
+    assert!(matches!(
+        executor.execute(stored, nrr_storage::BASELINE_PRINCIPAL),
+        MutationOutcome::Completed(_)
+    ));
+
+    let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
+        .with_host_app_section(RulesFileSection::Windows);
+
+    // The caller carries the section it kept — the GUI reads it back from its
+    // sidecar — and the export puts it where it was.
+    let mut carried = std::collections::BTreeMap::new();
+    carried.insert(FOREIGN_SECTION.to_string(), "/usr/bin/curl\n".to_string());
+    let with_passthrough = exporter
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &carried,
+        )
+        .expect("export");
+    assert!(
+        with_passthrough
+            .file_bytes_utf8
+            .contains(&format!("--- {FOREIGN_SECTION}")),
+        "the section header is gone:\n{}",
+        with_passthrough.file_bytes_utf8
+    );
+    assert!(with_passthrough.file_bytes_utf8.contains("/usr/bin/curl"));
+    assert!(with_passthrough.file_bytes_utf8.contains("kept.example"));
+
+    // Negative control, and the reason the doc is worded the way it is: with an
+    // empty map the very same revision exports WITHOUT the user's section. The
+    // exporter cannot invent it — the revision never held it.
+    let without = exporter
+        .export_rules_file(
+            nrr_storage::BASELINE_PRINCIPAL,
+            RouteRole::Primary,
+            false,
+            &Default::default(),
+        )
+        .expect("export");
+    assert!(!without.file_bytes_utf8.contains(FOREIGN_SECTION));
+    assert!(without.file_bytes_utf8.contains("kept.example"));
+}
+
 /// A preset the domain accepts must survive the wire it travels on.
 ///
 /// `IMPORT_FILE_SIZE_LIMIT_BYTES` is derived from `IPC_MAX_MESSAGE_BYTES` by

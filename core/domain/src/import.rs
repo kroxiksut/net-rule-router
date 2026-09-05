@@ -236,7 +236,10 @@ pub fn process_import(
         content_hash: request.content_hash,
         diff_summary: None,         // TODO: computed by diff engine
         risk_level: RiskLevel::Low, // TODO: enriched by risk scoring
-        integrity_status: IntegrityStatus::Verified,
+        // Unverified, not Verified: nothing has recomputed a hash over this
+        // content yet — the candidate was built in memory a line ago. Claiming
+        // the verified state here is a claim about a check that never ran.
+        integrity_status: IntegrityStatus::Unverified,
     };
 
     let pending = PendingRevision {

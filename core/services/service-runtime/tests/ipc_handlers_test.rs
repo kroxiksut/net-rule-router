@@ -223,6 +223,7 @@ impl DiagnosticsFacade for FakeDiagnostics {
         &self,
         _filter: &LogEntryFilter,
         _pagination: &PaginationParams,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
         Ok(PageResult::single_page(Vec::new()))
     }
@@ -230,6 +231,7 @@ impl DiagnosticsFacade for FakeDiagnostics {
         &self,
         _filter: &AuditEntryFilter,
         _pagination: &PaginationParams,
+        _audience: &nrr_shared::diagnostics_dto::DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         Ok(PageResult::single_page(Vec::new()))
     }

@@ -217,7 +217,7 @@ GroupBox {
             text: root.tr("settings.field.notify-block-notices",
                 "Tell me when a connection gets blocked")
             checked: root.prefs.notifyBlockNotices !== false
-            onToggled: { root.updatePrefs({ notifyBlockNotices: checked }); root.emitPrefs() }
+            onToggled: root.updatePrefs({ notifyBlockNotices: checked })
         }
         CheckBox {
             Layout.fillWidth: true
@@ -226,7 +226,7 @@ GroupBox {
             text: root.tr("settings.field.notify-rule-duplicates",
                 "Tell me when a rule is set on both routes")
             checked: root.prefs.notifyRuleDuplicates !== false
-            onToggled: root.updatePrefs({ notifyRuleDuplicates: checked })
+            onToggled: { root.updatePrefs({ notifyRuleDuplicates: checked }); root.emitPrefs() }
         }
         // Tray notices are our own window, not system balloons, so their
         // opacity is ours to offer. Indented with the mutes above: it is the
@@ -252,10 +252,7 @@ GroupBox {
                 value: root.prefs.trayNoticeOpacityPercent || 100
                 ToolTip.visible: hovered && root.prefs.tooltipsEnabled
                 ToolTip.text: "40–100 %"
-                onValueModified: {
-                    root.updatePrefs({ trayNoticeOpacityPercent: value })
-                    root.emitPrefs()
-                }
+                onValueModified: root.updatePrefs({ trayNoticeOpacityPercent: value })
             }
             Item { Layout.fillWidth: true }
         }
@@ -504,7 +501,7 @@ GroupBox {
             text: root.tr("settings.field.hide-block-notice-addresses",
                 "Hide addresses in these notifications")
             checked: root.prefs.hideBlockNoticeAddresses === true
-            onToggled: { root.updatePrefs({ hideBlockNoticeAddresses: checked }); root.emitPrefs() }
+            onToggled: root.updatePrefs({ hideBlockNoticeAddresses: checked })
         }
         Label {
             Layout.fillWidth: true

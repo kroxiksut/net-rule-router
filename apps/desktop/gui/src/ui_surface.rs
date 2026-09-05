@@ -8,7 +8,10 @@ use nrr_shared::{
 };
 use nrr_ui_support::first_run::FirstRunFlowSnapshot;
 use nrr_ui_support::theme::resolve_theme;
-use nrr_ui_support::ui_preferences::{canonicalize_language_id, SystemFontFamily, UiPreferences};
+use nrr_ui_support::ui_preferences::{
+    allowed_slug_or, canonicalize_language_id, storable_json_blob_or_empty, storable_line_or,
+    SystemFontFamily, UiPreferences, COMPAT_BANNER_MODES, MERGE_CONFLICT_POLICIES,
+};
 use serde::Deserialize;
 use serde_json::json;
 use std::env;
@@ -109,10 +112,15 @@ fn resolve_logs_directory() -> Option<PathBuf> {
     }
     candidates.push(env::temp_dir().join(leaf).join("logs"));
 
-    // Existing path wins; only fall through to create when nothing
-    // is present (development scenario where the service has never
-    // written anything yet).
-    if let Some(existing) = candidates.iter().find(|p| p.is_dir()) {
+    // Existing path wins — and only if THIS process can actually list it.
+    // The service's log directory is closed to ordinary users, so offering to
+    // open a folder the user cannot read would send them to an empty window
+    // with no explanation; the window shows "unavailable" instead, and the
+    // diagnostics archive is the path that works for everyone.
+    if let Some(existing) = candidates
+        .iter()
+        .find(|p| p.is_dir() && fs::read_dir(p).is_ok())
+    {
         return Some(existing.clone());
     }
     candidates
@@ -208,7 +216,6 @@ fn load_eula_text(language: &str) -> String {
 /// twenty.
 const COLD_START_BACKEND_BUDGET: std::time::Duration = std::time::Duration::from_millis(2500);
 
-#[allow(deprecated)]
 #[allow(clippy::too_many_arguments)] // context emitter threads the full UI surface
 pub fn write_qt_context_file_at(
     file_path: &Path,
@@ -1463,12 +1470,9 @@ fn default_liveness_window_secs() -> u32 {
 }
 
 impl QtPreferencesPayload {
-    // `apply_over` writes the legacy policy fields back into
-    // `UiPreferences` for round-trip parity with Qt's legacy preferences
-    // shape. The launcher's migration flow then zeroes them via
-    // `cleanup_legacy_policy_fields` once the per-SID service-owned
-    // values have been written through IPC.
-    #[allow(deprecated)]
+    // `apply_over` writes the adapter-binding fields back into
+    // `UiPreferences`: the app's own store of what the service enforces per
+    // SID, and what every panel shows while the service is stopped.
     fn apply_over(self, mut current: UiPreferences) -> UiPreferences {
         // Absent means "not reported", never "set it to the type default".
         // These nineteen fields used to be mandatory, so one key missing from
@@ -1585,63 +1589,28 @@ impl QtPreferencesPayload {
             self.route_liveness_window_secs.clamp(5, 3600)
         };
         // Unconditional carry (an EMPTY string means "pending set
-        // applied/discarded" and must clear the stored value). Structural
-        // gate mirrors the ui-support parser: a payload
-        // that is not a single-line `{…}` object (or is oversized) resets to
-        // empty rather than corrupting the line-oriented preferences file.
-        current.route_pending_offline_json = if self.route_pending_offline_json.is_empty()
-            || (self.route_pending_offline_json.len() <= 8 * 1024
-                && self.route_pending_offline_json.starts_with('{')
-                && self.route_pending_offline_json.ends_with('}')
-                && !self.route_pending_offline_json.contains(['\n', '\r']))
-        {
-            self.route_pending_offline_json
-        } else {
-            String::new()
-        };
+        // applied/discarded" and must clear the stored value).
+        current.route_pending_offline_json = storable_json_blob_or_empty(
+            "route_pending_offline_json",
+            self.route_pending_offline_json,
+        );
         // Cache-viewer column widths — unconditional carry (empty clears to
-        // defaults). Same structural gate as the pending-offline blob: a value
-        // that is not a single-line `{…}` object (or is oversized) resets to
-        // empty rather than corrupting the line-oriented preferences file.
-        current.cache_table_column_widths = if self.cache_table_column_widths.is_empty()
-            || (self.cache_table_column_widths.len() <= 8 * 1024
-                && self.cache_table_column_widths.starts_with('{')
-                && self.cache_table_column_widths.ends_with('}')
-                && !self.cache_table_column_widths.contains(['\n', '\r']))
-        {
-            self.cache_table_column_widths
-        } else {
-            String::new()
-        };
+        // defaults).
+        current.cache_table_column_widths = storable_json_blob_or_empty(
+            "cache_table_column_widths",
+            self.cache_table_column_widths,
+        );
         // Last-known service-owned values — unconditional carry (an EMPTY
-        // string is the legitimate "nothing mirrored yet" state). Same
-        // structural gate as the two blobs above: a value that is not a
-        // single-line `{…}` object (or is oversized) resets to empty rather
-        // than corrupting the line-oriented preferences file.
-        current.service_backed_mirror_json = if self.service_backed_mirror_json.is_empty()
-            || (self.service_backed_mirror_json.len() <= 8 * 1024
-                && self.service_backed_mirror_json.starts_with('{')
-                && self.service_backed_mirror_json.ends_with('}')
-                && !self.service_backed_mirror_json.contains(['\n', '\r']))
-        {
-            self.service_backed_mirror_json
-        } else {
-            String::new()
-        };
-        // The user's intent for those same settings — same unconditional
-        // carry and same structural gate. A blob that fails the gate resets to
-        // "no intent recorded"; replaying a half-parsed intent to the service
-        // would be worse than replaying none.
-        current.service_intent_json = if self.service_intent_json.is_empty()
-            || (self.service_intent_json.len() <= 8 * 1024
-                && self.service_intent_json.starts_with('{')
-                && self.service_intent_json.ends_with('}')
-                && !self.service_intent_json.contains(['\n', '\r']))
-        {
-            self.service_intent_json
-        } else {
-            String::new()
-        };
+        // string is the legitimate "nothing mirrored yet" state).
+        current.service_backed_mirror_json = storable_json_blob_or_empty(
+            "service_backed_mirror_json",
+            self.service_backed_mirror_json,
+        );
+        // The user's intent for those same settings. A blob failing the gate
+        // resets to "no intent recorded": replaying a half-parsed intent to the
+        // service would be worse than replaying none.
+        current.service_intent_json =
+            storable_json_blob_or_empty("service_intent_json", self.service_intent_json);
         current.show_bluetooth_adapters = self.show_bluetooth_adapters;
         current.show_audit_tab = self.show_audit_tab;
         // Out-of-range (including the 0 an older QML build emits) keeps whatever
@@ -1702,31 +1671,39 @@ impl QtPreferencesPayload {
         // is `|`-joined exe patterns and must not break the line-oriented
         // prefs file); key absent (older QML) → keep stored.
         if let Some(sig) = self.unenforced_apps_ack_sig {
-            if !sig.contains(['\n', '\r']) {
-                current.unenforced_apps_ack_signature = sig;
-            }
+            current.unenforced_apps_ack_signature = storable_line_or(
+                "unenforced_apps_ack_signature",
+                sig,
+                current.unenforced_apps_ack_signature,
+            );
         }
         // Same shape as the signature above: single line only, absent key
         // keeps what is stored.
         if let Some(sig) = self.rules_overlap_keep_sig {
-            if !sig.contains(['\n', '\r']) {
-                current.rules_overlap_keep_signature = sig;
-            }
+            current.rules_overlap_keep_signature = storable_line_or(
+                "rules_overlap_keep_signature",
+                sig,
+                current.rules_overlap_keep_signature,
+            );
         }
         // Key present → take the value (single line only, so the
         // line-oriented prefs file stays intact); key absent (older QML) →
         // keep stored.
         if let Some(path) = self.confirmed_vpn_exe_path {
-            if !path.contains(['\n', '\r']) {
-                current.confirmed_vpn_exe_path = path;
-            }
+            current.confirmed_vpn_exe_path = storable_line_or(
+                "confirmed_vpn_exe_path",
+                path,
+                current.confirmed_vpn_exe_path,
+            );
         }
         // Key present → take the whole set (single line only); key
         // absent (older QML) → keep stored.
         if let Some(paths) = self.confirmed_vpn_exe_paths {
-            if !paths.contains(['\n', '\r']) {
-                current.confirmed_vpn_exe_paths = paths;
-            }
+            current.confirmed_vpn_exe_paths = storable_line_or(
+                "confirmed_vpn_exe_paths",
+                paths,
+                current.confirmed_vpn_exe_paths,
+            );
         }
         if let Some(section) = self.last_opened_section.as_deref() {
             current.last_opened_section = section
@@ -1755,7 +1732,11 @@ impl QtPreferencesPayload {
         current.auto_load_rules_on_launch = self.auto_load_rules_on_launch;
         current.export_include_comments = self.export_include_comments;
         current.import_only_active = self.import_only_active;
-        current.compat_banner_mode = self.compat_banner_mode;
+        current.compat_banner_mode = allowed_slug_or(
+            &self.compat_banner_mode,
+            &COMPAT_BANNER_MODES,
+            &current.compat_banner_mode,
+        );
         current.update_page_url = self.update_page_url;
         current.show_bundled_presets = self.show_bundled_presets;
         // Key present → take the value (single line only, so the
@@ -1775,7 +1756,11 @@ impl QtPreferencesPayload {
         }
         current.allow_saving_into_bundled_presets = self.allow_saving_into_bundled_presets;
         current.rules_folder_suggestion_dismissed = self.rules_folder_suggestion_dismissed;
-        current.merge_conflict_policy = self.merge_conflict_policy;
+        current.merge_conflict_policy = allowed_slug_or(
+            &self.merge_conflict_policy,
+            &MERGE_CONFLICT_POLICIES,
+            &current.merge_conflict_policy,
+        );
         current.secondary_split_ack_adapter_name = self.secondary_split_ack_adapter_name;
 
         current

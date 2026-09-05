@@ -57,6 +57,7 @@ redd.it  # Discord and community platforms
 *.sc-cdn.net  # Professional and streaming social platforms
 *.bsky.app  # Professional and streaming social platforms
 *.medium.com  # Publishing platform
+*.meduza.io  # Independent news outlet
 
 *.telegram.org  # Foreign messengers and communication tools
 *.t.me  # Foreign messengers and communication tools

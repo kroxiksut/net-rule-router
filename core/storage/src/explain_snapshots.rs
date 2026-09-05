@@ -66,7 +66,7 @@ impl<'c> ExplainSnapshotRepository<'c> {
 
     /// Insert a new snapshot. PRIMARY KEY collision returns
     /// `StorageError::Internal` — `DecisionId` is meant to be unique
-    /// per `DecisionEngine::decide_route` call, so a collision
+    /// per decision, so a collision
     /// indicates upstream bug, not a normal flow.
     pub fn insert(&self, record: &ExplainSnapshotRecord) -> StorageResult<()> {
         self.conn

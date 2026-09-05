@@ -272,6 +272,12 @@ impl TrafficSampler {
         self.store.rows_in_range(from_day, to_day)
     }
 
+    /// Truncates the ledger's write-ahead log — see
+    /// [`SqliteTrafficStore::checkpoint_wal`].
+    pub fn checkpoint_wal(&self) -> StorageResult<()> {
+        self.store.checkpoint_wal()
+    }
+
     /// Retention sweep — drops daily rows older than `cutoff_day`.
     pub fn prune_before(&self, cutoff_day: i64) -> StorageResult<u64> {
         self.store.prune_before(cutoff_day)
@@ -295,6 +301,28 @@ impl TrafficSampler {
 
     /// All persisted adapter address observations — feeds the
     /// `traffic-stats.get` response join.
+    /// The remembered address pair for one adapter, or `None` when nothing was
+    /// ever recorded for it.
+    pub fn adapter_address(
+        &self,
+        adapter_key: &str,
+    ) -> StorageResult<Option<nrr_storage::AdapterAddressRow>> {
+        self.store.adapter_address(adapter_key)
+    }
+
+    /// Drop the remembered EXTERNAL address while keeping the adapter's current
+    /// local one — what to do when the pair turns out to belong to a different
+    /// adapter than the one under this name today.
+    pub fn forget_adapter_external_address(
+        &self,
+        adapter_key: &str,
+        local_ip: &str,
+        observed_at_ms: i64,
+    ) -> StorageResult<()> {
+        self.store
+            .upsert_adapter_address(adapter_key, local_ip, None, observed_at_ms)
+    }
+
     pub fn adapter_addresses(&self) -> StorageResult<Vec<nrr_storage::AdapterAddressRow>> {
         self.store.all_adapter_addresses()
     }

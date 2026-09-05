@@ -136,6 +136,14 @@ const REFRESH_LOOPBACK_BACKOFF_MIN: Duration = Duration::from_secs(60);
 const REFRESH_LOOPBACK_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 
 impl DnsRefreshOrchestrator {
+    /// The shared FQDN-cache handle this orchestrator writes through.
+    ///
+    /// Exposed for the storage-maintenance tick, which needs a periodic WAL
+    /// checkpoint on the same connection rather than a second one.
+    pub fn cache_handle(&self) -> Arc<Mutex<dyn CacheRepository + Send>> {
+        Arc::clone(&self.cache)
+    }
+
     pub fn new(
         resolver: Arc<dyn DnsResolverPort>,
         cache: Arc<Mutex<dyn CacheRepository + Send>>,

@@ -139,6 +139,41 @@ pub trait CacheRepository {
         limit: usize,
     ) -> StorageResult<Vec<ExpiredHostname>>;
 
+    /// Every IPv4 resolution in the cache, as `(canonical_host, ip,
+    /// resolved_at)`, in ONE query.
+    ///
+    /// The filter codegen needs the addresses of thousands of hostnames per
+    /// pass and used to ask for them one hostname at a time — a prepared
+    /// statement, a query and a lock acquisition each, against a table of a few
+    /// thousand rows. On the owner's machine one preview spent 18.9 s doing
+    /// that; the whole table reads in milliseconds.
+    ///
+    /// Rows carry the same join and ordering `get_by_hostname` uses
+    /// (`resolved_at DESC` within a hostname), so a snapshot built from them
+    /// answers exactly what the per-hostname path answers.
+    fn snapshot_ipv4_resolutions(
+        &self,
+    ) -> StorageResult<Vec<(String, std::net::Ipv4Addr, SystemTime)>>;
+
+    /// Every cached hostname as `(canonical_host, last_seen_at_ms)`, in ONE
+    /// query, ordered exactly like [`Self::list_hostnames_under_suffix`]
+    /// (`last_seen_at DESC, canonical_host ASC`).
+    ///
+    /// The order is load-bearing, not cosmetic: suffix fan-out is capped, so it
+    /// decides WHICH hosts of a busy zone earn a permit. A snapshot that sorted
+    /// alphabetically instead would silently re-introduce the defect that
+    /// ordering was changed to fix.
+    ///
+    /// Hostnames with no resolution, and hostnames whose every address has aged
+    /// out, are included — the suffix listing has never filtered on addresses,
+    /// and the caller's "DNS warm-up pending" diagnostic depends on seeing them.
+    fn snapshot_hostnames(&self) -> StorageResult<Vec<(String, i64)>>;
+
+    /// The whole shared-IP census as `(ip, distinct direct hostnames)`, in ONE
+    /// query — the bulk form of [`Self::direct_host_count_for_ip`], for the
+    /// same reason as the snapshot above.
+    fn shared_ip_direct_host_counts(&self) -> StorageResult<Vec<(std::net::Ipv4Addr, u32)>>;
+
     /// List cached canonical hostnames whose name ends with
     /// `.{suffix}`. Used by the WFP filter codegen to fan-out
     /// `SuffixDomain` and `Zone` rules across the live
@@ -266,6 +301,18 @@ pub trait CacheRepository {
     /// Remove expired resolutions, negative cache entries, and old lookup
     /// events according to `policy`.  Runs `periodic_vacuum` when
     /// `policy.run_vacuum` is `true`.
+    ///
+    /// **Nothing schedules this, on purpose.** An expired resolution is not
+    /// waste: the row stays as a reusable network observation (`stale_usable`),
+    /// the DNS refresh re-resolves it in place, and enforcement reads it while
+    /// it does. A periodic sweep would delete rows the enforcement path is
+    /// still looking at, to reclaim space on a table that holds a few thousand
+    /// rows — a risk with nothing on the other side of it.
+    ///
+    /// So this is the caller-driven path (a user asking to clear the cache),
+    /// not a background one, and `CleanupPolicy::run_vacuum` has no production
+    /// writer for the same reason. The journal is kept small by the WAL
+    /// checkpoint on the maintenance tick instead.
     fn cleanup_expired(
         &self,
         now: SystemTime,

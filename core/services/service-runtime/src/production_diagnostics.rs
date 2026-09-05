@@ -58,9 +58,9 @@ use nrr_diagnostics::event::{AuditEvent, LogEvent};
 use nrr_diagnostics::explain::{ExplainDataAvailability, ExplainQuery, ExplainResponse};
 use nrr_diagnostics::facade::dto::{
     AcknowledgeAlertRequest, AuditEntryDto, AuditEntryFilter, CacheHealthCard, ClearLogsRequest,
-    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
-    LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto, SecurityStatusCard,
-    ServiceHealthCard, SetDiagnosticModeRequest,
+    ClearLogsResult, DiagnosticModeStateDto, DiagnosticsAudience, DiagnosticsDataOrigin,
+    DiagnosticsStatusDto, LogEntryDto, LogEntryFilter, LogHealthCard, SecurityAlertDto,
+    SecurityStatusCard, ServiceHealthCard, SetDiagnosticModeRequest,
 };
 use nrr_diagnostics::facade::pagination::{PageCursor, PageResult, PaginationParams};
 use nrr_diagnostics::facade::service::DiagnosticsFacade;
@@ -294,8 +294,9 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         &self,
         filter: &LogEntryFilter,
         pagination: &PaginationParams,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
-        let events = self.scan_sorted_log_events(filter);
+        let events = self.scan_sorted_log_events_for(filter, audience);
         let items: Vec<LogEntryDto> = events.iter().map(log_event_to_dto).collect();
         Ok(paginate(items, pagination, log_entry_position))
     }
@@ -307,11 +308,12 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         &self,
         filter: &LogEntryFilter,
         max_entries: usize,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<Vec<LogEntryDto>> {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
-        let events = self.scan_sorted_log_events(filter);
+        let events = self.scan_sorted_log_events_for(filter, audience);
         let start = events.len().saturating_sub(max_entries);
         let mut items: Vec<LogEntryDto> = events[start..].iter().map(log_event_to_dto).collect();
         items.reverse();
@@ -322,10 +324,18 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         &self,
         filter: &AuditEntryFilter,
         pagination: &PaginationParams,
+        audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
         let reader = AuditReader::new(self.audit_dir.clone());
         let query_filter = audit_filter_to_query(filter);
         let mut events: Vec<AuditEvent> = reader.scan(&query_filter);
+        // Whose events these are is decided here, not by the request. The hash
+        // is computed from the caller's own principal with the same function
+        // the writer used, so "mine" cannot be spelled as somebody else's.
+        if let Some(principal) = audience.principal() {
+            let mine = nrr_diagnostics::audit::actor_id_hash(principal);
+            events.retain(|event| audit_event_is_visible_to(event, mine.as_deref()));
+        }
 
         events.sort_by(|a, b| {
             a.created_at
@@ -335,6 +345,18 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
 
         let items: Vec<AuditEntryDto> = events.iter().map(audit_event_to_dto).collect();
         Ok(paginate(items, pagination, audit_entry_position))
+    }
+
+    fn recent_log_lines_raw(
+        &self,
+        max_bytes: usize,
+        from_ms: Option<i64>,
+        audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<String>> {
+        Ok(
+            nrr_diagnostics::logs::reader::LogReader::new(self.logs_dir.clone())
+                .recent_raw_lines_for(max_bytes, audience.principal(), from_ms),
+        )
     }
 
     fn recent_audit_chain_lines(&self, max_bytes: usize) -> DiagnosticsResult<Vec<String>> {
@@ -432,9 +454,11 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         level: ExplainDetailLevel,
         caller_sid: &str,
     ) -> DiagnosticsResult<ExplainResponse> {
-        // Historical replay needs a persisted `DecisionExplain` snapshot
-        // store (not yet implemented). The
-        // Synthetic path bypasses that by running a minimal rule-match
+        // Historical replay would need persisted decision snapshots, and
+        // nothing produces them: enforcement is generated from the rule book
+        // rather than decided per connection, so there is no per-decision
+        // record to store. The branch answers `DecisionNotFound` rather than
+        // pretending. The synthetic path runs a real rule-match
         // against the current revision's canonical rule book. Compact
         // view fields (`input`, `route_role`, `reason_key`) get
         // populated; the rest stays empty (no lookup section, no
@@ -459,10 +483,26 @@ impl ProductionDiagnosticsFacade {
     /// Scans + filters + sorts (ascending `(created_at, event_id)`) the
     /// operational log events for `filter`. Shared by `list_log_entries`
     /// (paginated) and `recent_log_entries` (newest-first tail selection).
-    fn scan_sorted_log_events(&self, filter: &LogEntryFilter) -> Vec<LogEvent> {
+    /// Scan, ordered, and narrowed to what `audience` may see.
+    ///
+    /// The operational log is ONE machine-wide stream: a line about routing
+    /// carries the principal it was done for, everything else (boot, adapters,
+    /// service lifecycle) belongs to the machine. So a principal-scoped reader
+    /// keeps the machine lines and its own, and nothing of anybody else's.
+    fn scan_sorted_log_events_for(
+        &self,
+        filter: &LogEntryFilter,
+        audience: &DiagnosticsAudience,
+    ) -> Vec<LogEvent> {
         let reader = LogReader::new(self.logs_dir.clone());
         let query_filter = log_filter_to_query(filter);
         let mut events: Vec<LogEvent> = reader.scan(&query_filter);
+        if let Some(principal) = audience.principal() {
+            events.retain(|event| match event.principal.as_deref() {
+                None => true,
+                Some(owner) => owner == principal,
+            });
+        }
 
         // Stable order: ascending (created_at_ms, event_id).
         events.sort_by(|a, b| {
@@ -1099,6 +1139,25 @@ fn log_event_to_dto(event: &LogEvent) -> LogEntryDto {
     }
 }
 
+/// Whether a principal-scoped reader may see `event`.
+///
+/// Two things are visible to everyone: what the SERVICE did on its own behalf
+/// (starts, applies, retention passes — facts about the machine, not about a
+/// person) and events with no actor at all, which are the same thing written
+/// before the actor was recorded. Everything else belongs to whoever performed
+/// it, and only they — or an administrator, who never reaches this function —
+/// get to read it back.
+fn audit_event_is_visible_to(event: &AuditEvent, my_actor_hash: Option<&str>) -> bool {
+    if event.actor_kind == nrr_diagnostics::audit::ActorKind::Service.as_str() {
+        return true;
+    }
+    match (event.actor_id_hash.as_deref(), my_actor_hash) {
+        (None, _) => true,
+        (Some(theirs), Some(mine)) => theirs == mine,
+        (Some(_), None) => false,
+    }
+}
+
 fn audit_event_to_dto(event: &AuditEvent) -> AuditEntryDto {
     AuditEntryDto {
         event_id: event.event_id.clone(),
@@ -1293,6 +1352,26 @@ mod tests {
             .expect("audit append");
     }
 
+    /// An event performed BY a user, hashed the same way the production writer
+    /// hashes it.
+    fn write_user_audit_event(dir: &Path, suffix: &str, principal: &str) {
+        let writer = AuditWriter::open(AuditWriterConfig::new(dir));
+        writer
+            .append(AuditEventInput {
+                event_id: format!("adt-{suffix}"),
+                kind: AuditEventKind::RevisionActivated,
+                created_at: 1_700_000_000_000,
+                actor_kind: ActorKind::User,
+                actor_id_hash: nrr_diagnostics::audit::actor_id_hash(principal),
+                revision_id: Some("rev-1".to_string()),
+                risk_level: None,
+                result: AuditEventResult::Success,
+                reason_code: ReasonCode("apply.completed"),
+                payload_summary_json: Some(r#"{"event":"test"}"#.to_string()),
+            })
+            .expect("audit append");
+    }
+
     #[test]
     fn get_status_reports_individual_cards_with_no_storage_attached() {
         // Degraded boot: cache_conn = None and state_conn = None
@@ -1321,6 +1400,61 @@ mod tests {
         assert!(!status.overall_healthy);
     }
 
+    /// One user must not read another user's audit entries. The trail is a
+    /// machine-wide file the filesystem keeps closed to ordinary users, so an
+    /// unscoped IPC read would hand out what those permissions withhold.
+    #[test]
+    fn a_principal_scoped_read_sees_its_own_events_and_the_services_own() {
+        let dir = TempDir::new().expect("tempdir");
+        let audit_dir = dir.path().join("audit");
+        let logs_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let mine = "S-1-5-21-mine";
+        let theirs = "S-1-5-21-theirs";
+        write_user_audit_event(&audit_dir, "001", mine);
+        write_user_audit_event(&audit_dir, "002", theirs);
+        // The service acting on its own behalf: a fact about the machine.
+        write_audit_event(&audit_dir, "003");
+
+        let facade = make_facade(&audit_dir, &logs_dir);
+        let page = PaginationParams {
+            cursor: None,
+            page_size: 50,
+        };
+        let scoped = facade
+            .list_audit_entries(
+                &AuditEntryFilter::default(),
+                &page,
+                &DiagnosticsAudience::Principal(mine.to_string()),
+            )
+            .expect("scoped read");
+        let ids: Vec<&str> = scoped.items.iter().map(|e| e.event_id.as_str()).collect();
+        assert!(
+            ids.contains(&"adt-001"),
+            "own event must be visible: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"adt-003"),
+            "service event must be visible: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"adt-002"),
+            "another principal's event must not be visible: {ids:?}"
+        );
+
+        // An administrator sees the whole trail — that is what elevation buys.
+        let all = facade
+            .list_audit_entries(
+                &AuditEntryFilter::default(),
+                &page,
+                &DiagnosticsAudience::Machine,
+            )
+            .expect("machine-wide read");
+        assert_eq!(all.items.len(), 3);
+    }
+
     #[test]
     fn list_audit_entries_pages_and_emits_cursor() {
         let dir = TempDir::new().expect("tempdir");
@@ -1338,7 +1472,9 @@ mod tests {
             cursor: None,
             page_size: 2,
         };
-        let page1 = facade.list_audit_entries(&filter, &p1).unwrap();
+        let page1 = facade
+            .list_audit_entries(&filter, &p1, &DiagnosticsAudience::Machine)
+            .unwrap();
         assert_eq!(page1.items.len(), 2);
         assert!(page1.next_cursor.is_some());
         assert_eq!(page1.total_count, Some(5));
@@ -1347,7 +1483,9 @@ mod tests {
             cursor: page1.next_cursor.clone(),
             page_size: 2,
         };
-        let page2 = facade.list_audit_entries(&filter, &p2).unwrap();
+        let page2 = facade
+            .list_audit_entries(&filter, &p2, &DiagnosticsAudience::Machine)
+            .unwrap();
         assert_eq!(page2.items.len(), 2);
         assert!(page2.next_cursor.is_some());
 
@@ -1355,7 +1493,9 @@ mod tests {
             cursor: page2.next_cursor.clone(),
             page_size: 2,
         };
-        let page3 = facade.list_audit_entries(&filter, &p3).unwrap();
+        let page3 = facade
+            .list_audit_entries(&filter, &p3, &DiagnosticsAudience::Machine)
+            .unwrap();
         assert_eq!(page3.items.len(), 1);
         assert!(
             page3.next_cursor.is_none(),
@@ -1372,7 +1512,11 @@ mod tests {
         std::fs::create_dir_all(&logs_dir).unwrap();
         let facade = make_facade(&audit_dir, &logs_dir);
         let r = facade
-            .list_log_entries(&LogEntryFilter::default(), &PaginationParams::default())
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &PaginationParams::default(),
+                &DiagnosticsAudience::Machine,
+            )
             .unwrap();
         assert!(r.items.is_empty());
         assert!(r.next_cursor.is_none());
@@ -1400,6 +1544,69 @@ mod tests {
         }
     }
 
+    /// The operational log is one machine-wide stream, so a line about one
+    /// user's routing must not reach another user's Logs view. Machine-level
+    /// lines — the ones that belong to nobody — stay visible to everyone,
+    /// because without them the view stops being a timeline.
+    #[test]
+    fn a_principal_scoped_log_read_keeps_machine_lines_and_drops_other_users() {
+        use nrr_diagnostics::event::LogEvent;
+        use nrr_diagnostics::reason::service::STARTED;
+        use nrr_diagnostics::taxonomy::EventLevel;
+        use std::io::Write;
+
+        let dir = TempDir::new().expect("tempdir");
+        let audit_dir = dir.path().join("audit");
+        let logs_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let date = nrr_diagnostics::audit::writer::local_date_string(std::time::SystemTime::now());
+        let path = logs_dir.join(format!("nrr_service_{date}-1.ndjson"));
+        let mut file = std::fs::File::create(&path).expect("create log file");
+        let owners = [None, Some("S-1-5-21-mine"), Some("S-1-5-21-theirs")];
+        for (i, owner) in owners.iter().enumerate() {
+            let mut event = LogEvent::new(
+                format!("evt-{i:04}"),
+                1_745_000_000_000 + i as i64 * 1000,
+                EventLevel::Info,
+                STARTED,
+            );
+            event.principal = owner.map(str::to_owned);
+            writeln!(file, "{}", event.to_ndjson().expect("serialize")).expect("write");
+        }
+        drop(file);
+
+        let facade = make_facade(&audit_dir, &logs_dir);
+        let page = PaginationParams {
+            cursor: None,
+            page_size: 50,
+        };
+        let scoped = facade
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &page,
+                &DiagnosticsAudience::Principal("S-1-5-21-mine".to_string()),
+            )
+            .expect("scoped read");
+        let ids: Vec<&str> = scoped.items.iter().map(|e| e.event_id.as_str()).collect();
+        assert!(ids.contains(&"evt-0000"), "machine line missing: {ids:?}");
+        assert!(ids.contains(&"evt-0001"), "own line missing: {ids:?}");
+        assert!(
+            !ids.contains(&"evt-0002"),
+            "another user's line must not be visible: {ids:?}"
+        );
+
+        let all = facade
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &page,
+                &DiagnosticsAudience::Machine,
+            )
+            .expect("machine-wide read");
+        assert_eq!(all.items.len(), 3);
+    }
+
     #[test]
     fn recent_log_entries_returns_newest_first() {
         let dir = TempDir::new().expect("tempdir");
@@ -1410,7 +1617,11 @@ mod tests {
         write_log_events(&logs_dir, 5);
         let facade = make_facade(&audit_dir, &logs_dir);
         let recent = facade
-            .recent_log_entries(&LogEntryFilter::default(), 100)
+            .recent_log_entries(
+                &LogEntryFilter::default(),
+                100,
+                &DiagnosticsAudience::Machine,
+            )
             .expect("recent");
         let ids: Vec<&str> = recent.iter().map(|e| e.event_id.as_str()).collect();
         // Newest (highest created_at) first, i.e. the reverse of the ascending
@@ -1431,7 +1642,7 @@ mod tests {
         write_log_events(&logs_dir, 10);
         let facade = make_facade(&audit_dir, &logs_dir);
         let recent = facade
-            .recent_log_entries(&LogEntryFilter::default(), 3)
+            .recent_log_entries(&LogEntryFilter::default(), 3, &DiagnosticsAudience::Machine)
             .expect("recent");
         let ids: Vec<&str> = recent.iter().map(|e| e.event_id.as_str()).collect();
         // Only the 3 NEWEST, newest-first — never the stale head the pre-0719
@@ -1449,7 +1660,7 @@ mod tests {
         write_log_events(&logs_dir, 3);
         let facade = make_facade(&audit_dir, &logs_dir);
         assert!(facade
-            .recent_log_entries(&LogEntryFilter::default(), 0)
+            .recent_log_entries(&LogEntryFilter::default(), 0, &DiagnosticsAudience::Machine)
             .expect("recent")
             .is_empty());
     }

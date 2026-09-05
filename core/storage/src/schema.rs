@@ -521,6 +521,15 @@ pub const TRAFFIC_DB_V1_DDL: &[&str] = &[
 // ── SQL DDL — nrr_service_state.db ───────────────────────────────────────────
 
 /// DDL for the `active_revision` singleton table.
+///
+/// Dead since the rollback target became DERIVED from `revisions`: nothing
+/// reads or writes either singleton any more. They are still created because
+/// this is the v1 DDL and the migration runner validates a stored checksum per
+/// migration — editing v1 would make every existing database report a failed
+/// history. Two empty tables cost nothing; a false integrity failure costs the
+/// user their service.
+///
+/// Same applies to `last_known_good` below.
 const CREATE_ACTIVE_REVISION: &str = "
 CREATE TABLE IF NOT EXISTS active_revision (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1285,8 +1294,9 @@ pub const STATE_DB_V29_DDL: &[&str] = &[
 /// establishing/maintaining that link (a VPN client is the common case for the
 /// secondary role; a plain Wi-Fi/Ethernet secondary has none). Policy-affecting
 /// per-SID data — this is the service-side SSOT the VPN onboarding dialog
-/// writes to (the `confirmed_vpn_exe_paths` UI preference is a display-only
-/// mirror). Consumed by:
+/// writes to. The `confirmed_vpn_exe_paths` UI preference holds the same picks
+/// device-side and reseeds this table when it comes back empty, so it is a
+/// recovery copy rather than a display mirror. Consumed by:
 /// - kill-switch codegen — each path earns an `ALE_APP_ID` permit in the
 ///   `APP_EXEMPT_BASE` band so the provider app can (re)establish its link
 ///   under any kill-switch posture (the C4 self-blocking class);
@@ -1838,6 +1848,18 @@ pub const STATE_DB_V60_DDL: &[&str] = &[
 pub const STATE_DB_V61_DDL: &[&str] = &[
     "ALTER TABLE secondary_block_policy ADD COLUMN zone_priority_over_ip INTEGER NOT NULL      DEFAULT 0 CHECK(zone_priority_over_ip IN (0, 1))",
 ];
+
+/// State DB v62. Signs the active-revision pointer.
+///
+/// Every `revisions` row carries a `row_hmac`, so editing one out of band is
+/// caught — but WHICH revision is active lived in an unsigned table. Moving the
+/// pointer therefore switched the enforced rule set silently: the revisions it
+/// pointed between both verified perfectly, and integrity had nothing to say.
+///
+/// The column mirrors the one on `revisions`, so the same verification path
+/// covers both and no second alarm mechanism is introduced.
+pub const STATE_DB_V62_DDL: &[&str] =
+    &["ALTER TABLE active_revision_pointer ADD COLUMN row_hmac BLOB NOT NULL DEFAULT x''"];
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

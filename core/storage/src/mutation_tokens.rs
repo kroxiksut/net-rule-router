@@ -26,7 +26,6 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{StorageError, StorageResult};
-use crate::schema::BASELINE_PRINCIPAL;
 
 // ── DTO ───────────────────────────────────────────────────────────────────────
 
@@ -75,24 +74,6 @@ impl<'c> MutationTokenStoreSqlite<'c> {
         Self { conn }
     }
 
-    /// Inserts a new token. Returns an error if the token already
-    /// exists (PRIMARY KEY violation).
-    pub fn issue(
-        &self,
-        token: &str,
-        mutation_payload_json: &str,
-        issued_at: i64,
-        expires_at: i64,
-    ) -> StorageResult<()> {
-        self.issue_for(
-            BASELINE_PRINCIPAL,
-            token,
-            mutation_payload_json,
-            issued_at,
-            expires_at,
-        )
-    }
-
     /// Issue a token scoped to `principal`. The principal is persisted so
     /// [`Self::consume_for`] can reject a cross-principal consume attempt.
     pub fn issue_for(
@@ -131,15 +112,6 @@ impl<'c> MutationTokenStoreSqlite<'c> {
         Ok(())
     }
 
-    /// Atomic consume. Marks `consumed = 1` and returns the payload only
-    /// when the token is unconsumed and not yet expired.
-    ///
-    /// `now` is the caller-supplied wall-clock seconds value used for
-    /// the expiration check.
-    pub fn consume(&self, token: &str, now: i64) -> StorageResult<ConsumeOutcome> {
-        self.consume_inner(token, now, None, |_| true)
-    }
-
     /// Consume `token` only if it was issued for
     /// `principal`. A token belonging to a different principal is reported
     /// as [`ConsumeOutcome::Unknown`] — from the caller's perspective the
@@ -152,6 +124,11 @@ impl<'c> MutationTokenStoreSqlite<'c> {
     /// let a confirmation of one revision activate another. Prefer
     /// [`Self::consume_for_matching`], which cannot be called without stating
     /// what the token has to say.
+    ///
+    /// There is deliberately no principal-blind sibling: the pair that existed
+    /// substituted the ADMIN BASELINE partition when a caller forgot to say who
+    /// the token was for, which is the worst possible default for a forgotten
+    /// argument. Nothing outside this file's own tests ever used them.
     pub fn consume_for(
         &self,
         principal: &str,
@@ -265,6 +242,10 @@ impl<'c> MutationTokenStoreSqlite<'c> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One principal for the storage-level tests. The API takes it explicitly
+    /// now, so the tests state it too rather than leaning on a default.
+    const TEST_PRINCIPAL: &str = "S-1-5-21-TEST";
     use crate::migration::{open_connection, SqliteMigrationRunner};
     use crate::repository::MigrationRunner;
 
@@ -283,7 +264,7 @@ mod tests {
         let store = MutationTokenStoreSqlite::new(&conn);
 
         store
-            .issue("tok-1", r#"{"op":"activate"}"#, 100, 500)
+            .issue_for(TEST_PRINCIPAL, "tok-1", r#"{"op":"activate"}"#, 100, 500)
             .expect("issue");
 
         let row = store.get("tok-1").expect("get").expect("present");
@@ -299,7 +280,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        assert!(store.issue("", "{}", 0, 1).is_err());
+        assert!(store.issue_for(TEST_PRINCIPAL, "", "{}", 0, 1).is_err());
     }
 
     #[test]
@@ -307,8 +288,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        assert!(store.issue("t", "{}", 100, 100).is_err());
-        assert!(store.issue("t", "{}", 100, 50).is_err());
+        assert!(store
+            .issue_for(TEST_PRINCIPAL, "t", "{}", 100, 100)
+            .is_err());
+        assert!(store.issue_for(TEST_PRINCIPAL, "t", "{}", 100, 50).is_err());
     }
 
     #[test]
@@ -316,8 +299,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        store.issue("dup", "{}", 0, 100).expect("first");
-        assert!(store.issue("dup", "{}", 0, 100).is_err());
+        store
+            .issue_for(TEST_PRINCIPAL, "dup", "{}", 0, 100)
+            .expect("first");
+        assert!(store
+            .issue_for(TEST_PRINCIPAL, "dup", "{}", 0, 100)
+            .is_err());
     }
 
     #[test]
@@ -326,8 +313,12 @@ mod tests {
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
 
-        store.issue("tok", r#"{"k":"v"}"#, 100, 500).expect("issue");
-        let outcome = store.consume("tok", 200).expect("consume");
+        store
+            .issue_for(TEST_PRINCIPAL, "tok", r#"{"k":"v"}"#, 100, 500)
+            .expect("issue");
+        let outcome = store
+            .consume_for(TEST_PRINCIPAL, "tok", 200)
+            .expect("consume");
         match outcome {
             ConsumeOutcome::Consumed { payload_json } => {
                 assert_eq!(payload_json, r#"{"k":"v"}"#);
@@ -344,7 +335,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        let outcome = store.consume("ghost", 0).expect("consume");
+        let outcome = store
+            .consume_for(TEST_PRINCIPAL, "ghost", 0)
+            .expect("consume");
         assert_eq!(outcome, ConsumeOutcome::Unknown);
     }
 
@@ -353,9 +346,15 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        store.issue("once", "{}", 0, 1000).expect("issue");
-        let _ = store.consume("once", 100).expect("first consume");
-        let outcome = store.consume("once", 100).expect("second consume");
+        store
+            .issue_for(TEST_PRINCIPAL, "once", "{}", 0, 1000)
+            .expect("issue");
+        let _ = store
+            .consume_for(TEST_PRINCIPAL, "once", 100)
+            .expect("first consume");
+        let outcome = store
+            .consume_for(TEST_PRINCIPAL, "once", 100)
+            .expect("second consume");
         assert_eq!(outcome, ConsumeOutcome::AlreadyConsumed);
     }
 
@@ -364,8 +363,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        store.issue("exp", "{}", 0, 100).expect("issue");
-        let outcome = store.consume("exp", 200).expect("consume");
+        store
+            .issue_for(TEST_PRINCIPAL, "exp", "{}", 0, 100)
+            .expect("issue");
+        let outcome = store
+            .consume_for(TEST_PRINCIPAL, "exp", 200)
+            .expect("consume");
         assert_eq!(outcome, ConsumeOutcome::Expired);
         // Row stays unconsumed for audit visibility.
         let row = store.get("exp").expect("get").expect("present");
@@ -378,9 +381,11 @@ mod tests {
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
 
-        store.issue("old", "{}", 0, 100).expect("issue old");
         store
-            .issue("recent", "{}", 0, 1_000_000)
+            .issue_for(TEST_PRINCIPAL, "old", "{}", 0, 100)
+            .expect("issue old");
+        store
+            .issue_for(TEST_PRINCIPAL, "recent", "{}", 0, 1_000_000)
             .expect("issue recent");
 
         // now=10_000, grace=1_000 → threshold = 9_000. "old" expired at
@@ -400,7 +405,7 @@ mod tests {
         {
             let conn = open_state_db(&dir);
             MutationTokenStoreSqlite::new(&conn)
-                .issue("persistent", r#"{"x":1}"#, 0, 1_000)
+                .issue_for(TEST_PRINCIPAL, "persistent", r#"{"x":1}"#, 0, 1_000)
                 .expect("issue");
         }
         // Reopen and verify the row survived.
@@ -450,13 +455,18 @@ mod tests {
     }
 
     #[test]
-    fn shim_issue_records_baseline_principal() {
+    fn an_issued_token_records_the_principal_it_was_asked_for() {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
-        store.issue("tok", "{}", 0, 100).expect("issue");
+        store
+            .issue_for(TEST_PRINCIPAL, "tok", "{}", 0, 100)
+            .expect("issue");
         let row = store.get("tok").expect("get").expect("present");
-        assert_eq!(row.principal, crate::schema::BASELINE_PRINCIPAL);
+        // The predecessor of this test asserted the opposite: a principal-blind
+        // `issue()` stamped the ADMIN BASELINE partition. The partition is now
+        // whatever the caller named, because there is no way to not name it.
+        assert_eq!(row.principal, TEST_PRINCIPAL);
     }
 
     #[test]
@@ -485,16 +495,26 @@ mod tests {
     }
 
     #[test]
-    fn global_consume_ignores_principal() {
+    fn a_token_is_invisible_to_another_principal() {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let store = MutationTokenStoreSqlite::new(&conn);
         store
             .issue_for("S-1-5-21-A", "tok", "{}", 0, 1000)
             .expect("issue");
-        // The back-compat global consume does not enforce the principal.
+        // Reported as unknown rather than refused: from the other principal's
+        // side the token simply does not exist, which leaks nothing about who
+        // else holds one.
         assert!(matches!(
-            store.consume("tok", 100).expect("consume"),
+            store
+                .consume_for("S-1-5-21-B", "tok", 100)
+                .expect("consume"),
+            ConsumeOutcome::Unknown
+        ));
+        assert!(matches!(
+            store
+                .consume_for("S-1-5-21-A", "tok", 100)
+                .expect("consume"),
             ConsumeOutcome::Consumed { .. }
         ));
     }

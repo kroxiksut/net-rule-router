@@ -54,6 +54,7 @@ youtu.be
 *.linkedin.com
 *.mattermost.com
 *.medium.com
+*.meduza.io
 *.messenger.com
 *.midjourney.com
 *.mistral.ai

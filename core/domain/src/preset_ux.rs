@@ -141,9 +141,9 @@ impl PresetImportGuiAction {
     }
 }
 
-// ── unsupported section badge ─────────────────────────────────────────────────────────
+// ── Extended-section badge ───────────────────────────────────────────────────
 
-/// Display data for a unsupported section shown as a badge row in the rules list.
+/// Display data for an extended section shown as a badge row in the rules list.
 ///
 /// When a preset file contains sections not recognised by the Free edition
 /// (e.g. `--- CIDR`, `--- Ports`), the rules list renders a read-only badge
@@ -158,8 +158,8 @@ impl PresetImportGuiAction {
 /// - Badge label: resolved from [`LOCALE_KEY_BADGE_LABEL`].
 /// - Row tooltip: resolved from [`LOCALE_KEY_BADGE_TOOLTIP`].
 /// - Rules in this section: greyed-out, non-interactive.
-/// - User cannot add, edit, or delete rules in a unsupported section.
-/// - Presence of a unsupported section is **not** an import error; import proceeds normally.
+/// - User cannot add, edit, or delete rules in an extended section.
+/// - Presence of an extended section is **not** an import error; import proceeds normally.
 /// - The section is shown only in read-only preview mode; not in the editing surface.
 ///
 /// # Construction
@@ -190,7 +190,7 @@ impl ExtendedSectionDisplayItem {
     /// Locale key for the per-rule "inactive" hint shown on each rule row.
     pub const LOCALE_KEY_INACTIVE_HINT: &'static str = "rules.extended-section.inactive-hint";
 
-    /// Locale key for the import-time warning that a unsupported section was skipped.
+    /// Locale key for the import-time warning that an extended section was skipped.
     ///
     /// Shown in the import result summary when `AcceptedWithWarnings` includes
     /// an `UnknownSection` warning.

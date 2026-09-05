@@ -1,31 +1,12 @@
 use nrr_shared::{
-    FreeRuleListType, FreeRuleType, RouteRole, RuleFormFieldId, RuleScenario, RulesEnabledFilter,
-    RulesFileChangeBehavior, RulesTypeFilter, RulesViewSort,
+    FreeRuleType, RouteRole, RuleScenario, RulesEnabledFilter, RulesTypeFilter, RulesViewSort,
 };
-
-/// Shown only by the preview (mock) backend — the service-backed path takes its
-/// notice from the locale catalogue. No block numbers in shipped strings.
-pub const RULES_PREVIEW_NOTICE: &str =
-    "Preview mode: rules are not validated or applied until the background service is running.";
 
 const SUPPORTED_FREE_RULE_TYPES: [FreeRuleType; 4] = [
     FreeRuleType::Application,
     FreeRuleType::Domain,
     FreeRuleType::Zone,
     FreeRuleType::ExactIp,
-];
-
-const RULE_SCENARIOS: [RuleScenario; 5] = [
-    RuleScenario::Create,
-    RuleScenario::Edit,
-    RuleScenario::Delete,
-    RuleScenario::Reorder,
-    RuleScenario::Search,
-];
-
-const SUPPORTED_LIST_TYPES: [FreeRuleListType; 2] = [
-    FreeRuleListType::SingleActiveManagedList,
-    FreeRuleListType::ImportedPresetReplacingActiveList,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,75 +30,32 @@ pub struct RuleRowPreview {
     pub match_value: &'static str,
     pub target_route: RouteRole,
     pub comment: &'static str,
+    /// Which per-OS section an application rule lives in (`--- Windows`,
+    /// `--- Linux`, `--- MacOS`); `None` for every other rule type, which is
+    /// platform-neutral.
+    ///
+    /// Without it the preview had no way to honour what
+    /// `RulesTypeFilter::Application` promises — "the current platform's
+    /// section" — so it answered with `.exe` names on Linux and left the Linux
+    /// filter permanently empty.
+    pub app_section: Option<RulesTypeFilter>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuleFormFieldPreview {
-    pub id: RuleFormFieldId,
-    pub required: bool,
-    pub constraint_hint: &'static str,
+/// The application section THIS build calls "the current platform".
+///
+/// `RulesTypeFilter::Application` is host-relative by contract; spelling the
+/// roles out as Windows-is-native is what made the preview wrong off Windows.
+const fn native_app_section() -> RulesTypeFilter {
+    if cfg!(target_os = "windows") {
+        RulesTypeFilter::Windows
+    } else if cfg!(target_os = "linux") {
+        RulesTypeFilter::Linux
+    } else {
+        RulesTypeFilter::MacOS
+    }
 }
 
-const FORM_FIELDS: [RuleFormFieldPreview; 5] = [
-    RuleFormFieldPreview {
-        id: RuleFormFieldId::RuleType,
-        required: true,
-        constraint_hint:
-            "Select one supported Free type: application, exact FQDN, suffix/subdomain, exact IP.",
-    },
-    RuleFormFieldPreview {
-        id: RuleFormFieldId::MatchValue,
-        required: true,
-        constraint_hint: "1..255 chars; exact FQDN/IP must not contain wildcard.",
-    },
-    RuleFormFieldPreview {
-        id: RuleFormFieldId::TargetRoute,
-        required: true,
-        constraint_hint: "Allowed targets are Primary route and Secondary route.",
-    },
-    RuleFormFieldPreview {
-        id: RuleFormFieldId::Enabled,
-        required: false,
-        constraint_hint: "Boolean toggle; new rule starts as enabled.",
-    },
-    RuleFormFieldPreview {
-        id: RuleFormFieldId::Comment,
-        required: false,
-        constraint_hint: "Optional note up to 256 chars.",
-    },
-];
-
-const LOAD_DIALOG_FIELDS: [&str; 7] = [
-    "File path",
-    "Format",
-    "Schema version",
-    "Parsed summary",
-    "Replace current list",
-    "Load action",
-    "Cancel action",
-];
-
-const EDIT_DIALOG_FIELDS: [&str; 7] = [
-    "List name",
-    "Description",
-    "Rules set",
-    "Rules order",
-    "Default mode",
-    "Save action",
-    "Cancel action",
-];
-
-const REVIEW_DIALOG_FIELDS: [&str; 7] = [
-    "Incoming list name",
-    "Incoming rules count",
-    "Current rules count",
-    "Default mode difference",
-    "New rule types summary",
-    "Replace action",
-    "Cancel action",
-];
-
-const RULE_ROWS: [RuleRowPreview; 6] = [
+const RULE_ROWS: [RuleRowPreview; 8] = [
     RuleRowPreview {
         id: "R-0001",
         enabled: true,
@@ -125,6 +63,7 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "browser.exe",
         target_route: RouteRole::Secondary,
         comment: "Browser traffic to secondary route.",
+        app_section: Some(RulesTypeFilter::Windows),
     },
     RuleRowPreview {
         id: "R-0002",
@@ -133,6 +72,7 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "updates.example.org",
         target_route: RouteRole::Secondary,
         comment: "Vendor updates domain and all subdomains.",
+        app_section: None,
     },
     RuleRowPreview {
         // All IDs are zero-padded to 4 digits so the GUI's id-collision
@@ -145,6 +85,7 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "corp.example.net",
         target_route: RouteRole::Primary,
         comment: "Internal corporate domain and all subdomains.",
+        app_section: None,
     },
     RuleRowPreview {
         id: "R-0004",
@@ -153,6 +94,7 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "203.0.113.7",
         target_route: RouteRole::Secondary,
         comment: "Temporary exact IP routing override.",
+        app_section: None,
     },
     RuleRowPreview {
         id: "R-0005",
@@ -161,6 +103,7 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "powershell.exe",
         target_route: RouteRole::Primary,
         comment: "Maintenance script traffic on primary route.",
+        app_section: Some(RulesTypeFilter::Windows),
     },
     // Demo zone rule for routing-probe testing. Free tier supports
     // domain-suffix zones (TLD or internal-suffix) as a first-class
@@ -174,18 +117,30 @@ const RULE_ROWS: [RuleRowPreview; 6] = [
         match_value: "ru",
         target_route: RouteRole::Primary,
         comment: "Russian-zone domains to primary route (demo).",
+        app_section: None,
+    },
+    // One application rule per OS section, so the preview shows the feature on
+    // every host instead of only on Windows — and so the "other OS" filters
+    // have something to demonstrate.
+    RuleRowPreview {
+        id: "R-0007",
+        enabled: true,
+        rule_type: FreeRuleType::Application,
+        match_value: "firefox",
+        target_route: RouteRole::Secondary,
+        comment: "Browser traffic to secondary route.",
+        app_section: Some(RulesTypeFilter::Linux),
+    },
+    RuleRowPreview {
+        id: "R-0008",
+        enabled: true,
+        rule_type: FreeRuleType::Application,
+        match_value: "Safari",
+        target_route: RouteRole::Secondary,
+        comment: "Browser traffic to secondary route.",
+        app_section: Some(RulesTypeFilter::MacOS),
     },
 ];
-
-/// A preview of a cross-set duplicate: the same match target appears in both
-/// the primary and secondary rule sets, so the user must decide how to resolve it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DuplicateConflictPreview {
-    /// ID of the conflicting rule in the primary set.
-    pub primary_rule_id: String,
-    /// ID of the conflicting rule in the secondary set.
-    pub secondary_rule_id: String,
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RulesScreenRequest {
@@ -196,49 +151,17 @@ pub struct RulesScreenRequest {
     pub scenario: Option<RuleScenario>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LoadListDialogPreview {
-    pub fields: &'static [&'static str],
-    pub accepted_formats: &'static [&'static str],
-    pub requires_review_before_replace: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EditListDialogPreview {
-    pub fields: &'static [&'static str],
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReplaceReviewDialogPreview {
-    pub fields: &'static [&'static str],
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RulesScreenPreviewSnapshot {
     pub data_source: RulesDataSource,
-    pub preview_notice: &'static str,
     pub applied_search_query: Option<String>,
     pub applied_type_filter: Option<RulesTypeFilter>,
     pub applied_enabled_filter: RulesEnabledFilter,
     pub applied_sort_mode: RulesViewSort,
     pub active_scenario: RuleScenario,
     pub supported_rule_types: &'static [FreeRuleType],
-    pub supported_list_types: &'static [FreeRuleListType],
-    pub placeholder_scenarios: &'static [RuleScenario],
-    pub form_fields: &'static [RuleFormFieldPreview],
     /// Visible rows after search, type-filter, enabled-filter, and sort are applied.
     pub rows: Vec<RuleRowPreview>,
-    /// Cross-set duplicate conflicts the user must resolve. Empty in this preview seed.
-    pub duplicate_conflicts: Vec<DuplicateConflictPreview>,
-    pub load_list_dialog: LoadListDialogPreview,
-    pub edit_list_dialog: EditListDialogPreview,
-    pub replace_review_dialog: ReplaceReviewDialogPreview,
-    /// Active file-change behavior setting for this preview seed.
-    pub file_change_behavior: RulesFileChangeBehavior,
-    /// Whether a file change was detected since the rules were last applied.
-    /// Always `false` in the preview seed — real detection is wired in the
-    /// service-backed implementation.
-    pub has_pending_file_change: bool,
 }
 
 pub fn rules_screen_preview_snapshot(request: RulesScreenRequest) -> RulesScreenPreviewSnapshot {
@@ -254,31 +177,13 @@ pub fn rules_screen_preview_snapshot(request: RulesScreenRequest) -> RulesScreen
 
     RulesScreenPreviewSnapshot {
         data_source: RulesDataSource::PreviewSeed,
-        preview_notice: RULES_PREVIEW_NOTICE,
         applied_search_query: normalized_query,
         applied_type_filter: request.type_filter,
         applied_enabled_filter: enabled_filter,
         applied_sort_mode: sort_mode,
         active_scenario: request.scenario.unwrap_or(RuleScenario::Search),
         supported_rule_types: &SUPPORTED_FREE_RULE_TYPES,
-        supported_list_types: &SUPPORTED_LIST_TYPES,
-        placeholder_scenarios: &RULE_SCENARIOS,
-        form_fields: &FORM_FIELDS,
         rows,
-        duplicate_conflicts: Vec::new(),
-        load_list_dialog: LoadListDialogPreview {
-            fields: &LOAD_DIALOG_FIELDS,
-            accepted_formats: &["yaml", "yml"],
-            requires_review_before_replace: true,
-        },
-        edit_list_dialog: EditListDialogPreview {
-            fields: &EDIT_DIALOG_FIELDS,
-        },
-        replace_review_dialog: ReplaceReviewDialogPreview {
-            fields: &REVIEW_DIALOG_FIELDS,
-        },
-        file_change_behavior: RulesFileChangeBehavior::default(),
-        has_pending_file_change: false,
     }
 }
 
@@ -288,7 +193,10 @@ fn normalize_search_query(query: Option<String>) -> Option<String> {
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_ascii_lowercase())
+        // Unicode case folding, not ASCII: Russian is a baseline locale here,
+        // and `to_ascii_lowercase` leaves «Корп» as it is, so it never matches
+        // a rule commented «корп».
+        Some(trimmed.to_lowercase())
     }
 }
 
@@ -306,10 +214,14 @@ fn build_rows(
             Some(RulesTypeFilter::Domain) => row.rule_type == FreeRuleType::Domain,
             Some(RulesTypeFilter::Zones) => row.rule_type == FreeRuleType::Zone,
             Some(RulesTypeFilter::ExactIp) => row.rule_type == FreeRuleType::ExactIp,
-            Some(RulesTypeFilter::Application | RulesTypeFilter::Windows) => {
-                row.rule_type == FreeRuleType::Application
-            }
-            Some(RulesTypeFilter::Linux | RulesTypeFilter::MacOS) => false,
+            // Host-relative, as the contract says: `Application` is whichever
+            // per-OS section this build calls its own.
+            Some(RulesTypeFilter::Application) => row.app_section == Some(native_app_section()),
+            Some(
+                section @ (RulesTypeFilter::Windows
+                | RulesTypeFilter::Linux
+                | RulesTypeFilter::MacOS),
+            ) => row.app_section == Some(section),
         })
         .filter(|row| match enabled_filter {
             RulesEnabledFilter::All => true,
@@ -339,9 +251,10 @@ fn build_rows(
 }
 
 fn row_matches_query(row: &RuleRowPreview, query: &str) -> bool {
-    row.id.to_ascii_lowercase().contains(query)
-        || row.match_value.to_ascii_lowercase().contains(query)
-        || row.comment.to_ascii_lowercase().contains(query)
+    // Folded the same way as the query — see `normalize_search_query`.
+    row.id.to_lowercase().contains(query)
+        || row.match_value.to_lowercase().contains(query)
+        || row.comment.to_lowercase().contains(query)
 }
 
 #[cfg(test)]
@@ -350,22 +263,10 @@ mod tests {
     use nrr_shared::{RuleScenario, RulesTypeFilter};
 
     #[test]
-    fn rules_snapshot_exposes_free_rule_types_scenarios_and_dialogs() {
+    fn rules_snapshot_exposes_the_free_rule_types() {
         let snapshot = rules_screen_preview_snapshot(RulesScreenRequest::default());
         assert_eq!(snapshot.supported_rule_types.len(), 4);
-        assert_eq!(snapshot.supported_list_types.len(), 2);
-        assert!(snapshot
-            .placeholder_scenarios
-            .contains(&RuleScenario::Create));
-        assert!(snapshot
-            .placeholder_scenarios
-            .contains(&RuleScenario::Delete));
-        assert_eq!(snapshot.form_fields.len(), 5);
-        assert_eq!(snapshot.rows.len(), 6);
-        assert!(snapshot.load_list_dialog.requires_review_before_replace);
-        assert_eq!(snapshot.load_list_dialog.accepted_formats, &["yaml", "yml"]);
-        assert_eq!(snapshot.edit_list_dialog.fields.len(), 7);
-        assert_eq!(snapshot.replace_review_dialog.fields.len(), 7);
+        assert_eq!(snapshot.rows.len(), super::RULE_ROWS.len());
     }
 
     #[test]
@@ -382,8 +283,82 @@ mod tests {
             snapshot.applied_type_filter,
             Some(RulesTypeFilter::Application)
         );
+        // Host-relative, like the filter itself: each OS section carries one
+        // browser rule, and `Application` must answer with THIS host's. Naming
+        // `R-0001` outright passed on a Windows runner and asserted the defect
+        // everywhere else.
         assert_eq!(snapshot.rows.len(), 1);
-        assert_eq!(snapshot.rows[0].id, "R-0001");
+        assert_eq!(
+            snapshot.rows[0].app_section,
+            Some(super::native_app_section())
+        );
+    }
+
+    /// The contract calls `Application` "the current platform's section", and
+    /// `Linux` / `MacOS` the explicit other-OS filters. Before this the seed
+    /// answered `Application` with `.exe` names on every host and left both
+    /// other-OS filters permanently empty.
+    #[test]
+    fn each_os_section_answers_with_its_own_rules() {
+        let listed = |filter: RulesTypeFilter| {
+            rules_screen_preview_snapshot(RulesScreenRequest {
+                search_query: None,
+                type_filter: Some(filter),
+                enabled_filter: None,
+                sort_mode: None,
+                scenario: None,
+            })
+            .rows
+        };
+
+        for section in [
+            RulesTypeFilter::Windows,
+            RulesTypeFilter::Linux,
+            RulesTypeFilter::MacOS,
+        ] {
+            let rows = listed(section);
+            assert!(
+                !rows.is_empty(),
+                "{section:?} has nothing to demonstrate the feature with"
+            );
+            assert!(
+                rows.iter().all(|r| r.app_section == Some(section)),
+                "{section:?} answered with another section's rules"
+            );
+        }
+
+        let native = listed(RulesTypeFilter::Application);
+        assert_eq!(native, listed(super::native_app_section()));
+    }
+
+    /// ASCII case folding leaves Cyrillic alone, so an uppercase query never
+    /// matched a lowercase rule — in a product whose baseline locale is Russian.
+    /// The preview rows are English, so the Cyrillic half is proven on the
+    /// folding itself and the matching half on a Latin row.
+    #[test]
+    fn search_folds_case_for_cyrillic_not_only_latin() {
+        assert_eq!(
+            super::normalize_search_query(Some("  BROWSER ".to_string())).as_deref(),
+            Some("browser")
+        );
+        assert_eq!(
+            super::normalize_search_query(Some("\u{041a}\u{043e}\u{0440}\u{043f}".to_string()))
+                .as_deref(),
+            Some("\u{043a}\u{043e}\u{0440}\u{043f}"),
+            "an uppercase Cyrillic query must fold like a Latin one"
+        );
+
+        let snapshot = rules_screen_preview_snapshot(RulesScreenRequest {
+            search_query: Some("BROWSER".to_string()),
+            type_filter: None,
+            enabled_filter: None,
+            sort_mode: None,
+            scenario: Some(RuleScenario::Search),
+        });
+        assert!(
+            !snapshot.rows.is_empty(),
+            "an uppercase query must match a lowercase comment"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ impl LogsListHandler {
 }
 
 impl IpcHandler for LogsListHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         let req: LogsListRequest = if request.payload.is_null() {
             LogsListRequest::default()
         } else {
@@ -34,7 +34,7 @@ impl IpcHandler for LogsListHandler {
 
         let page: LogsListResponse = self
             .diagnostics
-            .list_log_entries(&req.filter, &req.pagination)
+            .list_log_entries(&req.filter, &req.pagination, &ctx.diagnostics_audience())
             .map_err(|e| IpcError {
                 code: IpcErrorCode::Internal,
                 message: format!("logs.list facade error: {e}"),

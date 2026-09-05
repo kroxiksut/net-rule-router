@@ -29,21 +29,13 @@ pub mod canonical;
 // so the application can propose routing them the same way. Pure and lazy —
 // see the module docs for the "never on the data path" contract.
 pub mod companion_affinity;
-pub mod decision_availability;
-pub mod decision_engine;
 pub mod decision_engine_input;
 pub mod decision_explain;
-pub mod decision_fail_policy;
-pub mod decision_final_action;
 pub mod decision_lookup;
 pub mod decision_matching;
 pub mod decision_normalization;
 pub mod decision_pipeline;
 pub mod decision_rules_matching;
-// Pure cross-module scenario tests (no production items) — compiled only for
-// test builds so its helpers/imports don't read as dead code in a lib build.
-#[cfg(test)]
-mod decision_scenarios;
 pub mod enforcement_mode;
 pub mod extension_channel;
 pub mod import;
@@ -196,8 +188,7 @@ impl fmt::Display for RuleId {
 /// # ExactIp semantics
 ///
 /// `ExactIp(addr)` matches only the exact IPv4 address. CIDR and IPv6 are
-/// unsupported. `IpAddr::V6` inputs are rejected at normalization
-/// time as unsupported unsupported.
+/// unsupported. `IpAddr::V6` inputs are rejected at normalization time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AddressMatch {
     /// Matches the exact FQDN only (runtime priority tier 1 — highest).

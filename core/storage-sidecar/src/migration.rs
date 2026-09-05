@@ -99,10 +99,12 @@ pub struct MigrationSummary {
 ///
 /// 1. Ensure the `schema_migrations` table exists.
 /// 2. Read the current version (`MAX(version)`); zero when empty.
-/// 3. Re-validate stored checksums against current embedded SQL.
-///    A mismatch returns [`SidecarError::MigrationCorrupted`].
-/// 4. Refuse to open if `current > LATEST_SCHEMA_VERSION`
-///    ([`SidecarError::SchemaTooNew`]).
+/// 3. Refuse to open if `current > LATEST_SCHEMA_VERSION`
+///    ([`SidecarError::SchemaTooNew`]) — before the history is judged, so a
+///    database from a newer build is named as such.
+/// 4. Re-validate the applied history against the currently-embedded SQL: a
+///    changed checksum OR a missing row below the maximum returns
+///    [`SidecarError::MigrationCorrupted`].
 /// 5. For each pending migration in order: open a transaction,
 ///    execute the DDL statements, insert the bookkeeping row,
 ///    commit.
@@ -113,14 +115,19 @@ pub struct MigrationSummary {
 pub fn migrate(conn: &mut Connection) -> SidecarResult<MigrationSummary> {
     ensure_migrations_table(conn)?;
     let from_version = current_version(conn)?;
-    validate_applied_checksums(conn, from_version)?;
 
+    // Before the history is validated. A database written by a NEWER build
+    // carries migrations this one has never heard of, and "you are running an
+    // older binary" is the diagnosis the caller can act on — checking it second
+    // reported a missing v1 instead.
     if from_version > LATEST_SCHEMA_VERSION {
         return Err(SidecarError::SchemaTooNew {
             found: from_version,
             supported: LATEST_SCHEMA_VERSION,
         });
     }
+
+    validate_applied_checksums(conn, from_version)?;
 
     let pending: Vec<&MigrationDef> = MIGRATIONS
         .iter()
@@ -163,14 +170,18 @@ fn current_version(conn: &Connection) -> SidecarResult<u32> {
     if table_exists == 0 {
         return Ok(0);
     }
-    let max_version: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    Ok(u32::try_from(max_version).unwrap_or(0))
+    let max_version: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |r| r.get(0),
+    )?;
+    // Not `unwrap_or(0)`. A version this build cannot make sense of used to
+    // read as "fresh database", so the v1 DDL ran again and the caller got
+    // `table already exists` from SQLite instead of a typed answer about the
+    // schema — the one thing the version column is for.
+    u32::try_from(max_version).map_err(|_| SidecarError::MigrationCorrupted {
+        detail: format!("schema_migrations holds an impossible version {max_version}"),
+    })
 }
 
 /// Re-compute checksums for migrations already applied and compare
@@ -188,16 +199,28 @@ fn validate_applied_checksums(conn: &Connection, applied_up_to: u32) -> SidecarR
                 |r| r.get(0),
             )
             .optional()?;
-        if let Some(stored) = stored {
-            let computed = checksum_of(migration.stmts);
-            if stored != computed {
-                return Err(SidecarError::MigrationCorrupted {
-                    detail: format!(
-                        "checksum mismatch for v{} ({}): stored={stored}, computed={computed}",
-                        migration.version, migration.name,
-                    ),
-                });
-            }
+        // A row missing BELOW the maximum means an earlier migration never ran:
+        // the version counter is `MAX(version)` and the runner only applies what
+        // is above it, so nothing would ever apply it and the schema is short
+        // whatever it created. Tolerating the `None` here made an interrupted
+        // upgrade look like a clean one.
+        let Some(stored) = stored else {
+            return Err(SidecarError::MigrationCorrupted {
+                detail: format!(
+                    "migration v{} ({}) is missing from the applied history while \
+                     v{applied_up_to} is recorded as applied",
+                    migration.version, migration.name,
+                ),
+            });
+        };
+        let computed = checksum_of(migration.stmts);
+        if stored != computed {
+            return Err(SidecarError::MigrationCorrupted {
+                detail: format!(
+                    "checksum mismatch for v{} ({}): stored={stored}, computed={computed}",
+                    migration.version, migration.name,
+                ),
+            });
         }
     }
     Ok(())
@@ -205,12 +228,19 @@ fn validate_applied_checksums(conn: &Connection, applied_up_to: u32) -> SidecarR
 
 /// Execute one migration step atomically.
 fn apply_migration(conn: &mut Connection, migration: &MigrationDef) -> SidecarResult<()> {
-    let tx = conn.transaction()?;
+    // IMMEDIATE, like the sibling runner: a deferred transaction asks for the
+    // write lock at the first DDL statement, and a concurrent writer then
+    // answers SQLITE_BUSY_SNAPSHOT, which `busy_timeout` does not retry.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for stmt in migration.stmts {
         tx.execute_batch(stmt)?;
     }
+    // IGNORE, not REPLACE. REPLACE overwrote the stored checksum of an
+    // already-applied migration, which is precisely what
+    // `validate_applied_checksums` exists to catch — the guard could be
+    // defeated by the code it guards.
     tx.execute(
-        "INSERT OR REPLACE INTO schema_migrations
+        "INSERT OR IGNORE INTO schema_migrations
             (version, name, applied_at, checksum, app_version)
             VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
@@ -321,6 +351,87 @@ mod tests {
         )?;
         match migrate(&mut conn) {
             Err(SidecarError::MigrationCorrupted { .. }) => Ok(()),
+            other => panic!("expected MigrationCorrupted, got {other:?}"),
+        }
+    }
+
+    /// The bookkeeping row must never be overwritten. `INSERT OR REPLACE`
+    /// silently rewrote the stored checksum of an already-applied migration,
+    /// so re-running the runner "repaired" the very mismatch
+    /// [`validate_applied_checksums`] exists to report — a guard the guarded
+    /// code could defeat.
+    #[test]
+    fn re_applying_never_rewrites_a_stored_checksum() -> SidecarResult<()> {
+        let mut conn = open_in_memory()?;
+        migrate(&mut conn)?;
+        conn.execute(
+            "UPDATE schema_migrations SET checksum = 'deadbeef' WHERE version = 1",
+            [],
+        )?;
+        match migrate(&mut conn) {
+            Err(SidecarError::MigrationCorrupted { detail }) => {
+                assert!(detail.contains("checksum mismatch"), "{detail}");
+            }
+            other => panic!("expected MigrationCorrupted, got {other:?}"),
+        }
+        // And the tampered value is still there — nothing quietly healed it.
+        let stored: String = conn.query_row(
+            "SELECT checksum FROM schema_migrations WHERE version = 1",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(stored, "deadbeef");
+        Ok(())
+    }
+
+    /// A gap below the maximum is an interrupted upgrade: nothing will ever
+    /// apply the missing migration, because the runner only looks above
+    /// `MAX(version)`. Same invariant as the service store's
+    /// `missing_migration_row_below_the_maximum_is_rejected`; the two runners
+    /// are copies by necessity, so each keeps its own test of the shared rule.
+    #[test]
+    fn a_gap_in_the_applied_history_is_rejected() -> SidecarResult<()> {
+        let mut conn = open_in_memory()?;
+        migrate(&mut conn)?;
+        let highest: i64 =
+            conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })?;
+        if highest < 2 {
+            // One migration only: there is no "below the maximum" to remove.
+            return Ok(());
+        }
+        conn.execute("DELETE FROM schema_migrations WHERE version = 1", [])?;
+        match migrate(&mut conn) {
+            Err(SidecarError::MigrationCorrupted { detail }) => {
+                assert!(
+                    detail.contains("missing from the applied history"),
+                    "{detail}"
+                );
+                Ok(())
+            }
+            other => panic!("expected MigrationCorrupted, got {other:?}"),
+        }
+    }
+
+    /// An unreadable version must not read as "fresh database": that re-ran the
+    /// v1 DDL and surfaced SQLite's `table already exists` instead of an answer
+    /// about the schema.
+    #[test]
+    fn an_impossible_version_is_reported_not_treated_as_empty() -> SidecarResult<()> {
+        let mut conn = open_in_memory()?;
+        migrate(&mut conn)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at, checksum, app_version)
+             VALUES (-7, 'impossible', 0, 'x', '0')",
+            [],
+        )?;
+        conn.execute("DELETE FROM schema_migrations WHERE version > 0", [])?;
+        match migrate(&mut conn) {
+            Err(SidecarError::MigrationCorrupted { detail }) => {
+                assert!(detail.contains("impossible version"), "{detail}");
+                Ok(())
+            }
             other => panic!("expected MigrationCorrupted, got {other:?}"),
         }
     }

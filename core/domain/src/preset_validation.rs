@@ -56,12 +56,16 @@ use crate::{
 /// Disabled entries count toward the limit — they are stored and must not
 /// cause unbounded resource consumption.
 ///
-/// Aligned with the product-wide Free cap
-/// (`nrr_shared::rules_json::FREE_MAX_RULES` = 9 999, counted across BOTH
-/// files at apply time): one file must be able to carry the whole allowance,
-/// so the per-file parse guard equals the cap. Zone/suffix fan-out hosts are
-/// derived permits, never rule entries, and do not count here.
-pub const MAX_RULES_PER_FILE: u32 = 9_999;
+/// DERIVED from the product-wide Free cap
+/// ([`nrr_shared::rules_json::FREE_MAX_RULES`], counted across BOTH files at
+/// apply time): one file must be able to carry the whole allowance, so the
+/// per-file parse guard equals the cap. Zone/suffix fan-out hosts are derived
+/// permits, never rule entries, and do not count here.
+///
+/// Derived rather than restated: the number lived here as its own literal while
+/// the doc named the constant it was supposed to equal, which is how two copies
+/// of one cap drift without anything failing.
+pub const MAX_RULES_PER_FILE: u32 = nrr_shared::rules_json::FREE_MAX_RULES as u32;
 
 /// Maximum byte length of a single match value string.
 ///

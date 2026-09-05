@@ -2,6 +2,7 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Dialogs
+import "../lib/pure.js" as Pure
 
 // Add / Edit rule dialog (extracted from Main.qml).
 //
@@ -528,6 +529,33 @@ Dialog {
             // Absorbs the leftover row width so the click zone above stops at
             // the label instead of stretching across the dialog.
             Item { Layout.fillWidth: true }
+        }
+        // How far a domain rule actually reaches. A suffix rule matches every
+        // name under the value, most of which the user never listed — that is
+        // how a background client's own subdomain ends up routed. Stating the
+        // reach is cheap; discovering it from a blocked connection is not.
+        Label {
+            Layout.fillWidth: true
+            wrapMode: Text.WordWrap
+            color: root.mutedTextColor
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            visible: text !== ""
+            text: {
+                if (root.uiRevision < 0) return ""
+                var rt = ruleDialog.localRuleType
+                if (rt !== "domain" && rt !== "suffix-domain") return ""
+                var val = String(ruleDialog.localValue || "").trim()
+                if (val === "") return ""
+                if (Pure.isPublicSuffixValue(val)) {
+                    return root.tr("rules.value.public-suffix-warning",
+                        "{value} is a public registry, not one service: the rule would "
+                        + "route unrelated owners. Use a zone rule if that is what you want.")
+                        .replace("{value}", val)
+                }
+                return root.tr("rules.value.suffix-reach",
+                    "Matches every name under {value}, including ones you did not list.")
+                    .replace("{value}", val)
+            }
         }
         // Punycode/IDN hint. When the user types a
         // non-ASCII hostname (e.g. `пример.рф`), surface the ASCII /

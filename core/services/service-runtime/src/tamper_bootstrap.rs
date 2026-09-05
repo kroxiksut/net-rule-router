@@ -265,6 +265,49 @@ pub fn run_tamper_bootstrap(
         }
     }
 
+    // The pointers, same three-way answer. Which revision is ACTIVE is as much
+    // a part of the enforced policy as the revision's contents: move it out of
+    // band and both revisions still verify while a different rule set runs.
+    let pointer_verifications = {
+        let guard = lock_state(conn)?;
+        RevisionsRepository::with_signing_key(&guard, signing_key.clone())
+            .verify_all_pointers()
+            .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?
+    };
+    let mut pointer_backfill: Vec<String> = Vec::new();
+    for (principal, verification) in pointer_verifications {
+        match verification {
+            HmacVerification::Verified => {}
+            HmacVerification::Unsigned => pointer_backfill.push(principal),
+            HmacVerification::Tampered => {
+                tracing::warn!(
+                    target: "nrr::tamper",
+                    principal = %principal,
+                    "active-revision pointer failed HMAC verification; raising tamper alert",
+                );
+                emit_alert(
+                    alerts_repo,
+                    tamper_alert_id(&format!("pointer:{principal}")),
+                    AuditEventKind::DbTamperDetected.as_str(),
+                    integrity::DB_ROW_HMAC_MISMATCH.as_str(),
+                    now_ms,
+                )?;
+                outcome
+                    .tampered_revision_ids
+                    .push(format!("pointer:{principal}"));
+                outcome.raised_blocking_alert = true;
+            }
+        }
+    }
+    if !pointer_backfill.is_empty() {
+        let guard = lock_state(conn)?;
+        let repo = RevisionsRepository::with_signing_key(&guard, signing_key.clone());
+        for principal in &pointer_backfill {
+            repo.re_sign_pointer_for(principal)
+                .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?;
+        }
+    }
+
     // Lazy backfill of legacy unsigned rows (the v10→v11 migration
     // added the column with an empty default). Safe to re-sign: these
     // predate signing and are not tampered. See module-level residual
@@ -277,7 +320,7 @@ pub fn run_tamper_bootstrap(
                 .map_err(|e| TamperBootstrapError::Storage(e.to_string()))?;
         }
     }
-    outcome.backfilled_rows = backfill_ids.len();
+    outcome.backfilled_rows = backfill_ids.len() + pointer_backfill.len();
     if !backfill_ids.is_empty() {
         tracing::info!(
             target: "nrr::tamper",

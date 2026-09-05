@@ -12,6 +12,11 @@ pub mod route_bindings;
 // rules in CLAUDE.md.
 pub use nrr_domain::rule_value_validation;
 
+// Same reason, same chain: the launcher answers `preset.parse`, and the
+// window must be able to say "the service will refuse this file" BEFORE the
+// user has chosen what to do with its contents.
+pub use nrr_domain::preset_validation;
+
 pub const APPLICATION_LAYER_NOTE: &str =
     "Transport-agnostic application workflows are composed here.";
 

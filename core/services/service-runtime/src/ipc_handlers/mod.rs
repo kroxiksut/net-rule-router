@@ -224,6 +224,11 @@ pub struct IpcHandlerDeps {
     /// fail with `alerts-store-unavailable`. Wired in `runtime_deps.rs`
     /// once the state DB connection is available.
     pub alerts_repo: Option<Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>>,
+    /// Answers "does anyone but this caller hold revisions?", so clearing a
+    /// blocking integrity alert can ask for elevation exactly when it would
+    /// adopt somebody else's rows. `None` reads as "nobody else".
+    pub other_principals_hold_revisions:
+        Option<crate::ipc_handlers::mutation_submit::OtherPrincipalsHoldRevisionsFn>,
     /// Service stability config provider/writer pair.
     /// `None` keeps the register loop registering the fallback stub
     /// for both ops.
@@ -247,6 +252,11 @@ pub struct IpcHandlerDeps {
     /// connection was unavailable at startup (degraded boot). Wired via
     /// `with_state_schema_version(...)`.
     pub state_schema_version: Option<u32>,
+    /// Grants the requesting principal read on a finished diagnostics archive.
+    /// `None` keeps the archive where only the service and administrators can
+    /// read it — correct for a build with no OS backend, wrong for a user who
+    /// just asked for one. Wired via `with_file_handoff(...)`.
+    pub file_handoff: Option<Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>>,
     /// Per-SID Fail-Closed probe. `None` keeps the
     /// snapshot handler without the enforcement banner (banner stays hidden).
     /// Wired through `with_fail_closed_probe(...)`.
@@ -413,12 +423,14 @@ impl IpcHandlerDeps {
             autostart,
             autostart_writer,
             alerts_repo: None,
+            other_principals_hold_revisions: None,
             service_stability_provider: None,
             service_stability_writer: None,
             archives_dir: None,
             app_version: None,
             system_info: None,
             state_schema_version: None,
+            file_handoff: None,
             fail_closed_probe: None,
             preset_export_source: None,
             settings_export_source: None,
@@ -474,6 +486,16 @@ impl IpcHandlerDeps {
     /// Attach the security alerts repository so the list
     /// handler honours `state_filter` and the mutation executor can
     /// route ack/resolve operations through it.
+    /// Attach the reader for [`Self::other_principals_hold_revisions`].
+    #[must_use]
+    pub fn with_other_principals_reader(
+        mut self,
+        reads: crate::ipc_handlers::mutation_submit::OtherPrincipalsHoldRevisionsFn,
+    ) -> Self {
+        self.other_principals_hold_revisions = Some(reads);
+        self
+    }
+
     pub fn with_alerts_repo(
         mut self,
         repo: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>,
@@ -585,6 +607,17 @@ impl IpcHandlerDeps {
     /// when the state DB connection was unavailable at startup.
     pub fn with_state_schema_version(mut self, version: Option<u32>) -> Self {
         self.state_schema_version = version;
+        self
+    }
+
+    /// Attach the per-OS file handoff so a finished diagnostics archive
+    /// reaches the user who asked for it. Without it the archive stays
+    /// readable only by the service and administrators.
+    pub fn with_file_handoff(
+        mut self,
+        handoff: Arc<dyn nrr_platform_api::file_handoff::FileHandoffPort>,
+    ) -> Self {
+        self.file_handoff = Some(handoff);
         self
     }
 
@@ -874,6 +907,9 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                 if let Some(repo) = deps.alerts_repo.clone() {
                     handler = handler.with_alerts_repo(repo);
                 }
+                if let Some(reads) = deps.other_principals_hold_revisions.clone() {
+                    handler = handler.with_other_principals_reader(reads);
+                }
                 // Administrative rules lock — refuse a non-elevated caller's
                 // rule change with a typed wire code the client renders as a
                 // read-only rules section.
@@ -1093,6 +1129,9 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                                 deps.adapters.clone(),
                                 deps.route_policy.clone(),
                                 deps.state_schema_version,
+                                deps.file_handoff.clone().unwrap_or_else(|| {
+                                    Arc::new(nrr_platform_api::file_handoff::NoopFileHandoff)
+                                }),
                             ),
                         );
                     }

@@ -102,11 +102,35 @@ pub struct InterfaceRouteRow {
     /// from a sender predating the field). Consumers must not read that as
     /// "unusable".
     pub has_forwarding_path: Option<bool>,
+    /// The OS could not be asked for IP / gateway / DNS at all, so the three
+    /// fields above read `"-"` for EVERY row.
+    ///
+    /// Phrased as "unavailable" rather than "known" so a sender predating the
+    /// field defaults to `false` — data present — instead of silently marking
+    /// every row unevaluated. A `"-"` local IP normally means "this adapter has
+    /// no address"; with this flag set it means "nobody was able to ask", and a
+    /// consumer that blocks on the first reading would declare a machine with a
+    /// working link to have no usable adapter at all.
+    pub runtime_data_unavailable: bool,
     pub availability_status: BasicAvailabilityStatus,
     pub observed_facts: ObservedInterfaceFacts,
     pub derived_assessment: DerivedInterfaceAssessment,
+    // ── Decoration slots ─────────────────────────────────────────────────
+    //
+    // The three fields below are NOT observations. Nothing on the service side
+    // fills them — `from_wire_dto` resets them on the way in — and the preview
+    // layer recomputes all three from the fields above on every pass. Reading
+    // one as "what the service is enforcing" is the mistake they invite: the
+    // row can arrive from the service and still carry a purely local verdict
+    // here. Their meaning is decided in `nrr-mock-backend::network_interfaces`.
+    /// Advisory only, and it says so on the wire (`advisory_only`).
     pub recommendation: RouteRoleRecommendation,
+    /// The role the USER bound, re-applied from the request — not a role the
+    /// service reported.
     pub selected_role: Option<RouteRole>,
+    /// Where this adapter stands in the SELECTION flow (chosen / needs a check
+    /// / unusable), derived from the fields above. It is not the enforcement
+    /// state of any policy.
     pub route_state: RouteSelectionState,
 }
 
@@ -138,6 +162,34 @@ pub struct RouteRoleRecommendation {
     pub summary: String,
     pub key_signals: Vec<String>,
     pub excluded_alternatives: Vec<String>,
+}
+
+/// Pick the one address a row shows out of everything an adapter holds.
+///
+/// Two properties the naive "first IPv4" pick lacked. It is DETERMINISTIC — the
+/// OS returns addresses in an order it never promised, so the displayed IP
+/// could change between two calls with nothing changed on the machine — and it
+/// falls back to IPv6, without which an IPv6-only adapter reads as having no
+/// address at all and is refused as a route.
+///
+/// Rank order: a routable IPv4, then a link-local IPv4 (169.254, an adapter
+/// that failed DHCP — worth showing, and the caller's own heuristics judge it),
+/// then a routable IPv6, then a link-local IPv6. Ties inside a rank go to the
+/// numerically smallest, which is arbitrary but stable.
+#[must_use]
+pub fn preferred_display_address(addresses: &[std::net::IpAddr]) -> Option<String> {
+    fn rank(addr: &std::net::IpAddr) -> u8 {
+        match addr {
+            std::net::IpAddr::V4(v4) if v4.is_link_local() => 1,
+            std::net::IpAddr::V4(_) => 0,
+            std::net::IpAddr::V6(v6) if v6.is_unicast_link_local() => 3,
+            std::net::IpAddr::V6(_) => 2,
+        }
+    }
+    addresses
+        .iter()
+        .min_by_key(|addr| (rank(addr), **addr))
+        .map(std::string::ToString::to_string)
 }
 
 /// Derive the next-hop traffic would leave `ifindex` through, for an adapter
@@ -514,6 +566,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             dns_servers: "1.1.1.1, 8.8.8.8".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
+            runtime_data_unavailable: false,
             availability_status: BasicAvailabilityStatus::Available,
             observed_facts: ethernet_observed,
             derived_assessment: ethernet_derived,
@@ -533,6 +586,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             dns_servers: "9.9.9.9".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
+            runtime_data_unavailable: false,
             availability_status: BasicAvailabilityStatus::Available,
             observed_facts: wifi_observed,
             derived_assessment: wifi_derived,
@@ -552,6 +606,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             dns_servers: "-".to_string(),
             has_default_route: false,
             has_forwarding_path: Some(false),
+            runtime_data_unavailable: false,
             availability_status: BasicAvailabilityStatus::RequiresCheck,
             observed_facts: vpn_observed,
             derived_assessment: vpn_derived,
@@ -571,6 +626,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             dns_servers: "8.8.4.4".to_string(),
             has_default_route: true,
             has_forwarding_path: Some(true),
+            runtime_data_unavailable: false,
             availability_status: BasicAvailabilityStatus::Available,
             observed_facts: bluetooth_observed,
             derived_assessment: bluetooth_derived,
@@ -600,6 +656,7 @@ impl From<&InterfaceRouteRow> for nrr_shared::ipc_payloads::InterfaceRowDto {
             dns_servers: row.dns_servers.clone(),
             has_default_route: row.has_default_route,
             has_forwarding_path: row.has_forwarding_path,
+            runtime_data_unavailable: row.runtime_data_unavailable,
             availability: row.availability_status.title().to_string(),
             selected_role: row.selected_role.map(|role| match role {
                 RouteRole::Primary => "primary".to_string(),
@@ -670,6 +727,7 @@ impl InterfaceRouteRow {
             dns_servers: dto.dns_servers.clone(),
             has_default_route: dto.has_default_route,
             has_forwarding_path: dto.has_forwarding_path,
+            runtime_data_unavailable: dto.runtime_data_unavailable,
             availability_status: availability_status_from_slug(&dto.availability),
             observed_facts: ObservedInterfaceFacts {
                 connectivity_state: connectivity_state_from_slug(
@@ -745,6 +803,54 @@ fn likelihood_from_slug(slug: &str) -> DerivedLikelihood {
 
 #[cfg(test)]
 mod tests {
+    /// The OS never promised an order, so "the first IPv4" could change the
+    /// displayed address between two calls with nothing changed on the machine.
+    #[test]
+    fn the_displayed_address_does_not_depend_on_enumeration_order() {
+        use std::net::IpAddr;
+        let a: IpAddr = "192.168.0.5".parse().expect("ip");
+        let b: IpAddr = "10.0.0.9".parse().expect("ip");
+        assert_eq!(
+            super::preferred_display_address(&[a, b]),
+            super::preferred_display_address(&[b, a]),
+        );
+        assert_eq!(
+            super::preferred_display_address(&[a, b]).as_deref(),
+            Some("10.0.0.9"),
+        );
+    }
+
+    /// An IPv6-only adapter has an address; reporting "-" made it unselectable.
+    #[test]
+    fn an_ipv6_only_adapter_still_reports_an_address() {
+        use std::net::IpAddr;
+        let link_local: IpAddr = "fe80::1".parse().expect("ip");
+        let global: IpAddr = "2001:db8::5".parse().expect("ip");
+        assert_eq!(
+            super::preferred_display_address(&[link_local, global]).as_deref(),
+            Some("2001:db8::5"),
+            "a routable address outranks a link-local one",
+        );
+        assert!(super::preferred_display_address(&[]).is_none());
+    }
+
+    /// A failed DHCP lease (169.254) is worth showing, but never over a real
+    /// address — and never over IPv6 either: it is still IPv4 reachability.
+    #[test]
+    fn a_routable_address_outranks_an_autoconfigured_one() {
+        use std::net::IpAddr;
+        let apipa: IpAddr = "169.254.3.4".parse().expect("ip");
+        let real: IpAddr = "192.168.1.7".parse().expect("ip");
+        assert_eq!(
+            super::preferred_display_address(&[apipa, real]).as_deref(),
+            Some("192.168.1.7"),
+        );
+        assert_eq!(
+            super::preferred_display_address(&[apipa]).as_deref(),
+            Some("169.254.3.4"),
+        );
+    }
+
     use super::*;
 
     fn route(

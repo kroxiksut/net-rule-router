@@ -102,8 +102,9 @@ impl LearnedVpnClientApps {
 /// Executables the USER explicitly confirmed as the link provider of a route
 /// binding — the VPN client that brings the secondary link up. The service-side
 /// SSOT is the per-SID `route_link_provider_apps` table (surfaced on the policy
-/// snapshot as `link_provider_exe_paths`; the GUI's `confirmed_vpn_exe_paths`
-/// preference is a display mirror of the same pick).
+/// snapshot as `link_provider_exe_paths`). The GUI's `confirmed_vpn_exe_paths`
+/// preference holds the same picks device-side and reseeds this table when the
+/// snapshot comes back empty — a recovery copy, not a display mirror.
 ///
 /// This is deliberately a *different* trust tier from
 /// [`nrr_platform_api::vpn_discovery::looks_like_vpn`], the keyword heuristic

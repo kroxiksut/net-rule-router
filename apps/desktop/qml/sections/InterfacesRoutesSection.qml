@@ -144,6 +144,16 @@ ColumnLayout {
     // Raw OS-reported order — NRR's own DNS redirect (Mode B) uses NRPT, never
     // a per-adapter rewrite, so a loopback entry here is third-party software.
     // Sink it to the end so the line leads with a useful address.
+    /// Does the readiness value add anything the row does not already show?
+    ///
+    /// `selected` / `not-selected` duplicate the role badge, so they are hidden:
+    /// an ordinary row loses a line of noise and a problem row keeps its
+    /// warning.
+    function _readinessWorthShowing(state) {
+        var s = String(state || "")
+        return s !== "" && s !== "selected" && s !== "not-selected"
+    }
+
     function _dnsDisplayText(raw) {
         var s = String(raw || "")
         if (s.indexOf(",") < 0) return s
@@ -859,9 +869,26 @@ ColumnLayout {
                         Label {
                             Layout.fillWidth: true
                             text: root.tr("interfaces.row.summary-2",
-                                "DNS: %1 | Default route: %2 | State: %3")
+                                "DNS: %1 | Default route: %2")
                                 .arg(section._dnsDisplayText(model.dns))
                                 .arg(root.boolLabel(model.hasDefaultRoute))
+                            color: root.mutedTextColor
+                            wrapMode: Text.WordWrap
+                        }
+
+                        // Readiness, and only when it says something the row
+                        // does not already show. "Selected" / "Not selected"
+                        // repeat the role badge above, and calling either of
+                        // them "State" next to DNS and the default route read
+                        // as a claim about the POLICY — which this field has
+                        // never been: it is where the adapter stands in the
+                        // SELECTION flow, derived locally from the fields
+                        // beside it.
+                        Label {
+                            Layout.fillWidth: true
+                            visible: section._readinessWorthShowing(model.routeState)
+                            text: root.tr("interfaces.row.readiness",
+                                "Readiness: %1")
                                 .arg(root.routeStateLabel(model.routeState))
                             color: root.mutedTextColor
                             wrapMode: Text.WordWrap

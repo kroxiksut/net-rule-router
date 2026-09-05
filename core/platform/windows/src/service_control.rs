@@ -485,18 +485,22 @@ fn configure_recovery(
 
 /// Restrict the service-owned data directory to the security baseline.
 ///
-/// The ROOT gets SYSTEM and Administrators only — no `Users` entry at all —
-/// with inheritance replaced rather than augmented. `logs` alone is then
-/// granted `Users:RX`: a readable log directory is what the diagnostics story
-/// needs, and it is the only thing under this tree a normal user has any
-/// business reading.
+/// SYSTEM and Administrators only — no `Users` entry anywhere under the tree —
+/// with inheritance replaced rather than augmented. The state DB carries every
+/// SID's rule set, their route bindings and their session list; the audit
+/// directory is the tamper-evident record of who changed what; and the
+/// operational log names the hosts each user's rules and traffic touched.
+/// `storage::bootstrap` states the intended shape in so many words — "Users
+/// (none)" — and this is the code that has to make it true.
 ///
-/// Granting `Users:(OI)(CI)RX` on the root instead inherited down onto
-/// everything: the service state DB carries every SID rule set, their route
-/// bindings and their session list, and the audit directory is the
-/// tamper-evident record of who changed what. `storage::bootstrap` states the
-/// intended shape in so many words — "Users (none)" — and this is the code
-/// that has to make it true.
+/// `logs` used to carry `Users:(OI)(CI)RX` so the GUI could open the folder and
+/// the launcher could attach the raw lines to a diagnostics archive. That made
+/// one machine-wide file, holding every user's hostnames, readable by every
+/// account — and it made the per-caller scoping of the log READS pointless,
+/// because the same lines were a double-click away. Both readers moved: the
+/// service answers `logs.list` scoped to the caller, puts the raw section into
+/// the archive itself, and hands the finished archive to its requester
+/// (`file_handoff`).
 ///
 /// `icacls.exe` ships with every supported Windows release and its command line
 /// is human-auditable in an install log, which is worth more here than saving a
@@ -529,14 +533,7 @@ pub fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
         "BUILTIN\\Administrators:(OI)(CI)F",
     ])?;
 
-    // Read access is granted where reading is the point, and nowhere else.
-    let logs = root.join("logs");
-    let logs_str = logs
-        .to_str()
-        .ok_or_else(|| ServiceControlError::Mechanism {
-            detail: format!("non-UTF8 logs dir path: {}", logs.display()),
-        })?;
-    run_icacls(&[logs_str, "/grant", "BUILTIN\\Users:(OI)(CI)RX"])
+    Ok(())
 }
 
 /// One `icacls` invocation, with its output folded into an error on failure.

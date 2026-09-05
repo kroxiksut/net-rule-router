@@ -398,6 +398,7 @@ fn only_the_arbiter_reads_the_observation_store() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     let (mut scanned, mut stripped) = (0usize, 0usize);
+    let mut stripped_files = 0usize;
     let mut stack = vec![src];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("src is readable") {
@@ -410,6 +411,15 @@ fn only_the_arbiter_reads_the_observation_store() {
                 continue;
             }
             let file = path.file_name().unwrap_or_default().to_string_lossy();
+            // A module's unit tests now live in `<module>/tests.rs` rather than
+            // in a `#[cfg(test)] mod tests` block, so the strip below never
+            // fires for them and every fixture would read as production. The
+            // file IS the test module; skip it the same way.
+            if file == "tests.rs" {
+                stripped += 1;
+                stripped_files += 1;
+                continue;
+            }
             // The arbiter itself, and the store that defines the query. Plus
             // the cross-session memory, which persists observations for a warm
             // start and emits no filter, route or block of its own — what it
@@ -446,6 +456,12 @@ fn only_the_arbiter_reads_the_observation_store() {
     assert!(
         stripped > 0,
         "no test module was recognised in {scanned} files: the strip is broken, so every fixture would count as production",
+    );
+    assert!(
+        stripped_files > 0,
+        "no `<module>/tests.rs` was recognised: unit tests moved into their own \
+         files, and a strip that only knows `#[cfg(test)]` blocks would read \
+         every one of them as production",
     );
     assert!(
         offenders.is_empty(),

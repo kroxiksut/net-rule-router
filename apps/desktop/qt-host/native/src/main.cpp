@@ -2128,7 +2128,8 @@ public:
     Q_INVOKABLE QString rpcRulesMergePreview(const QString &primaryText,
                                              const QString &secondaryText,
                                              const QString &policySlug,
-                                             const QVariantList &resolutions) {
+                                             const QVariantList &resolutions,
+                                             const QVariantList &keepSecondary = {}) {
         QJsonObject obj;
         obj.insert(QStringLiteral("primary-text"), primaryText);
         obj.insert(QStringLiteral("secondary-text"), secondaryText);
@@ -2136,6 +2137,10 @@ public:
                    policySlug.isEmpty() ? QStringLiteral("union") : policySlug);
         obj.insert(QStringLiteral("resolutions"),
                    QJsonArray::fromVariantList(resolutions));
+        // Identity keys whose additional-route copy the user chose to keep —
+        // the other half of the same dialog's answers.
+        obj.insert(QStringLiteral("keep-secondary"),
+                   QJsonArray::fromVariantList(keepSecondary));
         return emitRpcRequest(QStringLiteral("rules.merge-preview"), obj);
     }
 
