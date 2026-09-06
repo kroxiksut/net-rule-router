@@ -810,6 +810,65 @@ fn a_resolver_drop_names_the_dns_lockdown_not_a_rule() {
     );
 }
 
+/// Consumer wired with a reverse-DNS learner that records what it is asked to
+/// name, plus the DoH/DoT lockdown band check under test.
+fn reverse_learner_consumer(
+    lockdown_check: KillswitchDropCheckFn,
+) -> (
+    ConnectionObservationConsumer,
+    Arc<Mutex<Vec<std::net::Ipv4Addr>>>,
+) {
+    let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> =
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new());
+    let coordinator = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api),
+        Arc::new(crate::per_sid_orchestrator::NoopRulesProvider)
+            as Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
+        Arc::new(NoopPolicySource) as Arc<dyn crate::per_sid_orchestrator::RoutePolicySource>,
+        Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new())
+            as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+        Arc::new(|| false),
+    ));
+    let active_sid: ActiveSidFn = Arc::new(|| None);
+    let named: Arc<Mutex<Vec<std::net::Ipv4Addr>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&named);
+    let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
+        .with_dns_lockdown_drop_check(lockdown_check)
+        .with_reverse_dns_learner(Arc::new(move |ip, _allow_direct| {
+            sink.lock().unwrap_or_else(|p| p.into_inner()).push(ip);
+        }));
+    (consumer, named)
+}
+
+#[test]
+fn a_dns_lockdown_drop_never_reaches_the_reverse_learner() {
+    // The field case: an app goes to Google Public DNS of its own, the
+    // lockdown cuts it, and naming the address registered the resolver as a
+    // DIRECT host — whose block-all exemption outranks the lockdown block.
+    const LOCKDOWN_SPEC: u64 = 5;
+    let (consumer, named) = reverse_learner_consumer(Arc::new(|id| id == LOCKDOWN_SPEC));
+    let resolver = || {
+        let mut o = block_obs(Some(true), Some(LOCKDOWN_SPEC));
+        o.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(8, 8, 4, 4), 443));
+        o
+    };
+    consumer.consume(&[resolver()], SystemTime::now());
+    assert!(
+        named.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+        "a resolver the lockdown just cut must not be named"
+    );
+
+    // Positive control: the same drop from any other band still teaches the
+    // learner — the gate must not have silenced reverse learning outright.
+    let mut other = resolver();
+    other.nrr_drop_spec_id = Some(LOCKDOWN_SPEC + 1);
+    consumer.consume(&[other], SystemTime::now());
+    assert_eq!(
+        *named.lock().unwrap_or_else(|p| p.into_inner()),
+        vec![Ipv4Addr::new(8, 8, 4, 4)]
+    );
+}
+
 #[test]
 fn an_unrecognised_drop_during_a_fail_closed_window_reads_as_the_outage() {
     // The exact 0811 case: fail-closed armed, the packet caught by a filter

@@ -222,6 +222,11 @@ impl ConnectionObservationConsumer {
                     // their ISP-pool PTRs forward-confirm and match broad zone
                     // rules, flooding the zone permit cap with junk.
                     && !process_is_p2p_fcrdns_suppressed(rec.process_path.as_deref())
+                    // A DoH/DoT lockdown drop is an app reaching for a resolver
+                    // of its own. Naming it registers that resolver as a DIRECT
+                    // host, and the exemption compiled for one outranks the
+                    // lockdown block — the leak guard would undo itself.
+                    && !self.is_dns_lockdown_drop(&rec)
                 {
                     if let IpAddr::V4(rip) = rec.remote.ip() {
                         if is_learnable_endpoint(rip) && reverse_learned_this_batch.insert(rip) {

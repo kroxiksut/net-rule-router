@@ -47,6 +47,17 @@ impl ConnectionObservationConsumer {
             .is_some_and(|at| at.elapsed() <= COMPANION_WINDOW)
     }
 
+    /// Did the DoH/DoT lockdown band produce this drop? Read by the notice
+    /// reason and by the FCrDNS gate, which must not name a resolver the
+    /// lockdown just cut.
+    // `pub(super)` because the impl is split across files and the caller
+    // is now another module.
+    pub(super) fn is_dns_lockdown_drop(&self, rec: &ConnectionTraceRecord) -> bool {
+        rec.nrr_drop_spec_id
+            .zip(self.dns_lockdown_drop_check.as_ref())
+            .is_some_and(|(spec_id, check)| check(spec_id))
+    }
+
     /// Turn one OUR-attributed Block into a `BlockAttempt` and hand it to the
     /// wired sink. A foreign filter (`blocked_by_nrr == Some(false)`) never
     /// reaches this method — see the `consume` call site — because blaming
@@ -77,10 +88,7 @@ impl ConnectionObservationConsumer {
             .nrr_drop_spec_id
             .zip(self.ipv6_cut_drop_check.as_ref())
             .is_some_and(|(spec_id, check)| check(spec_id));
-        let dns_lockdown = rec
-            .nrr_drop_spec_id
-            .zip(self.dns_lockdown_drop_check.as_ref())
-            .is_some_and(|(spec_id, check)| check(spec_id));
+        let dns_lockdown = self.is_dns_lockdown_drop(rec);
         let reason = block_reason_for(
             rec.nrr_drop_spec_id,
             killswitch_verified,
