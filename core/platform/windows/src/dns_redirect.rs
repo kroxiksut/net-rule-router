@@ -26,9 +26,14 @@ use std::sync::Arc;
 
 use nrr_platform_api::adapters::names_indicate_virtual_machine_network;
 use nrr_platform_api::dns::{DnsCacheControlPort, UpstreamDnsCandidate};
+// The flush is a real API call on Windows; other hosts, where only the
+// fake-backed tests of this module run, get the no-op.
+#[cfg(not(target_os = "windows"))]
+use nrr_platform_api::dns::NoopDnsCacheControl as DefaultDnsCacheControl;
 use nrr_platform_api::fake_ip::FakeIpPoolConfig;
 
-use crate::dns::WindowsDnsCacheControl;
+#[cfg(target_os = "windows")]
+use crate::dns::WindowsDnsCacheControl as DefaultDnsCacheControl;
 use crate::error::PlatformError;
 
 /// Comment stamped on OUR NRPT rule so `restore` / `verify` only ever touch the
@@ -364,7 +369,7 @@ pub struct NrptDnsRedirect<R: CommandRunner, S: NrptRuleStore> {
 
 impl<R: CommandRunner, S: NrptRuleStore> NrptDnsRedirect<R, S> {
     pub fn new(runner: R, store: S) -> Self {
-        Self::with_cache_control(runner, store, Arc::new(WindowsDnsCacheControl::new()))
+        Self::with_cache_control(runner, store, Arc::new(DefaultDnsCacheControl))
     }
 
     /// Same, with the cache flush injected — tests use it to observe the flush
