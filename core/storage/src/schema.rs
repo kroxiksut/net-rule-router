@@ -518,6 +518,39 @@ pub const TRAFFIC_DB_V1_DDL: &[&str] = &[
     CREATE_ADAPTER_ADDRESSES,
 ];
 
+/// DDL for the user's answers to "did this connection continue as that one?".
+///
+/// A row per pair the user was ASKED about, whichever way they answered:
+/// `merged = 1` continues the old key's history under the new one, `merged = 0`
+/// keeps them apart. Both are answers, and both must be remembered — a refused
+/// pair that came back would be the same question again every session.
+///
+/// `old_key` is the primary key rather than the pair, because a history can
+/// only be continued once: a second successor for the same predecessor is a
+/// contradiction, not another answer.
+const CREATE_ADAPTER_HISTORY_LINK: &str = "
+CREATE TABLE IF NOT EXISTS adapter_history_link (
+    old_key      TEXT    PRIMARY KEY,
+    new_key      TEXT    NOT NULL,
+    merged       INTEGER NOT NULL,
+    decided_at_ms INTEGER NOT NULL
+) WITHOUT ROWID";
+
+/// DDL for `nrr_traffic_stats.db` schema v2 — the answers above.
+///
+/// Additive, as its own migration rather than an edit to v1: the checksum of a
+/// changed v1 would not match an installed database, and this store's recovery
+/// from that is to delete and rebuild — costing the user the whole all-time
+/// ledger, which is the very thing the merge question exists to preserve.
+pub const TRAFFIC_DB_V2_DDL: &[&str] = &[
+    CREATE_ADAPTER_HISTORY_LINK,
+    // When a key was first seen, which is half the handover evidence (the other
+    // half, `last_seen`, was already here). `0` for a row written by an older
+    // build reads as "known since before we tracked this", which correctly
+    // makes such a key ineligible as the SUCCESSOR — it did not just appear.
+    "ALTER TABLE interface_identity ADD COLUMN first_seen INTEGER NOT NULL DEFAULT 0",
+];
+
 // ── SQL DDL — nrr_service_state.db ───────────────────────────────────────────
 
 /// DDL for the `active_revision` singleton table.
@@ -1363,7 +1396,7 @@ CHECK(browser_history_auto_seed IN (0, 1))"];
 /// "smart"): an IP the shared-IP census has seen on a direct (non-rule) host is
 /// EXCLUDED from the kill-switch per-IP pin/block set, so blocking a
 /// secondary-routed CDN address cannot cut an innocent co-tenant site
-/// (e.g. gemini/youtube sharing Google front-end IPs with www.google.com).
+/// (e.g. gemini/video-site sharing Google front-end IPs with www.search.example).
 /// `1` ("strict"): pin/block every secondary-destined IP regardless of
 /// sharing; no leak, accepts the collateral.
 ///
@@ -1735,7 +1768,7 @@ pub const STATE_DB_V53_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS local_networ
 /// instead of only when the user presses Check; the three bounds are what one
 /// pass may cost. Stored per principal because both the permission and the
 /// appetite for waiting are personal. Defaults match
-/// `nrr_service_runtime::primary_path_probe::ProbeLimits::default`.
+/// `nrr_service_runtime::path_probe::ProbeLimits::default`.
 pub const STATE_DB_V54_DDL: &[&str] = &[
     "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_auto INTEGER NOT NULL DEFAULT 0 CHECK(primary_probe_auto IN (0, 1))",
     "ALTER TABLE secondary_block_policy ADD COLUMN primary_probe_timeout_ms INTEGER NOT NULL DEFAULT 1500",

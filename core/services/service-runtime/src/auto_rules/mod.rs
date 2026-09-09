@@ -53,12 +53,14 @@ use nrr_domain::companion_affinity::{
     CompanionAffinityLedger, CompanionEvidenceSnapshot, CompanionProposal, CompanionSignal,
     PrimaryBehavior, PrimaryHealthEvent,
 };
+use nrr_shared::ipc_payloads::is_self_signed_signal;
 use nrr_shared::ipc_payloads::{
     AutoRuleCandidateDto, AutoRuleConsumerDto, AutoRuleDismissedEntryDto, StatusUpdateEvent,
     AUTO_RULE_MATCH_KIND_EXACT, AUTO_RULE_MATCH_KIND_SUFFIX, AUTO_RULE_PRIMARY_BEHAVIOR_CUT,
     AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS, AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
     AUTO_RULE_SIGNAL_BRAND_RELATED, AUTO_RULE_SIGNAL_CO_ACTIVITY, AUTO_RULE_SIGNAL_DELIVERY_NAME,
-    AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE,
+    AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE, AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
+    AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
 };
 use nrr_shared::{AutoRuleReason, RouteRole};
 use nrr_storage::auto_rule_dismissals::AutoRuleDismissal;
@@ -128,6 +130,15 @@ const MAX_PENDING_PER_PRINCIPAL: usize = 50;
 /// about what is still current.
 const PENDING_TTL_MS: i64 = 86_400_000;
 
+/// The same, for an offer a host signed about ITSELF (4 h).
+///
+/// Its evidence is that connections were failing a moment ago, and that is a
+/// statement about the network right now: a provider's block lifts, a route
+/// changes, an outage ends. A companion offer says "these two belong together",
+/// which stays true across a day; this one goes stale with the weather, and an
+/// offer nobody can act on any more is noise in the inbox.
+const SELF_SIGNED_PENDING_TTL_MS: i64 = 4 * 60 * 60 * 1_000;
+
 /// Maximum principals tracked concurrently.
 ///
 /// Free is single-active-user, so in practice this is one. The cap exists so a
@@ -165,6 +176,16 @@ pub type MainLinkPassEnabledFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 /// right now. A closure over the route coordinator at the composition root, so
 /// this module never learns what an adapter binding is.
 pub type SecondaryReadyFn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// How a host currently fares on the main link, asked by name.
+///
+/// The companion ledger only keeps this verdict for hosts it already tracks as
+/// candidates, so an offer a host made about ITSELF has no way to learn that
+/// the main link started working. A closure over the observation registry at
+/// the composition root answers it for any name. `None` behaves as
+/// [`PrimaryBehavior::Unknown`], which is what a self-signed offer carried
+/// before this existed.
+pub type PrimaryBehaviorFn = Arc<dyn Fn(&str) -> PrimaryBehavior + Send + Sync>;
 
 /// What one principal configured for companion discovery, read together and
 /// memoised together because they are one row and are consulted on the same
@@ -390,6 +411,17 @@ pub struct QuietNote {
     pub sample: Vec<String>,
 }
 
+/// Whether this tick's dropped-companion set says anything the log does not
+/// already carry.
+///
+/// The tick fires every ten seconds; a set that has not moved writes the same
+/// names again for as long as the site is open. Both halves count: the COUNT
+/// alone would hide one companion being swapped for another, and the SAMPLE
+/// alone would hide the count growing past what the sample shows.
+fn quiet_note_is_news(previous: Option<&QuietNote>, current: &QuietNote) -> bool {
+    previous != Some(current)
+}
+
 pub struct AutoRulesEngine {
     ledgers: Mutex<HashMap<String, SidLedger>>,
     pending: Mutex<HashMap<String, Vec<PendingCandidate>>>,
@@ -434,6 +466,8 @@ pub struct AutoRulesEngine {
     /// Is an answer about the main link still coming (see
     /// [`MainLinkPassEnabledFn`])? `None` behaves as "no", so nothing is held.
     main_link_pass_enabled: Option<MainLinkPassEnabledFn>,
+    /// Current main-link verdict for a host by name (see [`PrimaryBehaviorFn`]).
+    primary_behavior_of: Option<PrimaryBehaviorFn>,
     /// Durable mirror of the ledgers. A proposal needs two windows, and a
     /// restart used to reset the count to zero — a machine that restarts a few
     /// times a day therefore never reached the second one. `None` (no state DB)
@@ -475,6 +509,7 @@ impl AutoRulesEngine {
             secondary_ready: None,
             refusing_anchors: None,
             main_link_pass_enabled: None,
+            primary_behavior_of: None,
             evidence_store: None,
             evidence_saved_at: Mutex::new(HashMap::new()),
         }
@@ -581,6 +616,14 @@ impl AutoRulesEngine {
     #[must_use]
     pub fn with_main_link_pass_enabled(mut self, enabled: MainLinkPassEnabledFn) -> Self {
         self.main_link_pass_enabled = Some(enabled);
+        self
+    }
+
+    /// Wire the "how does this host fare on the main link" question, so an
+    /// offer a host made about itself goes quiet once the main link carries it.
+    #[must_use]
+    pub fn with_primary_behavior_source(mut self, source: PrimaryBehaviorFn) -> Self {
+        self.primary_behavior_of = Some(source);
         self
     }
 
@@ -726,6 +769,16 @@ impl AutoRulesEngine {
         batch.note_primary_health(hostname, event);
     }
 
+    /// A host the main link answered with a placeholder instead of an address
+    /// — parked like a companion suggestion, the host signing its own offer.
+    ///
+    /// Not gated behind a flag, unlike [`Self::note_isp_blocked_host`]: that
+    /// one reads a notice PAGE and can misread one, while this one is about
+    /// addresses nothing can be reached at.
+    pub fn note_placeholder_answer_host(&self, sid: &str, hostname: &str, now: SystemTime) -> bool {
+        self.park_self_signed(sid, hostname, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER, now)
+    }
+
     /// A host an ISP notice page named as blocked — parked like a companion
     /// suggestion (no anchor, so the host signs its own offer). Gated like
     /// `count_cuts`: observing never stops, only parking does.
@@ -733,8 +786,151 @@ impl AutoRulesEngine {
         if !self.isp_block_candidates_enabled.load(Ordering::Relaxed) {
             return false;
         }
+        self.park_self_signed(sid, hostname, AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE, now)
+    }
+
+    /// Connections to this host kept failing on the main link and none ever
+    /// completed there — the verdict comes from
+    /// [`crate::primary_stall_registry`], which counts what the connection
+    /// observer already sees.
+    ///
+    /// The strongest of the self-signed signals, because it is measured rather
+    /// than inferred: the offer says the main link will not carry the site, and
+    /// that is exactly what was observed. The same measurement withdraws the
+    /// offer the moment the host starts working.
+    pub fn note_main_link_blocked_host(&self, sid: &str, hostname: &str, now: SystemTime) -> bool {
+        self.park_self_signed(sid, hostname, AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED, now)
+    }
+
+    /// What the ADDITIONAL route found for a host that has an offer parked.
+    ///
+    /// The offer says "move this into the tunnel". If the tunnel cannot reach
+    /// the host either, the move would change nothing, and the honest place to
+    /// notice that is before the user is asked — an outage upstream of both
+    /// links looks exactly like a host worth routing.
+    ///
+    /// Recorded, never inferred: only a probe that actually ran writes here,
+    /// so an unchecked offer stays exactly as visible as it was.
+    pub fn note_secondary_reach(&self, sid: &str, hostname: &str, answered: bool, now: SystemTime) {
+        let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return;
+        }
+        let now_ms = unix_ms(now);
+        let updated = {
+            let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(entry) = guard.get_mut(sid) else {
+                return;
+            };
+            let mut touched = false;
+            for candidate in entry.iter_mut() {
+                if candidate.dto.proposed_match == host {
+                    candidate.dto.secondary_reach = Some(answered);
+                    touched = true;
+                }
+            }
+            touched.then(|| entry.clone())
+        };
+        if let Some(updated) = updated {
+            self.persist_pending(sid, &updated, now_ms);
+        }
+    }
+
+    /// The name a self-signed offer should carry: `host` itself, or the
+    /// registrable domain when the evidence already reaches that far.
+    ///
+    /// It reaches that far when a SECOND name under the same domain is already
+    /// parked for failing, or when the failing name IS the domain. One failing
+    /// subdomain proves nothing about its neighbours: measured on the field
+    /// case, one subdomain was cut while the apex and `www` answered normally,
+    /// so rolling up on that evidence would move working traffic into the
+    /// tunnel.
+    ///
+    /// Two of them do prove it, and the proof is about the DOMAIN rather than
+    /// about the apex: a provider cutting two unrelated names under one domain
+    /// is cutting the domain, and the apex still answering is a detail of how
+    /// far it has got. One site is one question, so the apex travels with the
+    /// site it belongs to. Platform infrastructure never reaches here — it is
+    /// refused before any of this — so a roll-up cannot swallow a domain that
+    /// belongs to everybody.
+    fn rolled_up_target(&self, sid: &str, host: String) -> String {
+        let Some(apex) = registrable_domain(&host).map(str::to_string) else {
+            return host;
+        };
+        if apex == host {
+            return host;
+        }
+        if !self.another_name_under(sid, &apex, &host) {
+            return host;
+        }
+        tracing::info!(
+            target: "nrr::auto-rules",
+            sid = %sid,
+            host = %host,
+            domain = %apex,
+            "a second name under this domain fails on the main link — offering the domain instead of each name",
+        );
+        apex
+    }
+
+    /// Is a DIFFERENT self-signed offer already parked under `apex`?
+    fn another_name_under(&self, sid: &str, apex: &str, host: &str) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(sid)
+            .is_some_and(|offers| {
+                offers.iter().any(|c| {
+                    is_self_signed_signal(&c.dto.signal)
+                        && c.dto.proposed_match != host
+                        && registrable_domain(&c.dto.proposed_match) == Some(apex)
+                })
+            })
+    }
+
+    /// Withdraw self-signed offers the domain-wide one now covers, so the user
+    /// is not shown the domain and its parts side by side.
+    fn absorb_names_under(&self, sid: &str, apex: &str, now_ms: i64) {
+        let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(entry) = guard.get_mut(sid) else {
+            return;
+        };
+        let before = entry.len();
+        entry.retain(|c| {
+            !(is_self_signed_signal(&c.dto.signal)
+                && c.dto.proposed_match != apex
+                && registrable_domain(&c.dto.proposed_match) == Some(apex))
+        });
+        let absorbed = before - entry.len();
+        let updated = (absorbed > 0).then(|| entry.clone());
+        drop(guard);
+        if let Some(updated) = updated {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                sid = %sid,
+                domain = %apex,
+                absorbed,
+                "single names withdrawn in favour of the offer for their domain",
+            );
+            self.persist_pending(sid, &updated, now_ms);
+        }
+    }
+
+    /// Park an offer a host makes about ITSELF: no anchor, no companion
+    /// arithmetic, just "this host does not work over the main link, and here
+    /// is how we know". Shared by every such signal so they cannot drift on the
+    /// exclusions — a host already covered by a rule, or a machine whose
+    /// default route IS the tunnel, must not be offered anything.
+    fn park_self_signed(&self, sid: &str, hostname: &str, signal: &str, now: SystemTime) -> bool {
         let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() || self.mode(sid) == AutoRulesMode::Off {
+            return false;
+        }
+        // A host the main link carries has nothing to move. Checked BEFORE
+        // parking, not only before the popup: an offer sitting in the inbox for
+        // a site that works is the same false statement, made quietly.
+        let behavior = self.main_link_behavior(&host);
+        if behavior == PrimaryBehavior::Responds {
             return false;
         }
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
@@ -745,12 +941,23 @@ impl AutoRulesEngine {
         };
         // Already covered, or a rule would change nothing (same reasoning
         // `tick` applies to companion proposals).
+        //
+        // Shared platform infrastructure is refused here for the same reason
+        // it is refused as a companion: it belongs to everybody, so routing
+        // it drags unrelated traffic along. That it fails on the main link
+        // does not change whose host it is — an ad or telemetry endpoint the
+        // provider cuts is not a site the user was trying to open.
         if exclusions.is_rule_host(&host)
             || exclusions.is_matched_by_existing_rule(&host)
+            || exclusions.is_platform_infrastructure(&host)
             || snapshot.behavior_mode.default_route_role() == RouteRole::Secondary
         {
             return false;
         }
+        // One site, one question. A provider that cuts two different names
+        // under a domain is cutting the domain, and asking about each name
+        // separately makes the user answer the same question twice.
+        let host = self.rolled_up_target(sid, host);
         let now_ms = unix_ms(now);
         let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_SUFFIX, &host);
         if self.suppressed_ids(sid).contains(&id) {
@@ -764,20 +971,29 @@ impl AutoRulesEngine {
                 match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
                 route: RouteRole::Secondary.slug().to_string(),
                 affinity: 0.0,
-                observations: 1,
+                // No pair, no visits — the signal below is what this offer knows.
+                observations: None,
                 first_seen_unix_ms: now_ms,
                 last_seen_unix_ms: now_ms,
-                signal: AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE.to_string(),
+                signal: signal.to_string(),
                 consumers: Vec::new(),
                 consumers_changed_unix_ms: 0,
-                primary_behavior: String::new(),
+                primary_behavior: primary_behavior_slug(behavior).to_string(),
                 anchor_refuses_main_link: false,
-                // The block page named this host itself; nothing else was seen.
+                // The host named itself; nothing else was seen alongside it.
                 observed_members: Vec::new(),
+                served_by_main_link: false,
+                // No site pulled this one in, so whose name it is was never
+                // asked — answering "the site's own" called ad hosts the
+                // user's own.
+                third_party: None,
+                // Nobody has asked the additional route about this host yet.
+                secondary_reach: None,
             },
             route: RouteRole::Secondary,
             match_kind: AuthoredMatchKind::SuffixDomain,
         };
+        self.absorb_names_under(sid, &candidate.dto.proposed_match, now_ms);
         self.park(sid, vec![candidate], now_ms);
         if matches!(self.mode(sid), AutoRulesMode::Suggest) {
             self.announce_pending(sid, now);
@@ -940,21 +1156,27 @@ impl AutoRulesEngine {
             })
             .collect();
         fresh.sort_by(|a, b| a.dto.id.cmp(&b.dto.id));
-        {
+        // Deduped on the SELECTION, not on the event: this tick runs every ten
+        // seconds, and a steady set of dropped companions used to write the
+        // same line with the same sample every time. What is worth a line is a
+        // set that CHANGED — the same reasoning as "bound adapter still NOT
+        // usable (deduped)".
+        let note_changed = {
             let mut notes = self.quiet_note.lock().unwrap_or_else(|p| p.into_inner());
             if inert > 0 {
-                notes.insert(
-                    sid.to_string(),
-                    QuietNote {
-                        inert: inert as u64,
-                        sample: inert_names.clone(),
-                    },
-                );
+                let note = QuietNote {
+                    inert: inert as u64,
+                    sample: inert_names.clone(),
+                };
+                let changed = quiet_note_is_news(notes.get(sid), &note);
+                notes.insert(sid.to_string(), note);
+                changed
             } else {
                 notes.remove(sid);
+                false
             }
-        }
-        if inert > 0 {
+        };
+        if note_changed {
             tracing::debug!(
                 target: "nrr::auto-rules",
                 sid = %sid,
@@ -1084,12 +1306,41 @@ impl AutoRulesEngine {
     }
 
     fn pending_snapshot(&self, sid: &str) -> Vec<PendingCandidate> {
-        self.pending
+        let mut offers: Vec<PendingCandidate> = self
+            .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(sid)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for offer in offers.iter_mut() {
+            self.refresh_self_signed_behavior(&mut offer.dto);
+        }
+        offers
+    }
+
+    /// What the main link currently does with `hostname`. `Unknown` when no
+    /// source is wired, which is how a self-signed offer behaved before one was.
+    fn main_link_behavior(&self, hostname: &str) -> PrimaryBehavior {
+        self.primary_behavior_of
+            .as_ref()
+            .map_or(PrimaryBehavior::Unknown, |read| read(hostname))
+    }
+
+    /// Re-stamp a self-signed offer with the main link's CURRENT verdict.
+    ///
+    /// A companion offer is rebuilt from the ledger on every tick and so
+    /// carries fresh evidence by construction. An offer a host made about
+    /// itself is parked once and never recomputed, so without this it would
+    /// keep asserting a failure that has since stopped happening.
+    fn refresh_self_signed_behavior(&self, dto: &mut AutoRuleCandidateDto) {
+        if !is_self_signed_signal(&dto.signal) {
+            return;
+        }
+        let behavior = self.main_link_behavior(&dto.proposed_match);
+        if behavior != PrimaryBehavior::Unknown {
+            dto.primary_behavior = primary_behavior_slug(behavior).to_string();
+        }
     }
 
     // ── IPC surface ──────────────────────────────────────────────────────────
@@ -1126,19 +1377,54 @@ impl AutoRulesEngine {
             .map(|v| {
                 v.iter()
                     .filter(|c| !covered_by_rules(snapshot.as_ref(), &c.dto.proposed_match))
-                    .map(|c| {
+                    .filter_map(|c| {
                         let mut dto = c.dto.clone();
+                        self.refresh_self_signed_behavior(&mut dto);
+                        // A host that answers on the main link has nothing left
+                        // to offer about itself — the inbox drops it outright
+                        // rather than showing it greyed out, because unlike a
+                        // companion there is no second question it could answer.
+                        if settled_self_signed(&dto) {
+                            return None;
+                        }
+                        // Neither link reaches it. The offer would move the
+                        // host from one route that cannot carry it to another
+                        // that cannot either — which is not a suggestion, it is
+                        // somebody else's outage. Only a probe that RAN puts
+                        // `Some(false)` here, so an unchecked offer is
+                        // untouched by this.
+                        if dto.secondary_reach == Some(false) && is_self_signed_signal(&dto.signal)
+                        {
+                            return None;
+                        }
                         dto.anchor_refuses_main_link = refusing.contains(&dto.anchor);
-                        dto
+                        // The same judgement the tray notice makes, carried to
+                        // the inbox. Withholding an offer from one surface and
+                        // presenting it as ordinary in the other is how a host
+                        // the main route already serves read as "your site
+                        // needs this".
+                        dto.served_by_main_link = settled_by_the_main_link(&dto);
+                        // Only an offer with a real anchor can answer this: a
+                        // self-signed one IS its own anchor, so the comparison
+                        // would say "the site's own name" about every host.
+                        dto.third_party = (!is_self_signed_signal(&dto.signal))
+                            .then(|| !shares_registrable_domain(&dto.anchor, &dto.proposed_match));
+                        Some(dto)
                     })
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Durable half of the same check: drop covered offers from the parked set
-    /// so they stop being counted (the tray badge reads `pending_count`) and do
-    /// not come back after a restart. Runs on the tick, which owns a clock.
+    /// Durable half of the read-path checks: drop offers with nothing left to
+    /// ask, so they stop being counted (the tray badge reads `pending_count`)
+    /// and do not come back after a restart. Runs on the tick, which owns a
+    /// clock.
+    ///
+    /// Two ways an offer runs out of question: a rule now covers its address,
+    /// or — for one a host made about itself — the main link started carrying
+    /// the host. Both are withdrawals, not refusals: the evidence that earned
+    /// the offer stopped being true.
     fn retire_covered(&self, sid: &str, snapshot: &ActiveRulesSnapshot, now_ms: i64) {
         let mut guard = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let Some(entry) = guard.get_mut(sid) else {
@@ -1148,9 +1434,19 @@ impl AutoRulesEngine {
         let exclusions = RuleBookExclusions {
             book: &snapshot.rule_book,
         };
+        let mut answered = 0_usize;
         entry.retain(|c| {
             let host = c.dto.proposed_match.as_str();
-            !(exclusions.is_rule_host(host) || exclusions.is_matched_by_existing_rule(host))
+            if exclusions.is_rule_host(host) || exclusions.is_matched_by_existing_rule(host) {
+                return false;
+            }
+            if is_self_signed_signal(&c.dto.signal)
+                && self.main_link_behavior(host) == PrimaryBehavior::Responds
+            {
+                answered += 1;
+                return false;
+            }
+            true
         });
         let retired = before - entry.len();
         let updated = (retired > 0).then(|| entry.clone());
@@ -1160,7 +1456,8 @@ impl AutoRulesEngine {
                 target: "nrr::auto-rules",
                 sid = %sid,
                 retired,
-                "suggestions whose address a rule already covers were withdrawn",
+                answered_on_the_main_link = answered,
+                "suggestions with nothing left to ask were withdrawn",
             );
             self.persist_pending(sid, &updated, now_ms);
         }
@@ -1198,8 +1495,8 @@ impl AutoRulesEngine {
                 // Subdomains count for BOTH kinds, because that is what
                 // accepting writes: `CanonicalRuleSet::with_subdomain_rules`
                 // expands every exact rule into a suffix one, so an exact
-                // suggestion for `cdninstagram.com` would cover
-                // `static.cdninstagram.com` the moment it is accepted.
+                // suggestion for `cdninsta.test` would cover
+                // `static.cdninsta.test` the moment it is accepted.
                 // Reading it narrower here let the collateral rescue yank that
                 // subdomain onto the primary while its parent was on offer.
                 host == m || host.ends_with(&format!(".{m}"))
@@ -1653,7 +1950,14 @@ impl AutoRulesEngine {
             return;
         };
         let before = entry.len();
-        entry.retain(|c| now_ms.saturating_sub(c.dto.last_seen_unix_ms) <= PENDING_TTL_MS);
+        entry.retain(|c| {
+            let ttl = if is_self_signed_signal(&c.dto.signal) {
+                SELF_SIGNED_PENDING_TTL_MS
+            } else {
+                PENDING_TTL_MS
+            };
+            now_ms.saturating_sub(c.dto.last_seen_unix_ms) <= ttl
+        });
         let expired = before - entry.len();
         let snapshot = (expired > 0).then(|| entry.clone());
         drop(guard);
@@ -1759,6 +2063,20 @@ impl AutoRulesEngine {
         let Some(bus) = self.events.as_ref() else {
             return false;
         };
+        // A subscription starts at the bus's current head, so a push sent
+        // before the tray connected reaches nobody — while the record below
+        // would mark the offer announced for good. The service and the tray
+        // start together, and the service wins that race routinely.
+        // Announcing means having had an audience.
+        if !bus.has_subscriber_for(sid) {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                sid = %sid,
+                offered = offered.len(),
+                "nothing is listening yet — the offer keeps its news for the next tick",
+            );
+            return false;
+        }
         let mut states = self.publish_state.lock().unwrap_or_else(|p| p.into_inner());
         let state = states.entry(sid.to_string()).or_default();
         let unseen: Vec<&PendingCandidate> = offered
@@ -1859,7 +2177,7 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
             match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
             route: proposal.route.slug().to_string(),
             affinity: proposal.affinity,
-            observations: proposal.distinct_windows,
+            observations: Some(proposal.distinct_windows),
             first_seen_unix_ms: proposal.first_seen_ms as i64,
             last_seen_unix_ms: proposal.last_seen_ms as i64,
             signal: signal_slug(proposal.signal).to_string(),
@@ -1872,6 +2190,9 @@ fn to_candidate(proposal: &CompanionProposal, id: String) -> PendingCandidate {
             // the state DB, and can change without the evidence changing.
             anchor_refuses_main_link: false,
             observed_members: proposal.observed_members.clone(),
+            served_by_main_link: false,
+            third_party: None,
+            secondary_reach: None,
         },
         route: proposal.route,
         match_kind: AuthoredMatchKind::SuffixDomain,
@@ -1953,6 +2274,14 @@ fn awaiting_the_main_link(dto: &AutoRuleCandidateDto, pass_can_answer: bool) -> 
     if !pass_can_answer || !dto.primary_behavior.is_empty() {
         return false;
     }
+    // A self-signed offer is never held WAITING for the pass. The pass
+    // probes addresses out of the FQDN cache, and these hosts are exactly
+    // the ones nothing cached — so no answer is coming, and holding would
+    // silence the offer for good. What settles them is an answer that
+    // actually arrives, which is the other gate.
+    if is_self_signed_signal(&dto.signal) {
+        return false;
+    }
     if !matches!(
         dto.signal.as_str(),
         AUTO_RULE_SIGNAL_CO_ACTIVITY | AUTO_RULE_SIGNAL_DELIVERY_NAME
@@ -1962,9 +2291,25 @@ fn awaiting_the_main_link(dto: &AutoRuleCandidateDto, pass_can_answer: bool) -> 
     !shares_registrable_domain(&dto.anchor, &dto.proposed_match)
 }
 
+/// A host that answers the main link has settled its OWN offer.
+///
+/// Kept apart from [`settled_by_the_main_link`] because the reasoning differs.
+/// For a companion, "it answers" only settles a name of another brand — the
+/// routed site's own delivery name can complete a connection and serve a
+/// refusal. A self-signed offer has no anchor to be a companion of: its entire
+/// claim is "the main link will not carry me", and one main-link answer
+/// contradicts it outright.
+fn settled_self_signed(dto: &AutoRuleCandidateDto) -> bool {
+    is_self_signed_signal(&dto.signal)
+        && dto.primary_behavior == AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS
+}
+
 fn settled_by_the_main_link(dto: &AutoRuleCandidateDto) -> bool {
     if dto.primary_behavior != AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS {
         return false;
+    }
+    if is_self_signed_signal(&dto.signal) {
+        return true;
     }
     if !matches!(
         dto.signal.as_str(),
@@ -2022,13 +2367,16 @@ fn explains_better(
 fn outranks(candidate: &AutoRuleCandidateDto, held: &AutoRuleCandidateDto) -> bool {
     (
         candidate.affinity,
-        candidate.observations,
+        // A self-signed offer counts no visits; ranking it as the one visit it
+        // used to claim keeps the order exactly what it was before the count
+        // became optional.
+        candidate.observations.unwrap_or(1),
         // Only for determinism when the evidence ties.
         std::cmp::Reverse(held.anchor.as_str()),
     )
         .partial_cmp(&(
             held.affinity,
-            held.observations,
+            held.observations.unwrap_or(1),
             std::cmp::Reverse(candidate.anchor.as_str()),
         ))
         .is_some_and(std::cmp::Ordering::is_gt)
@@ -2067,7 +2415,12 @@ fn sort_and_cap(entry: &mut Vec<PendingCandidate>, sid: &str) {
         b.dto
             .affinity
             .total_cmp(&a.dto.affinity)
-            .then_with(|| b.dto.observations.cmp(&a.dto.observations))
+            .then_with(|| {
+                b.dto
+                    .observations
+                    .unwrap_or(1)
+                    .cmp(&a.dto.observations.unwrap_or(1))
+            })
             .then_with(|| a.dto.anchor.cmp(&b.dto.anchor))
             .then_with(|| a.dto.proposed_match.cmp(&b.dto.proposed_match))
     });
@@ -2092,6 +2445,16 @@ fn sort_and_cap(entry: &mut Vec<PendingCandidate>, sid: &str) {
 /// outage is exactly what [`PENDING_TTL_MS`] already forgets on a live tick.
 /// A row that fails to decode (DTO shape changed, unrecognised route or
 /// match-kind slug) is skipped rather than failing the whole restore.
+///
+/// An offer a host made about ITSELF is not restored at all. The two kinds
+/// rest on different ground: a companion offer stands on accumulated
+/// evidence, and that evidence is restored alongside it, while a
+/// self-signed one asserts what the network is doing RIGHT NOW — and
+/// nothing behind it survives a restart. The stall registry starts empty,
+/// no answer has been screened yet, so the restored row would state as
+/// current a condition nobody has checked since. A host that still fails
+/// re-earns its offer on the next connection; one that has been fixed
+/// meanwhile never asks again.
 fn hydrate_pending(
     store: &dyn PendingSuggestionStore,
     now_ms: i64,
@@ -2110,6 +2473,9 @@ fn hydrate_pending(
                 // kind is part of the id. Dropping it costs nothing: a live
                 // candidate is re-proposed on the next tick in the new shape.
                 if dto.match_kind == AUTO_RULE_MATCH_KIND_EXACT {
+                    return None;
+                }
+                if is_self_signed_signal(&dto.signal) {
                     return None;
                 }
                 PendingCandidate::from_dto(dto)

@@ -729,7 +729,7 @@ impl CacheRepository for SqliteCacheStore {
         // per-rule zone/suffix fan-out, which is bounded (SUFFIX_FANOUT_BACKSTOP). With
         // the old `canonical_host ASC` a busy zone (e.g. `.ru`) that exceeded the
         // cap only ever permitted the alphabetically-first N hosts, so an actively
-        // visited late-alphabet host (`yandex.ru`) never earned an ALE permit and
+        // visited late-alphabet host (`zulu.example`) never earned an ALE permit and
         // was blocked by the catch-all. `last_seen_at DESC` keeps the hosts the
         // user is actually using inside the window; `canonical_host ASC` breaks
         // ties deterministically so identical-timestamp rows stay stable.
@@ -771,14 +771,14 @@ impl CacheRepository for SqliteCacheStore {
         // (matches every row), so there is one SQL and one param set.
         //
         // EXACT-match by default for full hostnames/IPs: searching
-        // `google.com` shows exactly that host (and only it), not every
+        // `search.example` shows exactly that host (and only it), not every
         // `*google*` hit drowning it out. A `*` in the query is the
         // user-facing wildcard (translated to LIKE `%` AFTER escaping the
-        // real metacharacters), so `*.google.com` lists the subdomains and
+        // real metacharacters), so `*.search.example` lists the subdomains and
         // `*google*` gives substring behaviour.
         //
         // A BARE token (no `.`, no `*`) is an implicit
-        // substring: nobody has a cache row whose whole hostname is `2gis`,
+        // substring: nobody has a cache row whose whole hostname is `citymap`,
         // so the exact interpretation made single-word searches always come
         // back empty. Full-hostname/IP queries (they contain a dot) keep the
         // exact semantics above. Matching stays case-insensitive.
@@ -1838,7 +1838,7 @@ mod tests {
     fn upsert_and_get_by_hostname() {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_cache_store(&dir);
-        let ip = Ipv4Addr::new(93, 184, 216, 34);
+        let ip = Ipv4Addr::new(23, 10, 20, 138);
 
         store
             .upsert_resolution(sample_resolution("example.com", ip))
@@ -2151,9 +2151,9 @@ mod tests {
     fn forgetting_a_census_host_stops_its_ips_counting_as_shared() {
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_cache_store(&dir);
-        let ip = Ipv4Addr::new(157, 240, 0, 63);
+        let ip = Ipv4Addr::new(23, 10, 20, 156);
         store
-            .record_shared_ip_direct_host(ip, "static.cdninstagram.com", 1, false)
+            .record_shared_ip_direct_host(ip, "static.cdninsta.test", 1, false)
             .expect("census");
         store
             .record_shared_ip_direct_host(ip, "unrelated.example", 1, false)
@@ -2162,7 +2162,7 @@ mod tests {
 
         // The trailing dot and the case are what a resolver hands us.
         let removed = store
-            .forget_shared_ip_direct_host("Static.CDNInstagram.com.")
+            .forget_shared_ip_direct_host("Static.CDNInsta.Test.")
             .expect("forget");
         assert_eq!(removed, 1);
         assert_eq!(
@@ -2173,7 +2173,7 @@ mod tests {
         // Idempotent: a host that left the census is not an error.
         assert_eq!(
             store
-                .forget_shared_ip_direct_host("static.cdninstagram.com")
+                .forget_shared_ip_direct_host("static.cdninsta.test")
                 .expect("forget"),
             0
         );
@@ -2193,7 +2193,7 @@ mod tests {
         store
             .upsert_resolution(sample_resolution(
                 "real.example",
-                Ipv4Addr::new(93, 184, 216, 34),
+                Ipv4Addr::new(23, 10, 20, 138),
             ))
             .expect("upsert");
         store
@@ -2248,7 +2248,7 @@ mod tests {
         use nrr_domain::decision_lookup::LookupDirection;
         let dir = tempfile::tempdir().expect("tmp");
         let store = migrated_cache_store(&dir);
-        let ip = Ipv4Addr::new(93, 184, 216, 34);
+        let ip = Ipv4Addr::new(23, 10, 20, 138);
 
         store
             .upsert_resolution(sample_resolution("example.com", ip))

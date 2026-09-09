@@ -33,33 +33,82 @@ const SENSITIVE_FIELDS: &[&str] = &[
     "adapter_name",
     "app",
     "app_key",
+    // Lists of executables, not one path: an app-rule roster and a per-process
+    // drop summary disclose the same thing `process` does, several times over.
+    "conflicts",
     "exe",
     "ifname",
     "image",
     "interface",
+    "intruder",
+    "owner",
     "path",
+    "primary_app_rules",
     "process",
+    "processes",
     "resolver",
+    "secondary_app_rules",
     "upstream",
+    // An adapter's human-readable NAME, unlike its opaque id, says who it
+    // belongs to — a tunnel adapter is usually named after its provider.
+    // `was`/`now` are the rename pair: one of the two drift events puts names
+    // in them and the other puts identities, and a field name cannot tell
+    // those apart, so both are treated as the more revealing case.
+    "display_name",
+    "now",
+    "was",
 ];
 
 /// Suffixes for the same class, so `vpn_exe_path` is caught alongside `path`.
 const SENSITIVE_SUFFIXES: &[&str] = &["_path", "_exe", "_adapter", "_interface", "_resolver"];
 
-/// Field names that carry a hostname or an address — [`PrivacyClass::Diagnostic`].
+/// Field names that carry a hostname, an address, or an opaque adapter id —
+/// [`PrivacyClass::Diagnostic`].
+///
+/// An adapter GUID sits here rather than with the sensitive names above: it
+/// identifies an interface without saying whose it is, and it is what every
+/// routing question is debugged against.
 const DIAGNOSTIC_FIELDS: &[&str] = &[
+    "active",
     "addr",
     "address",
+    "addresses",
+    "admitted",
+    "also_answered_for",
+    "bound",
     "dest",
     "destination",
     "domain",
+    "effective_id",
+    "evicted",
+    "fake",
     "fqdn",
     "host",
     "hostname",
+    "hosts",
+    "identity",
     "ip",
+    "ipv4",
+    "live_adapters",
+    // The socket's own endpoint, paired with `remote` in every trace line —
+    // it was the one half of the pair nobody classified.
+    "local",
+    // Both carry `ip_set=[…]` inside a filter-plan summary.
+    "only_live",
+    "only_neutral",
+    "next_hop",
     "peer",
+    "previous",
     "qname",
+    "real",
+    "rejected",
     "remote",
+    "retired",
+    "sample",
+    "server",
+    "source",
+    "stable_id",
+    "table",
 ];
 
 const DIAGNOSTIC_SUFFIXES: &[&str] = &[
@@ -176,6 +225,83 @@ mod tests {
         // the log would say nothing at all.
         for name in ["error", "reason", "count", "message", "kind", "elapsed_ms"] {
             assert_eq!(field_class(name), PrivacyClass::PublicSummary, "{name}");
+        }
+    }
+
+    /// A second audit of a production file found the classification leaking in
+    /// the direction nobody had checked: the rule was written from the fields
+    /// that WERE being redacted, so whole families that were not on any list
+    /// went out verbatim.
+    #[test]
+    fn the_families_the_first_pass_missed_are_covered_too() {
+        // Addresses and hostnames. `local` is the one that shows how the gap
+        // happened: its pair `remote` was classified and it was not, in the
+        // very same trace line.
+        for name in [
+            "local",
+            "addresses",
+            "hosts",
+            "next_hop",
+            "admitted",
+            "evicted",
+            "real",
+            "fake",
+            "source",
+            "server",
+            "table",
+            "only_live",
+            "only_neutral",
+            "sample",
+            "also_answered_for",
+            "rejected",
+            "active",
+            "previous",
+            "retired",
+        ] {
+            assert!(
+                field_class(name) >= PrivacyClass::Diagnostic,
+                "{name} carries a hostname or address and must not read as public",
+            );
+        }
+        // Executables, named in the plural or as a roster.
+        for name in [
+            "processes",
+            "primary_app_rules",
+            "secondary_app_rules",
+            "conflicts",
+            "intruder",
+            "owner",
+        ] {
+            assert_eq!(
+                field_class(name),
+                PrivacyClass::Sensitive,
+                "{name} names executables",
+            );
+        }
+        // An adapter's NAME says whose it is — a tunnel adapter carries its
+        // provider's name — while its opaque id does not, and every routing
+        // question is debugged against the id.
+        for name in ["display_name", "was", "now"] {
+            assert_eq!(
+                field_class(name),
+                PrivacyClass::Sensitive,
+                "{name} can hold an adapter's human-readable name",
+            );
+        }
+        // The positive control for the line above: were these sensitive too,
+        // the split would be pointless and route debugging would go dark.
+        for name in [
+            "bound",
+            "stable_id",
+            "effective_id",
+            "live_adapters",
+            "identity",
+        ] {
+            assert_eq!(
+                field_class(name),
+                PrivacyClass::Diagnostic,
+                "{name} is an opaque adapter id, readable in diagnostic mode",
+            );
         }
     }
 

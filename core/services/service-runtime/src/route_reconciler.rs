@@ -386,73 +386,6 @@ impl SecondaryRouteReconciler {
             .collect();
         self.reconcile_owned(&keep, owned)
     }
-
-    /// strip the VPN client's own
-    /// redirect-gateway overlay (the `/1` split-default pair it installed on
-    /// the secondary interface) so NetRuleRouter's policy — not the VPN
-    /// client — decides what rides the tunnel.
-    ///
-    /// **DORMANT — not wired into `recompute_for`.** Hardware testing showed
-    /// removing a live VPN client's routes destabilises it (hidemy.name's
-    /// OpenVPN forced reconnects). Kept for reference / a possible future
-    /// event-driven owner; the live mode-A selectivity path will instead use a
-    /// `/2` counter-overlay via primary (additive, no removal). Do NOT re-wire
-    /// this without solving the client-disruption problem.
-    ///
-    /// In **mode A** the active user owns no `/1`, so the VPN's pair is removed
-    /// and non-rule traffic falls back to the primary default (selective). In
-    /// **mode B** the active user owns a `/1` overlay with the *same key* (our
-    /// next-hop is the tunnel peer the VPN itself uses), so the owned-set guard
-    /// keeps it — the redirect pair is preserved and our exceptions win by
-    /// longest-prefix match.
-    ///
-    /// Safety: only routes classified [`RouteOwnership::VpnRedirectOverlay`]
-    /// are removed, AND never a route whose key we currently own (the live OS
-    /// table reports `is_ours = false` for everything, so we exclude our own
-    /// routes by key, not by the flag). The bootstrap host route and the OS
-    /// default are never classified as strippable. Best-effort and idempotent:
-    /// returns how many foreign overlay routes were removed (0 when there is
-    /// nothing to strip). A delete failure rolls back this strip transaction
-    /// and surfaces the error to the caller (who logs it; routing already
-    /// applied).
-    pub fn strip_foreign_overlay(
-        &self,
-        secondary_ifindex: u32,
-        primary_gateway: Option<Ipv4Addr>,
-    ) -> Result<usize, PlatformError> {
-        let owned_keys: HashSet<RouteKey> = {
-            let owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
-            owned.iter().map(route_key).collect()
-        };
-        let table = self.api.get_ip_forward_table()?;
-        let foreign: Vec<RouteEntry> = table
-            .into_iter()
-            .filter(|r| {
-                !owned_keys.contains(&route_key(r))
-                    && classify_route_ownership(r, secondary_ifindex, primary_gateway)
-                        == RouteOwnership::VpnRedirectOverlay
-            })
-            .collect();
-        if foreign.is_empty() {
-            return Ok(0);
-        }
-        let actions: Vec<RoutingAction> = foreign
-            .iter()
-            .cloned()
-            .map(RoutingAction::DeleteRoute)
-            .collect();
-        let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
-        match tx.execute(&actions) {
-            Ok(()) => {
-                tx.finalize();
-                Ok(foreign.len())
-            }
-            Err(e) => {
-                let _ = tx.rollback();
-                Err(e)
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -700,7 +633,7 @@ mod tests {
             raw_route([198, 51, 100, 9], 32, pg, 12, false), // VPN server #2 (bootstrap)
             raw_route([203, 0, 113, 7], 32, pg, 12, false), // dup → deduped
             raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, false), // VPN redirect half (not a server)
-            raw_route([93, 184, 216, 34], 32, [10, 91, 192, 1], 78, true), // our /32 (is_ours)
+            raw_route([23, 10, 20, 138], 32, [10, 91, 192, 1], 78, true), // our /32 (is_ours)
         ];
         let got = bootstrap_server_ips(&routes, 78, Some(Ipv4Addr::from(pg)));
         assert_eq!(
@@ -885,84 +818,6 @@ mod tests {
             classify_route_ownership(&r, 78, None),
             RouteOwnership::Untracked
         );
-    }
-
-    // ── strip_foreign_overlay (block 16.18.vpn, slice C2) ──
-
-    #[test]
-    fn strip_removes_vpn_redirect_pair_keeps_bootstrap_owned_and_default() {
-        let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        // Mode A: we own a /32 secondary route (its key goes into `owned`).
-        rec.reconcile(&[route([5, 5, 5, 5], [10, 91, 192, 1], 78)])
-            .unwrap();
-        // The live OS table (FFI reports is_ours=false for ALL): our /32 + the
-        // VPN's redirect /1 pair on the secondary + the bootstrap /32 via the
-        // primary gateway + the OS default.
-        api.set_route_table(vec![
-            raw_route([5, 5, 5, 5], 32, [10, 91, 192, 1], 78, false), // ours (key owned)
-            raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, false),  // VPN redirect lo
-            raw_route([128, 0, 0, 0], 1, [10, 91, 192, 1], 78, false), // VPN redirect hi
-            raw_route([203, 0, 113, 7], 32, [192, 168, 1, 1], 12, false), // bootstrap
-            raw_route([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, false),  // OS default
-        ]);
-        let n = rec
-            .strip_foreign_overlay(78, Some(Ipv4Addr::new(192, 168, 1, 1)))
-            .unwrap();
-        assert_eq!(n, 2, "only the two /1 redirect halves are stripped");
-        let table = api.get_ip_forward_table().unwrap();
-        assert!(
-            !table.iter().any(|r| r.prefix_length == 1),
-            "VPN redirect pair removed"
-        );
-        assert!(
-            table
-                .iter()
-                .any(|r| r.destination == Ipv4Addr::new(203, 0, 113, 7)),
-            "bootstrap host route preserved (tunnel survives)"
-        );
-        assert!(
-            table
-                .iter()
-                .any(|r| r.destination == Ipv4Addr::new(5, 5, 5, 5)),
-            "our owned /32 preserved"
-        );
-        assert!(
-            table.iter().any(|r| r.prefix_length == 0),
-            "OS default preserved (fail-safe anchor)"
-        );
-    }
-
-    #[test]
-    fn strip_skips_redirect_overlay_we_own_in_mode_b() {
-        let api = Arc::new(MockWindowsApi::new());
-        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
-        // Mode B: we own the /1 overlay (same key as the VPN's redirect pair —
-        // our next-hop is the tunnel peer the VPN itself uses).
-        let overlay_lo = RouteEntry {
-            destination: Ipv4Addr::new(0, 0, 0, 0),
-            prefix_length: 1,
-            next_hop: Ipv4Addr::new(10, 91, 192, 1),
-            interface_index: 78,
-            metric: 5,
-            is_ours: true,
-            table: nrr_platform_api::RouteTableRef::Main,
-        };
-        let overlay_hi = RouteEntry {
-            destination: Ipv4Addr::new(128, 0, 0, 0),
-            ..overlay_lo.clone()
-        };
-        rec.reconcile(&[overlay_lo, overlay_hi]).unwrap();
-        // Live table has the /1 pair (is_ours=false from FFI) — same keys we own.
-        api.set_route_table(vec![
-            raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, false),
-            raw_route([128, 0, 0, 0], 1, [10, 91, 192, 1], 78, false),
-        ]);
-        let n = rec
-            .strip_foreign_overlay(78, Some(Ipv4Addr::new(192, 168, 1, 1)))
-            .unwrap();
-        assert_eq!(n, 0, "we own those /1 keys in mode B → not stripped");
-        assert_eq!(api.get_ip_forward_table().unwrap().len(), 2);
     }
 
     #[test]

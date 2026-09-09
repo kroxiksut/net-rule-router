@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn compact_fresh_hit_sets_cache_hit_and_labels() {
-        let ip = Ipv4Addr::new(93, 184, 216, 34);
+        let ip = Ipv4Addr::new(23, 10, 20, 138);
         let result = fresh_result(ip);
         let summary = build_explain_summary(&result, DiagnosticRedactionLevel::Compact);
 

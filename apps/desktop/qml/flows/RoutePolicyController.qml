@@ -21,11 +21,31 @@ QtObject {
     id: routePolicyController
     property var root
 
+    /// One key, the common case. Thin wrapper over the many-key form so both
+    /// take exactly one read and one write.
     function _applyRoutePolicyKey(key, value, o) {
         o = o || {}
+        var one = {}
+        one[key] = value
+        _applyRoutePolicyKeys(one, {
+            onApplied: function() { if (o.onApplied) o.onApplied(value) },
+            ok: o.ok, uac: o.uac, failPrefix: o.failPrefix
+        })
+    }
+
+    /// Apply SEVERAL policy keys as ONE write.
+    ///
+    /// Not a loop over the single-key form: that would read the policy once per
+    /// key, ask for approval once per key, and let two writes race over the
+    /// snapshot each of them read.
+    function _applyRoutePolicyKeys(changes, o) {
+        o = o || {}
+        var keys = Object.keys(changes || {})
+        if (keys.length === 0) return
         // Service stopped: park the intent + offer it on reconnect.
         if (!root._routingBackendConnected()) {
-            root._recordOfflineRoutingIntent("route-policy", key, value)
+            for (var i = 0; i < keys.length; i += 1)
+                root._recordOfflineRoutingIntent("route-policy", keys[i], changes[keys[i]])
             return
         }
         if (!root.bridgeAvailable
@@ -35,7 +55,8 @@ QtObject {
             // No RPC to carry the change. Park it in the same store a stopped
             // service uses rather than returning silently: only some keys have a
             // local pref mirror, so a silent return dropped the rest outright.
-            root._recordOfflineRoutingIntent("route-policy", key, value)
+            for (var j = 0; j < keys.length; j += 1)
+                root._recordOfflineRoutingIntent("route-policy", keys[j], changes[keys[j]])
             return
         }
         var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
@@ -49,7 +70,8 @@ QtObject {
             // decision is parked instead, exactly like one made while the
             // service is down: it is still what the user asked for.
             if (!ok || !p) {
-                root._recordOfflineRoutingIntent("route-policy", key, value)
+                for (var k = 0; k < keys.length; k += 1)
+                    root._recordOfflineRoutingIntent("route-policy", keys[k], changes[keys[k]])
                 var readCode = String(code || "")
                 var readLabel = (typeof root.ipcErrorLabel === "function")
                     ? root.ipcErrorLabel(readCode) : readCode
@@ -60,7 +82,8 @@ QtObject {
             }
             var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
             var req = root._buildFullRoutePolicyReq(cur)
-            req[key] = value
+            for (var m = 0; m < keys.length; m += 1)
+                req[keys[m]] = changes[keys[m]]
             var wCorr = nrrNativeBridge.rpcRoutePolicyUpdate(req)
             root.rpc.registerRpcCallback(wCorr, function(ok2, p2, code2, msg2) {
                 if (ok2) {
@@ -70,10 +93,11 @@ QtObject {
                     // stopped. Display bookkeeping only — never a push source.
                     if (typeof root._rememberServiceValues === "function") {
                         var remembered = {}
-                        remembered[key] = value
+                        for (var n = 0; n < keys.length; n += 1)
+                            remembered[keys[n]] = changes[keys[n]]
                         root._rememberServiceValues("route-policy", remembered)
                     }
-                    if (o.onApplied) o.onApplied(value)
+                    if (o.onApplied) o.onApplied(changes)
                     root.statusLine = o.ok
                     return
                 }
@@ -141,7 +165,7 @@ QtObject {
                     "Domain rules now also cover subdomains.")
                 : root.tr("status.include-subdomains-off",
                     "Domain rules now match the exact domain only."),
-            uac: root.tr("status.include-subdomains-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.include-subdomains-failed",
                 "Could not update the subdomain setting: ")
@@ -156,7 +180,7 @@ QtObject {
         _applyRoutePolicyKey("shared-ip-policy", want, {
             ok: root.tr("status.shared-ip-policy-set",
                 "Shared-IP handling updated."),
-            uac: root.tr("status.shared-ip-policy-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.shared-ip-policy-failed",
                 "Could not update shared-IP handling: ")
@@ -174,7 +198,7 @@ QtObject {
         _applyRoutePolicyKey("mode-a-coverage-strategy", want, {
             ok: root.tr("status.mode-a-coverage-set",
                 "Fallback blocking behavior updated."),
-            uac: root.tr("status.mode-a-coverage-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.mode-a-coverage-failed",
                 "Could not update the fallback blocking behavior: ")
@@ -191,7 +215,7 @@ QtObject {
         _applyRoutePolicyKey("resolve-hosts-bypass", want, {
             ok: root.tr("status.hosts-bypass-set",
                 "Rule-domain resolution updated."),
-            uac: root.tr("status.hosts-bypass-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.hosts-bypass-failed",
                 "Could not update rule-domain resolution: ")
@@ -209,7 +233,7 @@ QtObject {
                     "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.")
                 : root.tr("status.doh-lockdown-off",
                     "Browser DoH/DoT blocking disabled."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.doh-lockdown-failed",
                 "Could not update DoH/DoT blocking: ")
@@ -222,7 +246,7 @@ QtObject {
         _applyRoutePolicyKey("doh-lockdown-scope", want, {
             ok: root.tr("status.doh-lockdown-scope-set",
                 "DoH/DoT blocking scope updated."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.doh-lockdown-failed",
                 "Could not update DoH/DoT blocking: ")
@@ -240,7 +264,7 @@ QtObject {
                     "Strict kill switch: addresses shared with regular sites are blocked too.")
                 : root.tr("status.kill-switch-shared-strict-off",
                     "Smart kill switch: addresses shared with regular sites are not blocked."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.kill-switch-shared-strict-failed",
                 "Could not update the kill-switch shared-address mode: ")
@@ -264,7 +288,7 @@ QtObject {
                         "Missing companion domains will be offered for your confirmation.")
                     : root.tr("status.auto-rules-off",
                         "Missing companion domains will no longer be collected.")),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.auto-rules-failed",
                 "Could not update the auto-rules setting: ")
@@ -337,7 +361,7 @@ QtObject {
                     "The service will check the main route for new suggestions itself.")
                 : root.tr("status.primary-probe-auto-off",
                     "The main route will only be checked when you ask."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
                 "Could not change the main-route check: ")
@@ -351,7 +375,27 @@ QtObject {
         _applyRoutePolicyKey(key, Number(value), {
             onApplied: function() {},
             ok: root.tr("status.primary-probe-limits-saved", "Check limits saved."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
+                "Administrator approval was declined; the setting was not changed."),
+            failPrefix: root.tr("status.primary-probe-failed",
+                "Could not change the main-route check: ")
+        })
+    }
+
+    /// The three main-route check limits back to their declared defaults, in one
+    /// write. The values come from the same table the fields clamp against, so
+    /// "default" cannot mean one thing in the button and another in the field.
+    function resetPrimaryProbeLimits() {
+        var keys = ["primary-probe-timeout-ms", "primary-probe-max-targets",
+                    "primary-probe-repeat-secs"]
+        var changes = {}
+        for (var i = 0; i < keys.length; i += 1)
+            changes[keys[i]] = Number(root.routePolicyDefault(keys[i]))
+        _applyRoutePolicyKeys(changes, {
+            onApplied: function() {},
+            ok: root.tr("status.primary-probe-limits-reset",
+                "Check limits are back to their defaults."),
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.primary-probe-failed",
                 "Could not change the main-route check: ")
@@ -369,7 +413,7 @@ QtObject {
                     "Delivery-looking domains will be offered as soon as they appear.")
                 : root.tr("status.auto-rules-eager-off",
                     "Delivery-looking domains will be offered only after they prove related to a site."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.auto-rules-failed",
                 "Could not update the auto-rules setting: ")
@@ -393,7 +437,7 @@ QtObject {
                     "The cache will be seeded from browser history automatically at service start.")
                 : root.tr("status.browser-history-auto-seed-off",
                     "Automatic browser-history seeding disabled."),
-            uac: root.tr("status.doh-lockdown-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.browser-history-auto-seed-failed",
                 "Could not update automatic browser-history seeding: ")
@@ -432,7 +476,7 @@ QtObject {
                     "Kill-switch: while the additional adapter is down, all traffic is now blocked except your primary-routed sites.")
                 : root.tr("status.kill-switch-block-all-off",
                     "Kill-switch: while the additional adapter is down, only its routed sites are blocked now."),
-            uac: root.tr("status.kill-switch-block-all-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.kill-switch-block-all-failed",
                 "Could not update the kill-switch setting: ")
@@ -454,8 +498,8 @@ QtObject {
                     "Kill-switch enabled. Choose how it blocks in the options below.")
                 : root.tr("status.kill-switch-enabled-off",
                     "Kill-switch disabled. Nothing is blocked — while the additional adapter is down, traffic is allowed to leak (your choice)."),
-            uac: root.tr("status.kill-switch-enabled-uac-declined",
-                "Administrator approval was declined; the kill-switch was not changed."),
+            uac: root.tr("status.kill-switch-uac-declined",
+                "Administrator approval was declined; leak protection was not changed."),
             failPrefix: root.tr("status.kill-switch-enabled-failed",
                 "Could not update the kill-switch: ")
         })
@@ -475,7 +519,7 @@ QtObject {
                     "While blocked, name resolution now works over your main link, so zones keep resolving.")
                 : root.tr("status.allow-dns-over-primary-off",
                     "Strict: while blocked, DNS is blocked over the main link too."),
-            uac: root.tr("status.allow-dns-over-primary-uac-declined",
+            uac: root.tr("status.route-policy-uac-declined",
                 "Administrator approval was declined; the setting was not changed."),
             failPrefix: root.tr("status.allow-dns-over-primary-failed",
                 "Could not update the DNS setting: ")

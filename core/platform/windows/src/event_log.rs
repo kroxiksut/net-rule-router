@@ -33,6 +33,126 @@ use windows::Win32::System::EventLog::{
     EVENTLOG_INFORMATION_TYPE, EVENTLOG_WARNING_TYPE,
 };
 
+/// When this boot reached the sign-in phase, as Unix milliseconds.
+///
+/// The marker is `Microsoft-Windows-Wininit` event 14 — the provider is
+/// registered under its full name, and the short `Wininit` matches nothing.
+/// Wininit is the component that brings the session up to the sign-in screen,
+/// so its record is the closest timestamp Windows offers for "the machine was
+/// ready to ask who you are"; it is a phase marker, not the pixel moment the
+/// prompt appeared, and the wording the user sees says so.
+///
+/// The query runs newest-first and takes the first hit, then keeps it only if
+/// it falls inside the CURRENT boot — the System log holds weeks of them, and
+/// answering with last Tuesday's boot would make the comparison nonsense.
+///
+/// Every failure path answers `None`. This is a diagnostic that exists to
+/// settle a suspicion honestly; a host that cannot answer must say so rather
+/// than produce a number the code invented.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn sign_in_prompt_at_ms() -> Option<u64> {
+    use windows::core::{h, PCWSTR};
+    use windows::Win32::System::EventLog::{
+        EvtClose, EvtCreateRenderContext, EvtNext, EvtQuery, EvtQueryReverseDirection, EvtRender,
+        EvtRenderContextValues, EvtRenderEventValues, EVT_HANDLE, EVT_VARIANT,
+    };
+
+    const QUERY: &str = "*[System[Provider[@Name='Microsoft-Windows-Wininit'] and (EventID=14)]]";
+
+    // SAFETY: literal wide strings, a handle closed on every path, and a render
+    // buffer whose declared size matches the value actually passed.
+    unsafe {
+        let query = windows::core::HSTRING::from(QUERY);
+        let results = EvtQuery(
+            None,
+            h!("System"),
+            PCWSTR(query.as_ptr()),
+            EvtQueryReverseDirection.0,
+        )
+        .ok()?;
+
+        let mut raw = 0isize;
+        let mut returned = 0u32;
+        let got = EvtNext(results, std::slice::from_mut(&mut raw), 0, 0, &mut returned).is_ok();
+        let _ = EvtClose(results);
+        if !got || returned == 0 {
+            return None;
+        }
+        let event = EVT_HANDLE(raw);
+
+        let path = PCWSTR(h!("Event/System/TimeCreated/@SystemTime").as_ptr());
+        let context = match EvtCreateRenderContext(
+            Some(std::slice::from_ref(&path)),
+            EvtRenderContextValues.0,
+        ) {
+            Ok(context) => context,
+            Err(_) => {
+                let _ = EvtClose(event);
+                return None;
+            }
+        };
+
+        let mut variant = EVT_VARIANT::default();
+        let mut used = 0u32;
+        let mut props = 0u32;
+        let rendered = EvtRender(
+            context,
+            event,
+            EvtRenderEventValues.0,
+            u32::try_from(std::mem::size_of::<EVT_VARIANT>()).unwrap_or(0),
+            Some(std::ptr::addr_of_mut!(variant).cast()),
+            &mut used,
+            &mut props,
+        )
+        .is_ok();
+        let _ = EvtClose(context);
+        let _ = EvtClose(event);
+        if !rendered || props == 0 {
+            return None;
+        }
+        let at_ms = filetime_ticks_to_unix_ms(variant.Anonymous.FileTimeVal)?;
+        current_boot_started_at_ms()
+            .is_some_and(|boot| at_ms >= boot)
+            .then_some(at_ms)
+    }
+}
+
+/// Non-Windows builds keep the trait's honest default.
+#[cfg(not(target_os = "windows"))]
+fn sign_in_prompt_at_ms() -> Option<u64> {
+    None
+}
+
+/// Convert raw `FILETIME` ticks (100 ns since 1601-01-01) to Unix
+/// milliseconds. `None` for a pre-epoch or zero stamp.
+fn filetime_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
+    const EPOCH_DELTA_100NS: u64 = 116_444_736_000_000_000;
+    ticks
+        .checked_sub(EPOCH_DELTA_100NS)
+        .map(|since_epoch| since_epoch / 10_000)
+}
+
+/// When the machine last booted, as Unix milliseconds — the fence that keeps a
+/// prompt from a previous boot out of the answer.
+#[cfg(target_os = "windows")]
+#[allow(unsafe_code)]
+fn current_boot_started_at_ms() -> Option<u64> {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    // SAFETY: no arguments, no out-parameters — the call cannot fail.
+    let uptime_ms = u128::from(unsafe { GetTickCount64() });
+    u64::try_from(now_ms.checked_sub(uptime_ms)?).ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn current_boot_started_at_ms() -> Option<u64> {
+    None
+}
+
 /// Registry home of an event source, under `HKEY_LOCAL_MACHINE`.
 const SOURCE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\EventLog\Application";
 
@@ -95,6 +215,10 @@ impl Drop for WindowsEventLog {
 }
 
 impl SystemEventLogPort for WindowsEventLog {
+    fn sign_in_prompt_at_ms(&self) -> Option<u64> {
+        sign_in_prompt_at_ms()
+    }
+
     fn write(&self, record: &SystemEventRecord) {
         let guard = self.handle.lock().unwrap_or_else(|p| p.into_inner());
         let Some(source) = guard.as_ref() else {
@@ -250,5 +374,38 @@ mod tests {
     fn every_severity_we_declare_is_covered_by_types_supported() {
         // information | warning | error = 1 | 2 | 4.
         assert_eq!(TYPES_SUPPORTED, 0x0007);
+    }
+
+    #[test]
+    fn filetime_ticks_convert_to_unix_ms() {
+        // 2026-09-06T00:00:00Z = 1_788_652_800_000 ms.
+        let unix_ms: u64 = 1_788_652_800_000;
+        let ticks = unix_ms * 10_000 + 116_444_736_000_000_000;
+        assert_eq!(filetime_ticks_to_unix_ms(ticks), Some(unix_ms));
+    }
+
+    #[test]
+    fn a_pre_epoch_stamp_is_none_rather_than_a_wrapped_number() {
+        // A zero FILETIME is 1601, and a diagnostic that reported it as an
+        // enormous positive gap would be worse than saying nothing.
+        assert_eq!(filetime_ticks_to_unix_ms(0), None);
+    }
+
+    /// Windows-only: reads the live System log. The assertion is the contract,
+    /// not the value — a machine whose log has rolled over answers `None`, and
+    /// that is a legitimate answer, not a failure.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_sign_in_prompt_is_read_or_admitted_unknown() {
+        match sign_in_prompt_at_ms() {
+            None => {}
+            Some(at) => {
+                let boot = current_boot_started_at_ms().expect("a booted machine knows when");
+                assert!(
+                    at >= boot,
+                    "a prompt from an earlier boot must never be the answer: {at} < {boot}"
+                );
+            }
+        }
     }
 }

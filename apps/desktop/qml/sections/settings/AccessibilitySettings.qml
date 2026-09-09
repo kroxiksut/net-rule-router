@@ -16,7 +16,9 @@ GroupBox {
             Layout.fillWidth: true
             text: root.tr("a11y.high-contrast", "High contrast")
             checked: root.prefs.themeMode === "high-contrast"
-            onToggled: root.updatePrefs({
+            // The palette switches under the tick, so the tick is the
+            // confirmation — same reasoning as the theme picker itself.
+            onToggled: root.commitPrefs({
                 themeMode: checked ? "high-contrast"
                     : (root.prefs.themeMode === "high-contrast" ? "system" : root.prefs.themeMode)
             })
@@ -58,7 +60,9 @@ GroupBox {
                 ? fontLabel(model[currentIndex]) : ""
             popup.width: root.comboPopupWidth(systemFontCombo, model, "",
                 function(item) { return systemFontCombo.fontLabel(item) })
-            onActivated: root.updatePrefs({ systemFont: model[currentIndex] })
+            // Same as the theme: the text redraws in the chosen family right
+            // away, so the change is its own confirmation.
+            onActivated: root.commitPrefs({ systemFont: model[currentIndex] })
         }
     }
 }

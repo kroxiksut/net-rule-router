@@ -25,17 +25,27 @@
 use std::path::{Path, PathBuf};
 
 use nrr_platform_api::path_registration::{
-    PathRegistrationPlan, PathRegistrationPort, PathRegistrationRequest, PathRegistrationStep,
+    list_contains_directory, PathRegistrationPlan, PathRegistrationPort, PathRegistrationRequest,
+    PathRegistrationStep,
 };
 use nrr_shared::product_identity::BinaryRole;
 
 /// What the UI needs to render the action and its result.
+///
+/// Two facts, not one, and they answer different questions. `reachable` is
+/// "would typing the console's name work" — the composed `PATH`, machine
+/// entries included — and it drives the status line. `owned_entry_present` is
+/// "is OUR entry in OUR store", and it drives the button: on Unix a removal
+/// cannot change this process's inherited `PATH`, so a button watching
+/// reachability would snap straight back and read as "it did not work".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsolePathState {
     /// The directory holding the console executable.
     pub directory: PathBuf,
-    /// Whether the directory is already reachable from a newly started shell.
-    pub registered: bool,
+    /// Whether the directory is reachable from a newly started shell.
+    pub reachable: bool,
+    /// Whether the entry WE would write is in the store we write to.
+    pub owned_entry_present: bool,
     /// The command to paste into a shell that is ALREADY open — no OS updates a
     /// running process's environment, so this is what closes the gap between
     /// clicking the button and the console working in the terminal on screen.
@@ -46,27 +56,42 @@ pub struct ConsolePathState {
 }
 
 impl ConsolePathState {
-    fn from_plan(plan: &PathRegistrationPlan, registered: bool) -> Self {
+    fn from_plan(plan: &PathRegistrationPlan, reachable: bool, owned_entry_present: bool) -> Self {
         let target_file = plan.steps.iter().find_map(|step| match step {
             PathRegistrationStep::AppendShellProfileLine { path, .. } => Some(path.clone()),
             _ => None,
         });
         Self {
             directory: plan.directory.clone(),
-            registered,
+            reachable,
+            owned_entry_present,
             current_session_command: plan.current_session_command.clone(),
             target_file,
         }
     }
 }
 
-/// Report whether the console is already reachable, without changing anything.
+/// Whether `directory` is on the `PATH` this process inherited.
+///
+/// The COMPOSED list, deliberately: a directory reachable only because a
+/// machine-wide entry names it is still reachable, and telling the user
+/// otherwise would be a lie about their own shell. What we must not do is let
+/// this answer drive the button — see [`ConsolePathState`].
+fn reachable_on_process_path(directory: &Path, port: &dyn PathRegistrationPort) -> bool {
+    let list = std::env::var("PATH").unwrap_or_default();
+    list_contains_directory(&list, directory, port.style())
+}
+
+/// Report the current state, without changing anything.
 pub fn console_path_state() -> Result<ConsolePathState, String> {
     let port = host_port()?;
     let request = PathRegistrationRequest::for_current_user(console_directory()?);
     let plan = port.plan(&request).map_err(|e| e.to_string())?;
-    let registered = !plan.changes_anything();
-    Ok(ConsolePathState::from_plan(&plan, registered))
+    let owned = port
+        .owned_entry_present(&request)
+        .map_err(|e| e.to_string())?;
+    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
+    Ok(ConsolePathState::from_plan(&plan, reachable, owned))
 }
 
 /// Register the console's directory on the current user's `PATH`.
@@ -80,7 +105,29 @@ pub fn register_console_on_path() -> Result<ConsolePathState, String> {
     if plan.changes_anything() {
         port.apply(&plan).map_err(|e| e.to_string())?;
     }
-    Ok(ConsolePathState::from_plan(&plan, true))
+    // Reachability is re-read rather than assumed: the entry is in the store
+    // now, but this process still holds the `PATH` it started with, and saying
+    // "reachable" here would promise something the user's open terminal does
+    // not have.
+    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
+    Ok(ConsolePathState::from_plan(&plan, reachable, true))
+}
+
+/// Take our entry back off the current user's `PATH`.
+///
+/// Idempotent in the same way registration is: with nothing of ours on the list
+/// this writes nothing and still returns a renderable state. Only OUR entry
+/// goes — see `decide_path_removal` for what "ours" means.
+pub fn unregister_console_from_path() -> Result<ConsolePathState, String> {
+    let port = host_port()?;
+    let request = PathRegistrationRequest::for_current_user(console_directory()?);
+    port.unregister(&request).map_err(|e| e.to_string())?;
+    // Re-plan against the store as it stands AFTER the write: the registration
+    // plan is what carries `current_session_command` and the target file, and a
+    // plan computed before the removal would describe the old world.
+    let plan = port.plan(&request).map_err(|e| e.to_string())?;
+    let reachable = reachable_on_process_path(&request.directory, port.as_ref());
+    Ok(ConsolePathState::from_plan(&plan, reachable, false))
 }
 
 /// The directory to register: the one this process runs from.
@@ -158,9 +205,10 @@ mod tests {
                 updated_list: "/usr/bin:/opt/netrulerouter/bin".to_string(),
             },
         );
-        let state = ConsolePathState::from_plan(&plan, false);
+        let state = ConsolePathState::from_plan(&plan, false, false);
         assert_eq!(state.target_file, Some(PathBuf::from("/home/u/.bashrc")));
-        assert!(!state.registered);
+        assert!(!state.reachable);
+        assert!(!state.owned_entry_present);
         assert!(state
             .current_session_command
             .contains("/opt/netrulerouter/bin"));
@@ -177,7 +225,10 @@ mod tests {
                 updated_list: "…".to_string(),
             },
         );
-        assert_eq!(ConsolePathState::from_plan(&plan, false).target_file, None);
+        assert_eq!(
+            ConsolePathState::from_plan(&plan, false, false).target_file,
+            None
+        );
     }
 
     #[test]
@@ -185,8 +236,9 @@ mod tests {
         // The user may have registered it in a previous session; the terminal
         // they have open right now still predates the change.
         let plan = plan_with(Vec::new(), PathDecision::AlreadyPresent);
-        let state = ConsolePathState::from_plan(&plan, true);
-        assert!(state.registered);
+        let state = ConsolePathState::from_plan(&plan, true, true);
+        assert!(state.reachable);
+        assert!(state.owned_entry_present);
         assert_eq!(state.target_file, None);
         assert!(!state.current_session_command.is_empty());
     }

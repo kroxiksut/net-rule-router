@@ -29,6 +29,7 @@
 #include <QSplashScreen>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QStyleHints>
 #include <QTimer>
 #include <QThread>
 #include <QUrl>
@@ -399,7 +400,9 @@ public:
           mainGuiExecutable_(resolveMainGuiExecutable(applicationDir)),
           trayGuiExecutable_(resolveTrayGuiExecutable(applicationDir)),
           guiActivationRequestPath_(guiActivationRequestFilePath()),
-          logsDirectory_(resolveLogsDirectory()) {}
+          logsDirectory_(resolveLogsDirectory()) {
+        watchSystemAppearance();
+    }
 
     Q_INVOKABLE void triggerTrayAction(const QString &actionId) {
         if (actionId == QStringLiteral("open-main-window")) {
@@ -821,6 +824,12 @@ signals:
     /// wind-down.
     void trayProcessDied();
 
+    /// The desktop changed its light/dark preference while the window is up.
+    /// Carries no value on purpose: Qt is the TRIGGER, the launcher's probe is
+    /// the ANSWER (`rpcSystemTheme`). Two sources for one question is how a
+    /// window ends up disagreeing with its own settings page.
+    void systemAppearanceChanged();
+
 public:
 
     // The main GUI polls this from QML; when the tray's "Exit" handler has
@@ -884,6 +893,19 @@ public:
     }
 
     void setMainWindow(QWindow *window) { mainWindow_ = window; }
+
+    /// Subscribe to the platform's colour-scheme hint. Qt carries this on every
+    /// OS it supports (registry broadcast on Windows, the desktop portal on
+    /// Linux), which is why the watch lives here rather than behind another
+    /// per-OS port: the host is the only piece with a running event loop.
+    void watchSystemAppearance() {
+        QStyleHints *hints = QGuiApplication::styleHints();
+        if (hints == nullptr) {
+            return;
+        }
+        connect(hints, &QStyleHints::colorSchemeChanged, this,
+                [this](Qt::ColorScheme) { emit systemAppearanceChanged(); });
+    }
 
     // Apply Windows DWM dark title bar to the main window. Native title bar
     // is rendered by the OS and ignores Qt palette / QML theme tokens, so a
@@ -1105,6 +1127,12 @@ public:
     Q_INVOKABLE QString rpcTrafficStatsClear() {
         return emitRpcRequest(QStringLiteral("traffic-stats.clear"), QJsonObject());
     }
+    // Answer the one-time "did this connection's history continue as that
+    // one's?" question. A refusal travels the same way — it is an answer.
+    Q_INVOKABLE QString rpcTrafficHistoryMergeSet(const QVariantMap &payload) {
+        return emitRpcRequest(QStringLiteral("traffic-stats.history-merge.set"),
+                              QJsonObject::fromVariantMap(payload));
+    }
 
     /// Replace the ENTIRE shared DoH/DoT resolver baseline list.
     /// `resolversJson` is a serialised
@@ -1249,6 +1277,14 @@ public:
     /// second call reports the folder is already there and writes nothing.
     Q_INVOKABLE QString rpcConsolePathRegister() {
         return emitRpcRequest(QStringLiteral("local.console-path.register"),
+                              QJsonObject());
+    }
+
+    /// Take our own entry back off the current user's PATH. Idempotent, and it
+    /// removes ONLY the entry we wrote — an entry someone else put on the list,
+    /// or one that comes from the machine-wide list, is left alone.
+    Q_INVOKABLE QString rpcConsolePathUnregister() {
+        return emitRpcRequest(QStringLiteral("local.console-path.unregister"),
                               QJsonObject());
     }
 
@@ -1485,6 +1521,15 @@ public:
     Q_INVOKABLE QString rpcSeedFromBrowserHistory() {
         return emitRpcRequest(QStringLiteral("diagnostics.seed-from-browser-history"),
                               QJsonObject());
+    }
+
+    /// Async wrapper over the launcher-local `local.system-theme` RPC. Answers
+    /// with `{systemMode, systemModeDetected}` from the process-wide
+    /// `SystemThemePort` — the same probe the cold-start context used, so a
+    /// live switch and a restart cannot disagree, and high contrast (which Qt's
+    /// colour-scheme hint cannot express) still outranks light/dark.
+    Q_INVOKABLE QString rpcSystemTheme() {
+        return emitRpcRequest(QStringLiteral("local.system-theme"), QJsonObject());
     }
 
     /// Async wrapper over `local.service-info` RPC.
@@ -2104,7 +2149,8 @@ public:
     // Identical paging shape to rpcCacheEntriesList: `cursor` is the opaque
     // offset echoed back as `page.next_cursor`; `pageSize <= 0` uses the
     // server-side default. The response carries `page.items` (ConnTraceEntryDto:
-    // process/proto/local/remote/egress-role/egress-ifindex/verdict) + `redacted`.
+    // process/proto/local/remote/egress-role/egress-ifindex/verdict), `redacted`
+    // and `observer-active` (false when the service is not watching at all).
     Q_INVOKABLE QString rpcConnTraceEntriesList(const QString &cursor, int pageSize) {
         QJsonObject pagination;
         if (!cursor.isEmpty()) {

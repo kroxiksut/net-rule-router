@@ -266,7 +266,7 @@ fn compute_records_unresolved_app_rules_into_status() {
     let source = Arc::new(ScriptedSource::default());
     source.set("S-1-5-21-APP", snap_primary_only("Wi-Fi"));
     let rules = Arc::new(ScriptedRules::default());
-    rules.set(rules_with_one_app("vk.exe"));
+    rules.set(rules_with_one_app("ab.exe"));
     let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
     let audit = Arc::new(CollectAudit::default());
     let status = crate::app_enforcement_status::AppEnforcementStatus::new();
@@ -285,7 +285,7 @@ fn compute_records_unresolved_app_rules_into_status() {
     orch.compute_filters_for_sid("S-1-5-21-APP", true, None, ComputeIntent::Apply)
         .unwrap();
 
-    assert_eq!(status.unresolved(), vec!["vk.exe".to_string()]);
+    assert_eq!(status.unresolved(), vec!["ab.exe".to_string()]);
 }
 
 #[test]
@@ -427,6 +427,8 @@ fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
             sid,
             nrr_domain::RouteBehaviorMode::PreferPrimary,
             &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
             &live,
         )
         .expect("a well-formed SID yields a verdict");
@@ -440,6 +442,139 @@ fn the_neutral_plan_agrees_with_the_filters_the_orchestrator_computes() {
         verdict.same_order,
         "neutral plan installs the same filters in a different arbitration order — \
          WFP resolves overlaps by weight, so that is a different policy"
+    );
+}
+
+/// The comparison re-derives the whole plan and lowers it, on a path that
+/// fires every 30 s and that DNS answers queue behind. On input it has already
+/// evidenced it must not do that work again — and it must resume the moment the
+/// input really changes, or the evidence stops arriving.
+// Windows-only for the same reason the comparison is: off-Windows there is
+// no WFP filter set to compare against.
+#[cfg(windows)]
+#[test]
+fn the_shadow_compare_runs_once_per_distinct_input() {
+    let (_api, orch, src, rules, _audit) = fixture();
+    let book = rules_with_n_primary_ips(3);
+    rules.set(book.clone());
+    let mode = nrr_domain::RouteBehaviorMode::PreferPrimary;
+
+    // A real filter set to compare against. Computing it also runs the compare
+    // for THIS sid — the periodic path does exactly that — so the sid under
+    // test below is a different, not-yet-evidenced one.
+    let seed_sid = "S-1-5-21-NEUTRAL-SEED";
+    src.set(seed_sid, snap_full("Wi-Fi", "TAP"));
+    let live = match orch
+        .compute_filters_for_sid(seed_sid, true, None, ComputeIntent::Preview)
+        .expect("compute succeeds")
+    {
+        ComputedFilterSet::Install(plan) => plan.filters,
+        _ => unreachable!("the fixture's rule book is installable"),
+    };
+    assert!(
+        !orch.shadow_compare_neutral_plan(
+            seed_sid,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            &live,
+        ),
+        "computing the filters already compared this input — the periodic pass          must not pay for it twice"
+    );
+
+    let sid = "S-1-5-21-NEUTRAL";
+    assert!(
+        orch.shadow_compare_neutral_plan(
+            sid,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            &live
+        ),
+        "the first sighting of an input has to be compared"
+    );
+    assert!(
+        !orch.shadow_compare_neutral_plan(
+            sid,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            &live
+        ),
+        "the same input yields the same verdict — recomputing it buys nothing"
+    );
+
+    // Positive control: a changed filter set is changed input, and the evidence
+    // has to be taken again. Without this the test would pass on a compare that
+    // simply never runs twice.
+    let narrower = &live[..live.len().saturating_sub(1)];
+    assert!(
+        orch.shadow_compare_neutral_plan(
+            sid,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            narrower
+        ),
+        "a different filter set is different input and must be compared again"
+    );
+}
+
+/// A separate user is separate evidence: folding both into one fingerprint
+/// would let the second SID inherit the first one's "already compared".
+// Windows-only for the same reason the comparison is: off-Windows there is
+// no WFP filter set to compare against.
+#[cfg(windows)]
+#[test]
+fn the_shadow_compare_is_remembered_per_user() {
+    let (_api, orch, src, rules, _audit) = fixture();
+    let book = rules_with_n_primary_ips(3);
+    rules.set(book.clone());
+    let mode = nrr_domain::RouteBehaviorMode::PreferPrimary;
+
+    let seed_sid = "S-1-5-21-PER-USER-SEED";
+    src.set(seed_sid, snap_full("Wi-Fi", "TAP"));
+    let live = match orch
+        .compute_filters_for_sid(seed_sid, true, None, ComputeIntent::Preview)
+        .expect("compute succeeds")
+    {
+        ComputedFilterSet::Install(plan) => plan.filters,
+        _ => unreachable!("the fixture's rule book is installable"),
+    };
+
+    let first = "S-1-5-21-NEUTRAL-A";
+    assert!(orch.shadow_compare_neutral_plan(
+        first,
+        mode,
+        &book.rule_book,
+        orch.fqdn_cache.as_ref(),
+        &std::collections::HashSet::new(),
+        &live
+    ));
+    assert!(!orch.shadow_compare_neutral_plan(
+        first,
+        mode,
+        &book.rule_book,
+        orch.fqdn_cache.as_ref(),
+        &std::collections::HashSet::new(),
+        &live
+    ));
+
+    let second = "S-1-5-21-NEUTRAL-B";
+    assert!(
+        orch.shadow_compare_neutral_plan(
+            second,
+            mode,
+            &book.rule_book,
+            orch.fqdn_cache.as_ref(),
+            &std::collections::HashSet::new(),
+            &live
+        ),
+        "another user has not been evidenced yet, whatever the first one's input was"
     );
 }
 
@@ -854,8 +989,8 @@ fn only_permitted_addresses_are_published_as_enforced() {
         remote_subnet_v6: None,
         ip_protocol: None,
     };
-    let permitted = Ipv4Addr::new(172, 64, 154, 50);
-    let packed = Ipv4Addr::new(104, 18, 33, 206);
+    let permitted = Ipv4Addr::new(23, 10, 20, 158);
+    let packed = Ipv4Addr::new(23, 10, 20, 142);
     let doh_blocked = Ipv4Addr::new(8, 8, 4, 4);
     let sid = "S-1-5-21-publish-test";
 
@@ -1092,6 +1227,7 @@ fn full_ks_resolution() -> KillSwitchResolution {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: vec![Ipv4Addr::new(203, 0, 113, 7)],
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
     }
 }
 
@@ -1208,6 +1344,7 @@ fn mode_b_catch_all_fails_open_without_server_exemption() {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: vec![], // unknown server → must not arm
         local_subnets: vec![],
+        foreign_tunnel_luids: Vec::new(),
     }));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(8, 8, 8, 8)));
     // Fail-OPEN posture: the catch-all refusing to arm without a server
@@ -1607,6 +1744,73 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
             .map(|p| !p.contains('*') && !p.contains('?'))
             .unwrap_or(true)),
         "no glob may leave the orchestrator's fail-closed exempt set",
+    );
+}
+
+/// A client's TRANSPORT is a different process from the binary we resolved, and
+/// it is the transport that talks to the server. Exempting only the resolved
+/// one is why the 2026-09-08 outage held for 88 minutes: every protocol the
+/// user tried ran from a nested executable no permit named.
+#[test]
+fn a_clients_nested_transport_is_exempt_while_an_unrelated_app_is_not() {
+    let api = Arc::new(MockWindowsApi::new());
+    let session = Arc::new(WfpSession::open(Arc::clone(&api) as Arc<dyn WindowsApiPort>).unwrap());
+    let source = Arc::new(ScriptedSource::default());
+    let rules = Arc::new(ScriptedRules::default());
+    let cache: Arc<dyn FqdnCacheLookup> = Arc::new(MockFqdnCacheLookup::new());
+    let audit = Arc::new(CollectAudit::default());
+    const CLIENT: &str = r"C:\Program Files\vendor vpn\vendor vpn.exe";
+    const TRANSPORT: &str = r"C:\Program Files\vendor vpn\XRay\ExternalBinaries\xray.exe";
+    const UNRELATED: &str = r"C:\Program Files\mail\mail.exe";
+    let resolver = nrr_platform_api::MockAppPathResolver::new()
+        // The built-in `*vpn*` glob recognises the client by its file name.
+        .with("vendor vpn.exe", vec![std::path::PathBuf::from(CLIENT)])
+        // …and this is what actually ships beside it.
+        .with_siblings(CLIENT, vec![std::path::PathBuf::from(TRANSPORT)])
+        // An ordinary application's tree must stay out of the exemption, so
+        // seed one and assert its sibling never appears.
+        .with_siblings(
+            UNRELATED,
+            vec![std::path::PathBuf::from(
+                r"C:\Program Files\mail\updater.exe",
+            )],
+        );
+    let orch = Arc::new(
+        PerSidApplyOrchestrator::new(
+            session,
+            Arc::clone(&source) as Arc<dyn RoutePolicySource>,
+            Arc::clone(&rules) as Arc<dyn RulesProvider>,
+            cache,
+            Arc::clone(&audit) as Arc<dyn PerSidApplyAudit>,
+        )
+        .with_app_resolver(Arc::new(resolver))
+        // Secondary unresolved → the fail-closed branch that emits exemptions.
+        .with_kill_switch_resolver(Arc::new(|_| None)),
+    );
+    rules.set(rules_with_n_primary_ips(1));
+    source.set("S-1-5-21-A", snap_full("Wi-Fi", "TAP"));
+
+    orch.install_for_sid("S-1-5-21-A").unwrap();
+    let filters = api.wfp_filters.lock().unwrap();
+    let exempt_paths: Vec<String> = filters
+        .iter()
+        .filter(|f| {
+            f.action == WfpAction::Permit && f.remote_ip.is_none() && f.remote_ip_set.is_empty()
+        })
+        .filter_map(|f| f.app_pattern.clone())
+        .collect();
+
+    assert!(
+        exempt_paths.iter().any(|p| p == CLIENT),
+        "positive control: the confirmed client itself is exempt: {exempt_paths:?}",
+    );
+    assert!(
+        exempt_paths.iter().any(|p| p == TRANSPORT),
+        "the process that performs the handshake must be exempt too: {exempt_paths:?}",
+    );
+    assert!(
+        !exempt_paths.iter().any(|p| p.contains("updater.exe")),
+        "an ordinary app's install tree is not a tunnel client's: {exempt_paths:?}",
     );
 }
 
@@ -2016,7 +2220,7 @@ fn fixture_with_resolution_and_vpn_clients(
     (api, orch, source, rules)
 }
 
-const VPN_CLIENT_PATH: &str = r"C:\Apps\hidemy.name vpn 3.0.exe";
+const VPN_CLIENT_PATH: &str = r"C:\Apps\swiftvpn 3.0.exe";
 
 /// Find the app-exempt permit for [`VPN_CLIENT_PATH`], if any installed.
 fn find_client_exempt(
@@ -2077,6 +2281,7 @@ fn verified_vpn_client_exempt_installed_when_pair_cannot_arm_fail_closed() {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: Vec::new(),
         local_subnets: Vec::new(),
+        foreign_tunnel_luids: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution_and_vpn_clients(
         Some(resolution),
@@ -2253,7 +2458,7 @@ fn fixture_with_census(
 fn a_main_route_named_ip_is_spared_by_the_block_all_in_both_modes() {
     use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(209, 85, 233, 84);
+    let shared = Ipv4Addr::new(23, 10, 20, 163);
     for (strict, expect_permit) in [(false, true), (true, true)] {
         let (api, orch, src, rules) = fixture_with_census(
             None,
@@ -2306,7 +2511,7 @@ fn known_direct_exemption_keeps_census_shared_ip_under_mode_b_block_all() {
     // is still subtracted and stays blocked. Requires an effective fake-IP
     // datapath since  (the rule host is then enforced by name).
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(209, 85, 233, 84);
+    let shared = Ipv4Addr::new(23, 10, 20, 163);
     let pinned = Ipv4Addr::new(203, 0, 113, 9);
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared, pinned]);
@@ -2378,11 +2583,11 @@ fn smart_exemption_requires_fake_ip_datapath() {
     // set is the ONLY enforcement, so the smart shared-IP relaxation must
     // fall back to the strict subtraction: a census-shared secondary
     // destination earns NO known-primary permit under the block-all (in
-    // the  run, 39 chatgpt.com connections egressed the primary
+    // the  run, 39 assistant.example connections egressed the primary
     // through this exemption while the rule host was fail-closed).
     use nrr_domain::mode_a_coverage::ModeACoverageStrategy;
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(209, 85, 233, 84);
+    let shared = Ipv4Addr::new(23, 10, 20, 163);
     let (api, orch, src, rules) = fixture_with_census(
         None,
         &[shared],
@@ -2417,7 +2622,7 @@ fn known_direct_exemption_denied_for_shared_ip_when_fake_ip_not_effective() {
     // down, a census-shared known-direct IP is subtracted like any other
     // secondary destination and earns no block-all exemption.
     use std::sync::atomic::AtomicBool;
-    let shared = Ipv4Addr::new(209, 85, 233, 84);
+    let shared = Ipv4Addr::new(23, 10, 20, 163);
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared]);
     let (api, orch, src, rules) = fixture_with_census(
@@ -2462,7 +2667,7 @@ fn fake_ip_datapath_flip_retightens_shared_ip_exemption_on_recompute() {
     // tightening pass must also DELETE the superseded permit — an add-only
     // pass would leave the leak installed.
     use std::sync::atomic::{AtomicBool, Ordering};
-    let shared = Ipv4Addr::new(209, 85, 233, 84);
+    let shared = Ipv4Addr::new(23, 10, 20, 163);
     let effective = Arc::new(AtomicBool::new(true));
     let registry = Arc::new(crate::known_direct::KnownDirectRegistry::default());
     registry.register(&[shared]);
@@ -2764,6 +2969,7 @@ fn turning_the_guard_off_in_strict_does_not_cut_the_machine_off() {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));
@@ -2807,6 +3013,7 @@ fn a_device_on_the_machines_own_lan_is_never_pinned_to_the_tunnel() {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
         local_subnets: vec![(Ipv4Addr::new(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ips(&[NAS, REMOTE]));
@@ -2841,6 +3048,7 @@ fn a_healthy_tunnel_is_never_cut_by_the_guard_in_the_tunnel_default_modes() {
         secondary_luid: KS_LUID,
         bootstrap_server_ips: Vec::new(),
         local_subnets: Vec::new(),
+        foreign_tunnel_luids: Vec::new(),
     };
     let (api, orch, src, rules) = fixture_with_resolution(Some(resolution));
     rules.set(rules_with_secondary_ip(Ipv4Addr::new(203, 0, 113, 9)));

@@ -62,6 +62,11 @@ wintun-bindings = { version = "0.7", features = ["verify_binary_signature"] }
 # Declared early so CI can verify the crate compiles on Windows.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    # CM_Locate_DevNodeW + CM_Get_DevNode_Status behind the neutral
+    # `NetworkDeviceStatusPort`: tells "the adapter was removed" apart from
+    # "the adapter is here and its driver will not start", which the ordinary
+    # adapter enumeration reports identically (as nothing at all).
+    "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_NetworkManagement_IpHelper",
     # Block 16.12.A.0: IP_ADAPTER_ADDRESSES_LH transitively pulls in
     # NDIS types (NET_LUID_LH, NET_IF_*) which the windows crate gates

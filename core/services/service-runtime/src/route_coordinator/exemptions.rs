@@ -109,7 +109,41 @@ impl SecondaryRouteCoordinator {
             secondary_luid,
             bootstrap_server_ips: server_ips,
             local_subnets,
+            foreign_tunnel_luids: self.foreign_tunnel_luids(Some(secondary.interface_index)),
         })
+    }
+
+    /// LUIDs of tunnels the user runs that are not our additional route.
+    ///
+    /// A machine can hold several: ours, and the corporate one the person
+    /// needs for work. Cutting the second is the product breaking something
+    /// it was never asked to manage, and from the outside it is
+    /// indistinguishable from the corporate VPN failing on its own.
+    ///
+    /// Only tunnels, and only usable ones. The name decision is
+    /// `text_indicates_vpn_tunnel`, the same one that keeps a tunnel from
+    /// being mistaken for a hypervisor network — one notion of "this is a
+    /// tunnel", not two.
+    fn foreign_tunnel_luids(&self, secondary_index: Option<u32>) -> Vec<u64> {
+        let Ok(adapters) = self.api.get_adapter_infos() else {
+            return Vec::new();
+        };
+        adapters
+            .iter()
+            .filter(|a| Some(a.index) != secondary_index)
+            .filter(|a| {
+                nrr_platform_api::classify_availability(a)
+                    == Some(nrr_platform_api::AdapterAvailability::Available)
+            })
+            .filter(|a| {
+                nrr_platform_api::adapters::text_indicates_vpn_tunnel(&format!(
+                    "{} {}",
+                    a.description, a.friendly_name
+                ))
+            })
+            .filter_map(|a| self.api.interface_luid_for_index(a.index).ok())
+            .filter(|luid| *luid != 0)
+            .collect()
     }
 
     /// exemptions for the **fail-closed** block-all path
@@ -223,9 +257,16 @@ impl SecondaryRouteCoordinator {
                 .map(|t| vec![t.gateway])
                 .unwrap_or_default(),
         };
+        // A peerless tunnel forwards on-link; there is no probe target to exempt.
+        let probe_target_ips: Vec<Ipv4Addr> = probe_target_ips
+            .into_iter()
+            .filter(|ip| !ip.is_unspecified())
+            .collect();
         FailClosedExemptions {
             bootstrap_server_ips,
             local_subnets,
+            foreign_tunnel_luids: self
+                .foreign_tunnel_luids(resolution.secondary.map(|s| s.interface_index)),
             // the resolver has no rule/codegen context;
             // the orchestrator fills known-primary IPs at the block-all call site.
             primary_dest_ips: Vec::new(),

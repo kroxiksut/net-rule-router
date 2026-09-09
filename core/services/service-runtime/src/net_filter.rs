@@ -1,7 +1,7 @@
 //! Non-routable IPv4 filtering shared across the route/cache pipeline.
 //!
 //! An ad-blocking OS `hosts` file commonly pins ad/tracker domains to the
-//! loopback address (`musical.ly 127.0.0.1`) or the unspecified address
+//! loopback address (`app.example 127.0.0.1`) or the unspecified address
 //! (`0.0.0.0`). NetRuleRouter observes DNS / seeds rule hostnames, caches
 //! those resolutions, and fans them out into `/32` secondary routes. A
 //! loopback/unspecified destination must never travel that pipeline:
@@ -10,7 +10,7 @@
 //!   leaves the box;
 //! - caching it pollutes the FQDN/IP cache with a bogus mapping;
 //! - it produces a spurious "collateral: a direct host shares its IP with a
-//!   secondary rule" warning (real logs: `musical.ly → 127.0.0.1`).
+//!   secondary rule" warning (real logs: `app.example → 127.0.0.1`).
 //!
 //! The fake-IP pool is filtered here for the same reason: those addresses are
 //! virtual (they exist only inside the userspace TUN stack), so caching one as
@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn public_and_private_are_routable() {
-        assert!(!is_non_routable_v4(&Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(!is_non_routable_v4(&Ipv4Addr::new(23, 10, 20, 138)));
         assert!(!is_non_routable_v4(&Ipv4Addr::new(10, 0, 0, 1)));
         assert!(!is_non_routable_v4(&Ipv4Addr::new(192, 168, 1, 1)));
         assert!(!is_non_routable_v4(&Ipv4Addr::new(8, 8, 8, 8)));

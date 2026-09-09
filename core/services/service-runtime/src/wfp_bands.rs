@@ -127,7 +127,11 @@ const PACKET_BANDS: &[(&str, u64)] = &[
 pub(crate) const BAND_WIDTH: u64 = 0x0010_0000;
 
 /// Fan-out slots one rule may use before colliding with the next rule's range.
-pub const SLOTS_PER_RULE: u64 = 256;
+///
+/// Declared in `nrr-platform-api` because the Windows lowering needs the same
+/// number to recover a rule from a plan ordinal, and it cannot depend on this
+/// crate. Re-exported here so the band story still reads in one place.
+pub use nrr_platform_api::enforcement::SLOTS_PER_RULE;
 
 /// Protected destination ADDRESSES one kill-switch plan accepts. Applied before
 /// packing, so a chunk index can never exceed the address count and every
@@ -140,6 +144,66 @@ pub(crate) const APP_KILLSWITCH_MAX_APPS: usize = 0x0003_FFFF;
 
 /// Slots one packet-layer per-destination filter takes (`idx * 16 + k`).
 const PACKET_SLOTS_PER_DESTINATION: u64 = 16;
+
+// ── Reading a weight back ───────────────────────────────────────────────────
+
+/// Which band a weight belongs to, by name.
+///
+/// The tables above are the only thing that knows where a band starts, so the
+/// answer is derived from them rather than from a second list that would drift.
+/// A weight below the lowest band is `"below-bands"` — an emitter that produced
+/// one is a defect worth seeing rather than silently filing under a neighbour.
+fn band_of(bands: &[(&'static str, u64)], weight: u64) -> &'static str {
+    let mut found = "below-bands";
+    for (name, base) in bands {
+        if weight >= *base {
+            found = name;
+        }
+    }
+    found
+}
+
+/// Which band this filter's weight sits in. ALE and the packet layer arbitrate
+/// separately and reuse the same numeric space, so the layer picks the table.
+pub(crate) fn band_of_filter(spec: &nrr_platform_api::types::WfpFilterSpec) -> &'static str {
+    use nrr_platform_api::types::WfpLayerKey;
+    match spec.layer {
+        WfpLayerKey::OutboundIpPacketV4 | WfpLayerKey::OutboundIpPacketV6 => {
+            band_of(PACKET_BANDS, spec.weight)
+        }
+        _ => band_of(ALE_BANDS, spec.weight),
+    }
+}
+
+/// How the standing filter set breaks down by band, biggest first.
+///
+/// The volume watchdog names a total; a total says a number is high and nothing
+/// about which emitter produced it. The first packed run measured 2260 filters
+/// with the kill switch at 176 and DoH at 34 — the remaining ~2000 were the
+/// rule band, and it took a separate hand count to learn that.
+pub(crate) fn standing_volume_by_band(
+    specs: &[nrr_platform_api::types::WfpFilterSpec],
+) -> Vec<(&'static str, usize)> {
+    let mut counts: std::collections::HashMap<&'static str, usize> =
+        std::collections::HashMap::new();
+    for spec in specs {
+        *counts.entry(band_of_filter(spec)).or_insert(0) += 1;
+    }
+    let mut out: Vec<(&'static str, usize)> = counts.into_iter().collect();
+    // Biggest first, then by name: the reader wants the culprit on the left,
+    // and a stable order makes two lines comparable.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    out
+}
+
+/// The breakdown as one log field: `BASE_SECONDARY=1980 KILLSWITCH_BLOCK_BASE=176`.
+pub(crate) fn render_standing_volume(specs: &[nrr_platform_api::types::WfpFilterSpec]) -> String {
+    standing_volume_by_band(specs)
+        .into_iter()
+        .map(|(band, count)| format!("{band}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 // ── The invariant ───────────────────────────────────────────────────────────
 
@@ -216,5 +280,92 @@ mod tests {
     fn every_band_is_in_a_table() {
         assert_eq!(ALE_BANDS.len(), 12);
         assert_eq!(PACKET_BANDS.len(), 3);
+    }
+
+    fn spec_at(
+        layer: nrr_platform_api::types::WfpLayerKey,
+        weight: u64,
+    ) -> nrr_platform_api::types::WfpFilterSpec {
+        use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec};
+        WfpFilterSpec {
+            layer,
+            action: WfpAction::Block,
+            remote_ip: None,
+            remote_ip_set: Vec::new(),
+            remote_port: None,
+            weight,
+            id: WfpFilterId { raw: weight },
+            user_sid: None,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        }
+    }
+
+    #[test]
+    fn a_weight_is_filed_under_the_band_it_sits_in() {
+        use nrr_platform_api::types::WfpLayerKey;
+        assert_eq!(
+            band_of_filter(&spec_at(WfpLayerKey::AleAuthConnectV4, BASE_SECONDARY + 7)),
+            "BASE_SECONDARY"
+        );
+        // The top band has no upper neighbour, so anything above it is still
+        // its own.
+        assert_eq!(
+            band_of_filter(&spec_at(WfpLayerKey::AleAuthConnectV4, BASE_BLOCK + 1_000)),
+            "BASE_BLOCK"
+        );
+    }
+
+    #[test]
+    fn the_layer_decides_which_table_answers() {
+        // The two layers arbitrate separately and REUSE the numeric space:
+        // 0x0030_0000 is the kill-switch block on ALE and the packet block on
+        // the packet layer. Filing both under one table would invent a
+        // constraint the hardware does not impose.
+        use nrr_platform_api::types::WfpLayerKey;
+        assert_eq!(
+            band_of_filter(&spec_at(
+                WfpLayerKey::AleAuthConnectV4,
+                KILLSWITCH_BLOCK_BASE
+            )),
+            "KILLSWITCH_BLOCK_BASE"
+        );
+        assert_eq!(
+            band_of_filter(&spec_at(WfpLayerKey::OutboundIpPacketV4, PACKET_BLOCK_BASE)),
+            "PACKET_BLOCK_BASE"
+        );
+    }
+
+    #[test]
+    fn a_weight_under_every_band_is_named_rather_than_filed_away() {
+        // An emitter that produced one is a defect; filing it under a
+        // neighbour would hide that.
+        use nrr_platform_api::types::WfpLayerKey;
+        assert_eq!(
+            band_of_filter(&spec_at(WfpLayerKey::AleAuthConnectV4, 1)),
+            "below-bands"
+        );
+    }
+
+    #[test]
+    fn the_breakdown_names_the_biggest_producer_first() {
+        use nrr_platform_api::types::WfpLayerKey;
+        let mut specs = Vec::new();
+        for i in 0..5 {
+            specs.push(spec_at(WfpLayerKey::AleAuthConnectV4, BASE_SECONDARY + i));
+        }
+        specs.push(spec_at(WfpLayerKey::AleAuthConnectV4, DOH_BLOCK_BASE));
+        specs.push(spec_at(WfpLayerKey::AleAuthConnectV4, DOH_BLOCK_BASE + 1));
+
+        let summary = standing_volume_by_band(&specs);
+        assert_eq!(summary[0], ("BASE_SECONDARY", 5), "the culprit reads first");
+        assert_eq!(summary[1], ("DOH_BLOCK_BASE", 2));
+        assert_eq!(
+            render_standing_volume(&specs),
+            "BASE_SECONDARY=5 DOH_BLOCK_BASE=2"
+        );
     }
 }

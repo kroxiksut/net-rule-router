@@ -85,9 +85,9 @@ impl AddressOwnership {
     ///
     /// The two sides are resolved TOGETHER, not one set at a time, because a
     /// host can be named by both and only the more specific rule actually
-    /// carries it: with `*.google.com` on the main link and
-    /// `notebooklm.google.com` on the additional one, resolving each set alone
-    /// puts notebooklm's addresses on both sides and the main link — which wins
+    /// carries it: with `*.search.example` on the main link and
+    /// `docs.search.example` on the additional one, resolving each set alone
+    /// puts docs's addresses on both sides and the main link — which wins
     /// ties — would swallow a rule the user wrote and can see.
     ///
     /// The contest is per HOST, and an address a main-link host still holds
@@ -518,7 +518,7 @@ mod tests {
     use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern, CanonicalRule};
     use nrr_domain::RuleId;
 
-    const NAMED: Ipv4Addr = Ipv4Addr::new(178, 248, 237, 68);
+    const NAMED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 68);
     const OTHER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
 
     fn address_rule(id: &str, m: CanonicalAddressMatch, action: RuleAction) -> CanonicalRule {
@@ -539,7 +539,7 @@ mod tests {
             enabled: true,
             address_match: None,
             app_match: Some(CanonicalAppMatch {
-                pattern: CanonicalAppPattern::Exact("claude.exe".into()),
+                pattern: CanonicalAppPattern::Exact("helper.exe".into()),
                 include_child_processes: false,
             }),
             comment: String::new(),
@@ -557,30 +557,30 @@ mod tests {
 
     fn cache() -> MockFqdnCacheLookup {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("habr.com", vec![NAMED]);
+        cache.set_ips("blog.example", vec![NAMED]);
         cache
     }
 
-    /// The live case: `*.google.com` on the main link, `notebooklm.google.com`
+    /// The live case: `*.search.example` on the main link, `docs.search.example`
     /// on the additional one, and Google hands both hosts the SAME address.
-    /// Pinning it into the tunnel takes translate.google.com with it, which the
+    /// Pinning it into the tunnel takes translate.search.example with it, which the
     /// user routed over the main link and which then breaks whenever the tunnel
     /// misbehaves.
     #[test]
     fn a_shared_address_stays_on_the_main_link() {
-        let shared = Ipv4Addr::new(172, 217, 17, 206);
+        let shared = Ipv4Addr::new(23, 10, 20, 161);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.google.com", vec![shared]);
-        cache.set_ips("notebooklm.google.com", vec![shared]);
+        cache.set_ips("translate.search.example", vec![shared]);
+        cache.set_ips("docs.search.example", vec![shared]);
         let book = book(
             vec![address_rule(
                 "p1",
-                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+                CanonicalAddressMatch::SuffixDomain("search.example".into()),
                 RuleAction::Route,
             )],
             vec![address_rule(
                 "s1",
-                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
                 RuleAction::Route,
             )],
         );
@@ -599,18 +599,18 @@ mod tests {
     /// tie-break then swallowed the rule the user wrote.
     #[test]
     fn a_more_specific_rule_keeps_the_address_only_its_host_has() {
-        let private = Ipv4Addr::new(142, 250, 150, 101);
+        let private = Ipv4Addr::new(23, 10, 20, 150);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("notebooklm.google.com", vec![private]);
+        cache.set_ips("docs.search.example", vec![private]);
         let book = book(
             vec![address_rule(
                 "p1",
-                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+                CanonicalAddressMatch::SuffixDomain("search.example".into()),
                 RuleAction::Route,
             )],
             vec![address_rule(
                 "s1",
-                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
                 RuleAction::Route,
             )],
         );
@@ -693,7 +693,7 @@ mod tests {
         let book = book(
             vec![address_rule(
                 "r-main",
-                CanonicalAddressMatch::ExactFqdn("habr.com".into()),
+                CanonicalAddressMatch::ExactFqdn("blog.example".into()),
                 RuleAction::Route,
             )],
             vec![app_rule("r-app")],
@@ -784,7 +784,7 @@ mod tests {
         let book = book(
             vec![address_rule(
                 "r-main",
-                CanonicalAddressMatch::ExactFqdn("habr.com".into()),
+                CanonicalAddressMatch::ExactFqdn("blog.example".into()),
                 RuleAction::Route,
             )],
             vec![app_rule("r-app")],

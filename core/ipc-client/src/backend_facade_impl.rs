@@ -212,7 +212,9 @@ fn timeout_for(op: IpcOperationName) -> Duration {
         // in-memory session totals; the write is one singleton-row upsert. 2 s.
         IpcOperationName::TrafficStatsGet
         | IpcOperationName::TrafficStatsSet
-        | IpcOperationName::TrafficStatsClear => Duration::from_secs(2),
+        | IpcOperationName::TrafficStatsClear
+        // Answering the merge question is one row written into the same store.
+        | IpcOperationName::TrafficHistoryMergeSet => Duration::from_secs(2),
         // Kicks off the async browser-history seed and returns immediately;
         // the read+resolve happens on a service worker thread.
         IpcOperationName::SeedFromBrowserHistory => Duration::from_secs(2),

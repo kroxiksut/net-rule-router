@@ -44,7 +44,7 @@ fn routed() -> Vec<String> {
 
 fn pinned_store() -> AppObservationStore {
     let store = AppObservationStore::new();
-    store.record("assistant.exe", Ipv4Addr::new(178, 248, 237, 68));
+    store.record("assistant.exe", Ipv4Addr::new(203, 0, 113, 68));
     store
 }
 
@@ -65,7 +65,7 @@ fn a_foreign_process_on_the_tunnel_names_the_pin_that_moved_it() {
         "chrome.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(178, 248, 237, 68),
+        Ipv4Addr::new(203, 0, 113, 68),
     );
     assert_eq!(owners, vec!["assistant".to_string()]);
 }
@@ -76,32 +76,32 @@ fn a_foreign_process_on_the_tunnel_names_the_pin_that_moved_it() {
 #[test]
 fn a_process_no_rule_names_never_owns_a_pin() {
     let store = AppObservationStore::new();
-    store.record("chrome.exe", Ipv4Addr::new(209, 85, 233, 188));
+    store.record("chrome.exe", Ipv4Addr::new(23, 10, 20, 165));
     let owners = owners_for(
         &store,
         "assistant.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(209, 85, 233, 188),
+        Ipv4Addr::new(23, 10, 20, 165),
     );
     assert!(owners.is_empty(), "{owners:?}");
 }
 
-/// The same run also withdrew from `claude.exe.old.<stamp>` — an updater's
+/// The same run also withdrew from `helper.exe.old.<stamp>` — an updater's
 /// leftover, with the real application as the supposed intruder.
 #[test]
 fn an_updaters_leftover_binary_is_not_an_owner() {
     let store = AppObservationStore::new();
     store.record(
         "assistant.exe.old.1787377508929",
-        Ipv4Addr::new(34, 149, 66, 165),
+        Ipv4Addr::new(23, 10, 20, 130),
     );
     let owners = owners_for(
         &store,
         "assistant.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(34, 149, 66, 165),
+        Ipv4Addr::new(23, 10, 20, 130),
     );
     assert!(owners.is_empty(), "{owners:?}");
 }
@@ -110,14 +110,14 @@ fn an_updaters_leftover_binary_is_not_an_owner() {
 fn one_routed_application_is_not_an_intruder_on_another() {
     // Both want the tunnel and the route serves them identically.
     let store = AppObservationStore::new();
-    store.record("assistant.exe", Ipv4Addr::new(178, 248, 237, 68));
+    store.record("assistant.exe", Ipv4Addr::new(203, 0, 113, 68));
     let both = vec!["assistant.exe".to_string(), "helper.exe".to_string()];
     let owners = owners_for(
         &store,
         "helper.exe",
         &both,
         EgressRole::Secondary,
-        Ipv4Addr::new(178, 248, 237, 68),
+        Ipv4Addr::new(203, 0, 113, 68),
     );
     assert!(owners.is_empty(), "{owners:?}");
 }
@@ -125,7 +125,7 @@ fn one_routed_application_is_not_an_intruder_on_another() {
 #[test]
 fn a_glob_rule_covers_the_processes_it_names() {
     let store = AppObservationStore::new();
-    store.record("codex-helper.exe", Ipv4Addr::new(178, 248, 237, 68));
+    store.record("codex-helper.exe", Ipv4Addr::new(203, 0, 113, 68));
     let routed = vec!["codex*.exe".to_string()];
     // Owner matches the glob → a real pin, and chrome is a real intruder.
     assert_eq!(
@@ -134,7 +134,7 @@ fn a_glob_rule_covers_the_processes_it_names() {
             "chrome.exe",
             &routed,
             EgressRole::Secondary,
-            Ipv4Addr::new(178, 248, 237, 68)
+            Ipv4Addr::new(203, 0, 113, 68)
         ),
         vec!["codex-helper".to_string()]
     );
@@ -147,7 +147,7 @@ fn the_owning_application_using_its_own_pin_is_not_collateral() {
         "assistant.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(178, 248, 237, 68),
+        Ipv4Addr::new(203, 0, 113, 68),
     );
     assert!(owners.is_empty());
 }
@@ -162,7 +162,7 @@ fn the_relays_own_dials_are_never_collateral() {
         "nrr-service.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(178, 248, 237, 68),
+        Ipv4Addr::new(203, 0, 113, 68),
     );
     assert!(owners.is_empty());
 }
@@ -176,7 +176,7 @@ fn the_same_flow_over_the_main_link_proves_nothing() {
             "chrome.exe",
             &routed(),
             role,
-            Ipv4Addr::new(178, 248, 237, 68),
+            Ipv4Addr::new(203, 0, 113, 68),
         );
         assert!(owners.is_empty(), "{role:?}");
     }
@@ -189,7 +189,7 @@ fn an_address_no_application_rule_pinned_is_left_alone() {
         "chrome.exe",
         &routed(),
         EgressRole::Secondary,
-        Ipv4Addr::new(93, 184, 216, 34),
+        Ipv4Addr::new(23, 10, 20, 138),
     );
     assert!(owners.is_empty());
 }
@@ -202,7 +202,7 @@ fn without_a_rule_book_the_check_stays_silent() {
         "chrome.exe",
         &[],
         EgressRole::Secondary,
-        Ipv4Addr::new(178, 248, 237, 68),
+        Ipv4Addr::new(203, 0, 113, 68),
     );
     assert!(owners.is_empty());
 }
@@ -449,8 +449,8 @@ fn test_consumer_with_live_secondary() -> ConnectionObservationConsumer {
     let vpn = AdapterInfo {
         index: VPN,
         adapter_name: "{vpn-live}".into(),
-        description: "hidemy.name VPN 3.0 OpenVPN Adapter".into(),
-        friendly_name: "hidemy.name VPN".into(),
+        description: "SwiftVPN 3.0 OpenVPN Adapter".into(),
+        friendly_name: "swiftvpn VPN".into(),
         mac: None,
         interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
         oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
@@ -596,7 +596,7 @@ fn vpn_name_match_accepts_vpn_clients_rejects_others() {
         r"\device\harddiskvolume2\program files\openvpn\bin\openvpn.exe"
     )));
     assert!(process_name_matches_vpn(Some(
-        r"\device\harddiskvolume3\hidemy.name\hidemy.name.exe"
+        r"\device\harddiskvolume3\swiftvpn\swiftvpn.exe"
     )));
     assert!(process_name_matches_vpn(Some(
         r"C:\Program Files\WireGuard\wireguard.exe"
@@ -663,14 +663,14 @@ fn build_unicast_table_flattens_adapter_addresses() {
 fn classify_labels_vpn_source_as_secondary() {
     let unicast = vec![(v4(Ipv4Addr::new(10, 8, 0, 6)), VPN)];
     let rec = classify_connection(
-        &obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(188, 40, 167, 82)),
+        &obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(23, 10, 20, 162)),
         &unicast,
         Some(ETHERNET),
         Some(VPN),
     );
     assert_eq!(rec.egress.role, EgressRole::Secondary);
     assert_eq!(rec.egress.ifindex, VPN);
-    assert_eq!(rec.remote.ip(), IpAddr::V4(Ipv4Addr::new(188, 40, 167, 82)));
+    assert_eq!(rec.remote.ip(), IpAddr::V4(Ipv4Addr::new(23, 10, 20, 162)));
 }
 
 #[test]
@@ -679,7 +679,7 @@ fn classify_labels_lan_source_as_primary() {
     let rec = classify_connection(
         &obs(
             Ipv4Addr::new(192, 168, 0, 50),
-            Ipv4Addr::new(93, 184, 216, 34),
+            Ipv4Addr::new(23, 10, 20, 138),
         ),
         &unicast,
         Some(ETHERNET),
@@ -721,7 +721,7 @@ fn trace_ring_caps_and_snapshots_newest_first() {
 #[test]
 fn p2p_processes_suppress_fcrdns_learning_others_do_not() {
     // A torrent client's dropped peers must be skipped;
-    // a browser's drop (the legit dzen.ru FCrDNS case) must not.
+    // a browser's drop (the legit forward-confirmed service case) must not.
     assert!(process_is_p2p_fcrdns_suppressed(Some(
         r"\device\harddiskvolume5\users\krox\appdata\roaming\bittorrent web\btweb.exe"
     )));
@@ -729,7 +729,7 @@ fn p2p_processes_suppress_fcrdns_learning_others_do_not() {
         r"C:\Program Files\qBittorrent\qbittorrent.exe"
     )));
     assert!(process_is_p2p_fcrdns_suppressed(Some("bitcoind.exe")));
-    // Non-P2P processes keep learning (the dzen.ru recovery path).
+    // Non-P2P processes keep learning (the forward-confirmed recovery path).
     assert!(!process_is_p2p_fcrdns_suppressed(Some("chrome.exe")));
     assert!(!process_is_p2p_fcrdns_suppressed(Some("VBoxSVC.exe")));
     assert!(!process_is_p2p_fcrdns_suppressed(None));
@@ -891,7 +891,7 @@ fn an_unrecognised_drop_during_a_fail_closed_window_reads_as_the_outage() {
 fn block_obs(blocked_by_nrr: Option<bool>, spec_id: Option<u64>) -> ConnectionObservation {
     ConnectionObservation {
         pid: 0,
-        process_path: Some(r"C:\Program Files\Telegram\Telegram.exe".to_string()),
+        process_path: Some(r"C:\Program Files\Messenger\Messenger.exe".to_string()),
         user_sid: None,
         protocol: TransportProtocol::Tcp,
         local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 5), 51000)),
@@ -987,7 +987,116 @@ fn a_role_verified_drop_opens_one_episode_and_its_retry_stays_silent() {
     assert_eq!(got.len(), 1, "one notice per episode, not per drop");
     assert_eq!(got[0].reason, BlockReason::RouteUnavailable);
     assert_eq!(got[0].destination, "203.0.113.9");
-    assert_eq!(got[0].app, "telegram.exe");
+    assert_eq!(got[0].app, "messenger.exe");
+}
+
+/// Consumer whose sink collects RAW attempts, with no ledger in between.
+///
+/// The ledger folds an outage by content already (one episode for every host
+/// and app), so a ledger-backed sink cannot see whether the CONSUMER decided to
+/// report a second time. What the field case showed is the time axis: an
+/// episode reopens after a minute of quiet, and the outage outlasted it.
+fn raw_attempt_consumer(
+    armed: bool,
+) -> (ConnectionObservationConsumer, Arc<Mutex<Vec<BlockAttempt>>>) {
+    let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> =
+        Arc::new(nrr_platform_api::windows_api::MockWindowsApi::new());
+    let coordinator = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api),
+        Arc::new(crate::per_sid_orchestrator::NoopRulesProvider)
+            as Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
+        Arc::new(NoopPolicySource) as Arc<dyn crate::per_sid_orchestrator::RoutePolicySource>,
+        Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new())
+            as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+        Arc::new(|| false),
+    ));
+    let active_sid: ActiveSidFn = Arc::new(|| None);
+    let attempts: Arc<Mutex<Vec<BlockAttempt>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_attempts = Arc::clone(&attempts);
+    let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
+        .with_block_notice(
+            Arc::new(|_ip| None),
+            Arc::new(move |_sid: &str, attempt: BlockAttempt| {
+                sink_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(attempt);
+            }),
+        )
+        .with_killswitch_drop_check(Arc::new(|id| id == 777))
+        .with_fail_closed_armed(Arc::new(move || armed));
+    (consumer, attempts)
+}
+
+/// An outage lasts as long as it lasts; the episode window is a minute. Without
+/// a latch on the STATE the same "waiting for the additional link" is reported
+/// again every time the window lapses, while nothing about the machine changed.
+#[test]
+fn an_armed_outage_is_reported_once_however_long_it_lasts() {
+    let (consumer, attempts) = raw_attempt_consumer(true);
+
+    consumer.consume(&[block_obs(Some(true), Some(777))], SystemTime::now());
+    let mut later = block_obs(Some(true), Some(777));
+    later.process_path = Some(r"C:\Program Files\Chrome\chrome.exe".to_string());
+    later.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443));
+    consumer.consume(&[later], SystemTime::now());
+
+    let got = attempts.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        got.len(),
+        1,
+        "the outage is one fact about the machine; the second report says it again"
+    );
+    assert_eq!(got[0].reason, BlockReason::RouteUnavailable);
+}
+
+/// The latch is on the STATE, not on the process lifetime: once the block-all
+/// disarms the wait is over, and the next outage is genuinely news.
+#[test]
+fn a_disarmed_block_all_lets_the_next_outage_speak() {
+    let (consumer, attempts) = raw_attempt_consumer(false);
+
+    consumer.consume(&[block_obs(Some(true), Some(777))], SystemTime::now());
+    let mut later = block_obs(Some(true), Some(777));
+    later.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443));
+    consumer.consume(&[later], SystemTime::now());
+
+    let got = attempts.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        got.len(),
+        2,
+        "with nothing armed there is no outage to collapse into"
+    );
+}
+
+/// Positive control for the collapse: a cause the user can act on keeps its own
+/// report even while an outage is latched. Acting on the outage does not act on
+/// the DoH lockdown, so folding them together would hide the actionable one.
+///
+/// The lockdown is the right control precisely because it survives an armed
+/// block-all: `block_reason_for` reads the lockdown band BEFORE the fail-closed
+/// posture, while an unidentified drop under an armed block-all classifies as
+/// the outage itself — so a rule block cannot be told apart there, and using
+/// one as the control would have tested nothing.
+#[test]
+fn an_actionable_block_still_speaks_during_an_outage() {
+    let (consumer, attempts) = raw_attempt_consumer(true);
+    let consumer = consumer.with_dns_lockdown_drop_check(Arc::new(|id| id == 42));
+
+    consumer.consume(&[block_obs(Some(true), Some(777))], SystemTime::now());
+    let mut own_resolver = block_obs(Some(true), Some(42));
+    own_resolver.process_path = Some(r"C:\Program Files\Chrome\chrome.exe".to_string());
+    own_resolver.remote = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 7), 443));
+    consumer.consume(&[own_resolver], SystemTime::now());
+
+    let got = attempts.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        got.len(),
+        2,
+        "the lockdown has its own remedy and its own news"
+    );
+    assert_eq!(got[0].reason, BlockReason::RouteUnavailable);
+    assert_eq!(got[1].reason, BlockReason::DnsLockdown);
 }
 
 #[test]

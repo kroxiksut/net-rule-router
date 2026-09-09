@@ -3,7 +3,7 @@
 //! These types represent the platform's view of the routing/packet-filter state
 //! — they are **not** business-domain types. `CanonicalProfile` (from
 //! `nrr-domain`) is converted to `ApplyActionPlan` by the service layer before
-//! being handed to the OS apply engine (e.g. the Windows WFP `WindowsApplyEngine`).
+//! being handed to the OS enforcement backend (on Windows, the WFP one).
 //! Per the policy/mechanism seam these DEFINITIONS live in the neutral
 //! `nrr-platform-api`; each OS backend consumes them and implements the ports.
 //!
@@ -254,8 +254,11 @@ pub struct WfpFilterSpec {
     pub local_interface_luid: Option<u64>,
     /// Match condition: a
     /// remote IPv4 **subnet** as `(network, prefix_len)`, mapped to
-    /// `FWPM_CONDITION_IP_REMOTE_ADDRESS_V4` with an `FWP_V4_ADDR_AND_MASK`
-    /// value. `None` = no subnet condition. Mutually exclusive with
+    /// `FWPM_CONDITION_IP_REMOTE_ADDRESS` — the SUFFIX-LESS field key, the
+    /// layer already fixes the address family — with an `FWP_V4_ADDR_AND_MASK`
+    /// value. The `_V4`/`_V6` spellings exist in the headers but do not
+    /// materialise a filter; that was a whole day of filters that silently
+    /// never appeared. `None` = no subnet condition. Mutually exclusive with
     /// `remote_ip` (an exact host is a /32 — use `remote_ip` for that).
     ///
     /// The catch-all kill-switch uses this to carve the system exemptions
@@ -267,8 +270,9 @@ pub struct WfpFilterSpec {
     pub remote_subnet: Option<(Ipv4Addr, u8)>,
     /// IPv6 catch-all kill-switch (Free's only IPv6 handling) — match
     /// condition: a remote IPv6 **subnet** as `(network, prefix_len)`, mapped
-    /// to `FWPM_CONDITION_IP_REMOTE_ADDRESS_V6` with an `FWP_V6_ADDR_AND_MASK`
-    /// value. `None` = no subnet condition. The IPv6 twin of [`remote_subnet`].
+    /// to `FWPM_CONDITION_IP_REMOTE_ADDRESS` — the same suffix-less field key
+    /// as the IPv4 twin — with an `FWP_V6_ADDR_AND_MASK` value. `None` = no
+    /// subnet condition. The IPv6 twin of [`remote_subnet`].
     ///
     /// The catch-all kill-switch uses this to carve the IPv6 system exemptions
     /// its block-everything must never cover: loopback `::1/128` and link-local

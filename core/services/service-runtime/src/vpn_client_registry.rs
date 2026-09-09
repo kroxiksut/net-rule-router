@@ -6,7 +6,7 @@
 //! exempts one server IP per drop — which fails against providers that run
 //! their client's connectivity checks over ROTATING infrastructure IPs: every
 //! rotation is a fresh ~72 s hang-until-drop before the next per-IP exemption
-//! lands  field logs, hidemy.name over Google front-ends). The
+//! lands  field logs, swiftvpn over Google front-ends). The
 //! client PROCESS, however, is stable across rotations, and its whole egress
 //! is the tunnel's transport — so once its role is verified, the process
 //! itself earns an app-scoped exemption whenever a block-all posture arms,
@@ -335,13 +335,13 @@ mod tests {
 
     // ── ConfirmedVpnClients ──────────────────────────────────────────────────
 
-    const HIDEMY: &str = r"C:\Program Files\hidemy.name VPN 3.0\hidemy.name VPN 3.0.exe";
+    const VPN_CLIENT: &str = r"C:\Program Files\SwiftVPN 3.0\swiftvpn 3.0.exe";
 
     #[test]
     fn an_unpublished_registry_is_unarmed_and_matches_nothing() {
         let confirmed = ConfirmedVpnClients::new();
         assert!(!confirmed.is_armed());
-        assert!(!confirmed.matches_image("hidemy.name vpn 3.0.exe"));
+        assert!(!confirmed.matches_image("swiftvpn 3.0.exe"));
         assert!(confirmed.paths().is_empty());
         assert!(confirmed.paths_matching("*vpn*").is_empty());
     }
@@ -349,13 +349,13 @@ mod tests {
     #[test]
     fn a_confirmed_client_matches_by_full_path_and_by_basename() {
         let confirmed = ConfirmedVpnClients::new();
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         assert!(confirmed.is_armed());
         // The codegen side holds the full path…
-        assert!(confirmed.matches_image(HIDEMY));
-        assert!(confirmed.matches_image(&HIDEMY.to_ascii_uppercase()));
+        assert!(confirmed.matches_image(VPN_CLIENT));
+        assert!(confirmed.matches_image(&VPN_CLIENT.to_ascii_uppercase()));
         // …the OS flow-owner lookup can only produce the image basename.
-        assert!(confirmed.matches_image("hidemy.name vpn 3.0.exe"));
+        assert!(confirmed.matches_image("swiftvpn 3.0.exe"));
         // Anything else stays outside the exemption.
         assert!(!confirmed.matches_image("chrome.exe"));
         assert!(!confirmed.matches_image(""));
@@ -364,37 +364,34 @@ mod tests {
     #[test]
     fn publishing_an_empty_set_disarms_that_sid() {
         let confirmed = ConfirmedVpnClients::new();
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         confirmed.publish("S-1-5-21-1", &[]);
         assert!(
             !confirmed.is_armed(),
             "un-confirming must revoke the exemption"
         );
-        assert!(!confirmed.matches_image("hidemy.name vpn 3.0.exe"));
+        assert!(!confirmed.matches_image("swiftvpn 3.0.exe"));
     }
 
     #[test]
     fn each_sid_owns_its_own_slice() {
         let confirmed = ConfirmedVpnClients::new();
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         confirmed.publish("S-1-5-21-2", &[r"C:\Apps\openvpn.exe".to_string()]);
         confirmed.publish("S-1-5-21-1", &[]);
         // The other user's confirmation survives its neighbour's clearing.
         assert!(confirmed.is_armed());
         assert!(confirmed.matches_image("openvpn.exe"));
-        assert!(!confirmed.matches_image("hidemy.name vpn 3.0.exe"));
+        assert!(!confirmed.matches_image("swiftvpn 3.0.exe"));
     }
 
     #[test]
     fn paths_matching_resolves_exact_names_and_globs() {
         let confirmed = ConfirmedVpnClients::new();
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
-        let expected = vec![HIDEMY.to_string()];
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
+        let expected = vec![VPN_CLIENT.to_string()];
         // The exact rule pattern the user typed.
-        assert_eq!(
-            confirmed.paths_matching("hidemy.name VPN 3.0.exe"),
-            expected
-        );
+        assert_eq!(confirmed.paths_matching("SwiftVPN 3.0.exe"), expected);
         // The built-in `*vpn*` exemption glob.
         assert_eq!(confirmed.paths_matching("*vpn*"), expected);
         // An unrelated pattern resolves to nothing.

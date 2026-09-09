@@ -276,7 +276,7 @@ mod tests {
         assert!(hosts_content_has_entries("127.0.0.1 ads.example.com\n"));
         assert!(hosts_content_has_entries("0.0.0.0 tracker.example\n"));
         assert!(hosts_content_has_entries(
-            "93.184.216.34 example.com # pinned\n"
+            "23.10.20.138 example.com # pinned\n"
         ));
         assert!(hosts_content_has_entries("::1 ipv6.local\n"));
         // An IP with no hostname, or junk, is not an entry.

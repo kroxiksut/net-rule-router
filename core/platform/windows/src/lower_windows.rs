@@ -68,6 +68,10 @@ const BASE_BLOCK: u64 = 0x0070_0000;
 // correctly.
 const KILLSWITCH_PERMIT_BASE: u64 = 0x0040_0000;
 const KILLSWITCH_BLOCK_BASE: u64 = 0x0030_0000;
+// The fake-IP pool, mirrored from `killswitch_codegen::FAKEIP_POOL_PERMIT_BASE`:
+// the top of the kill-switch permit band, so an application always reaches the
+// relay's virtual addresses — a pool cut is every fake-routed host dead.
+const FAKEIP_POOL_PERMIT_BASE: u64 = KILLSWITCH_PERMIT_BASE + 0x000E_0000;
 // Per-APP kill-switch / fail-closed block band, mirrored from
 // `killswitch_codegen::APP_KILLSWITCH_BLOCK_BASE`. Like the catch-all, it sits
 // BETWEEN the secondary and primary rule bands: a primary rule's own permit
@@ -111,7 +115,8 @@ const DEFAULT_BLOCK_WEIGHT: u64 = 0x0000_FFFF;
 const _: () = {
     assert!(BASE_BLOCK > APP_EXEMPT_BASE);
     assert!(APP_EXEMPT_BASE > CATCHALL_EXEMPT_BASE);
-    assert!(CATCHALL_EXEMPT_BASE > KILLSWITCH_PERMIT_BASE);
+    assert!(CATCHALL_EXEMPT_BASE > FAKEIP_POOL_PERMIT_BASE);
+    assert!(FAKEIP_POOL_PERMIT_BASE > KILLSWITCH_PERMIT_BASE);
     assert!(KILLSWITCH_PERMIT_BASE > KILLSWITCH_BLOCK_BASE);
     assert!(KILLSWITCH_BLOCK_BASE > DOH_BLOCK_BASE);
     assert!(DOH_BLOCK_BASE > BASE_PRIMARY);
@@ -134,7 +139,110 @@ const _: () = {
 /// `wfp_codegen::push_packet_block_mirror`. Ids are deterministic (re-apply = no
 /// churn) but need NOT match the old FNV scheme — the oracle ignores ids.
 pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
-    plan.flows.iter().flat_map(lower_flow).collect()
+    // Host flows are COLLECTED per rule and packed; everything else (app
+    // filters, the default catch-all) lowers one flow at a time.
+    //
+    // The neutral plan stays per-address — which addresses a rule covers is
+    // policy. Folding them into chunk filters is Windows mechanism (WFP ORs
+    // conditions on one field), shared with `wfp_codegen` through
+    // `wfp_slotting` so both pipelines produce identical chunk keys and the
+    // behavioural oracle still compares like with like.
+    let mut out = Vec::new();
+    let mut rules: Vec<(RuleChunkKey, Vec<Ipv4Addr>)> = Vec::new();
+    for flow in &plan.flows {
+        match rule_chunk_key(flow) {
+            Some((key, ip)) => match rules.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ips)) => ips.push(ip),
+                None => rules.push((key, vec![ip])),
+            },
+            None => out.extend(lower_flow(flow)),
+        }
+    }
+    for (key, ips) in rules {
+        for (idx, chunk) in nrr_platform_api::wfp_slotting::pack_v4(ips)
+            .into_iter()
+            .enumerate()
+        {
+            let weight = key.base
+                + key.rule_position * nrr_platform_api::enforcement::SLOTS_PER_RULE
+                + key.slot_base
+                + idx as u64;
+            out.push(make_chunk_filter(
+                WfpLayerKey::AleAuthConnectV4,
+                key.action,
+                &chunk,
+                weight,
+                key.user_sid.clone(),
+            ));
+            // A Block with packet coverage drops the destination at the packet
+            // layer too; that layer exposes no ALE user id.
+            if key.action == WfpAction::Block && key.all_packets {
+                out.push(make_chunk_filter(
+                    WfpLayerKey::OutboundIpPacketV4,
+                    WfpAction::Block,
+                    &chunk,
+                    weight,
+                    None,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// What makes two host flows part of the SAME packed rule.
+///
+/// The ordinal the planner assigns is `rule_position * SLOTS_PER_RULE +
+/// fanout_index`, so dividing it recovers the rule and every address of one
+/// rule lands in one group. Everything else in the key is what a filter would
+/// carry anyway — mixing two of them into one chunk would change what the
+/// filter means.
+#[derive(Clone, PartialEq, Eq)]
+struct RuleChunkKey {
+    base: u64,
+    rule_position: u64,
+    /// First slot of the range this group occupies. A rule's own addresses
+    /// start at 0; the addresses its application was OBSERVED using start after
+    /// the per-executable app-id filters. Packing the two together would put a
+    /// filter in a slot the codegen reserved for the other kind.
+    slot_base: u64,
+    action: WfpAction,
+    all_packets: bool,
+    user_sid: Option<String>,
+}
+
+/// `Some((key, ip))` for a plain per-address rule flow; `None` for anything
+/// that is not one (an app filter, the default catch-all, a non-rule class).
+fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, Ipv4Addr)> {
+    let base = base_for_class(flow.precedence.class)?;
+    if matches!(flow.app, AppScope::Program { .. }) {
+        return None;
+    }
+    let DstMatch::HostV4(ip) = flow.flow.dst else {
+        return None;
+    };
+    let action = match flow.verdict {
+        Verdict::Permit => WfpAction::Permit,
+        Verdict::Block => WfpAction::Block,
+    };
+    let ordinal = u64::from(flow.precedence.ordinal);
+    let slot = ordinal % nrr_platform_api::enforcement::SLOTS_PER_RULE;
+    let observed_app_range = nrr_platform_api::enforcement::APP_PATH_FANOUT_CAP + 1;
+    Some((
+        RuleChunkKey {
+            base,
+            rule_position: ordinal / nrr_platform_api::enforcement::SLOTS_PER_RULE,
+            slot_base: if slot >= observed_app_range {
+                observed_app_range
+            } else {
+                0
+            },
+            action,
+            all_packets: flow.coverage == Coverage::AllPackets,
+            user_sid: flow.principal.0.as_ref().map(|p| p.as_stored().to_string()),
+        },
+        ip,
+    ))
 }
 
 /// Lower the **per-destination / per-app kill-switch**
@@ -761,23 +869,34 @@ fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
 ///   `CATCHALL_BLOCK_WEIGHT + ordinal` (ALE) or `PACKET_BLOCK_BASE + ordinal`
 ///   (packet). Exact weights are reproduced, so arbitration is identical.
 ///
-/// Fails OPEN on `secondary_luid == 0` (the blanket permit's egress condition
-/// would never match, black-holing everything) — like the current codegen. The
-/// `no server exemptions` / `no protocol selected` safety valves are the planner's
-/// concern (it emits no flows), so they need no handling here.
+/// Without a tunnel LUID only the egress-CONDITIONAL flows are dropped: their
+/// condition could never match, and a blanket permit that never matches
+/// black-holes everything. Address-scoped exemptions (loopback, link-local,
+/// DHCP, the local control block, the tunnel's own servers, LAN subnets) need
+/// no LUID at all — and they are exactly the floor the strict default block
+/// depends on, which exists whether or not a tunnel is up.
+/// The `no server exemptions` / `no protocol selected` safety valves are the
+/// planner's concern (it emits no flows), so they need no handling here.
 pub fn lower_catch_all_kill_switch(
     plan: &EnforcementPlan,
     secondary_luid: u64,
 ) -> Vec<WfpFilterSpec> {
-    if secondary_luid == 0 {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for flow in &plan.flows {
         if !matches!(
             flow.precedence.class,
             PrecedenceClass::CatchAllExempt | PrecedenceClass::CatchAllBlock
         ) {
+            continue;
+        }
+        // Without a tunnel LUID the whole blanket posture is off: its block
+        // would stand while the egress permit that lets the tunnel through
+        // could never match. Only the address-scoped permits survive — they are
+        // the floor, and a floor without its block harms nothing.
+        if secondary_luid == 0
+            && (flow.precedence.class == PrecedenceClass::CatchAllBlock
+                || matches!(flow.egress, EgressConstraint::OnlyVia(EgressRef::Secondary)))
+        {
             continue;
         }
         let ord = u64::from(flow.precedence.ordinal);
@@ -1012,6 +1131,34 @@ fn make_host_filter(
     }
 }
 
+/// One packed chunk as a filter. The per-address twin of this is
+/// [`make_host_filter`]; identity comes from the chunk digest, so the same
+/// address set always yields the same id.
+fn make_chunk_filter(
+    layer: WfpLayerKey,
+    action: WfpAction,
+    chunk: &nrr_platform_api::wfp_slotting::V4SlotChunk,
+    weight: u64,
+    user_sid: Option<String>,
+) -> WfpFilterSpec {
+    let id = derive_catch_all_id(user_sid.as_deref(), layer, action, weight, &chunk.id_seg());
+    WfpFilterSpec {
+        layer,
+        action,
+        remote_ip: None,
+        remote_ip_set: chunk.members.clone(),
+        remote_port: None,
+        weight,
+        id,
+        user_sid,
+        app_pattern: None,
+        local_interface_luid: None,
+        remote_subnet: None,
+        remote_subnet_v6: None,
+        ip_protocol: None,
+    }
+}
+
 /// Deterministic id for an app-id filter (keyed on user/action/exe-path/weight —
 /// no remote IP). Oracle ignores ids; this only needs to be stable + unique.
 fn derive_app_id(sid: Option<&str>, action: WfpAction, path: &str, weight: u64) -> WfpFilterId {
@@ -1116,7 +1263,71 @@ pub fn lower_plan(plan: &EnforcementPlan, egress: EgressLuids) -> Vec<WfpFilterS
     out.extend(lower_kill_switch(plan, egress.secondary));
     out.extend(lower_doh_dot_block(plan));
     out.extend(lower_catch_all_kill_switch(plan, egress.secondary));
+    out.extend(lower_fake_ip_pool(plan));
     out
+}
+
+/// The fake-IP pool band: a subnet permit per family, plus the UDP veto that
+/// rides above it while the relay's UDP path is off. Ordinal IS the offset
+/// inside the band — the planner emits them in the order the arbitration needs
+/// (permit, then the veto that qualifies it).
+pub fn lower_fake_ip_pool(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
+    let mut flows: Vec<&FlowRule> = plan
+        .flows
+        .iter()
+        .filter(|f| f.precedence.class == PrecedenceClass::FakeIpPool)
+        .collect();
+    flows.sort_by_key(|f| f.precedence.ordinal);
+
+    let mut out = Vec::new();
+    for flow in flows {
+        let user_sid = flow.principal.0.as_ref().map(|p| p.as_stored().to_string());
+        let action = match flow.verdict {
+            Verdict::Permit => WfpAction::Permit,
+            Verdict::Block => WfpAction::Block,
+        };
+        let weight = FAKEIP_POOL_PERMIT_BASE + u64::from(flow.precedence.ordinal);
+        let proto = flow.flow.protocol.map(l4proto_to_ip_number);
+        let (layer, subnet_v4, subnet_v6) = match flow.flow.dst {
+            DstMatch::SubnetV4 { net, prefix } => {
+                (WfpLayerKey::AleAuthConnectV4, Some((net, prefix)), None)
+            }
+            DstMatch::SubnetV6 { net, prefix } => {
+                (WfpLayerKey::AleAuthConnectV6, None, Some((net, prefix)))
+            }
+            // The pool is a subnet by construction; anything else in this band
+            // is a planner bug, and silently lowering it would hide that.
+            _ => continue,
+        };
+        out.push(WfpFilterSpec {
+            layer,
+            action,
+            remote_ip: None,
+            remote_ip_set: Vec::new(),
+            remote_port: None,
+            weight,
+            id: derive_subnet_filter_id(user_sid.as_deref(), layer, action, weight),
+            user_sid,
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: subnet_v4,
+            remote_subnet_v6: subnet_v6,
+            ip_protocol: proto,
+        });
+    }
+    out
+}
+
+/// Identity for a subnet-scoped filter. The address itself is not part of the
+/// seed because a band's subnet is fixed by configuration, while the weight
+/// already separates the members of the band.
+fn derive_subnet_filter_id(
+    sid: Option<&str>,
+    layer: WfpLayerKey,
+    action: WfpAction,
+    weight: u64,
+) -> WfpFilterId {
+    derive_filter_id(sid, layer, action, Ipv4Addr::UNSPECIFIED, weight)
 }
 
 #[cfg(test)]
@@ -1188,7 +1399,9 @@ mod tests {
         let f = &out[0];
         assert_eq!(f.layer, WfpLayerKey::AleAuthConnectV4);
         assert_eq!(f.action, WfpAction::Permit);
-        assert_eq!(f.remote_ip, Some(Ipv4Addr::new(203, 0, 113, 5)));
+        // Packed: the address rides in the set, and `covers_v4` is the
+        // question every consumer actually asks.
+        assert!(f.covers_v4(Ipv4Addr::new(203, 0, 113, 5)));
         assert_eq!(f.user_sid.as_deref(), Some("S-1-5-21-A"));
         assert_eq!(f.weight, BASE_PRIMARY);
         assert!(f.app_pattern.is_none() && f.local_interface_luid.is_none());

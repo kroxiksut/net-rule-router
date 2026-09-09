@@ -13,7 +13,9 @@
 
 use serde_json::{json, Value};
 
-use crate::console_path::{console_path_state, register_console_on_path, ConsolePathState};
+use crate::console_path::{
+    console_path_state, register_console_on_path, unregister_console_from_path, ConsolePathState,
+};
 
 /// Read the current state without changing anything.
 const STATE_OP: &str = "local.console-path.state";
@@ -21,7 +23,11 @@ const STATE_OP: &str = "local.console-path.state";
 /// Register the console's directory on the user's `PATH`. Idempotent.
 const REGISTER_OP: &str = "local.console-path.register";
 
-/// `true` for the two operations this module answers.
+/// Take our own entry back off it. Idempotent, and it removes only the entry we
+/// wrote — a directory someone else put on the list stays there.
+const UNREGISTER_OP: &str = "local.console-path.unregister";
+
+/// `true` for the three operations this module answers.
 ///
 /// Matched on every OS: unlike autostart, there is no per-OS split in ownership
 /// here — the user's `PATH` belongs to the user's session on every host, so the
@@ -29,7 +35,7 @@ const REGISTER_OP: &str = "local.console-path.register";
 /// mechanism surface that as an error from the capability itself rather than by
 /// silently forwarding to a service that cannot help either.
 pub fn is_console_path_op(operation: &str) -> bool {
-    operation == STATE_OP || operation == REGISTER_OP
+    operation == STATE_OP || operation == REGISTER_OP || operation == UNREGISTER_OP
 }
 
 /// Answer one console-PATH operation. Returns the JSON the Settings panel
@@ -43,18 +49,27 @@ pub fn handle_console_path(operation: &str, _payload: &Value) -> Result<Value, S
     match operation {
         STATE_OP => Ok(state_to_json(&console_path_state()?)),
         REGISTER_OP => Ok(state_to_json(&register_console_on_path()?)),
+        UNREGISTER_OP => Ok(state_to_json(&unregister_console_from_path()?)),
         other => Err(format!("not a console-path op: {other}")),
     }
 }
 
 /// Project the capability's state onto the wire.
 ///
+/// Two facts travel, because the panel needs both and they can disagree:
+/// `reachable` drives the status line ("would the name work in a new shell"),
+/// `ownedEntryPresent` drives the button ("is our entry in our store"). Sending
+/// one `registered` flag made the button follow the wrong fact — on Unix a
+/// removal leaves this process's inherited `PATH` untouched, so the toggle
+/// flipped straight back and read as a failure.
+///
 /// `targetFile` is `null` wherever the host has a real per-user environment
 /// store (Windows): there is no file to name, and the panel's "the line was
 /// added to …" hint stays hidden rather than inventing a path.
 fn state_to_json(state: &ConsolePathState) -> Value {
     json!({
-        "registered": state.registered,
+        "reachable": state.reachable,
+        "ownedEntryPresent": state.owned_entry_present,
         "directory": state.directory.display().to_string(),
         "currentSessionCommand": state.current_session_command,
         "targetFile": state
@@ -71,11 +86,11 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn recognises_the_two_console_path_ops() {
+    fn recognises_the_three_console_path_ops() {
         assert!(is_console_path_op("local.console-path.state"));
         assert!(is_console_path_op("local.console-path.register"));
+        assert!(is_console_path_op("local.console-path.unregister"));
         assert!(!is_console_path_op("local.console-path"));
-        assert!(!is_console_path_op("local.console-path.unregister"));
         assert!(!is_console_path_op("local.service-control"));
         assert!(!is_console_path_op("autostart.get"));
     }
@@ -93,12 +108,14 @@ mod tests {
     fn a_file_based_state_names_the_file_it_wrote() {
         let state = ConsolePathState {
             directory: PathBuf::from("/opt/netrulerouter/bin"),
-            registered: true,
+            reachable: true,
+            owned_entry_present: true,
             current_session_command: "export PATH=\"$PATH:/opt/netrulerouter/bin\"".to_string(),
             target_file: Some(PathBuf::from("/home/u/.bashrc")),
         };
         let value = state_to_json(&state);
-        assert_eq!(value["registered"], json!(true));
+        assert_eq!(value["reachable"], json!(true));
+        assert_eq!(value["ownedEntryPresent"], json!(true));
         assert_eq!(value["directory"], json!("/opt/netrulerouter/bin"));
         assert_eq!(value["targetFile"], json!("/home/u/.bashrc"));
         assert!(value["currentSessionCommand"]
@@ -111,12 +128,30 @@ mod tests {
     fn an_environment_store_state_sends_a_null_target_file() {
         let state = ConsolePathState {
             directory: PathBuf::from("C:/Program Files/NetRuleRouter"),
-            registered: false,
+            reachable: false,
+            owned_entry_present: false,
             current_session_command: "$env:Path += ';C:/Program Files/NetRuleRouter'".to_string(),
             target_file: None,
         };
         let value = state_to_json(&state);
-        assert_eq!(value["registered"], json!(false));
+        assert_eq!(value["reachable"], json!(false));
         assert_eq!(value["targetFile"], Value::Null);
+    }
+
+    /// The two facts are independent on the wire. Straight after a removal on
+    /// Unix this is the REAL state: our entry is gone from the start-up file,
+    /// and the directory is still on the PATH this process inherited.
+    #[test]
+    fn a_removed_entry_can_still_be_reachable_in_this_session() {
+        let state = ConsolePathState {
+            directory: PathBuf::from("/opt/netrulerouter/bin"),
+            reachable: true,
+            owned_entry_present: false,
+            current_session_command: "export PATH=\"$PATH:/opt/netrulerouter/bin\"".to_string(),
+            target_file: Some(PathBuf::from("/home/u/.bashrc")),
+        };
+        let value = state_to_json(&state);
+        assert_eq!(value["reachable"], json!(true));
+        assert_eq!(value["ownedEntryPresent"], json!(false));
     }
 }

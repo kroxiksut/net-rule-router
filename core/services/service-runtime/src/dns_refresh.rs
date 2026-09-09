@@ -384,7 +384,7 @@ impl DnsRefreshOrchestrator {
                 // our fake-pool address back. That answer carries no signal
                 // about the host — skip it on a FLAT short retry instead of
                 // walking the hosts-file backoff ladder (observed :
-                // youtube/ytimg banned for minutes by their own fake answers).
+                // a delivery apex banned for minutes by its own fake answers).
                 let fake_intercepted = contains_fake_pool_addr(&record.addresses);
                 // Drop non-routable IPs (loopback/unspecified) before writing
                 // back. A hostname can flip to a hosts-file loopback pin
@@ -677,9 +677,9 @@ mod tests {
         let now = SystemTime::now();
         let resolver_mock = Arc::new(MockDnsResolver::new());
         resolver_mock.set_response(
-            "mattermost.com",
+            "chat.example",
             ResolvedRecord {
-                canonical_hostname: "mattermost.com".into(),
+                canonical_hostname: "chat.example".into(),
                 addresses: vec![Ipv4Addr::new(203, 0, 113, 9)],
                 ttl_seconds: Some(300),
             },
@@ -689,20 +689,20 @@ mod tests {
 
         let orchestrator = DnsRefreshOrchestrator::new(resolver, cache.clone());
         // Trailing dot and case are what a rule file can carry.
-        let summary = orchestrator.resolve_now(&["MatterMost.com.".to_string()], now);
+        let summary = orchestrator.resolve_now(&["Chat.Example.".to_string()], now);
 
         assert_eq!(summary.attempted, 1);
         assert_eq!(summary.succeeded, 1);
         assert_eq!(
             resolver_mock.observed_queries(),
-            vec!["mattermost.com".to_string()],
+            vec!["chat.example".to_string()],
             "the name must be canonicalised before it reaches the resolver"
         );
 
         let guard = cache.lock().unwrap();
         let lookup = guard
             .get_by_hostname(
-                "mattermost.com",
+                "chat.example",
                 &FreshnessThresholds::default_production(),
                 nrr_storage::resolution_source::CachePriorityStrategy::default(),
             )
@@ -867,7 +867,7 @@ mod tests {
         // Mode B self-interception: the system resolver hands back OUR OWN
         // fake-pool address. It must not be cached, and — unlike a hosts-file
         // loopback pin — it must never walk the doubling backoff ladder
-        // : youtube/ytimg spent minutes banned by their own
+        // : a delivery apex spent minutes banned by its own
         // virtual answers during a fake-IP datapath outage).
         let now = SystemTime::now();
         let resolver_mock = Arc::new(MockDnsResolver::new());

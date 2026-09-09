@@ -20,8 +20,8 @@
 //! The service's own RAW log lines used to be step 3 here, read off disk —
 //! which is why its log directory had to be readable by every account on the
 //! machine, and why one user's bundle carried everyone's lines. The service
-//! puts them in the archive itself now (`service-logs.ndjson`), scoped to
-//! whoever asked for it.
+//! puts them in the archive itself now (the `service-logs/` directory, one
+//! file per rotation), scoped to whoever asked for it.
 //!
 //! Both GUI export buttons then show a folder the user owns outright.
 //! Everything is best-effort: any failure returns the response untouched

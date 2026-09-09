@@ -106,6 +106,19 @@ QtObject {
             ? bridge.rpcTrafficStatsClear()
             : ""
     }
+    function rpcTrafficHistoryMergeSet(payload) {
+        return (bridgeAvailable && typeof bridge.rpcTrafficHistoryMergeSet === "function")
+            ? bridge.rpcTrafficHistoryMergeSet(payload)
+            : ""
+    }
+    // The system appearance as the launcher's probe reports it right now. Asked
+    // when the desktop's colour scheme changes under a running window; "" means
+    // no bridge, and the shell keeps the appearance it started with.
+    function rpcSystemTheme() {
+        return (bridgeAvailable && typeof bridge.rpcSystemTheme === "function")
+            ? bridge.rpcSystemTheme()
+            : ""
+    }
     // App-group routing discovery (mirrors rpcVpnDiscover); "" == scan-failed.
     function rpcAppGroupsDiscover() {
         return (bridgeAvailable && typeof bridge.rpcAppGroupsDiscover === "function")

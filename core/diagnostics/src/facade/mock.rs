@@ -154,6 +154,8 @@ fn healthy_status() -> DiagnosticsStatusDto {
             state: "running".into(),
             active_revision_id: Some("rev-preview-001".into()),
             pending_changes: 0,
+            start_relative_to_sign_in: "unknown".to_string(),
+            start_sign_in_gap_ms: None,
         },
         security_status: SecurityStatusCard {
             audit_chain_ok: true,

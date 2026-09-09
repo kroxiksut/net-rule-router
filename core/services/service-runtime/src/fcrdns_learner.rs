@@ -4,7 +4,7 @@
 //! browser reached from its OWN in-process cache / DoH / a reused connection
 //! never produced an OS-level DNS query, so the observer never saw the name and
 //! the zone rule never expanded to it — the connection is dropped even though a
-//! rule would have permitted it (the dzen.ru case). This module closes
+//! rule would have permitted it (the DoH blind-spot case). This module closes
 //! that class by learning the name FROM THE DROP:
 //!
 //! ```text
@@ -18,8 +18,8 @@
 //!
 //! **Why forward-confirm is mandatory (anti-spoofing).** An attacker controls
 //! the PTR zone of their OWN IP, so a bare PTR answer could claim any name
-//! (`yandex.ru`) and earn a permit. FCrDNS defeats this: the attacker does NOT
-//! control the forward (`A`) zone of `yandex.ru`, so the forward lookup of the
+//! (`bank.example`) and earn a permit. FCrDNS defeats this: the attacker does
+//! NOT control the forward (`A`) zone of `bank.example`, so the lookup of the
 //! claimed name will not return the attacker's IP, and the claim is rejected.
 //! Only a name whose forward record actually contains the dropped IP is trusted.
 //!
@@ -60,9 +60,9 @@ pub trait ConfirmedHostSink: Send + Sync {
     /// [`Self::record_confirmed`] refused it) is a POSITIVELY-direct
     /// destination: the name provably owns the dropped IP, and no rule routes
     /// it to the secondary. The production impl registers its addresses in the
-    /// known-direct registry so the block-all stops cutting it (the habr.com
-    /// case — a plain primary-path site the resolver never saw because the
-    /// browser resolved it over DoH). Default `false` = direct-learning off
+    /// known-direct registry so the block-all stops cutting it (a plain
+    /// primary-path site the resolver never saw because the browser resolved
+    /// it over DoH). Default `false` = direct-learning off
     /// (existing sinks/tests keep the strict behaviour).
     fn record_confirmed_direct(&self, _hostname: &str, _addresses: &[Ipv4Addr]) -> bool {
         false
@@ -290,24 +290,29 @@ mod tests {
 
     #[test]
     fn learns_a_forward_confirmed_rule_host() {
-        let ip = Ipv4Addr::new(5, 45, 202, 100); // dzen.ru-ish
-        let l = learner(&[(ip, &["dzen.ru"])], &[("dzen.ru", &[ip])], ".ru", 64);
+        let ip = Ipv4Addr::new(203, 0, 113, 100); // a plain service host
+        let l = learner(
+            &[(ip, &["feed.example"])],
+            &[("feed.example", &[ip])],
+            ".example",
+            64,
+        );
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
         assert_eq!(
             l.sink.kept.lock().unwrap().as_slice(),
-            &["dzen.ru".to_string()]
+            &["feed.example".to_string()]
         );
     }
 
     #[test]
     fn rejects_ptr_name_that_forward_does_not_confirm() {
-        // Attacker's PTR claims yandex.ru, but yandex.ru's forward record does
+        // Attacker's PTR claims bank.example, but its forward record does
         // NOT contain the attacker IP → rejected (anti-spoofing).
         let attacker = Ipv4Addr::new(203, 0, 113, 66);
         let l = learner(
-            &[(attacker, &["yandex.ru"])],
-            &[("yandex.ru", &[Ipv4Addr::new(5, 255, 255, 5)])],
-            ".ru",
+            &[(attacker, &["bank.example"])],
+            &[("bank.example", &[Ipv4Addr::new(198, 51, 100, 5)])],
+            ".example",
             64,
         );
         assert_eq!(l.learn(attacker), LearnOutcome::NotConfirmed);
@@ -319,38 +324,28 @@ mod tests {
         // The provider's generated reverse name forward-confirms perfectly and
         // sits under a wide rule — adopting it would hand the whole fleet to
         // that rule.
-        let ip = Ipv4Addr::new(35, 190, 80, 1);
-        let name = "1.80.190.35.bc.googleusercontent.com";
-        let l = learner(
-            &[(ip, &[name])],
-            &[(name, &[ip])],
-            "googleusercontent.com",
-            64,
-        );
+        let ip = Ipv4Addr::new(23, 10, 20, 132);
+        let name = "132.20.10.23.bc.hosting.example";
+        let l = learner(&[(ip, &[name])], &[(name, &[ip])], "hosting.example", 64);
         assert_eq!(l.learn(ip), LearnOutcome::NotConfirmed);
         assert!(l.sink.kept.lock().unwrap().is_empty());
     }
 
     #[test]
     fn a_service_name_under_the_same_zone_is_still_learned() {
-        let ip = Ipv4Addr::new(142, 250, 74, 33);
-        let name = "lh3.googleusercontent.com";
-        let l = learner(
-            &[(ip, &[name])],
-            &[(name, &[ip])],
-            "googleusercontent.com",
-            64,
-        );
+        let ip = Ipv4Addr::new(23, 10, 20, 148);
+        let name = "lh3.hosting.example";
+        let l = learner(&[(ip, &[name])], &[(name, &[ip])], "hosting.example", 64);
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
     }
 
     #[test]
     fn confirmed_but_non_rule_host_is_not_kept() {
-        let ip = Ipv4Addr::new(93, 184, 216, 34);
+        let ip = Ipv4Addr::new(23, 10, 20, 138);
         let l = learner(
             &[(ip, &["example.com"])],
             &[("example.com", &[ip])],
-            ".ru", // example.com is not a rule host
+            ".example", // example.com is not a rule host
             64,
         );
         // Default sink has direct-learning off → still NotConfirmed.
@@ -412,13 +407,13 @@ mod tests {
 
     #[test]
     fn confirmed_non_rule_host_is_learned_direct() {
-        // The habr.com case: forward-confirmed, matches no rule → known-direct.
-        let ip = Ipv4Addr::new(178, 248, 237, 68);
-        let l = direct_learner(&[(ip, &["habr.com"])], &[("habr.com", &[ip])], ".ru");
+        // Forward-confirmed, matches no rule → known-direct.
+        let ip = Ipv4Addr::new(203, 0, 113, 68);
+        let l = direct_learner(&[(ip, &["blog.test"])], &[("blog.test", &[ip])], ".example");
         assert_eq!(l.learn(ip), LearnOutcome::LearnedDirect);
         assert_eq!(
             l.sink.direct.lock().unwrap().as_slice(),
-            &["habr.com".to_string()]
+            &["blog.test".to_string()]
         );
         assert!(l.sink.kept.lock().unwrap().is_empty());
     }
@@ -427,8 +422,8 @@ mod tests {
     fn app_scoped_drop_never_learns_a_direct_host() {
         // The routed app was blocked because its tunnel is down. Calling its
         // destination direct would exempt that address from the block-all.
-        let ip = Ipv4Addr::new(178, 248, 237, 68);
-        let l = direct_learner(&[(ip, &["habr.com"])], &[("habr.com", &[ip])], ".ru");
+        let ip = Ipv4Addr::new(203, 0, 113, 68);
+        let l = direct_learner(&[(ip, &["blog.test"])], &[("blog.test", &[ip])], ".example");
         assert_eq!(l.learn_scoped(ip, false), LearnOutcome::NotConfirmed);
         assert!(l.sink.direct.lock().unwrap().is_empty());
     }
@@ -438,11 +433,11 @@ mod tests {
         // One IP, two confirmed names: the rule host must be learned as a rule
         // host — direct classification only applies when EVERY confirmed name
         // failed the rule gate.
-        let ip = Ipv4Addr::new(5, 45, 202, 100);
+        let ip = Ipv4Addr::new(203, 0, 113, 100);
         let l = direct_learner(
-            &[(ip, &["cdn.example", "dzen.ru"])],
-            &[("cdn.example", &[ip]), ("dzen.ru", &[ip])],
-            ".ru",
+            &[(ip, &["cdn.test", "feed.example"])],
+            &[("cdn.test", &[ip]), ("feed.example", &[ip])],
+            ".example",
         );
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
         assert!(l.sink.direct.lock().unwrap().is_empty());
@@ -454,9 +449,9 @@ mod tests {
         // contain the dropped IP earns NO direct exemption either.
         let attacker = Ipv4Addr::new(203, 0, 113, 66);
         let l = direct_learner(
-            &[(attacker, &["habr.com"])],
-            &[("habr.com", &[Ipv4Addr::new(178, 248, 237, 68)])],
-            ".ru",
+            &[(attacker, &["blog.test"])],
+            &[("blog.test", &[Ipv4Addr::new(203, 0, 113, 68)])],
+            ".example",
         );
         assert_eq!(l.learn(attacker), LearnOutcome::NotConfirmed);
         assert!(l.sink.direct.lock().unwrap().is_empty());
@@ -464,8 +459,13 @@ mod tests {
 
     #[test]
     fn second_attempt_on_same_ip_is_skipped() {
-        let ip = Ipv4Addr::new(5, 45, 202, 100);
-        let l = learner(&[(ip, &["dzen.ru"])], &[("dzen.ru", &[ip])], ".ru", 64);
+        let ip = Ipv4Addr::new(203, 0, 113, 100);
+        let l = learner(
+            &[(ip, &["feed.example"])],
+            &[("feed.example", &[ip])],
+            ".example",
+            64,
+        );
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
         assert_eq!(l.learn(ip), LearnOutcome::Skipped, "deduped per IP");
     }
@@ -480,7 +480,7 @@ mod tests {
         // failure heals.
         let a = Ipv4Addr::new(1, 1, 1, 1);
         let b = Ipv4Addr::new(2, 2, 2, 2);
-        let l = learner(&[], &[], ".ru", 1);
+        let l = learner(&[], &[], ".example", 1);
         assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
         assert_eq!(
             l.learn(b),
@@ -500,12 +500,12 @@ mod tests {
         // we dropped. The rest of the `A` answer is whatever the zone's owner
         // chose to return, and this path feeds routes, pins and kill-switch
         // exemptions.
-        let ip = Ipv4Addr::new(5, 45, 202, 100);
+        let ip = Ipv4Addr::new(203, 0, 113, 100);
         let stranger = Ipv4Addr::new(203, 0, 113, 7);
         let l = learner(
-            &[(ip, &["dzen.ru"])],
-            &[("dzen.ru", &[ip, stranger])],
-            ".ru",
+            &[(ip, &["feed.example"])],
+            &[("feed.example", &[ip, stranger])],
+            ".example",
             64,
         );
         assert_eq!(l.learn(ip), LearnOutcome::Learned);
@@ -525,7 +525,7 @@ mod tests {
         // The failure most likely to happen here is the block-all that caused
         // the drop; a permanent record would disable the address until restart.
         let ip = Ipv4Addr::new(1, 1, 1, 1);
-        let l = learner(&[], &[], ".ru", 8);
+        let l = learner(&[], &[], ".example", 8);
         assert_eq!(l.learn(ip), LearnOutcome::NotConfirmed);
         assert_eq!(l.learn(ip), LearnOutcome::Skipped, "still deduped");
 
@@ -549,21 +549,21 @@ mod tests {
         // The window is still a dedup: while an address is in it, a drop storm
         // against the same destination costs one lookup, not one per packet.
         let a = Ipv4Addr::new(1, 1, 1, 1);
-        let l = learner(&[], &[], ".ru", 8);
+        let l = learner(&[], &[], ".example", 8);
         assert_eq!(l.learn(a), LearnOutcome::NotConfirmed);
         assert_eq!(l.learn(a), LearnOutcome::Skipped);
     }
 
     #[test]
     fn tries_multiple_ptr_names_until_one_confirms() {
-        let ip = Ipv4Addr::new(5, 45, 202, 100);
+        let ip = Ipv4Addr::new(203, 0, 113, 100);
         let l = learner(
-            &[(ip, &["decoy.example", "dzen.ru"])],
+            &[(ip, &["decoy.test", "feed.example"])],
             &[
-                ("decoy.example", &[Ipv4Addr::new(9, 9, 9, 9)]),
-                ("dzen.ru", &[ip]),
+                ("decoy.test", &[Ipv4Addr::new(9, 9, 9, 9)]),
+                ("feed.example", &[ip]),
             ],
-            ".ru",
+            ".example",
             64,
         );
         assert_eq!(l.learn(ip), LearnOutcome::Learned);

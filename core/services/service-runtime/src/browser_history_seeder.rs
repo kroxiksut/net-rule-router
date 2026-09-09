@@ -4,7 +4,7 @@
 //! to a one-off import, we read the visited HOSTNAMES
 //! ([`BrowserHistoryReadPort`]), keep only the ones a rule already matches, and
 //! resolve + cache those so their suffix/zone permits compile before the first
-//! block (the dzen.ru class).
+//! block (the visited-but-unruled class).
 //!
 //! Privacy: only rule-MATCHING hostnames are ever resolved or cached — a site the
 //! user visited that matches no rule is dropped in memory and never touches the
@@ -234,22 +234,28 @@ mod tests {
     fn seeds_only_rule_matching_hosts_and_caches_routable() {
         let history = Arc::new(MockBrowserHistoryRead {
             hostnames: vec![
-                "dzen.ru".into(),     // matches zone .ru → resolve
-                "avito.ru".into(),    // matches zone .ru → resolve
-                "example.com".into(), // no rule → dropped
-                "loopback.ru".into(), // matches, but resolves to loopback → not cached
+                "feed.example".into(),     // matches zone .example → resolve
+                "shop.example".into(),     // matches the zone → resolve
+                "example.com".into(),      // no rule → dropped
+                "loopback.example".into(), // matches, but resolves to loopback → not cached
             ],
         });
         let rules = Arc::new(ScriptedRules(CanonicalRuleSet::from_rules(vec![
-            zone_rule("r-ru", "ru"),
+            zone_rule("r-zone", "example"),
         ])));
         let mut map = std::collections::HashMap::new();
-        map.insert("dzen.ru".to_string(), vec![Ipv4Addr::new(5, 45, 202, 100)]);
         map.insert(
-            "avito.ru".to_string(),
-            vec![Ipv4Addr::new(178, 154, 131, 1)],
+            "feed.example".to_string(),
+            vec![Ipv4Addr::new(203, 0, 113, 100)],
         );
-        map.insert("loopback.ru".to_string(), vec![Ipv4Addr::new(127, 0, 0, 1)]);
+        map.insert(
+            "shop.example".to_string(),
+            vec![Ipv4Addr::new(203, 0, 113, 101)],
+        );
+        map.insert(
+            "loopback.example".to_string(),
+            vec![Ipv4Addr::new(127, 0, 0, 1)],
+        );
         let resolver = Arc::new(FakeResolver { map });
         let cache = in_memory_cache();
         let seeder = BrowserHistorySeeder::new(
@@ -261,17 +267,20 @@ mod tests {
         );
         let s = seeder.seed(SystemTime::now());
         assert_eq!(s.visited, 4);
-        assert_eq!(s.rule_matching, 3, "3 .ru hosts match; example.com dropped");
-        assert_eq!(s.cached, 2, "dzen + avito cached; loopback filtered out");
+        assert_eq!(
+            s.rule_matching, 3,
+            "3 zone hosts match; example.com dropped"
+        );
+        assert_eq!(s.cached, 2, "two hosts cached; loopback filtered out");
     }
 
     #[test]
     fn no_active_sid_seeds_nothing() {
         let history = Arc::new(MockBrowserHistoryRead {
-            hostnames: vec!["dzen.ru".into()],
+            hostnames: vec!["feed.example".into()],
         });
         let rules = Arc::new(ScriptedRules(CanonicalRuleSet::from_rules(vec![
-            zone_rule("r-ru", "ru"),
+            zone_rule("r-zone", "example"),
         ])));
         let seeder = BrowserHistorySeeder::new(
             history,

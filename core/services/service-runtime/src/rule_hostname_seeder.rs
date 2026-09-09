@@ -24,7 +24,7 @@
 //!   cannot be enumerated (there is no API that lists "every host under
 //!   example.com"); those enter the cache via DNS observation or a matching
 //!   `ExactFqdn` rule. A documented Free-tier limitation, not a bug.
-//!   Plenty of such apexes (`ytimg.com`, `cdninstagram.com`, `musical.ly`) are
+//!   Plenty of such apexes (`cdn.example`, `cdninsta.test`, `app.example`) are
 //!   zones that publish no address at all, so once the resolver has said so
 //!   authoritatively often enough, the apex is parked for this rule book — the
 //!   `*.x` rule's real job, the subdomains, is unaffected.
@@ -61,7 +61,7 @@ pub struct SeedSummary {
     /// Suffix-rule apexes confirmed to have **no address record** and parked
     /// for the lifetime of this rule book (see [`RuleHostnameSeeder::apex_absent`]).
     ///
-    /// A distinct, NON-error outcome: `ytimg.com` / `cdninstagram.com` and the
+    /// A distinct, NON-error outcome: `cdn.example` / `cdninsta.test` and the
     /// rest of the CDN apex family exist as zones but were never meant to be
     /// addressable, so "no A record" is the correct, final answer rather than a
     /// resolver failure. Counting them as failures made them 2/3 of the DNS
@@ -130,7 +130,7 @@ pub struct RuleHostnameSeeder {
     /// constructed once and re-runs `seed_for_principal` on every hook tick,
     /// re-deriving the SAME cold hostname set each pass — without this the
     /// INFO line repeated every tick for as long as the pin held (HW: 704
-    /// repeats for `musical.ly`). Cleared per hostname the moment it resolves
+    /// repeats for `app.example`). Cleared per hostname the moment it resolves
     /// to a routable address again, so a later re-pin logs again.
     loopback_warned: Mutex<HashSet<String>>,
     /// Per-hostname retry gate for names that failed to resolve: when the next
@@ -143,7 +143,7 @@ pub struct RuleHostnameSeeder {
     /// with them the set of apexes parked off the rotation entirely (count
     /// at or above [`SEED_APEX_ABSENT_CONFIRMATIONS`]).
     ///
-    /// `ytimg.com`, `cdninstagram.com`, `twimg.com`, `musical.ly` and the rest
+    /// `cdn.example`, `cdninsta.test`, `app.example` and the rest
     /// of the CDN family are zones, not hosts: the apex publishes no A record
     /// and never will, so the 30-minute retry ceiling still meant a permanent
     /// trickle of queries and log lines, and made these names the bulk of the
@@ -240,7 +240,7 @@ impl RuleHostnameSeeder {
     /// that started before the schedule existed — overlapping passes racing
     /// the same host — and carries no new information about the host. Without
     /// this, one burst of concurrent passes walked a host 60→1800 s in
-    /// milliseconds (observed : ytimg.com banned for 30 minutes off
+    /// milliseconds (observed : a delivery apex banned for 30 minutes off
     /// six simultaneous boot-time failures, which YouTube then wore).
     fn note_resolve_failed(&self, host: &str) -> Duration {
         let mut guard = self.retry_after.lock().unwrap_or_else(|p| p.into_inner());
@@ -1083,7 +1083,7 @@ mod tests {
     /// While the guard blocks an unresolved link, an unresolvable rule host is
     /// also an UNPROTECTED one: the guard can only block addresses it knows.
     /// The calm minute of patience is what kept the hole open at logon
-    /// (HW-0830: chatgpt.com unprotected for the full 65 s backoff), so the
+    /// (HW-0830: assistant.example unprotected for the full 65 s backoff), so the
     /// pacing drops to seconds and stops escalating early.
     #[test]
     fn the_backoff_tightens_while_the_guard_is_blocking() {
@@ -1221,32 +1221,32 @@ mod tests {
 
     #[test]
     fn an_address_less_suffix_apex_is_parked_and_not_counted_as_a_dns_failure() {
-        // `*.ytimg.com` names an apex that is a zone, not a host: the resolver
+        // `*.cdn.example` names an apex that is a zone, not a host: the resolver
         // answers authoritatively "no address record" forever. After
         // `SEED_APEX_ABSENT_CONFIRMATIONS` such passes the apex leaves the
         // rotation — no more queries, and no more DNS-failure counts.
         let resolver = Arc::new(MockDnsResolver::new());
         resolver.set_error(
-            "ytimg.com",
+            "cdn.example",
             DnsResolverError::NxDomain {
-                hostname: "ytimg.com".into(),
+                hostname: "cdn.example".into(),
             },
         );
         let (cache, lookup) = in_memory_cache();
         let rules = Arc::new(FakeRules::new(
             empty(),
-            CanonicalRuleSet::from_rules(vec![suffix_rule("r1", "ytimg.com")]),
+            CanonicalRuleSet::from_rules(vec![suffix_rule("r1", "cdn.example")]),
         ));
         let s = seeder(Arc::clone(&resolver), cache, lookup, rules);
 
         let confirming = run_passes(
             &s,
-            &["ytimg.com"],
+            &["cdn.example"],
             SEED_APEX_ABSENT_CONFIRMATIONS as usize - 1,
         );
         assert_eq!(confirming.failed, 1, "still inconclusive → a plain failure");
         assert_eq!(confirming.apex_absent, 0);
-        assert!(!s.apex_absent("ytimg.com"));
+        assert!(!s.apex_absent("cdn.example"));
 
         let parking = s.seed_for_principal("S-A", SystemTime::now());
         assert_eq!(parking.apex_absent, 1);
@@ -1254,11 +1254,11 @@ mod tests {
             parking.failed, 0,
             "a name with no address record is not a DNS failure"
         );
-        assert!(s.apex_absent("ytimg.com"));
+        assert!(s.apex_absent("cdn.example"));
 
         // Parked: subsequent passes report the outcome without querying.
         let queries_at_parking = resolver.observed_queries().len();
-        let after = run_passes(&s, &["ytimg.com"], 3);
+        let after = run_passes(&s, &["cdn.example"], 3);
         assert_eq!(after.apex_absent, 1);
         assert_eq!(after.failed, 0);
         assert_eq!(
@@ -1408,23 +1408,27 @@ mod tests {
         assert_eq!(last.apex_absent, 0);
     }
 
-    /// Parks `ytimg.com` behind a `*.ytimg.com` rule and hands back the pieces.
+    /// Parks `cdn.example` behind a `*.cdn.example` rule and hands back the pieces.
     fn parked_apex_fixture() -> (Arc<MockDnsResolver>, Arc<FakeRules>, RuleHostnameSeeder) {
         let resolver = Arc::new(MockDnsResolver::new());
         resolver.set_error(
-            "ytimg.com",
+            "cdn.example",
             DnsResolverError::NxDomain {
-                hostname: "ytimg.com".into(),
+                hostname: "cdn.example".into(),
             },
         );
         let (cache, lookup) = in_memory_cache();
         let rules = Arc::new(FakeRules::new(
             empty(),
-            CanonicalRuleSet::from_rules(vec![suffix_rule("r1", "ytimg.com")]),
+            CanonicalRuleSet::from_rules(vec![suffix_rule("r1", "cdn.example")]),
         ));
         let s = seeder(Arc::clone(&resolver), cache, lookup, Arc::clone(&rules));
-        run_passes(&s, &["ytimg.com"], SEED_APEX_ABSENT_CONFIRMATIONS as usize);
-        assert!(s.apex_absent("ytimg.com"));
+        run_passes(
+            &s,
+            &["cdn.example"],
+            SEED_APEX_ABSENT_CONFIRMATIONS as usize,
+        );
+        assert!(s.apex_absent("cdn.example"));
         (resolver, rules, s)
     }
 
@@ -1441,18 +1445,18 @@ mod tests {
                 .filter(|q| q.as_str() == host)
                 .count()
         };
-        let before = asked_for("ytimg.com");
+        let before = asked_for("cdn.example");
 
         rules.set_secondary(CanonicalRuleSet::from_rules(vec![
-            suffix_rule("r1", "ytimg.com"),
+            suffix_rule("r1", "cdn.example"),
             fqdn_rule("r2", "api.example.com"),
         ]));
         let sum = s.seed_for_principal("S-A", SystemTime::now());
 
-        assert!(s.apex_absent("ytimg.com"));
+        assert!(s.apex_absent("cdn.example"));
         assert_eq!(sum.apex_absent, 1);
         assert_eq!(
-            asked_for("ytimg.com"),
+            asked_for("cdn.example"),
             before,
             "an edit that never mentioned the apex must not re-query it"
         );
@@ -1468,11 +1472,11 @@ mod tests {
         // Same hostname, now named exactly rather than as a suffix.
         rules.set_secondary(CanonicalRuleSet::from_rules(vec![fqdn_rule(
             "r1",
-            "ytimg.com",
+            "cdn.example",
         )]));
         let sum = s.seed_for_principal("S-A", SystemTime::now());
 
-        assert!(!s.apex_absent("ytimg.com"));
+        assert!(!s.apex_absent("cdn.example"));
         assert_eq!(sum.apex_absent, 0);
         assert!(
             resolver.observed_queries().len() > queries_while_parked,

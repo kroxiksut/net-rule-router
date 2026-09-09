@@ -393,6 +393,13 @@ pub enum IpcOperationName {
     /// totals + cursors); the settings are kept. Service-global command,
     /// admin-gated.
     TrafficStatsClear,
+    /// Answer the one-time question "did this connection's history continue as
+    /// that one's?". A refusal is an answer and is stored too, so the question
+    /// is asked once either way. The question itself rides on
+    /// [`Self::TrafficStatsGet`] — it belongs beside the two rows it is about.
+    /// Payload schema: [`crate::ipc_payloads::TrafficHistoryMergeSetRequest`] →
+    /// [`crate::ipc_payloads::TrafficHistoryMergeSetResponse`].
+    TrafficHistoryMergeSet,
     /// Mark (or unmark) a routed site as answering the MAIN link with a
     /// refusal — the one fact about it no measurement here can establish.
     /// Per-SID, no elevation; answers with the full marked list.
@@ -494,7 +501,7 @@ pub enum IpcOperationName {
 }
 
 impl IpcOperationName {
-    pub const ALL: [Self; 69] = [
+    pub const ALL: [Self; 70] = [
         Self::ContractNegotiate,
         Self::ServiceHealthGet,
         Self::SnapshotInitialGet,
@@ -544,6 +551,7 @@ impl IpcOperationName {
         Self::ThirdPartyComponentsList,
         Self::TrafficStatsGet,
         Self::TrafficStatsSet,
+        Self::TrafficHistoryMergeSet,
         Self::TrafficStatsClear,
         Self::AutoRuleCandidatesProbe,
         Self::RefusingAnchorSet,
@@ -617,6 +625,7 @@ impl IpcOperationName {
             Self::ThirdPartyComponentsList => "third-party.components.list",
             Self::TrafficStatsGet => "traffic-stats.get",
             Self::TrafficStatsSet => "traffic-stats.set",
+            Self::TrafficHistoryMergeSet => "traffic-stats.history-merge.set",
             Self::TrafficStatsClear => "traffic-stats.clear",
             Self::AutoRuleCandidatesProbe => "autorules.candidates.probe",
             Self::RefusingAnchorSet => "autorules.refusing-anchor.set",
@@ -686,7 +695,7 @@ const CLIENTS_GUI_AND_TRAY: [IpcClientProfile; 2] = [
     IpcClientProfile::TrayLightweight,
 ];
 
-const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
+const IPC_OPERATION_CATALOG: [IpcOperationSpec; 70] = [
     IpcOperationSpec {
         name: IpcOperationName::ContractNegotiate,
         class: IpcInteractionClass::HealthCheck,
@@ -1074,6 +1083,16 @@ const IPC_OPERATION_CATALOG: [IpcOperationSpec; 69] = [
         execution: IpcExecutionModel::SyncReply,
         allowed_clients: &CLIENTS_GUI_AND_TRAY,
         requires_service_mutation_privilege: false,
+    },
+    IpcOperationSpec {
+        name: IpcOperationName::TrafficHistoryMergeSet,
+        // The ledger it rewrites is machine-wide, exactly like the settings
+        // below, so the answer carries the same gate. Joining two connections'
+        // history is not a per-user preference.
+        class: IpcInteractionClass::Command,
+        execution: IpcExecutionModel::SyncReply,
+        allowed_clients: &CLIENTS_GUI_ONLY,
+        requires_service_mutation_privilege: true,
     },
     IpcOperationSpec {
         name: IpcOperationName::TrafficStatsSet,

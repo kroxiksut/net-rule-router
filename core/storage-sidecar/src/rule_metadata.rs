@@ -387,7 +387,7 @@ mod tests {
         let tmp = tempfile::tempdir()?;
         let db = open_sidecar(&tmp)?;
         let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
-        let s2 = RuleSignature::build("domain", "vk.com", "secondary")
+        let s2 = RuleSignature::build("domain", "ab.test", "secondary")
             .expect("a signature with no pipe");
         let s3 = RuleSignature::build("zone", "su", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "ru-comment")?;
@@ -418,7 +418,7 @@ mod tests {
         let s1 = RuleSignature::build("zone", "ru", "primary").expect("a signature with no pipe");
         let s2 = RuleSignature::build("zone", "рф", "primary").expect("a signature with no pipe");
         let s3 =
-            RuleSignature::build("domain", "vk.com", "primary").expect("a signature with no pipe");
+            RuleSignature::build("domain", "ab.test", "primary").expect("a signature with no pipe");
         db.write_comment(&s1, "ru")?;
         db.write_comment(&s2, "rf")?;
         db.write_comment(&s3, "vk")?;

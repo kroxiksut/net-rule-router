@@ -746,9 +746,9 @@ mod tests {
 
     #[test]
     fn ip_v4_passes_through() {
-        let addr = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let addr = IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138));
         let (ip, w) = normalize_ip_value(Some(addr));
-        assert_eq!(ip, NormalizedIp::ValidIpv4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(ip, NormalizedIp::ValidIpv4(Ipv4Addr::new(23, 10, 20, 138)));
         assert!(w.is_empty());
     }
 
@@ -850,7 +850,7 @@ mod tests {
     fn full_connection_all_classes_available() {
         let input = make_runtime_input(
             Some("example.com"),
-            Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))),
+            Some(IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138))),
             Some("firefox.exe"),
         );
         let n = normalize_runtime_input(&input);

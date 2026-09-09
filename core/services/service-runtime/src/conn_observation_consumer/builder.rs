@@ -34,11 +34,14 @@ impl ConnectionObservationConsumer {
             reverse_dns_learner: None,
             drop_logged: Mutex::new(HashSet::new()),
             name_for_address: None,
+            health_name_fallback: None,
             companion_in_use: None,
             companion_primary_health: None,
+            navigation_attempt: None,
             companion_reported: Mutex::new(HashSet::new()),
             torn_down_before: Mutex::new(HashSet::new()),
             last_secondary_at: Mutex::new(None),
+            outage_announced: std::sync::atomic::AtomicBool::new(false),
             block_notice_name_for_address: None,
             block_notice_sink: None,
             stale_flow_reset: None,
@@ -98,6 +101,28 @@ impl ConnectionObservationConsumer {
     #[must_use]
     pub fn with_companion_primary_health(mut self, sink: CompanionPrimaryHealthFn) -> Self {
         self.companion_primary_health = Some(sink);
+        self
+    }
+
+    /// Wire the navigation measurement. Observational only: the consumer
+    /// reports every attempt and nothing downstream reads the result yet.
+    #[must_use]
+    pub fn with_navigation_attempt(mut self, sink: NavigationAttemptFn) -> Self {
+        self.navigation_attempt = Some(sink);
+        self
+    }
+
+    /// A second name source, consulted ONLY by the primary-health path and
+    /// only after the first misses.
+    ///
+    /// Deliberately not shared with [`Self::with_companion_in_use`]: that
+    /// path can bring a host into companion discovery, and a rule-less name
+    /// has not earned that. Reporting how a host fares carries no such
+    /// consequence — and the host with no rule yet is exactly the one whose
+    /// failures nobody could name.
+    #[must_use]
+    pub fn with_health_name_fallback(mut self, name_for_address: NameForAddressFn) -> Self {
+        self.health_name_fallback = Some(name_for_address);
         self
     }
 

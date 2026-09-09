@@ -19,6 +19,9 @@ impl PerSidApplyOrchestrator {
     ) -> Self {
         Self {
             apply_locks: Mutex::new(std::collections::HashMap::new()),
+            #[cfg(windows)]
+            shadow_compare_seen: Mutex::new(std::collections::HashMap::new()),
+            standing_volume_last: Mutex::new(std::collections::HashMap::new()),
             session,
             policy_source,
             rules_provider,

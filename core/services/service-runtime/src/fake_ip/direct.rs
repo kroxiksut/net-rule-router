@@ -280,16 +280,19 @@ mod tests {
     #[test]
     fn armed_answerer_records_real_then_hands_out_a_stable_fake() {
         let (answerer, map) = answerer(Arc::new(AtomicBool::new(true)));
-        let real = [ip(178, 248, 237, 68)];
+        let real = [ip(203, 0, 113, 68)];
         let fake = answerer
-            .fake_direct_answer("habr.com", &real)
+            .fake_direct_answer("blog.example", &real)
             .expect("armed + in scope");
         assert_eq!(fake.len(), 1);
         assert!(fake[0].to_string().starts_with("198.18."));
         // The real set was registered for the relay BEFORE the fake went out.
-        assert_eq!(map.ips_for("habr.com"), real.to_vec());
+        assert_eq!(map.ips_for("blog.example"), real.to_vec());
         // Stable: the same host keeps its fake address across re-queries.
-        assert_eq!(answerer.fake_direct_answer("habr.com", &real), Some(fake));
+        assert_eq!(
+            answerer.fake_direct_answer("blog.example", &real),
+            Some(fake)
+        );
     }
 
     #[test]
@@ -297,10 +300,10 @@ mod tests {
         // Disarmed → None even for an in-scope host.
         let (disarmed, map) = answerer(Arc::new(AtomicBool::new(false)));
         assert_eq!(
-            disarmed.fake_direct_answer("habr.com", &[ip(178, 248, 237, 68)]),
+            disarmed.fake_direct_answer("blog.example", &[ip(203, 0, 113, 68)]),
             None
         );
-        assert!(map.ips_for("habr.com").is_empty(), "nothing recorded");
+        assert!(map.ips_for("blog.example").is_empty(), "nothing recorded");
         // Armed, but the name is excluded by scope (non-routable / literal).
         let (armed, _) = answerer(Arc::new(AtomicBool::new(true)));
         assert_eq!(
@@ -312,26 +315,27 @@ mod tests {
             None
         );
         // An empty answer set is never claimed.
-        assert_eq!(armed.fake_direct_answer("habr.com", &[]), None);
+        assert_eq!(armed.fake_direct_answer("blog.example", &[]), None);
     }
 
     #[test]
     fn direct_aware_resolver_prefers_the_map_and_falls_back_to_the_cache() {
         let map = Arc::new(DirectRealIpMap::new());
-        map.record("habr.com", &[ip(178, 248, 237, 68)]);
+        map.record("blog.example", &[ip(203, 0, 113, 68)]);
         let inner = Arc::new(
-            StaticUpstreamResolver::new().with("chatgpt.com", &[IpAddr::V4(ip(104, 18, 32, 47))]),
+            StaticUpstreamResolver::new()
+                .with("assistant.example", &[IpAddr::V4(ip(23, 10, 20, 140))]),
         );
         let resolver = DirectAwareUpstreamResolver::new(map, inner);
         // Direct host → map.
         assert_eq!(
-            resolver.addresses_for("habr.com"),
-            vec![IpAddr::V4(ip(178, 248, 237, 68))]
+            resolver.addresses_for("blog.example"),
+            vec![IpAddr::V4(ip(203, 0, 113, 68))]
         );
         // Rule host → inner (FQDN cache in production).
         assert_eq!(
-            resolver.addresses_for("chatgpt.com"),
-            vec![IpAddr::V4(ip(104, 18, 32, 47))]
+            resolver.addresses_for("assistant.example"),
+            vec![IpAddr::V4(ip(23, 10, 20, 140))]
         );
         assert!(resolver.addresses_for("nowhere.example").is_empty());
     }

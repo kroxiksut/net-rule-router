@@ -21,6 +21,10 @@ Item {
     // True while an additional-adapter session is live; false when it has ended
     // or never started. Absent in older payloads — treated as false.
     property bool sessionActive: false
+    /// The one-time question the service is asking, or null. `{oldKey, oldName,
+    /// newKey, newName, sharedToken}` — see the wire DTO. Null is the normal
+    /// state; the panel shows nothing.
+    property var historyMerge: null
     property var settings: ({
         enabled: true, countLoopback: false, countVirtual: false, retentionDays: 365
     })
@@ -69,7 +73,59 @@ Item {
             controller.allTimeRows = p["all-time"] || []
             controller.sessionActive = p["session-active"] === true
             controller.settings = controller._applySettingsPayload(p["settings"] || {})
+            controller.historyMerge = controller._mergeQuestion(p["history-merge"])
             controller.loaded = true
+        })
+    }
+
+    /// Normalise the pending merge question, or null when there is none.
+    ///
+    /// A question missing either side is dropped rather than shown: the whole
+    /// point is that the user is choosing between two named connections, and a
+    /// half-named pair cannot be answered honestly.
+    function _mergeQuestion(raw) {
+        if (!raw) return null
+        var oldKey = String(raw["old-key"] || "")
+        var newKey = String(raw["new-key"] || "")
+        if (oldKey === "" || newKey === "" || oldKey === newKey) return null
+        return {
+            oldKey: oldKey,
+            newKey: newKey,
+            oldName: String(raw["old-name"] || oldKey),
+            newName: String(raw["new-name"] || newKey),
+            sharedToken: String(raw["shared-token"] || "")
+        }
+    }
+
+    /// Answer the merge question. `merged: false` is an answer too — the pair is
+    /// recorded as decided and never offered again, which is why the panel has
+    /// no third "ask me later" button.
+    function answerHistoryMerge(merged) {
+        var q = controller.historyMerge
+        if (!q) return
+        if (!ownerRoot || !ownerRoot.rpc
+                || typeof ownerRoot.rpc.rpcTrafficHistoryMergeSet !== "function") return
+        var corr = ownerRoot.rpc.rpcTrafficHistoryMergeSet({
+            "old-key": q.oldKey,
+            "new-key": q.newKey,
+            "merged": merged === true
+        })
+        if (!corr || corr === "") return
+        // Hidden only once the service confirms: the ledger is machine-wide and
+        // the write needs Administrator rights, so hiding first would show a
+        // refused answer as taken and bring the question back on the next poll
+        // with nothing said.
+        ownerRoot.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
+            if (ok) {
+                controller.historyMerge = null
+                controller.refresh()
+                return
+            }
+            ownerRoot.statusLine = (code === "uac-declined")
+                ? ownerRoot.tr("progress.service-uac-declined",
+                    "Administrator prompt declined - operation cancelled.")
+                : ownerRoot.tr("status.traffic-history-merge-failed",
+                    "Could not save the answer: ") + String(msg || code || "")
         })
     }
 

@@ -1,23 +1,29 @@
-//! Troubleshooting playbooks.
+//! Troubleshooting playbooks for the diagnostic archive.
 //!
-//! Playbooks describe common symptoms and step-by-step remediation actions.
-//! Text is represented as localization keys — the GUI resolves them; this
-//! module only generates a Markdown skeleton for the archive `troubleshooting.md`.
+//! Six symptoms a person actually reports, each with the steps that resolve it
+//! or narrow it down, rendered into the archive's `troubleshooting.md`.
+//!
+//! The text is English and lives here as prose rather than as localization
+//! keys. The keys were the original design and they produced a page of
+//! unresolved names (`troubleshoot.stale_cache.step1.title`) pointing at an
+//! in-app screen that does not exist — in every support archive. Whoever opens
+//! this file is reading `manifest.json` and `health.json` beside it, which are
+//! English too; a support bundle is not a localized surface.
 
 // ── TroubleshootingStep ───────────────────────────────────────────────────────
 
 pub struct TroubleshootingStep {
-    /// Localization key for the step title.
-    pub title_key: &'static str,
-    /// Localization key for the step description.
-    pub description_key: &'static str,
+    /// What to do, as a short imperative.
+    pub title: &'static str,
+    /// Why, and what the outcome tells you.
+    pub description: &'static str,
 }
 
 // ── TroubleshootingPlaybook ───────────────────────────────────────────────────
 
 pub struct TroubleshootingPlaybook {
-    /// Localization key for the symptom title.
-    pub symptom_key: &'static str,
+    /// The symptom in the reporter's words.
+    pub symptom: &'static str,
     /// Stable identifier used in Markdown anchors.
     pub id: &'static str,
     /// Ordered list of remediation steps.
@@ -40,20 +46,27 @@ pub fn all_playbooks() -> Vec<TroubleshootingPlaybook> {
 
 fn service_unavailable_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.service_unavailable.symptom",
+        symptom: "The app says the background service is not running",
         id: "service-unavailable",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.service_unavailable.step1.title",
-                description_key: "troubleshoot.service_unavailable.step1.description",
+                title: "Check whether the service is running",
+                description: "Run `nrr-cli status`, or open Services and look for \
+                              NetRuleRouter. The console prints whether the service is \
+                              installed, whether it is running, and which version it is.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.service_unavailable.step2.title",
-                description_key: "troubleshoot.service_unavailable.step2.description",
+                title: "Start it",
+                description: "Run `nrr-cli start`. It needs administrator rights: an \
+                              interactive console asks before elevating, and a script \
+                              gets the exact command to repeat rather than a prompt \
+                              nobody is there to answer.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.service_unavailable.step3.title",
-                description_key: "troubleshoot.service_unavailable.step3.description",
+                title: "If it starts and stops again, read the last lines before the stop",
+                description: "`logs.ndjson` in this archive holds the service's own \
+                              account of what it was doing. A service that exits on its \
+                              own says why on the way out.",
             },
         ],
     }
@@ -61,16 +74,22 @@ fn service_unavailable_playbook() -> TroubleshootingPlaybook {
 
 fn secondary_no_ip_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.secondary_no_ip.symptom",
+        symptom: "The additional connection is selected but has no address",
         id: "secondary-no-ip",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.secondary_no_ip.step1.title",
-                description_key: "troubleshoot.secondary_no_ip.step1.description",
+                title: "Bring the connection up in its own client first",
+                description: "NetRuleRouter routes over connections that already exist; \
+                              it does not establish them. Until the client reports the \
+                              connection as up and its adapter holds an IPv4 address, \
+                              there is nothing to route onto.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.secondary_no_ip.step2.title",
-                description_key: "troubleshoot.secondary_no_ip.step2.description",
+                title: "Check that the adapter you picked is the one the client raised",
+                description: "Some clients create a new adapter when they update, so the \
+                              one chosen earlier can still exist while sitting idle. \
+                              Interfaces and routes lists every adapter with its current \
+                              address — pick the one holding the address.",
             },
         ],
     }
@@ -78,20 +97,30 @@ fn secondary_no_ip_playbook() -> TroubleshootingPlaybook {
 
 fn fail_closed_block_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.fail_closed_block.symptom",
+        symptom: "A site does not open and the app reports the traffic as blocked",
         id: "fail-closed-block",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.fail_closed_block.step1.title",
-                description_key: "troubleshoot.fail_closed_block.step1.description",
+                title: "Check whether the additional connection is up",
+                description: "While it is down, traffic your rules send through it is \
+                              blocked rather than allowed out the main connection. That \
+                              is leak protection working as configured, and it clears by \
+                              itself once the connection returns.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.fail_closed_block.step2.title",
-                description_key: "troubleshoot.fail_closed_block.step2.description",
+                title: "Decide whether you want that trade",
+                description: "Leak protection can be switched off in Settings, Routing. \
+                              The same traffic then leaves over the main connection while \
+                              the additional one is down — reachable, and visible to \
+                              whoever can see that link.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.fail_closed_block.step3.title",
-                description_key: "troubleshoot.fail_closed_block.step3.description",
+                title: "If the connection is up and traffic is still blocked, read the notice",
+                description: "The block notice in the app names what stopped the \
+                              connection: a rule you wrote, or a switch such as the IPv6 \
+                              cut or the DNS lockdown, which have no rule behind them. \
+                              `health.json` in this archive states the same posture the \
+                              service was in.",
             },
         ],
     }
@@ -99,16 +128,21 @@ fn fail_closed_block_playbook() -> TroubleshootingPlaybook {
 
 fn stale_cache_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.stale_cache.symptom",
+        symptom: "A site takes the wrong connection, or stops opening, after its addresses changed",
         id: "stale-cache",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.stale_cache.step1.title",
-                description_key: "troubleshoot.stale_cache.step1.description",
+                title: "Open the site again",
+                description: "A rule follows the addresses its name currently answers \
+                              with, so a name whose addresses have just moved can be \
+                              enforced on the previous ones for a short while. One fresh \
+                              lookup normally settles it.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.stale_cache.step2.title",
-                description_key: "troubleshoot.stale_cache.step2.description",
+                title: "If it persists, clear the name caches and retry",
+                description: "Clear the browser's own resolver cache and the operating \
+                              system's, then open the site again. A name the machine \
+                              never re-resolves cannot be re-learned.",
             },
         ],
     }
@@ -116,20 +150,27 @@ fn stale_cache_playbook() -> TroubleshootingPlaybook {
 
 fn audit_integrity_failure_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.audit_integrity_failure.symptom",
+        symptom: "The app reports that the audit trail failed its integrity check",
         id: "audit-integrity-failure",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.audit_integrity_failure.step1.title",
-                description_key: "troubleshoot.audit_integrity_failure.step1.description",
+                title: "Nothing about your routing is affected",
+                description: "The audit trail is a record of what was done, not a control \
+                              over what happens. Rules keep being enforced exactly as \
+                              before while this is investigated.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.audit_integrity_failure.step2.title",
-                description_key: "troubleshoot.audit_integrity_failure.step2.description",
+                title: "Look for something editing the data directory",
+                description: "The check fails when audit files were changed or truncated \
+                              outside the app — a backup tool, an antivirus quarantine, \
+                              or a manual edit. Excluding the data directory from such \
+                              tools prevents a recurrence.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.audit_integrity_failure.step3.title",
-                description_key: "troubleshoot.audit_integrity_failure.step3.description",
+                title: "Send this archive",
+                description: "`audit_summary.json` shows where the record stops being \
+                              self-consistent, which is what identifies the moment \
+                              something else touched it.",
             },
         ],
     }
@@ -137,16 +178,20 @@ fn audit_integrity_failure_playbook() -> TroubleshootingPlaybook {
 
 fn import_pending_playbook() -> TroubleshootingPlaybook {
     TroubleshootingPlaybook {
-        symptom_key: "troubleshoot.import_pending.symptom",
+        symptom: "An imported rule set is shown in the app but is not being applied",
         id: "import-pending",
         steps: vec![
             TroubleshootingStep {
-                title_key: "troubleshoot.import_pending.step1.title",
-                description_key: "troubleshoot.import_pending.step1.description",
+                title: "An import is a proposal until you apply it",
+                description: "The table shows what the file holds; the service keeps \
+                              enforcing what it already had. Use Save and review to see \
+                              what would change, then confirm it.",
             },
             TroubleshootingStep {
-                title_key: "troubleshoot.import_pending.step2.title",
-                description_key: "troubleshoot.import_pending.step2.description",
+                title: "If applying is refused, the message names the reason",
+                description: "A value that is not valid, or more rules than a set may \
+                              hold. Rules the app will not apply are marked in the table; \
+                              fix those lines and apply again.",
             },
         ],
     }
@@ -155,28 +200,22 @@ fn import_pending_playbook() -> TroubleshootingPlaybook {
 // ── Markdown renderer ─────────────────────────────────────────────────────────
 
 /// Renders playbooks as a Markdown document for the archive.
-///
-/// Text is shown as localization key references since the archive may be
-/// opened without the application.  A note explains this at the top.
 pub fn render_playbooks_markdown(playbooks: &[TroubleshootingPlaybook]) -> String {
     let mut md = String::new();
     md.push_str("# NetRuleRouter — Troubleshooting Guide\n\n");
-    md.push_str("> **Note:** This file uses localization key references.\n");
-    md.push_str("> Open the Troubleshooting section in the application for\n");
-    md.push_str("> fully localized instructions.\n\n");
+    md.push_str("Common symptoms and what to check for each. Everything referenced\n");
+    md.push_str("here (`health.json`, `logs.ndjson`, `audit_summary.json`) is in this\n");
+    md.push_str("archive next to this file.\n\n");
     md.push_str("---\n\n");
 
     for playbook in playbooks {
-        md.push_str(&format!(
-            "## {} (`{}`)\n\n",
-            playbook.symptom_key, playbook.id
-        ));
+        md.push_str(&format!("## {} (`{}`)\n\n", playbook.symptom, playbook.id));
         for (i, step) in playbook.steps.iter().enumerate() {
             md.push_str(&format!(
                 "**Step {}: {}**\n\n{}\n\n",
                 i + 1,
-                step.title_key,
-                step.description_key
+                step.title,
+                step.description
             ));
         }
         md.push_str("---\n\n");
@@ -207,17 +246,28 @@ mod tests {
         assert!(ids.contains(&"secondary-no-ip"));
     }
 
+    /// The defect this file was rewritten for: a support archive full of
+    /// unresolved key names. A key is recognisable by its shape, so the shape
+    /// is what the test refuses.
     #[test]
-    fn all_playbook_keys_have_troubleshoot_prefix() {
+    fn no_playbook_text_is_a_localization_key() {
         for p in all_playbooks() {
-            assert!(
-                p.symptom_key.starts_with("troubleshoot."),
-                "symptom key must have troubleshoot. prefix: {}",
-                p.symptom_key
-            );
+            let mut texts = vec![p.symptom];
             for step in &p.steps {
-                assert!(step.title_key.starts_with("troubleshoot."));
-                assert!(step.description_key.starts_with("troubleshoot."));
+                texts.push(step.title);
+                texts.push(step.description);
+            }
+            for text in texts {
+                assert!(
+                    !text.starts_with("troubleshoot."),
+                    "playbook '{}' still carries a key instead of text: {text}",
+                    p.id
+                );
+                assert!(
+                    text.contains(' '),
+                    "playbook '{}' carries a single token where a sentence belongs: {text}",
+                    p.id
+                );
             }
         }
     }

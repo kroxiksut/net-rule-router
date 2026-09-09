@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 /// (so their per-process `ALE_APP_ID` filter was not built). Written by the
 /// orchestrator on every filter compute, read by the `SnapshotInitial`
 /// handler for the GUI banner. Entries are the rule's app pattern (e.g.
-/// `"vk.exe"`, `"disko*.exe"`), stored sorted + deduped.
+/// `"ab.exe"`, `"disko*.exe"`), stored sorted + deduped.
 #[derive(Clone, Default)]
 pub struct AppEnforcementStatus(Arc<Mutex<Vec<String>>>);
 
@@ -218,8 +218,8 @@ mod tests {
     #[test]
     fn set_then_get_round_trips() {
         let status = AppEnforcementStatus::new();
-        status.set_unresolved(vec!["vk.exe".to_string(), "disko*.exe".to_string()]);
-        assert_eq!(status.unresolved(), vec!["disko*.exe", "vk.exe"]);
+        status.set_unresolved(vec!["ab.exe".to_string(), "disko*.exe".to_string()]);
+        assert_eq!(status.unresolved(), vec!["ab.exe", "disko*.exe"]);
     }
 
     #[test]
@@ -256,9 +256,9 @@ mod tests {
         let reader = writer.clone();
         assert_eq!(reader.count(), 0, "no exclusions by default");
         assert!(reader.addresses().is_empty());
-        writer.set(&[Ipv4Addr::new(8, 6, 112, 1), Ipv4Addr::new(8, 6, 112, 2)]);
+        writer.set(&[Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]);
         assert_eq!(reader.count(), 2);
-        assert_eq!(reader.addresses(), vec!["8.6.112.1", "8.6.112.2"]);
+        assert_eq!(reader.addresses(), vec!["192.0.2.1", "192.0.2.2"]);
         writer.set(&[]);
         assert_eq!(reader.count(), 0);
         assert!(reader.addresses().is_empty());

@@ -31,9 +31,15 @@ pub mod autostart;
 // port; per-OS mechanism in the platform crates.
 pub mod browser_history;
 pub mod conn_observe;
+// Is an adapter absent, or here and refusing to start? The ordinary
+// enumeration cannot tell the two apart, and they need opposite advice.
+pub mod device_status;
 pub mod dns;
 pub mod dns_observe;
 pub mod dns_redirect;
+// Which connection claims which DNS namespace. A corporate VPN says this
+// itself over DHCP, so the user never has to know their own domain.
+pub mod dns_scope;
 // The neutral cross-OS enforcement data model. Deliberately NOT crate-root
 // re-exported until a lowering path consumes it, so it stays inert until wired
 // in.
@@ -132,8 +138,8 @@ pub mod windows_api;
 // `nrr-platform-windows` crate root so consumers (`service-runtime`,
 // `mock-backend`) can write `nrr_platform_api::RouteEntry` exactly as they
 // wrote `nrr_platform_windows::RouteEntry`. Windows-only concretes
-// (ProductionWindowsApi, WindowsApplyEngine, fail_closed/rollback/strategy/
-// verify, the Etw*/Wfp*/Dpapi impls, collect_interfaces_rows) are
+// (ProductionWindowsApi, the WFP enforcement backend, fail_closed/strategy,
+// the Etw*/Wfp*/Dpapi impls, collect_interfaces_rows) are
 // intentionally NOT re-exported here — they live only in the Windows backend
 // and are consumed under `#[cfg(windows)]`.
 pub use adapters::{

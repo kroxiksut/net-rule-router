@@ -77,6 +77,28 @@ pub struct AdapterAddressRow {
     pub observed_at_ms: i64,
 }
 
+/// One ledger key with the window it has been seen in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterKeySighting {
+    pub adapter_key: String,
+    pub display_name: String,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+/// One answer to "did this connection continue as that one?".
+///
+/// A refusal is stored as much as an acceptance: the question is asked once,
+/// and a pair the user said no to must not come back next session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterHistoryLink {
+    pub old_key: String,
+    pub new_key: String,
+    /// `true` = the old key's history continues under the new one.
+    pub merged: bool,
+    pub decided_at_ms: i64,
+}
+
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 /// SQLite-backed traffic-statistics store. Owns one connection to
@@ -106,8 +128,8 @@ impl SqliteTrafficStore {
     ) -> StorageResult<()> {
         let conn = self.conn.borrow();
         conn.execute(
-            "INSERT INTO interface_identity (adapter_key, display_name, last_seen)
-             VALUES (?1, ?2, ?3)
+            "INSERT INTO interface_identity (adapter_key, display_name, last_seen, first_seen)
+             VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(adapter_key) DO UPDATE SET
                  display_name = excluded.display_name,
                  last_seen    = excluded.last_seen",
@@ -389,6 +411,78 @@ impl SqliteTrafficStore {
     /// without this its journal carries nearly the whole dataset: 28 KB of
     /// database behind 4.1 MB of journal on the owner's machine. Best-effort by
     /// contract — a concurrent connection makes SQLite decline.
+    /// Every key the ledger knows, with when it was first and last seen.
+    ///
+    /// The input to the merge question: a key that stopped being seen and one
+    /// that appeared in its place are visible here and nowhere else.
+    pub fn key_sightings(&self) -> StorageResult<Vec<AdapterKeySighting>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare(
+                "SELECT adapter_key, display_name, first_seen, last_seen
+                 FROM interface_identity ORDER BY adapter_key",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdapterKeySighting {
+                    adapter_key: r.get(0)?,
+                    display_name: r.get(1)?,
+                    first_seen_ms: r.get::<_, i64>(2)?.max(0),
+                    last_seen_ms: r.get::<_, i64>(3)?.max(0),
+                })
+            })
+            .map_err(db_err)?;
+        collect_rows(rows)
+    }
+
+    /// Record the user's answer about one pair.
+    ///
+    /// Re-answering the same predecessor replaces the previous answer: a
+    /// history can only continue in one place, so the latest decision is the
+    /// one that holds.
+    pub fn set_history_link(&self, link: &AdapterHistoryLink) -> StorageResult<()> {
+        let conn = self.conn.borrow();
+        conn.execute(
+            "INSERT INTO adapter_history_link (old_key, new_key, merged, decided_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(old_key) DO UPDATE SET
+                 new_key       = excluded.new_key,
+                 merged        = excluded.merged,
+                 decided_at_ms = excluded.decided_at_ms",
+            params![
+                link.old_key,
+                link.new_key,
+                i64::from(link.merged),
+                link.decided_at_ms
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Every answer given so far, oldest decision first.
+    pub fn history_links(&self) -> StorageResult<Vec<AdapterHistoryLink>> {
+        let conn = self.conn.borrow();
+        let mut stmt = conn
+            .prepare(
+                "SELECT old_key, new_key, merged, decided_at_ms
+                 FROM adapter_history_link ORDER BY decided_at_ms",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AdapterHistoryLink {
+                    old_key: r.get(0)?,
+                    new_key: r.get(1)?,
+                    merged: r.get::<_, i64>(2)? != 0,
+                    decided_at_ms: r.get(3)?,
+                })
+            })
+            .map_err(db_err)?;
+        collect_rows(rows)
+    }
+
     pub fn checkpoint_wal(&self) -> StorageResult<()> {
         let conn = self.conn.borrow();
         crate::migration::checkpoint_wal_truncate(&conn)
@@ -438,6 +532,46 @@ mod tests {
         let v = runner.verify_schema().expect("verify");
         assert!(v.is_ok(), "traffic schema verify failed: {v:?}");
         SqliteTrafficStore::new(runner.into_connection())
+    }
+
+    fn link(old: &str, new: &str, merged: bool, at: i64) -> AdapterHistoryLink {
+        AdapterHistoryLink {
+            old_key: old.to_string(),
+            new_key: new.to_string(),
+            merged,
+            decided_at_ms: at,
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_stored_as_firmly_as_an_acceptance() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = open_store(&dir);
+        store
+            .set_history_link(&link("old", "new", false, 10))
+            .expect("write");
+        store
+            .set_history_link(&link("a", "b", true, 20))
+            .expect("write");
+        let links = store.history_links().expect("read");
+        assert_eq!(
+            links,
+            vec![link("old", "new", false, 10), link("a", "b", true, 20)]
+        );
+    }
+
+    #[test]
+    fn a_history_continues_in_only_one_place() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = open_store(&dir);
+        store
+            .set_history_link(&link("old", "first", true, 10))
+            .expect("write");
+        store
+            .set_history_link(&link("old", "second", true, 20))
+            .expect("rewrite");
+        let links = store.history_links().expect("read");
+        assert_eq!(links, vec![link("old", "second", true, 20)]);
     }
 
     fn delta(name: &str, cat: TrafficCategory, in_d: u64, out_d: u64) -> TrafficDelta {

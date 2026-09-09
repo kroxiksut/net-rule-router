@@ -4,7 +4,7 @@
 //! The catch-all block-all (`FailClosedUnknown` / `kill_switch_block_all`) cuts
 //! every destination it cannot classify. Rule hosts escape via their compiled
 //! permits, but a DIRECT host — one no rule matches — has no permit at all, so
-//! it is cut too (the habr.com case: the secondary adapter vanished after an
+//! it is cut too (the field case: the secondary adapter vanished after an
 //! unclean restart, the block-all armed, and a plain primary-path site died).
 //!
 //! This registry collects addresses two provers feed in:
@@ -123,12 +123,12 @@ mod tests {
     fn registers_routable_and_ignores_non_routable() {
         let r = KnownDirectRegistry::new(16);
         let added = r.register(&[
-            ip(178, 248, 237, 68), // habr.com — routable
-            ip(127, 0, 0, 1),      // loopback (hosts-file pin) — ignored
-            ip(0, 0, 0, 0),        // unspecified (adblock pin) — ignored
+            ip(203, 0, 113, 68), // an unruled direct host — routable
+            ip(127, 0, 0, 1),    // loopback (hosts-file pin) — ignored
+            ip(0, 0, 0, 0),      // unspecified (adblock pin) — ignored
         ]);
         assert_eq!(added, 1);
-        assert_eq!(r.snapshot(), vec![ip(178, 248, 237, 68)]);
+        assert_eq!(r.snapshot(), vec![ip(203, 0, 113, 68)]);
     }
 
     #[test]

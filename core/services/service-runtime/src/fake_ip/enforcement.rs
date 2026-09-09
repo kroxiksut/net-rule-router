@@ -225,10 +225,10 @@ mod tests {
     #[test]
     fn disabled_scope_yields_an_empty_plan() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("chatgpt.com", vec![ip(104, 18, 32, 47)]);
+        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::disabled(),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
             &NoSharedIps,
         );
@@ -239,12 +239,12 @@ mod tests {
     fn an_unshared_scope_ip_keeps_its_permit() {
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips(
-            "chatgpt.com",
-            vec![ip(104, 18, 32, 47), ip(104, 18, 33, 47)],
+            "assistant.example",
+            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
         );
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
             &NoSharedIps,
         );
@@ -259,18 +259,18 @@ mod tests {
         // .32 is shared with a direct host (a non-scope host on the same CDN IP);
         // .33 is unique to chatgpt.
         cache.set_ips(
-            "chatgpt.com",
-            vec![ip(104, 18, 32, 47), ip(104, 18, 33, 47)],
+            "assistant.example",
+            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
         );
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
-            &SharedSet(vec![ip(104, 18, 32, 47)]),
+            &SharedSet(vec![ip(23, 10, 20, 140)]),
         );
         // Pinning the shared one would drag its direct co-tenant into the
         // tunnel; the unshared one has no co-tenant to drag.
-        assert_eq!(plan.suppress_ips, vec![ip(104, 18, 32, 47)]);
+        assert_eq!(plan.suppress_ips, vec![ip(23, 10, 20, 140)]);
     }
 
     /// The 0719 breakage in one assertion: an address a direct host also uses
@@ -279,14 +279,17 @@ mod tests {
     #[test]
     fn a_shared_ip_is_never_left_pinnable_to_the_tunnel() {
         let cache = MockFqdnCacheLookup::new();
-        let shared = ip(142, 251, 154, 119);
-        cache.set_ips("gemini.google.com", vec![shared]);
-        cache.set_ips("aistudio.google.com", vec![shared, ip(216, 58, 198, 46)]);
+        let shared = ip(23, 10, 20, 152);
+        cache.set_ips("gemini.search.example", vec![shared]);
+        cache.set_ips(
+            "aistudio.search.example",
+            vec![shared, ip(216, 58, 198, 46)],
+        );
         let plan = plan_fake_ip_enforcement(
             &FakeIpScope::enabled(Vec::<String>::new()),
             &CanonicalRuleSet::from_rules(vec![
-                fqdn_rule("gemini.google.com"),
-                fqdn_rule("aistudio.google.com"),
+                fqdn_rule("gemini.search.example"),
+                fqdn_rule("aistudio.search.example"),
             ]),
             &cache,
             &SharedSet(vec![shared]),
@@ -339,11 +342,11 @@ mod tests {
     #[test]
     fn augmentation_is_empty_when_fake_ip_is_off() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("chatgpt.com", vec![ip(104, 18, 32, 47)]);
+        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
         let aug = augment_codegen_for_fake_ip(
             "S",
             &ctx(false),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
             &HashSet::new(),
             false,
@@ -356,23 +359,23 @@ mod tests {
     fn augmentation_suppresses_only_the_shared_ip_and_permits_pool() {
         let cache = MockFqdnCacheLookup::new();
         cache.set_ips(
-            "chatgpt.com",
-            vec![ip(104, 18, 32, 47), ip(104, 18, 33, 47)],
+            "assistant.example",
+            vec![ip(23, 10, 20, 140), ip(23, 10, 20, 141)],
         );
         // .32 is shared with a direct host (in the base denylist).
         let mut base = HashSet::new();
-        base.insert(ip(104, 18, 32, 47));
+        base.insert(ip(23, 10, 20, 140));
         let aug = augment_codegen_for_fake_ip(
             "S-1-5-21-3",
             &ctx(true),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
             &base,
             false,
         );
         // Only the shared .32 loses its /32 permit; .33 belongs to chatgpt
         // alone and keeps the route its rule already implies.
-        assert_eq!(aug.denylist_additions, vec![ip(104, 18, 32, 47)]);
+        assert_eq!(aug.denylist_additions, vec![ip(23, 10, 20, 140)]);
         // A real address is never blocked outright: the shared one would take
         // its direct co-tenant down with it, the unshared one is simply routed.
         assert!(
@@ -392,11 +395,11 @@ mod tests {
     #[test]
     fn udp_relay_enabled_drops_pool_udp_blocks() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("chatgpt.com", vec![ip(104, 18, 32, 47)]);
+        cache.set_ips("assistant.example", vec![ip(23, 10, 20, 140)]);
         let aug = augment_codegen_for_fake_ip(
             "S-1-5-21-3",
             &ctx(true),
-            &CanonicalRuleSet::from_rules(vec![fqdn_rule("chatgpt.com")]),
+            &CanonicalRuleSet::from_rules(vec![fqdn_rule("assistant.example")]),
             &cache,
             &HashSet::new(),
             true,

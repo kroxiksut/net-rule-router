@@ -271,7 +271,6 @@ QtObject {
             var displayValue = Rules.isHostlikeRuleType(ruleType)
                 ? root._unicodeDecodeHost(matchValue)
                 : matchValue
-            var verdict = verdicts[String(r["id-hint"])]
             rows.push({
                 id: "R-" + ("0000" + String(nextId)).slice(-4),
                 enabled: true,
@@ -383,6 +382,9 @@ QtObject {
             var displayValue = Rules.isHostlikeRuleType(ruleType)
                 ? root._unicodeDecodeHost(matchValue)
                 : matchValue
+            // Absent for a row the service did not flag, which is the common
+            // case: the roles below then fall back to "valid".
+            var verdict = verdicts[String(r["id-hint"])]
             rows.push({
                 id: "R-" + ("0000" + String(nextId)).slice(-4),
                 enabled: !!r.enabled,

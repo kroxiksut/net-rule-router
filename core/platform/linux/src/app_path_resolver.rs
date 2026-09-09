@@ -58,6 +58,55 @@ impl AppPathResolver for LinuxAppPathResolver {
         }
         dedup_paths(found)
     }
+
+    fn sibling_executables(&self, exe: &std::path::Path) -> Vec<PathBuf> {
+        let Some(dir) = private_install_dir_of(exe) else {
+            return Vec::new();
+        };
+        nrr_platform_api::app_path_resolver::executables_in_tree(
+            &dir,
+            SIBLING_WALK_MAX_DEPTH,
+            SIBLING_WALK_MAX_FILES,
+            &is_executable_file,
+        )
+        .into_iter()
+        .filter(|p| p != exe)
+        .take(SIBLING_MAX_PATHS)
+        .collect()
+    }
+}
+
+/// Install-tree walk limits — same reasoning as the Windows backend: deep
+/// enough for a bundled transport, capped at one product's worth of binaries.
+const SIBLING_WALK_MAX_DEPTH: u32 = 3;
+const SIBLING_WALK_MAX_FILES: u32 = 4000;
+const SIBLING_MAX_PATHS: usize = 12;
+
+/// The directory holding `exe` when that directory belongs to ONE product.
+///
+/// On Linux the usual install shape is the opposite of Windows: the binary
+/// sits in a shared `bin` directory next to everything else on the system, and
+/// its private files live elsewhere (`/opt/<vendor>`, `/usr/lib/<pkg>`). So the
+/// shared directories are rejected outright and nothing is expanded from them —
+/// a bundle under `/opt` is the case this answers.
+fn private_install_dir_of(exe: &std::path::Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    // The filesystem root itself is never one product's directory.
+    dir.parent()?;
+    let shared = [
+        "/bin",
+        "/sbin",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+    ];
+    if shared.iter().any(|s| dir == std::path::Path::new(s)) {
+        return None;
+    }
+    Some(dir.to_path_buf())
 }
 
 /// The names to look for on disk, given the neutral key.
@@ -107,7 +156,7 @@ fn search_directories() -> Vec<PathBuf> {
 #[cfg(target_os = "linux")]
 fn is_executable_file(path: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    // `metadata` follows symlinks on purpose: `/usr/bin/telegram` is usually a
+    // `metadata` follows symlinks on purpose: `/usr/bin/messenger` is usually a
     // link to the real binary, and the link is the path the user launches.
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
@@ -126,13 +175,36 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
 
+    /// On Linux the binary usually sits in a directory shared with the whole
+    /// system, so expanding it would exempt everything installed. Only a
+    /// bundle's own directory (`/opt/vendor`, `/usr/lib/pkg`) may expand.
+    #[test]
+    fn only_a_bundles_own_directory_expands() {
+        assert_eq!(
+            private_install_dir_of(std::path::Path::new("/opt/vendor-vpn/client")).as_deref(),
+            Some(std::path::Path::new("/opt/vendor-vpn")),
+        );
+        for shared in [
+            "/usr/bin/client",
+            "/usr/local/bin/client",
+            "/bin/client",
+            "/snap/bin/client",
+            "/client",
+        ] {
+            assert!(
+                private_install_dir_of(std::path::Path::new(shared)).is_none(),
+                "{shared} must not expand",
+            );
+        }
+    }
+
     #[test]
     fn the_neutral_exe_suffix_is_stripped_for_the_lookup() {
-        // The neutral layer guarantees `.exe`; on disk the file is `telegram`.
-        let patterns = candidate_patterns("telegram.exe");
-        assert_eq!(patterns.first().map(String::as_str), Some("telegram"));
+        // The neutral layer guarantees `.exe`; on disk the file is `messenger`.
+        let patterns = candidate_patterns("messenger.exe");
+        assert_eq!(patterns.first().map(String::as_str), Some("messenger"));
         // The original spelling stays as a fallback for a Wine-launched app.
-        assert!(patterns.iter().any(|p| p == "telegram.exe"));
+        assert!(patterns.iter().any(|p| p == "messenger.exe"));
     }
 
     #[test]
@@ -143,7 +215,10 @@ mod tests {
 
     #[test]
     fn a_name_without_the_suffix_is_looked_up_as_written() {
-        assert_eq!(candidate_patterns("telegram"), vec!["telegram".to_string()]);
+        assert_eq!(
+            candidate_patterns("messenger"),
+            vec!["messenger".to_string()]
+        );
     }
 
     #[test]

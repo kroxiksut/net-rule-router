@@ -366,18 +366,18 @@ mod tests {
     fn cache_resolver_returns_cached_v4_addresses() {
         let cache = Arc::new(MockFqdnCacheLookup::new());
         cache.set_ips(
-            "chatgpt.com",
+            "assistant.example",
             vec![
-                Ipv4Addr::new(104, 18, 32, 47),
-                Ipv4Addr::new(104, 18, 33, 47),
+                Ipv4Addr::new(23, 10, 20, 140),
+                Ipv4Addr::new(23, 10, 20, 141),
             ],
         );
         let resolver = CacheUpstreamResolver::new(cache);
         assert_eq!(
-            resolver.addresses_for("chatgpt.com"),
+            resolver.addresses_for("assistant.example"),
             vec![
-                IpAddr::V4(Ipv4Addr::new(104, 18, 32, 47)),
-                IpAddr::V4(Ipv4Addr::new(104, 18, 33, 47)),
+                IpAddr::V4(Ipv4Addr::new(23, 10, 20, 140)),
+                IpAddr::V4(Ipv4Addr::new(23, 10, 20, 141)),
             ]
         );
         // An un-cached host yields nothing — the relay then fails the flow closed
@@ -423,8 +423,11 @@ mod tests {
 
     #[test]
     fn route_selector_steers_secondary_hosts_and_defaults_others_to_primary() {
-        let selector = selector_for("chatgpt.com", Some("S-1-5-21-1"));
-        assert_eq!(selector.route_for("chatgpt.com"), RouteRole::Secondary);
+        let selector = selector_for("assistant.example", Some("S-1-5-21-1"));
+        assert_eq!(
+            selector.route_for("assistant.example"),
+            RouteRole::Secondary
+        );
         // A primary-only rule host, and an unmatched host, both take the primary.
         assert_eq!(selector.route_for("primary.example"), RouteRole::Primary);
         assert_eq!(selector.route_for("random.net"), RouteRole::Primary);
@@ -432,7 +435,7 @@ mod tests {
 
     #[test]
     fn route_selector_defaults_to_primary_with_no_active_principal() {
-        let selector = selector_for("chatgpt.com", None);
-        assert_eq!(selector.route_for("chatgpt.com"), RouteRole::Primary);
+        let selector = selector_for("assistant.example", None);
+        assert_eq!(selector.route_for("assistant.example"), RouteRole::Primary);
     }
 }

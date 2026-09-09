@@ -436,7 +436,7 @@ mod tests {
         let handle = fresh_handle(&tmp.path().join("sidecar.db"));
         for (rule_type, value, route, comment) in [
             ("zone", "ru", "primary", "Россия"),
-            ("domain", "vk.com", "secondary", "Соцсеть"),
+            ("domain", "ab.test", "secondary", "Соцсеть"),
         ] {
             handle_sidecar_request(
                 &handle,
@@ -450,7 +450,7 @@ mod tests {
         let map = all["comments"].as_object().expect("comments object");
         assert_eq!(map.len(), 2);
         assert_eq!(map["zone|ru|primary"], "Россия");
-        assert_eq!(map["domain|vk.com|secondary"], "Соцсеть");
+        assert_eq!(map["domain|ab.test|secondary"], "Соцсеть");
     }
 
     #[test]

@@ -45,7 +45,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use nrr_domain::canonical::{
-    CanonicalAddressMatch, CanonicalAppPattern, CanonicalRuleBook, CanonicalRuleSet,
+    CanonicalAddressMatch, CanonicalAppPattern, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
 };
 use nrr_domain::user_principal::UserPrincipal;
 use nrr_domain::{RouteBehaviorMode, RuleAction};
@@ -82,6 +82,15 @@ pub struct PlannerInput<'a> {
     /// address-ownership arbiter, which is the one place the two can contest
     /// the same address.
     pub zone_priority_over_ip: bool,
+    /// Addresses the shared-IP policy declined for the ADDITIONAL route — the
+    /// same set the Windows codegen hides behind
+    /// [`crate::secondary_ip_policy::DenylistFilteredCache`].
+    ///
+    /// Applied to secondary rules only: a shared address declined for the
+    /// tunnel must still be reachable over the main link, so the primary side
+    /// reads the raw cache. Empty means "no policy declined anything", which is
+    /// what a caller with no shared-IP census passes.
+    pub secondary_ip_denylist: &'a HashSet<Ipv4Addr>,
 }
 
 /// Within-band ordinal slots reserved per rule, mirroring
@@ -143,9 +152,10 @@ pub fn plan_route_rules(
     sid: &str,
     behavior_mode: RouteBehaviorMode,
     input: &PlannerInput,
-) -> Vec<FlowRule> {
+) -> (Vec<FlowRule>, PlanReport) {
     let principal = principal_scope(sid);
     let mut flows = Vec::new();
+    let mut report = PlanReport::default();
     // The same arbiter the Windows codegens read. Without it this path pins an
     // app rule's observed destinations over an address rule the user wrote for
     // that very host, and the kill-switch then blocks the address for every
@@ -158,10 +168,23 @@ pub fn plan_route_rules(
             input.zone_priority_over_ip,
         ),
     );
+    // Secondary rules read the denylist-filtered view, primary rules the raw
+    // cache — the same split `wfp_codegen::generate_filters` makes. Without it
+    // this path plans the tunnel over addresses the shared-IP policy already
+    // declined, which is both a different plan and a different set of ordinals
+    // for everything after it.
+    let secondary_cache = crate::secondary_ip_policy::DenylistFilteredCache::new(
+        input.fqdn_cache,
+        input.secondary_ip_denylist,
+    );
     for (role, set) in [
         (RouteRole::Primary, &rule_book.primary),
         (RouteRole::Secondary, &rule_book.secondary),
     ] {
+        let cache_for_role: &dyn FqdnCacheLookup = match role {
+            RouteRole::Primary => input.fqdn_cache,
+            RouteRole::Secondary => &secondary_cache,
+        };
         let gate = crate::address_ownership::AppDestinationGate::for_rule_set(
             &ownership,
             input.app_observations,
@@ -206,7 +229,9 @@ pub fn plan_route_rules(
             };
 
             if let Some(addr_match) = rule.address_match.as_ref() {
-                for (fanout_idx, ip) in resolve_targets(addr_match, input.fqdn_cache) {
+                let targets = resolve_targets(addr_match, cache_for_role);
+                note_address_resolution(&mut report, rule, addr_match, &targets, cache_for_role);
+                for (fanout_idx, ip) in targets {
                     // A Block rule steers nothing, so the arbiter has no say
                     // over it. Otherwise: an address the main link's own rules
                     // name is not this link's to take, however specific this
@@ -226,9 +251,17 @@ pub fn plan_route_rules(
                 // Per-exe-path ALE_APP_ID filters (slots 0..APP_PATH_FANOUT_CAP).
                 // No remote IP → DstMatch::Any; no packet mirror (the packet
                 // layer has no app context), so ConnectOnly.
-                for (k, path) in input
-                    .app_resolver
-                    .resolve(pattern)
+                let resolved = input.app_resolver.resolve(pattern);
+                if resolved.is_empty() {
+                    report.unresolved_apps.push(pattern.to_string());
+                } else if resolved.len() > APP_PATH_FANOUT_CAP as usize {
+                    report.over_capped_apps.push((
+                        pattern.to_string(),
+                        APP_PATH_FANOUT_CAP as usize,
+                        resolved.len(),
+                    ));
+                }
+                for (k, path) in resolved
                     .into_iter()
                     .take(APP_PATH_FANOUT_CAP as usize)
                     .enumerate()
@@ -255,8 +288,17 @@ pub fn plan_route_rules(
                 }
                 // Observed-destination /32s (slots APP_PATH_FANOUT_CAP+1+i) —
                 // ordinary host flows, so `coverage` (mirror for Block) applies.
-                for (i, ip) in gate
-                    .admit(pattern, link)
+                let destinations = gate.admit(pattern, link);
+                for (ip, refusal) in &destinations.refused {
+                    // Only the address-rule claim is the user's own two rules
+                    // pointing one address both ways — the one they can act on.
+                    if *refusal
+                        == crate::address_ownership::AppDestinationRefusal::ClaimedByAddressRule
+                    {
+                        report.claimed_by_main.push((pattern.to_string(), *ip));
+                    }
+                }
+                for (i, ip) in destinations
                     .admitted
                     .into_iter()
                     .take(PER_HOSTNAME_IP_CAP)
@@ -269,6 +311,7 @@ pub fn plan_route_rules(
     }
     // Slice 5 — the StrictSecondaryFailClosed default catch-all block (ALE only,
     // lowest band). Any rule-driven `Permit` above still wins.
+    // (report is returned with the flows at the end)
     if matches!(behavior_mode, RouteBehaviorMode::StrictSecondaryFailClosed) {
         flows.push(FlowRule {
             verdict: Verdict::Block,
@@ -287,7 +330,7 @@ pub fn plan_route_rules(
             coverage: Coverage::ConnectOnly,
         });
     }
-    flows
+    (flows, report)
 }
 
 /// Resolve an address match to its `(fanout_index, IPv4)` targets, replicating
@@ -949,19 +992,6 @@ pub fn plan_fail_closed_apps(
         .collect()
 }
 
-/// Plan the **fail-closed Mode-B block-all** (Sub-slice 4d) — the secondary is
-/// gone, so block ALL egress for this user except the safe exemptions. Neutral
-/// equivalent of `killswitch_codegen::fail_closed_block_all_filters`.
-///
-/// Unlike [`plan_catch_all_kill_switch`] it arms WITHOUT a resolvable secondary
-/// (there is none — so no egress-via-secondary permit) and WITHOUT requiring
-/// server IPs. The exemptions are loopback / link-local / broadcast / servers /
-/// liveness-probe targets / local subnets (ALE + packet mirror), plus opt-in
-/// DNS-over-primary (port-53
-/// UDP/TCP, ALE only). The ALE catch-all block is narrowed to the ALE protocol and
-/// emitted only when TCP/UDP is selected; the packet blocks reproduce
-/// `packet_protocol_blocks`; the IPv6 cut always applies. Empty when no protocol is
-/// selected.
 /// Plan the DoH/DoT lockdown blocks as neutral
 /// [`FlowRule`]s — the neutral equivalent of
 /// [`crate::killswitch_codegen::doh_dot_block_filters`]. Per resolver IP: a
@@ -1013,6 +1043,19 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[Ipv4Addr], block_dot: bool)
     flows
 }
 
+/// Plan the **fail-closed Mode-B block-all** (Sub-slice 4d) — the secondary is
+/// gone, so block ALL egress for this user except the safe exemptions. Neutral
+/// equivalent of `killswitch_codegen::fail_closed_block_all_filters`.
+///
+/// Unlike [`plan_catch_all_kill_switch`] it arms WITHOUT a resolvable secondary
+/// (there is none — so no egress-via-secondary permit) and WITHOUT requiring
+/// server IPs. The exemptions are loopback / link-local / broadcast / servers /
+/// liveness-probe targets / local subnets (ALE + packet mirror), plus opt-in
+/// DNS-over-primary (port-53
+/// UDP/TCP, ALE only). The ALE catch-all block is narrowed to the ALE protocol and
+/// emitted only when TCP/UDP is selected; the packet blocks reproduce
+/// `packet_protocol_blocks`; the IPv6 cut always applies. Empty when no protocol is
+/// selected.
 // Mirrors `FailClosedExemptions` field-by-field as plain slices — the
 // equivalence tests drive both sides from the same locals, and a struct here
 // would just duplicate the codegen's.
@@ -1485,6 +1528,320 @@ fn overlay_intent(net: Ipv4Addr, prefix: u8, egress: EgressRef) -> RouteIntent {
     }
 }
 
+/// An empty denylist for callers with no shared-IP policy in play.
+/// The floor a blanket block may never cut, as neutral flows.
+///
+/// The strict mode's default catch-all blocks everything no rule permitted —
+/// including loopback, DHCP, the link's own control traffic and the tunnel's
+/// handshake. Those are not traffic anyone routes; cutting them takes the
+/// machine off its own network. On Windows this floor was carried by a branch
+/// in the orchestrator, so the neutral plan — the one Linux enforces — had a
+/// block with nothing underneath it.
+///
+/// Order mirrors the shipped `killswitch_codegen::default_block_exemptions`:
+/// loopback, link-local, broadcast, the local network control block, then the
+/// tunnel servers and the attached subnets. `server_ips` / `local_subnets` may
+/// be empty (a machine whose route table has not been read yet); the
+/// machine-independent part of the floor is planned regardless.
+pub fn plan_default_block_exemptions(
+    sid: &str,
+    server_ips: &[Ipv4Addr],
+    local_subnets: &[(Ipv4Addr, u8)],
+) -> Vec<FlowRule> {
+    let principal = principal_scope(sid);
+    let mut dsts: Vec<DstMatch> = vec![
+        DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(127, 0, 0, 0),
+            prefix: 8,
+        },
+        DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(169, 254, 0, 0),
+            prefix: 16,
+        },
+        DstMatch::HostV4(Ipv4Addr::BROADCAST),
+        DstMatch::SubnetV4 {
+            net: Ipv4Addr::new(224, 0, 0, 0),
+            prefix: 24,
+        },
+    ];
+    dsts.extend(server_ips.iter().map(|ip| DstMatch::HostV4(*ip)));
+    dsts.extend(
+        local_subnets
+            .iter()
+            .map(|(net, prefix)| DstMatch::SubnetV4 {
+                net: *net,
+                prefix: *prefix,
+            }),
+    );
+
+    dsts.into_iter()
+        .enumerate()
+        .map(|(ordinal, dst)| FlowRule {
+            verdict: Verdict::Permit,
+            precedence: Precedence {
+                class: PrecedenceClass::CatchAllExempt,
+                ordinal: ordinal as u32,
+            },
+            flow: FlowMatch {
+                dst,
+                dst_port: None,
+                protocol: None,
+            },
+            principal: principal.clone(),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        })
+        .collect()
+}
+
+/// The fake-IP relay's pool, as neutral flows.
+///
+/// Two things have to be true at once for a fake-routed host to work: an
+/// application must be able to open a connection to the virtual address under
+/// ANY posture (including a blanket block), and — while the UDP path is off —
+/// QUIC must die at connect time rather than handshake against a stack that
+/// will drop its datagrams. Hence a permit for the pool and, conditionally, a
+/// UDP veto above it. Both sit in [`PrecedenceClass::FakeIpPool`]: the pool is
+/// machinery a rule is served THROUGH, not a destination anyone named.
+///
+/// `ordinal` order is the emission order of the shipped codegen (v4 permit, v6
+/// permit, v4 UDP veto, v6 UDP veto), so the veto outranks the permit it
+/// qualifies.
+pub fn plan_fake_ip_pool(
+    sid: &str,
+    pool: &nrr_platform_api::fake_ip::FakeIpPoolConfig,
+    udp_relay_enabled: bool,
+) -> Vec<FlowRule> {
+    let principal = principal_scope(sid);
+    let mut flows = Vec::new();
+    let mut push = |ordinal: u32, verdict: Verdict, dst: DstMatch, protocol: Option<L4Proto>| {
+        flows.push(FlowRule {
+            verdict,
+            precedence: Precedence {
+                class: PrecedenceClass::FakeIpPool,
+                ordinal,
+            },
+            flow: FlowMatch {
+                dst,
+                dst_port: None,
+                protocol,
+            },
+            principal: principal.clone(),
+            app: AppScope::Any,
+            egress: EgressConstraint::Any,
+            coverage: Coverage::ConnectOnly,
+        })
+    };
+
+    push(
+        0,
+        Verdict::Permit,
+        DstMatch::SubnetV4 {
+            net: pool.v4_base,
+            prefix: pool.v4_prefix_len,
+        },
+        None,
+    );
+    if let Some(v6) = pool.v6_base {
+        push(
+            1,
+            Verdict::Permit,
+            DstMatch::SubnetV6 {
+                net: v6,
+                prefix: pool.v6_prefix_len,
+            },
+            None,
+        );
+    }
+    if !udp_relay_enabled {
+        push(
+            2,
+            Verdict::Block,
+            DstMatch::SubnetV4 {
+                net: pool.v4_base,
+                prefix: pool.v4_prefix_len,
+            },
+            Some(L4Proto::Udp),
+        );
+        if let Some(v6) = pool.v6_base {
+            push(
+                3,
+                Verdict::Block,
+                DstMatch::SubnetV6 {
+                    net: v6,
+                    prefix: pool.v6_prefix_len,
+                },
+                Some(L4Proto::Udp),
+            );
+        }
+    }
+    flows
+}
+
+/// Name what an address rule failed to resolve to, so the caller can say which
+/// rule is waiting on DNS rather than reporting silence.
+///
+/// An `ExactIp` always resolves; the rest depend on the cache being warm. The
+/// backstop is reported separately: a fan-out that STOPPED is a different fact
+/// from one that found nothing.
+fn note_address_resolution(
+    report: &mut PlanReport,
+    rule: &CanonicalRule,
+    addr_match: &CanonicalAddressMatch,
+    targets: &[(u32, Ipv4Addr)],
+    cache: &dyn FqdnCacheLookup,
+) {
+    let name = match addr_match {
+        CanonicalAddressMatch::ExactIp(_) => return,
+        CanonicalAddressMatch::ExactFqdn(host) => host,
+        CanonicalAddressMatch::SuffixDomain(suffix) => suffix,
+        CanonicalAddressMatch::Zone(zone) => zone,
+    };
+    if targets.is_empty() {
+        report.unresolved_hosts.push(name.clone());
+        return;
+    }
+    let subdomains = match addr_match {
+        CanonicalAddressMatch::SuffixDomain(suffix) => {
+            cache.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_BACKSTOP)
+        }
+        CanonicalAddressMatch::Zone(zone) => {
+            cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP)
+        }
+        _ => return,
+    };
+    if subdomains.len() >= SUFFIX_FANOUT_BACKSTOP {
+        report.truncated_suffixes.push((
+            rule.id.as_str().to_string(),
+            name.clone(),
+            SUFFIX_FANOUT_BACKSTOP,
+        ));
+    }
+}
+
+/// What planning could NOT do, in the words the GUI shows the user.
+///
+/// A rule that resolves to nothing emits no flow, and a plan cannot say why:
+/// the absence looks identical to "the user has no such rule". The shipped
+/// codegen answered this with a diagnostics stream; the neutral planner answers
+/// it with this report, returned alongside the flows so a caller cannot take
+/// the plan and quietly drop the reasons.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PlanReport {
+    /// Application rules whose name/glob resolved to no executable on disk.
+    pub unresolved_apps: Vec<String>,
+    /// Hostnames, suffixes and zones with nothing cached under them.
+    pub unresolved_hosts: Vec<String>,
+    /// Application rules that resolved to more executables than the fan-out
+    /// allows: `(app, cap, resolved)`.
+    pub over_capped_apps: Vec<(String, usize, usize)>,
+    /// Destinations an application rule observed but did not take over, because
+    /// the main link's own rules name them: `(app, address)`.
+    pub claimed_by_main: Vec<(String, Ipv4Addr)>,
+    /// Suffix/zone fan-outs stopped at the backstop: `(rule_id, suffix, cap)`.
+    pub truncated_suffixes: Vec<(String, String, usize)>,
+}
+
+// ── Derived sets ────────────────────────────────────────────────────────────
+//
+// What the kill-switch, its exemptions and the GUI need is not the plan itself
+// but a handful of sets READ BACK off it. Deriving them here — from the planned
+// flows — is deliberate: the planner already did the fan-out, the caps and the
+// arbitration, and computing the same sets a second time from the rule book is
+// how the guarded set drifts from the routed one.
+
+/// The destinations a role's rules route, in planning order (deduplicated).
+///
+/// Only `Permit` flows contribute: a Block rule's destinations are being
+/// dropped, not routed, and protecting them would be the kill switch cancelling
+/// the user's own rule.
+pub fn route_destinations(flows: &[FlowRule], role: RouteRole) -> Vec<Ipv4Addr> {
+    let mut seen = std::collections::HashSet::new();
+    flows
+        .iter()
+        .filter(|f| {
+            f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::RouteRule(role)
+        })
+        .filter_map(|f| match f.flow.dst {
+            DstMatch::HostV4(ip) => Some(ip),
+            _ => None,
+        })
+        .filter(|ip| seen.insert(*ip))
+        .collect()
+}
+
+/// The VPN clients' own executables, resolved from the built-in globs to real
+/// on-disk paths.
+///
+/// A blanket block that seals the tunnel client's own traffic turns an outage
+/// into a permanent one, so these processes are spared. Resolution happens here
+/// rather than at lowering time because the apply layer needs a real path: a
+/// raw glob in an app-id filter is silently dropped. Deduplicated
+/// case-insensitively and sorted, so the exemption set does not depend on the
+/// resolver's ordering.
+pub fn vpn_default_exempt_paths(resolver: &dyn AppPathResolver) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut paths: Vec<String> = crate::killswitch_codegen::DEFAULT_VPN_EXEMPT_PATTERNS
+        .iter()
+        .flat_map(|glob| resolver.resolve(glob))
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| seen.insert(p.to_ascii_lowercase()))
+        .collect();
+    paths.sort_unstable();
+    paths
+}
+
+/// The destinations that reached a role's plan through OBSERVATION of an
+/// application, not through a rule naming the address.
+///
+/// The kill switch treats them differently on purpose: such an address is
+/// already guarded by its application's own permit/block pair, and pinning it a
+/// second time per-destination is what made a shared address unreachable for
+/// every other process. The two are told apart by the ordinal window each rule
+/// slot reserves — paths occupy `0..APP_PATH_FANOUT_CAP`, observed addresses
+/// start one past it — which is the same arithmetic `lower_windows` uses to
+/// rebuild the literal weight.
+pub fn app_observed_destinations(flows: &[FlowRule], role: RouteRole) -> Vec<Ipv4Addr> {
+    let mut seen = std::collections::HashSet::new();
+    flows
+        .iter()
+        .filter(|f| {
+            f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::RouteRule(role)
+        })
+        .filter(|f| f.precedence.ordinal % SLOTS_PER_RULE > APP_PATH_FANOUT_CAP as u32)
+        .filter_map(|f| match f.flow.dst {
+            DstMatch::HostV4(ip) => Some(ip),
+            _ => None,
+        })
+        .filter(|ip| seen.insert(*ip))
+        .collect()
+}
+
+/// The executable paths a role's application rules route, in planning order
+/// (deduplicated). These are what an app-scoped kill-switch pins and what the
+/// fail-closed exemption band spares.
+pub fn route_app_paths(flows: &[FlowRule], role: RouteRole) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for flow in flows.iter().filter(|f| {
+        f.verdict == Verdict::Permit && f.precedence.class == PrecedenceClass::RouteRule(role)
+    }) {
+        if let AppScope::Program { exe_paths, .. } = &flow.app {
+            for path in exe_paths {
+                let path = path.to_string_lossy().into_owned();
+                if seen.insert(path.clone()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+static NO_DENYLIST: std::sync::OnceLock<HashSet<Ipv4Addr>> = std::sync::OnceLock::new();
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1553,11 +1910,77 @@ mod tests {
         obs: &'a MapObs,
     ) -> PlannerInput<'a> {
         PlannerInput {
+            secondary_ip_denylist: NO_DENYLIST.get_or_init(HashSet::new),
             fqdn_cache: cache,
             app_resolver: resolver,
             app_observations: obs,
             zone_priority_over_ip: false,
         }
+    }
+
+    /// The shared-IP policy decides what the tunnel may claim, and the plan has
+    /// to be built behind that decision — the Windows codegen reads a
+    /// denylist-filtered cache for secondary rules and the raw one for primary.
+    /// Planning without it put declined addresses back on the tunnel, and
+    /// shifted every ordinal after them, which is what made the live and
+    /// neutral pipelines disagree on real data.
+    #[test]
+    fn a_declined_shared_address_is_kept_off_the_tunnel() {
+        let shared = Ipv4Addr::new(203, 0, 113, 7);
+        let own = Ipv4Addr::new(203, 0, 113, 8);
+        let cache = MapCache {
+            hosts: HashMap::from([("site.test".to_string(), vec![shared, own])]),
+            suffixes: HashMap::new(),
+        };
+        let resolver = MapResolver::default();
+        let obs = MapObs::default();
+        let declined: HashSet<Ipv4Addr> = HashSet::from([shared]);
+        // One rule, on the additional route: the policy is about what the
+        // TUNNEL may claim. (A main-link rule naming the same host would settle
+        // the address by ownership instead, which is a different mechanism.)
+        let rule_book = book(
+            Vec::new(),
+            vec![rule(
+                "r-2",
+                CanonicalAddressMatch::ExactFqdn("site.test".into()),
+                RuleAction::Route,
+            )],
+        );
+
+        let planned = |denylist: &HashSet<Ipv4Addr>| -> Vec<(RouteRole, Ipv4Addr)> {
+            let input = PlannerInput {
+                fqdn_cache: &cache,
+                app_resolver: &resolver,
+                app_observations: &obs,
+                zone_priority_over_ip: false,
+                secondary_ip_denylist: denylist,
+            };
+            plan_route_rules(
+                &rule_book,
+                "S-1-5-21-DENY",
+                RouteBehaviorMode::PreferPrimary,
+                &input,
+            )
+            .0
+            .into_iter()
+            .filter_map(|f| match (f.precedence.class, f.flow.dst) {
+                (PrecedenceClass::RouteRule(role), DstMatch::HostV4(ip)) => Some((role, ip)),
+                _ => None,
+            })
+            .collect()
+        };
+
+        let with_policy = planned(&declined);
+        assert!(
+            !with_policy.contains(&(RouteRole::Secondary, shared)),
+            "the tunnel must not claim an address the policy declined: {with_policy:?}",
+        );
+        assert!(with_policy.contains(&(RouteRole::Secondary, own)));
+
+        // Positive control: without the denylist the tunnel claims it, which is
+        // exactly the plan the live pipeline does NOT produce.
+        let without_policy = planned(&HashSet::new());
+        assert!(without_policy.contains(&(RouteRole::Secondary, shared)));
     }
 
     fn app_rule(id: &str, pattern: &str, action: RuleAction) -> CanonicalRule {
@@ -1595,7 +2018,8 @@ mod tests {
             "unix:uid:1000",
             RouteBehaviorMode::PreferPrimary,
             &planner_input(&cache, &resolver, &obs),
-        );
+        )
+        .0;
 
         assert!(!flows.is_empty(), "the rule must plan at least one flow");
         for flow in &flows {
@@ -1627,7 +2051,8 @@ mod tests {
             nrr_domain::user_principal::BASELINE_PRINCIPAL,
             RouteBehaviorMode::PreferPrimary,
             &planner_input(&cache, &resolver, &obs),
-        );
+        )
+        .0;
 
         assert!(!flows.is_empty());
         assert!(flows.iter().all(|f| f.principal.0.is_none()));
@@ -1651,7 +2076,8 @@ mod tests {
                 &MapResolver::default(),
                 &MapObs::default(),
             ),
-        );
+        )
+        .0;
         assert_eq!(flows.len(), 3);
         assert_eq!(
             flows[0].precedence.class,
@@ -1695,7 +2121,8 @@ mod tests {
             "S-1-5-21-A",
             RouteBehaviorMode::PreferPrimary,
             &planner_input(&cache, &MapResolver::default(), &MapObs::default()),
-        );
+        )
+        .0;
         // Two fan-out permits (ordinals 0,1) + one block flow.
         assert_eq!(flows.len(), 3);
         assert_eq!(flows[0].precedence.ordinal, 0);
@@ -1731,6 +2158,7 @@ mod tests {
                 &MapObs::default()
             )
         )
+        .0
         .is_empty());
     }
 
@@ -1771,15 +2199,15 @@ mod tests {
         // App rule: resolves to two exe paths + one observed destination IP.
         let mut resolver = MapResolver::default();
         resolver.0.insert(
-            "chatgpt.exe".into(),
+            "aiclient.exe".into(),
             vec![
-                std::path::PathBuf::from(r"C:\Apps\chatgpt.exe"),
-                std::path::PathBuf::from(r"C:\Apps2\chatgpt.exe"),
+                std::path::PathBuf::from(r"C:\Apps\aiclient.exe"),
+                std::path::PathBuf::from(r"C:\Apps2\aiclient.exe"),
             ],
         );
         let mut obs = MapObs::default();
         obs.0
-            .insert("chatgpt.exe".into(), vec![Ipv4Addr::new(172, 64, 155, 209)]);
+            .insert("aiclient.exe".into(), vec![Ipv4Addr::new(23, 10, 20, 159)]);
 
         let sid = "S-1-5-21-1-2-3-1001";
         let rb = book(
@@ -1802,7 +2230,7 @@ mod tests {
                     CanonicalAddressMatch::ExactIp(Ipv4Addr::new(10, 0, 0, 9)),
                     RuleAction::Block,
                 ),
-                app_rule("s-app", "chatgpt.exe", RuleAction::Route),
+                app_rule("s-app", "aiclient.exe", RuleAction::Route),
             ],
         );
 
@@ -1826,7 +2254,8 @@ mod tests {
                 sid,
                 nrr_domain::RouteBehaviorMode::PreferPrimary,
                 &planner_input(&cache, &resolver, &obs),
-            ),
+            )
+            .0,
             routes: Vec::new(),
             policy_rules: Vec::new(),
         };
@@ -1894,6 +2323,537 @@ mod tests {
             arbitration_order_preserved(&current, &lowered),
             "kill-switch permit must still outrank its block"
         );
+    }
+
+    /// The pool is the machinery every fake-routed host is served through, so
+    /// the neutral pipeline has to reproduce it exactly — including the UDP
+    /// veto that must sit ABOVE the permit it qualifies. Both switch positions
+    /// are exercised: with the relay on, the vetoes are absent, and a pipeline
+    /// that emitted them unconditionally would still pass the off-case alone.
+    #[cfg(windows)]
+    #[test]
+    fn slice6_fake_ip_pool_matches_current_codegen() {
+        use crate::killswitch_codegen::fake_ip_pool_permit_filters;
+        use nrr_platform_api::enforcement::EnforcementPlan;
+        use nrr_platform_api::fake_ip::FakeIpPoolConfig;
+        use nrr_platform_api::wfp_behavioral::{
+            arbitration_order_preserved, behaviorally_equivalent,
+        };
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let pool = FakeIpPoolConfig::default();
+
+        for udp_relay_enabled in [false, true] {
+            let current = fake_ip_pool_permit_filters(sid, &pool, udp_relay_enabled);
+            let plan = EnforcementPlan {
+                principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
+                    .expect("valid sid"),
+                flows: plan_fake_ip_pool(sid, &pool, udp_relay_enabled),
+                routes: Vec::new(),
+                policy_rules: Vec::new(),
+            };
+            let lowered = nrr_platform_windows::lower_windows::lower_fake_ip_pool(&plan);
+
+            assert!(
+                !current.is_empty(),
+                "the pool always permits itself — otherwise this proves nothing"
+            );
+            assert!(
+                behaviorally_equivalent(&current, &lowered),
+                "pool filters must match (udp_relay_enabled={udp_relay_enabled}):
+current={current:#?}
+lowered={lowered:#?}"
+            );
+            assert!(
+                arbitration_order_preserved(&current, &lowered),
+                "the UDP veto must keep outranking the pool permit"
+            );
+        }
+    }
+
+    /// The floor under the strict default block. Lowered with NO tunnel LUID
+    /// on purpose: the floor exists whether or not a tunnel is up, and the
+    /// posture that needs a LUID (the blanket block and its egress permit) is
+    /// exactly what must NOT appear in that case.
+    #[cfg(windows)]
+    #[test]
+    fn slice7_default_block_exemptions_match_current_codegen() {
+        use crate::killswitch_codegen::{default_block_exemptions, FailClosedExemptions};
+        use nrr_platform_api::enforcement::EnforcementPlan;
+        use nrr_platform_api::wfp_behavioral::{
+            arbitration_order_preserved, behaviorally_equivalent,
+        };
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let server_ips = vec![Ipv4Addr::new(203, 0, 113, 5)];
+        let local_subnets = vec![(Ipv4Addr::new(192, 168, 1, 0), 24)];
+
+        let current = default_block_exemptions(
+            sid,
+            &FailClosedExemptions {
+                bootstrap_server_ips: server_ips.clone(),
+                local_subnets: local_subnets.clone(),
+                foreign_tunnel_luids: Vec::new(),
+                ..Default::default()
+            },
+        );
+        assert!(!current.is_empty(), "the floor is never empty");
+
+        let plan = EnforcementPlan {
+            principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(sid)
+                .expect("valid sid"),
+            flows: plan_default_block_exemptions(sid, &server_ips, &local_subnets),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        let lowered = nrr_platform_windows::lower_windows::lower_catch_all_kill_switch(&plan, 0);
+
+        assert!(
+            behaviorally_equivalent(&current, &lowered),
+            "the floor must match:
+current={current:#?}
+lowered={lowered:#?}"
+        );
+        assert!(
+            arbitration_order_preserved(&current, &lowered),
+            "the floor's own order is what the codegen's running weight encodes"
+        );
+    }
+
+    /// The kill switch and the GUI do not consume the plan — they consume sets
+    /// READ BACK off it. Until those sets come from the plan, the live codegen
+    /// cannot be switched off no matter how equal the filters are.
+    #[test]
+    fn slice8_derived_sets_match_current_codegen() {
+        use crate::wfp_codegen::{generate_filters, CodegenInput};
+
+        let mut cache = MapCache::default();
+        cache.hosts.insert(
+            "api.example.com".into(),
+            vec![Ipv4Addr::new(203, 0, 113, 1), Ipv4Addr::new(203, 0, 113, 2)],
+        );
+        cache.suffixes.insert(
+            "corp.example".into(),
+            vec!["a.corp.example".into(), "b.corp.example".into()],
+        );
+        cache.hosts.insert(
+            "a.corp.example".into(),
+            vec![Ipv4Addr::new(198, 51, 100, 1)],
+        );
+        cache.hosts.insert(
+            "b.corp.example".into(),
+            vec![Ipv4Addr::new(198, 51, 100, 2)],
+        );
+        let mut resolver = MapResolver::default();
+        resolver.0.insert(
+            "aiclient.exe".into(),
+            vec![
+                std::path::PathBuf::from(r"C:\Apps\aiclient.exe"),
+                std::path::PathBuf::from(r"C:\Apps2\aiclient.exe"),
+            ],
+        );
+        // One of the built-in VPN globs resolves here, so the exemption set is
+        // NOT empty — two empty lists would agree about nothing.
+        resolver.0.insert(
+            "*vpn*".into(),
+            vec![std::path::PathBuf::from(
+                r"C:\Program Files\Acme VPN\acmevpn.exe",
+            )],
+        );
+        let mut obs = MapObs::default();
+        obs.0
+            .insert("aiclient.exe".into(), vec![Ipv4Addr::new(23, 10, 20, 159)]);
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let rb = book(
+            vec![
+                exact_ip_rule("p-ip", Ipv4Addr::new(192, 0, 2, 5)),
+                rule(
+                    "p-fqdn",
+                    CanonicalAddressMatch::ExactFqdn("api.example.com".into()),
+                    RuleAction::Route,
+                ),
+            ],
+            vec![
+                rule(
+                    "s-suffix",
+                    CanonicalAddressMatch::SuffixDomain("corp.example".into()),
+                    RuleAction::Route,
+                ),
+                rule(
+                    "s-block",
+                    CanonicalAddressMatch::ExactIp(Ipv4Addr::new(10, 0, 0, 9)),
+                    RuleAction::Block,
+                ),
+                app_rule("s-app", "aiclient.exe", RuleAction::Route),
+            ],
+        );
+        let denylist = std::collections::HashSet::new();
+        let current = generate_filters(CodegenInput {
+            sid,
+            rule_book: &rb,
+            behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &obs,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
+        });
+        let flows = plan_route_rules(
+            &rb,
+            sid,
+            nrr_domain::RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        )
+        .0;
+
+        // Compared as SETS. The shipped order is an artefact of WFP slot
+        // packing — the codegen reads its addresses back out of packed chunks,
+        // whose bucket order comes from an FNV hash — while the plan keeps them
+        // in planning order. Neither order carries policy: these addresses each
+        // get their own permit/block pair, and pairs for different destinations
+        // never arbitrate against each other. What the switch-over WILL change
+        // is the ordinals, hence the literal weights, hence a one-off churn on
+        // the first apply after it.
+        let sorted = |mut v: Vec<Ipv4Addr>| {
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(
+            sorted(route_destinations(&flows, RouteRole::Secondary)),
+            sorted(current.secondary_dest_ips.clone()),
+            "the kill switch protects what the tunnel routes"
+        );
+        assert_eq!(
+            sorted(route_destinations(&flows, RouteRole::Primary)),
+            sorted(current.primary_dest_ips.clone()),
+            "the block-all spares what the main link routes"
+        );
+        assert_eq!(
+            route_app_paths(&flows, RouteRole::Secondary),
+            current.secondary_app_patterns,
+            "an app the tunnel routes is pinned by its own pair"
+        );
+        assert_eq!(
+            route_app_paths(&flows, RouteRole::Primary),
+            current.primary_app_patterns,
+            "an app the main link routes is never a leak to cut"
+        );
+        assert_eq!(
+            sorted(app_observed_destinations(&flows, RouteRole::Secondary)),
+            sorted(current.app_observed_secondary_ips.clone()),
+            "an address learned from watching an app is guarded by that app's pair"
+        );
+        // Positive control for the ordinal window: the fixture's app rule DOES
+        // contribute an observed address, so an empty answer would be a passing
+        // test that proves nothing.
+        assert_eq!(
+            app_observed_destinations(&flows, RouteRole::Secondary),
+            vec![Ipv4Addr::new(23, 10, 20, 159)],
+        );
+        assert_eq!(
+            vpn_default_exempt_paths(&resolver),
+            current.vpn_default_exempt_paths,
+            "the tunnel client's own exemption set is resolved the same way"
+        );
+        assert!(
+            !current.vpn_default_exempt_paths.is_empty(),
+            "positive control: the fixture resolves one VPN client"
+        );
+    }
+
+    /// The report is the half of the codegen's answer the plan cannot carry: a
+    /// rule that resolved to nothing emits no flow, and silence reads as "no
+    /// such rule". Every list here has a fixture behind it — an app that does
+    /// not resolve, a host nobody cached, a zone with nothing under it and an
+    /// address both links claim — so an empty report would fail the test.
+    #[test]
+    fn slice9_plan_report_matches_current_codegen_diagnostics() {
+        use crate::wfp_codegen::{generate_filters, CodegenDiagnostic, CodegenInput};
+
+        let mut cache = MapCache::default();
+        cache
+            .hosts
+            .insert("known.example".into(), vec![Ipv4Addr::new(203, 0, 113, 9)]);
+        let mut resolver = MapResolver::default();
+        resolver.0.insert(
+            "known.exe".into(),
+            vec![std::path::PathBuf::from(r"C:\Apps\known.exe")],
+        );
+        let mut obs = MapObs::default();
+        // The app watched an address the MAIN link's own rule names: the app
+        // rule does not take it over, and the user is told which one it was.
+        obs.0
+            .insert("known.exe".into(), vec![Ipv4Addr::new(203, 0, 113, 9)]);
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let rb = book(
+            vec![rule(
+                "p-known",
+                CanonicalAddressMatch::ExactFqdn("known.example".into()),
+                RuleAction::Route,
+            )],
+            vec![
+                rule(
+                    "s-cold",
+                    CanonicalAddressMatch::ExactFqdn("cold.example".into()),
+                    RuleAction::Route,
+                ),
+                rule(
+                    "s-zone",
+                    CanonicalAddressMatch::Zone("empty.zone".into()),
+                    RuleAction::Route,
+                ),
+                app_rule("s-missing-app", "ghost.exe", RuleAction::Route),
+                app_rule("s-app", "known.exe", RuleAction::Route),
+            ],
+        );
+
+        let denylist = std::collections::HashSet::new();
+        let current = generate_filters(CodegenInput {
+            sid,
+            rule_book: &rb,
+            behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &obs,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
+        });
+        let (_, report) = plan_route_rules(
+            &rb,
+            sid,
+            nrr_domain::RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        );
+
+        let mut codegen_apps: Vec<String> = Vec::new();
+        let mut codegen_hosts: Vec<String> = Vec::new();
+        let mut codegen_claimed: Vec<(String, Ipv4Addr)> = Vec::new();
+        for diag in &current.diagnostics {
+            match diag {
+                CodegenDiagnostic::AppUnresolved { app, .. } => codegen_apps.push(app.clone()),
+                CodegenDiagnostic::HostnameUnresolved { hostname, .. } => {
+                    codegen_hosts.push(hostname.clone())
+                }
+                CodegenDiagnostic::SuffixEmpty { suffix, .. } => codegen_hosts.push(suffix.clone()),
+                CodegenDiagnostic::ZoneEmpty { zone, .. } => codegen_hosts.push(zone.clone()),
+                CodegenDiagnostic::AppDestinationClaimedByPrimary { app, ip, .. } => {
+                    codegen_claimed.push((app.clone(), *ip))
+                }
+                _ => {}
+            }
+        }
+
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(
+            sorted(report.unresolved_apps.clone()),
+            sorted(codegen_apps.clone()),
+            "an app rule pointing at nothing installed"
+        );
+        assert_eq!(
+            sorted(report.unresolved_hosts.clone()),
+            sorted(codegen_hosts.clone()),
+            "a rule waiting on DNS, and a zone with nothing under it"
+        );
+        assert_eq!(
+            report.claimed_by_main.clone(),
+            codegen_claimed.clone(),
+            "an address the main link named is not the app rule's to take"
+        );
+
+        // Positive controls: each list is non-empty, so an all-empty report
+        // could not pass this test by agreeing about nothing.
+        assert_eq!(codegen_apps, vec!["ghost.exe".to_string()]);
+        assert_eq!(sorted(codegen_hosts), vec!["cold.example", "empty.zone"]);
+        assert_eq!(
+            codegen_claimed,
+            vec![("known.exe".to_string(), Ipv4Addr::new(203, 0, 113, 9))]
+        );
+    }
+
+    /// The two caps in the report. Both are silent truncations in the plan —
+    /// filters simply stop appearing — so the only place a user can learn that
+    /// a rule was cut short is this report.
+    #[test]
+    fn slice9_plan_report_names_both_caps() {
+        use crate::wfp_codegen::{generate_filters, CodegenDiagnostic, CodegenInput};
+
+        let mut cache = MapCache::default();
+        // A zone whose fan-out hits the backstop.
+        let hosts: Vec<String> = (0..SUFFIX_FANOUT_BACKSTOP)
+            .map(|i| format!("h{i}.wide.zone"))
+            .collect();
+        for (i, h) in hosts.iter().enumerate() {
+            cache.hosts.insert(
+                h.clone(),
+                vec![Ipv4Addr::new(
+                    10,
+                    ((i >> 16) & 0xff) as u8,
+                    ((i >> 8) & 0xff) as u8,
+                    (i & 0xff) as u8,
+                )],
+            );
+        }
+        cache.suffixes.insert("wide.zone".into(), hosts);
+
+        // An app resolving to more executables than the fan-out allows.
+        let mut resolver = MapResolver::default();
+        resolver.0.insert(
+            "many.exe".into(),
+            (0..(APP_PATH_FANOUT_CAP + 1))
+                .map(|i| std::path::PathBuf::from(format!(r"C:\Apps\{i}\many.exe")))
+                .collect(),
+        );
+        let obs = MapObs::default();
+
+        let sid = "S-1-5-21-1-2-3-1001";
+        let rb = book(
+            Vec::new(),
+            vec![
+                rule(
+                    "s-wide",
+                    CanonicalAddressMatch::Zone("wide.zone".into()),
+                    RuleAction::Route,
+                ),
+                app_rule("s-many", "many.exe", RuleAction::Route),
+            ],
+        );
+        let denylist = std::collections::HashSet::new();
+        let current = generate_filters(CodegenInput {
+            sid,
+            rule_book: &rb,
+            behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &obs,
+            app_resolver: &resolver,
+            secondary_ip_denylist: &denylist,
+            zone_priority_over_ip: false,
+        });
+        let (_, report) = plan_route_rules(
+            &rb,
+            sid,
+            nrr_domain::RouteBehaviorMode::PreferPrimary,
+            &planner_input(&cache, &resolver, &obs),
+        );
+
+        let codegen_truncated: Vec<(String, String, usize)> = current
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                CodegenDiagnostic::SuffixTruncated {
+                    rule_id,
+                    suffix,
+                    cap,
+                } => Some((rule_id.clone(), suffix.clone(), *cap)),
+                _ => None,
+            })
+            .collect();
+        let codegen_over_capped: Vec<(String, usize, usize)> = current
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                CodegenDiagnostic::AppOverCapped {
+                    app, cap, resolved, ..
+                } => Some((app.clone(), *cap as usize, *resolved)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(report.truncated_suffixes, codegen_truncated);
+        assert_eq!(report.over_capped_apps, codegen_over_capped);
+        // Positive controls: both caps really fired in this fixture.
+        assert_eq!(
+            codegen_truncated,
+            vec![(
+                "s-wide".to_string(),
+                "wide.zone".to_string(),
+                SUFFIX_FANOUT_BACKSTOP
+            )]
+        );
+        assert_eq!(
+            codegen_over_capped,
+            vec![(
+                "many.exe".to_string(),
+                APP_PATH_FANOUT_CAP as usize,
+                APP_PATH_FANOUT_CAP as usize + 1
+            )]
+        );
+    }
+
+    // ── DoH/DoT lockdown on LINUX ───────────────────────────────────────────────
+    // Windows needs its own `lower_doh_dot_block` because WFP packs addresses
+    // into OR-condition slots; nftables has no such shape, so the lockdown
+    // lowers through the ordinary flow path. This test is what says so — the
+    // generic path was believed to swallow `DohBlock`, and nothing measured it.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_doh_lockdown_lowers_to_nftables_through_the_ordinary_flow_path() {
+        use nrr_platform_api::enforcement::EnforcementPlan;
+        use nrr_platform_linux::lower_linux::{lower_plan, EgressNames};
+        use nrr_platform_linux::nft_ir::{NftMatch, NftVerdict};
+
+        let principal = nrr_platform_api::enforcement::UserPrincipal::from_linux_uid(1000);
+        let sid = principal.as_stored().to_string();
+        let resolvers = [Ipv4Addr::new(8, 8, 8, 8), Ipv4Addr::new(77, 88, 8, 8)];
+        let plan = EnforcementPlan {
+            principal,
+            flows: plan_doh_dot_block(&sid, &resolvers, true),
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+        let lowered = lower_plan(
+            &plan,
+            &EgressNames {
+                primary: Some("eth0".into()),
+                secondary: Some("nrrtun0".into()),
+            },
+        );
+        assert!(
+            lowered.unsupported.is_empty(),
+            "no DoH flow may be reported unsupported: {:?}",
+            lowered.unsupported
+        );
+
+        // Every resolver is cut on 443 for both transports, and the global DoT
+        // port is cut for both — the same twelve verdicts the Windows codegen
+        // installs, expressed as ten nft rules (the two `Any:853` cuts carry no
+        // address).
+        let rules = &lowered.ruleset.rules;
+        for ip in resolvers {
+            for proto in [6u8, 17u8] {
+                assert!(
+                    rules.iter().any(|r| {
+                        r.verdict == NftVerdict::Drop
+                            && r.comment.starts_with("doh-block#")
+                            && r.matches.contains(&NftMatch::DstV4 {
+                                net: ip,
+                                prefix: 32,
+                            })
+                            && r.matches.contains(&NftMatch::Protocol(proto))
+                            && r.matches.contains(&NftMatch::DstPort(443))
+                    }),
+                    "no 443 drop for {ip} proto {proto} in {rules:#?}"
+                );
+            }
+        }
+        for proto in [6u8, 17u8] {
+            assert!(
+                rules.iter().any(|r| {
+                    r.verdict == NftVerdict::Drop
+                        && r.matches.contains(&NftMatch::Protocol(proto))
+                        && r.matches.contains(&NftMatch::DstPort(853))
+                        && !r
+                            .matches
+                            .iter()
+                            .any(|m| matches!(m, NftMatch::DstV4 { .. }))
+                }),
+                "the DoT cut must be global, not per-resolver: {rules:#?}"
+            );
+        }
     }
 
     // ── DoH/DoT lockdown EQUIVALENCE (Windows only) ─────────────────────────────
@@ -2074,6 +3034,7 @@ mod tests {
             secondary_luid: luid,
             bootstrap_server_ips: servers.to_vec(),
             local_subnets: local_subnets.to_vec(),
+            foreign_tunnel_luids: Vec::new(),
         };
 
         let check = |protos: KillSwitchProtocols, expected_len: usize| {
@@ -2226,7 +3187,7 @@ mod tests {
                 Ipv4Addr::new(203, 0, 113, 51),
             ];
             // Known-direct exemptions ride the same parity check.
-            let directs = [Ipv4Addr::new(178, 248, 237, 68)];
+            let directs = [Ipv4Addr::new(203, 0, 113, 68)];
             // The liveness-probe target (tunnel next-hop) rides the
             // same parity check as every other exemption.
             let probes = [Ipv4Addr::new(10, 91, 192, 1)];
@@ -2234,6 +3195,7 @@ mod tests {
                 let ex = FailClosedExemptions {
                     bootstrap_server_ips: servers.to_vec(),
                     local_subnets: subnets.to_vec(),
+                    foreign_tunnel_luids: Vec::new(),
                     primary_dest_ips: primaries.to_vec(),
                     allow_dns_over_primary: allow_dns,
                     known_direct_ips: directs.to_vec(),
@@ -2298,7 +3260,8 @@ mod tests {
                 sid,
                 RouteBehaviorMode::StrictSecondaryFailClosed,
                 &planner_input(&cache, &resolver, &obs),
-            ),
+            )
+            .0,
             routes: Vec::new(),
             policy_rules: Vec::new(),
         };
@@ -2310,8 +3273,12 @@ mod tests {
             current
                 .filters
                 .iter()
+                // Unconditional means NO destination at all — a packed
+                // filter carries its addresses in `remote_ip_set`, so checking
+                // the single field alone would count one as unconditional.
                 .filter(|f| f.action == WfpAction::Block
                     && f.remote_ip.is_none()
+                    && f.remote_ip_set.is_empty()
                     && f.remote_subnet.is_none())
                 .count(),
             1,
@@ -2438,6 +3405,7 @@ mod tests {
                         &apps,
                         &denylist,
                         crate::address_ownership::ZoneVsIpOrder::default(),
+                        &[],
                     );
                     let plan = EnforcementPlan {
                         principal: nrr_platform_api::enforcement::UserPrincipal::from_windows_sid(

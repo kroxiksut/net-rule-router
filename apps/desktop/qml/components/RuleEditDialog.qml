@@ -61,6 +61,32 @@ Dialog {
         }
         return root.ruleTypesModel.count > 0 ? root.ruleTypesModel.get(0).id : "exact-ip"
     }
+    // Prefill a NEW rule from elsewhere in the app (today: a row in the
+    // connection trace). Falls back to the dialog's own default type when the
+    // requested one is not offered on this platform, so the user still lands on
+    // a usable form instead of a blank one.
+    function resetForNew(ruleType, value) {
+        root.editingRule = -1
+        resetForEdit()
+        var wanted = String(ruleType || "")
+        for (var i = 0; i < root.ruleTypesModel.count; i += 1) {
+            if (root.ruleTypesModel.get(i).id === wanted) {
+                localRuleType = wanted
+                break
+            }
+        }
+        localValue = String(value || "")
+        // Same reason as resetForEdit: user input severs the bindings, so the
+        // visible widgets are assigned directly.
+        if (matchValueField) matchValueField.text = localValue
+        if (ruleTypeCombo) {
+            var idx = 0
+            for (var k = 0; k < root.ruleTypesModel.count; k += 1) {
+                if (root.ruleTypesModel.get(k).id === localRuleType) { idx = k; break }
+            }
+            ruleTypeCombo.currentIndex = idx
+        }
+    }
     function resetForEdit() {
         if (root.editingRule >= 0 && root.editingRule < root.rulesModel.count) {
             var r = root.rulesModel.get(root.editingRule)
@@ -105,9 +131,9 @@ Dialog {
             routeTargetCombo.currentIndex = rIdx
         }
     }
-    // Comment max length is also enforced by the rules-file parser via
-    // RulesFileEntry, the back-end validators and docs/en/rules-file-format.md. Keep these
-    // four numbers in sync if you ever change one.
+    // Copy of `nrr_domain::preset_validation::MAX_INLINE_COMMENT_CHARS`, which
+    // rejects a longer comment on import. QML cannot read Rust constants, so
+    // `core/domain/tests/inline_comment_limit.rs` holds this literal to it.
     readonly property int commentMaxLength: 200
 
     // Match-value placeholder + hint depend on rule type. For
@@ -418,6 +444,21 @@ Dialog {
             text: root.uiRevision >= 0
                 ? root.tr("rules.application-routing-note",
                     "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.")
+                : ""
+        }
+        // Where a per-application block is not leak-proof, say so next to the
+        // control that creates one — a user who blocks an app must not read
+        // the rule as a guarantee the platform cannot give.
+        Label {
+            Layout.fillWidth: true
+            visible: ruleDialog.localRuleType === "application"
+                && !root.supports("perAppBlockLeakproof")
+            wrapMode: Text.WordWrap
+            color: root.uiTheme.colorWarning
+            font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
+            text: root.uiRevision >= 0
+                ? root.tr("rules.application-not-leakproof",
+                    "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.")
                 : ""
         }
         // What this rule will actually cover, spelled out. A bare

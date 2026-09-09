@@ -153,6 +153,14 @@ impl AppPathResolver for PersistentAppPathResolver {
         // path) — fall back to the last-good on-disk survivors.
         self.load_survivors(name_or_glob)
     }
+
+    /// Straight through: this decorator remembers RESOLUTIONS, and an install
+    /// tree is read from the disk that either has it or does not. A decorator
+    /// that silently answered the port's empty default would disable the
+    /// exemption for every caller behind it.
+    fn sibling_executables(&self, exe: &std::path::Path) -> Vec<PathBuf> {
+        self.inner.sibling_executables(exe)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

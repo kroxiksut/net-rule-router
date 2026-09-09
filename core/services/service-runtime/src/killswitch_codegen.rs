@@ -109,6 +109,9 @@ pub struct KillSwitchResolution {
     pub bootstrap_server_ips: Vec<Ipv4Addr>,
     /// Primary interface's connected subnets to exempt (LAN/DHCP/local DNS).
     pub local_subnets: Vec<(Ipv4Addr, u8)>,
+    /// Tunnels the user runs beside ours — see
+    /// [`FailClosedExemptions::foreign_tunnel_luids`].
+    pub foreign_tunnel_luids: Vec<u64>,
 }
 
 /// The pseudo-`role` slug stamped into kill-switch filter ids so they
@@ -552,7 +555,7 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
 ///
 /// Patterns are OS-neutral case-insensitive globs (matched by the platform app
 /// resolver's `glob_match`). `*vpn*` covers most branded clients (NordVPN,
-/// ProtonVPN, ExpressVPN, hidemy.name VPN, …); the rest name clients that lack
+/// ProtonVPN, ExpressVPN, swiftvpn VPN, …); the rest name clients that lack
 /// "vpn" in their executable. This is neutral policy DATA co-located with the
 /// emitter — the OS-specific `.exe` handling lives in the Windows resolver.
 ///
@@ -575,7 +578,7 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
     "tunnelbear*",
     "windscribe*",
     "hide.me*",
-    "hidemy.name*",
+    "swiftvpn*",
     "amnezia*",
     "outline*",
     "warp-svc",
@@ -601,6 +604,58 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
 /// ALE connect layer only: `ALE_APP_ID` is not exposed at the packet layer, so a
 /// per-app ICMP exemption is not possible (VPN bootstrap is TCP/UDP, so this is
 /// sufficient). There is no `Block` half — this is a pure exemption.
+/// How many install-tree binaries the exemption is willing to admit in total,
+/// across every recognised client. A ceiling, not a target: one product ships a
+/// handful of executables, and a number this size only ever binds if something
+/// unexpected resolved as a client.
+pub const CLIENT_TREE_EXEMPT_CAP: usize = 24;
+
+/// The OTHER executables of each recognised tunnel client, so the exemption
+/// covers the process that actually performs the handshake.
+///
+/// A client is not one binary. `hidemy.name VPN 3.0.exe` is a window: its
+/// transports are `OpenVPN\openvpn.exe` and `XRay\ExternalBinaries\xray.exe`,
+/// each a separate process, and one of them — never the window — is what talks
+/// to the server. Exempting only the resolved binary is why a 2026-09-08 outage
+/// held: the user switched protocols for over an hour while every attempt ran
+/// from a process no permit named. The bounded Program-Files walk had not found
+/// the nested `openvpn.exe` either, and `xray.exe` matches no VPN pattern at
+/// all, so neither the resolver nor the drop-driven learner could ever have
+/// covered them.
+///
+/// `client_paths` must hold ONLY recognised clients — resolved built-in VPN
+/// patterns, the user-confirmed link provider, drop-verified clients. An
+/// ordinary primary-routed application must not reach here: the user routing
+/// their mail client to the main link is not a reason to exempt everything
+/// shipped beside it.
+///
+/// The residual hole is one product directory: a binary planted next to a
+/// confirmed client is exempt too. That is narrower than it looks — writing
+/// there already means being able to replace the client itself — but it is the
+/// reason this takes recognised clients rather than any resolved app.
+pub fn tunnel_client_tree_exempt_paths(
+    resolver: &dyn nrr_platform_api::AppPathResolver,
+    client_paths: &[String],
+) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = client_paths
+        .iter()
+        .map(|p| p.to_ascii_lowercase())
+        .collect();
+    let mut out = Vec::new();
+    for client in client_paths {
+        for sibling in resolver.sibling_executables(std::path::Path::new(client)) {
+            if out.len() >= CLIENT_TREE_EXEMPT_CAP {
+                return out;
+            }
+            let path = sibling.to_string_lossy().into_owned();
+            if seen.insert(path.to_ascii_lowercase()) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
 pub fn primary_app_exempt_filters(sid: &str, app_patterns: &[String]) -> Vec<WfpFilterSpec> {
     app_patterns
         .iter()
@@ -979,7 +1034,7 @@ pub struct FailClosedExemptions {
     /// matches no rule. Unlike [`Self::primary_dest_ips`] these have NO rule
     /// permit at the ALE layer, so under the block-all each earns BOTH an ALE
     /// exempt and a packet-layer permit — otherwise a plain primary-path site
-    /// (habr.com, HW-0721) dies with the tunnel it never used. The caller has
+    /// (an unruled direct destination) dies with the tunnel it never used. The caller has
     /// already subtracted anything secondary-destined.
     pub known_direct_ips: Vec<Ipv4Addr>,
     /// LUID of the tunnel, so traffic leaving THROUGH it survives a cut. `0`
@@ -987,6 +1042,19 @@ pub struct FailClosedExemptions {
     /// here rather than passed alongside because it answers the same question
     /// as every other field: what may still leave.
     pub secondary_luid: u64,
+    /// LUIDs of tunnels the USER runs that are none of our business — a
+    /// corporate VPN beside our own additional route.
+    ///
+    /// Traffic leaving through one of these is not a leak: it goes into
+    /// somebody else's encrypted tunnel, not out of the provider's door,
+    /// which is the thing this block-all exists to stop. Cutting it makes the
+    /// product the reason a working corporate connection dies, and the user
+    /// cannot tell our block from their VPN failing.
+    ///
+    /// Permitted by EGRESS, never by destination: exempting the tunnel's
+    /// address range instead would open that range on every link, including
+    /// the primary — the hole the kill-switch is for.
+    pub foreign_tunnel_luids: Vec<u64>,
     /// The secondary tunnel next-hop(s) the liveness probe pings. The probe's
     /// verdict is what DISARMS this very block-all, and its ICMP echo is
     /// kernel-originated — it carries no app-id, so no process exemption can
@@ -1114,6 +1182,16 @@ pub fn fail_closed_block_all_filters(
     let mut filters: Vec<WfpFilterSpec> = Vec::new();
     let mut weight = CATCHALL_EXEMPT_BASE;
 
+    // Somebody else's tunnel keeps carrying what it was carrying. See
+    // `FailClosedExemptions::foreign_tunnel_luids` for why this is not a hole:
+    // the permit is on the EGRESS interface, so it covers only packets that
+    // actually leave through that tunnel.
+    for luid in &exemptions.foreign_tunnel_luids {
+        if *luid != 0 && *luid != exemptions.secondary_luid {
+            filters.push(exempt_egress(sid, *luid, weight));
+            weight += 1;
+        }
+    }
     // ── ALE connect layer exemptions (TCP/UDP) ──
     filters.extend(base_ale_exemptions(
         sid,

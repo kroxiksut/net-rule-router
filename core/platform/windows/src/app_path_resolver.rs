@@ -1,7 +1,7 @@
 //! `AppPathResolver` platform port: exe name/glob → concrete paths.
 //!
 //! An `Application` rule names an executable by its file **name** or a filename
-//! **glob** (`2gis.exe`, `DiskO*.exe`, `vk.exe`). But the WFP `ALE_APP_ID`
+//! **glob** (`citymap.exe`, `DiskO*.exe`, `ab.exe`). But the WFP `ALE_APP_ID`
 //! condition keys on a real, on-disk **file path** (`FwpmGetAppIdFromFileName0`),
 //! not a name — so without a name→path bridge those rules are silently skipped.
 //! This port turns a name/glob into the set of concrete exe paths present on the
@@ -112,6 +112,15 @@ impl ResolveCache {
 // ── Production impl (Win32) ───────────────────────────────────────────────────
 
 #[cfg(target_os = "windows")]
+/// File name of the image behind `pid`, for diagnostics that name a process
+/// without exposing where it lives on disk.
+#[must_use]
+pub fn image_name_for_pid(pid: u32) -> Option<String> {
+    windows_impl::process_image_path(pid).and_then(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+    })
+}
 mod windows_impl {
     #![allow(unsafe_code)]
 
@@ -157,6 +166,17 @@ mod windows_impl {
     /// whichever ran first starve the other.
     const PACKAGED_WALK_MAX_FILES: u32 = 20_000;
 
+    /// Install-tree walk limits for `sibling_executables`.
+    ///
+    /// Depth 3 reaches the deepest transport a shipping client has actually
+    /// used (`XRay\ExternalBinaries\xray.exe` is two below the install root);
+    /// the file budget bounds a client that also ships an asset tree. The path
+    /// cap is what the exemption is willing to spend filters on — one product's
+    /// binaries, not a bundled toolchain.
+    const SIBLING_WALK_MAX_DEPTH: u32 = 3;
+    const SIBLING_WALK_MAX_FILES: u32 = 4000;
+    const SIBLING_MAX_PATHS: usize = 12;
+
     /// Windows [`AppPathResolver`]: unions three sources (App Paths registry,
     /// running-process images, Program Files walk), case-insensitively dedups,
     /// keeps only existing exe files, and caches the result briefly.
@@ -198,6 +218,100 @@ mod windows_impl {
             }
             self.cache.get_or_compute(&key, || resolve_uncached(&key))
         }
+
+        fn sibling_executables(&self, exe: &Path) -> Vec<PathBuf> {
+            let Some(dir) = install_dir_of(exe) else {
+                return Vec::new();
+            };
+            // Same cache, disjoint key space: a resolve key is a lowercased
+            // file name or glob and can never start with this prefix.
+            let key = format!("\u{1}tree:{}", dir.to_string_lossy().to_ascii_lowercase());
+            let exe_lower = exe.to_string_lossy().to_ascii_lowercase();
+            self.cache.get_or_compute(&key, || {
+                nrr_platform_api::app_path_resolver::executables_in_tree(
+                    &dir,
+                    SIBLING_WALK_MAX_DEPTH,
+                    SIBLING_WALK_MAX_FILES,
+                    &|path: &Path| {
+                        path.extension()
+                            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                    },
+                )
+                .into_iter()
+                .filter(|p| !p.to_string_lossy().eq_ignore_ascii_case(&exe_lower))
+                .take(SIBLING_MAX_PATHS)
+                .collect()
+            })
+        }
+    }
+
+    /// The directory an application was installed into, or `None` when that
+    /// directory is a place many unrelated programs share.
+    ///
+    /// The whole point of walking the directory is that everything in it
+    /// belongs to one product. `C:\Program Files` and `system32` fail that
+    /// test completely: expanding either would hand a kill-switch exemption to
+    /// every binary on the machine. A client installed directly into such a
+    /// root simply keeps the single-path behaviour.
+    fn install_dir_of(exe: &Path) -> Option<PathBuf> {
+        let dir = exe.parent()?;
+        // A drive root (`C:\`) — never expandable.
+        dir.parent()?;
+        let dir_lower = dir.to_string_lossy().to_ascii_lowercase();
+        (!shared_roots_lowercased().contains(&dir_lower)).then(|| dir.to_path_buf())
+    }
+
+    /// Install roots that hold many unrelated products. Compared whole, not by
+    /// prefix: a client's own folder INSIDE `Program Files` is exactly the case
+    /// this feature exists for.
+    fn shared_roots_lowercased() -> Vec<String> {
+        let mut roots: Vec<String> = Vec::new();
+        for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    roots.push(v.to_ascii_lowercase());
+                    roots.push(
+                        PathBuf::from(&v)
+                            .join("WindowsApps")
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                    );
+                    roots.push(
+                        PathBuf::from(&v)
+                            .join("Common Files")
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                    );
+                }
+            }
+        }
+        if let Ok(windir) = std::env::var("SystemRoot") {
+            if !windir.is_empty() {
+                roots.push(windir.to_ascii_lowercase());
+                for sub in ["System32", "SysWOW64"] {
+                    roots.push(
+                        PathBuf::from(&windir)
+                            .join(sub)
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                    );
+                }
+            }
+        }
+        for var in ["LocalAppData", "AppData", "ProgramData"] {
+            if let Ok(v) = std::env::var(var) {
+                if !v.is_empty() {
+                    roots.push(v.to_ascii_lowercase());
+                    roots.push(
+                        PathBuf::from(&v)
+                            .join("Programs")
+                            .to_string_lossy()
+                            .to_ascii_lowercase(),
+                    );
+                }
+            }
+        }
+        roots
     }
 
     /// Union all four sources for `key` (already trimmed + lowercased).
@@ -479,7 +593,7 @@ mod windows_impl {
 
     /// Resolve a PID to its full image path. `None` for PID 0, an exited
     /// process, or a protected PID `OpenProcess` cannot open (access denied).
-    fn process_image_path(pid: u32) -> Option<PathBuf> {
+    pub(super) fn process_image_path(pid: u32) -> Option<PathBuf> {
         if pid == 0 {
             return None;
         }
@@ -541,6 +655,20 @@ mod windows_impl {
                 break;
             }
             walk_dir_bounded(&root, query, FS_WALK_MAX_DEPTH, &mut budget, &mut out);
+        }
+        if budget == 0 {
+            // Same reason the Store walk says so: truncation must not look like
+            // absence. `found` is part of the message because a partial answer
+            // is its own failure — a client whose second and third transports
+            // live past the budget is exempted for one of the three, and that
+            // reads as a working exemption right up to the moment it is not.
+            tracing::warn!(
+                target: "nrr::app_path_resolver",
+                query,
+                files = FS_WALK_MAX_FILES,
+                found = out.len(),
+                "install-root search hit its file budget — an application may be missed, or found only in part, until it runs",
+            );
         }
         out
     }
@@ -657,6 +785,110 @@ mod windows_impl {
             let mut left = budget;
             walk_dir_bounded(root, query, depth, &mut left, &mut out);
             out
+        }
+
+        /// An exhausted budget is the ONLY thing that distinguishes "searched
+        /// and found nothing" from "stopped searching", and it is what both
+        /// install-root walks warn on. If a spent budget did not read as zero
+        /// here, neither warning could ever fire and truncation would go back
+        /// to looking exactly like absence.
+        #[test]
+        fn a_spent_budget_is_visible_to_the_caller_and_the_answer_is_partial() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            for i in 0..12 {
+                let d = root.join(format!("vendor{i}"));
+                std::fs::create_dir_all(&d).expect("mkdir");
+                std::fs::write(d.join("target.exe"), b"").expect("write");
+            }
+
+            let mut out = Vec::new();
+            let mut budget = 3_u32;
+            walk_dir_bounded(root, "target.exe", 4, &mut budget, &mut out);
+            assert_eq!(budget, 0, "the walk stopped because it ran out of budget");
+            assert!(
+                out.len() < 12,
+                "a truncated walk cannot have returned everything: {}",
+                out.len()
+            );
+
+            // The positive control: with room to finish, the same tree answers
+            // in full and leaves budget over — so the zero above means
+            // truncation and not simply "this is what a walk costs".
+            let mut out = Vec::new();
+            let mut budget = 500_u32;
+            walk_dir_bounded(root, "target.exe", 4, &mut budget, &mut out);
+            assert_eq!(out.len(), 12, "an unbounded-enough walk finds every copy");
+            assert!(budget > 0, "and it does not exhaust the budget");
+        }
+
+        /// The exemption expands ONE product's directory. Expanding a shared
+        /// install root would hand it every binary on the machine, so the
+        /// directory that holds many products is refused outright.
+        #[test]
+        fn a_products_own_directory_expands_and_a_shared_root_never_does() {
+            let program_files =
+                std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".to_string());
+
+            let own = PathBuf::from(&program_files).join("vendor vpn/vendor vpn.exe");
+            assert_eq!(
+                install_dir_of(&own).as_deref(),
+                Some(PathBuf::from(&program_files).join("vendor vpn").as_path()),
+                "a product folder inside Program Files is exactly the expandable case",
+            );
+
+            for shared in [
+                PathBuf::from(&program_files).join("loose.exe"),
+                PathBuf::from(&program_files).join("Common Files/loose.exe"),
+                PathBuf::from(&program_files).join("WindowsApps/loose.exe"),
+                PathBuf::from(r"C:\loose.exe"),
+            ] {
+                assert!(
+                    install_dir_of(&shared).is_none(),
+                    "{} must not expand",
+                    shared.display(),
+                );
+            }
+            if let Ok(windir) = std::env::var("SystemRoot") {
+                let system32 = PathBuf::from(&windir).join("System32/loose.exe");
+                assert!(
+                    install_dir_of(&system32).is_none(),
+                    "system32 must not expand"
+                );
+            }
+        }
+
+        /// A client's transports live in subdirectories; the resolved binary
+        /// itself is not repeated (its permit already exists, and filter ids
+        /// are path-derived, so a repeat is a duplicate filter).
+        #[test]
+        fn sibling_executables_finds_nested_transports_and_omits_the_binary_itself() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path();
+            std::fs::write(root.join("client.exe"), b"").expect("write");
+            std::fs::create_dir_all(root.join("OpenVPN")).expect("mkdir");
+            std::fs::write(root.join("OpenVPN/openvpn.exe"), b"").expect("write");
+            std::fs::create_dir_all(root.join("XRay/ExternalBinaries")).expect("mkdir");
+            std::fs::write(root.join("XRay/ExternalBinaries/xray.exe"), b"").expect("write");
+            std::fs::write(root.join("readme.txt"), b"").expect("write");
+
+            let resolver = WindowsAppPathResolver::new();
+            let found = resolver.sibling_executables(&root.join("client.exe"));
+            let names: Vec<String> = found
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .collect();
+
+            assert!(names.iter().any(|n| n == "openvpn.exe"), "{names:?}");
+            assert!(names.iter().any(|n| n == "xray.exe"), "{names:?}");
+            assert!(
+                !names.iter().any(|n| n == "client.exe"),
+                "the binary we started from is already exempt: {names:?}",
+            );
+            assert!(
+                !names.iter().any(|n| n.ends_with(".txt")),
+                "only executables: {names:?}",
+            );
         }
 
         #[test]
@@ -789,19 +1021,19 @@ mod tests {
         };
 
         let t0 = Instant::now();
-        let first = cache.get_or_compute_at("vk.exe", t0, || compute("a"));
+        let first = cache.get_or_compute_at("ab.exe", t0, || compute("a"));
         assert_eq!(first, vec![p("a")]);
         assert_eq!(calls.get(), 1);
 
         // Within TTL → cached; the (different) closure must NOT run.
         let within =
-            cache.get_or_compute_at("vk.exe", t0 + Duration::from_secs(5), || compute("b"));
+            cache.get_or_compute_at("ab.exe", t0 + Duration::from_secs(5), || compute("b"));
         assert_eq!(within, vec![p("a")], "served from cache");
         assert_eq!(calls.get(), 1, "compute not re-invoked within TTL");
 
         // After TTL → recompute, new value cached.
         let after =
-            cache.get_or_compute_at("vk.exe", t0 + Duration::from_secs(31), || compute("c"));
+            cache.get_or_compute_at("ab.exe", t0 + Duration::from_secs(31), || compute("c"));
         assert_eq!(after, vec![p("c")]);
         assert_eq!(calls.get(), 2, "compute re-invoked after TTL expiry");
     }

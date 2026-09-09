@@ -78,6 +78,13 @@ impl AppPathResolver for ConfirmedClientAppPathResolver {
         }
         fallback
     }
+
+    /// Straight through — see the note on the persistence decorator: a
+    /// decorator that does not forward this turns the whole install-tree
+    /// exemption off for everyone behind it.
+    fn sibling_executables(&self, exe: &Path) -> Vec<PathBuf> {
+        self.inner.sibling_executables(exe)
+    }
 }
 
 #[cfg(test)]
@@ -122,7 +129,7 @@ mod tests {
         // The whole point: nothing is running, nothing was ever persisted, and
         // the exe is not on a searched path — only the user's confirmation.
         let dir = tempfile::tempdir().expect("temp dir");
-        let exe = touch(&dir, "hidemy.name VPN 3.0.exe");
+        let exe = touch(&dir, "SwiftVPN 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[exe.to_string_lossy().into_owned()]);
         let resolver = ConfirmedClientAppPathResolver::new(
@@ -131,10 +138,7 @@ mod tests {
         );
 
         // The user's own app rule, spelled exactly as in the rule book…
-        assert_eq!(
-            resolver.resolve("hidemy.name VPN 3.0.exe"),
-            vec![exe.clone()],
-        );
+        assert_eq!(resolver.resolve("SwiftVPN 3.0.exe"), vec![exe.clone()],);
         // …and the built-in kill-switch exemption glob.
         assert_eq!(resolver.resolve("*vpn*"), vec![exe]);
     }
@@ -142,7 +146,7 @@ mod tests {
     #[test]
     fn an_unconfirmed_pattern_still_resolves_to_nothing() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let _exe = touch(&dir, "hidemy.name VPN 3.0.exe");
+        let _exe = touch(&dir, "SwiftVPN 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
         confirmed.publish("S-1-5-21-1", &[_exe.to_string_lossy().into_owned()]);
         let resolver =

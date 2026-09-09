@@ -16,7 +16,7 @@
 //! avoids caching every site the user visits).
 
 use crate::bounded_set::BoundedRecentSet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -142,6 +142,11 @@ pub struct DnsObservationConsumer {
     /// Hosts already dropped from the shared-IP census this process lifetime,
     /// so the purge runs once per host rather than on every observe tick.
     census_purged: Mutex<BoundedRecentSet<String>>,
+    /// Where the names of RULE-LESS hosts are remembered, so the connection
+    /// observer can name a destination that fails on the main link. The
+    /// observations this consumer discards are exactly the ones that index
+    /// needs. `None` (default) leaves it unfed.
+    observed_names: Option<Arc<crate::observed_host_names::ObservedHostNames>>,
 }
 
 /// How long a reverse-confirmed `(hostname, ip)` pair suppresses identical
@@ -173,7 +178,20 @@ impl DnsObservationConsumer {
             reverse_confirm_memo: Mutex::new(HashMap::new()),
             auto_rules: None,
             census_purged: Mutex::new(BoundedRecentSet::new(WARNED_HOSTS_CAP)),
+            observed_names: None,
         }
+    }
+
+    /// Inject the index of names for rule-less hosts (see the field doc).
+    /// Builder-style; without it nothing is recorded and `consume` behaves
+    /// exactly as before.
+    #[must_use]
+    pub fn with_observed_host_names(
+        mut self,
+        index: Arc<crate::observed_host_names::ObservedHostNames>,
+    ) -> Self {
+        self.observed_names = Some(index);
+        self
     }
 
     ///  — inject the companion-domain learner so this consumer's
@@ -273,6 +291,13 @@ impl DnsObservationConsumer {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // Both address-less cases below are steady states, not events: under
+        // Mode B every rule host is answered from our own pool on every
+        // resolution, and a hosts-file pin never stops being pinned. One line
+        // each per observation made them 10% of a verbose session, so the drain
+        // counts them and says it once at the end.
+        let mut fake_intercepted: BTreeSet<&str> = BTreeSet::new();
+        let mut loopback_pinned: BTreeSet<&str> = BTreeSet::new();
         for (index, obs) in observations.iter().enumerate() {
             if obs.ipv4s.is_empty() {
                 continue;
@@ -281,7 +306,7 @@ impl DnsObservationConsumer {
             // else touches this observation. An ad-blocking hosts file pins
             // ad/tracker domains to 127.0.0.1 / 0.0.0.0; such a mapping must
             // never enter the FQDN cache, become a /32 route, or be flagged
-            // as collateral (real logs: `musical.ly → 127.0.0.1`). If nothing
+            // as collateral (real logs: `app.example → 127.0.0.1`). If nothing
             // routable remains the ADDRESS is inert; whether the observation
             // itself still means something is decided just below.
             let routable: Vec<Ipv4Addr> = obs
@@ -322,19 +347,23 @@ impl DnsObservationConsumer {
                             ),
                         );
                     }
-                    tracing::debug!(
-                        target: "nrr::dns-observe",
-                        hostname = %obs.hostname,
-                        "observed hostname answered from our own fake-IP pool (Mode B interception) — no real address to cache or route",
-                    );
+                    fake_intercepted.insert(obs.hostname.as_str());
                 } else {
-                    tracing::debug!(
-                        target: "nrr::dns-observe",
-                        hostname = %obs.hostname,
-                        "observed hostname pinned to loopback/unspecified (hosts file?) — not cached or routed",
-                    );
+                    loopback_pinned.insert(obs.hostname.as_str());
                 }
                 continue;
+            }
+            // The main link answered, and nothing in the answer can be
+            // reached — a filtering provider standing a placeholder in for the
+            // site. That is not a companion signal (nobody pulled this host);
+            // it is the host saying the main link cannot carry it, which is
+            // exactly the case the user otherwise has to diagnose and add by
+            // hand. The engine applies its own exclusions, and the main-link
+            // probe still gets to disagree before the user is asked.
+            if crate::dns_address_sanity::is_provider_placeholder_answer(&obs.ipv4s) {
+                if let Some(engine) = self.auto_rules.as_ref() {
+                    engine.note_placeholder_answer_host(&sid, &obs.hostname, now);
+                }
             }
             let secondary = rule_set_match_origin(&obs.hostname, &snapshot.rule_book.secondary);
             let primary = rule_set_match_origin(&obs.hostname, &snapshot.rule_book.primary);
@@ -366,6 +395,12 @@ impl DnsObservationConsumer {
                 );
             } else {
                 summary.ignored = summary.ignored.saturating_add(1);
+                // Discarded from the CACHE, kept as a name. An address
+                // no rule covers still needs a name the moment its
+                // connections start failing on the main link.
+                if let Some(names) = self.observed_names.as_ref() {
+                    names.record(&obs.hostname, &routable);
+                }
             }
             // Collateral: a host that should egress the PRIMARY link (matches
             // a primary rule, or no rule at all) yet resolves to an IP a
@@ -447,6 +482,22 @@ impl DnsObservationConsumer {
                     }
                 }
             }
+        }
+        if !fake_intercepted.is_empty() {
+            tracing::debug!(
+                target: "nrr::dns-observe",
+                hosts = %name_sample(&fake_intercepted),
+                distinct = fake_intercepted.len(),
+                "observations answered from our own fake-IP pool (Mode B interception) — no real address to cache or route",
+            );
+        }
+        if !loopback_pinned.is_empty() {
+            tracing::debug!(
+                target: "nrr::dns-observe",
+                hosts = %name_sample(&loopback_pinned),
+                distinct = loopback_pinned.len(),
+                "observations pinned to loopback/unspecified (hosts file?) — not cached or routed",
+            );
         }
         summary
     }
@@ -713,8 +764,8 @@ impl DnsObservationConsumer {
         // subject — it just arrived by reverse lookup instead of by watching a
         // query. Without this the census can only learn from resolutions we
         // saw, so a browser on DoH keeps the address pinned and keeps getting
-        // blocked: exactly the "google.com is in my primary rules and still
-        // will not open" report. A suffix rule (`*.google.com`) has no address
+        // blocked: exactly the "search.example is in my primary rules and still
+        // will not open" report. A suffix rule (`*.search.example`) has no address
         // of its own to seed, which is why the drop is the only evidence there
         // will ever be.
         if in_primary && !in_secondary {
@@ -974,6 +1025,22 @@ pub(crate) fn rule_set_match_kind(
     best.map(|(_, kind)| kind)
 }
 
+/// A few names plus how many were left out — enough to recognise what a batch
+/// was about without printing a hundred hostnames.
+fn name_sample(names: &BTreeSet<&str>) -> String {
+    const SHOWN: usize = 5;
+    let head = names
+        .iter()
+        .take(SHOWN)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().checked_sub(SHOWN) {
+        Some(rest) if rest > 0 => format!("{head} (+{rest} more)"),
+        _ => head,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1227,48 @@ mod tests {
         SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms)
     }
 
+    /// The case the user had to diagnose by hand: a site the provider answers
+    /// with an address nothing lives at. Nobody pulled it, so the companion
+    /// path never proposes it — the host has to be able to make the offer
+    /// itself.
+    #[test]
+    fn a_site_answered_with_a_placeholder_offers_itself_for_the_tunnel() {
+        let (cache, lookup) = in_memory_cache();
+        let (c, engine) = consumer_with_learning(
+            vec![exact_fqdn_rule("r1", "site.example")],
+            Arc::clone(&cache),
+            Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        );
+
+        // Documentation space: a resolver standing something in for the name.
+        c.consume(&[obs("journal.example", [192, 0, 2, 1])], at_ms(0));
+
+        let candidates = engine.candidates("S-A");
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].anchor, "journal.example");
+        assert_eq!(candidates[0].proposed_match, "journal.example");
+        assert_eq!(
+            candidates[0].signal,
+            nrr_shared::ipc_payloads::AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
+        );
+    }
+
+    /// Positive control for the line between the two: a hosts-file pin looks
+    /// just as unusable and must never be offered — the user asked for it.
+    #[test]
+    fn a_hosts_file_pin_is_never_offered_for_the_tunnel() {
+        let (cache, lookup) = in_memory_cache();
+        let (c, engine) = consumer_with_learning(
+            vec![exact_fqdn_rule("r1", "site.example")],
+            Arc::clone(&cache),
+            Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
+        );
+
+        c.consume(&[obs("ads.example", [127, 0, 0, 1])], at_ms(0));
+
+        assert!(engine.candidates("S-A").is_empty());
+    }
+
     #[test]
     fn fake_pool_answers_still_anchor_companion_learning() {
         // Under Mode B our own resolver answers every rule host with a fake-pool
@@ -1179,7 +1288,7 @@ mod tests {
             let sum = c.consume(
                 &[
                     obs("site.example", [198, 18, 0, 7]),
-                    obs("cdn.example", [93, 184, 216, 34]),
+                    obs("cdn.example", [23, 10, 20, 138]),
                 ],
                 at_ms(visit),
             );
@@ -1221,7 +1330,7 @@ mod tests {
                 &[
                     obs("site.example", [127, 0, 0, 1]),
                     obs("other.example", [0, 0, 0, 0]),
-                    obs("cdn.example", [93, 184, 216, 34]),
+                    obs("cdn.example", [23, 10, 20, 138]),
                 ],
                 at_ms(visit),
             );
@@ -1250,14 +1359,14 @@ mod tests {
         // cdn-17.example.com is an unknowable subdomain — only observation
         // reveals it. It matches `*.example.com`.
         let sum = c.consume(
-            &[obs("cdn-17.example.com", [93, 184, 216, 34])],
+            &[obs("cdn-17.example.com", [23, 10, 20, 138])],
             SystemTime::now(),
         );
         assert_eq!(sum.matched, 1);
         assert!(sum.made_progress());
         assert_eq!(
             lookup.ips_for_hostname("cdn-17.example.com"),
-            vec![Ipv4Addr::new(93, 184, 216, 34)]
+            vec![Ipv4Addr::new(23, 10, 20, 138)]
         );
         // And the suffix fan-out now finds it.
         assert_eq!(
@@ -1272,25 +1381,25 @@ mod tests {
         let (cache, lookup) = in_memory_cache();
         let reader = Arc::new(MockDnsCacheRead::new());
         reader.set_entries(vec![
-            // Matches the `.ru` zone rule → seeded.
+            // Matches the `.example` zone rule → seeded.
             OsCachedResolution {
-                canonical_hostname: "avito.ru".into(),
+                canonical_hostname: "shop.example".into(),
                 addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
             },
             // No rule → ignored.
             OsCachedResolution {
-                canonical_hostname: "google.com".into(),
+                canonical_hostname: "other.test".into(),
                 addresses: vec![Ipv4Addr::new(8, 8, 8, 8)],
             },
             // Matches the zone name but is an ad-block loopback pin → dropped
             // before it can become a /32 (mirrors the observe path).
             OsCachedResolution {
-                canonical_hostname: "ads.ru".into(),
+                canonical_hostname: "ads.example".into(),
                 addresses: vec![Ipv4Addr::new(127, 0, 0, 1)],
             },
         ]);
         let c = consumer(
-            vec![zone_rule("r1", "ru")],
+            vec![zone_rule("r1", "example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
@@ -1300,22 +1409,22 @@ mod tests {
         let sum = c.seed_from_os_cache(SystemTime::now());
         assert_eq!(
             sum.matched, 1,
-            "only avito.ru is a rule match with a routable IP"
+            "only shop.example is a rule match with a routable IP"
         );
-        assert_eq!(sum.ignored, 1, "google.com matched no rule");
+        assert_eq!(sum.ignored, 1, "other.test matched no rule");
         assert_eq!(
-            lookup.ips_for_hostname("avito.ru"),
+            lookup.ips_for_hostname("shop.example"),
             vec![Ipv4Addr::new(1, 2, 3, 4)]
         );
-        assert!(lookup.ips_for_hostname("google.com").is_empty());
+        assert!(lookup.ips_for_hostname("other.test").is_empty());
         assert!(
-            lookup.ips_for_hostname("ads.ru").is_empty(),
+            lookup.ips_for_hostname("ads.example").is_empty(),
             "loopback pin must never enter the cache"
         );
         // The zone fan-out now sees the seeded host.
         assert_eq!(
-            lookup.hostnames_under_suffix("ru", 16),
-            vec!["avito.ru".to_string()]
+            lookup.hostnames_under_suffix("example", 16),
+            vec!["shop.example".to_string()]
         );
     }
 
@@ -1382,11 +1491,11 @@ mod tests {
         let (cache, lookup) = in_memory_cache();
         let reader = Arc::new(MockDnsCacheRead::new());
         reader.set_entries(vec![OsCachedResolution {
-            canonical_hostname: "avito.ru".into(),
+            canonical_hostname: "shop.example".into(),
             addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
         }]);
         let c = consumer(
-            vec![zone_rule("r1", "ru")],
+            vec![zone_rule("r1", "example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
@@ -1545,15 +1654,15 @@ mod tests {
     /// A host a MAIN-route rule claims keeps its census seat however wide that
     /// rule is, and is marked as main-route-claimed. Dropping it — the "narrower
     /// claim wins" posture — re-pinned the Google front-end addresses shared by
-    /// `*.google.com` and a named `aistudio.google.com`, and search died in
+    /// `*.search.example` and a named `aistudio.search.example`, and search died in
     /// every browser: the pin cannot divert a host the user routed the other
     /// way, it can only cut it.
     #[test]
     fn a_host_claimed_by_a_wide_main_route_rule_stays_a_census_tenant() {
         let (cache, lookup) = in_memory_cache();
         let c = consumer_with_primary(
-            vec![suffix_rule("p1", "google.com")],
-            vec![exact_fqdn_rule("s1", "aistudio.google.com")],
+            vec![suffix_rule("p1", "search.example")],
+            vec![exact_fqdn_rule("s1", "aistudio.search.example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
@@ -1561,7 +1670,7 @@ mod tests {
         // The named secondary rule resolves → the address is secondary-owned.
         assert_eq!(
             c.consume(
-                &[obs("aistudio.google.com", [9, 9, 9, 9])],
+                &[obs("aistudio.search.example", [9, 9, 9, 9])],
                 SystemTime::now()
             )
             .matched,
@@ -1569,7 +1678,7 @@ mod tests {
         );
         // A neighbour on the same address, held only by the wide primary rule.
         c.consume(
-            &[obs("workspace.google.com", [9, 9, 9, 9])],
+            &[obs("workspace.search.example", [9, 9, 9, 9])],
             SystemTime::now(),
         );
         let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -1598,13 +1707,13 @@ mod tests {
         let (cache, lookup) = in_memory_cache();
         let c = consumer_with_primary(
             Vec::new(),
-            vec![exact_fqdn_rule("s1", "chatgpt.com")],
+            vec![exact_fqdn_rule("s1", "assistant.example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
         );
         assert_eq!(
-            c.consume(&[obs("chatgpt.com", [9, 9, 9, 9])], SystemTime::now())
+            c.consume(&[obs("assistant.example", [9, 9, 9, 9])], SystemTime::now())
                 .matched,
             1
         );
@@ -1631,13 +1740,13 @@ mod tests {
         let (cache, lookup) = in_memory_cache();
         let c = consumer_with_primary(
             Vec::new(),
-            vec![exact_fqdn_rule("s1", "chatgpt.com")],
+            vec![exact_fqdn_rule("s1", "assistant.example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
         );
         assert_eq!(
-            c.consume(&[obs("chatgpt.com", [9, 9, 9, 9])], SystemTime::now())
+            c.consume(&[obs("assistant.example", [9, 9, 9, 9])], SystemTime::now())
                 .matched,
             1
         );
@@ -1660,22 +1769,22 @@ mod tests {
     fn a_neighbour_claimed_as_narrowly_stays_a_census_tenant() {
         let (cache, lookup) = in_memory_cache();
         let c = consumer_with_primary(
-            vec![exact_fqdn_rule("p1", "workspace.google.com")],
-            vec![exact_fqdn_rule("s1", "aistudio.google.com")],
+            vec![exact_fqdn_rule("p1", "workspace.search.example")],
+            vec![exact_fqdn_rule("s1", "aistudio.search.example")],
             Arc::clone(&cache),
             Arc::clone(&lookup) as Arc<dyn FqdnCacheLookup>,
             active_sid("S-A"),
         );
         assert_eq!(
             c.consume(
-                &[obs("aistudio.google.com", [9, 9, 9, 9])],
+                &[obs("aistudio.search.example", [9, 9, 9, 9])],
                 SystemTime::now()
             )
             .matched,
             1
         );
         c.consume(
-            &[obs("workspace.google.com", [9, 9, 9, 9])],
+            &[obs("workspace.search.example", [9, 9, 9, 9])],
             SystemTime::now(),
         );
         let guard = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -1736,12 +1845,12 @@ mod tests {
         assert_eq!(s1.collateral, 0);
         assert!(lookup.ips_for_hostname("ad.example.com").is_empty());
 
-        // The classic `musical.ly → 127.0.0.1` case: a direct (unmatched)
+        // The classic `app.example → 127.0.0.1` case: a direct (unmatched)
         // host pinned to loopback must never be cached nor flagged collateral.
-        let s2 = c.consume(&[obs("musical.ly", [127, 0, 0, 1])], SystemTime::now());
+        let s2 = c.consume(&[obs("app.example", [127, 0, 0, 1])], SystemTime::now());
         assert_eq!(s2.matched, 0);
         assert_eq!(s2.collateral, 0);
-        assert!(lookup.ips_for_hostname("musical.ly").is_empty());
+        assert!(lookup.ips_for_hostname("app.example").is_empty());
 
         // Unspecified (0.0.0.0) is treated identically.
         let s3 = c.consume(
@@ -1764,5 +1873,20 @@ mod tests {
             lookup.ips_for_hostname("mix.example.com"),
             vec![Ipv4Addr::new(8, 8, 4, 4)]
         );
+    }
+
+    /// The summary has to stay readable when a busy drain touches dozens of
+    /// names, and still name enough of them to be recognisable.
+    #[test]
+    fn a_name_sample_shows_a_few_names_and_counts_the_rest() {
+        let few: BTreeSet<&str> = ["b.test", "a.test"].into_iter().collect();
+        assert_eq!(
+            name_sample(&few),
+            "a.test, b.test",
+            "sorted, nothing elided"
+        );
+
+        let many: BTreeSet<&str> = ["a", "b", "c", "d", "e", "f", "g"].into_iter().collect();
+        assert_eq!(name_sample(&many), "a, b, c, d, e (+2 more)");
     }
 }

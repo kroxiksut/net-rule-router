@@ -263,7 +263,7 @@ mod tests {
     fn the_port_rule_does_not_quieten_anything_else() {
         for (addr, port) in [
             ("8.8.8.8", 5353),       // public resolver, not our segment
-            ("93.184.216.34", 137),  // public host on a discovery port
+            ("23.10.20.138", 137),   // public host on a discovery port
             ("192.168.1.10", 443),   // private host, ordinary traffic
             ("192.168.1.255", 6771), // BitTorrent LPD — deliberately not ours
             ("100.64.0.1", 5353),    // CGNAT is not a private network

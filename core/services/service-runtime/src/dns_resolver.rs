@@ -316,8 +316,8 @@ pub trait FactSink: Send + Sync {
 /// listener steers DIRECT-host answers with it: an upstream answer for a
 /// non-rule host is filtered so the client never gets an address the
 /// kill-switch pins to the secondary — the DNS-level cure for the shared-CDN
-/// collateral (0719: www.google.com handed the same front-end IPs as
-/// gemini/youtube secondary rules). Production memoizes over the rule book ×
+/// collateral (0719: www.search.example handed the same front-end IPs as
+/// gemini/video-site secondary rules). Production memoizes over the rule book ×
 /// FQDN cache; the default empty set disables steering.
 pub trait SecondaryOwnedIps: Send + Sync {
     /// Handed out behind an `Arc`: the production impl memoizes one set and
@@ -340,7 +340,7 @@ impl SecondaryOwnedIps for NoopSecondaryOwnedIps {
 /// addresses as known-direct and drives a bounded reconcile so the exemption
 /// is installed BEFORE the client receives the answer — otherwise the app's
 /// first connect races the catch-all and is dropped with no retry (the ALE
-/// deny is instant; the habr.com case). Must be a fast no-op while the
+/// deny is instant; the observed first-contact drop). Must be a fast no-op while the
 /// block-all is not armed: this sits on the hot path of every direct `A`
 /// answer in Mode B.
 pub trait DirectAnswerGate: Send + Sync {
@@ -551,8 +551,8 @@ fn origin_suffix(host: &str) -> &str {
 
 /// Do two hostnames plausibly belong to one origin? True when they are equal,
 /// one is a subdomain of the other, or both end in the same two labels — enough
-/// to keep an ordinary shared front end (`static.whatsapp.net` /
-/// `crashlogs.whatsapp.net`) from being reported as a cross-host collision.
+/// to keep an ordinary shared front end (`static.chatapp.test` /
+/// `crashlogs.chatapp.test`) from being reported as a cross-host collision.
 /// Pure.
 pub(crate) fn hosts_share_origin(a: &str, b: &str) -> bool {
     let a = a.trim_end_matches('.').to_ascii_lowercase();
@@ -941,13 +941,13 @@ mod tests {
 
     #[test]
     fn shared_origin_covers_subdomains_and_a_common_registrable_tail() {
-        assert!(hosts_share_origin("signal.me", "signal.me."));
-        assert!(hosts_share_origin("web.whatsapp.com", "whatsapp.com"));
+        assert!(hosts_share_origin("secure.example", "secure.example."));
+        assert!(hosts_share_origin("web.chatapp.example", "chatapp.example"));
         assert!(hosts_share_origin(
-            "static.whatsapp.net",
-            "crashlogs.whatsapp.net"
+            "static.chatapp.test",
+            "crashlogs.chatapp.test"
         ));
-        assert!(!hosts_share_origin("chatgpt.com", "signal.me"));
+        assert!(!hosts_share_origin("assistant.example", "secure.example"));
         assert!(!hosts_share_origin("a.example.com", "a.example.net"));
     }
 
@@ -1010,7 +1010,7 @@ mod tests {
             },
             &oracle(&[]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(93, 184, 216, 34)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(
             out,
             QueryOutcome::Answer {
-                ips: vec![ip(93, 184, 216, 34)],
+                ips: vec![ip(23, 10, 20, 138)],
                 enforced: false,
             }
         );
@@ -1083,22 +1083,22 @@ mod tests {
         }
     }
 
-    /// The observed provider placeholder: one address pair, every octet ending
-    /// in `.0`, handed out for any filtered name. Second-source confirmation
-    /// upstream of the handler already failed, so nothing about it may reach
-    /// enforcement — no cache fact, no reconcile, `enforced: false`. The client
-    /// still gets the answer: the name is blocked either way.
+    /// A resolver standing documentation space in for a name it will not
+    /// carry. Second-source confirmation upstream of the handler already
+    /// failed, so nothing about it may reach enforcement — no cache fact, no
+    /// reconcile, `enforced: false`. The client still gets the answer: the name
+    /// is blocked either way.
     #[test]
     fn a_placeholder_only_answer_is_never_pinned() {
         let log = CallLog::default();
-        let stub = [ip(8, 47, 69, 0), ip(8, 6, 112, 0)];
+        let stub = [ip(192, 0, 2, 1), ip(203, 0, 113, 7)];
         let out = handle_a_query(
-            "signal.me",
+            "secure.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["signal.me"]),
+            &oracle(&["secure.example"]),
             &FakeUpstream {
                 answer: Ok(resolved(&stub)),
             },
@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn an_unusable_address_beside_a_real_one_is_dropped_and_the_host_stays_enforced() {
         let log = CallLog::default();
-        let real = ip(142, 250, 74, 78);
+        let real = ip(23, 10, 20, 78);
         let out = handle_a_query(
             "rule.example",
             AnswerHold {
@@ -1144,7 +1144,7 @@ mod tests {
             },
             &oracle(&["rule.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(169, 254, 3, 4), real, ip(9, 9, 9, 0)])),
+                answer: Ok(resolved(&[ip(169, 254, 3, 4), real, ip(198, 51, 100, 9)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1218,14 +1218,14 @@ mod tests {
     #[test]
     fn fast_answers_skips_the_hold_when_every_answered_address_is_enforced() {
         let log = CallLog::default();
-        let addr = ip(172, 64, 155, 209);
+        let addr = ip(23, 10, 20, 159);
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: true,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
                 answer: Ok(resolved(&[addr])),
             },
@@ -1257,14 +1257,14 @@ mod tests {
         // name ever resolved to, so a rotated CDN address read as covered and
         // the answer went out ahead of its enforcement. Cached is not enforced.
         let log = CallLog::default();
-        let addr = ip(172, 64, 154, 50);
+        let addr = ip(23, 10, 20, 158);
         let out = handle_a_query(
-            "static.licdn.com",
+            "static.proflcdn.test",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: true,
             },
-            &oracle(&["static.licdn.com"]),
+            &oracle(&["static.proflcdn.test"]),
             &FakeUpstream {
                 answer: Ok(resolved(&[addr])),
             },
@@ -1298,14 +1298,14 @@ mod tests {
         // installs nothing and only spends the budget. Answer, say so, and let
         // the learn-from-drops path recover the first connect.
         let log = CallLog::default();
-        let addr = ip(172, 64, 154, 50);
+        let addr = ip(23, 10, 20, 158);
         let out = handle_a_query(
-            "static.licdn.com",
+            "static.proflcdn.test",
             AnswerHold {
                 deadline: Duration::from_millis(900),
                 fast_answers: true,
             },
-            &oracle(&["static.licdn.com"]),
+            &oracle(&["static.proflcdn.test"]),
             &FakeUpstream {
                 answer: Ok(resolved(&[addr])),
             },
@@ -1332,14 +1332,14 @@ mod tests {
     fn fast_answers_still_holds_on_first_contact_with_a_new_address() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: true,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(172, 64, 155, 209)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
             },
             // Cache is empty → the answer introduces a never-seen address and
             // the first connect could race the install: hold as before.
@@ -1355,7 +1355,7 @@ mod tests {
         assert_eq!(
             out,
             QueryOutcome::Answer {
-                ips: vec![ip(172, 64, 155, 209)],
+                ips: vec![ip(23, 10, 20, 159)],
                 enforced: true,
             }
         );
@@ -1365,14 +1365,14 @@ mod tests {
     #[test]
     fn fast_answers_off_awaits_the_reconcile_even_for_cached_addresses() {
         let log = CallLog::default();
-        let addr = ip(172, 64, 155, 209);
+        let addr = ip(23, 10, 20, 159);
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
                 answer: Ok(resolved(&[addr])),
             },
@@ -1402,14 +1402,14 @@ mod tests {
     fn rule_host_records_then_reconciles_before_answering() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(172, 64, 155, 209)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1423,7 +1423,7 @@ mod tests {
         assert_eq!(
             out,
             QueryOutcome::Answer {
-                ips: vec![ip(172, 64, 155, 209)],
+                ips: vec![ip(23, 10, 20, 159)],
                 enforced: true,
             }
         );
@@ -1437,14 +1437,14 @@ mod tests {
     fn rule_host_answers_but_unenforced_when_deadline_exceeded() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(172, 64, 155, 209)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1460,7 +1460,7 @@ mod tests {
         assert_eq!(
             out,
             QueryOutcome::Answer {
-                ips: vec![ip(172, 64, 155, 209)],
+                ips: vec![ip(23, 10, 20, 159)],
                 enforced: false,
             }
         );
@@ -1470,19 +1470,19 @@ mod tests {
     /// The same missed deadline, but with the guard blocking a link it could
     /// not resolve: nothing has a filter for these addresses, so handing them
     /// over sends the caller out the main link — the leak the guard exists to
-    /// prevent (the chatgpt.com case, HW-0830).
+    /// prevent (the assistant.example case, HW-0830).
     #[test]
     fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_the_deadline() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(172, 64, 155, 209)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 159)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1505,14 +1505,14 @@ mod tests {
     #[test]
     fn deferred_answer_is_not_withheld_while_the_guard_is_blocking() {
         let log = CallLog::default();
-        let cached = ip(172, 64, 155, 209);
+        let cached = ip(23, 10, 20, 159);
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: true,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
                 answer: Ok(resolved(&[cached])),
             },
@@ -1577,14 +1577,14 @@ mod tests {
         // Seven upstream addresses → the answer (and the recorded fact) must
         // carry only MAX_RULE_ANSWER_IPS of them.
         let log = CallLog::default();
-        let many: Vec<Ipv4Addr> = (1..=7).map(|i| ip(172, 64, 155, i)).collect();
+        let many: Vec<Ipv4Addr> = (1..=7).map(|i| ip(23, 10, 20, i)).collect();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
                 answer: Ok(resolved(&many)),
             },
@@ -1612,14 +1612,14 @@ mod tests {
     fn fake_ip_scope_host_is_answered_with_the_virtual_address_and_skips_reconcile() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(104, 18, 32, 47)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 140)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1627,7 +1627,7 @@ mod tests {
                 outcome: ReconcileOutcome::Installed,
             },
             &FakeFakeIp {
-                scope: vec!["chatgpt.com".to_string()],
+                scope: vec!["assistant.example".to_string()],
                 refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
@@ -1659,7 +1659,7 @@ mod tests {
             },
             &oracle(&["bank.example"]),
             &FakeUpstream {
-                answer: Ok(resolved(&[ip(93, 184, 216, 34)])),
+                answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
             },
             &FakeSink(&log),
             &FakeReconciler {
@@ -1669,7 +1669,7 @@ mod tests {
             // Fake-IP is on, but this host is NOT in scope (e.g. a P2P/crypto
             // exclusion) → real address + normal reconcile.
             &FakeFakeIp {
-                scope: vec!["chatgpt.com".to_string()],
+                scope: vec!["assistant.example".to_string()],
                 refuse: Vec::new(),
                 fake: ip(198, 18, 0, 5),
             },
@@ -1679,7 +1679,7 @@ mod tests {
         assert_eq!(
             out,
             QueryOutcome::Answer {
-                ips: vec![ip(93, 184, 216, 34)],
+                ips: vec![ip(23, 10, 20, 138)],
                 enforced: true,
             }
         );
@@ -1691,11 +1691,14 @@ mod tests {
         let allocator = Arc::new(Mutex::new(FakeIpAllocator::default()));
         let answerer =
             ScopedFakeIpAnswerer::new(FakeIpScope::enabled(Vec::<String>::new()), allocator);
-        let first = answerer.fake_answer("chatgpt.com").expect("in scope");
+        let first = answerer.fake_answer("assistant.example").expect("in scope");
         assert_eq!(first.len(), 1);
         assert!(first[0].to_string().starts_with("198.18."));
         // Idempotent: the same host always maps to the same fake address.
-        assert_eq!(answerer.fake_answer("chatgpt.com"), Some(first.clone()));
+        assert_eq!(
+            answerer.fake_answer("assistant.example"),
+            Some(first.clone())
+        );
         // A different host gets a different address.
         let other = answerer.fake_answer("claude.ai").expect("in scope");
         assert_ne!(other, first);
@@ -1706,12 +1709,12 @@ mod tests {
         let allocator = Arc::new(Mutex::new(FakeIpAllocator::default()));
         // Feature off → real path.
         let off = ScopedFakeIpAnswerer::new(FakeIpScope::disabled(), Arc::clone(&allocator));
-        assert_eq!(off.fake_answer("chatgpt.com"), None);
+        assert_eq!(off.fake_answer("assistant.example"), None);
         // On, but the host is excluded / non-routable / a literal → real path.
         let on = ScopedFakeIpAnswerer::new(FakeIpScope::enabled(["bank.example"]), allocator);
         assert_eq!(on.fake_answer("api.bank.example"), None);
         assert_eq!(on.fake_answer("localhost"), None);
-        assert_eq!(on.fake_answer("142.250.74.78"), None);
+        assert_eq!(on.fake_answer("23.10.20.78"), None);
     }
 
     #[test]
@@ -1729,7 +1732,7 @@ mod tests {
         assert_eq!(answerer.fake_answer("vpn.example.com"), None);
         assert_eq!(answerer.fake_answer("gw1.vpn.example.com"), None);
         // An unrelated in-scope host is unaffected.
-        assert!(answerer.fake_answer("chatgpt.com").is_some());
+        assert!(answerer.fake_answer("assistant.example").is_some());
     }
 
     #[test]
@@ -1738,7 +1741,7 @@ mod tests {
         let up = Arc::new(AtomicBool::new(false));
         let gate_flag = Arc::clone(&up);
         let inner: Arc<dyn FakeIpAnswerer> = Arc::new(FakeFakeIp {
-            scope: vec!["chatgpt.com".to_string()],
+            scope: vec!["assistant.example".to_string()],
             refuse: Vec::new(),
             fake: ip(198, 18, 0, 9),
         });
@@ -1746,11 +1749,11 @@ mod tests {
             GatedFakeIpAnswerer::new(inner, Arc::new(move || gate_flag.load(Ordering::SeqCst)));
         // Gate closed (stack down / feature off) → real path even for an
         // in-scope host: fake-IP never hands out an address nothing carries.
-        assert_eq!(gated.fake_answer("chatgpt.com"), None);
+        assert_eq!(gated.fake_answer("assistant.example"), None);
         // Gate open (stack running) → the inner answerer decides.
         up.store(true, Ordering::SeqCst);
         assert_eq!(
-            gated.fake_answer("chatgpt.com"),
+            gated.fake_answer("assistant.example"),
             Some(vec![ip(198, 18, 0, 9)])
         );
         // Still nothing for an out-of-scope host — the gate only enables, the
@@ -1762,12 +1765,12 @@ mod tests {
     fn upstream_failure_propagates_without_enforcement() {
         let log = CallLog::default();
         let out = handle_a_query(
-            "chatgpt.com",
+            "assistant.example",
             AnswerHold {
                 deadline: Duration::from_millis(150),
                 fast_answers: false,
             },
-            &oracle(&["chatgpt.com"]),
+            &oracle(&["assistant.example"]),
             &FakeUpstream {
                 answer: Err(ResolveError::Unavailable("timeout".into())),
             },
