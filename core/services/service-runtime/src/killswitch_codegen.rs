@@ -616,7 +616,7 @@ pub const CLIENT_TREE_EXEMPT_CAP: usize = 24;
 /// A client is not one binary. `hidemy.name VPN 3.0.exe` is a window: its
 /// transports are `OpenVPN\openvpn.exe` and `XRay\ExternalBinaries\xray.exe`,
 /// each a separate process, and one of them — never the window — is what talks
-/// to the server. Exempting only the resolved binary is why a 2026-09-08 outage
+/// to the server. Exempting only the resolved binary is why one observed outage
 /// held: the user switched protocols for over an hour while every attempt ran
 /// from a process no permit named. The bounded Program-Files walk had not found
 /// the nested `openvpn.exe` either, and `xray.exe` matches no VPN pattern at
