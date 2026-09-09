@@ -1,7 +1,7 @@
 //! `AppPathResolver` platform port — the neutral contract.
 //!
 //! An `Application` rule names an executable by its file **name** or a filename
-//! **glob** (`2gis.exe`, `DiskO*.exe`). But the packet-filter backends key on a
+//! **glob** (`citymap.exe`, `DiskO*.exe`). But the packet-filter backends key on a
 //! real, on-disk **file path**, not a name — so a name→path bridge is needed or
 //! those rules are silently skipped. This port turns a name/glob into the set of
 //! concrete exe paths present on the machine so the filter codegen can emit one
@@ -22,11 +22,29 @@ use std::path::PathBuf;
 /// on this machine.
 ///
 /// The input is already lowercased, path-stripped and `.exe`-suffixed by the
-/// domain layer (e.g. `"2gis.exe"` or `"disko*.exe"`). Returns `0..N` existing
+/// domain layer (e.g. `"citymap.exe"` or `"disko*.exe"`). Returns `0..N` existing
 /// exe file paths; an **empty** vector means "unresolved" (app not installed /
 /// not found) and is a normal result, never an error.
 pub trait AppPathResolver: Send + Sync {
     fn resolve(&self, name_or_glob: &str) -> Vec<PathBuf>;
+
+    /// Every executable that ships INSIDE the install directory of `exe`,
+    /// `exe` itself excluded.
+    ///
+    /// A tunnel client is rarely one binary. `hidemy.name VPN 3.0.exe` carries
+    /// its transports in subdirectories — `OpenVPN\openvpn.exe`,
+    /// `XRay\ExternalBinaries\xray.exe` — and it is those processes, not the
+    /// GUI, that perform the handshake. A kill-switch exemption naming only the
+    /// binary we happened to resolve therefore permits the window and blocks
+    /// the tunnel, which is the deadlock the exemption exists to prevent.
+    ///
+    /// Only the caller knows whether `exe` is a confirmed tunnel client — this
+    /// port answers "what else lives in its directory" and nothing else. The
+    /// default is empty so an OS with no implementation degrades to the
+    /// single-path behaviour instead of failing.
+    fn sibling_executables(&self, _exe: &std::path::Path) -> Vec<PathBuf> {
+        Vec::new()
+    }
 }
 
 /// Default / off-platform resolver: resolves nothing. Compiles on every OS so the
@@ -102,6 +120,67 @@ pub fn glob_chars(pat: &[char], txt: &[char]) -> bool {
     }
 }
 
+/// Collect the files under `root` that `is_executable` accepts, bounded by
+/// depth and by a shared file budget.
+///
+/// Shared by every backend's [`AppPathResolver::sibling_executables`]: walking
+/// a directory is `std::fs` on all three platforms, and only the two questions
+/// around it — which directories may be walked at all, and what counts as an
+/// executable — are OS knowledge, so those stay with the caller.
+///
+/// Symlinked directories are reported as symlinks by `file_type()` and are
+/// never followed, so a link back up the tree cannot make this loop. Budget is
+/// spent per file examined, not per file returned: a directory of a thousand
+/// assets costs its thousand and stops, which is what keeps a mis-aimed root
+/// from turning into a full-disk scan.
+pub fn executables_in_tree(
+    root: &std::path::Path,
+    max_depth: u32,
+    file_budget: u32,
+    is_executable: &dyn Fn(&std::path::Path) -> bool,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut budget = file_budget;
+    walk_executables(root, max_depth, &mut budget, is_executable, &mut out);
+    dedup_paths(out)
+}
+
+fn walk_executables(
+    dir: &std::path::Path,
+    depth: u32,
+    budget: &mut u32,
+    is_executable: &dyn Fn(&std::path::Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) {
+    if *budget == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        // An unreadable directory (permissions, a stale junction) contributes
+        // nothing; best-effort is the port's contract.
+        return;
+    };
+    for entry in entries.flatten() {
+        if *budget == 0 {
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            if depth > 0 {
+                walk_executables(&path, depth - 1, budget, is_executable, out);
+            }
+        } else if file_type.is_file() {
+            *budget = budget.saturating_sub(1);
+            if is_executable(&path) {
+                out.push(path);
+            }
+        }
+    }
+}
+
 /// Case-insensitive union dedup with a deterministic (sorted) order.
 ///
 /// A resolver may union several sources whose iteration order is not stable
@@ -130,6 +209,8 @@ pub fn dedup_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 #[derive(Default, Clone)]
 pub struct MockAppPathResolver {
     map: HashMap<String, Vec<PathBuf>>,
+    /// `exe path (lowercased) -> what else ships in its install tree`.
+    siblings: HashMap<String, Vec<PathBuf>>,
 }
 
 impl MockAppPathResolver {
@@ -151,7 +232,17 @@ impl MockAppPathResolver {
             .into_iter()
             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v))
             .collect();
-        Self { map }
+        Self {
+            map,
+            siblings: HashMap::new(),
+        }
+    }
+
+    /// Seed what ships alongside `exe` in its install tree (chainable).
+    #[must_use]
+    pub fn with_siblings(mut self, exe: &str, paths: Vec<PathBuf>) -> Self {
+        self.siblings.insert(exe.trim().to_ascii_lowercase(), paths);
+        self
     }
 }
 
@@ -169,6 +260,13 @@ impl AppPathResolver for MockAppPathResolver {
         }
         dedup_paths(out)
     }
+
+    fn sibling_executables(&self, exe: &std::path::Path) -> Vec<PathBuf> {
+        self.siblings
+            .get(&exe.to_string_lossy().to_ascii_lowercase())
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -179,12 +277,65 @@ mod tests {
         PathBuf::from(s)
     }
 
+    /// The walk every backend shares: nested binaries are found, the depth
+    /// bound is real, and non-executables are left where they are.
+    #[test]
+    fn the_tree_walk_reaches_nested_binaries_and_stops_at_its_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for (sub, name) in [
+            ("", "client.bin"),
+            ("transport", "openvpn.bin"),
+            ("transport/external", "xray.bin"),
+            ("a/b/c/d", "too-deep.bin"),
+        ] {
+            let d = root.join(sub);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            std::fs::write(d.join(name), b"").expect("write");
+        }
+        std::fs::write(root.join("readme.txt"), b"").expect("write");
+
+        let is_bin = |path: &std::path::Path| {
+            path.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("bin"))
+        };
+        let found = executables_in_tree(root, 3, 1000, &is_bin);
+        let names: Vec<String> = found
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .collect();
+
+        assert!(names.iter().any(|n| n == "openvpn.bin"), "{names:?}");
+        assert!(
+            names.iter().any(|n| n == "xray.bin"),
+            "two levels down is where a bundled transport actually lives: {names:?}",
+        );
+        assert!(
+            !names.iter().any(|n| n == "too-deep.bin"),
+            "the depth bound must be real: {names:?}",
+        );
+        assert!(!names.iter().any(|n| n.ends_with(".txt")), "{names:?}");
+    }
+
+    /// The budget is what keeps a mis-aimed root from becoming a disk scan, so
+    /// it has to bind on files EXAMINED, not on files returned.
+    #[test]
+    fn the_file_budget_stops_the_walk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        for i in 0..50 {
+            std::fs::write(root.join(format!("f{i}.bin")), b"").expect("write");
+        }
+        let is_bin = |_: &std::path::Path| true;
+        assert_eq!(executables_in_tree(root, 2, 5, &is_bin).len(), 5);
+    }
+
     #[test]
     fn glob_match_exact_is_case_insensitive() {
-        assert!(glob_match("vk.exe", "vk.exe"));
-        assert!(glob_match("VK.EXE", "vk.exe"));
-        assert!(glob_match("vk.exe", "VK.EXE"));
-        assert!(!glob_match("vk.exe", "vkontakte.exe"));
+        assert!(glob_match("ab.exe", "ab.exe"));
+        assert!(glob_match("AB.EXE", "ab.exe"));
+        assert!(glob_match("ab.exe", "AB.EXE"));
+        assert!(!glob_match("ab.exe", "vkontakte.exe"));
     }
 
     #[test]
@@ -193,7 +344,7 @@ mod tests {
         assert!(glob_match("disko*.exe", "diskosync.exe"));
         assert!(!glob_match("disko*.exe", "disk.exe"));
         assert!(glob_match("*.exe", "anything.exe"));
-        assert!(glob_match("2gis*", "2gis.exe"));
+        assert!(glob_match("citymap*", "citymap.exe"));
         assert!(glob_match("a*b*c.exe", "axxbyyc.exe"));
         assert!(!glob_match("a*b*c.exe", "axxc.exe"));
     }
@@ -201,7 +352,7 @@ mod tests {
     #[test]
     fn glob_match_question_mark_is_single_char() {
         assert!(glob_match("vk?.exe", "vk1.exe"));
-        assert!(!glob_match("vk?.exe", "vk.exe")); // '?' needs exactly one char
+        assert!(!glob_match("vk?.exe", "ab.exe")); // '?' needs exactly one char
         assert!(!glob_match("vk?.exe", "vk12.exe"));
     }
 
@@ -214,42 +365,42 @@ mod tests {
     #[test]
     fn dedup_paths_is_case_insensitive_and_sorted() {
         let out = dedup_paths(vec![
-            p(r"C:\B\vk.exe"),
-            p(r"C:\A\vk.exe"),
-            p(r"c:\a\VK.EXE"), // case-insensitive dup of C:\A\vk.exe
-            p(r"C:\A\vk.exe"), // exact dup
+            p(r"C:\B\ab.exe"),
+            p(r"C:\A\ab.exe"),
+            p(r"c:\a\AB.EXE"), // case-insensitive dup of C:\A\ab.exe
+            p(r"C:\A\ab.exe"), // exact dup
         ]);
-        assert_eq!(out, vec![p(r"C:\A\vk.exe"), p(r"C:\B\vk.exe")]);
+        assert_eq!(out, vec![p(r"C:\A\ab.exe"), p(r"C:\B\ab.exe")]);
     }
 
     #[test]
     fn noop_resolver_always_empty() {
         let r = NoopAppPathResolver;
-        assert!(r.resolve("vk.exe").is_empty());
+        assert!(r.resolve("ab.exe").is_empty());
         assert!(r.resolve("disko*.exe").is_empty());
     }
 
     #[test]
     fn mock_exact_lookup_is_case_insensitive() {
-        let r = MockAppPathResolver::new().with("vk.exe", vec![p(r"C:\Apps\vk.exe")]);
-        assert_eq!(r.resolve("vk.exe"), vec![p(r"C:\Apps\vk.exe")]);
-        assert_eq!(r.resolve("VK.EXE"), vec![p(r"C:\Apps\vk.exe")]);
+        let r = MockAppPathResolver::new().with("ab.exe", vec![p(r"C:\Apps\ab.exe")]);
+        assert_eq!(r.resolve("ab.exe"), vec![p(r"C:\Apps\ab.exe")]);
+        assert_eq!(r.resolve("AB.EXE"), vec![p(r"C:\Apps\ab.exe")]);
         assert!(r.resolve("other.exe").is_empty());
     }
 
     #[test]
     fn mock_glob_unions_matching_keys_deterministically() {
         let r = MockAppPathResolver::from_seed([
-            ("disko.exe".to_string(), vec![p(r"C:\Yandex\disko.exe")]),
+            ("disko.exe".to_string(), vec![p(r"C:\Vendor\disko.exe")]),
             (
                 "diskosync.exe".to_string(),
-                vec![p(r"C:\Yandex\diskosync.exe")],
+                vec![p(r"C:\Vendor\diskosync.exe")],
             ),
-            ("vk.exe".to_string(), vec![p(r"C:\Apps\vk.exe")]),
+            ("ab.exe".to_string(), vec![p(r"C:\Apps\ab.exe")]),
         ]);
         assert_eq!(
             r.resolve("disko*.exe"),
-            vec![p(r"C:\Yandex\disko.exe"), p(r"C:\Yandex\diskosync.exe")],
+            vec![p(r"C:\Vendor\disko.exe"), p(r"C:\Vendor\diskosync.exe")],
         );
         // Non-matching glob → empty.
         assert!(r.resolve("chrome*.exe").is_empty());
@@ -257,7 +408,7 @@ mod tests {
 
     #[test]
     fn mock_empty_query_resolves_nothing() {
-        let r = MockAppPathResolver::new().with("vk.exe", vec![p(r"C:\Apps\vk.exe")]);
+        let r = MockAppPathResolver::new().with("ab.exe", vec![p(r"C:\Apps\ab.exe")]);
         assert!(r.resolve("").is_empty());
         assert!(r.resolve("   ").is_empty());
     }

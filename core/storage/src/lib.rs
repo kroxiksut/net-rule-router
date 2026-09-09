@@ -146,7 +146,8 @@ pub use schema::{
 };
 pub use store::{SqliteCacheStore, SqliteStateStore};
 pub use traffic_stats::{
-    AdapterAddressRow, SqliteTrafficStore, TrafficCursorRow, TrafficDayRow, TrafficTotalRow,
+    AdapterAddressRow, AdapterHistoryLink, AdapterKeySighting, SqliteTrafficStore,
+    TrafficCursorRow, TrafficDayRow, TrafficTotalRow,
 };
 pub use traffic_stats_settings::{TrafficStatsSettings, TrafficStatsSettingsRepository};
 pub use vpn_bootstrap_endpoints::VpnBootstrapEndpointsRepository;

@@ -191,8 +191,17 @@ ColumnLayout {
         Pure.countDismissedAutoRuleHosts(section.mergedGroups)
     readonly property var statusFilteredGroups: Pure.filterAutoRuleGroupsByStatus(
         section.mergedGroups, section.showDismissed)
+    /// Hosts the main route already serves are not wrong, they are just not
+    /// work — the site pulling them reaches them without a tunnel. Behind a
+    /// toggle rather than dropped, so "why isn't this host here" has a visible
+    /// answer.
+    property bool showServedByMainLink: false
+    readonly property int servedByMainLinkCount:
+        Pure.countAutoRuleHostsServedByMainLink(section.statusFilteredGroups)
+    readonly property var mainLinkFilteredGroups: Pure.filterAutoRuleGroupsServedByMainLink(
+        section.statusFilteredGroups, section.showServedByMainLink)
     readonly property var consumerFilteredGroups: Pure.filterAutoRuleGroups(
-        section.statusFilteredGroups, section.consumerFilter)
+        section.mainLinkFilteredGroups, section.consumerFilter)
     readonly property var displayGroups: Pure.sortAutoRuleGroups(
         Pure.searchAutoRuleGroups(section.consumerFilteredGroups, section.searchQuery),
         section.sortMode)
@@ -438,6 +447,23 @@ ColumnLayout {
             return root.tr("rules.suggestions.inbox.behavior-cut", "the main route drops connections to it")
         return root.tr("rules.suggestions.inbox.behavior-unknown", "not checked on the main route")
     }
+    /// Whose name the offer is: the site's own, or a third party it pulls in.
+    ///
+    /// A fact, like the behaviour line above it — not a recommendation. A
+    /// third-party name is often exactly what a site needs to work; it is just
+    /// worth knowing that approving it routes somebody else's service too.
+    ///
+    /// An offer a host signed about ITSELF has no site to be third-party to,
+    /// and the line is left out rather than guessed — saying nothing beats
+    /// calling an ad host one of the site's own names.
+    function _ownershipText(host) {
+        if (host.thirdParty === undefined || host.thirdParty === null) return ""
+        return host.thirdParty === true
+            ? root.tr("rules.suggestions.inbox.ownership-third-party",
+                "a third-party service the site pulls in")
+            : root.tr("rules.suggestions.inbox.ownership-own-name",
+                "one of the site's own names")
+    }
     function _isPrimaryConsumer(consumer) {
         return String((consumer || {}).route || "") === "primary"
     }
@@ -507,6 +533,27 @@ ColumnLayout {
                 "The service saw {count} addresses beside your sites, but each already travels the route it would be sent to — a rule would change nothing. For example: {sample}.")
             .replace("{count}", String(root.autoRuleSuggestionsController.autoRuleInertDropped))
             .replace("{sample}", section._inertSampleText())
+        Accessible.role: Accessible.StaticText
+        Accessible.name: text
+    }
+
+    /// Nothing to act on because the main connection already reaches every
+    /// address here. Silence would be worse than a plain statement: the user is
+    /// looking at a browser error and came here for an answer. The sentence
+    /// states CONNECTIVITY and stops there — a refused certificate is checked
+    /// inside the browser and never reaches the network, so we do not observe
+    /// it and must not name it.
+    Label {
+        Layout.fillWidth: true
+        Layout.preferredWidth: 0
+        visible: root.uiRevision >= 0
+            && section.mainLinkFilteredGroups.length === 0
+            && section.servedByMainLinkCount > 0
+        wrapMode: Text.Wrap
+        color: root.mutedTextColor
+        text: root.tr("rules.suggestions.inbox.empty-served-by-main-link",
+                "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it.")
+            .replace("{n}", String(section.servedByMainLinkCount))
         Accessible.role: Accessible.StaticText
         Accessible.name: text
     }
@@ -615,6 +662,22 @@ ColumnLayout {
                 ToolTip.visible: hovered
                 ToolTip.text: root.tr("rules.suggestions.inbox.show-dismissed-tooltip",
                     "Also list the addresses you told the app not to suggest again, so you can change your mind about one.")
+                Accessible.role: Accessible.CheckBox
+                Accessible.name: text
+                Accessible.description: ToolTip.text
+            }
+
+            CheckBox {
+                id: showServedToggle
+                visible: section.servedByMainLinkCount > 0 || section.showServedByMainLink
+                checked: section.showServedByMainLink
+                text: root.tr("rules.suggestions.inbox.show-served-by-main-link",
+                    "Show ones the main connection already handles ({n})")
+                    .replace("{n}", String(section.servedByMainLinkCount))
+                onClicked: section.showServedByMainLink = checked
+                ToolTip.visible: hovered
+                ToolTip.text: root.tr("rules.suggestions.inbox.show-served-by-main-link-tooltip",
+                    "These addresses answer over your main connection, so sending them through the additional one changes nothing. They are listed for completeness, not as work.")
                 Accessible.role: Accessible.CheckBox
                 Accessible.name: text
                 Accessible.description: ToolTip.text
@@ -936,6 +999,19 @@ ColumnLayout {
                                         font.pixelSize: 12
                                         color: root.textColor
                                         text: section._behaviorText(modelData)
+                                        visible: text !== ""
+                                    }
+                                    // Whose name this is. A host belonging to
+                                    // the site itself is worth more than one
+                                    // belonging to an analytics or delivery
+                                    // service, and the user asked to see the
+                                    // difference rather than infer it.
+                                    Label {
+                                        Layout.fillWidth: true
+                                        wrapMode: Text.Wrap
+                                        font.pixelSize: 12
+                                        color: root.mutedTextColor
+                                        text: section._ownershipText(modelData)
                                         visible: text !== ""
                                     }
                                     Label {

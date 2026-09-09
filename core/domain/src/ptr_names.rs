@@ -1,6 +1,6 @@
 //! Telling a service name apart from a machine name in a PTR answer.
 //!
-//! Reverse DNS answers two different kinds of names. `dzen.ru` names a service:
+//! Reverse DNS answers two different kinds of names. `feed.example` names a service:
 //! learning it from a dropped packet is exactly the point of reverse-learning.
 //! `1.80.190.35.bc.googleusercontent.com` names a machine — the operator
 //! generated it from the address, it forward-confirms just as well, and it says
@@ -57,8 +57,8 @@ mod tests {
     #[test]
     fn a_reversed_octet_prefix_is_address_derived() {
         assert!(is_address_derived(
-            "1.80.190.35.bc.googleusercontent.com",
-            ip(35, 190, 80, 1)
+            "1.2.0.192.bc.example.com",
+            ip(192, 0, 2, 1)
         ));
     }
 
@@ -84,10 +84,10 @@ mod tests {
 
     #[test]
     fn a_service_name_is_not_address_derived() {
-        assert!(!is_address_derived("dzen.ru", ip(87, 250, 250, 242)));
+        assert!(!is_address_derived("feed.example", ip(203, 0, 113, 242)));
         assert!(!is_address_derived(
             "lh3.googleusercontent.com",
-            ip(142, 250, 74, 33)
+            ip(23, 10, 20, 148)
         ));
     }
 
@@ -95,7 +95,7 @@ mod tests {
     fn numbers_belonging_to_another_address_do_not_count() {
         assert!(!is_address_derived(
             "1.2.3.4.example.com",
-            ip(35, 190, 80, 1)
+            ip(23, 10, 20, 132)
         ));
     }
 

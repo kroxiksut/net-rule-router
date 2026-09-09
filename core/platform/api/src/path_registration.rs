@@ -155,6 +155,27 @@ impl PathDecision {
     }
 }
 
+/// What the pure REMOVAL decision concluded.
+///
+/// Separate from [`PathDecision`] rather than a third variant of it: a caller
+/// asking "should I add this" and one asking "should I take it away" must not
+/// be able to pass each other's answer to `apply`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathRemovalDecision {
+    /// The directory is not on the list — there is nothing of ours to take off.
+    NotPresent,
+    /// `updated_list` is the list with our entry gone and everything else
+    /// preserved byte for byte.
+    Remove { updated_list: String },
+}
+
+impl PathRemovalDecision {
+    /// Whether carrying this decision out changes anything.
+    pub const fn changes_anything(&self) -> bool {
+        matches!(self, Self::Remove { .. })
+    }
+}
+
 // ── Plan / report ────────────────────────────────────────────────────────────
 
 /// One concrete action an [`apply`](PathRegistrationPort::apply) performs.
@@ -175,6 +196,10 @@ pub enum PathRegistrationStep {
     /// Tell the system the environment changed, so newly launched programs pick
     /// the new value up without a sign-out.
     AnnounceEnvironmentChange,
+    /// Take our own block back out of the shell start-up file at `path`,
+    /// leaving every other line in that file untouched. The counterpart of
+    /// [`AppendShellProfileLine`](Self::AppendShellProfileLine).
+    RemoveShellProfileBlock { path: PathBuf },
 }
 
 /// A computed, side-effect-free description of a registration.
@@ -208,6 +233,40 @@ impl PathRegistrationPlan {
             decision: PathDecision::AlreadyPresent,
             steps: Vec::new(),
             current_session_command,
+        }
+    }
+
+    /// Whether applying this plan would change the machine.
+    pub fn changes_anything(&self) -> bool {
+        self.decision.changes_anything()
+    }
+}
+
+/// A computed, side-effect-free description of a removal.
+///
+/// No `current_session_command`: a shell that already has the directory on its
+/// `PATH` cannot be cleaned up with one pasted line, and offering one that only
+/// half-works is worse than saying nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathRemovalPlan {
+    /// The directory the plan is about.
+    pub directory: PathBuf,
+    /// The list the plan targets.
+    pub scope: PathScope,
+    /// What the pure decision concluded.
+    pub decision: PathRemovalDecision,
+    /// The steps to perform, in order. Empty when there is nothing of ours.
+    pub steps: Vec<PathRegistrationStep>,
+}
+
+impl PathRemovalPlan {
+    /// A plan that does nothing because we have nothing on the list.
+    pub fn nothing_to_remove(directory: PathBuf, scope: PathScope) -> Self {
+        Self {
+            directory,
+            scope,
+            decision: PathRemovalDecision::NotPresent,
+            steps: Vec::new(),
         }
     }
 
@@ -423,6 +482,35 @@ pub fn decide_path_registration(
     Ok(PathDecision::Append { updated_list })
 }
 
+/// The removal counterpart of [`decide_path_registration`]: given the list as it
+/// stands, what does it become once our directory is off it.
+///
+/// Every entry that names the directory is dropped — a list can have picked up
+/// duplicates from an installer, and leaving one behind would make the button
+/// look broken. Everything else survives byte for byte, INCLUDING empty
+/// segments: a stray `;;` in someone's list is theirs, and tidying it here is a
+/// change nobody asked for that surfaces days later in an unrelated program.
+pub fn decide_path_removal(
+    current_list: &str,
+    directory: &Path,
+    style: PathListStyle,
+) -> Result<PathRemovalDecision, PathRegistrationError> {
+    validate_directory(directory, style)?;
+    if !list_contains_directory(current_list, directory, style) {
+        return Ok(PathRemovalDecision::NotPresent);
+    }
+    let Some(target) = comparison_key(&directory.to_string_lossy(), style) else {
+        return Ok(PathRemovalDecision::NotPresent);
+    };
+    let kept: Vec<&str> = current_list
+        .split(style.separator())
+        .filter(|entry| comparison_key(entry, style).as_deref() != Some(target.as_str()))
+        .collect();
+    Ok(PathRemovalDecision::Remove {
+        updated_list: kept.join(&style.separator().to_string()),
+    })
+}
+
 // ── The port ─────────────────────────────────────────────────────────────────
 
 /// Make a directory reachable by name from the user's shell.
@@ -470,6 +558,48 @@ pub trait PathRegistrationPort {
         let plan = self.plan(request)?;
         self.apply(&plan)
     }
+
+    /// Compute what taking `request`'s directory back off the list would do.
+    /// Reads only OUR store — the per-user environment value on Windows, our own
+    /// block in the start-up file on Unix — never the composed `PATH` this
+    /// process inherited. An entry someone else put on the list is not ours to
+    /// remove, and a directory that is only reachable because a machine-wide
+    /// list names it must not read as "we put it there".
+    fn plan_removal(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<PathRemovalPlan, PathRegistrationError>;
+
+    /// Carry out a removal plan. Applying a nothing-to-remove plan is a
+    /// successful no-op. Same freshness rule as [`apply`](Self::apply): plan and
+    /// apply together rather than holding a plan across other edits.
+    fn apply_removal(
+        &self,
+        plan: &PathRemovalPlan,
+    ) -> Result<PathRegistrationReport, PathRegistrationError>;
+
+    /// Whether OUR entry is in OUR store right now.
+    ///
+    /// This — not "is the directory reachable" — is what a remove button must be
+    /// driven by. On Unix the two disagree in an ordinary case: a process holds
+    /// the `PATH` it inherited until it restarts, so straight after a successful
+    /// removal the directory is still reachable here, and a button watching
+    /// reachability would snap back and read as "it did not work".
+    fn owned_entry_present(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<bool, PathRegistrationError> {
+        Ok(self.plan_removal(request)?.changes_anything())
+    }
+
+    /// Plan and apply a removal in one call — the shape a UI button wants.
+    fn unregister(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
+        let plan = self.plan_removal(request)?;
+        self.apply_removal(&plan)
+    }
 }
 
 // ── Test double ──────────────────────────────────────────────────────────────
@@ -502,6 +632,27 @@ impl MockPathRegistration {
     /// Every step applied so far, in order.
     pub fn applied_steps(&self) -> Vec<PathRegistrationStep> {
         self.applied.lock().expect("mock mutex").clone()
+    }
+
+    /// Run steps against the in-memory list. Registration and removal differ
+    /// only in the value they store, so they share this.
+    fn run_steps(
+        &self,
+        steps: &[PathRegistrationStep],
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
+        let mut changed = false;
+        for step in steps {
+            if let PathRegistrationStep::SetUserEnvironmentVariable { value, .. } = step {
+                *self.list.lock().expect("mock mutex") = value.clone();
+                changed = true;
+            }
+            self.applied.lock().expect("mock mutex").push(step.clone());
+        }
+        Ok(PathRegistrationReport {
+            changed,
+            files_written: Vec::new(),
+            restart_shell_required: changed,
+        })
     }
 }
 
@@ -546,19 +697,43 @@ impl PathRegistrationPort for MockPathRegistration {
         &self,
         plan: &PathRegistrationPlan,
     ) -> Result<PathRegistrationReport, PathRegistrationError> {
-        let mut changed = false;
-        for step in &plan.steps {
-            if let PathRegistrationStep::SetUserEnvironmentVariable { value, .. } = step {
-                *self.list.lock().expect("mock mutex") = value.clone();
-                changed = true;
-            }
-            self.applied.lock().expect("mock mutex").push(step.clone());
+        self.run_steps(&plan.steps)
+    }
+
+    fn plan_removal(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<PathRemovalPlan, PathRegistrationError> {
+        if request.scope != PathScope::CurrentUser {
+            return Err(PathRegistrationError::Unsupported {
+                detail: "the in-memory port models one user's list only".to_string(),
+            });
         }
-        Ok(PathRegistrationReport {
-            changed,
-            files_written: Vec::new(),
-            restart_shell_required: changed,
+        let list = self.current_list();
+        let decision = decide_path_removal(&list, &request.directory, self.style)?;
+        let steps = match &decision {
+            PathRemovalDecision::NotPresent => Vec::new(),
+            PathRemovalDecision::Remove { updated_list } => vec![
+                PathRegistrationStep::SetUserEnvironmentVariable {
+                    name: "PATH".to_string(),
+                    value: updated_list.clone(),
+                },
+                PathRegistrationStep::AnnounceEnvironmentChange,
+            ],
+        };
+        Ok(PathRemovalPlan {
+            directory: request.directory.clone(),
+            scope: request.scope,
+            decision,
+            steps,
         })
+    }
+
+    fn apply_removal(
+        &self,
+        plan: &PathRemovalPlan,
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
+        self.run_steps(&plan.steps)
     }
 }
 
@@ -580,6 +755,105 @@ mod tests {
     }
 
     // ── Conventions ──────────────────────────────────────────────────────────
+
+    // ── Removal ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn removing_a_directory_that_is_not_there_changes_nothing() {
+        let decision = decide_path_removal(r"C:\Windows;C:\Windows\System32", &win_dir(), WIN)
+            .expect("decide");
+        assert_eq!(decision, PathRemovalDecision::NotPresent);
+        assert!(!decision.changes_anything());
+    }
+
+    #[test]
+    fn removal_takes_out_our_entry_and_leaves_the_others_verbatim() {
+        // Deliberately messy neighbours: quoted, trailing separator, odd case.
+        let list = format!(r#"C:\Windows;"C:\Toolsin\";{}"#, win_dir().display());
+        let decision = decide_path_removal(&list, &win_dir(), WIN).expect("decide");
+        match decision {
+            PathRemovalDecision::Remove { updated_list } => {
+                assert_eq!(updated_list, r#"C:\Windows;"C:\Toolsin\""#);
+            }
+            other => panic!("expected a removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_our_entry_goes_in_one_pass() {
+        // An installer that ran twice, or a hand-edit with a different case and
+        // slash direction: leaving one behind makes the button look broken.
+        let list = format!(
+            "{};C:/Program Files/NetRuleRouter;/other;{}\\",
+            win_dir().display(),
+            win_dir().display()
+        );
+        match decide_path_removal(&list, &win_dir(), WIN).expect("decide") {
+            PathRemovalDecision::Remove { updated_list } => {
+                assert_eq!(updated_list, "/other");
+            }
+            other => panic!("expected a removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_case_difference_is_not_our_entry_on_unix() {
+        // Unix compares exactly, so a differently-cased directory is a
+        // different directory and stays where it is.
+        let list = "/usr/bin:/OPT/netrulerouter/bin";
+        assert_eq!(
+            decide_path_removal(list, &unix_dir(), UNIX).expect("decide"),
+            PathRemovalDecision::NotPresent
+        );
+    }
+
+    #[test]
+    fn empty_segments_belong_to_the_user_and_survive_removal() {
+        // A stray `::` means "the current directory" to some shells. Tidying it
+        // away here would change what the user's PATH does.
+        let list = "/usr/bin::/opt/netrulerouter/bin:/usr/local/bin";
+        match decide_path_removal(list, &unix_dir(), UNIX).expect("decide") {
+            PathRemovalDecision::Remove { updated_list } => {
+                assert_eq!(updated_list, "/usr/bin::/usr/local/bin");
+            }
+            other => panic!("expected a removal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removal_refuses_the_same_directories_registration_refuses() {
+        // One validator, so "we would never add this" and "we would never claim
+        // to remove this" cannot drift apart.
+        let relative = PathBuf::from("bin");
+        assert!(decide_path_removal("/usr/bin", &relative, UNIX).is_err());
+        assert!(decide_path_registration("/usr/bin", &relative, UNIX).is_err());
+    }
+
+    #[test]
+    fn register_then_remove_returns_the_list_it_started_with() {
+        let port = MockPathRegistration::new(UNIX, "/usr/bin:/usr/local/bin");
+        let request = PathRegistrationRequest::for_current_user(unix_dir());
+        assert!(!port.owned_entry_present(&request).expect("present?"));
+
+        port.register(&request).expect("register");
+        assert!(port.current_list().ends_with("/opt/netrulerouter/bin"));
+        assert!(port.owned_entry_present(&request).expect("present?"));
+
+        let report = port.unregister(&request).expect("unregister");
+        assert!(report.changed);
+        assert_eq!(port.current_list(), "/usr/bin:/usr/local/bin");
+        assert!(!port.owned_entry_present(&request).expect("present?"));
+    }
+
+    #[test]
+    fn unregistering_twice_is_a_quiet_no_op() {
+        let port = MockPathRegistration::new(UNIX, "/usr/bin");
+        let request = PathRegistrationRequest::for_current_user(unix_dir());
+        let report = port.unregister(&request).expect("unregister");
+        assert!(!report.changed);
+        assert!(!report.restart_shell_required);
+        assert_eq!(port.current_list(), "/usr/bin");
+    }
 
     #[test]
     fn separators_and_case_rules_follow_the_convention() {

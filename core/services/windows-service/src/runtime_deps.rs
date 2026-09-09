@@ -609,6 +609,10 @@ pub(crate) fn build_supervised_runtime_deps(
                 if nrr_service_runtime::teardown_in_progress() {
                     return;
                 }
+                // What this pass costs, phase by phase. A 10 s median with
+                // requests queueing behind it was measured as ONE number, which
+                // says nothing about what to take off the periodic path.
+                let mut timings = nrr_service_runtime::phase_timings::PhaseTimings::start();
                 v6_routes.log_if_changed(v6_api.as_ref(), "network-change");
                 let tray_active = registry.active_sids();
                 // Enforce for the effective routing
@@ -632,12 +636,14 @@ pub(crate) fn build_supervised_runtime_deps(
                         }
                     }
                 }
+                timings.mark("seed");
                 if let Err(e) = coord.recompute_active(&tray_active) {
                     tracing::error!(
                         target: "nrr::route-coordinator",
                         "route recompute after DNS warm-up failed: {e:?}",
                     );
                 }
+                timings.mark("routes");
                 if let Some(orch) = orch.as_ref() {
                     // NEVER reconcile the
                     // orchestrator to an EMPTY effective set from a periodic
@@ -653,6 +659,7 @@ pub(crate) fn build_supervised_runtime_deps(
                     // the filters in place fails SAFE (they block, never leak).
                     if active.is_empty() {
                         dns_ctl.tick();
+                        report_recompute_cost(&timings);
                         return;
                     }
                     // Boot self-apply: reconcile the
@@ -672,6 +679,7 @@ pub(crate) fn build_supervised_runtime_deps(
                                 "pause-state read failed; skipping enforcement reconcile: {e:?}",
                             );
                             dns_ctl.tick();
+                            report_recompute_cost(&timings);
                             return;
                         }
                     };
@@ -686,6 +694,7 @@ pub(crate) fn build_supervised_runtime_deps(
                             "periodic enforcement reconcile failed: {e:?}",
                         );
                     }
+                    timings.mark("filters");
                     for sid in &unpaused {
                         match orch.reconcile_secondary_coverage(sid) {
                             Ok(0) => {}
@@ -725,11 +734,14 @@ pub(crate) fn build_supervised_runtime_deps(
                 // Rate-limited inside the pool. Runs BEFORE the watchdog so an
                 // upstream that just appeared clears the re-arm backoff in the
                 // same pass instead of the tick after next.
+                timings.mark("leak-guard");
                 let upstream = upstream_dns_pool().note_network_change();
                 dns_ctl.note_upstream_present(upstream.is_some());
                 // Mode-B resolver watchdog (see above): re-arm the
                 // resolver if it is enabled but its serve thread has died.
                 dns_ctl.tick();
+                timings.mark("dns-watchdog");
+                report_recompute_cost(&timings);
             }) as nrr_service_runtime::supervised_runtime::RouteRecomputeHook
         });
 
@@ -811,6 +823,28 @@ pub(crate) fn build_supervised_runtime_deps(
                 let conn = Arc::clone(conn);
                 Some(
                     Arc::new(move || {
+                        // Who was connected at the moment the paths go away.
+                        // Removing our routes changes the outgoing path for
+                        // live sessions, and TCP does not survive that — so
+                        // an application losing its connection right at the
+                        // stop looks like our doing and cannot be told apart
+                        // from a coincidence. This line is the evidence.
+                        let connected =
+                            nrr_platform_windows::stale_flows::established_connections_by_process(
+                                8,
+                            );
+                        if !connected.is_empty() {
+                            let summary = connected
+                                .iter()
+                                .map(|(name, n)| format!("{name} ({n})"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            tracing::info!(
+                                target: "nrr::lifecycle",
+                                processes = %summary,
+                                "connections live at teardown — removing our routes changes their path, and an established session does not survive that",
+                            );
+                        }
                         if read_routing_stop_persist(&conn) {
                             // persist (default): keep the /32 rule-routes on the
                             // VPN, remove NRR's overlays.
@@ -2186,6 +2220,7 @@ fn build_conn_trace_pair(
     }
     // Feed the connection-trace ring so the Diagnostics panel can read
     // recent connections (only wired when the GUI stream is on → ring is Some).
+    let trace_ring_flag = trace_ring.clone();
     if let Some(ring) = trace_ring {
         consumer_builder = consumer_builder.with_trace_ring(ring);
     }
@@ -2334,8 +2369,7 @@ fn build_conn_trace_pair(
         // keeps it only for hosts it already tracks as companion candidates and
         // drops it for anything else; the registry keeps it for every named
         // destination, which is the only record of "this host does not open"
-        // for a host nobody has a theory about yet. Diagnostic — it is read by
-        // the log, and nothing acts on it.
+        // for a host nobody has a theory about yet.
         let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
         consumer_builder =
             consumer_builder.with_companion_primary_health(Arc::new(move |hostname, stalled| {
@@ -2344,14 +2378,59 @@ fn build_conn_trace_pair(
                 } else {
                     nrr_domain::companion_affinity::PrimaryHealthEvent::Completed
                 };
-                if let Some(report) = stalls.note(hostname, event) {
-                    nrr_service_runtime::primary_stall_registry::log_report(&report);
+                let report = stalls.note(hostname, event);
+                if let Some(report) = report.as_ref() {
+                    nrr_service_runtime::primary_stall_registry::log_report(report);
                 }
                 let Some(sid) = sid_for_health() else {
                     return;
                 };
                 engine_health.note_primary_health(&sid, hostname, event);
+                // A verdict that just turned to "stalls" is the product
+                // finding out, by measurement, that the main link will
+                // not carry this site. Offering the additional route is
+                // the whole point of having noticed. Only on the CHANGE:
+                // the registry stays silent while the verdict holds, so
+                // this cannot fire per packet.
+                if report.is_some_and(|r| {
+                    r.behavior == nrr_domain::companion_affinity::PrimaryBehavior::Stalls
+                }) {
+                    // Evidence for the threshold, recorded exactly where the
+                    // offer is born: this is the moment the product decides a
+                    // host is worth asking about.
+                    let nav = nrr_service_runtime::navigation_registry::global_navigation();
+                    nrr_service_runtime::navigation_registry::log_counts(
+                        hostname,
+                        &nav.counts_of(hostname),
+                    );
+                    engine_health.note_main_link_blocked_host(
+                        &sid,
+                        hostname,
+                        std::time::SystemTime::now(),
+                    );
+                }
             }));
+        // Did the user go to this host, or did a page take them there? Pure
+        // measurement for now: nothing reads the counts to decide anything,
+        // they only travel beside the verdict below so the thresholds can be
+        // picked from real traffic instead of guessed.
+        {
+            let nav = nrr_service_runtime::navigation_registry::global_navigation();
+            consumer_builder = consumer_builder.with_navigation_attempt(Arc::new(
+                move |process: Option<&str>, hostname: Option<&str>, at_ms: u64| {
+                    if let Some(dist) = nav.note_attempt(process, hostname, at_ms) {
+                        nrr_service_runtime::navigation_registry::log_distribution(&dist);
+                    }
+                },
+            ));
+        }
+        // Names for the hosts the rule index cannot name. Health-only: a
+        // rule-less name may say how a host fares, never bring it into
+        // companion discovery.
+        consumer_builder = consumer_builder.with_health_name_fallback({
+            let observed = nrr_service_runtime::observed_host_names::global_observed_host_names();
+            Arc::new(move |ip| observed.lookup(ip))
+        });
     }
     // Block-notice reporting: the observer decides which OUR drops are
     // notice-worthy (see `conn_observation_consumer::block_reason_for`); the
@@ -2442,6 +2521,10 @@ fn build_conn_trace_pair(
                 backend = backend.slug(),
                 "connection trace enabled",
             );
+            // Only now is the ring actually being fed: the panel may say so.
+            if let Some(ring) = trace_ring_flag {
+                ring.mark_observer_active();
+            }
             (Some(source), Some(consumer))
         }
         Err(e) => {
@@ -3632,12 +3715,26 @@ fn build_dns_resolver_instance(
     if let Some(policy) = egress.clone() {
         poison_fallback = poison_fallback.with_egress(policy);
     }
-    let upstream = Arc::new(poison_fallback);
+    // Last stop before an application is told a name does not exist: ask the
+    // machine's own private resolvers, which are the only ones that can hold a
+    // namespace the public internet never heard of. Costs nothing on the
+    // answered path — it runs only for names that already failed.
+    let upstream = Arc::new(
+        nrr_service_runtime::local_namespace_fallback::LocalNamespaceFallbackResolver::new(
+            Arc::new(poison_fallback),
+            Arc::new(nrr_platform_windows::dns_redirect::WindowsSystemDnsServers),
+            std::time::Duration::from_millis(700),
+        )
+        .already_asked(match upstream_dns.ip() {
+            std::net::IpAddr::V4(v4) => vec![v4],
+            std::net::IpAddr::V6(_) => Vec::new(),
+        }),
+    );
     let sink = Arc::new(CacheFactSink::new(Arc::clone(cache)));
     let reconciler = Arc::new(HookSyncReconciler::new(hook.clone()));
     // Direct-answer steering: replies for non-rule
     // hosts are filtered against the secondary-pinned set so a shared-CDN host
-    // (www.google.com vs gemini/youtube) gets clean addresses that stay on the
+    // (www.search.example vs gemini/video-site) gets clean addresses that stay on the
     // primary path even under a STRICT kill-switch.
     let owned_ips = nrr_service_runtime::dns_resolver_ports::ActiveSecondaryOwnedIps::new(
         Arc::new(ProductionRulesProvider::new(Arc::clone(settings_conn))),
@@ -3651,6 +3748,19 @@ fn build_dns_resolver_instance(
     );
     let secondary_owned = Arc::new(owned_ips);
 
+    // Re-ask the machine's own private resolvers when one server calls a name
+    // non-existent. Windows asked every interface's server before we pointed
+    // the whole system at ourselves; a corporate host and a machine on the
+    // LAN stopped resolving because of it.
+    let private_resolvers: nrr_service_runtime::dns_listener::PrivateResolversFn = Arc::new(|| {
+        use nrr_platform_api::dns::SystemDnsServersPort;
+        nrr_platform_windows::dns_redirect::WindowsSystemDnsServers
+            .upstream_candidates_v4()
+            .into_iter()
+            .map(|c| c.server)
+            .filter(|s| nrr_service_runtime::local_namespace_fallback::is_private_resolver(*s))
+            .collect()
+    });
     let mut listener = DnsInterceptListener::new(
         oracle,
         upstream,
@@ -3677,6 +3787,7 @@ fn build_dns_resolver_instance(
             active_sid,
         )),
     ));
+    listener = listener.with_private_resolvers(private_resolvers);
     // Withhold a rule-host answer whose enforcement missed its deadline while
     // the guard is blocking an unresolved link — handing it over is the leak
     // the guard exists to prevent.
@@ -3772,7 +3883,58 @@ fn build_dns_resolver_instance(
         "Mode B armed: local DNS resolver will bind 127.0.0.1:53 and forward non-rule \
          queries to an upstream that answered a probe",
     );
-    Some(DnsResolverService::new(listener, redirect, listen_addr))
+    Some(
+        DnsResolverService::new(listener, redirect, listen_addr)
+            // Namespaces other connections claim as their own. A corporate
+            // VPN announces its domain and its servers over DHCP, so the
+            // product can stay out of names it has no business answering —
+            // without asking the user for a domain they may not know.
+            .with_namespace_exemptions(Arc::new(claimed_namespaces)),
+    )
+}
+
+/// The namespaces the product must not answer for, read fresh on every call.
+///
+/// Two exclusions beyond the neutral rules. Our OWN tunnel never counts — a
+/// namespace pointed back at us is the loop this feature exists to break. And
+/// a claim from a connection the OS is not currently using is dropped: a
+/// disconnected VPN keeps its registry values, and honouring them would send
+/// a whole namespace to a resolver nothing can reach.
+fn claimed_namespaces() -> Vec<nrr_platform_api::dns_redirect::DnsNamespaceExemption> {
+    use nrr_platform_api::dns_scope::{is_actionable_scope, InterfaceDnsScopePort};
+    use nrr_platform_api::route_table::RouteTablePort;
+
+    let live = nrr_platform_windows::windows_api::ProductionWindowsApi
+        .get_adapter_infos()
+        .unwrap_or_default();
+    nrr_platform_windows::dns_scope::WindowsInterfaceDnsScopes
+        .dns_scopes()
+        .into_iter()
+        .filter(is_actionable_scope)
+        .filter_map(|scope| {
+            let adapter = live
+                .iter()
+                .find(|a| a.adapter_name.eq_ignore_ascii_case(&scope.adapter_id))?;
+            if nrr_platform_api::classify_availability(adapter)
+                != Some(nrr_platform_api::AdapterAvailability::Available)
+            {
+                return None;
+            }
+            if adapter
+                .description
+                .contains(nrr_shared::product_identity::PRODUCT_NAME)
+                || adapter
+                    .friendly_name
+                    .contains(nrr_shared::product_identity::PRODUCT_NAME)
+            {
+                return None;
+            }
+            Some(nrr_platform_api::dns_redirect::DnsNamespaceExemption {
+                suffix: scope.suffix,
+                servers: scope.servers,
+            })
+        })
+        .collect()
 }
 
 /// Resolves the absolute path to `NetRuleRouterTray.exe`. Used for the
@@ -3790,4 +3952,17 @@ fn resolve_tray_binary_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     parent.join("NetRuleRouterTray.exe")
+}
+
+/// Log what one enforcement recompute cost, phase by phase, when it was slow
+/// enough to matter.
+///
+/// The threshold exists because this hook fires every 30 s plus on every
+/// adapter change: a healthy sub-second pass logging its breakdown would bury
+/// the log in noise and teach everyone to filter the target out. A slow pass is
+/// the one worth a line, because it is the one that queues DNS answers and the
+/// GUI's own requests behind it.
+fn report_recompute_cost(timings: &nrr_service_runtime::phase_timings::PhaseTimings) {
+    const SLOW_PASS: std::time::Duration = std::time::Duration::from_secs(1);
+    nrr_service_runtime::phase_timings::report_if_slow(timings, "recompute", SLOW_PASS);
 }

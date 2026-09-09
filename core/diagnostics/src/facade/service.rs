@@ -143,6 +143,22 @@ pub trait DiagnosticsFacade: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// The same lines, kept in the files they were written to — what the
+    /// archive ships as its `service-logs/` directory.
+    ///
+    /// A day of logs is several rotated files, and the boundary between them is
+    /// how a reader navigates it; flattening them into one stream throws that
+    /// away. Scoping, budget and ordering match
+    /// [`recent_log_lines_raw`](Self::recent_log_lines_raw).
+    fn recent_log_files_raw(
+        &self,
+        _max_bytes: usize,
+        _from_ms: Option<i64>,
+        _audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<crate::logs::reader::RawLogFile>> {
+        Ok(Vec::new())
+    }
+
     /// Returns raw audit NDJSON lines VERBATIM — including the `prev_hash` /
     /// `event_hash` chain fields — for the newest events, up to `max_bytes`
     /// (a contiguous suffix of the chain so it stays independently verifiable).

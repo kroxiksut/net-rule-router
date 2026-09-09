@@ -70,6 +70,10 @@ pub struct FakeIpHealth {
     /// opening connections it never closes — both worth seeing before the
     /// user reports "some sites stopped loading".
     tcp_flows_refused_at_capacity: AtomicU64,
+    /// Times a TCP flow was visited by the splice pump. Divided by `ingress`
+    /// this is the per-packet cost of the pump — the number that says whether
+    /// the stack is servicing the flows with work or walking all of them.
+    tcp_flow_visits: AtomicU64,
 }
 
 impl FakeIpHealth {
@@ -112,6 +116,16 @@ impl FakeIpHealth {
     #[must_use]
     pub fn tcp_flows_refused_at_capacity(&self) -> u64 {
         self.tcp_flows_refused_at_capacity.load(Ordering::Relaxed)
+    }
+
+    /// One flow was visited by the splice pump.
+    pub fn record_flow_serviced(&self) {
+        self.tcp_flow_visits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn tcp_flow_visits(&self) -> u64 {
+        self.tcp_flow_visits.load(Ordering::Relaxed)
     }
 
     /// A TCP dial completed successfully.

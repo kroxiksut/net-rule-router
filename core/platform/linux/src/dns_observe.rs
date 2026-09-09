@@ -198,7 +198,7 @@ mod tests {
     /// Captured verbatim from `resolvectl monitor --json=short` on a live
     /// machine (systemd 255), so the parser is tested against the real shape
     /// rather than one imagined from documentation.
-    const LIVE_LINE: &str = r#"{"state":"success","question":[{"class":1,"type":1,"name":"example.com"},{"class":1,"type":28,"name":"example.com"}],"answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[172,66,147,243]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[104,20,23,154]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":28,"name":"example.com"},"address":[42,6,152,193,49,35,128,0,0,0,0,0,0,0,0,0]},"raw":"B2V4YW1wbGU=","ifindex":2}]}"#;
+    const LIVE_LINE: &str = r#"{"state":"success","question":[{"class":1,"type":1,"name":"example.com"},{"class":1,"type":28,"name":"example.com"}],"answer":[{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[23,10,20,160]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":1,"name":"example.com"},"address":[23,10,20,143]},"raw":"B2V4YW1wbGU=","ifindex":2},{"rr":{"key":{"class":1,"type":28,"name":"example.com"},"address":[42,6,152,193,49,35,128,0,0,0,0,0,0,0,0,0]},"raw":"B2V4YW1wbGU=","ifindex":2}]}"#;
 
     #[test]
     fn a_successful_answer_yields_the_name_and_its_v4_addresses() {
@@ -208,8 +208,8 @@ mod tests {
         assert_eq!(
             observation.ipv4s,
             vec![
-                Ipv4Addr::new(172, 66, 147, 243),
-                Ipv4Addr::new(104, 20, 23, 154)
+                Ipv4Addr::new(23, 10, 20, 160),
+                Ipv4Addr::new(23, 10, 20, 143)
             ],
         );
     }

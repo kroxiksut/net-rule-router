@@ -239,7 +239,7 @@ fn collect_qml_files(dir: &std::path::Path, out: &mut Vec<String>) {
 /// being one side of a comparison instead of the input to both.
 ///
 /// A dotted lowercase string is also how a file name and a hostname look, so
-/// the root check is what keeps `eula.en.md` and `notebooklm.google.com` out.
+/// the root check is what keeps `eula.en.md` and `docs.search.example` out.
 fn looks_like_locale_key(value: &str) -> bool {
     let mut parts = value.split('.');
     let Some(first) = parts.next() else {

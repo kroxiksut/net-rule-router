@@ -768,8 +768,8 @@ mod tests {
     #[test]
     fn allocation_is_stable_and_idempotent() {
         let mut alloc = FakeIpAllocator::default();
-        let first = alloc.allocate("ChatGPT.com.").expect("allocate");
-        let again = alloc.allocate("chatgpt.com").expect("allocate");
+        let first = alloc.allocate("Assistant.Example.").expect("allocate");
+        let again = alloc.allocate("assistant.example").expect("allocate");
         assert_eq!(first, again, "normalized hostname keeps its address");
         assert_eq!(alloc.len(), 1);
         // First hostname gets the first host index, never the adapter address.
@@ -780,8 +780,8 @@ mod tests {
     #[test]
     fn distinct_hostnames_get_distinct_addresses() {
         let mut alloc = FakeIpAllocator::default();
-        let a = alloc.allocate("chatgpt.com").expect("allocate");
-        let b = alloc.allocate("www.google.com").expect("allocate");
+        let a = alloc.allocate("assistant.example").expect("allocate");
+        let b = alloc.allocate("www.search.example").expect("allocate");
         assert_ne!(a.v4, b.v4, "no collateral: one address per hostname");
         assert_ne!(a.v6, b.v6);
     }
@@ -812,9 +812,9 @@ mod tests {
     fn addresses_outside_the_pool_are_not_fake() {
         let mut alloc = FakeIpAllocator::default();
         assert!(alloc.is_fake_address(ip("198.19.255.254")));
-        assert!(!alloc.is_fake_address(ip("142.250.74.78")));
+        assert!(!alloc.is_fake_address(ip("23.10.20.78")));
         assert!(!alloc.is_fake_address(ip("198.20.0.1")));
-        assert_eq!(alloc.domain_for_ip(ip("142.250.74.78")), None);
+        assert_eq!(alloc.domain_for_ip(ip("23.10.20.78")), None);
     }
 
     #[test]

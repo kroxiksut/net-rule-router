@@ -351,15 +351,16 @@ mod tests {
 
     #[test]
     fn a_mapped_fake_address_relays_to_the_real_host_on_its_route() {
-        let (allocator, fake) = allocator_with("chatgpt.com");
-        let resolver = StaticUpstreamResolver::new().with("chatgpt.com", &[ip("104.18.32.47")]);
+        let (allocator, fake) = allocator_with("assistant.example");
+        let resolver =
+            StaticUpstreamResolver::new().with("assistant.example", &[ip("23.10.20.140")]);
         let relay = core(allocator, resolver, RouteRole::Secondary);
 
         let decision = relay.decide(&packet(SocketAddr::new(fake, 443), true));
         match decision {
             RelayDecision::Relay { hostname, target } => {
-                assert_eq!(hostname, "chatgpt.com");
-                assert_eq!(target.address, "104.18.32.47:443".parse().ok());
+                assert_eq!(hostname, "assistant.example");
+                assert_eq!(target.address, "23.10.20.140:443".parse().ok());
                 assert_eq!(target.route, RouteRole::Secondary);
             }
             other => panic!("expected a relay decision, got {other:?}"),
@@ -403,9 +404,9 @@ mod tests {
 
     #[test]
     fn traffic_to_a_real_address_is_not_ours() {
-        let (allocator, _) = allocator_with("chatgpt.com");
+        let (allocator, _) = allocator_with("assistant.example");
         let relay = core(allocator, StaticUpstreamResolver::new(), RouteRole::Primary);
-        let decision = relay.decide(&packet("142.250.74.78:443".parse().expect("addr"), true));
+        let decision = relay.decide(&packet("23.10.20.78:443".parse().expect("addr"), true));
         assert_eq!(decision, RelayDecision::NotFakeAddress);
     }
 
@@ -414,7 +415,7 @@ mod tests {
         // A VPN client bound its in-tunnel API socket to our adapter by
         // mistake — the flow must be carried literally over the secondary
         // link, not reset.
-        let (allocator, _) = allocator_with("chatgpt.com");
+        let (allocator, _) = allocator_with("assistant.example");
         let relay = core(allocator, StaticUpstreamResolver::new(), RouteRole::Primary);
         for destination in ["10.117.0.1:80", "192.168.77.1:443", "100.64.0.1:80"] {
             let decision = relay.decide(&packet(destination.parse().expect("addr"), true));
@@ -492,7 +493,7 @@ mod tests {
     #[test]
     fn a_primary_routed_flow_never_pays_for_an_owner_lookup() {
         let (allocator, fake) = allocator_with("example.com");
-        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("93.184.216.34")]);
+        let resolver = StaticUpstreamResolver::new().with("example.com", &[ip("23.10.20.138")]);
         let relay = core(allocator, resolver, RouteRole::Primary)
             .with_vpn_client_bypass(Arc::new(NeverAsked));
         assert!(matches!(
@@ -503,7 +504,7 @@ mod tests {
 
     #[test]
     fn a_recycled_fake_address_is_dropped_not_guessed() {
-        let (allocator, _) = allocator_with("chatgpt.com");
+        let (allocator, _) = allocator_with("assistant.example");
         let relay = core(allocator, StaticUpstreamResolver::new(), RouteRole::Primary);
         // Inside the pool, but no hostname holds it.
         let stale = SocketAddr::new(ip("198.18.9.9"), 443);
@@ -515,12 +516,12 @@ mod tests {
 
     #[test]
     fn a_hostname_with_no_known_address_fails_closed() {
-        let (allocator, fake) = allocator_with("chatgpt.com");
+        let (allocator, fake) = allocator_with("assistant.example");
         let relay = core(allocator, StaticUpstreamResolver::new(), RouteRole::Primary);
         assert_eq!(
             relay.decide(&packet(SocketAddr::new(fake, 443), true)),
             RelayDecision::NoUpstreamAddress {
-                hostname: "chatgpt.com".to_string()
+                hostname: "assistant.example".to_string()
             }
         );
     }
@@ -540,17 +541,18 @@ mod tests {
 
     #[test]
     fn a_policy_change_that_excludes_the_host_stops_new_flows() {
-        let (allocator, fake) = allocator_with("chatgpt.com");
-        let resolver = StaticUpstreamResolver::new().with("chatgpt.com", &[ip("104.18.32.47")]);
+        let (allocator, fake) = allocator_with("assistant.example");
+        let resolver =
+            StaticUpstreamResolver::new().with("assistant.example", &[ip("23.10.20.140")]);
         let relay = RelayCore::new(
             allocator,
-            FakeIpScope::enabled(["chatgpt.com"]),
+            FakeIpScope::enabled(["assistant.example"]),
             Arc::new(resolver),
             Arc::new(FixedRouteSelector(RouteRole::Primary)),
         );
         match relay.decide(&packet(SocketAddr::new(fake, 443), true)) {
             RelayDecision::OutOfScope { hostname, reason } => {
-                assert_eq!(hostname, "chatgpt.com");
+                assert_eq!(hostname, "assistant.example");
                 assert_eq!(reason, "excluded-host");
             }
             other => panic!("expected out-of-scope, got {other:?}"),

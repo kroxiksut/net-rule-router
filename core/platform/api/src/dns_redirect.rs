@@ -11,9 +11,26 @@
 //!   the registry in one transaction (in `nrr-platform-windows`).
 //! - **Linux / macOS** — systemd-resolved / `resolv.conf`, `scutil` (future).
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use crate::error::PlatformError;
+
+/// A namespace the product steps out of, and who answers for it instead.
+///
+/// A catch-all redirect captures names the machine's OTHER resolvers own —
+/// a corporate VPN's internal domain being the case that matters. Asking a
+/// public resolver for such a name yields "no such name", and the product
+/// becomes the reason a working VPN cannot reach its own hosts.
+///
+/// An exemption says: these names are not ours. The OS resolves them the way
+/// it would if the product were not installed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DnsNamespaceExemption {
+    /// Lower-cased namespace with no leading or trailing dot.
+    pub suffix: String,
+    /// Servers that answer for it, in the order the OS listed them.
+    pub servers: Vec<Ipv4Addr>,
+}
 
 /// Opaque, persistable handle to an active redirect. Persist it so a restart —
 /// even after a crash — can `restore` the OS to its prior DNS configuration and
@@ -64,5 +81,22 @@ pub trait SystemDnsRedirectPort: Send + Sync {
     /// a warm cache silently bypasses the resolver on activation.
     fn flush_cache(&self) -> Result<(), PlatformError> {
         Ok(())
+    }
+
+    /// Step out of the way for `exemptions`, replacing any previous set.
+    ///
+    /// Called whenever the machine's connections change, with the CURRENT
+    /// full set — an empty slice therefore means "claim everything again",
+    /// which is what a disconnected VPN must produce. Returns how many are
+    /// in force, so the caller can log a change rather than a state.
+    ///
+    /// Default: none, and none in force. A platform whose redirect cannot be
+    /// narrowed keeps the behaviour it had.
+    fn exempt_namespaces(
+        &self,
+        exemptions: &[DnsNamespaceExemption],
+    ) -> Result<usize, PlatformError> {
+        let _ = exemptions;
+        Ok(0)
     }
 }

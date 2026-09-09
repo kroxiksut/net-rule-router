@@ -1012,18 +1012,18 @@ mod tests {
     fn a_rotated_out_address_is_withheld_while_the_confirmed_one_is_kept() {
         let store = confirmation_store();
         let now = SystemTime::now();
-        let rotated = Ipv4Addr::new(209, 85, 233, 188);
-        let current = Ipv4Addr::new(142, 250, 1, 1);
+        let rotated = Ipv4Addr::new(23, 10, 20, 165);
+        let current = Ipv4Addr::new(23, 10, 20, 147);
         let yesterday = now
             .checked_sub(Duration::from_secs(26 * 60 * 60))
             .expect("clock past the epoch");
-        seed(&store, "aistudio.google.com", rotated, yesterday);
-        seed(&store, "aistudio.google.com", current, now);
+        seed(&store, "aistudio.search.example", rotated, yesterday);
+        seed(&store, "aistudio.search.example", current, now);
 
         let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
         let adapter = SqliteFqdnCacheLookup::new(cache, FreshnessThresholds::default_production());
         assert_eq!(
-            adapter.ips_for_hostname("aistudio.google.com"),
+            adapter.ips_for_hostname("aistudio.search.example"),
             vec![current],
             "the address confirmed today enforces; yesterday's does not"
         );

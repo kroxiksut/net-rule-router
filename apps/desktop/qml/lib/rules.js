@@ -43,7 +43,7 @@ function canonicalRuleTypeSlug(ruleType) {
 
 // Dedup key for import-merge: two rows collide when their type, lowercased
 // match value, and target route all match. The type is folded first — without
-// that, importing `suffix-domain|habr.ru` next to `domain|habr.ru` kept both,
+// that, importing `suffix-domain|site.example` next to `domain|site.example` kept both,
 // and the two then shared one comment row in the sidecar.
 function mergeKey(row) {
     return canonicalRuleTypeSlug(row.ruleType) + "|" +
@@ -243,9 +243,9 @@ function canonicalRulesBody(text) {
 // Map a host match value to its canonical address-match DTO, honoring the `*.`
 // prefix the service round-trips for suffix rules. The service emits BOTH host
 // kinds under rule-type "domain", distinguished only by the prefix —
-// ("domain","*.youtube.com") for SuffixDomain and ("domain","youtube.com") for
+// ("domain","*.video.example") for SuffixDomain and ("domain","video.example") for
 // ExactFqdn — so every rules-json builder must decode it here. Skipping this
-// collapses `*.youtube.com` into a dead ExactFqdn (a literal that matches no
+// collapses `*.video.example` into a dead ExactFqdn (a literal that matches no
 // host).
 function hostAddressMatchDto(value) {
     var v = String(value || "")

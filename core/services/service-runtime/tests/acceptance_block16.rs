@@ -131,40 +131,112 @@ use std::collections::HashSet;
 
 // ── Gate 1: catalog consistency ──────────────────────────────────────────────
 
-/// The wire-stable IPC catalog includes read-only export ops, cache
-/// management (`cache.clear`, `cache.entries.list`), DoH resolver
-/// configuration (`doh.resolvers.get`/`.set`), browser-history rule
-/// seeding (`diagnostics.seed-from-browser-history`), the file<->service
-/// rules merge preview (`rules.merge-preview`), the connection-trace
-/// panel (`conn-trace.entries.list`), the extended-diagnostics mode
-/// toggle (`diagnostics.mode.set`), log/audit retention settings
-/// (`settings.log-retention.{get,set}`), the per-SID link-provider app
-/// set behind the kill-switch exemption (`route.link-provider.set`),
-/// the licenses window (`third-party.components.list`), the traffic
-/// counter (`traffic-stats.{get,set,clear}`), and the autorules
-/// companion-domain suggestions the tray offers
-/// (`autorules.candidates.{list,accept,dismiss}`), the dismissed-suggestion
-/// shelf (`autorules.dismissed.{list,restore}`, `autorules.candidates.forget`)
-/// and the blocked-connection notices the tray raises
-/// (`block-notices.mutes.{list,set,remove,clear}`,
-/// `block-notices.route-to-secondary`), plus the local networks a user may keep
-/// reachable under the kill-switch (`settings.local-networks.{get,set}`) and the
-/// on-demand main-route check (`autorules.candidates.probe`) plus the mark for a
-/// site that refuses main-link addresses (`autorules.refusing-anchor.set`) and
-/// the backlog a surface drains when it comes up
-/// (`block-notices.journal.{list,ack}`).
+/// Every operation the service will answer, pinned.
+///
+/// This is the whole surface an unelevated client can reach in a process
+/// running as LocalSystem, so growing it is a decision, not a detail. The list
+/// is what makes it one: a new variant in `IpcOperationName::ALL` fails this
+/// test until somebody writes its slug here.
+///
+/// It replaced a pinned COUNT, which could not see an operation removed and
+/// another added in the same change — and a prose comment that tried to
+/// enumerate the catalog and had drifted to naming 33 of 70.
+const PINNED_OPERATION_SLUGS: [&str; 70] = [
+    "audit.list",
+    "autorules.candidates.accept",
+    "autorules.candidates.dismiss",
+    "autorules.candidates.forget",
+    "autorules.candidates.list",
+    "autorules.candidates.probe",
+    "autorules.dismissed.list",
+    "autorules.dismissed.restore",
+    "autorules.refusing-anchor.set",
+    "autostart.get",
+    "autostart.toggle",
+    "block-notices.journal.ack",
+    "block-notices.journal.list",
+    "block-notices.mutes.clear",
+    "block-notices.mutes.list",
+    "block-notices.mutes.remove",
+    "block-notices.mutes.set",
+    "block-notices.route-to-secondary",
+    "cache.clear",
+    "cache.entries.list",
+    "conn-trace.entries.list",
+    "contract.negotiate",
+    "diagnostics.explain.get",
+    "diagnostics.export-archive",
+    "diagnostics.mode.set",
+    "diagnostics.seed-from-browser-history",
+    "doh.resolvers.get",
+    "doh.resolvers.set",
+    "interfaces.refresh.request",
+    "logs.clear",
+    "logs.list",
+    "migration.mark.complete",
+    "migration.status.get",
+    "mutation.submit",
+    "operation.status.get",
+    "preset.export.get",
+    "principal-data.count",
+    "principal-data.purge",
+    "product-impact.disable.temporary",
+    "revision.rollback.request",
+    "route.link-provider.set",
+    "route.policy.update",
+    "routing.pause.get",
+    "routing.pause.toggle",
+    "rules.list",
+    "rules.merge-preview",
+    "security.alerts.list",
+    "service.health.get",
+    "settings.apply-failure-policy.get",
+    "settings.apply-failure-policy.set",
+    "settings.export.full",
+    "settings.local-networks.get",
+    "settings.local-networks.set",
+    "settings.log-retention.get",
+    "settings.log-retention.set",
+    "settings.retention.get",
+    "settings.retention.set",
+    "settings.service-stability.get",
+    "settings.service-stability.set",
+    "snapshot.diagnostics.get",
+    "snapshot.initial.get",
+    "snapshot.interfaces.get",
+    "status.updates.poll",
+    "status.updates.subscribe",
+    "storage.usage.get",
+    "third-party.components.list",
+    "traffic-stats.clear",
+    "traffic-stats.get",
+    "traffic-stats.history-merge.set",
+    "traffic-stats.set",
+];
+
 /// The catalog must list every variant in `IpcOperationName::ALL` exactly
-/// once, with unique kebab-case slugs.
+/// once, with unique kebab-case slugs, and that set must be the pinned one.
 #[test]
-fn block16_catalog_size_is_pinned_and_slugs_are_unique() {
+fn block16_catalog_is_pinned_and_slugs_are_unique() {
+    let pinned: HashSet<&'static str> = PINNED_OPERATION_SLUGS.into_iter().collect();
     assert_eq!(
-        IpcOperationName::ALL.len(),
-        69,
-        "block 16 catalog size has drifted — update the gate test if intentional"
+        pinned.len(),
+        PINNED_OPERATION_SLUGS.len(),
+        "the pinned list itself contains a duplicate"
     );
+    let live: HashSet<&'static str> = IpcOperationName::ALL.iter().map(|op| op.slug()).collect();
+    let added: Vec<&str> = live.difference(&pinned).copied().collect();
+    let removed: Vec<&str> = pinned.difference(&live).copied().collect();
+    assert!(
+        added.is_empty() && removed.is_empty(),
+        "the IPC surface changed: added {added:?}, removed {removed:?}. Add or delete the slug in PINNED_OPERATION_SLUGS to say the change was meant.",
+    );
+    // Against `ALL`, not against a second literal: two pinned numbers cannot
+    // disagree with each other, which is precisely what this assertion claims
+    // to check.
     assert_eq!(
         ipc_operation_catalog().len(),
-        69,
+        IpcOperationName::ALL.len(),
         "catalog spec count must match `ALL` count"
     );
     let mut slugs: HashSet<&'static str> = HashSet::new();

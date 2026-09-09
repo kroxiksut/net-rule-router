@@ -502,6 +502,11 @@ fn fixed_operation_class(op: IpcOperationName) -> IpcOperationClass {
         // carry no user dimension, so this erases everyone's history — and the
         // caller must hold the rights to decide that for everyone.
         IpcOperationName::TrafficStatsClear => IpcOperationClass::MachineScopedAction,
+        // Joining one connection's history to another rewrites how the same
+        // machine-wide ledger reads for everyone, so it travels beside the wipe
+        // rather than beside a per-user preference. A REFUSAL is stored too and
+        // takes the same route — it is the same decision, answered the other way.
+        IpcOperationName::TrafficHistoryMergeSet => IpcOperationClass::MachineScopedAction,
         // Probing the caller's own suggestions writes evidence about them, not
         // policy — but it is still a per-SID action the service performs on the
         // caller's behalf, so it travels the same envelope as their other

@@ -459,6 +459,12 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     )
                     .with_binding_heal_persist(binding_heal_persist)
                     .with_binding_anchor_persist(binding_anchor_persist)
+                    // Tells "the adapter was removed" apart from "the adapter
+                    // is here and its driver will not start" — the enumeration
+                    // reports both as nothing, and they need opposite advice.
+                    .with_device_status(Arc::new(
+                        nrr_platform_windows::device_status::WindowsNetworkDeviceStatus,
+                    ))
                     .with_local_network_policy(local_network_policy)
                     .with_bootstrap_server_persistence(server_ip_persist, server_ip_loader)
                     .with_pause_state(pause_reader)
@@ -690,6 +696,16 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     .with_secondary_ready({
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move |sid: &str| coord.resolve_egress_ifindexes(sid).1.is_some())
+                    })
+                    // What the main link currently does with a host, by
+                    // name. An offer a host made about ITSELF is parked
+                    // once and never rebuilt from the ledger, so this is
+                    // its only way to learn that the site started working
+                    // — and the offer is withdrawn when it does.
+                    .with_primary_behavior_source({
+                        let stalls =
+                            nrr_service_runtime::primary_stall_registry::global_primary_stalls();
+                        Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
                     }),
                 );
                 let observe_consumer = Arc::new(
@@ -736,7 +752,13 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                     // The observations this consumer discards are
                     // the companion candidates. Feeding them costs one hash
                     // insert per observation on a drain that already runs.
-                    .with_auto_rules(Arc::clone(&auto_rules_engine)),
+                    .with_auto_rules(Arc::clone(&auto_rules_engine))
+                    // The same discarded observations, kept as names so
+                    // the connection observer can say WHICH host is
+                    // failing on the main link. Diagnostic only.
+                    .with_observed_host_names(
+                        nrr_service_runtime::observed_host_names::global_observed_host_names(),
+                    ),
                 );
                 // Per-filter apply-failure mode tracks the admin's stored
                 // `ApplyFailurePolicy` (Settings → Routing behavior). Read

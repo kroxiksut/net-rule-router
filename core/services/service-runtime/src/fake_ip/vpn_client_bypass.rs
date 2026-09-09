@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use nrr_platform_api::MockFlowOwnerLookup;
 
-    const HIDEMY: &str = r"C:\Program Files\hidemy.name VPN 3.0\hidemy.name VPN 3.0.exe";
+    const VPN_CLIENT: &str = r"C:\Program Files\SwiftVPN 3.0\swiftvpn 3.0.exe";
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().expect("addr")
@@ -163,9 +163,9 @@ mod tests {
         let client = addr("10.88.1.41:51000");
         let fake = addr("198.18.0.7:443");
         let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "hidemy.name vpn 3.0.exe");
+        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
         assert!(gate.owned_by_confirmed_client(client, fake));
@@ -178,7 +178,7 @@ mod tests {
         let owner = MockFlowOwnerLookup::new();
         owner.set_owner(client, fake, "chrome.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
         assert!(!gate.owned_by_confirmed_client(client, fake));
@@ -194,7 +194,7 @@ mod tests {
         let owner = MockFlowOwnerLookup::new();
         owner.set_owner(client, fake, "somevpn.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
 
         let gate = bypass(Arc::new(owner), confirmed);
         assert!(!gate.owned_by_confirmed_client(client, fake));
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn an_unknown_owner_keeps_todays_routing() {
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         // No entries → the lookup answers None (the row vanished / no rights).
         let gate = bypass(Arc::new(MockFlowOwnerLookup::new()), confirmed);
         assert!(!gate.owned_by_confirmed_client(addr("10.88.1.41:51004"), addr("198.18.0.11:443")));
@@ -229,9 +229,9 @@ mod tests {
         let client = addr("10.88.1.41:51005");
         let fake = addr("198.18.0.12:443");
         let owner = MockFlowOwnerLookup::new();
-        owner.set_owner(client, fake, "hidemy.name vpn 3.0.exe");
+        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[HIDEMY.to_string()]);
+        confirmed.publish("S-1-5-21-1", &[VPN_CLIENT.to_string()]);
         // A very long floor makes the second call deterministically declined.
         let gate = OwnerLookupVpnClientBypass::new(Arc::new(owner), confirmed)
             .with_min_probe_interval(Duration::from_secs(3600));

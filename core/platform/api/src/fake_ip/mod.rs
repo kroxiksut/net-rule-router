@@ -3,7 +3,7 @@
 //! Fake-IP hands every rule-host its **own** address out of a reserved pool
 //! instead of the provider's real answer, so routing and the kill-switch become
 //! exactly per-hostname. That removes the collateral damage of shared CDN
-//! addresses (`chatgpt.com` and unrelated hosts share one Google front-end IP,
+//! addresses (`assistant.example` and unrelated hosts share one Google front-end IP,
 //! so pinning the IP either over- or under-blocks) and removes the
 //! dependency on the provider's DNS being honest — without terminating TLS.
 //!

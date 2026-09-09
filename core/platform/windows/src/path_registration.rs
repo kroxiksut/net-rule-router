@@ -35,9 +35,9 @@
 use std::path::PathBuf;
 
 use nrr_platform_api::path_registration::{
-    decide_path_registration, PathDecision, PathListStyle, PathRegistrationError,
-    PathRegistrationPlan, PathRegistrationPort, PathRegistrationReport, PathRegistrationRequest,
-    PathRegistrationStep, PathScope,
+    decide_path_registration, decide_path_removal, PathDecision, PathListStyle,
+    PathRegistrationError, PathRegistrationPlan, PathRegistrationPort, PathRegistrationReport,
+    PathRegistrationRequest, PathRegistrationStep, PathRemovalDecision, PathRemovalPlan, PathScope,
 };
 
 /// Registry sub-key holding the per-user environment block. The
@@ -157,6 +157,55 @@ impl<S: UserEnvironmentStore> PathRegistrationPort for WindowsUserPathRegistrati
         plan: &PathRegistrationPlan,
     ) -> Result<PathRegistrationReport, PathRegistrationError> {
         Self::check_scope(plan.scope)?;
+        self.run_steps(&plan.steps)
+    }
+
+    fn plan_removal(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<PathRemovalPlan, PathRegistrationError> {
+        Self::check_scope(request.scope)?;
+        // The USER hive, never the composed `PATH`: a directory reachable only
+        // because the machine-wide list names it is not ours, and a removal
+        // here could not take it off anyway.
+        let stored = self.store.read_path()?;
+        let current = stored.as_ref().map(|v| v.text.as_str()).unwrap_or("");
+        let decision = decide_path_removal(current, &request.directory, self.style())?;
+        let steps = match &decision {
+            PathRemovalDecision::NotPresent => Vec::new(),
+            PathRemovalDecision::Remove { updated_list } => vec![
+                PathRegistrationStep::SetUserEnvironmentVariable {
+                    name: PATH_VALUE_NAME.to_string(),
+                    value: updated_list.clone(),
+                },
+                PathRegistrationStep::AnnounceEnvironmentChange,
+            ],
+        };
+        Ok(PathRemovalPlan {
+            directory: request.directory.clone(),
+            scope: request.scope,
+            decision,
+            steps,
+        })
+    }
+
+    fn apply_removal(
+        &self,
+        plan: &PathRemovalPlan,
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
+        Self::check_scope(plan.scope)?;
+        self.run_steps(&plan.steps)
+    }
+}
+
+impl<S: UserEnvironmentStore> WindowsUserPathRegistration<S> {
+    /// Write the steps of either plan. Adding and removing differ only in the
+    /// value the decision produced, so the write path — including preserving
+    /// `REG_EXPAND_SZ` — is deliberately one piece of code.
+    fn run_steps(
+        &self,
+        steps: &[PathRegistrationStep],
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
         // The stored type is read back here rather than carried in the plan: the
         // plan is a neutral value, and `REG_EXPAND_SZ` is a registry detail that
         // has no meaning in it.
@@ -169,7 +218,7 @@ impl<S: UserEnvironmentStore> PathRegistrationPort for WindowsUserPathRegistrati
             .unwrap_or(true);
 
         let mut changed = false;
-        for step in &plan.steps {
+        for step in steps {
             match step {
                 PathRegistrationStep::SetUserEnvironmentVariable { name, value } => {
                     if !name.eq_ignore_ascii_case(PATH_VALUE_NAME) {
@@ -190,9 +239,10 @@ impl<S: UserEnvironmentStore> PathRegistrationPort for WindowsUserPathRegistrati
                     // a missed broadcast only costs the user a new shell.
                     let _ = self.store.announce_change();
                 }
-                PathRegistrationStep::AppendShellProfileLine { .. } => {
+                PathRegistrationStep::AppendShellProfileLine { .. }
+                | PathRegistrationStep::RemoveShellProfileBlock { .. } => {
                     return Err(PathRegistrationError::Unsupported {
-                        detail: "Windows has no shell start-up file to append to".to_string(),
+                        detail: "Windows has no shell start-up file to edit".to_string(),
                     });
                 }
             }
@@ -591,6 +641,60 @@ mod tests {
         let port = WindowsUserPathRegistration::new(FakeStore::with(r"C:\Windows", false));
         port.register(&request()).expect("register");
         assert!(!port.store.stored().expect("value written").expandable);
+    }
+
+    #[test]
+    fn removing_takes_our_entry_off_and_announces() {
+        let port = WindowsUserPathRegistration::new(FakeStore::with(
+            r"C:\Windows;C:\Program Files\NetRuleRouter;C:\Tools",
+            false,
+        ));
+        let report = port.unregister(&request()).expect("unregister");
+
+        assert!(report.changed);
+        assert!(report.restart_shell_required);
+        let stored = port.store.stored().expect("value written");
+        assert_eq!(stored.text, r"C:\Windows;C:\Tools");
+        assert_eq!(port.store.announcements(), 1);
+    }
+
+    #[test]
+    fn removing_preserves_the_stored_value_type() {
+        // Same rule as registration: demoting REG_EXPAND_SZ would turn every
+        // `%VAR%` entry on the user's own list into a directory that does not
+        // exist — and a REMOVAL doing that would be the last place they'd look.
+        let port = WindowsUserPathRegistration::new(FakeStore::with(
+            r"%USERPROFILE%\bin;C:\Program Files\NetRuleRouter",
+            true,
+        ));
+        port.unregister(&request()).expect("unregister");
+        let stored = port.store.stored().expect("value written");
+        assert!(
+            stored.expandable,
+            "REG_EXPAND_SZ must survive a removal too"
+        );
+        assert_eq!(stored.text, r"%USERPROFILE%\bin");
+    }
+
+    #[test]
+    fn removing_what_is_not_ours_writes_nothing() {
+        let port = WindowsUserPathRegistration::new(FakeStore::with(r"C:\Windows", false));
+        let report = port.unregister(&request()).expect("unregister");
+        assert!(!report.changed);
+        assert_eq!(port.store.stored().expect("untouched").text, r"C:\Windows");
+        assert_eq!(port.store.announcements(), 0, "nothing changed to announce");
+    }
+
+    #[test]
+    fn the_button_state_follows_the_user_hive() {
+        // `owned_entry_present` is what the remove button is driven by, so it
+        // must answer from the store we write — not from this process's PATH.
+        let port = WindowsUserPathRegistration::new(FakeStore::with(r"C:\Windows", false));
+        assert!(!port.owned_entry_present(&request()).expect("before"));
+        port.register(&request()).expect("register");
+        assert!(port.owned_entry_present(&request()).expect("after add"));
+        port.unregister(&request()).expect("unregister");
+        assert!(!port.owned_entry_present(&request()).expect("after remove"));
     }
 
     #[test]

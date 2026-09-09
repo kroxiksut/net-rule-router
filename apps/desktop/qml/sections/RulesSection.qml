@@ -18,6 +18,14 @@ ColumnLayout {
     property string sortBy: "by-display-order"
     property string sortDir: "asc"
     property string filterEnabled: "all"
+    /// How many rules the backend validator refuses, across the WHOLE set —
+    /// not just the rows the current filter shows.
+    ///
+    /// Counted in the pass that rebuilds the display, so it costs nothing extra
+    /// and cannot go stale while the table is right. Imported rows carry the
+    /// same verdict roles as rows read back from the service, so one number
+    /// covers both origins.
+    property int invalidRuleCount: 0
     property string filterType: "all"
     property string filterRoute: "all"      // фильтр по маршруту
     /// Show only rules the service authored (they carry an origin tag; a rule
@@ -127,8 +135,12 @@ ColumnLayout {
         if (typeof displayModel === "undefined" || displayModel === null
                 || !root.rulesModel) return
         var arr = []
+        var invalid = 0
         for (var i = 0; i < root.rulesModel.count; i += 1) {
             var entry = root.rulesModel.get(i)
+            // Before the filter, deliberately: the count answers "how much of
+            // my set will not apply", which the current filter must not change.
+            if (String(entry.validationStatus || "valid") === "error") invalid += 1
             if (!section.passesFilter(entry)) continue
             var snapshot = {}
             var keys = Object.keys(entry)
@@ -153,6 +165,7 @@ ColumnLayout {
             snapshot.masterIndex = i
             arr.push(snapshot)
         }
+        section.invalidRuleCount = invalid
         arr.sort(compareRules)
         displayModel.clear()
         // Single append for the whole snapshot — see `_appendRowsChunked` in
@@ -1032,6 +1045,25 @@ ColumnLayout {
         ThemedButton {
             theme: root.uiTheme
             Layout.fillWidth: true
+            // The question "why did this go out the wrong way" is asked over
+            // the rule table; the answer lives in Diagnostics.
+            text: root.tr("rules.action.where-traffic-goes", "Where traffic is going")
+            icon.source: root.uiIconSource("diagnostics")
+            ToolTip.visible: hovered && root.prefs.tooltipsEnabled
+            ToolTip.text: root.tr("rules.action.where-traffic-goes-tooltip",
+                "Opens the connection trace: which application reached which destination, and over which connection it actually left.")
+            Accessible.role: Accessible.Button
+            Accessible.name: text
+            Accessible.description: ToolTip.text
+            // Through the unsaved-changes guard: the rule table is often
+            // dirty, and assigning the section directly would skip the ask.
+            onClicked: root.requestSectionChange("diagnostics", function() {
+                root.diagOpenConnTrace = true
+            })
+        }
+        ThemedButton {
+            theme: root.uiTheme
+            Layout.fillWidth: true
             text: root.tr("action.delete", "Delete")
             icon.source: root.uiIconSource("delete")
             enabled: root.selectedRule >= 0 && !section.rulesLocked
@@ -1752,6 +1784,36 @@ ColumnLayout {
         if (typeof root.reviewFlowController.startRulesReviewFlow === "function") {
             root.reviewFlowController.startRulesReviewFlow(
                 rulesJson, contentHash, true /* adminBaseline */, "set-baseline")
+        }
+    }
+
+    // Rules the service would refuse. The table paints them red one by one,
+    // which only helps a reader already looking at the right row — after an
+    // import of several hundred rules the bad ones are usually off screen. The
+    // button is the answer to "which ones": it drives the filter that already
+    // exists, rather than adding a second way to find them.
+    RowLayout {
+        Layout.fillWidth: true
+        visible: section.invalidRuleCount > 0
+        spacing: root.uiTheme.spacingSm
+        Label {
+            Layout.fillWidth: true
+            Layout.preferredWidth: 0
+            wrapMode: Text.Wrap
+            color: root.uiTheme.colorDanger
+            text: root.tr("rules.invalid-count",
+                    "{n} rule(s) will not be applied: the value is not valid.")
+                .replace("{n}", String(section.invalidRuleCount))
+            Accessible.role: Accessible.StaticText
+            Accessible.name: text
+        }
+        ThemedButton {
+            theme: root.uiTheme
+            visible: section.filterEnabled !== "with-errors"
+            text: root.tr("rules.invalid-count-show", "Show them")
+            onClicked: section.filterEnabled = "with-errors"
+            Accessible.role: Accessible.Button
+            Accessible.name: text
         }
     }
 

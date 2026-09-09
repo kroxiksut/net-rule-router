@@ -145,7 +145,7 @@ mod tests {
             },
             principal: PrincipalScope(None),
             app: AppScope::Program {
-                key: "telegram".into(),
+                key: "messenger".into(),
                 exe_paths: Vec::new(),
             },
             egress: EgressConstraint::OnlyVia(EgressRef::Secondary),

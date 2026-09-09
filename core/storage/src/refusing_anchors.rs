@@ -93,14 +93,16 @@ mod tests {
     fn a_mark_round_trips_per_principal_and_however_it_was_typed() {
         let c = conn();
         let repo = RefusingAnchorsRepository::new(&c);
-        assert!(repo.set("S-A", "ChatGPT.com.", true, 1).expect("mark"));
+        assert!(repo
+            .set("S-A", "Assistant.Example.", true, 1)
+            .expect("mark"));
         assert_eq!(
             repo.list_for_sid("S-A").expect("read"),
-            vec!["chatgpt.com".to_string()]
+            vec!["assistant.example".to_string()]
         );
         assert!(repo.list_for_sid("S-B").expect("read").is_empty());
         // Marking again is a harmless rewrite, not a duplicate.
-        assert!(repo.set("S-A", "chatgpt.com", true, 2).expect("mark"));
+        assert!(repo.set("S-A", "assistant.example", true, 2).expect("mark"));
         assert_eq!(repo.list_for_sid("S-A").expect("read").len(), 1);
     }
 

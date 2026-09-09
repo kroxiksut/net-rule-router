@@ -199,6 +199,10 @@ const PLATFORM_INFRASTRUCTURE_SUFFIXES: &[&str] = &[
     "firebaseio.com",
     "crashlytics.com",
     "doubleclick.net",
+    "googlesyndication.com",
+    "googletagservices.com",
+    "googletagmanager.com",
+    "scorecardresearch.com",
     "sentry.io",
     "segment.io",
     "segment.com",
@@ -470,7 +474,7 @@ mod tests {
         let owner = MockFlowOwnerLookup::new();
         let client = addr("10.0.0.2:51000");
         let tunnel = addr("10.117.0.1:80");
-        owner.set_owner(client, tunnel, "hidemy.name vpn 3.0.exe");
+        owner.set_owner(client, tunnel, "swiftvpn 3.0.exe");
         let ex = RuntimeHostExclusions::new();
         let flush = || panic!("must not flush the OS resolver cache for a literal address");
 
@@ -505,7 +509,7 @@ mod tests {
             &flush,
             client,
             fake,
-            "chatgpt.com",
+            "assistant.example",
         );
         assert_eq!(healed, HealVerdict::Settled);
         assert!(ex.is_empty());
@@ -519,7 +523,7 @@ mod tests {
         let owner = MockFlowOwnerLookup::new();
         let client = addr("10.0.0.2:51000");
         let fake = addr("198.18.0.11:443");
-        owner.set_owner(client, fake, "hidemy.name vpn 3.0.exe");
+        owner.set_owner(client, fake, "swiftvpn 3.0.exe");
         let ex = RuntimeHostExclusions::new();
         let flush = || panic!("must not flush for platform infrastructure");
 
@@ -561,7 +565,7 @@ mod tests {
             &flush,
             addr("10.0.0.2:51000"),
             addr("198.18.0.7:443"),
-            "chatgpt.com",
+            "assistant.example",
         );
         // NOT `Settled`: the connection-table row can vanish before it is read,
         // and one unlucky first flow must not retire the host for the session.

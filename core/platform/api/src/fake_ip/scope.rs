@@ -200,7 +200,7 @@ mod tests {
         let scope = FakeIpScope::default();
         assert!(!scope.is_enabled());
         assert_eq!(
-            scope.decide("chatgpt.com", None),
+            scope.decide("assistant.example", None),
             FakeIpVerdict::RealIp(RealIpReason::FeatureDisabled)
         );
         assert_eq!(FakeIpScope::disabled(), FakeIpScope::default());
@@ -209,7 +209,10 @@ mod tests {
     #[test]
     fn enabled_scope_covers_ordinary_hosts() {
         let scope = FakeIpScope::enabled(Vec::<String>::new());
-        assert_eq!(scope.decide("chatgpt.com", None), FakeIpVerdict::FakeIp);
+        assert_eq!(
+            scope.decide("assistant.example", None),
+            FakeIpVerdict::FakeIp
+        );
         assert!(scope.decide("Www.Google.com.", None).is_fake_ip());
         // A hypervisor's guest traffic is explicitly in scope.
         assert!(scope
@@ -253,7 +256,7 @@ mod tests {
     fn literals_and_local_names_keep_real_addresses() {
         let scope = FakeIpScope::enabled(Vec::<String>::new());
         assert_eq!(
-            scope.decide("142.250.74.78", None),
+            scope.decide("23.10.20.78", None),
             FakeIpVerdict::RealIp(RealIpReason::LiteralAddress)
         );
         assert_eq!(

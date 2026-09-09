@@ -472,11 +472,27 @@ SystemTrayIcon {
         return ""
     }
 
+    /// Is this offer one the host made about ITSELF? Such a row has no site
+    /// it belongs to — printing the arrow anyway rendered as "this site
+    /// needs itself", which is not a thing anyone can act on.
+    ///
+    /// Read from the signal, with the structural check as a backstop: the
+    /// slugs are pinned in `nrr-shared::ipc_payloads`, and a slug added
+    /// there without reaching here must still not produce that row.
+    function _isSelfSigned(c) {
+        var signal = String((c || {}).signal || (c || {})["signal"] || "")
+        if (["isp-block-page", "placeholder-answer", "main-link-blocked"]
+                .indexOf(signal) >= 0) return true
+        var candidateAnchor = String((c || {}).anchor || (c || {})["anchor"] || "")
+        var match = String((c || {})["proposed-match"] || (c || {}).proposedMatch || "")
+        return candidateAnchor !== "" && candidateAnchor === match
+    }
+
     /// Row subtitle: the site the address was seen with, plus the route when
     /// one notice mixes sites that do not share one.
-    function _companionRowSubtitle(candidateAnchor, routeSlug) {
+    function _companionRowSubtitle(candidateAnchor, routeSlug, selfSigned) {
         var parts = []
-        if (candidateAnchor !== "") {
+        if (candidateAnchor !== "" && !selfSigned) {
             parts.push(tr("tray.auto-rules.item-companion-short", "← {name}")
                 .replace("{name}", candidateAnchor))
         }
@@ -524,9 +540,13 @@ SystemTrayIcon {
         // Anchors of the rows actually SHOWN. The push event's `top-anchor` is
         // not usable for the heading: the list is fetched whole, so it routinely
         // contains companions of other sites — a notice headed
-        // "notebooklm.google.com" listed rows belonging to chatgpt.com and
+        // "docs.search.example" listed rows belonging to assistant.example and
         // reddit.com. The heading is derived from what the user can see.
         var anchorCounts = ({})
+        // How many of the shown rows are offers a host made about itself.
+        // When that is all of them the notice is about sites that do not
+        // open, not about addresses some other site needs.
+        var selfSignedCount = 0
         // Group by site so rows of one site sit together; ties break on the
         // name, so the same set always lists in the same order.
         var ordered = (candidates || []).slice().sort(function(a, b) {
@@ -544,7 +564,12 @@ SystemTrayIcon {
                     ? noticeLedger.isDecided(_autoRuleRefusedId(id))
                     : _autoRuleAnswered(id)) continue
             var candidateAnchor = String(c.anchor || c["anchor"] || "")
-            if (candidateAnchor !== "") {
+            var selfSigned = _isSelfSigned(c)
+            if (selfSigned) selfSignedCount += 1
+            // A host that signed its own offer is not a site whose
+            // companions are being listed, so it must not become the
+            // heading — that is what read as "this site needs itself".
+            if (candidateAnchor !== "" && !selfSigned) {
                 anchorCounts[candidateAnchor] = Number(anchorCounts[candidateAnchor] || 0) + 1
             }
             var candidateRoute = String(c.route || c["route"] || "")
@@ -555,7 +580,7 @@ SystemTrayIcon {
             items.push({
                 primaryText: String(c["proposed-match"] || c.proposedMatch || ""),
                 secondaryText: _companionRowSubtitle(
-                    candidateAnchor, routes.length > 1 ? candidateRoute : ""),
+                    candidateAnchor, routes.length > 1 ? candidateRoute : "", selfSigned),
                 detailText: _candidateDetailLine(c)
             })
         }
@@ -596,15 +621,34 @@ SystemTrayIcon {
         var siteName = anchor !== ""
             ? anchor
             : tr("tray.auto-rules.site-fallback", "a site you use")
-        // One heading cannot honestly name one site when the rows belong to
-        // several; each row still says which site it came from.
-        var bodyText = anchorNames.length > 1
-            ? tr("tray.auto-rules.body-multi",
-                    "Found addresses that {count} of the sites you routed need.")
-                .replace("{count}", String(anchorNames.length))
-            : tr("tray.auto-rules.body",
-                    "Found addresses without which {name} will not work fully.")
-                .replace("{name}", siteName)
+        // Every row is a site that will not open. Saying "addresses a site
+        // needs" over that list states the wrong problem: nobody is missing
+        // a companion, the main route is dropping the site itself.
+        var allSelfSigned = selfSignedCount === ids.length
+        var titleText = allSelfSigned
+            ? tr("tray.auto-rules.title-blocked",
+                    "Sites the main route will not carry")
+            : tr("tray.auto-rules.title", "Addresses a site needs")
+        var bodyText
+        if (allSelfSigned) {
+            bodyText = ids.length > 1
+                ? tr("tray.auto-rules.body-blocked-multi",
+                        "Connections to {count} sites keep failing on the main route.")
+                    .replace("{count}", String(ids.length))
+                : tr("tray.auto-rules.body-blocked",
+                        "Connections to {name} keep failing on the main route.")
+                    .replace("{name}", items[0].primaryText)
+        } else {
+            // One heading cannot honestly name one site when the rows belong
+            // to several; each row still says which site it came from.
+            bodyText = anchorNames.length > 1
+                ? tr("tray.auto-rules.body-multi",
+                        "Found addresses that {count} of the sites you routed need.")
+                    .replace("{count}", String(anchorNames.length))
+                : tr("tray.auto-rules.body",
+                        "Found addresses without which {name} will not work fully.")
+                    .replace("{name}", siteName)
+        }
         // Mixed routes are named per row instead; one shared route reads
         // better as a sentence than as a repeated tag.
         if (routes.length === 1) {
@@ -614,7 +658,7 @@ SystemTrayIcon {
         bodyText = bodyText + "\n" + tr("tray.auto-rules.unchecked-declined",
             "Unchecked rows will be declined; you can bring them back later in the app.")
         promptWindow.present({
-            titleText: tr("tray.auto-rules.title", "Addresses a site needs"),
+            titleText: titleText,
             bodyText: bodyText,
             items: items,
             selectable: true,
@@ -1201,6 +1245,32 @@ SystemTrayIcon {
             body = tr("notifications.enforcement.adapter-choice.body",
                     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
                 .replace("{list}", candidates.join(", "))
+        } else if (status === "adapter-gone") {
+            // A vendor that replaced its adapter outright, a driver that no
+            // longer starts, a connection removed by hand. The cause differs,
+            // the answer does not: nothing here answers to the saved name, so
+            // the choice goes back to the user.
+            title = tr("notifications.enforcement.adapter-gone.title",
+                "The saved connection is gone")
+            body = candidates.length > 0
+                ? tr("notifications.enforcement.adapter-gone.body",
+                        "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}")
+                    .replace("{list}", candidates.join(", "))
+                : tr("notifications.enforcement.adapter-gone.body-empty",
+                    "The connection your rules were set to use is no longer on this computer, and there is nothing to replace it with right now.")
+        } else if (status === "adapter-failed") {
+            // The device is still on the machine and its driver will not
+            // start — usually a second VPN client that installed an older copy
+            // of the same driver. Picking another connection works around it;
+            // repairing the driver fixes it, and only the user can decide.
+            title = tr("notifications.enforcement.adapter-failed.title",
+                "The saved connection is broken")
+            body = candidates.length > 0
+                ? tr("notifications.enforcement.adapter-failed.body",
+                        "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}")
+                    .replace("{list}", candidates.join(", "))
+                : tr("notifications.enforcement.adapter-failed.body-empty",
+                    "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps.")
         } else if (status === "no-primary-route") {
             title = tr("notifications.enforcement.no-primary.title",
                 "Main connection is not set")
@@ -2218,6 +2288,29 @@ SystemTrayIcon {
         tooltip = base
     }
 
+    /// Re-read the system appearance and re-resolve the tray's own theme.
+    ///
+    /// The tray carries resolved slugs, not the token set, so "system" is
+    /// resolved here the same way the shell resolves it: the system's answer
+    /// IS the effective mode, and an explicit light/dark choice is left alone.
+    function refreshSystemAppearance() {
+        var correlationId = rpc.rpcSystemTheme()
+        if (!correlationId || correlationId === "") return
+        rpc.registerRpcCallback(correlationId, function(ok, payload) {
+            if (!ok || !payload) return
+            var mode = String(payload.systemMode || "")
+            if (mode !== "light" && mode !== "dark" && mode !== "high-contrast") return
+            var current = tray.theme || {}
+            if (String(current.systemMode || "") === mode) return
+            var next = Object.assign({}, current)
+            next.systemMode = mode
+            next.systemModeDetected = payload.systemModeDetected !== false
+            if (String(next.selectedMode || "system") === "system") next.effectiveMode = mode
+            tray.theme = next
+            uiTheme.themeMode = String(next.effectiveMode || "light")
+        })
+    }
+
     Component.onCompleted: {
         loadContext()
         if (statusKey !== "") statusLine = tr(statusKey, statusLine)
@@ -2239,6 +2332,13 @@ SystemTrayIcon {
                     routingPaused = !!p.paused
                 }
             })
+            // The desktop can switch light/dark while the tray sits in the
+            // notification area for days. Its own prompt windows are themed
+            // from this snapshot, so without the refresh they keep the
+            // appearance the machine had when the tray started.
+            if (typeof nrrNativeBridge.systemAppearanceChanged !== "undefined") {
+                nrrNativeBridge.systemAppearanceChanged.connect(refreshSystemAppearance)
+            }
             _subscribeStatusUpdatesTray()
             // Sidecar, not the service: this is the one source that answers
             // while the service is stopped, which is when the menu would
@@ -2299,7 +2399,14 @@ SystemTrayIcon {
                 // service was down: retry on the 10s cadence until it succeeds so
                 // the tray resumes receiving live pushes without a restart.
                 if (!_traySubscribed && bridgeAvailable)
-                    _subscribeStatusUpdatesTray()
+                    // The desktop can switch light/dark while the tray sits in the
+            // notification area for days. Its own prompt windows are themed
+            // from this snapshot, so without the refresh they keep the
+            // appearance the machine had when the tray started.
+            if (typeof nrrNativeBridge.systemAppearanceChanged !== "undefined") {
+                nrrNativeBridge.systemAppearanceChanged.connect(refreshSystemAppearance)
+            }
+            _subscribeStatusUpdatesTray()
             })
         }
     }

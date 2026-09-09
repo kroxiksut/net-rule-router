@@ -14,7 +14,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use nrr_domain::enforcement_mode::EnforcementMode;
-use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
+use nrr_platform_api::dns_redirect::{
+    DnsNamespaceExemption, RedirectHandle, RedirectState, SystemDnsRedirectPort,
+};
 
 use crate::dns_listener::DnsInterceptListener;
 
@@ -56,11 +58,21 @@ const REDIRECT_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Owns the Mode-B intercept listener plus the system-DNS redirect port and
 /// drives their combined lifecycle in one blocking call.
+/// Which namespaces the product should stay out of, asked afresh each time.
+///
+/// A closure rather than a stored list: connections come and go, and the
+/// answer at arm time is stale by the first reconnect. The caller decides
+/// what qualifies; this module only carries the answer to the port.
+pub type DnsNamespaceExemptionsFn = Arc<dyn Fn() -> Vec<DnsNamespaceExemption> + Send + Sync>;
+
 pub struct DnsResolverService {
     listener: DnsInterceptListener,
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
     guard_interval: Duration,
+    /// `None` claims every name, which is what the product did before it
+    /// learned to step aside.
+    exemptions: Option<DnsNamespaceExemptionsFn>,
 }
 
 impl DnsResolverService {
@@ -74,6 +86,50 @@ impl DnsResolverService {
             redirect,
             listen_addr,
             guard_interval: REDIRECT_GUARD_INTERVAL,
+            exemptions: None,
+        }
+    }
+
+    /// Wire the source of namespaces to stay out of. Re-read on the guard
+    /// tick, so a VPN that connects later is honoured without a restart.
+    #[must_use]
+    pub fn with_namespace_exemptions(mut self, source: DnsNamespaceExemptionsFn) -> Self {
+        self.exemptions = Some(source);
+        self
+    }
+
+    /// Hand the current set to the port, and say so only when it changed.
+    ///
+    /// Runs on every guard tick, so an unconditional line would write one
+    /// entry every thirty seconds for a machine that never changes.
+    fn apply_exemptions(
+        redirect: &Arc<dyn SystemDnsRedirectPort>,
+        source: Option<&DnsNamespaceExemptionsFn>,
+        last: &mut Vec<DnsNamespaceExemption>,
+    ) {
+        let Some(source) = source else {
+            return;
+        };
+        let current = source();
+        if current == *last {
+            return;
+        }
+        match redirect.exempt_namespaces(&current) {
+            Ok(_) => {
+                let names: Vec<&str> = current.iter().map(|e| e.suffix.as_str()).collect();
+                tracing::info!(
+                    target: "nrr::dns-resolver",
+                    namespaces = %names.join(", "),
+                    "Mode B: these namespaces are answered by the connections that claim them",
+                );
+                *last = current;
+            }
+            // Keep the previous set as the last-known state so the next tick
+            // retries instead of believing the failed write took effect.
+            Err(error) => tracing::warn!(
+                target: "nrr::dns-resolver",
+                "Mode B: could not step out of the claimed namespaces ({error}); names inside them keep resolving through us",
+            ),
         }
     }
 
@@ -90,6 +146,8 @@ impl DnsResolverService {
         handle: RedirectHandle,
         interval: Duration,
         stop: Arc<AtomicBool>,
+        exemptions: Option<DnsNamespaceExemptionsFn>,
+        mut applied: Vec<DnsNamespaceExemption>,
     ) {
         let slice = Duration::from_millis(50).min(interval);
         loop {
@@ -101,6 +159,12 @@ impl DnsResolverService {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
+            // A connection that appeared since the last tick may claim a
+            // namespace of its own, and one that went away stops claiming it.
+            // Checked before the redirect itself: re-installing the catch-all
+            // without the exemptions beside it would capture those names for a
+            // whole interval.
+            Self::apply_exemptions(&redirect, exemptions.as_ref(), &mut applied);
             match redirect.inspect(&handle) {
                 Ok(RedirectState::Active) => {}
                 Ok(RedirectState::Inactive) => {
@@ -111,6 +175,11 @@ impl DnsResolverService {
                     );
                     match redirect.redirect_to(handle.listener) {
                         Ok(_) => {
+                            // The catch-all was just rewritten; the exemptions
+                            // must be put back beside it, and the remembered set
+                            // no longer describes the table.
+                            applied.clear();
+                            Self::apply_exemptions(&redirect, exemptions.as_ref(), &mut applied);
                             let _ = redirect.flush_cache();
                             tracing::info!(
                                 target: "nrr::dns-resolver",
@@ -187,6 +256,11 @@ impl DnsResolverService {
                 return DnsResolverRunOutcome::RedirectFailed;
             }
         };
+        // Before the flush, so a name inside a claimed namespace is never
+        // answered by us even once: the flush is what sends every cached name
+        // back through the table we just wrote.
+        let mut applied: Vec<DnsNamespaceExemption> = Vec::new();
+        Self::apply_exemptions(&self.redirect, self.exemptions.as_ref(), &mut applied);
         // A warm OS cache would otherwise bypass us on first contact (HW-0709
         // review). Best-effort: a flush failure is logged, not fatal.
         if let Err(error) = self.redirect.flush_cache() {
@@ -210,7 +284,11 @@ impl DnsResolverService {
                 let handle = handle.clone();
                 let interval = self.guard_interval;
                 let stop = Arc::clone(&guard_stop);
-                move || Self::guard(redirect, handle, interval, stop)
+                let exemptions = self.exemptions.clone();
+                // The set arm time installed: the guard starts from it so an
+                // unchanged machine writes nothing on its first tick.
+                let applied = applied.clone();
+                move || Self::guard(redirect, handle, interval, stop, exemptions, applied)
             })
             .ok();
 
@@ -572,6 +650,10 @@ mod tests {
         /// How many self-checks answer "gone" before the redirect reads as
         /// intact again — the guard's re-install is what the count buys.
         damaged_checks: std::sync::atomic::AtomicUsize,
+        /// Every exemption set handed to the port, in order — so a test can
+        /// assert both what was claimed and that an unchanged machine is not
+        /// re-written on every guard tick.
+        exempted: Mutex<Vec<Vec<String>>>,
         /// Set once the guard has re-installed the redirect at least once, so
         /// a test can stop the serve loop at that moment.
         reinstalled: Option<Arc<AtomicBool>>,
@@ -613,6 +695,17 @@ mod tests {
         fn flush_cache(&self) -> Result<(), PlatformError> {
             self.calls.lock().unwrap().push("flush");
             Ok(())
+        }
+        fn exempt_namespaces(
+            &self,
+            exemptions: &[DnsNamespaceExemption],
+        ) -> Result<usize, PlatformError> {
+            self.calls.lock().unwrap().push("exempt");
+            self.exempted
+                .lock()
+                .unwrap()
+                .push(exemptions.iter().map(|e| e.suffix.clone()).collect());
+            Ok(exemptions.len())
         }
     }
 
@@ -659,6 +752,76 @@ mod tests {
             installs[1] < restore,
             "the re-install happens while serving, never after the restore: {calls:?}"
         );
+    }
+
+    fn exemption(suffix: &str) -> DnsNamespaceExemption {
+        DnsNamespaceExemption {
+            suffix: suffix.to_string(),
+            servers: vec!["192.168.0.53".parse().expect("ip")],
+        }
+    }
+
+    /// The field case: a corporate VPN claims its own namespace, and we step
+    /// out of it BEFORE the cache flush. The flush is what sends every warm
+    /// name back through the table, so an exemption written after it would
+    /// let us answer those names once.
+    #[test]
+    fn claimed_namespaces_are_left_alone_before_the_cache_is_flushed() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            flip_stop: Some(Arc::clone(&stop)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap())
+                .with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
+
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+
+        let calls = redirect.calls.lock().unwrap().clone();
+        let exempt_at = calls.iter().position(|c| *c == "exempt").expect("exempted");
+        let flush_at = calls.iter().position(|c| *c == "flush").expect("flushed");
+        let redirect_at = calls.iter().position(|c| *c == "redirect_to").unwrap();
+        assert!(redirect_at < exempt_at, "{calls:?}");
+        assert!(exempt_at < flush_at, "{calls:?}");
+        assert_eq!(
+            redirect.exempted.lock().unwrap().clone(),
+            vec![vec!["branch.corp.example".to_string()]],
+        );
+    }
+
+    /// Nothing claimed is the ordinary machine, and it must cost nothing: no
+    /// call at all, so a table that needs no narrowing is never rewritten.
+    #[test]
+    fn a_machine_where_nothing_is_claimed_is_never_narrowed() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            flip_stop: Some(Arc::clone(&stop)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap())
+                .with_namespace_exemptions(Arc::new(Vec::new));
+
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+        let calls = redirect.calls.lock().unwrap().clone();
+        assert!(!calls.contains(&"exempt"), "{calls:?}");
+    }
+
+    /// Without a source wired the product behaves exactly as it did before
+    /// the feature existed — the control that keeps the two tests above
+    /// honest about what the source is doing.
+    #[test]
+    fn an_unwired_source_claims_every_name_as_before() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect {
+            flip_stop: Some(Arc::clone(&stop)),
+            ..Default::default()
+        });
+        let service =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap());
+        assert_eq!(service.run(&stop), DnsResolverRunOutcome::ServedAndRestored);
+        assert!(redirect.exempted.lock().unwrap().is_empty());
     }
 
     #[test]

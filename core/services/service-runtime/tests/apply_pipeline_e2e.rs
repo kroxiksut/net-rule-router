@@ -282,9 +282,13 @@ fn install_for_sid_with_active_rules_produces_tagged_filters() {
     assert!(filters
         .iter()
         .all(|f| f.user_sid.as_deref() == Some("S-1-5-21-A")));
-    let ips: Vec<_> = filters.iter().filter_map(|f| f.remote_ip).collect();
-    assert!(ips.contains(&Ipv4Addr::new(203, 0, 113, 1)));
-    assert!(ips.contains(&Ipv4Addr::new(203, 0, 113, 2)));
+    // Addresses ride in a packed set now; coverage is the question, not shape.
+    assert!(filters
+        .iter()
+        .any(|f| f.covers_v4(Ipv4Addr::new(203, 0, 113, 1))));
+    assert!(filters
+        .iter()
+        .any(|f| f.covers_v4(Ipv4Addr::new(203, 0, 113, 2))));
 
     // Audit: one Applied with the right count + slug.
     let records = fx.audit.snapshot();
@@ -329,7 +333,7 @@ fn recompile_for_sid_reflects_rule_changes() {
     assert_eq!(c2, 1, "after recompile, B's single rule wins");
     let filters = fx.api.wfp_filters.lock().unwrap();
     assert_eq!(filters.len(), 1);
-    assert_eq!(filters[0].remote_ip, Some(Ipv4Addr::new(192, 0, 2, 9)));
+    assert!(filters[0].covers_v4(Ipv4Addr::new(192, 0, 2, 9)));
     drop(filters);
 
     let kinds: Vec<_> = fx.audit.snapshot().into_iter().map(|r| r.kind).collect();
@@ -357,15 +361,14 @@ fn strict_secondary_fail_closed_emits_default_block_filter() {
     // 1 rule-driven Permit + 1 catch-all Block.
     assert_eq!(filters.len(), 2);
     assert!(
-        filters
-            .iter()
-            .any(|f| f.action == WfpAction::Block && f.remote_ip.is_none()),
+        filters.iter().any(|f| f.action == WfpAction::Block
+            && f.remote_ip.is_none()
+            && f.remote_ip_set.is_empty()),
         "fail-closed catch-all Block must be present"
     );
     assert!(
-        filters
-            .iter()
-            .any(|f| f.action == WfpAction::Permit && f.remote_ip.is_some()),
+        filters.iter().any(|f| f.action == WfpAction::Permit
+            && (f.remote_ip.is_some() || !f.remote_ip_set.is_empty())),
         "rule-driven Permit must also be present"
     );
 }

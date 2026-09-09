@@ -40,11 +40,18 @@ use crate::error::PlatformError;
 /// rule this service created, never a VPN client's or an admin's own rule.
 const NRPT_MARKER: &str = "NetRuleRouter-ModeB-DnsRedirect";
 
+/// Marker on the rules that step OUT of a namespace. A separate marker on
+/// purpose: the catch-all's own sweep removes every rule carrying its marker
+/// under a different key, and these are supposed to sit beside it.
+const NRPT_EXEMPT_MARKER: &str = "NetRuleRouter-DnsScopeExemption";
+
 // The neutral system-DNS-redirect PORT + its handle/state types live
 // in `nrr-platform-api`; re-export so `nrr_platform_windows::dns_redirect::*`
 // paths keep resolving unchanged. The Windows NRPT MECHANISM below impls it via
 // the internal `CommandRunner` (PowerShell) abstraction, which stays here.
-pub use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState, SystemDnsRedirectPort};
+pub use nrr_platform_api::dns_redirect::{
+    DnsNamespaceExemption, RedirectHandle, RedirectState, SystemDnsRedirectPort,
+};
 
 /// Output of a shell command: whether it succeeded plus its captured streams.
 #[derive(Clone, Debug)]
@@ -133,6 +140,42 @@ pub fn nrpt_rule_values(listener_ip: &str, marker: &str) -> Vec<RegistryValue> {
         dword("ConfigOptions", NRPT_CONFIG_GENERIC_DNS_SERVERS),
         dword("Version", NRPT_RULE_VERSION),
     ]
+}
+
+/// The seven values of a rule that sends ONE namespace to the servers that
+/// own it. Same shape as the catch-all — the DNS client rejects any subset —
+/// differing only in the namespace and in carrying several servers.
+///
+/// The namespace is written with a leading dot: that is how the table spells
+/// "this name and everything under it", and it is what makes this rule beat
+/// the catch-all for the names it covers.
+pub fn nrpt_namespace_rule_values(suffix: &str, servers: &str) -> Vec<RegistryValue> {
+    vec![
+        sz("Comment", NRPT_EXEMPT_MARKER),
+        sz("DisplayName", ""),
+        sz("IPSECCARestriction", ""),
+        multi_sz("Name", &format!(".{suffix}")),
+        sz("GenericDNSServers", servers),
+        dword("ConfigOptions", NRPT_CONFIG_GENERIC_DNS_SERVERS),
+        dword("Version", NRPT_RULE_VERSION),
+    ]
+}
+
+/// Registry key for one namespace exemption.
+///
+/// Derived from the namespace so the same claim always lands on the same key:
+/// a reconnecting VPN then replaces its own rule instead of accumulating one
+/// per session. Hex of a stable hash, because a key name may not carry the
+/// characters a domain can.
+pub fn nrpt_exemption_key(suffix: &str) -> String {
+    // FNV-1a: no dependency, and the only property needed is that the same
+    // string maps to the same key.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in suffix.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{{NRR-EXEMPT-{hash:016X}}}")
 }
 
 /// What a scan of the rule table found.
@@ -333,7 +376,8 @@ impl nrr_platform_api::dns::SystemDnsServersPort for WindowsSystemDnsServers {
 /// went, so the boot log can tell "nothing to clean" from "never ran".
 pub fn clear_orphan_redirect<S: NrptRuleStore>(store: &S) -> Result<usize, PlatformError> {
     let own = usize::from(store.delete_rule(NRPT_RULE_KEY)?);
-    Ok(own + store.sweep_orphans(NRPT_MARKER, "")?)
+    let exemptions = store.sweep_orphans(NRPT_EXEMPT_MARKER, "")?;
+    Ok(own + exemptions + store.sweep_orphans(NRPT_MARKER, "")?)
 }
 
 /// Echo the namespace our redirect governs iff the OS is ACTUALLY resolving
@@ -432,8 +476,23 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         }
     }
 
+    /// Take the catch-all out AND every namespace we stepped out of.
+    ///
+    /// The exemptions exist only to narrow our own redirect. Left behind
+    /// they would keep steering names at servers we no longer watch, which
+    /// is a change to the machine outliving the thing that asked for it.
     fn restore(&self, _handle: &RedirectHandle) -> Result<(), PlatformError> {
-        self.store.delete_rule(NRPT_RULE_KEY).map(drop)
+        let swept = self.store.sweep_orphans(NRPT_EXEMPT_MARKER, "");
+        let deleted = self.store.delete_rule(NRPT_RULE_KEY);
+        // The catch-all is what actually points the OS at us, so its removal
+        // decides the outcome; a stuck exemption is reported and not fatal.
+        if let Err(error) = swept {
+            tracing::warn!(
+                target: "nrr::dns-redirect",
+                "could not remove the namespace exemptions: {error:?}",
+            );
+        }
+        deleted.map(drop)
     }
 
     fn inspect(&self, handle: &RedirectHandle) -> Result<RedirectState, PlatformError> {
@@ -465,6 +524,54 @@ impl<R: CommandRunner, S: NrptRuleStore> SystemDnsRedirectPort for NrptDnsRedire
         } else {
             RedirectState::Active
         })
+    }
+
+    /// Replace the whole exemption set with `exemptions`.
+    ///
+    /// Written as a set rather than incrementally: a connection that went
+    /// away stops claiming its namespace, and a rule pointing at a resolver
+    /// that is no longer reachable is worse than no rule — every name under
+    /// it would resolve nowhere. Sweeping first and writing after means the
+    /// table always describes the machine as it is now.
+    fn exempt_namespaces(
+        &self,
+        exemptions: &[DnsNamespaceExemption],
+    ) -> Result<usize, PlatformError> {
+        let removed = self.store.sweep_orphans(NRPT_EXEMPT_MARKER, "")?;
+        let mut written = 0usize;
+        for exemption in exemptions {
+            let servers = exemption
+                .servers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(";");
+            if servers.is_empty() {
+                continue;
+            }
+            let key = nrpt_exemption_key(&exemption.suffix);
+            let values = nrpt_namespace_rule_values(&exemption.suffix, &servers);
+            match self.store.write_rule(&key, &values) {
+                Ok(()) => written += 1,
+                // One unwritable rule must not cost the others: the point of
+                // the feature is to stop being in the way, and being half out
+                // of the way is still better than being fully in it.
+                Err(error) => tracing::warn!(
+                    target: "nrr::dns-redirect",
+                    suffix = %exemption.suffix,
+                    "could not leave this namespace to its own resolver: {error:?}",
+                ),
+            }
+        }
+        if removed > 0 || written > 0 {
+            tracing::info!(
+                target: "nrr::dns-redirect",
+                removed,
+                written,
+                "namespaces left to the connections that claim them",
+            );
+        }
+        Ok(written)
     }
 
     fn flush_cache(&self) -> Result<(), PlatformError> {
@@ -1307,6 +1414,132 @@ mod tests {
             .expect("restoring twice is a no-op");
     }
 
+    fn exemption(suffix: &str, servers: &[&str]) -> DnsNamespaceExemption {
+        DnsNamespaceExemption {
+            suffix: suffix.to_string(),
+            servers: servers.iter().map(|s| s.parse().expect("ip")).collect(),
+        }
+    }
+
+    /// The field case: a corporate VPN claims its own domain, and the product
+    /// must stop answering for it. The rule sits BESIDE the catch-all and wins
+    /// for those names because its namespace is narrower.
+    #[test]
+    fn a_claimed_namespace_gets_its_own_rule_beside_the_catch_all() {
+        let store = FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]);
+        let redirect = NrptDnsRedirect::new(FakeRunner::new(ok("")), store);
+        let written = redirect
+            .exempt_namespaces(&[exemption("branch.corp.example", &["192.168.0.53"])])
+            .expect("exempt");
+        assert_eq!(written, 1);
+
+        let key = nrpt_exemption_key("branch.corp.example");
+        let mut keys = redirect.store.keys();
+        keys.sort();
+        let mut expected = vec![NRPT_RULE_KEY.to_string(), key.clone()];
+        expected.sort();
+        assert_eq!(keys, expected, "the catch-all stays");
+
+        let rules = redirect
+            .store
+            .rules
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let values = rules.get(&key).expect("the exemption rule");
+        assert!(has(values, &multi_sz("Name", ".branch.corp.example")));
+        assert!(has(values, &sz("GenericDNSServers", "192.168.0.53")));
+        assert!(has(values, &sz("Comment", NRPT_EXEMPT_MARKER)));
+        assert!(
+            has(values, &dword("Version", NRPT_RULE_VERSION)),
+            "a rule without a version makes the DNS client reject the whole table",
+        );
+    }
+
+    /// The set is replaced, not added to. A VPN that disconnected stops
+    /// claiming its namespace, and a rule pointing at a resolver that is no
+    /// longer reachable resolves every name under it to nothing.
+    #[test]
+    fn a_namespace_that_is_no_longer_claimed_stops_being_exempt() {
+        let redirect = NrptDnsRedirect::new(
+            FakeRunner::new(ok("")),
+            FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]),
+        );
+        redirect
+            .exempt_namespaces(&[
+                exemption("corp.a.example", &["10.0.0.1"]),
+                exemption("corp.b.example", &["10.0.0.2"]),
+            ])
+            .expect("exempt");
+        assert_eq!(redirect.store.keys().len(), 3);
+
+        let left = redirect
+            .exempt_namespaces(&[exemption("corp.a.example", &["10.0.0.1"])])
+            .expect("exempt");
+        assert_eq!(left, 1);
+        let mut keys = redirect.store.keys();
+        keys.sort();
+        let mut expected = vec![
+            NRPT_RULE_KEY.to_string(),
+            nrpt_exemption_key("corp.a.example"),
+        ];
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        // Nothing claimed at all: we answer for everything again.
+        assert_eq!(redirect.exempt_namespaces(&[]).expect("exempt"), 0);
+        assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY.to_string()]);
+    }
+
+    /// Stopping must leave the machine as it was found. An exemption outliving
+    /// the service would keep steering names at a resolver nobody watches.
+    #[test]
+    fn restoring_takes_the_exemptions_out_with_the_catch_all() {
+        let redirect = NrptDnsRedirect::new(
+            FakeRunner::new(ok("")),
+            FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1")), ("{VPN}", theirs())]),
+        );
+        redirect
+            .exempt_namespaces(&[exemption("corp.example.com", &["10.0.0.1"])])
+            .expect("exempt");
+        redirect.restore(&handle()).expect("restore");
+        assert_eq!(
+            redirect.store.keys(),
+            ["{VPN}"],
+            "somebody else's rule is never ours to remove",
+        );
+    }
+
+    /// A claim with no server is not a claim. Writing the rule anyway would
+    /// send the namespace to an empty server list, which resolves nothing.
+    #[test]
+    fn a_claim_without_servers_is_skipped_rather_than_written_empty() {
+        let redirect = NrptDnsRedirect::new(
+            FakeRunner::new(ok("")),
+            FakeStore::with(&[(NRPT_RULE_KEY, ours("127.0.0.1"))]),
+        );
+        let written = redirect
+            .exempt_namespaces(&[exemption("corp.example.com", &[])])
+            .expect("exempt");
+        assert_eq!(written, 0);
+        assert_eq!(redirect.store.keys(), [NRPT_RULE_KEY.to_string()]);
+    }
+
+    /// The same claim must land on the same key, so a reconnecting VPN replaces
+    /// its own rule instead of leaving one behind per session.
+    #[test]
+    fn an_exemption_key_is_stable_for_a_namespace_and_distinct_between_them() {
+        assert_eq!(
+            nrpt_exemption_key("corp.example.com"),
+            nrpt_exemption_key("corp.example.com"),
+        );
+        assert_ne!(
+            nrpt_exemption_key("corp.example.com"),
+            nrpt_exemption_key("corp.example.net"),
+        );
+        let key = nrpt_exemption_key("corp.example.com");
+        assert!(key.starts_with("{NRR-EXEMPT-") && key.ends_with('}'));
+    }
+
     #[test]
     fn inspect_reads_our_configuration_and_the_table_around_it() {
         fn inspect(store: FakeStore) -> RedirectState {
@@ -1391,7 +1624,7 @@ mod tests {
     fn upstream_candidates_drop_hypervisor_networks_and_our_own_pool() {
         let runner = FakeRunner::new(ok(concat!(
             "16\t192.168.0.1\tIntel(R) Ethernet Connection (2) I219-V\tEthernet\n",
-            "24\t1.1.1.1\tTAP-Windows Adapter V9\thidemy.name VPN OpenVPN Adapter\n",
+            "24\t1.1.1.1\tTAP-Windows Adapter V9\tswiftvpn VPN OpenVPN Adapter\n",
             "4\t192.168.140.2\tVMware Virtual Ethernet Adapter for VMnet8\tVMware Network Adapter VMnet8\n",
             "28\t172.20.80.1\tHyper-V Virtual Ethernet Adapter\tvEthernet (Default Switch)\n",
             "14\t192.168.56.1\tVirtualBox Host-Only Ethernet Adapter\tVirtualBox Host-Only Network\n",

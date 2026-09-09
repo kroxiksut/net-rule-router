@@ -114,7 +114,9 @@ pub use crate::wfp_bands::SLOTS_PER_RULE;
 /// them (see [`emit_for_app_match`]). Invariant:
 /// `APP_PATH_FANOUT_CAP + 1 + PER_HOSTNAME_IP_CAP (16 + 1 + 64 = 81) <
 /// SLOTS_PER_RULE (256)`.
-pub const APP_PATH_FANOUT_CAP: u64 = 16;
+/// Declared in `nrr-platform-api` because the Windows lowering needs the same
+/// split to recover a rule's own addresses from its app's observed ones.
+pub use nrr_platform_api::enforcement::APP_PATH_FANOUT_CAP;
 /// Runaway backstop (NOT a product limit) on the number of cached subdomains
 /// [`SuffixDomain`](nrr_domain::canonical::CanonicalAddressMatch::SuffixDomain)
 /// / [`Zone`](nrr_domain::canonical::CanonicalAddressMatch::Zone)
@@ -469,7 +471,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
             // "protect via secondary adapter" targets — we are dropping them, not routing
             // them. Only Permit filters contribute protected destinations.
             .filter(|f| f.action == WfpAction::Permit)
-            .filter_map(|f| f.remote_ip)
+            .flat_map(destination_ips)
             .filter(|ip| seen.insert(*ip))
             .collect()
     };
@@ -500,7 +502,7 @@ pub fn generate_filters(input: CodegenInput<'_>) -> CodegenOutput {
         out.filters[..secondary_filter_start]
             .iter()
             .filter(|f| f.action == WfpAction::Permit)
-            .filter_map(|f| f.remote_ip)
+            .flat_map(destination_ips)
             .filter(|ip| seen.insert(*ip))
             .collect()
     };
@@ -672,7 +674,17 @@ fn emit_for_address_match(
     match addr_match {
         CanonicalAddressMatch::ExactIp(addr) => {
             if steerable(*addr) {
-                emit_single_ip_filter(sid, role_slug, ctx, pos, 0, rule, "exact-ip", *addr, out);
+                emit_packed_ip_filters(
+                    sid,
+                    role_slug,
+                    ctx,
+                    pos,
+                    0,
+                    rule,
+                    "exact-ip",
+                    vec![*addr],
+                    out,
+                );
             } else {
                 note_held(&mut held, *addr);
             }
@@ -686,23 +698,25 @@ fn emit_for_address_match(
                 });
                 return;
             }
-            for (i, ip) in ips.into_iter().take(PER_HOSTNAME_IP_CAP).enumerate() {
-                if !steerable(ip) {
+            let mut steerable_ips = Vec::new();
+            for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
+                if steerable(ip) {
+                    steerable_ips.push(ip);
+                } else {
                     note_held(&mut held, ip);
-                    continue;
                 }
-                emit_single_ip_filter(
-                    sid,
-                    role_slug,
-                    ctx,
-                    pos,
-                    i as u64,
-                    rule,
-                    "exact-fqdn",
-                    ip,
-                    out,
-                );
             }
+            emit_packed_ip_filters(
+                sid,
+                role_slug,
+                ctx,
+                pos,
+                0,
+                rule,
+                "exact-fqdn",
+                steerable_ips,
+                out,
+            );
         }
         CanonicalAddressMatch::SuffixDomain(suffix) => {
             emit_suffix_fanout(
@@ -819,7 +833,15 @@ fn emit_suffix_fanout<F>(
             cap: SUFFIX_FANOUT_BACKSTOP,
         });
     }
-    let mut fanout_idx: u64 = 0;
+    // Collected, then packed: one filter per CHUNK of addresses rather than one
+    // per (subdomain, address). A `.ru` zone rule over a warm cache is where the
+    // rule band grew to thousands of standing filters.
+    //
+    // The subdomain stops appearing in the filter id, which is what made each
+    // pair unique before. Identity now comes from the chunk's own digest — the
+    // same address set always yields the same id — and the subdomain a filter
+    // came from was never a fact the enforcement path read back.
+    let mut fanout_ips = Vec::new();
     for sub in subdomains {
         let ips = cache.ips_for_hostname(&sub);
         if ips.is_empty() {
@@ -830,23 +852,16 @@ fn emit_suffix_fanout<F>(
             continue;
         }
         for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
-            if !steerable(ip) {
+            if steerable(ip) {
+                fanout_ips.push(ip);
+            } else {
                 note_held(held, ip);
-                continue;
             }
-            // Weight slots exist to keep ADJACENT rules' bands from
-            // overlapping; within one rule every fan-out target carries the
-            // same Permit/Block action, so their relative order is
-            // irrelevant. Targets beyond the band therefore share the band's
-            // top slot instead of being dropped — filter identity stays
-            // unique via the (subdomain, ip) target in the id derivation.
-            let slot = fanout_idx.min(SLOTS_PER_RULE - 1);
-            emit_subdomain_ip_filter(
-                sid, role_slug, ctx, pos, slot, rule, rule_kind, &sub, ip, out,
-            );
-            fanout_idx += 1;
         }
     }
+    emit_packed_ip_filters(
+        sid, role_slug, ctx, pos, 0, rule, rule_kind, fanout_ips, out,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -975,120 +990,119 @@ fn emit_for_app_match(
         let app_pair_covers = ctx.action == WfpAction::Permit
             && link == crate::address_ownership::Link::Additional
             && !paths.is_empty();
-        for (i, ip) in ips.into_iter().take(PER_HOSTNAME_IP_CAP).enumerate() {
+        let mut observed = Vec::new();
+        for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
             if app_pair_covers && !out.app_observed_secondary_ips.contains(&ip) {
                 out.app_observed_secondary_ips.push(ip);
             }
-            emit_single_ip_filter(
-                sid,
-                role_slug,
-                ctx,
-                pos,
-                APP_PATH_FANOUT_CAP + 1 + i as u64,
-                rule,
-                "application",
-                ip,
-                out,
-            );
+            observed.push(ip);
         }
+        // Packed like every other address group, but in the slot range that
+        // starts after the per-path app-id filters — the two must not share
+        // slots, and the neutral lowering recovers the same split from the
+        // ordinal.
+        emit_packed_ip_filters(
+            sid,
+            role_slug,
+            ctx,
+            pos,
+            APP_PATH_FANOUT_CAP + 1,
+            rule,
+            "application",
+            observed,
+            out,
+        );
     }
 }
 
 // ── Filter constructors ─────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
-fn emit_single_ip_filter(
-    sid: &str,
-    role_slug: &str,
-    ctx: EmitContext,
-    pos: u64,
-    fanout_idx: u64,
-    rule: &CanonicalRule,
-    rule_kind: &str,
-    addr: Ipv4Addr,
-    out: &mut CodegenOutput,
-) {
-    let target = addr.to_string();
-    let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
-    let weight = rule_weight(ctx.base_weight, pos, fanout_idx);
-    let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
-    out.filters.push(WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: ctx.action,
-        remote_ip: Some(addr),
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id,
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    });
-    if ctx.is_block() {
-        push_packet_block_mirror(sid, role_slug, rule, &kind, &target, addr, weight, out);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_subdomain_ip_filter(
-    sid: &str,
-    role_slug: &str,
-    ctx: EmitContext,
-    pos: u64,
-    fanout_idx: u64,
-    rule: &CanonicalRule,
-    rule_kind: &str,
-    subdomain: &str,
-    addr: Ipv4Addr,
-    out: &mut CodegenOutput,
-) {
-    // Target encodes both the subdomain and the resolved IP so two
-    // subdomains that happen to resolve to the same IP under the
-    // same suffix rule still get distinct filter ids.
-    let target = format!("{subdomain}|{addr}");
-    let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
-    let weight = rule_weight(ctx.base_weight, pos, fanout_idx);
-    let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
-    out.filters.push(WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: ctx.action,
-        remote_ip: Some(addr),
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id,
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    });
-    if ctx.is_block() {
-        push_packet_block_mirror(sid, role_slug, rule, &kind, &target, addr, weight, out);
-    }
-}
-
-/// Mirrors a Block rule's ALE (connect-layer) block with a packet-layer
-/// (`OUTBOUND_IPPACKET_V4`) block for the same destination IP, so the drop also
-/// covers ICMP/ping and other non-TCP/UDP protocols — the ALE connect layer
-/// only sees TCP/UDP. `ip_protocol = None` blocks all protocols to `addr`.
+/// Every destination address a filter carries, whichever shape it is in.
 ///
-/// ⚠ The packet layer does NOT expose `ALE_USER_ID`, so `user_sid` MUST be
-/// `None` (the block is system-wide for that destination); the id is still
-/// seeded with `sid`/role/rule for deterministic cleanup tracking. The filter
-/// kind is suffixed `-pkt` so it never collides with the ALE block's id.
+/// A packed filter holds its addresses in `remote_ip_set`; a single-address one
+/// in `remote_ip`. Every collector below reads through here, because reading
+/// only the single field is how the packing change silently emptied
+/// `secondary_dest_ips` — and that set is what the kill switch protects and
+/// what the route table steers.
+fn destination_ips(spec: &WfpFilterSpec) -> impl Iterator<Item = Ipv4Addr> + '_ {
+    spec.remote_ip
+        .into_iter()
+        .chain(spec.remote_ip_set.iter().copied())
+}
+
+/// Emit one rule's address set as PACKED chunks instead of one filter per
+/// address.
+///
+/// WFP ORs several conditions on the same field, so a rule that resolves to
+/// hundreds of addresses does not need hundreds of filters. That matters beyond
+/// tidiness: four 0xEF bugchecks were traced to the BFE host degrading over
+/// hours under thousands of standing filters, and the rule band was the largest
+/// producer left after the kill switch was packed — about 2000 of 2260 on the
+/// first measured run.
+///
+/// Safe here for the reason the fan-out comment already states: within one rule
+/// every target carries the SAME verdict, so their relative order is
+/// irrelevant. Ordering still matters BETWEEN rules, and that is untouched —
+/// each chunk sits at `rule_weight(base, pos, chunk_index)`, inside the same
+/// per-rule slot range a per-address filter used.
+///
+/// Filter identity becomes content-addressed (the chunk's digest), like the
+/// kill switch's: the same address set always yields the same id, so a
+/// recompute that changes nothing installs nothing.
 #[allow(clippy::too_many_arguments)]
-fn push_packet_block_mirror(
+fn emit_packed_ip_filters(
+    sid: &str,
+    role_slug: &str,
+    ctx: EmitContext,
+    pos: u64,
+    slot_base: u64,
+    rule: &CanonicalRule,
+    rule_kind: &str,
+    ips: Vec<Ipv4Addr>,
+    out: &mut CodegenOutput,
+) {
+    let kind = format!("{}{}", ctx.kind_prefix, rule_kind);
+    for (idx, chunk) in nrr_platform_api::wfp_slotting::pack_v4(ips)
+        .into_iter()
+        .enumerate()
+    {
+        let weight = rule_weight(ctx.base_weight, pos, slot_base + idx as u64);
+        let target = chunk.id_seg();
+        let id = filter_id_for(sid, role_slug, rule.id.as_str(), &kind, &target);
+        out.filters.push(WfpFilterSpec {
+            layer: WfpLayerKey::AleAuthConnectV4,
+            action: ctx.action,
+            remote_ip: None,
+            remote_ip_set: chunk.members.clone(),
+            remote_port: None,
+            weight,
+            id,
+            user_sid: Some(sid.to_string()),
+            app_pattern: None,
+            local_interface_luid: None,
+            remote_subnet: None,
+            remote_subnet_v6: None,
+            ip_protocol: None,
+        });
+        if ctx.is_block() {
+            push_packed_packet_block_mirror(
+                sid, role_slug, rule, &kind, &target, &chunk, weight, out,
+            );
+        }
+    }
+}
+
+/// Packet-layer mirror of a packed Block chunk. Same reasoning as the
+/// per-address mirror it replaces: the ALE layer does not classify ICMP and
+/// friends, so an explicit Block needs its packet-layer twin.
+#[allow(clippy::too_many_arguments)]
+fn push_packed_packet_block_mirror(
     sid: &str,
     role_slug: &str,
     rule: &CanonicalRule,
     kind: &str,
     target: &str,
-    addr: Ipv4Addr,
+    chunk: &nrr_platform_api::wfp_slotting::V4SlotChunk,
     weight: u64,
     out: &mut CodegenOutput,
 ) {
@@ -1097,8 +1111,8 @@ fn push_packet_block_mirror(
     out.filters.push(WfpFilterSpec {
         layer: WfpLayerKey::OutboundIpPacketV4,
         action: WfpAction::Block,
-        remote_ip: Some(addr),
-        remote_ip_set: Vec::new(),
+        remote_ip: None,
+        remote_ip_set: chunk.members.clone(),
         remote_port: None,
         weight,
         id,
@@ -1275,14 +1289,14 @@ mod tests {
     /// other — which is how a destination ends up dead for every process.
     #[test]
     fn a_shared_address_gets_no_secondary_filter() {
-        let shared = Ipv4Addr::new(172, 217, 17, 206);
-        let only_theirs = Ipv4Addr::new(142, 250, 150, 101);
+        let shared = Ipv4Addr::new(23, 10, 20, 161);
+        let only_theirs = Ipv4Addr::new(23, 10, 20, 150);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.google.com", vec![shared]);
-        cache.set_ips("notebooklm.google.com", vec![shared, only_theirs]);
+        cache.set_ips("translate.search.example", vec![shared]);
+        cache.set_ips("docs.search.example", vec![shared, only_theirs]);
         let rule_book = book(
-            vec![suffix_rule("p1", "google.com")],
-            vec![exact_fqdn_rule("s1", "notebooklm.google.com")],
+            vec![suffix_rule("p1", "search.example")],
+            vec![exact_fqdn_rule("s1", "docs.search.example")],
         );
         let out = generate_filters(CodegenInput {
             sid: "S-1-5-21-A",
@@ -1299,7 +1313,7 @@ mod tests {
         assert!(out
             .filters
             .iter()
-            .any(|f| f.remote_ip == Some(shared) && f.action == WfpAction::Permit));
+            .any(|f| f.covers_v4(shared) && f.action == WfpAction::Permit));
         // The additional link's rule got its private address and not the shared one.
         assert!(
             !out.secondary_dest_ips.contains(&shared),
@@ -1341,7 +1355,7 @@ mod tests {
         let f = &out.filters[0];
         assert_eq!(f.action, WfpAction::Permit);
         assert_eq!(f.layer, WfpLayerKey::AleAuthConnectV4);
-        assert_eq!(f.remote_ip, Some(Ipv4Addr::new(203, 0, 113, 5)));
+        assert!(f.covers_v4(Ipv4Addr::new(203, 0, 113, 5)));
         assert_eq!(f.user_sid.as_deref(), Some("S-1-5-21-A"));
         assert!(f.app_pattern.is_none());
         assert!(out.diagnostics.is_empty());
@@ -1371,8 +1385,11 @@ mod tests {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
         });
-        assert_eq!(out.filters.len(), 3, "one filter per cached IP");
-        let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
+        // Packed by slot, so the ADDRESSES are the contract and their order is
+        // not: `pack_v4` groups by a hash of the address, deliberately
+        // independent of the order they arrived in.
+        let mut ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
+        ips.sort();
         assert_eq!(
             ips,
             vec![
@@ -1505,7 +1522,7 @@ mod tests {
         });
         // 1 (api) + 2 (www) = 3 filters
         assert_eq!(out.filters.len(), 3);
-        let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
+        let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
         assert!(ips.contains(&Ipv4Addr::new(1, 1, 1, 1)));
         assert!(ips.contains(&Ipv4Addr::new(2, 2, 2, 2)));
         assert!(ips.contains(&Ipv4Addr::new(2, 2, 2, 3)));
@@ -1531,7 +1548,7 @@ mod tests {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
         });
-        let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
+        let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
         assert!(ips.contains(&Ipv4Addr::new(9, 9, 9, 9)), "apex IP: {ips:?}");
         assert!(ips.contains(&Ipv4Addr::new(2, 2, 2, 2)));
     }
@@ -1554,7 +1571,7 @@ mod tests {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
         });
-        let ips: Vec<_> = out.filters.iter().filter_map(|f| f.remote_ip).collect();
+        let ips: Vec<_> = out.filters.iter().flat_map(destination_ips).collect();
         assert_eq!(ips, vec![Ipv4Addr::new(2, 2, 2, 2)]);
     }
 
@@ -1602,7 +1619,7 @@ mod tests {
     }
 
     #[test]
-    fn suffix_domain_beyond_slots_per_rule_keeps_every_host_with_clamped_weights() {
+    fn suffix_domain_over_many_hosts_keeps_every_address_inside_one_band() {
         // 300 cached hosts — past the old 256-slot cap. Every host must get a
         // filter (nothing dropped), no truncation diagnostic, and every weight
         // must stay inside this rule's band so the next rule cannot collide.
@@ -1625,7 +1642,17 @@ mod tests {
             secondary_ip_denylist: &std::collections::HashSet::new(),
             zone_priority_over_ip: false,
         });
-        assert_eq!(out.filters.len(), hosts, "no host may lose its filter");
+        // Packing is why this is now a coverage question rather than a count:
+        // 300 hosts fold into a handful of chunk filters, and what must hold is
+        // that not one address fell out along the way.
+        let covered: std::collections::HashSet<Ipv4Addr> =
+            out.filters.iter().flat_map(destination_ips).collect();
+        assert_eq!(covered.len(), hosts, "no host may lose its coverage");
+        assert!(
+            out.filters.len() < hosts,
+            "the whole point of packing is fewer filters than addresses: {} vs {hosts}",
+            out.filters.len()
+        );
         assert!(
             !out.diagnostics
                 .iter()
@@ -1638,12 +1665,72 @@ mod tests {
             out.filters.iter().all(|f| f.weight <= band_top),
             "every weight must stay inside the first rule's band"
         );
+        // Sharing the band's top slot used to be how 300 targets fitted into
+        // 256 of them. Packed, a rule cannot run out: the chunk count is bounded
+        // by the slot partition, far below the band, so no two filters are
+        // forced onto one weight any more.
         let at_top = out.filters.iter().filter(|f| f.weight == band_top).count();
         assert_eq!(
-            at_top,
-            hosts - (SLOTS_PER_RULE as usize - 1),
-            "targets beyond the band share the band's top slot"
+            at_top, 0,
+            "packing leaves room in the band — nothing should be clamped to its top"
         );
+    }
+
+    /// The reason the rule band was packed at all: four 0xEF bugchecks were
+    /// traced to the BFE host degrading over hours under thousands of standing
+    /// filters, and after the kill switch was packed the rule band was the
+    /// largest producer left — about 2000 filters of 2260 on the first measured
+    /// run. This pins the shape of the fix, not a particular number.
+    #[test]
+    fn a_wide_rule_costs_filters_by_slot_not_by_address() {
+        let cache = MockFqdnCacheLookup::new();
+        let hosts = 300usize;
+        for i in 0..hosts {
+            cache.set_ips(
+                &format!("h{i}.example.com"),
+                vec![Ipv4Addr::new(10, (i / 256) as u8, (i % 256) as u8, 1)],
+            );
+        }
+        let rule_book = book(vec![suffix_rule("r-suf", "example.com")], vec![]);
+        let out = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &MockAppObservationLookup::new(),
+            app_resolver: &NoopAppPathResolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+        });
+
+        let covered: std::collections::HashSet<Ipv4Addr> =
+            out.filters.iter().flat_map(destination_ips).collect();
+        assert_eq!(covered.len(), hosts, "every address stays covered");
+        assert!(
+            out.filters.len() <= nrr_platform_api::wfp_slotting::V4_SLOT_COUNT as usize,
+            "300 addresses must not cost 300 filters: got {}",
+            out.filters.len()
+        );
+
+        // Recomputing the same rule book must produce the same filters, ids
+        // included — a set that churns would reinstall the whole band on every
+        // pass, which is the failure mode packing exists to avoid.
+        let again = generate_filters(CodegenInput {
+            sid: "S",
+            rule_book: &rule_book,
+            behavior_mode: RouteBehaviorMode::PreferPrimary,
+            fqdn_cache: &cache,
+            app_observations: &MockAppObservationLookup::new(),
+            app_resolver: &NoopAppPathResolver,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
+            zone_priority_over_ip: false,
+        });
+        let ids = |o: &CodegenOutput| -> Vec<u64> {
+            let mut v: Vec<u64> = o.filters.iter().map(|f| f.id.raw).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(ids(&out), ids(&again), "packing is content-addressed");
     }
 
     #[test]
@@ -1688,9 +1775,9 @@ mod tests {
     #[test]
     fn zone_fans_out_over_cached_hosts_under_tld() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("vk.ru", vec![Ipv4Addr::new(87, 240, 190, 78)]);
-        cache.set_ips("ya.ru", vec![Ipv4Addr::new(77, 88, 8, 8)]);
-        let rule_book = book(vec![zone_rule("r-zone", "ru")], vec![]);
+        cache.set_ips("ab.example", vec![Ipv4Addr::new(23, 10, 20, 136)]);
+        cache.set_ips("cd.example", vec![Ipv4Addr::new(23, 10, 20, 137)]);
+        let rule_book = book(vec![zone_rule("r-zone", "example")], vec![]);
         let out = generate_filters(CodegenInput {
             sid: "S",
             rule_book: &rule_book,
@@ -1751,7 +1838,7 @@ mod tests {
         // on it at apply time.
         assert_eq!(out.filters.len(), 1);
         let f = &out.filters[0];
-        assert!(f.remote_ip.is_none());
+        assert!(f.remote_ip.is_none() && f.remote_ip_set.is_empty());
         assert_eq!(f.app_pattern.as_deref(), Some(r"C:\Apps\chrome.exe"));
         assert_eq!(f.action, WfpAction::Permit);
     }
@@ -1918,7 +2005,10 @@ mod tests {
         );
         // The observed /32 mirror is still emitted (independent of resolution).
         assert_eq!(
-            out.filters.iter().filter(|f| f.remote_ip.is_some()).count(),
+            out.filters
+                .iter()
+                .filter(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
+                .count(),
             1
         );
         // And the diagnostic explains why the app-id filter is missing.
@@ -1997,7 +2087,7 @@ mod tests {
         let mirror = out
             .filters
             .iter()
-            .find(|f| f.remote_ip.is_some())
+            .find(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
             .expect("observation /32 mirror");
         // The app-id band (slots 0..APP_PATH_FANOUT_CAP) sits strictly below the
         // observation-mirror band (slots APP_PATH_FANOUT_CAP + 1 + i) — no
@@ -2025,7 +2115,7 @@ mod tests {
         assert_eq!(out.filters.len(), 1);
         let f = &out.filters[0];
         assert_eq!(f.action, WfpAction::Block);
-        assert!(f.remote_ip.is_none());
+        assert!(f.remote_ip.is_none() && f.remote_ip_set.is_empty());
         assert_eq!(f.weight, DEFAULT_BLOCK_WEIGHT);
         assert_eq!(
             out.diagnostics,
@@ -2173,13 +2263,13 @@ mod tests {
         let primary_weight = out
             .filters
             .iter()
-            .find(|f| f.remote_ip == Some(Ipv4Addr::new(1, 1, 1, 1)))
+            .find(|f| f.covers_v4(Ipv4Addr::new(1, 1, 1, 1)))
             .unwrap()
             .weight;
         let secondary_weight = out
             .filters
             .iter()
-            .find(|f| f.remote_ip == Some(Ipv4Addr::new(2, 2, 2, 2)))
+            .find(|f| f.covers_v4(Ipv4Addr::new(2, 2, 2, 2)))
             .unwrap()
             .weight;
         assert!(
@@ -2372,17 +2462,17 @@ mod tests {
     /// and the outcome was neither — it was a block.
     #[test]
     fn an_app_rule_does_not_take_over_an_address_a_main_route_rule_names() {
-        let shared = Ipv4Addr::new(178, 248, 237, 68);
+        let shared = Ipv4Addr::new(203, 0, 113, 68);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("habr.com", vec![shared]);
+        cache.set_ips("blog.example", vec![shared]);
         let observations = MockAppObservationLookup::new();
-        observations.set_ips("claude.exe", vec![shared]);
+        observations.set_ips("helper.exe", vec![shared]);
         let resolver = MockAppPathResolver::new()
-            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+            .with("helper.exe", vec![PathBuf::from(r"C:\Apps\helper.exe")]);
 
         let rule_book = book(
-            vec![exact_fqdn_rule("r-main", "habr.com")],
-            vec![app_rule("r-app", "claude.exe", false)],
+            vec![exact_fqdn_rule("r-main", "blog.example")],
+            vec![app_rule("r-app", "helper.exe", false)],
         );
         let out = generate_filters(CodegenInput {
             sid: "S",
@@ -2423,16 +2513,16 @@ mod tests {
     /// and the refusals above already carry the real reason.
     #[test]
     fn an_app_whose_every_address_was_claimed_is_not_reported_as_unobserved() {
-        let shared = Ipv4Addr::new(178, 248, 237, 68);
+        let shared = Ipv4Addr::new(203, 0, 113, 68);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("habr.com", vec![shared]);
+        cache.set_ips("blog.example", vec![shared]);
         let observations = MockAppObservationLookup::new();
-        observations.set_ips("claude.exe", vec![shared]);
+        observations.set_ips("helper.exe", vec![shared]);
         let resolver = MockAppPathResolver::new()
-            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+            .with("helper.exe", vec![PathBuf::from(r"C:\Apps\helper.exe")]);
         let rule_book = book(
-            vec![exact_fqdn_rule("r-main", "habr.com")],
-            vec![app_rule("r-app", "claude.exe", false)],
+            vec![exact_fqdn_rule("r-main", "blog.example")],
+            vec![app_rule("r-app", "helper.exe", false)],
         );
         let out = generate_filters(CodegenInput {
             sid: "S",
@@ -2465,11 +2555,11 @@ mod tests {
         let only_app = Ipv4Addr::new(203, 0, 113, 9);
         let cache = MockFqdnCacheLookup::new();
         let observations = MockAppObservationLookup::new();
-        observations.set_ips("claude.exe", vec![only_app]);
+        observations.set_ips("helper.exe", vec![only_app]);
         let resolver = MockAppPathResolver::new()
-            .with("claude.exe", vec![PathBuf::from(r"C:\Apps\claude.exe")]);
+            .with("helper.exe", vec![PathBuf::from(r"C:\Apps\helper.exe")]);
 
-        let rule_book = book(Vec::new(), vec![app_rule("r-app", "claude.exe", false)]);
+        let rule_book = book(Vec::new(), vec![app_rule("r-app", "helper.exe", false)]);
         let out = generate_filters(CodegenInput {
             sid: "S",
             rule_book: &rule_book,
@@ -2542,7 +2632,10 @@ mod tests {
         // Two /32 Permits (one per observed IP), each carrying remote_ip,
         // plus the per-process Permit (no remote_ip).
         assert_eq!(
-            out.filters.iter().filter(|f| f.remote_ip.is_some()).count(),
+            out.filters
+                .iter()
+                .filter(|f| f.remote_ip.is_some() || !f.remote_ip_set.is_empty())
+                .count(),
             2
         );
     }
@@ -2644,7 +2737,7 @@ mod tests {
         // Exactly two filters: an ALE-layer block and a packet-layer mirror.
         assert_eq!(out.filters.len(), 2);
         assert!(out.filters.iter().all(|f| f.action == WfpAction::Block));
-        assert!(out.filters.iter().all(|f| f.remote_ip == Some(addr)));
+        assert!(out.filters.iter().all(|f| f.covers_v4(addr)));
         let ale = out
             .filters
             .iter()

@@ -3,7 +3,7 @@
 //! An OPT-IN way to close the "visited before the service started" blind spot:
 //! a host the browser reached from its own cache (never wire-queried while the
 //! service was up) has no FQDN-cache entry, so a suffix/zone rule never expanded
-//! to it and it can be blocked under block-all (the dzen.ru class).
+//! to it and it can be blocked under block-all (the visited-but-unruled class).
 //! The browser's HISTORY, however, records every hostname the user visited. This
 //! port surfaces those hostnames so the service can resolve the rule-matching
 //! ones and pre-fill the cache — turning "sites you actually visit" into permits
@@ -144,8 +144,8 @@ mod tests {
     #[test]
     fn extracts_bare_hostname_from_urls() {
         assert_eq!(
-            hostname_from_history_url("https://dzen.ru/feed?x=1"),
-            Some("dzen.ru".into())
+            hostname_from_history_url("https://feed.example/feed?x=1"),
+            Some("feed.example".into())
         );
         assert_eq!(
             hostname_from_history_url("http://Sub.Example.COM/path"),
@@ -194,11 +194,11 @@ mod tests {
     #[test]
     fn mock_port_returns_scripted_hosts() {
         let m = MockBrowserHistoryRead {
-            hostnames: vec!["dzen.ru".into(), "ya.ru".into()],
+            hostnames: vec!["feed.example".into(), "search.example".into()],
         };
         assert_eq!(
             m.read_history_hostnames("S-1-5-21-TEST").unwrap(),
-            vec!["dzen.ru".to_string(), "ya.ru".to_string()]
+            vec!["feed.example".to_string(), "search.example".to_string()]
         );
     }
 }

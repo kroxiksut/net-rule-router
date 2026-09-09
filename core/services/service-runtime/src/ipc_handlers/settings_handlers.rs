@@ -508,6 +508,49 @@ impl IpcHandler for TrafficStatsClearHandler {
     }
 }
 
+// ── Traffic history: continue one connection's history as another's ─────────
+
+pub struct TrafficHistoryMergeSetHandler {
+    writer: Arc<dyn TrafficStatsWriter>,
+}
+
+impl TrafficHistoryMergeSetHandler {
+    pub fn new(writer: Arc<dyn TrafficStatsWriter>) -> Self {
+        Self { writer }
+    }
+}
+
+impl IpcHandler for TrafficHistoryMergeSetHandler {
+    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+        const OP: &str = "traffic-stats.history-merge.set";
+        let req: nrr_shared::ipc_payloads::TrafficHistoryMergeSetRequest =
+            serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?;
+        // A pair with an empty side, or a key joined to itself, is not an
+        // answer to anything — and storing it would suppress the real question.
+        if req.old_key.trim().is_empty()
+            || req.new_key.trim().is_empty()
+            || req.old_key == req.new_key
+        {
+            return Err(IpcError {
+                code: IpcErrorCode::MalformedRequest,
+                message: format!("{OP}: the answer must name two different ledger keys"),
+                diagnostics_id: None,
+            });
+        }
+        self.writer
+            .set_history_link(&req.old_key, &req.new_key, req.merged)
+            .map_err(map_settings_write_error)?;
+        serialise(
+            OP,
+            nrr_shared::ipc_payloads::TrafficHistoryMergeSetResponse {
+                old_key: req.old_key,
+                new_key: req.new_key,
+                merged: req.merged,
+            },
+        )
+    }
+}
+
 // ── Routing pause ────────────────────────────────────────────────────────────
 
 pub struct RoutingPauseGetHandler {
@@ -659,6 +702,7 @@ mod tests {
     struct FakeTrafficStats {
         current: TrafficStatsSettingsDto,
         written: Mutex<Vec<TrafficStatsSettingsDto>>,
+        links: Mutex<Vec<(String, String, bool)>>,
     }
 
     impl TrafficStatsWriter for FakeTrafficStats {
@@ -678,6 +722,19 @@ mod tests {
         fn settings(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError> {
             Ok(self.current.clone())
         }
+        fn set_history_link(
+            &self,
+            old_key: &str,
+            new_key: &str,
+            merged: bool,
+        ) -> Result<(), SettingsWriteError> {
+            self.links.lock().unwrap_or_else(|p| p.into_inner()).push((
+                old_key.to_string(),
+                new_key.to_string(),
+                merged,
+            ));
+            Ok(())
+        }
     }
 
     fn traffic_settings(enabled: bool, retention_days: u32) -> TrafficStatsSettingsDto {
@@ -695,6 +752,7 @@ mod tests {
         let fake = Arc::new(FakeTrafficStats {
             current,
             written: Mutex::new(Vec::new()),
+            links: Mutex::new(Vec::new()),
         });
         (TrafficStatsSetHandler::new(fake.clone()), fake)
     }

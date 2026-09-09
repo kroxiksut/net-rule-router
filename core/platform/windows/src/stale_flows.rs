@@ -38,6 +38,54 @@ impl WindowsStaleFlowReset {
     }
 }
 
+/// Which processes hold ESTABLISHED outbound TCP connections right now,
+/// busiest first.
+///
+/// A diagnostic, and only that: it installs nothing and decides nothing.
+/// It exists for one question the logs could not answer — when the service
+/// stops it removes its routes and filters, every live connection that was
+/// travelling by them changes path, and a TCP session does not survive that.
+/// The user sees an application lose its connection at the moment the
+/// service stopped and cannot tell whether we caused it. Naming who was
+/// connected turns that into evidence instead of a guess.
+///
+/// Reads the same table as the flow reset above, so there is one notion of
+/// "an established connection", not two.
+#[must_use]
+pub fn established_connections_by_process(cap: usize) -> Vec<(String, usize)> {
+    let Some(buffer) = read_tcp_owner_pid_table() else {
+        return Vec::new();
+    };
+    let mut by_pid: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    // SAFETY: `read_tcp_owner_pid_table` fills the buffer with a valid
+    // `MIB_TCPTABLE_OWNER_PID`; its `dwNumEntries` header is followed by that
+    // many contiguous rows, and only those rows are read.
+    unsafe {
+        let table = buffer.as_ptr().cast::<MIB_TCPTABLE_OWNER_PID>();
+        let count = (*table).dwNumEntries as usize;
+        let rows = std::ptr::addr_of!((*table).table).cast::<MIB_TCPROW_OWNER_PID>();
+        for i in 0..count {
+            let row = &*rows.add(i);
+            if row.dwState != MIB_TCP_STATE_ESTAB.0 as u32 {
+                continue;
+            }
+            *by_pid.entry(row.dwOwningPid).or_insert(0) += 1;
+        }
+    }
+    let mut out: Vec<(String, usize)> = by_pid
+        .into_iter()
+        .map(|(pid, n)| {
+            let name = crate::app_path_resolver::image_name_for_pid(pid)
+                .unwrap_or_else(|| format!("pid {pid}"));
+            (name, n)
+        })
+        .collect();
+    // Busiest first, then by name so the same machine logs the same order.
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out.truncate(cap);
+    out
+}
+
 impl StaleFlowReset for WindowsStaleFlowReset {
     fn reset_flows_to(&self, base: Ipv4Addr, prefix_len: u8) -> StaleFlowSweep {
         let Some(buffer) = read_tcp_owner_pid_table() else {

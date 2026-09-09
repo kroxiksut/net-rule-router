@@ -10,8 +10,8 @@
 //! explicit: graceful stop strips every filter (`cleanup_all`), and service
 //! startup strips orphaned block filters left by a hard-killed prior instance.
 //!
-//! The `WindowsApplyEngine` owns the session. Each policy apply uses a
-//! **per-apply WFP transaction** (begin → add/delete filters → commit/abort)
+//! The Windows enforcement backend owns the session. Each reconcile uses a
+//! **per-pass WFP transaction** (begin → add/delete filters → commit/abort)
 //! within the long-lived session.
 //!
 //! ## Batching
@@ -19,8 +19,8 @@
 //! If a plan has more than `MAX_FILTERS_PER_TRANSACTION` filter actions
 //! (default 500), they are split into multiple transactions. Each batch is
 //! committed independently. A failure in a non-first batch leaves earlier
-//! batches committed; the rollback logic in `apply/mod.rs` enumerates and
-//! deletes all our filters by provider GUID to restore the previous state.
+//! batches committed; the next reconcile converges on the intended set, and
+//! `cleanup_all` deletes every filter of ours by provider GUID on stop.
 //!
 //! ## Idempotency (error classification)
 //!
@@ -225,7 +225,7 @@ impl WfpSession {
                             // (absent app, degenerate app-id blob, rejected
                             // condition). Under best-effort skip just this
                             // filter so a shared preset listing one bad rule
-                            // (e.g. an uninstalled `2gis.exe`, or a malformed
+                            // (e.g. an uninstalled `citymap.exe`, or a malformed
                             // condition → FWP_E_CONDITION_NOT_FOUND) does NOT
                             // roll back the user's ENTIRE policy. The engine
                             // and transaction stay healthy, so we continue.

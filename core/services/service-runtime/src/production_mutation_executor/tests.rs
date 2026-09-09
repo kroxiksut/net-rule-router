@@ -88,15 +88,15 @@ fn two_spellings_of_one_app_rule_become_one_payload() {
         p
     }
 
-    let typed = payload("hidemy.name VPN 3.0.exe");
-    let stored = payload("hidemy.name vpn 3.0.exe");
+    let typed = payload("SwiftVPN 3.0.exe");
+    let stored = payload("swiftvpn 3.0.exe");
     assert_eq!(typed.rules_json, stored.rules_json);
     assert_eq!(typed.content_hash, stored.content_hash);
     assert_ne!(
         typed.content_hash, "client-supplied",
         "the hash must be recomputed from the canonical form, not trusted"
     );
-    assert!(typed.rules_json.contains("hidemy.name vpn 3.0.exe"));
+    assert!(typed.rules_json.contains("swiftvpn 3.0.exe"));
 }
 
 #[test]

@@ -89,14 +89,37 @@ impl ConnectionObservationConsumer {
             .zip(self.ipv6_cut_drop_check.as_ref())
             .is_some_and(|(spec_id, check)| check(spec_id));
         let dns_lockdown = self.is_dns_lockdown_drop(rec);
+        let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
         let reason = block_reason_for(
             rec.nrr_drop_spec_id,
             killswitch_verified,
             default_block_id,
-            self.fail_closed_armed.as_ref().is_some_and(|armed| armed()),
+            armed,
             ipv6_cut,
             dns_lockdown,
         );
+        // The outage is one fact about the machine, not one fact per
+        // application that ran into it. A disarmed block-all means the wait is
+        // over, so the next one is news again — this is also what keeps the
+        // latch from surviving a link that came back while nothing was trying.
+        if !armed {
+            self.outage_announced
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if !nrr_domain::block_notice::announces_individually(
+            reason,
+            self.outage_announced
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ) {
+            return;
+        }
+        // Latched by the notice that actually announces the outage — not by
+        // any drop that happens to land while one is armed. Marking it on a
+        // rule-block would swallow the outage notice that follows.
+        if reason == nrr_domain::block_notice::BlockReason::RouteUnavailable {
+            self.outage_announced
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let host = match rec.remote.ip() {
             IpAddr::V4(ip) => self
                 .block_notice_name_for_address

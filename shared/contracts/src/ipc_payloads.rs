@@ -1399,16 +1399,21 @@ pub enum StatusUpdateEvent {
     /// `status = "ok"` clears a standing notice.
     EnforcementStatusChanged {
         sid: String,
-        /// `"ok"` | `"adapter-choice-needed"` | `"no-primary-route"` |
-        /// `"no-policy"` | `"adapters-unreadable"`. A client that does not
-        /// recognise a value shows the generic "your rules are not being
-        /// applied" wording rather than nothing.
+        /// `"ok"` | `"adapter-choice-needed"` | `"adapter-gone"` |
+        /// `"adapter-failed"` |
+        /// `"no-primary-route"` | `"no-policy"` | `"secondary-down"` |
+        /// `"adapters-unreadable"`. A client that does not recognise a value
+        /// shows the generic "your rules are not being applied" wording rather
+        /// than nothing.
         status: String,
         /// Binding role the status is about (`"primary"` / `"secondary"`);
         /// empty when it is not about one role.
         role: String,
         /// Adapters the user could pick from, by the name the interfaces list
-        /// shows. Only populated for `"adapter-choice-needed"`.
+        /// shows. Populated for the statuses that ask the user to choose:
+        /// `"adapter-choice-needed"` (too many answer to the saved name) and
+        /// `"adapter-gone"` (none does) and `"adapter-failed"` (the bound one
+        /// is still installed but its driver will not start).
         #[serde(default)]
         candidates: Vec<String>,
     },
@@ -1542,7 +1547,7 @@ pub struct SnapshotInitialResponse {
     /// to an on-disk path (app not installed / not running / not in App
     /// Paths), so their per-process `ALE_APP_ID` filter was not built and the
     /// rule is silently unenforced. Each entry is the rule's app pattern
-    /// (e.g. `"vk.exe"`), sorted + deduped. Surfaced so the GUI can show a
+    /// (e.g. `"ab.exe"`), sorted + deduped. Surfaced so the GUI can show a
     /// banner. Empty when every app rule resolved (or there are none). Wire
     /// key: `unenforced-app-rules`.
     #[serde(default)]
@@ -2829,6 +2834,18 @@ pub struct ConnTraceEntriesListResponse {
     pub page: PageResult<ConnTraceEntryDto>,
     /// `true` when the compact redaction tier is active (IPs masked).
     pub redacted: bool,
+    /// `false` when no observation source is running, so an empty page means
+    /// "not watching" rather than "nothing happened yet" — the two states the
+    /// GUI must not present as one. Defaults to `true` for a service that
+    /// predates the field: silence is the safer read than a false alarm.
+    #[serde(default = "default_true")]
+    pub observer_active: bool,
+    /// `false` when the user has switched the GUI trace off in Settings. The
+    /// page is then empty BY REQUEST — a third silence, distinct from both
+    /// "nothing happened" and "not watching". Read per request, so the switch
+    /// takes effect without restarting the service.
+    #[serde(default = "default_true")]
+    pub gui_stream_enabled: bool,
 }
 
 /// Wire request for `DiagnosticModeSet`. The response
@@ -2899,9 +2916,12 @@ pub struct ServiceStabilityConfigDto {
     /// `#[serde(default)]` keeps it additive (older GUIs deserialise `false`).
     #[serde(default)]
     pub conn_trace_ndjson: bool,
-    /// When `true` the trace streams to the GUI
-    /// «Диагностика» panel. Independent of `conn_trace_ndjson`.
-    #[serde(default)]
+    /// When `true` the Diagnostics connection-trace panel may show what was
+    /// observed. Independent of `conn_trace_ndjson` — it gates the VIEW, never
+    /// the observation app routing and the learners depend on. Defaults to
+    /// `true`: an absent field must not blank a panel that costs nothing on
+    /// disk (the privacy-sensitive half is the NDJSON sink).
+    #[serde(default = "default_true")]
     pub conn_trace_gui: bool,
     /// Routing scope. `true` (default) = service-driven
     /// (the service enforces continuously while it runs, even with no GUI/tray
@@ -3102,7 +3122,7 @@ impl Default for ServiceStabilityConfigDto {
             ipc_accept_policy: IpcAcceptFailurePolicyDto::default(),
             verbose_logging: false,
             conn_trace_ndjson: false,
-            conn_trace_gui: false,
+            conn_trace_gui: true,
             // Preserve the historical Rust-side default (`false`) for this
             // field; the wire/serde default is `true` via `rule_scope_default`.
             rule_scope_service_driven: false,
@@ -3277,6 +3297,12 @@ pub struct TrafficStatsGetResponse {
     pub settings: TrafficStatsSettingsDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub csv: Option<String>,
+    /// The pending merge question, when there is one. Rides on the read the
+    /// traffic screen already makes: the question is about two of the rows on
+    /// that screen, and that is the only place the user has the context to
+    /// answer it. Defaulted, so an older window simply never sees it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_merge: Option<TrafficHistoryMergeDto>,
 }
 
 /// `traffic-stats.set` request — the new service-global settings.
@@ -3284,6 +3310,47 @@ pub struct TrafficStatsGetResponse {
 #[serde(rename_all = "kebab-case")]
 pub struct TrafficStatsSetRequest {
     pub settings: TrafficStatsSettingsDto,
+}
+
+/// The one-time question "did this connection's history continue as that one's?".
+///
+/// Present only when the service has evidence for it: one key stopped being
+/// seen, another appeared in its place, and the two names share a word that
+/// means something. Absent is the normal state — the GUI shows nothing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrafficHistoryMergeDto {
+    /// Ledger key that went quiet — the history that would be continued.
+    pub old_key: String,
+    /// Name to show for it. The keys are identity, not something to read out.
+    pub old_name: String,
+    /// Ledger key that appeared.
+    pub new_key: String,
+    pub new_name: String,
+    /// The word both names share, so the question can say why it is being asked
+    /// instead of presenting a bare pair.
+    pub shared_token: String,
+}
+
+/// `traffic-stats.history-merge.set` — the user's answer.
+///
+/// `merged: false` is an answer, not a dismissal: the pair is recorded as
+/// decided and never offered again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrafficHistoryMergeSetRequest {
+    pub old_key: String,
+    pub new_key: String,
+    pub merged: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TrafficHistoryMergeSetResponse {
+    /// Echoed so the window can confirm which pair the service recorded.
+    pub old_key: String,
+    pub new_key: String,
+    pub merged: bool,
 }
 
 /// IPv6 is cut by default while protection is on — see the field docs.
@@ -3480,6 +3547,36 @@ pub const AUTO_RULE_SIGNAL_SLUGS: &[&str] = &[
 /// counterpart, so it stays out of [`AUTO_RULE_SIGNAL_SLUGS`].
 pub const AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE: &str = "isp-block-page";
 
+/// [`AutoRuleCandidateDto::signal`]: the main link answered this host with
+/// addresses nothing can live at — a placeholder standing in for the real
+/// answer. Unlike the companion signals this one is about the host itself, not
+/// about the company it keeps, so it too stays out of
+/// [`AUTO_RULE_SIGNAL_SLUGS`].
+pub const AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER: &str = "placeholder-answer";
+
+/// [`AutoRuleCandidateDto::signal`]: connections to this host kept failing on
+/// the main link while nothing about it ever completed there. Measured, not
+/// inferred from an address — the one honest way to say "the main link will not
+/// carry this site". Also outside [`AUTO_RULE_SIGNAL_SLUGS`].
+pub const AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED: &str = "main-link-blocked";
+
+/// The signals where the host makes the offer about ITSELF: `anchor` is the
+/// host, there is no companion arithmetic, and the question is only whether the
+/// main link carries it. The GUI reads this to know it must not say "a site
+/// needs this address", and the engine reads it to know the main-link verdict
+/// settles the offer outright.
+pub const AUTO_RULE_SELF_SIGNED_SIGNALS: &[&str] = &[
+    AUTO_RULE_SIGNAL_ISP_BLOCK_PAGE,
+    AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER,
+    AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
+];
+
+/// `true` when `signal` is one of [`AUTO_RULE_SELF_SIGNED_SIGNALS`].
+#[must_use]
+pub fn is_self_signed_signal(signal: &str) -> bool {
+    AUTO_RULE_SELF_SIGNED_SIGNALS.contains(&signal)
+}
+
 /// [`AutoRuleCandidateDto::primary_behavior`]: connections to the host went
 /// through on the main route — it already works without the tunnel.
 pub const AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS: &str = "responds";
@@ -3539,7 +3636,13 @@ pub struct AutoRuleCandidateDto {
     /// means it was never seen anywhere else.
     pub affinity: f64,
     /// Distinct visits the pair was observed in.
-    pub observations: u32,
+    ///
+    /// `None` for an offer a host signed about ITSELF: there is no pair and
+    /// there were no visits, and the count of 1 it used to carry read as
+    /// "seen once" about a host whose evidence is three failed connections.
+    /// The signal, not a visit count, is what such an offer knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<u32>,
     /// First and most recent sighting, UTC Unix milliseconds.
     pub first_seen_unix_ms: i64,
     pub last_seen_unix_ms: i64,
@@ -3590,6 +3693,41 @@ pub struct AutoRuleCandidateDto {
     /// Additive on the wire: empty (and omitted) for peers that predate it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub observed_members: Vec<String>,
+    /// A third party the main route already serves. The tray notice has always
+    /// withheld these; the inbox showed them like any other offer, so the same
+    /// host read as "your site needs this" in one surface and as "nothing to do
+    /// here" in the other.
+    ///
+    /// Decided by the service, not re-derived by the GUI: the judgement folds
+    /// the measured main-route behaviour with "is this the site's own name",
+    /// and two copies of that rule would drift.
+    ///
+    /// Additive on the wire: `false` for peers that predate it.
+    #[serde(default)]
+    pub served_by_main_link: bool,
+    /// The offer is a name that does NOT belong to the site that pulled it —
+    /// an analytics, tag or delivery host rather than the site's own. The user
+    /// asked to see the difference; it changes how much the offer is worth,
+    /// not whether it is shown.
+    ///
+    /// `None` when the question was never posed: an offer a host makes about
+    /// ITSELF has no site that pulled it, so "whose name is this" has no
+    /// answer to give. A `bool` there could only answer "the site's own",
+    /// which is what an ad host was being called.
+    ///
+    /// Additive on the wire: absent for peers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub third_party: Option<bool>,
+    /// Did the ADDITIONAL route reach this host when it was checked?
+    ///
+    /// The offer is "move this into the tunnel", and that is worth nothing if
+    /// the tunnel cannot carry it either — an outage upstream of both links
+    /// looks exactly like a host worth routing. `None` means nobody has
+    /// checked; only a measured `false` says the move would not help.
+    ///
+    /// Additive on the wire: absent for peers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_reach: Option<bool>,
 }
 
 /// `autorules.candidates.list` request — no parameters; the caller's own SID
@@ -4138,7 +4276,7 @@ mod tests {
             StatusUpdateEvent::BlockNoticeRaised {
                 sid: "S-1-5-21".into(),
                 destination: "cdn.example".into(),
-                app: "telegram.exe".into(),
+                app: "messenger.exe".into(),
                 reason: "not-covered-by-rules".into(),
                 attempts: 1,
             },
@@ -4207,7 +4345,7 @@ mod tests {
         let notice = serde_json::to_value(StatusUpdateEvent::BlockNoticeRaised {
             sid: "S-1-5-21".into(),
             destination: "cdn.example".into(),
-            app: "telegram.exe".into(),
+            app: "messenger.exe".into(),
             reason: "not-covered-by-rules".into(),
             attempts: 1,
         })
@@ -4352,7 +4490,7 @@ mod tests {
             match_kind: AUTO_RULE_MATCH_KIND_EXACT.into(),
             route: crate::RouteRole::Secondary.slug().into(),
             affinity: 1.0,
-            observations: 2,
+            observations: Some(2),
             first_seen_unix_ms: 1,
             last_seen_unix_ms: 2,
             signal: AUTO_RULE_SIGNAL_DELIVERY_NAME.into(),
@@ -4364,6 +4502,9 @@ mod tests {
             primary_behavior: AUTO_RULE_PRIMARY_BEHAVIOR_STALLS.into(),
             anchor_refuses_main_link: false,
             observed_members: vec!["ledger.other.example".into()],
+            served_by_main_link: false,
+            third_party: Some(false),
+            secondary_reach: None,
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         for key in [
@@ -4381,6 +4522,7 @@ mod tests {
             "consumers-changed-unix-ms",
             "primary-behavior",
             "observed-members",
+            "third-party",
         ] {
             assert!(json.get(key).is_some(), "missing wire key {key}");
         }
@@ -4400,7 +4542,7 @@ mod tests {
             match_kind: AUTO_RULE_MATCH_KIND_EXACT.into(),
             route: crate::RouteRole::Secondary.slug().into(),
             affinity: 1.0,
-            observations: 2,
+            observations: Some(2),
             first_seen_unix_ms: 1,
             last_seen_unix_ms: 2,
             signal: String::new(),
@@ -4409,6 +4551,9 @@ mod tests {
             primary_behavior: String::new(),
             anchor_refuses_main_link: false,
             observed_members: Vec::new(),
+            served_by_main_link: false,
+            third_party: None,
+            secondary_reach: None,
         };
         let json = serde_json::to_value(&dto).expect("serialise");
         let keys: Vec<&String> = json.as_object().expect("object").keys().collect::<Vec<_>>();
@@ -4423,6 +4568,12 @@ mod tests {
         assert!(
             !keys.iter().any(|k| k.as_str() == "primary-behavior"),
             "an unobserved primary behaviour must not add a key: {keys:?}"
+        );
+        // An offer with no anchor site leaves the question off the wire
+        // entirely, so a reader cannot mistake it for "the site's own name".
+        assert!(
+            !keys.iter().any(|k| k.as_str() == "third-party"),
+            "an unposed ownership question must not add a key: {keys:?}"
         );
         let back: AutoRuleCandidateDto = serde_json::from_value(json).expect("deserialise");
         assert_eq!(back, dto);
@@ -4440,6 +4591,20 @@ mod tests {
             AUTO_RULE_SIGNAL_SLUGS,
             ["brand-related", "delivery-name", "co-activity"]
         );
+        // The signals a host raises about ITSELF carry no companion arithmetic,
+        // so they are not in the list above — but they are the same
+        // cross-process contract with the GUI text and must not drift either.
+        assert_eq!(
+            AUTO_RULE_SELF_SIGNED_SIGNALS,
+            ["isp-block-page", "placeholder-answer", "main-link-blocked"]
+        );
+        for signal in AUTO_RULE_SELF_SIGNED_SIGNALS {
+            assert!(is_self_signed_signal(signal), "{signal}");
+            assert!(!AUTO_RULE_SIGNAL_SLUGS.contains(signal), "{signal}");
+        }
+        for signal in AUTO_RULE_SIGNAL_SLUGS {
+            assert!(!is_self_signed_signal(signal), "{signal}");
+        }
     }
 
     #[test]
@@ -4518,7 +4683,7 @@ mod tests {
             ),
             (
                 BlockNoticeMuteScopeDto::App {
-                    app: "telegram.exe".into(),
+                    app: "messenger.exe".into(),
                 },
                 "app",
                 Some("app"),
@@ -4562,13 +4727,13 @@ mod tests {
     fn block_notice_mutes_set_request_uses_kebab_wire_keys() {
         let req = BlockNoticeMutesSetRequest {
             scope: BlockNoticeMuteScopeDto::App {
-                app: "telegram.exe".into(),
+                app: "messenger.exe".into(),
             },
             until_unix_ms: Some(1_000),
         };
         let json = serde_json::to_value(&req).expect("serialise");
         assert_eq!(json["scope"]["kind"], "app");
-        assert_eq!(json["scope"]["app"], "telegram.exe");
+        assert_eq!(json["scope"]["app"], "messenger.exe");
         assert_eq!(json["until-unix-ms"], 1_000);
         let back: BlockNoticeMutesSetRequest = serde_json::from_value(json).expect("deserialise");
         assert_eq!(back, req);

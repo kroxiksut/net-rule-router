@@ -914,6 +914,12 @@ pub fn write_qt_context_file_at(
                 "state": diagnostics_status.service_health.state,
                 "activeRevisionId": diagnostics_status.service_health.active_revision_id,
                 "pendingChanges": diagnostics_status.service_health.pending_changes,
+                // A fact about THIS boot, so the cold-start snapshot carries it
+                // for the whole session — there is nothing for a live poll to
+                // refresh.
+                "startRelativeToSignIn":
+                    diagnostics_status.service_health.start_relative_to_sign_in,
+                "startSignInGapMs": diagnostics_status.service_health.start_sign_in_gap_ms,
             },
             "securityStatus": {
                 "auditChainOk": diagnostics_status.security_status.audit_chain_ok,

@@ -1,7 +1,7 @@
 //! Opening the REAL connection a fake-IP flow stands for.
 //!
 //! Once the relay knows that "the application is talking to `198.18.0.7:443`"
-//! means "the application is talking to `chatgpt.com:443`", something has to
+//! means "the application is talking to `assistant.example:443`", something has to
 //! open that real connection and move bytes. That something is a dialer, kept
 //! behind a trait for two reasons:
 //!
@@ -794,7 +794,7 @@ mod tests {
 
     fn target(address: &str, route: RouteRole) -> UpstreamTarget {
         UpstreamTarget::at(
-            "chatgpt.com".to_string(),
+            "assistant.example".to_string(),
             address.parse().expect("address"),
             route,
         )
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(dialer.written(), b"client-hello");
         assert_eq!(dialer.dials().len(), 1);
         assert_eq!(dialer.dials()[0].route, RouteRole::Secondary);
-        assert_eq!(dialer.dials()[0].hostname, "chatgpt.com");
+        assert_eq!(dialer.dials()[0].hostname, "assistant.example");
     }
 
     #[test]

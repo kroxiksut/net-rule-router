@@ -55,11 +55,7 @@ impl ArchiveSection {
     pub fn is_mandatory(self) -> bool {
         matches!(
             self,
-            Self::Health
-                | Self::Logs
-                | Self::AuditSummary
-                | Self::Troubleshooting
-                | Self::SystemInfo
+            Self::Health | Self::Logs | Self::AuditSummary | Self::SystemInfo
         )
     }
 
@@ -79,11 +75,14 @@ impl ArchiveSection {
         Self::SystemInfo,
     ];
 
+    /// What an archive must carry to be evidence at all. `Troubleshooting` is
+    /// deliberately NOT here: it is generated text, identical in every archive
+    /// and derived from nothing on this machine, so a bundle without it is
+    /// still a complete account of what happened.
     pub const MANDATORY: &'static [Self] = &[
         Self::Health,
         Self::Logs,
         Self::AuditSummary,
-        Self::Troubleshooting,
         Self::SystemInfo,
     ];
 }
@@ -136,6 +135,12 @@ pub struct DiagnosticArchiveRequest {
     pub max_audit_chain_bytes: u64,
     /// Human-readable app version string (e.g., `"0.1.0-preview"`).
     pub app_version: String,
+    /// Whether `troubleshooting.md` is written. The only mandatory section a
+    /// caller may drop: it carries no evidence at all — it is generated text,
+    /// identical in every archive — so an operator slimming a bundle down to
+    /// the parts that differ has nothing to lose by leaving it out. Every other
+    /// mandatory section is what the archive is FOR.
+    pub include_troubleshooting: bool,
 }
 
 impl DiagnosticArchiveRequest {
@@ -151,6 +156,7 @@ impl DiagnosticArchiveRequest {
             max_audit_entries: DEFAULT_MAX_AUDIT_ENTRIES,
             max_audit_chain_bytes: DEFAULT_MAX_AUDIT_CHAIN_BYTES,
             app_version: app_version.into(),
+            include_troubleshooting: true,
         }
     }
 
@@ -174,12 +180,16 @@ impl DiagnosticArchiveRequest {
             max_audit_entries: DEFAULT_MAX_AUDIT_ENTRIES,
             max_audit_chain_bytes: DEFAULT_MAX_AUDIT_CHAIN_BYTES,
             app_version: app_version.into(),
+            include_troubleshooting: true,
         }
     }
 
     /// Returns all sections (mandatory + requested optional), deduplicated.
     pub fn all_sections(&self) -> Vec<ArchiveSection> {
         let mut sections: Vec<ArchiveSection> = ArchiveSection::MANDATORY.to_vec();
+        if self.include_troubleshooting {
+            sections.push(ArchiveSection::Troubleshooting);
+        }
         for s in &self.optional_sections {
             if !sections.contains(s) {
                 sections.push(*s);
@@ -227,6 +237,28 @@ mod tests {
         assert!(sections.contains(&ArchiveSection::Health));
         assert!(sections.contains(&ArchiveSection::Logs));
         assert!(sections.contains(&ArchiveSection::RedactionReport));
+    }
+
+    #[test]
+    fn dropping_the_playbooks_removes_the_section_and_nothing_else() {
+        let mut req = DiagnosticArchiveRequest::default_export("v");
+        let with = req.all_sections();
+        // Positive control: the section IS there by default, so the assertion
+        // below is measuring the flag rather than an already-absent section.
+        assert!(with.contains(&ArchiveSection::Troubleshooting));
+
+        req.include_troubleshooting = false;
+        let without = req.all_sections();
+        assert!(!without.contains(&ArchiveSection::Troubleshooting));
+        for section in with
+            .iter()
+            .filter(|s| **s != ArchiveSection::Troubleshooting)
+        {
+            assert!(
+                without.contains(section),
+                "{section:?} is evidence, not generated text — it must survive the flag"
+            );
+        }
     }
 
     #[test]

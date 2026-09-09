@@ -1364,7 +1364,7 @@ GroupBox {
                         Layout.fillWidth: true
                         text: root.tr(
                             "settings.diagnostics.conn-trace.intro",
-                            "Records outgoing connections of all apps and the interface each left through (direct vs VPN). Sees the real socket, so it works even when the browser uses DoH. Requires service restart.")
+                            "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two switches decide where it is shown and whether it is written down.")
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1384,12 +1384,12 @@ GroupBox {
                         ToolTip.delay: 400
                         ToolTip.text: root.tr(
                             "settings.diagnostics.conn-trace.ndjson.tooltip",
-                            "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/VPN).")
+                            "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/additional adapter). Applies at the next service start.")
                     }
                     CheckBox {
                         text: root.tr(
                             "settings.diagnostics.conn-trace.gui.label",
-                            "Show connection trace in diagnostics (GUI)")
+                            "Show connection trace in Diagnostics")
                         checked: group._stabilityDraftConnTraceGui
                         onToggled: {
                             if (checked !== group._stabilityDraftConnTraceGui) {
@@ -1401,14 +1401,14 @@ GroupBox {
                         ToolTip.delay: 400
                         ToolTip.text: root.tr(
                             "settings.diagnostics.conn-trace.gui.tooltip",
-                            "Surfaces the connection trace in the diagnostics log view (also writes it to NDJSON).")
+                            "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on.")
                     }
                     Label {
                         Layout.fillWidth: true
                         Layout.leftMargin: root.uiTheme.spacingLg
                         text: root.tr(
                             "settings.diagnostics.conn-trace.help",
-                            "Privacy-sensitive: the trace contains per-connection process names and remote addresses. Leave off in normal operation.")
+                            "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation.")
                         color: root.mutedTextColor
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1

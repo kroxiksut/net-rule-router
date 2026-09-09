@@ -153,16 +153,16 @@ mod tests {
     use super::*;
 
     fn ip(d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(142, 251, 150, d)
+        Ipv4Addr::new(203, 0, 113, d)
     }
 
     #[test]
     fn remembers_every_resolved_address_not_just_the_answered_ones() {
         let idx = RecentRuleAddressIndex::new();
-        idx.record("google.com", &[ip(1), ip(2), ip(3)]);
+        idx.record("search.example", &[ip(1), ip(2), ip(3)]);
 
-        assert_eq!(idx.lookup(ip(2)).as_deref(), Some("google.com"));
-        assert_eq!(idx.lookup(ip(3)).as_deref(), Some("google.com"));
+        assert_eq!(idx.lookup(ip(2)).as_deref(), Some("search.example"));
+        assert_eq!(idx.lookup(ip(3)).as_deref(), Some("search.example"));
         assert!(idx.lookup(ip(9)).is_none());
     }
 
@@ -179,11 +179,14 @@ mod tests {
     #[test]
     fn reports_a_wholesale_owner_change() {
         let idx = RecentRuleAddressIndex::new();
-        assert_eq!(idx.record_displacing("signal.me", &[ip(1), ip(2)]), None);
         assert_eq!(
-            idx.record_displacing("chatgpt.com", &[ip(1), ip(2)])
+            idx.record_displacing("secure.example", &[ip(1), ip(2)]),
+            None
+        );
+        assert_eq!(
+            idx.record_displacing("assistant.example", &[ip(1), ip(2)])
                 .as_deref(),
-            Some("signal.me")
+            Some("secure.example")
         );
     }
 
@@ -209,7 +212,7 @@ mod tests {
     fn empty_inputs_are_ignored() {
         let idx = RecentRuleAddressIndex::new();
         idx.record("", &[ip(1)]);
-        idx.record("google.com", &[]);
+        idx.record("search.example", &[]);
 
         assert!(idx.is_empty());
     }

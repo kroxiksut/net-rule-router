@@ -795,13 +795,17 @@ mod tests {
             FakeIpPoolConfig::default(),
         );
         let view = assembly.binding_view();
-        assert_eq!(view.fake_v4_for("habr.com"), None, "nothing answered yet");
+        assert_eq!(
+            view.fake_v4_for("blog.example"),
+            None,
+            "nothing answered yet"
+        );
         let answered = assembly
             .answerer()
-            .fake_answer("habr.com")
+            .fake_answer("blog.example")
             .expect("in scope")[0];
         assert_eq!(
-            view.fake_v4_for("habr.com"),
+            view.fake_v4_for("blog.example"),
             Some(answered),
             "view mirrors the live allocator"
         );
@@ -850,20 +854,23 @@ mod tests {
             FakeIpPoolConfig::default(),
         );
         let direct = assembly.direct_answerer(Arc::new(|| true));
-        let real = Ipv4Addr::new(178, 248, 237, 68);
+        let real = Ipv4Addr::new(203, 0, 113, 68);
         let fake = direct
-            .fake_direct_answer("habr.com", &[real])
+            .fake_direct_answer("blog.example", &[real])
             .expect("armed + in scope")[0];
         // Shared allocator: a rule-host binding from the same assembly cannot
         // collide with the direct-host binding.
         let rule_fake = assembly
             .answerer()
-            .fake_answer("chatgpt.com")
+            .fake_answer("assistant.example")
             .expect("in scope")[0];
         assert_ne!(fake, rule_fake, "one allocator serves both answerers");
         // The relay's resolver sees the recorded real set without any cache.
         let resolver = assembly.direct_aware_resolver(Arc::new(StaticUpstreamResolver::new()));
-        assert_eq!(resolver.addresses_for("habr.com"), vec![IpAddr::V4(real)]);
+        assert_eq!(
+            resolver.addresses_for("blog.example"),
+            vec![IpAddr::V4(real)]
+        );
     }
 
     #[test]

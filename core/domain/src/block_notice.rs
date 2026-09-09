@@ -59,6 +59,33 @@ pub enum BlockReason {
     Unattributed,
 }
 
+/// Whether this attempt earns a notice of its OWN, given that the outage behind
+/// it has already been announced.
+///
+/// This is the SECOND half of collapsing an outage, and it answers a different
+/// question from the episode key. The key ([`BlockAttempt::key`]) folds by
+/// CONTENT: every host and every application share one `RouteUnavailable`
+/// episode, so a hundred simultaneous failures are one notice. What it cannot
+/// fold is TIME — an episode reopens after [`DEFAULT_EPISODE_GAP_MS`] of quiet,
+/// and an outage routinely outlasts that (a field case ran 79 s), so the same
+/// "waiting for the additional link" arrives again while nothing has changed.
+///
+/// So the caller latches on the STATE instead: while the block-all stays armed
+/// the outage is announced once, and the latch clears when it disarms — the
+/// wait is over, and the next one is genuinely news.
+///
+/// Only [`BlockReason::RouteUnavailable`] collapses. Every other cause names
+/// something the user can act on — a rule, a switch, a resolver — and those
+/// stay one notice per episode, because acting on one of them does not act on
+/// the others.
+#[must_use]
+pub fn announces_individually(reason: BlockReason, outage_already_announced: bool) -> bool {
+    match reason {
+        BlockReason::RouteUnavailable => !outage_already_announced,
+        _ => true,
+    }
+}
+
 impl BlockReason {
     /// Stable slug for the wire and for locale keys.
     #[must_use]
@@ -351,7 +378,7 @@ mod tests {
     #[test]
     fn a_retrying_application_is_one_notice_not_a_storm() {
         let mut ledger = BlockNoticeLedger::default();
-        let a = attempt("cdn.example", "telegram.exe");
+        let a = attempt("cdn.example", "messenger.exe");
 
         assert!(ledger.record(0, &a).is_some());
         for tick in 1..211 {
@@ -369,10 +396,10 @@ mod tests {
         // for every app that hit it, not just the one that happened to ask.
         let mut ledger = BlockNoticeLedger::default();
         let chrome = attempt("cdn.example", "chrome.exe");
-        let telegram = attempt("cdn.example", "telegram.exe");
+        let messenger = attempt("cdn.example", "messenger.exe");
         let other = attempt("other.example", "chrome.exe");
         assert!(ledger.record(0, &chrome).is_some());
-        assert!(ledger.record(0, &telegram).is_some());
+        assert!(ledger.record(0, &messenger).is_some());
         assert!(ledger.record(0, &other).is_some());
 
         assert_eq!(
@@ -381,7 +408,7 @@ mod tests {
             "case and trailing dot are noise"
         );
         assert_eq!(ledger.attempts_so_far(&chrome), 0);
-        assert_eq!(ledger.attempts_so_far(&telegram), 0);
+        assert_eq!(ledger.attempts_so_far(&messenger), 0);
         assert_eq!(
             ledger.attempts_so_far(&other),
             1,
@@ -430,8 +457,8 @@ mod tests {
 
     #[test]
     fn each_mute_scope_silences_exactly_what_it_names() {
-        let noisy = attempt("cdn.example", "telegram.exe");
-        let other_host = attempt("other.example", "telegram.exe");
+        let noisy = attempt("cdn.example", "messenger.exe");
+        let other_host = attempt("other.example", "messenger.exe");
         let other_app = attempt("cdn.example", "chrome.exe");
 
         let mut by_host = BlockNoticeLedger::default();
@@ -440,7 +467,7 @@ mod tests {
         assert!(by_host.record(0, &other_host).is_some());
 
         let mut by_app = BlockNoticeLedger::default();
-        by_app.set_mutes(vec![Mute::forever(MuteScope::App("telegram.exe".into()))]);
+        by_app.set_mutes(vec![Mute::forever(MuteScope::App("messenger.exe".into()))]);
         assert!(by_app.record(0, &noisy).is_none());
         assert!(by_app.record(0, &other_app).is_some());
 
@@ -507,19 +534,22 @@ mod tests {
             app: Some(app.into()),
             reason: BlockReason::RouteUnavailable,
         };
-        let first = down("chatgpt.com", "chrome.exe");
+        let first = down("assistant.example", "chrome.exe");
 
         let notice = ledger.record(0, &first).expect("the outage is news once");
-        assert_eq!(notice.destination, "chatgpt.com", "names a real example");
+        assert_eq!(
+            notice.destination, "assistant.example",
+            "names a real example"
+        );
 
         assert!(ledger
-            .record(10, &down("www.youtube.com", "chrome.exe"))
+            .record(10, &down("www.video.example", "chrome.exe"))
             .is_none());
         assert!(ledger
-            .record(20, &down("web.whatsapp.com", "telegram.exe"))
+            .record(20, &down("web.chatapp.example", "messenger.exe"))
             .is_none());
         assert!(ledger
-            .record(30, &down("chatgpt.com", "chrome.exe"))
+            .record(30, &down("assistant.example", "chrome.exe"))
             .is_none());
         assert_eq!(ledger.attempts_so_far(&first), 4, "all of them counted");
     }
@@ -546,5 +576,33 @@ mod tests {
             reason: BlockReason::BlockedByRule,
         };
         assert_eq!(nameless.destination_label(), "203.0.113.7");
+    }
+
+    /// While the additional link is down every routed host is unreachable, so
+    /// each application that tries earns its own episode with the same cause.
+    /// One of them is news; the rest are the same news with different nouns.
+    #[test]
+    fn an_announced_outage_collapses_the_attempts_that_follow_it() {
+        assert!(announces_individually(BlockReason::RouteUnavailable, false));
+        assert!(!announces_individually(BlockReason::RouteUnavailable, true));
+    }
+
+    /// Every other cause names something the user can act on, and acting on one
+    /// of them does not act on the others — so they keep their own notices even
+    /// while an outage is being announced.
+    #[test]
+    fn an_actionable_cause_is_never_collapsed_into_the_outage() {
+        for reason in [
+            BlockReason::NotCoveredByRules,
+            BlockReason::BlockedByRule,
+            BlockReason::Ipv6Blocked,
+            BlockReason::DnsLockdown,
+            BlockReason::Unattributed,
+        ] {
+            assert!(
+                announces_individually(reason, true),
+                "{reason:?} has its own remedy and must keep its own notice"
+            );
+        }
     }
 }

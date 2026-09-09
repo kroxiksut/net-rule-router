@@ -226,6 +226,73 @@ GroupBox {
             }
         }
 
+        // One connection stopped being seen while another appeared in its
+        // place, and the two names share a word. Asked HERE because the answer
+        // is about two of the rows below it — this is the only screen where the
+        // user has what they need to decide. There is no third "later" button:
+        // the pair is recorded either way, so the question is asked once.
+        Rectangle {
+            Layout.fillWidth: true
+            visible: group.ctrl !== null && group.ctrl !== undefined
+                && group.ctrl.historyMerge !== null
+            implicitHeight: historyMergeColumn.implicitHeight + root.uiTheme.spacingSm * 2
+            radius: root.uiTheme.radiusSm
+            color: Qt.rgba(root.uiTheme.colorAccent.r, root.uiTheme.colorAccent.g,
+                root.uiTheme.colorAccent.b, 0.12)
+            border.width: root.uiTheme.borderWidth
+            border.color: Qt.rgba(root.uiTheme.colorAccent.r, root.uiTheme.colorAccent.g,
+                root.uiTheme.colorAccent.b, 0.45)
+            ColumnLayout {
+                id: historyMergeColumn
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                anchors.margins: root.uiTheme.spacingSm
+                spacing: root.uiTheme.spacingXs
+                Label {
+                    Layout.fillWidth: true
+                    color: root.textColor
+                    wrapMode: Text.WordWrap
+                    text: {
+                        var q = group.ctrl ? group.ctrl.historyMerge : null
+                        if (!q) return ""
+                        return root.tr("settings.traffic.history-merge.question",
+                                "\"{old}\" stopped appearing and \"{new}\" took its place. Is this the same connection, so its history should continue as one?")
+                            .replace("{old}", q.oldName)
+                            .replace("{new}", q.newName)
+                    }
+                    Accessible.role: Accessible.StaticText
+                    Accessible.name: text
+                }
+                Label {
+                    Layout.fillWidth: true
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                    text: root.tr("settings.traffic.history-merge.hint",
+                        "Answered once. If they are different connections, their histories stay apart and you will not be asked again.")
+                }
+                RowLayout {
+                    spacing: root.uiTheme.spacingSm
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("settings.traffic.history-merge.same",
+                            "Same connection")
+                        onClicked: if (group.ctrl) group.ctrl.answerHistoryMerge(true)
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                    }
+                    ThemedButton {
+                        theme: root.uiTheme
+                        text: root.tr("settings.traffic.history-merge.different",
+                            "Different connections")
+                        onClicked: if (group.ctrl) group.ctrl.answerHistoryMerge(false)
+                        Accessible.role: Accessible.Button
+                        Accessible.name: text
+                    }
+                }
+            }
+        }
+
         Label {
             Layout.fillWidth: true
             color: root.mutedTextColor

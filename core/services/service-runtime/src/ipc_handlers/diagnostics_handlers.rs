@@ -63,7 +63,9 @@ use crate::dns_observation_consumer::{
     build_secondary_ip_owners, rule_set_match_kind, rule_set_matches, ActiveSidFn,
 };
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
-use crate::ipc_handlers::providers::{AdaptersSnapshotProvider, RoutePolicyProvider};
+use crate::ipc_handlers::providers::{
+    AdaptersSnapshotProvider, RoutePolicyProvider, ServiceStabilityConfigProvider,
+};
 use crate::per_sid_orchestrator::RulesProvider;
 
 /// Inputs for the conn-trace `expected_route` stamp: the active
@@ -233,8 +235,8 @@ impl ExplainGetHandler {
             .is_empty()
         {
             // Host itself is un-cached (never matches a rule — e.g. bare
-            // google.com), but rule-cached subdomains exist under it
-            // (gemini.google.com). Same-front-end CDNs serve both from one IP
+            // search.example), but rule-cached subdomains exist under it
+            // (gemini.search.example). Same-front-end CDNs serve both from one IP
             // pool, so collateral is likely even before it is observed.
             return ("collateral-risk-subdomain-rules".to_string(), 0, 0);
         }
@@ -783,6 +785,11 @@ impl IpcHandler for CacheEntriesListHandler {
 /// facade for a redaction tier.
 pub struct ConnTraceEntriesListHandler {
     ring: Arc<ConnectionTraceRing>,
+    /// Machine settings, consulted per request so the "show the trace in the
+    /// GUI" switch acts at once instead of at the next service start. It gates
+    /// the ANSWER, never the observer: app-routing, FCrDNS learning and the
+    /// VPN learners read the same observation stream and must keep running.
+    gui_stream: Option<Arc<dyn ServiceStabilityConfigProvider>>,
     /// Optional inputs for the `expected_route` stamp: the active
     /// user's rule book + the FQDN cache yield the set of IPv4s a secondary
     /// rule currently owns, so each trace row can carry where policy EXPECTS
@@ -794,8 +801,28 @@ impl ConnTraceEntriesListHandler {
     pub fn new(ring: Arc<ConnectionTraceRing>) -> Self {
         Self {
             ring,
+            gui_stream: None,
             expectation: None,
         }
+    }
+
+    /// Honour the user's "show connection trace in the GUI" switch. Without
+    /// this the viewer answers regardless of the setting.
+    pub fn with_gui_stream_gate(
+        mut self,
+        settings: Arc<dyn ServiceStabilityConfigProvider>,
+    ) -> Self {
+        self.gui_stream = Some(settings);
+        self
+    }
+
+    /// Whether the viewer may answer at all. An absent provider means the
+    /// deployment has no settings DB — answering is then the useful default.
+    fn gui_stream_enabled(&self) -> bool {
+        self.gui_stream
+            .as_ref()
+            .map(|s| s.get().conn_trace_gui)
+            .unwrap_or(true)
     }
 
     /// Enable the expected-route stamp (see the struct field doc).
@@ -853,6 +880,25 @@ impl IpcHandler for ConnTraceEntriesListHandler {
         } else {
             serde_json::from_value(request.payload.clone()).map_err(|e| malformed(OP, e))?
         };
+
+        // The switch is off: answer with an empty page and say why, rather
+        // than with rows the user asked not to be shown.
+        if !self.gui_stream_enabled() {
+            return serialise(
+                OP,
+                &ConnTraceEntriesListResponse {
+                    page: PageResult {
+                        items: Vec::new(),
+                        next_cursor: None,
+                        total_count: None,
+                        stale: false,
+                    },
+                    redacted: false,
+                    observer_active: self.ring.observer_active(),
+                    gui_stream_enabled: false,
+                },
+            );
+        }
 
         // This is the user's own-machine connection viewer (per-SID,
         // DACL-protected local pipe), so show real remote/local IPs and the
@@ -952,6 +998,8 @@ impl IpcHandler for ConnTraceEntriesListHandler {
             // shows real addresses (see the mode note above). The GUI's
             // "addresses masked" notice therefore stays hidden.
             redacted: false,
+            observer_active: self.ring.observer_active(),
+            gui_stream_enabled: true,
         };
         serialise(OP, &response)
     }
@@ -1194,6 +1242,10 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         } else {
             DiagnosticArchiveRequest::default_export(self.app_version.clone())
         };
+        // The one inclusion flag with no consumer until now: the wire promised
+        // a choice the builder never read, so an operator who unticked it still
+        // got the file.
+        archive_request.include_troubleshooting = req.include_troubleshooting_playbooks;
         // "Current session only": the builder drops
         // `logs.ndjson` entries older than this cutoff (see the wire DTO doc).
         // The GUI sends its day floor; narrow it to the current service
@@ -1303,10 +1355,10 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             Some(bytes) if bytes > 0 => bytes as usize,
             _ => usize::MAX,
         };
-        let raw_log_lines = if req.include_logs {
+        let raw_log_files = if req.include_logs {
             self.diagnostics
-                .recent_log_lines_raw(raw_log_budget, effective_logs_from_ms, &audience)
-                .map_err(|e| internal(OP, format!("recent_log_lines_raw: {e}")))?
+                .recent_log_files_raw(raw_log_budget, effective_logs_from_ms, &audience)
+                .map_err(|e| internal(OP, format!("recent_log_files_raw: {e}")))?
         } else {
             Vec::new()
         };
@@ -1318,7 +1370,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             log_entries,
             audit_entries,
             audit_chain_lines,
-            raw_log_lines,
+            raw_log_files,
             explain_samples,
             system_info: self.system_info.clone(),
             service_stderr: self.read_service_stderr(),
@@ -1539,6 +1591,116 @@ mod tests {
         };
         let value = handler.handle(&env, &ctx).expect("cache.clear ok");
         serde_json::from_value(value).expect("decode CacheClearResponse")
+    }
+
+    // ── ConnTraceEntriesListHandler ──────────────────────────────────
+
+    fn conn_trace_list(handler: &ConnTraceEntriesListHandler) -> ConnTraceEntriesListResponse {
+        let env = IpcRequestEnvelope {
+            protocol_version: crate::ipc::IPC_PROTOCOL_VERSION,
+            request_id: "r".into(),
+            correlation_id: None,
+            operation: IpcOperationName::ConnTraceEntriesList,
+            operation_class: crate::ipc::IpcOperationClass::DiagnosticQuery,
+            confirmation_token: None,
+            payload: serde_json::Value::Null,
+        };
+        let ctx = IpcRequestContext {
+            client_profile: IpcClientProfile::GuiInteractive,
+            caller_is_elevated: false,
+            caller_principal: None,
+            caller_pid: None,
+        };
+        let value = handler
+            .handle(&env, &ctx)
+            .expect("conn-trace.entries.list ok");
+        serde_json::from_value(value).expect("decode ConnTraceEntriesListResponse")
+    }
+
+    /// One observed connection, enough to prove a page is (or is not) served.
+    fn trace_row() -> crate::conn_observation_consumer::ConnectionTraceRecord {
+        use nrr_platform_api::conn_observe::egress::{EgressInterface, EgressRole};
+        use nrr_platform_api::conn_observe::{ConnectionVerdict, TransportProtocol};
+        crate::conn_observation_consumer::ConnectionTraceRecord {
+            process_path: Some(r"\device\hd\chrome.exe".into()),
+            user_sid: None,
+            protocol: TransportProtocol::Tcp,
+            local: "192.0.2.10:52000".parse().expect("local"),
+            remote: "198.51.100.7:443".parse().expect("remote"),
+            egress: EgressInterface {
+                ifindex: 7,
+                role: EgressRole::Primary,
+            },
+            verdict: ConnectionVerdict::Permit,
+            blocked_by_nrr: None,
+            nrr_drop_spec_id: None,
+            observed_unix_ms: Some(1_757_000_000_000),
+        }
+    }
+
+    /// The switch is the user's own "do not show me this"; it must silence the
+    /// VIEWER without silencing the observation the rest of the service reads.
+    /// The enabled case is the positive control: without it, a handler that
+    /// simply never answers would pass.
+    #[test]
+    fn conn_trace_gui_switch_gates_the_answer_not_the_ring() {
+        let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+            8,
+        ));
+        ring.mark_observer_active();
+        ring.push(trace_row());
+
+        let hidden = ConnTraceEntriesListHandler::new(Arc::clone(&ring)).with_gui_stream_gate(
+            crate::ipc_handlers::test_fakes::FakeConnTraceGui::showing(false),
+        );
+        let resp = conn_trace_list(&hidden);
+        assert!(resp.page.items.is_empty(), "the switch is off");
+        assert!(
+            !resp.gui_stream_enabled,
+            "and the viewer says why it is empty"
+        );
+        assert!(
+            resp.observer_active,
+            "the observer keeps running — app-routing and the learners read it"
+        );
+        assert_eq!(ring.len(), 1, "the ring is untouched by the switch");
+
+        let shown = ConnTraceEntriesListHandler::new(Arc::clone(&ring)).with_gui_stream_gate(
+            crate::ipc_handlers::test_fakes::FakeConnTraceGui::showing(true),
+        );
+        let resp = conn_trace_list(&shown);
+        assert_eq!(
+            resp.page.items.len(),
+            1,
+            "switched on, the same row is served"
+        );
+        assert!(resp.gui_stream_enabled);
+    }
+
+    /// An empty page means two different things, and the viewer can only tell
+    /// them apart if the answer carries the observer's state. Both directions
+    /// are asserted: without the positive control, a field wired to a constant
+    /// `false` would pass the first half on its own.
+    #[test]
+    fn conn_trace_reports_whether_the_observer_is_running() {
+        let ring = Arc::new(crate::conn_observation_consumer::ConnectionTraceRing::new(
+            8,
+        ));
+        let handler = ConnTraceEntriesListHandler::new(Arc::clone(&ring));
+
+        let idle = conn_trace_list(&handler);
+        assert!(idle.page.items.is_empty());
+        assert!(
+            !idle.observer_active,
+            "nothing has started the observer yet"
+        );
+
+        ring.mark_observer_active();
+        let watching = conn_trace_list(&handler);
+        assert!(
+            watching.observer_active,
+            "an empty ring under a running observer means 'nothing happened yet'"
+        );
     }
 
     #[test]
@@ -1784,7 +1946,7 @@ mod tests {
         );
         // Hostname absent from the (empty) FQDN cache → no permit compiles
         // while armed → the verdict slug rides along.
-        let payload = serde_json::json!({ "input-sample": { "hostname": "google.com" } });
+        let payload = serde_json::json!({ "input-sample": { "hostname": "search.example" } });
         let v = h.handle(&envelope(payload), &ctx()).expect("ok");
         assert_eq!(
             v["compact"]["enforcement"],
@@ -1793,7 +1955,7 @@ mod tests {
 
         // Same probe WITHOUT the deps → field absent (skip_serializing_if).
         let bare = ExplainGetHandler::new(facade());
-        let payload = serde_json::json!({ "input-sample": { "hostname": "google.com" } });
+        let payload = serde_json::json!({ "input-sample": { "hostname": "search.example" } });
         let v = bare.handle(&envelope(payload), &ctx()).expect("ok");
         assert!(v["compact"].get("enforcement").is_none());
     }
@@ -2207,7 +2369,11 @@ mod tests {
         let diagnostics = names_for(serde_json::json!({ "redaction-level": "diagnostics" }));
         assert!(diagnostics.contains(&"cache_health.json".to_string()));
         assert!(diagnostics.contains(&"storage_health.json".to_string()));
-        assert!(diagnostics.contains(&"explain_samples.json".to_string()));
+        // `explain_samples.json` belongs to this tier's section set, but this
+        // service has no decisions to explain, and a section with nothing in it
+        // is now absent rather than shipped as an empty `[]` — what is missing
+        // is stated in the redaction report instead.
+        assert!(!diagnostics.contains(&"explain_samples.json".to_string()));
     }
 
     #[test]

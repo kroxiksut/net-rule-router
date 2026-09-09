@@ -6,7 +6,8 @@
 //! is a destination that is routed one way and dropped on the other, dead for
 //! every process on the machine.
 //!
-//! That is not hypothetical. A live machine lost `habr.com` for hours: an
+//! That is not hypothetical. A live machine lost an ordinary direct host for
+//! hours: an
 //! application rule on the additional link had once been observed connecting to
 //! its address, so the filter side pinned and then blocked it, while the route
 //! side — which already had the guard — left it on the main link. The site was
@@ -35,11 +36,11 @@ use nrr_service_runtime::route_codegen::{address_rule_ips, generate_routes, Seco
 use nrr_service_runtime::wfp_codegen::{generate_filters, CodegenInput};
 
 /// The address two rules end up fighting over.
-const CONTESTED: Ipv4Addr = Ipv4Addr::new(178, 248, 237, 68);
+const CONTESTED: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 68);
 /// An address only the application ever touches.
 const APP_ONLY: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 9);
-const HOST: &str = "habr.com";
-const APP: &str = "claude.exe";
+const HOST: &str = "blog.example";
+const APP: &str = "helper.exe";
 
 fn address_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
     CanonicalRule {
@@ -99,7 +100,7 @@ fn observations() -> MockAppObservationLookup {
 }
 
 fn resolver() -> MockAppPathResolver {
-    MockAppPathResolver::new().with(APP, vec![PathBuf::from(r"C:\Apps\claude.exe")])
+    MockAppPathResolver::new().with(APP, vec![PathBuf::from(r"C:\Apps\helper.exe")])
 }
 
 fn target() -> SecondaryRouteTarget {
@@ -142,6 +143,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             &observations,
             &HashSet::new(),
             nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
 
         assert!(
@@ -204,6 +206,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         &observations,
         &HashSet::new(),
         nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
+        &[],
     );
 
     let steered: HashSet<Ipv4Addr> = routes.routes.iter().map(|r| r.destination).collect();
@@ -319,6 +322,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
         &observations,
         &HashSet::new(),
         nrr_service_runtime::address_ownership::ZoneVsIpOrder::default(),
+        &[],
     );
 
     assert!(
@@ -362,8 +366,10 @@ fn the_neutral_planner_reads_the_same_arbiter() {
             app_resolver: &resolver,
             app_observations: &observations,
             zone_priority_over_ip: false,
+            secondary_ip_denylist: &std::collections::HashSet::new(),
         },
-    );
+    )
+    .0;
 
     let secondary_hosts: Vec<Ipv4Addr> = flows
         .iter()

@@ -160,14 +160,12 @@ impl RulesProvider for ProductionRulesProvider {
             Err(()) => return None,
         };
         let mut snapshot = Self::snapshot_from_record(&record)?;
-        // subdomain coverage (ON by default since
-        // , applied HERE at the enforcement-read layer (this snapshot
-        // feeds the WFP codegen, the route codegen and the DNS-observation
-        // seeder) and NEVER to the stored/hashed rule book — the drift detector
-        // must keep hashing the bare rules (`rules.list` / the canonical hash use
-        // a separate path). The toggle is read for the CALLING principal's own
-        // policy even when the rules read through to the baseline. Degrades to
-        // OFF on a storage error (the narrow rule book, never a guess).
+        // Subdomain coverage (ON by default) is applied HERE, at the
+        // enforcement-read layer feeding the WFP codegen, the route codegen and
+        // the DNS-observation seeder — NEVER to the stored/hashed rule book,
+        // which the drift detector must keep hashing bare. Read for the CALLING
+        // principal even when the rules read through to the baseline; a storage
+        // error degrades to OFF (the narrow rule book, never a guess).
         if Self::reads_include_subdomains(&guard, principal) {
             snapshot.rule_book = snapshot.rule_book.with_subdomain_coverage();
         }
@@ -177,18 +175,18 @@ impl RulesProvider for ProductionRulesProvider {
 
 impl ProductionRulesProvider {
     /// Read the per-SID `include_subdomains` flag from `secondary_block_policy`
-    /// (ON by default since ; a SID with no policy row gets the
-    /// default from the storage layer). Degrades to `false` on a storage error —
-    /// an unreadable policy must not be guessed at.
+    /// (ON by default; a SID with no policy row gets the storage layer's
+    /// default). Degrades to `false` on a storage error — an unreadable policy
+    /// must not be guessed at.
     fn reads_include_subdomains(guard: &Connection, principal: &str) -> bool {
         include_subdomains_for(guard, principal)
     }
 }
 
-/// the per-SID `include_subdomains` flag, shared with
-/// the activation dispatcher so a snapshot decoded from dispatched rules-JSON
-/// gets the SAME subdomain widening `active_rules_for` applies. ON by default
-/// ; degrades to `false` on a storage error.
+/// The per-SID `include_subdomains` flag, shared with the activation dispatcher
+/// so a snapshot decoded from dispatched rules-JSON gets the SAME subdomain
+/// widening `active_rules_for` applies. ON by default; degrades to `false` on a
+/// storage error.
 pub fn include_subdomains_for(guard: &Connection, principal: &str) -> bool {
     nrr_storage::route_bindings::RouteBindingsRepository::new(guard)
         .load_for_sid(principal)

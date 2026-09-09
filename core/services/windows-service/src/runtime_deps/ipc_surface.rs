@@ -213,7 +213,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 Arc::clone(&alerts_repo),
                 Some(Arc::clone(conn)),
             )
-            .with_log_writer(artifacts.log_writer.clone()),
+            .with_log_writer(artifacts.log_writer.clone())
+            // "Did the service slow my boot" is the standing suspicion of every
+            // background service. The card answers it with the two moments
+            // measured — the host log's sign-in phase, and this process's own
+            // start — rather than with a reassurance.
+            .with_boot_timing(
+                std::sync::Arc::new(nrr_platform_windows::event_log::WindowsEventLog::new()),
+                nrr_service_runtime::process_started_at_ms(),
+            ),
         );
 
         // Build the sampler-backed traffic-counter provider + writer
@@ -746,17 +754,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     Arc::clone(engine),
                     fqdn_for_probe,
                     Arc::clone(coord),
-                    Arc::new(
-                        nrr_service_runtime::primary_path_probe::PrimaryPathProber::new(Arc::new(
-                            nrr_service_runtime::primary_path_probe::SystemPrimaryPathProbe,
-                        )),
-                    ),
+                    Arc::new(nrr_service_runtime::path_probe::PathProber::new(Arc::new(
+                        nrr_service_runtime::path_probe::SystemPathProbe,
+                    ))),
                     {
                         // The user's own bounds, clamped by `ProbeLimits::new`
                         // — a stored value can widen nothing.
                         let conn = Arc::clone(conn_for_probe);
                         Arc::new(move |sid: &str| {
-                            use nrr_service_runtime::primary_path_probe::ProbeLimits;
+                            use nrr_service_runtime::path_probe::ProbeLimits;
                             let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
                             let repo =
                                 nrr_storage::route_bindings::RouteBindingsRepository::new(&guard);
@@ -775,7 +781,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                         })
                     },
                 )
-                .with_verdicts(Arc::clone(&main_route_verdicts)),
+                .with_verdicts(Arc::clone(&main_route_verdicts))
+                // Its own prober: the repeat-suppression is per instance, and a
+                // shared one would skip every host the main-link pass had just
+                // asked about.
+                .with_secondary_prober(Arc::new(
+                    nrr_service_runtime::path_probe::PathProber::new(Arc::new(
+                        nrr_service_runtime::path_probe::SystemPathProbe,
+                    )),
+                )),
             );
             // The user's own opt-in decides whether the tick runs the pass; the
             // stored repeat window is what keeps it a check rather than a

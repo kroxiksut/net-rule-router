@@ -21,7 +21,7 @@ use crate::auto_rules::AutoRulesEngine;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::ipc_handlers::providers::AutoRuleProbeRunner;
 use crate::main_route_verdicts::{MainRouteVerdict, MainRouteVerdicts};
-use crate::primary_path_probe::{PrimaryPathProber, ProbeLimits, ProbeTarget};
+use crate::path_probe::{PathProber, ProbeLimits, ProbeTarget};
 use crate::route_coordinator::SecondaryRouteCoordinator;
 
 /// Port 443 is where a companion host lives in practice — these are CDN, media
@@ -33,11 +33,16 @@ pub struct ProductionAutoRuleProbe {
     engine: Arc<AutoRulesEngine>,
     cache: Arc<dyn FqdnCacheLookup>,
     coordinator: Arc<SecondaryRouteCoordinator>,
-    prober: Arc<PrimaryPathProber>,
+    prober: Arc<PathProber>,
     limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
     /// Where a rule-host pass leaves its answers. `None` keeps the runner
     /// suggestion-only, exactly as before.
     verdicts: Option<Arc<MainRouteVerdicts>>,
+    /// Prober for the second question — "would the tunnel reach it?". A
+    /// SEPARATE instance on purpose: the prober suppresses a repeat of the same
+    /// hostname, and sharing one would make the second pass skip every host the
+    /// first had just asked about.
+    secondary_prober: Option<Arc<PathProber>>,
 }
 
 impl ProductionAutoRuleProbe {
@@ -45,7 +50,7 @@ impl ProductionAutoRuleProbe {
         engine: Arc<AutoRulesEngine>,
         cache: Arc<dyn FqdnCacheLookup>,
         coordinator: Arc<SecondaryRouteCoordinator>,
-        prober: Arc<PrimaryPathProber>,
+        prober: Arc<PathProber>,
         limits_for: Arc<dyn Fn(&str) -> ProbeLimits + Send + Sync>,
     ) -> Self {
         Self {
@@ -55,7 +60,17 @@ impl ProductionAutoRuleProbe {
             prober,
             limits_for,
             verdicts: None,
+            secondary_prober: None,
         }
+    }
+
+    /// Wire the second pass: hosts the main link did not answer for are asked
+    /// again over the additional route, and the answer is filed against the
+    /// offer. Without it the runner behaves exactly as it did before.
+    #[must_use]
+    pub fn with_secondary_prober(mut self, prober: Arc<PathProber>) -> Self {
+        self.secondary_prober = Some(prober);
+        self
     }
 
     /// Wire the store a rule-host pass writes its verdicts into; the rules list
@@ -131,11 +146,20 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
         let accepted = targets.len().min(limits.max_targets) as u32;
         // The main link's own address — without it the OS would route by the
         // pin, which points at the tunnel and would answer a different question.
-        let source = self.coordinator.resolve_egress_source_ips(sid).0;
+        let (source, secondary_source) = self.coordinator.resolve_egress_source_ips(sid);
         let engine = Arc::clone(&self.engine);
         let prober = Arc::clone(&self.prober);
         let sid_owned = sid.to_string();
         let verdicts = self.verdicts.clone();
+        // The second question is only worth asking about SUGGESTIONS, and only
+        // when there is a tunnel to ask over.
+        let secondary = (!rules_pass)
+            .then(|| self.secondary_prober.clone())
+            .flatten()
+            .zip(secondary_source);
+        let targets_for_second = targets.clone();
+        let engine_for_second = Arc::clone(&self.engine);
+        let sid_for_second = sid.to_string();
         let spawned = std::thread::Builder::new()
             .name("nrr-main-link-probe".into())
             .spawn(move || {
@@ -170,13 +194,26 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                         },
                     );
                 };
+                let unanswered = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+                let report_and_collect = {
+                    let unanswered = Arc::clone(&unanswered);
+                    move |hostname: &str, answered: bool| {
+                        if !answered {
+                            unanswered
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(hostname.to_string());
+                        }
+                        report(hostname, answered);
+                    }
+                };
                 let summary = prober.run_pass(
                     &targets,
                     PROBE_PORT,
                     source,
                     limits,
                     std::time::Instant::now(),
-                    &report,
+                    &report_and_collect,
                 );
                 tracing::info!(
                     target: "nrr::auto-rules",
@@ -187,6 +224,46 @@ impl AutoRuleProbeRunner for ProductionAutoRuleProbe {
                     skipped_over_limit = summary.skipped_over_limit,
                     source = ?source,
                     "checked whether the suggested addresses answer on the main link (requested by the user)",
+                );
+                let Some((secondary_prober, secondary_source)) = secondary else {
+                    return;
+                };
+                // Only the hosts the main link could not reach: for the rest
+                // the offer is already answered, and asking the tunnel would
+                // send traffic there for a question nobody has.
+                let silent: Vec<String> = unanswered
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone();
+                if silent.is_empty() {
+                    return;
+                }
+                let second_targets: Vec<ProbeTarget> = targets_for_second
+                    .into_iter()
+                    .filter(|t| silent.contains(&t.hostname))
+                    .collect();
+                let record = move |hostname: &str, answered: bool| {
+                    engine_for_second.note_secondary_reach(
+                        &sid_for_second,
+                        hostname,
+                        answered,
+                        std::time::SystemTime::now(),
+                    );
+                };
+                let second = secondary_prober.run_pass(
+                    &second_targets,
+                    PROBE_PORT,
+                    Some(secondary_source),
+                    limits,
+                    std::time::Instant::now(),
+                    &record,
+                );
+                tracing::info!(
+                    target: "nrr::auto-rules",
+                    answered = second.answered,
+                    silent = second.silent,
+                    indeterminate = second.indeterminate,
+                    "checked whether the additional route reaches the hosts the main link did not",
                 );
             });
         if let Err(e) = spawned {

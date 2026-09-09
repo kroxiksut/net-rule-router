@@ -77,8 +77,8 @@
 //! ([`CompanionSignal`], strongest first):
 //!
 //! 1. **Brand relation** — the candidate carries the anchor's brand token or
-//!    vice versa (`web.whatsapp.com` and `static.whatsapp.net`, `vk.ru` and
-//!    `login.vk.com`, `tiktok.com` and `tiktokv.com`). Shared branding is a
+//!    vice versa (`web.chatapp.example` and `static.chatapp.test`, `ab.example` and
+//!    `login.ab.test`, `tiktok.com` and `tiktokv.com`). Shared branding is a
 //!    statement of ownership, so a single co-occurrence is enough and no
 //!    temporal threshold applies.
 //! 2. **Delivery name** — the name matches a delivery-endpoint mask
@@ -130,8 +130,8 @@ pub const DEFAULT_WINDOW_MS: u64 = 15_000;
 /// milliseconds.
 ///
 /// Rationale: a browser routinely opens the CDN connection before the one to
-/// the page itself — `static.cdninstagram.com` a second ahead of
-/// `www.instagram.com` is the ordinary case, not a rarity. A window that only
+/// the page itself — `static.cdninsta.test` a second ahead of
+/// `www.insta.example` is the ordinary case, not a rarity. A window that only
 /// looks forward throws that sighting away at the door and the CDN is never
 /// proposed, while the same site visited in the other order proposes fine. Ten
 /// seconds covers the spread of one page load without reaching into whatever
@@ -399,7 +399,12 @@ impl PrimaryBehavior {
     /// a single failing member makes the offer failing, and only unanimity the
     /// other way makes it working. Between the two failure modes the more
     /// specific one wins — being refused says more than being unreachable.
-    fn merge(self, other: Self) -> Self {
+    ///
+    /// `pub` because the stall registry answers the same question for a name
+    /// and everything under it, and a second spelling of "one failing member
+    /// makes the offer failing" is how the two come to disagree.
+    #[must_use]
+    pub fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::Cut, _) | (_, Self::Cut) => Self::Cut,
             (Self::Stalls, _) | (_, Self::Stalls) => Self::Stalls,
@@ -482,6 +487,23 @@ pub trait CandidateExclusions {
             || self.is_matched_by_existing_rule(hostname)
             || self.is_platform_infrastructure(hostname)
     }
+}
+
+/// Does shared infrastructure still earn a proposal?
+///
+/// Normally it does not: a host that belongs to everybody would drag
+/// unrelated traffic onto one site's route. But the product cannot tell an
+/// advertising endpoint from a delivery one, and it must not try — deciding
+/// which hosts a person is allowed to reach is a different product, and the
+/// sites would work around it anyway.
+///
+/// So the exception is not about what the host IS, it is about what was
+/// MEASURED: connections to it keep failing on the main link. Then it is no
+/// longer "an ad server", it is a host the user's site needs and cannot
+/// reach — exactly the case the suggestion exists for.
+#[must_use]
+pub fn infrastructure_earns_a_proposal(behavior: PrimaryBehavior) -> bool {
+    matches!(behavior, PrimaryBehavior::Stalls | PrimaryBehavior::Cut)
 }
 
 /// No-op exclusions — nothing is suppressed. Useful for tests and previews.
@@ -609,9 +631,9 @@ fn covers_the_anchor(anchor: &str, suffix: &str) -> bool {
 /// Whether generalizing to `*.apex` would also swallow the anchor itself.
 ///
 /// One site under a corporate umbrella says nothing about the umbrella:
-/// `aistudio.google.com` is evidence about itself, not about every host under
-/// `google.com`. Generalizing there is only earned when the anchor IS the
-/// apex (`vk.com` may speak for `*.vk.com`). A companion apex the anchor does
+/// `aistudio.search.example` is evidence about itself, not about every host under
+/// `search.example`. Generalizing there is only earned when the anchor IS the
+/// apex (`ab.test` may speak for `*.ab.test`). A companion apex the anchor does
 /// not live under — a CDN, say — is unaffected and still generalizes on its
 /// own evidence.
 fn suffix_would_swallow_the_anchor(anchor: &str, apex: &str) -> bool {
@@ -708,7 +730,7 @@ pub fn registrable_domain(hostname: &str) -> Option<&str> {
 /// Shortest brand token accepted for a substring relation.
 ///
 /// Below this, containment is coincidence rather than branding: three-letter
-/// tokens (`vk`, `ok`, `mts`) appear inside unrelated words constantly.
+/// tokens (`ab`, `ok`, `mts`) appear inside unrelated words constantly.
 const MIN_BRAND_TOKEN_LEN: usize = 4;
 
 /// Substrings that mark a hostname as a delivery endpoint rather than a site.
@@ -722,7 +744,7 @@ pub const DELIVERY_NAME_MASKS: &[&str] = &[
 ];
 
 /// The first label of the registrable domain — the token that carries the
-/// brand (`static.whatsapp.net` -> `whatsapp`, `login.vk.com` -> `vk`).
+/// brand (`static.chatapp.test` -> `chatapp`, `login.ab.test` -> `ab`).
 fn brand_token(hostname: &str) -> &str {
     registrable_domain(hostname)
         .unwrap_or(hostname)
@@ -732,9 +754,9 @@ fn brand_token(hostname: &str) -> &str {
 }
 
 /// The candidate carries the anchor's brand, or the anchor carries the
-/// candidate's: `web.whatsapp.com` and `static.whatsapp.net`, `vk.ru` and
-/// `login.vk.com`, `tiktok.com` and `tiktokv.com`, `dzen.ru` and
-/// `static.dzeninfra.ru`.
+/// candidate's: `web.chatapp.example` and `static.chatapp.test`, `ab.example` and
+/// `login.ab.test`, `tiktok.com` and `tiktokv.com`, `feed.example` and
+/// `static.feedinfra.example`.
 ///
 /// Containment (not equality) is what catches the last two shapes: operators
 /// register adjacent brands rather than reusing the exact one. Every label of
@@ -745,10 +767,10 @@ fn is_brand_related(anchor: &str, candidate: &str) -> bool {
 
 /// What a shared brand is worth as evidence.
 ///
-/// The equality branch has no length floor, and it must not get one: `vk.ru`
-/// and `login.vk.com` are kin precisely because their token matches exactly,
-/// and `vk` is below the length containment demands. But the same branch makes
-/// `t.co`/`t.me`, `x.com`/`x.ai` and `ok.ru`/`ok.com` kin as well, and a token
+/// The equality branch has no length floor, and it must not get one: `ab.example`
+/// and `login.ab.test` are kin precisely because their token matches exactly,
+/// and `ab` is below the length containment demands. But the same branch makes
+/// `q.test`/`q.example`, `x.com`/`x.ai` and `ok.ru`/`ok.com` kin as well, and a token
 /// that short is one registrar away from coincidence. So the relation stands
 /// and its REACH does not: weak evidence buys the exact host, never the apex.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -777,18 +799,18 @@ fn brand_relation(anchor: &str, candidate: &str) -> BrandRelation {
 }
 
 /// Whether `name` carries `brand` as a label, a label's prefix, or a label's
-/// suffix — the shapes branding actually takes (`dzeninfra`, `tiktokv`,
-/// `cdninstagram`).
+/// suffix — the shapes branding actually takes (`feedinfra`, `tiktokv`,
+/// `cdninsta`).
 ///
 /// Anchored on purpose. A brand found anywhere INSIDE a label is a collision,
 /// not a relation: `istu` sits in the middle of `aistudio`, and reading that as
-/// kinship proposed a university's domain as a companion of Google's AI studio.
+/// kinship proposed an unrelated domain as a companion of the AI studio host.
 ///
 /// Only the REGISTRABLE domain is searched. A brand sitting in a subdomain of
 /// somebody else's apex names the customer, not the owner: `mozilla.map.fastly.net`
 /// is a Fastly machine, and treating it as kin proposed moving all of
 /// `mozilla.org` onto the additional link. Ownership shapes survive, because
-/// they put the brand in the registrable domain itself (`dzeninfra.ru`,
+/// they put the brand in the registrable domain itself (`feedinfra.example`,
 /// `githubusercontent.com`).
 fn carries_brand(name: &str, brand: &str) -> bool {
     brand.len() >= MIN_BRAND_TOKEN_LEN
@@ -798,7 +820,7 @@ fn carries_brand(name: &str, brand: &str) -> bool {
             .any(|label| label.starts_with(brand) || label.ends_with(brand))
 }
 
-/// An explicit shard marker: `rr5---sn-ajaig5-5a.googlevideo.com` and friends.
+/// An explicit shard marker: `rr5---sn-ajaig5-5a.videocdn.test` and friends.
 ///
 /// Only this literal, unmistakable form is recognized. A structural rule for
 /// short alphanumeric labels (`s07.`, `p13.`) was measured and rejected: it
@@ -1311,7 +1333,7 @@ impl CompanionAffinityLedger {
     ///   a delivery endpoint.** Our data cannot tell a navigation from an XHR to
     ///   an apex, so an anchor's page calling `partner.test` and then
     ///   `one.partner.test` must keep its attribution. A delivery name is
-    ///   different: `cdninstagram.com` seen while `instagram.com` is loading is
+    ///   different: `cdninsta.test` seen while `insta.example` is loading is
     ///   serving Instagram, whichever rule host happens to be open.
     fn document_disowns(&self, at_ms: u64, anchor_hostname: &str, candidate: &str) -> bool {
         let Some((document, seen_at)) = self.last_document.as_ref() else {
@@ -1798,8 +1820,8 @@ impl CompanionAffinityLedger {
             // Brand relation states ownership, not need. An operator's
             // advertising and telemetry domains carry the brand exactly as
             // plainly as the asset host a page cannot render without
-            // (`googlesyndication.com` beside `googleusercontent.com` under
-            // `notebooklm.google.com`), so the shared name opens the tier and
+            // (an operator's ad domain beside its asset domain under one of
+            // that operator's product hosts), so the shared name opens the tier and
             // evidence decides it — one sighting is not a relationship.
             //
             // Ownership is measured with `nearest_share`, not `affinity`:
@@ -1824,8 +1846,8 @@ impl CompanionAffinityLedger {
         // that the anchor is the page doing the fetching. When most of the hits
         // this anchor claims happened while somebody else's page was loading,
         // the assumption is false — this is how a rule host in one tab collects
-        // another site's CDN (`ypncdn.com` under `www.google.ru`,
-        // `cdninstagram.com` under `cdn.openai.com`). Brand relation above is
+        // another site's CDN (`ypncdn.com` under `www.search.test`,
+        // `cdninsta.test` under `cdn.openai.com`). Brand relation above is
         // exempt: a shared name states ownership regardless of timing.
         let mostly_someone_elses =
             pair.foreign_parent_hits > 0 && pair.foreign_parent_hits * 2 > pair.nearest_hits.max(1);
@@ -1933,7 +1955,19 @@ impl CompanionAffinityLedger {
             if now_ms.saturating_sub(candidate.last_seen_ms) > self.config.evidence_ttl_ms {
                 continue;
             }
-            if candidate.total_windows == 0 || exclusions.excludes(host) {
+            if candidate.total_windows == 0 {
+                continue;
+            }
+            if exclusions.is_rule_host(host) || exclusions.is_matched_by_existing_rule(host) {
+                continue;
+            }
+            // Shared infrastructure is held back until the main link is
+            // measured to fail for it — see `infrastructure_earns_a_proposal`.
+            if exclusions.is_platform_infrastructure(host)
+                && !infrastructure_earns_a_proposal(
+                    candidate.primary_behavior(self.config.count_cuts),
+                )
+            {
                 continue;
             }
             for pair in &candidate.pairs {
@@ -1996,7 +2030,7 @@ impl CompanionAffinityLedger {
                     members.iter().filter(|m| m.hostname != *apex).collect();
                 // A name that carries the anchor's brand or is a delivery name
                 // is evidence about the domain, not just about itself:
-                // `static.cdninstagram.com` says the whole CDN serves the site.
+                // `static.cdninsta.test` says the whole CDN serves the site.
                 // Co-activity alone says nothing of the kind — a host that
                 // merely loaded at the same time must not drag its siblings
                 // onto the route.
@@ -2006,7 +2040,7 @@ impl CompanionAffinityLedger {
                 // name under a service's own domain: generalizing it moved all
                 // of `auth0.com` — sign-in included — onto the additional link
                 // on the strength of one asset host. A dedicated delivery apex
-                // (`cdninstagram.com`, `googlevideo.com`, `ytimg.com`) carries
+                // (`cdninsta.test`, `videocdn.test`, `cdn.example`) carries
                 // the mask itself, and that is the shape worth generalizing.
                 let generalizes_alone = subdomains.iter().any(|m| match m.signal {
                     CompanionSignal::BrandRelated => {
@@ -2019,14 +2053,37 @@ impl CompanionAffinityLedger {
                 // Co-activity says a host loaded at the same time; two of them
                 // say it twice, never that the apex serves the anchor — that
                 // reading put a torrent client's whole domain on the tunnel.
+                //
+                // A short shared token is the same kind of non-evidence, and
+                // it needs refusing at BOTH doors: `generalizes_alone` above
+                // already declines it, but counting let two subdomains of
+                // `q.test` generalize under the anchor `q.example` on the strength of
+                // one letter. Kinship survives — it buys the exact host, which
+                // is what [`BrandRelation::ShortToken`] is for — the apex does
+                // not.
+                let apex_brand_is_evidence =
+                    brand_relation(anchor_name, apex) == BrandRelation::Named;
                 let named_subdomains = subdomains
                     .iter()
                     .filter(|m| m.signal != CompanionSignal::CoActivity)
+                    .filter(|m| apex_brand_is_evidence || m.signal != CompanionSignal::BrandRelated)
                     .count();
+                // The apex of shared infrastructure follows its members: a
+                // domain whose names are measured to fail on the main link is
+                // asked about once, instead of once per name. Cutting to the
+                // domain is the whole point — a person answering four
+                // questions about one service is answering the same question
+                // four times.
+                let apex_infra_ok = !exclusions.is_platform_infrastructure(apex)
+                    || subdomains
+                        .iter()
+                        .any(|m| infrastructure_earns_a_proposal(m.primary_behavior));
                 let suffix_proposed = !subdomains.is_empty()
                     && (generalizes_alone || named_subdomains >= SUFFIX_MIN_DISTINCT_SUBDOMAINS)
                     && !suffix_would_swallow_the_anchor(anchor_name, apex)
-                    && !exclusions.excludes(apex);
+                    && !exclusions.is_rule_host(apex)
+                    && !exclusions.is_matched_by_existing_rule(apex)
+                    && apex_infra_ok;
                 // Summarize with the strongest member's evidence and the union
                 // of the members' observation span.
                 let summarize = |members: &[&Member<'_>], value: String| CompanionProposal {
@@ -2466,11 +2523,15 @@ mod tests {
     fn a_brand_related_companion_is_proposed_once_the_relation_repeats() {
         // A brand-related subdomain generalizes to its domain; a candidate that
         // IS the domain has no subdomain to generalize from and stays exact.
-        // `vk` is two letters: the relation holds, the reach does not — see
+        // `ab` is two letters: the relation holds, the reach does not — see
         // `a_short_brand_token_earns_the_host_but_not_the_apex`.
         for (anchor, candidate, expected) in [
-            ("web.whatsapp.com", "crashlogs.whatsapp.net", "whatsapp.net"),
-            ("vk.ru", "login.vk.com", "login.vk.com"),
+            (
+                "web.chatapp.example",
+                "crashlogs.chatapp.test",
+                "chatapp.test",
+            ),
+            ("ab.example", "login.ab.test", "login.ab.test"),
             ("tiktok.com", "tiktokv.com", "tiktokv.com"),
         ] {
             let mut ledger = defaults();
@@ -2495,9 +2556,9 @@ mod tests {
             page_load(
                 &mut ledger,
                 i * 100_000,
-                &format!("site-{i}.google.com"),
+                &format!("site-{i}.brand.example"),
                 SECONDARY,
-                &["googlesyndication.com"],
+                &["brandsyndication.example"],
             );
         }
 
@@ -2507,14 +2568,14 @@ mod tests {
     #[test]
     fn a_brand_buried_inside_a_longer_word_is_not_a_relation() {
         // `istu` sits in the middle of `aistudio`. Reading that as kinship
-        // proposed a university's domain as a companion of Google's AI studio.
+        // proposed an unrelated domain as a companion of the AI studio host.
         let mut ledger = defaults();
         page_load(
             &mut ledger,
             0,
-            "aistudio.google.com",
+            "aistudio.search.example",
             SECONDARY,
-            &["istu.edu"],
+            &["istu.test"],
         );
 
         assert!(ledger.proposals(10_000, &NoExclusions).is_empty());
@@ -2524,8 +2585,8 @@ mod tests {
     fn a_brand_at_a_label_edge_is_still_a_relation() {
         // The shapes operators actually register: prefix, suffix, dashed label.
         for (anchor, candidate) in [
-            ("dzen.ru", "static.dzeninfra.ru"),
-            ("instagram.com", "static.cdninstagram.com"),
+            ("feed.example", "static.feedinfra.example"),
+            ("insta.example", "static.cdninsta.test"),
             ("example.com", "assets.example-cdn.net"),
         ] {
             let mut ledger = defaults();
@@ -2573,7 +2634,7 @@ mod tests {
         page_load(
             &mut ledger,
             0,
-            "web.whatsapp.com",
+            "web.chatapp.example",
             SECONDARY,
             &["telemetry.othervendor.net"],
         );
@@ -2694,7 +2755,7 @@ mod tests {
     /// The defect this criterion exists for, four times reported: the user
     /// searches on a rule host, follows a link to an unrelated site, and that
     /// site's CDN is offered under the rule host — `ypncdn.com` under
-    /// `www.google.ru`, `cdninstagram.com` under `cdn.openai.com`.
+    /// `www.search.test`, `cdninsta.test` under `cdn.openai.com`.
     #[test]
     fn a_cdn_fetched_by_another_sites_page_is_not_offered_under_the_open_anchor() {
         let mut ledger = defaults();
@@ -2789,20 +2850,20 @@ mod tests {
         );
     }
 
-    /// Equal brand tokens below the length containment demands (`t.co`/`t.me`,
+    /// Equal brand tokens below the length containment demands (`q.test`/`q.example`,
     /// `x.com`/`x.ai`) are kinship one registrar away from coincidence. They
     /// still earn the host they name; they must not earn the apex.
     #[test]
     fn a_short_brand_token_earns_the_host_but_not_the_apex() {
         let mut ledger = defaults();
-        two_visits(&mut ledger, "t.co", &["img.t.me"]);
+        two_visits(&mut ledger, "q.test", &["img.q.example"]);
 
         let proposals = ledger.proposals(150_000, &NoExclusions);
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].signal, CompanionSignal::BrandRelated);
         assert_eq!(
             proposals[0].proposed,
-            ProposedCompanionMatch::ExactHost("img.t.me".to_string())
+            ProposedCompanionMatch::ExactHost("img.q.example".to_string())
         );
     }
 
@@ -2811,13 +2872,13 @@ mod tests {
     #[test]
     fn a_full_brand_token_still_speaks_for_the_apex() {
         let mut ledger = defaults();
-        two_visits(&mut ledger, "whatsapp.com", &["static.whatsapp.net"]);
+        two_visits(&mut ledger, "chatapp.example", &["static.chatapp.test"]);
 
         let proposals = ledger.proposals(150_000, &NoExclusions);
         assert!(
             proposals.iter().any(|p| matches!(
                 &p.proposed,
-                ProposedCompanionMatch::SuffixDomain(d) if d == "whatsapp.net")),
+                ProposedCompanionMatch::SuffixDomain(d) if d == "chatapp.test")),
             "a named brand stopped generalizing: {:?}",
             proposals
                 .iter()
@@ -2826,18 +2887,18 @@ mod tests {
         );
     }
 
-    /// Shared branding outranks the page context: `static.whatsapp.net` is
-    /// WhatsApp's whoever's page happened to be loading.
+    /// Shared branding outranks the page context: `static.chatapp.test` is
+    /// ChatApp's whoever's page happened to be loading.
     #[test]
     fn brand_relation_is_not_overruled_by_the_page_context() {
         let mut ledger = defaults();
         let anchor = CoActivityKind::Anchor { route: SECONDARY };
         for start in [0_u64, 100_000] {
-            ledger.observe(start, "web.whatsapp.com", anchor);
+            ledger.observe(start, "web.chatapp.example", anchor);
             ledger.observe(start + 1_000, "elsewhere.test", CoActivityKind::Candidate);
             ledger.observe(
                 start + 2_000,
-                "static.whatsapp.net",
+                "static.chatapp.test",
                 CoActivityKind::Candidate,
             );
         }
@@ -2847,7 +2908,7 @@ mod tests {
             proposals
                 .iter()
                 .any(|p| p.signal == CompanionSignal::BrandRelated
-                    && p.proposed.value().contains("whatsapp.net")),
+                    && p.proposed.value().contains("chatapp.test")),
             "a brand match states ownership and needs no page context: {:?}",
             proposals
                 .iter()
@@ -3055,9 +3116,9 @@ mod tests {
             assert!(names_one_machine(machine), "{machine}");
         }
         for service in [
-            "static.cdninstagram.com",
-            "xx-fbcdn-shv-02-fra3.fbcdn.net",
-            "rr5---sn-2o25g5-55.googlevideo.com",
+            "static.cdninsta.test",
+            "xx-socialcdn-shv-02-fra3.socialcdn.test",
+            "rr5---sn-2o25g5-55.videocdn.test",
             "ei.phncdn.com",
             // Four groups, but 2026 is no octet.
             "build-2026-01-02-03.example.com",
@@ -3068,14 +3129,14 @@ mod tests {
 
     #[test]
     fn only_the_explicit_shard_form_counts_as_a_delivery_name() {
-        assert!(is_delivery_named("rr5---sn-ajaig5-5a.googlevideo.com"));
-        assert!(is_delivery_named("static.whatsapp.net"));
-        assert!(is_delivery_named("i.ytimg.com"));
+        assert!(is_delivery_named("rr5---sn-ajaig5-5a.videocdn.test"));
+        assert!(is_delivery_named("static.chatapp.test"));
+        assert!(is_delivery_named("i.cdn.example"));
         // A short alphanumeric label is NOT a shard marker: ordinary update and
         // telemetry infrastructure is named that way, and admitting it was
         // measured to bury the real companions in noise.
-        assert!(!is_delivery_named("s07.upd3.kaspersky.com"));
-        assert!(!is_delivery_named("p13.upd3.kaspersky.com"));
+        assert!(!is_delivery_named("s07.upd3.antivirus.example"));
+        assert!(!is_delivery_named("p13.upd3.antivirus.example"));
         assert!(!is_delivery_named("api.example.com"));
     }
 
@@ -3107,8 +3168,8 @@ mod tests {
             ledger.observe(start, "other.test", anchor);
             ledger.observe(start + 1_000, "site.test", anchor);
             for (i, host) in [
-                "rr5---sn-ajaig5-5a.googlevideo.com",
-                "s07.upd3.kaspersky.com",
+                "rr5---sn-ajaig5-5a.videocdn.test",
+                "s07.upd3.antivirus.example",
             ]
             .iter()
             .enumerate()
@@ -3119,7 +3180,7 @@ mod tests {
 
         let proposals = ledger.proposals(150_000, &NoExclusions);
         let values: Vec<&str> = proposals.iter().map(|p| p.proposed.value()).collect();
-        assert_eq!(values, vec!["googlevideo.com"]);
+        assert_eq!(values, vec!["videocdn.test"]);
         assert_eq!(proposals[0].anchor_hostname, "site.test");
     }
 
@@ -3435,7 +3496,7 @@ mod tests {
     #[test]
     fn one_delivery_named_subdomain_is_enough_to_generalize() {
         let mut ledger = defaults();
-        // The user's case: seeing `static.cdninstagram.com` should offer the
+        // The user's case: seeing `static.cdninsta.test` should offer the
         // whole CDN, not one host of it that the next page load replaces.
         two_visits(&mut ledger, "site.example", &["di.cdn-relay.example"]);
 
@@ -3495,7 +3556,7 @@ mod tests {
         );
     }
 
-    /// The `bt.co` shape: a background client's plain-named hosts under one
+    /// The background-client shape: a client's plain-named hosts under one
     /// apex, seen beside the anchor because it is open all day. Two of them
     /// used to earn `*.apex` — a whole third-party domain on the tunnel from
     /// evidence that says only "these loaded at the same time".
@@ -3557,15 +3618,15 @@ mod tests {
     #[test]
     fn a_suffix_covering_the_anchor_itself_is_never_proposed() {
         let mut ledger = defaults();
-        // The anchor lives under the apex, so `*.google.com` would put the
+        // The anchor lives under the apex, so `*.search.example` would put the
         // whole corporation on the route on the strength of one site. The
         // companions stay as exact proposals instead.
         two_visits(
             &mut ledger,
-            "aistudio.google.com",
+            "aistudio.search.example",
             &[
-                "google.com",
-                "accounts.google.com",
+                "search.example",
+                "accounts.search.example",
                 "content.googleapis.com",
             ],
         );
@@ -3574,8 +3635,67 @@ mod tests {
         assert!(
             !proposals.iter().any(|p| matches!(
                 &p.proposed,
-                ProposedCompanionMatch::SuffixDomain(d) if d == "google.com")),
+                ProposedCompanionMatch::SuffixDomain(d) if d == "search.example")),
             "the anchor's own umbrella was proposed: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_short_shared_token_never_generalizes_to_the_apex() {
+        // `q.example` and `q.test` share the token `t`. That is one letter and one
+        // registrar away from coincidence, so it may buy the exact hosts and
+        // nothing wider — otherwise two subdomains hand somebody else's whole
+        // domain to the additional route.
+        let mut ledger = defaults();
+        two_visits(&mut ledger, "q.example", &["cdn.q.test", "img.q.test"]);
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            !proposals.iter().any(|p| matches!(
+                &p.proposed,
+                ProposedCompanionMatch::SuffixDomain(d) if d == "q.test")),
+            "a one-letter token generalized to the apex: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.clone())
+                .collect::<Vec<_>>()
+        );
+        // Positive control for the assertion above: the kinship itself is NOT
+        // what was refused — the exact hosts are still proposed.
+        assert!(
+            proposals.iter().any(|p| matches!(
+                &p.proposed,
+                ProposedCompanionMatch::ExactHost(h) if h == "cdn.q.test")),
+            "the exact host must survive: {:?}",
+            proposals
+                .iter()
+                .map(|p| p.proposed.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_named_brand_still_generalizes_to_the_apex() {
+        // The other side of the rule above, so "no apex" cannot be reached by
+        // switching the counting off altogether: a token long enough to name an
+        // operator still carries the whole delivery domain.
+        let mut ledger = defaults();
+        two_visits(
+            &mut ledger,
+            "insta.example",
+            &["static.cdninsta.test", "scontent.cdninsta.test"],
+        );
+
+        let proposals = ledger.proposals(150_000, &NoExclusions);
+        assert!(
+            proposals.iter().any(|p| matches!(
+                &p.proposed,
+                ProposedCompanionMatch::SuffixDomain(d) if d == "cdninsta.test")),
+            "a named brand stopped generalizing: {:?}",
             proposals
                 .iter()
                 .map(|p| p.proposed.clone())
@@ -3590,7 +3710,7 @@ mod tests {
         // delivery domain is unaffected: two subdomains still earn `*.apex`.
         two_visits(
             &mut ledger,
-            "aistudio.google.com",
+            "aistudio.search.example",
             &["static.cdnexample.net", "media.cdnexample.net"],
         );
 
@@ -3612,7 +3732,7 @@ mod tests {
         let mut ledger = defaults();
         // `rt.site.com` shares a brand with `www.site.com` only because they
         // share a domain — the same trivial equality that would fire for any
-        // sibling of `aistudio.google.com`. It must earn only itself, not
+        // sibling of `aistudio.search.example`. It must earn only itself, not
         // `*.site.com`, on one window's evidence — this is the shape behind
         // any two same-domain subdomains reached via trivial brand equality
         // in the companion-affinity trace study.
@@ -4105,9 +4225,9 @@ mod tests {
             page_load(
                 &mut ledger,
                 start,
-                "web.whatsapp.com",
+                "web.chatapp.example",
                 SECONDARY,
-                &["helper.other", "crashlogs.whatsapp.net"],
+                &["helper.other", "crashlogs.chatapp.test"],
             );
         }
         // A second site pulls the brand-related host too, diluting its affinity
@@ -4117,7 +4237,7 @@ mod tests {
             400_000,
             "b.test",
             SECONDARY,
-            &["crashlogs.whatsapp.net"],
+            &["crashlogs.chatapp.test"],
         );
 
         let proposals = ledger.proposals(450_000, &NoExclusions);
@@ -4128,7 +4248,7 @@ mod tests {
         assert_eq!(
             shape,
             vec![
-                ("whatsapp.net", CompanionSignal::BrandRelated),
+                ("chatapp.test", CompanionSignal::BrandRelated),
                 ("helper.other", CompanionSignal::CoActivity),
             ]
         );
@@ -4163,6 +4283,68 @@ mod tests {
         }
         // Sanity: without exclusions the same evidence does propose.
         assert_eq!(build().proposals(150_000, &NoExclusions).len(), 1);
+    }
+
+    /// Shared infrastructure is held back — until the main link is measured
+    /// to fail for it. The product must not decide which hosts a person may
+    /// reach, so the exception keys on the measurement, never on what the
+    /// host appears to be.
+    #[test]
+    fn shared_infrastructure_is_proposed_only_once_the_main_link_is_measured_to_fail() {
+        let build = || {
+            let mut ledger = defaults();
+            two_visits(&mut ledger, "site.example", &["cdn.example"]);
+            ledger
+        };
+        let mut exclusions = StaticExclusions::default();
+        exclusions
+            .platform_infrastructure
+            .insert("cdn.example".to_string());
+
+        // Nothing measured: held back, as before.
+        assert!(build().proposals(150_000, &exclusions).is_empty());
+
+        // Measured as working on the main link: still held back — the site
+        // loads, and moving a shared host would drag everyone else with it.
+        let mut working = build();
+        health(
+            &mut working,
+            "cdn.example",
+            PrimaryHealthEvent::Completed,
+            1,
+        );
+        assert!(working.proposals(150_000, &exclusions).is_empty());
+
+        // Measured as failing: the site needs it and cannot reach it.
+        let mut failing = build();
+        health(
+            &mut failing,
+            "cdn.example",
+            PrimaryHealthEvent::Stalled,
+            PRIMARY_STALL_CONFIRMATIONS,
+        );
+        let proposals = failing.proposals(150_000, &exclusions);
+        assert_eq!(proposals.len(), 1, "{proposals:?}");
+        assert_eq!(proposals[0].proposed.value(), "cdn.example");
+        assert_eq!(proposals[0].primary_behavior, PrimaryBehavior::Stalls);
+
+        // A rule already covering it still wins over everything above: the
+        // measurement widens ONE door, not all of them.
+        let mut covered = StaticExclusions::default();
+        covered
+            .platform_infrastructure
+            .insert("cdn.example".to_string());
+        covered
+            .matched_by_existing_rule
+            .insert("cdn.example".to_string());
+        let mut failing = build();
+        health(
+            &mut failing,
+            "cdn.example",
+            PrimaryHealthEvent::Stalled,
+            PRIMARY_STALL_CONFIRMATIONS,
+        );
+        assert!(failing.proposals(150_000, &covered).is_empty());
     }
 
     #[test]

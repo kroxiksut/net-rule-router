@@ -198,7 +198,7 @@ mod tests {
             user_sid: Some("S-1-5-21-1".to_string()),
             protocol: TransportProtocol::Tcp,
             local: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 6), 51514)),
-            remote: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(188, 40, 167, 82), 443)),
+            remote: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(23, 10, 20, 162), 443)),
             verdict: ConnectionVerdict::Permit,
             drop_filter_id: None,
             blocked_by_nrr: None,

@@ -195,7 +195,7 @@ impl ConnectionObservationConsumer {
             // app-scoped exemption so the next block-all arming permits the
             // whole process up front — its egress IS the tunnel's transport —
             // instead of chasing one rotated endpoint IP per drop (the
-            // hidemy.name-over-rotating-Google-IPs failure mode). Not gated on
+            // swiftvpn-over-rotating-Google-IPs failure mode). Not gated on
             // the remote IP being a learnable endpoint: the client's role is
             // proven by the drop regardless of which address the check targeted.
             if let Some(learner) = self.vpn_client_app_learner.as_ref() {
@@ -304,6 +304,16 @@ impl ConnectionObservationConsumer {
             if rec.egress.role == EgressRole::Primary {
                 self.note_companion_in_use(rec.remote.ip());
             }
+            // Did the user go there, or did a page take them there? Measured
+            // on the event's OWN timestamp: the batch is drained on a timer,
+            // and the drain time would collapse a whole interval onto one
+            // instant. A backend that stamps nothing degrades to exactly that,
+            // which is why the fallback is last, not first.
+            self.note_navigation_attempt(
+                rec.process_path.as_deref(),
+                rec.remote.ip(),
+                rec.observed_unix_ms.unwrap_or_else(now_unix_ms),
+            );
             match rec.egress.role {
                 EgressRole::Primary => summary.primary += 1,
                 EgressRole::Secondary => summary.secondary += 1,

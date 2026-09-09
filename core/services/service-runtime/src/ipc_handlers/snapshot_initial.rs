@@ -288,12 +288,12 @@ mod tests {
             oper_status: "up".into(),
         };
         let app_enforcement = AppEnforcementStatus::new();
-        app_enforcement.set_unresolved(vec!["vk.exe".into(), "disko*.exe".into()]);
+        app_enforcement.set_unresolved(vec!["ab.exe".into(), "disko*.exe".into()]);
         let shared_exemptions = crate::app_enforcement_status::SharedIpExemptionStatus::new();
         shared_exemptions.set(&[
-            std::net::Ipv4Addr::new(8, 6, 112, 1),
-            std::net::Ipv4Addr::new(8, 6, 112, 2),
-            std::net::Ipv4Addr::new(8, 6, 112, 3),
+            std::net::Ipv4Addr::new(192, 0, 2, 1),
+            std::net::Ipv4Addr::new(192, 0, 2, 2),
+            std::net::Ipv4Addr::new(192, 0, 2, 3),
         ]);
         // An armed block-all posture rides the same snapshot.
         let block_all = crate::app_enforcement_status::BlockAllPostureStatus::new();
@@ -319,14 +319,14 @@ mod tests {
         let resp = h.handle(&req(), &ctx()).unwrap();
         let parsed: SnapshotInitialResponse = serde_json::from_value(resp).unwrap();
         // Sorted + deduped by the status.
-        assert_eq!(parsed.unenforced_app_rules, vec!["disko*.exe", "vk.exe"]);
+        assert_eq!(parsed.unenforced_app_rules, vec!["ab.exe", "disko*.exe"]);
         // The smart-kill-switch exclusion count rides the same snapshot.
         assert_eq!(parsed.kill_switch_shared_ip_exemptions, 3);
         // The excluded addresses ride the same snapshot for the GUI's
         // "show details" list.
         assert_eq!(
             parsed.kill_switch_shared_ip_exemption_addresses,
-            vec!["8.6.112.1", "8.6.112.2", "8.6.112.3"]
+            vec!["192.0.2.1", "192.0.2.2", "192.0.2.3"]
         );
         // The block-all posture rides the same snapshot.
         assert!(parsed.kill_switch_block_all_armed);

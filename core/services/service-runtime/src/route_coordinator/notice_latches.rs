@@ -95,6 +95,23 @@ impl SecondaryRouteCoordinator {
         true
     }
 
+    /// Remember the next-hop derived for `ifindex` and say whether it is NEWS.
+    ///
+    /// The derive itself repeats on every resolve, so logging its result each
+    /// time buries the log in one answer (verbose capture: 6257 identical
+    /// lines, 23% of a session). The cache has to be written either way — it is what lets
+    /// routing survive the catch-all routes being stripped — so the latch is
+    /// the write's own return value rather than a second map.
+    // `pub(super)` because the impl is split across files and the caller
+    // is now another module.
+    pub(super) fn note_derived_next_hop(&self, ifindex: u32, next_hop: std::net::Ipv4Addr) -> bool {
+        self.next_hop_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(ifindex, next_hop)
+            != Some(next_hop)
+    }
+
     /// Re-arm [`Self::note_not_usable_once`] for `(sid, role)` — called once
     /// the binding resolves to a usable adapter again, so the next
     /// usable→not-usable transition warns instead of staying silent forever.

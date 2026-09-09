@@ -116,18 +116,41 @@ pub(super) fn binding_matches_live(
 /// `true` when a whitespace token of an adapter friendly name is purely a
 /// version designator (all digits/dots, optionally a leading `v`): "3.0",
 /// "4.1", "v3", "2". VPN vendors bump these across reinstalls/upgrades
-/// ("hidemy.name VPN OpenVPN Adapter" ↔ "hidemy.name VPN 3.0 OpenVPN
+/// ("swiftvpn VPN OpenVPN Adapter" ↔ "SwiftVPN 3.0 OpenVPN
 /// Adapter"), so a version token must never participate in identity matching.
 pub(super) fn is_version_token(token: &str) -> bool {
     let stripped = token.trim_start_matches(['v', 'V']);
     !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
-/// Lower-cased whitespace tokens of a friendly name with version tokens
-/// dropped — the stable "family" identity of an adapter description.
+/// Words that name a category, not a vendor. A family match resting only on
+/// these is not evidence: every tunnel on the machine carries some of them.
+const GENERIC_NAME_TOKENS: &[&str] = &[
+    "vpn",
+    "adapter",
+    "tunnel",
+    "client",
+    "network",
+    "connection",
+    "ethernet",
+    "wireless",
+    "virtual",
+    "tap",
+    "wintun",
+];
+
+/// Lower-cased tokens of a friendly name with version tokens dropped — the
+/// stable "family" identity of an adapter description.
+///
+/// Splits on `_` and `-` as well as whitespace: a vendor writes the same name
+/// both ways across its own products ("swiftvpn VPN OpenVPN Adapter" for
+/// the TAP device, "swiftvpn_VPN" for the WireGuard one), and treating the
+/// underscore spelling as one opaque token left the family match blind exactly
+/// when the user switched transport. `.` stays a word character — it belongs to
+/// brand names like "swiftvpn".
 pub(super) fn core_tokens(name: &str) -> Vec<String> {
-    name.split_whitespace()
-        .filter(|t| !is_version_token(t))
+    name.split(|c: char| c.is_whitespace() || c == '_' || c == '-')
+        .filter(|t| !t.is_empty() && !is_version_token(t))
         .map(|t| t.to_ascii_lowercase())
         .collect()
 }
@@ -137,7 +160,7 @@ pub(super) fn core_tokens(name: &str) -> Vec<String> {
 /// the SAME adapter family, ignoring version tokens.
 ///
 /// Both sides are reduced to their version-stripped core token set (so
-/// "hidemy.name VPN OpenVPN Adapter" and "hidemy.name VPN 3.0 OpenVPN Adapter"
+/// "swiftvpn VPN OpenVPN Adapter" and "SwiftVPN 3.0 OpenVPN Adapter"
 /// reduce to the same family), then matched by **symmetric** containment:
 /// either core set is a subset of the other. The earlier implementation
 /// required the saved name to be a subset of the live description — a
@@ -147,13 +170,21 @@ pub(super) fn core_tokens(name: &str) -> Vec<String> {
 /// leaving a live, working VPN reported as "not found among live adapters".
 /// Symmetric containment heals both directions. The caller only uses this when
 /// EXACTLY ONE usable adapter matches, bounding false positives.
+/// Containment alone is not enough once `_`/`-` split names into short token
+/// sets: an adapter merely called "VPN" is a subset of every VPN name there is.
+/// At least one shared token must name the vendor rather than the category.
 pub(super) fn description_matches_display_name(description: &str, display_name: &str) -> bool {
     let saved = core_tokens(display_name);
     let live = core_tokens(description);
     if saved.is_empty() || live.is_empty() {
         return false;
     }
-    saved.iter().all(|t| live.contains(t)) || live.iter().all(|t| saved.contains(t))
+    let contained =
+        saved.iter().all(|t| live.contains(t)) || live.iter().all(|t| saved.contains(t));
+    contained
+        && saved
+            .iter()
+            .any(|t| live.contains(t) && !GENERIC_NAME_TOKENS.contains(&t.as_str()))
 }
 
 /// Does `info` still answer to the name the binding was saved under?
@@ -221,8 +252,8 @@ pub(super) fn mac_dash(info: &AdapterInfo) -> Option<String> {
 /// `true` when the MAC identifies the adapter independently of its GUID.
 ///
 /// A tunnel adapter derives its MAC from its own GUID — a live TAP-Windows
-/// instance was observed as MAC `00:FF:0C:93:B1:CC` under GUID
-/// `{0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}` — so the two rotate together on
+/// instance was observed as MAC `00:FF:AA:BB:CC:DD` under GUID
+/// `{AABBCCDD-1111-2222-3333-444444444444}` — so the two rotate together on
 /// every reconnect and the MAC carries no identity the GUID did not already
 /// carry. Anchoring on it would either never match or, worse, match whatever
 /// instance the client created last. Interface TYPE cannot make this call:
@@ -273,7 +304,7 @@ pub(super) fn preferred_display_name(info: &AdapterInfo) -> &str {
 /// gateway list and the adapter-gateway lookup finds nothing, even though
 /// the link is up and routing fine. We reuse that peer as the next-hop for
 /// our `/32` overlays so matched traffic travels exactly like the VPN's own
-/// redirected traffic. (Observed on a live hidemy.name OpenVPN link:
+/// redirected traffic. (Observed on a live swiftvpn OpenVPN link:
 /// `0.0.0.0/1 -> 10.91.192.1` with no adapter gateway.)
 ///
 /// Default-style routes on `ifindex` with a real (non-unspecified,

@@ -426,6 +426,7 @@ fn band_slug(class: nrr_platform_api::enforcement::PrecedenceClass) -> &'static 
         P::CatchAllExempt => "catch-all-exempt",
         P::KillSwitchBlock => "kill-switch-block",
         P::KillSwitchPermit => "kill-switch-permit",
+        P::FakeIpPool => "fake-ip-pool",
         P::HardBlock => "hard-block",
     }
 }
@@ -561,7 +562,7 @@ mod tests {
         let mut pinned = rule(
             PrecedenceClass::RouteRule(RouteRole::Secondary),
             0,
-            DstMatch::HostV4(v4(93, 184, 216, 34)),
+            DstMatch::HostV4(v4(23, 10, 20, 138)),
             Verdict::Permit,
         );
         pinned.egress = EgressConstraint::OnlyVia(EgressRef::Secondary);
@@ -586,7 +587,7 @@ mod tests {
         );
         // Same destination on both — the drop is scoped, not a blanket cut.
         assert!(guard.matches.contains(&NftMatch::DstV4 {
-            net: v4(93, 184, 216, 34),
+            net: v4(23, 10, 20, 138),
             prefix: 32,
         }));
     }
@@ -603,8 +604,8 @@ mod tests {
             Verdict::Permit,
         );
         app_rule.app = AppScope::Program {
-            key: "telegram".into(),
-            exe_paths: vec!["C:/telegram.exe".into()],
+            key: "messenger".into(),
+            exe_paths: vec!["C:/messenger.exe".into()],
         };
 
         let lowered = lower_plan(&plan_of(vec![app_rule]), &names());
@@ -615,7 +616,7 @@ mod tests {
                 index: 0,
                 principal: "unix:uid:1000".into(),
                 reason: UnsupportedReason::AppScoped {
-                    key: "telegram".into()
+                    key: "messenger".into()
                 },
             }],
         );

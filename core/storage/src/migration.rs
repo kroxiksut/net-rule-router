@@ -48,7 +48,7 @@ use crate::schema::{
     STATE_DB_V52_DDL, STATE_DB_V53_DDL, STATE_DB_V54_DDL, STATE_DB_V55_DDL, STATE_DB_V56_DDL,
     STATE_DB_V57_DDL, STATE_DB_V58_DDL, STATE_DB_V59_DDL, STATE_DB_V5_DDL, STATE_DB_V60_DDL,
     STATE_DB_V61_DDL, STATE_DB_V62_DDL, STATE_DB_V6_DDL, STATE_DB_V7_DDL, STATE_DB_V8_DDL,
-    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL,
+    STATE_DB_V9_DDL, TRAFFIC_DB_V1_DDL, TRAFFIC_DB_V2_DDL,
 };
 
 // ── schema_migrations bootstrap DDL ──────────────────────────────────────────
@@ -109,11 +109,18 @@ pub(crate) const CACHE_MIGRATIONS: &[MigrationDef] = &[
 // nrr_traffic_stats.db. Rebuildable, like the cache DB: delete + rebuild on
 // corruption. Pre-release, wiped freely — a schema change bumps v1 in place,
 // never adds v2.
-pub(crate) const TRAFFIC_MIGRATIONS: &[MigrationDef] = &[MigrationDef {
-    version: 1,
-    name: "initial_traffic_schema",
-    stmts: TRAFFIC_DB_V1_DDL,
-}];
+pub(crate) const TRAFFIC_MIGRATIONS: &[MigrationDef] = &[
+    MigrationDef {
+        version: 1,
+        name: "initial_traffic_schema",
+        stmts: TRAFFIC_DB_V1_DDL,
+    },
+    MigrationDef {
+        version: 2,
+        name: "add_adapter_history_link",
+        stmts: TRAFFIC_DB_V2_DDL,
+    },
+];
 
 pub(crate) const STATE_MIGRATIONS: &[MigrationDef] = &[
     MigrationDef {
@@ -641,6 +648,7 @@ const TRAFFIC_REQUIRED_TABLES: &[&str] = &[
     "interface_counter_cursor",
     "traffic_metadata",
     "adapter_addresses",
+    "adapter_history_link",
 ];
 
 // The `(day, adapter_key, role)` primary key is the covering index for every
@@ -1507,6 +1515,74 @@ mod tests {
         assert!(s.migrations_applied.is_empty());
     }
 
+    /// A runner that knows only the FIRST `count` migrations — the state a
+    /// database left by an older build is in.
+    fn state_runner_stopped_at(dir: &tempfile::TempDir, count: usize) -> SqliteMigrationRunner {
+        let path = dir.path().join("state.db");
+        let conn = open_connection(&path).expect("open_connection");
+        SqliteMigrationRunner {
+            conn: RefCell::new(conn),
+            migrations: &STATE_MIGRATIONS[..count],
+            required_tables: STATE_REQUIRED_TABLES,
+            required_indexes: STATE_REQUIRED_INDEXES,
+            backup_policy: None,
+        }
+    }
+
+    /// Every version an installed build could have left behind must upgrade to
+    /// the current schema.
+    ///
+    /// `run_state_migrations_empty_db` only ever walks 0 → latest, which is the
+    /// one path a developer's machine takes. A user upgrading from build N
+    /// starts at N, and a migration that quietly assumes a table introduced
+    /// later fails only for them — after the release. This walks all of them.
+    #[test]
+    fn every_intermediate_state_version_upgrades_to_the_current_schema() {
+        for stop_at in 1..=STATE_MIGRATIONS.len() {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let older = state_runner_stopped_at(&dir, stop_at);
+            let partial = older
+                .run_pending_migrations()
+                .unwrap_or_else(|e| panic!("migrating an empty db to v{stop_at}: {e}"));
+            assert_eq!(
+                partial.to_version, stop_at as u32,
+                "the prefix runner must stop exactly where it was told"
+            );
+            drop(older);
+
+            let current = state_runner(&dir);
+            let rest = current
+                .run_pending_migrations()
+                .unwrap_or_else(|e| panic!("upgrading a v{stop_at} database: {e}"));
+            assert_eq!(
+                rest.from_version, stop_at as u32,
+                "the upgrade must start from the version the older build left"
+            );
+            assert_eq!(rest.to_version, STATE_MIGRATIONS.len() as u32);
+            let verified = current
+                .verify_schema()
+                .unwrap_or_else(|e| panic!("verifying after an upgrade from v{stop_at}: {e}"));
+            assert!(
+                verified.is_ok(),
+                "schema after upgrading from v{stop_at} is incomplete: {verified:?}"
+            );
+        }
+    }
+
+    /// Positive control for the walk above: the prefix runner really does stop
+    /// short, so a green matrix is not a matrix of full migrations.
+    #[test]
+    fn the_prefix_runner_leaves_the_schema_incomplete() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let older = state_runner_stopped_at(&dir, 1);
+        older.run_pending_migrations().expect("migrate to v1");
+        let verified = older.verify_schema().expect("verify");
+        assert!(
+            !verified.is_ok(),
+            "v1 alone cannot satisfy the current schema, or this test proves nothing"
+        );
+    }
+
     // ── verify_schema ─────────────────────────────────────────────────────────
 
     #[test]
@@ -1837,7 +1913,7 @@ mod tests {
         let opened = open_traffic_connection_or_rebuild(&path).expect("open");
         assert!(opened.rebuilt_reason.is_none(), "fresh DB must not rebuild");
         let version = read_schema_version(&opened.connection).expect("version");
-        assert_eq!(version, 1);
+        assert_eq!(version, TRAFFIC_MIGRATIONS.len() as u32);
     }
 
     #[test]
@@ -1945,7 +2021,48 @@ mod tests {
         let opened = open_traffic_connection_or_rebuild(&path).expect("rebuild open");
         assert!(opened.rebuilt_reason.is_some(), "garbage file must rebuild");
         let version = read_schema_version(&opened.connection).expect("version");
-        assert_eq!(version, 1);
+        assert_eq!(version, TRAFFIC_MIGRATIONS.len() as u32);
+    }
+
+    /// The path every installed user takes: a v1 traffic ledger gains the
+    /// answers table WITHOUT losing a day of history. Editing v1 in place would
+    /// have failed its checksum and rebuilt the file instead — erasing exactly
+    /// what the merge question exists to preserve.
+    #[test]
+    fn upgrade_traffic_db_from_v1_keeps_the_ledger() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("nrr_traffic_stats.db");
+
+        // A database an older binary left behind, with a day of history in it.
+        {
+            let mut conn = open_connection(&path).expect("open");
+            ensure_migrations_table(&conn).expect("bootstrap");
+            apply_migration(&mut conn, &TRAFFIC_MIGRATIONS[0]).expect("apply v1");
+            conn.execute(
+                "INSERT INTO interface_daily_traffic (day, adapter_key, role, in_bytes, out_bytes)
+                 VALUES (1, 'eth0', 'primary', 111, 222)",
+                [],
+            )
+            .expect("seed a day");
+        }
+
+        let conn = open_connection(&path).expect("reopen");
+        let runner = SqliteMigrationRunner::for_traffic_db(conn);
+        assert_eq!(runner.current_schema_version().expect("before"), 1);
+        let summary = runner.run_pending_migrations().expect("upgrade");
+        assert_eq!(summary.from_version, 1);
+        assert_eq!(summary.to_version, TRAFFIC_MIGRATIONS.len() as u32);
+        assert!(runner.verify_schema().expect("verify").is_ok());
+
+        let conn = runner.into_connection();
+        let kept: i64 = conn
+            .query_row(
+                "SELECT in_bytes FROM interface_daily_traffic WHERE adapter_key = 'eth0'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("the day must survive the upgrade");
+        assert_eq!(kept, 111);
     }
 
     // ── incremental state DB upgrades ────────────────────────────────────────

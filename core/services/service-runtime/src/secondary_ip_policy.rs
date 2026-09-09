@@ -191,11 +191,11 @@ mod tests {
     #[test]
     fn any_rule_domain_never_denies() {
         let inner = MockFqdnCacheLookup::new();
-        inner.set_ips("chatgpt.com", vec![Ipv4Addr::new(8, 6, 112, 0)]);
+        inner.set_ips("assistant.example", vec![Ipv4Addr::new(192, 0, 2, 0)]);
         let mut direct = HashMap::new();
-        direct.insert(Ipv4Addr::new(8, 6, 112, 0), 9); // heavily shared
+        direct.insert(Ipv4Addr::new(192, 0, 2, 0), 9); // heavily shared
         let cache = CensusMock { inner, direct };
-        let secondary = CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "chatgpt.com")]);
+        let secondary = CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "assistant.example")]);
         let denied = secondary_ip_denylist(&secondary, &cache, SharedIpPolicy::AnyRuleDomain);
         assert!(denied.is_empty());
     }
@@ -203,12 +203,12 @@ mod tests {
     #[test]
     fn majority_of_ip_denies_a_minority_shared_ip() {
         let inner = MockFqdnCacheLookup::new();
-        let shared = Ipv4Addr::new(8, 6, 112, 0);
-        inner.set_ips("chatgpt.com", vec![shared]);
+        let shared = Ipv4Addr::new(192, 0, 2, 0);
+        inner.set_ips("assistant.example", vec![shared]);
         let mut direct = HashMap::new();
         direct.insert(shared, 3); // 1 rule host vs 3 innocents → minority
         let cache = CensusMock { inner, direct };
-        let secondary = CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "chatgpt.com")]);
+        let secondary = CanonicalRuleSet::from_rules(vec![fqdn_rule("r1", "assistant.example")]);
         let denied = secondary_ip_denylist(&secondary, &cache, SharedIpPolicy::MajorityOfIp);
         assert!(denied.contains(&shared));
     }

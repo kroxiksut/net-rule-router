@@ -327,6 +327,21 @@ impl TrafficSampler {
         self.store.all_adapter_addresses()
     }
 
+    /// Every key the ledger knows, with the window it has been seen in.
+    pub fn key_sightings(&self) -> StorageResult<Vec<nrr_storage::AdapterKeySighting>> {
+        self.store.key_sightings()
+    }
+
+    /// Answers already given about continuing one key's history as another's.
+    pub fn history_links(&self) -> StorageResult<Vec<nrr_storage::AdapterHistoryLink>> {
+        self.store.history_links()
+    }
+
+    /// Record an answer. A refusal is stored too — the question is asked once.
+    pub fn set_history_link(&self, link: &nrr_storage::AdapterHistoryLink) -> StorageResult<()> {
+        self.store.set_history_link(link)
+    }
+
     /// Resets all traffic data (persisted ledger + session + cursors) on an
     /// explicit user "reset statistics" action.
     pub fn clear(&mut self) -> StorageResult<()> {

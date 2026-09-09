@@ -218,12 +218,18 @@
       "description": "NetRuleRouter ships a small console for service tasks: install, start, stop and check the service. Add its folder to your PATH to run it as \"nrr-cli\" from any terminal.",
       "path-registered": "The console can be run from any terminal.",
       "path-not-registered": "The console can only be run from its own folder — and in PowerShell you still have to spell it \".\\nrr-cli.exe\", because a bare name is not searched for in the current directory.",
+      "path-reachable-not-ours": "The folder is already on your PATH, but the entry was not added by NetRuleRouter — so there is nothing here to add or take away.",
       "folder-label": "Console folder",
       "add-to-path": "Add console to PATH",
       "add-to-path-tooltip": "Adds the console's folder to your personal PATH. It affects your account only, needs no administrator rights, and changes nothing else on the list.",
+      "remove-from-path": "Remove console from PATH",
+      "remove-from-path-tooltip": "Removes the entry NetRuleRouter added to your personal PATH. Nothing else on the list is touched, and terminals that are already open keep the PATH they started with.",
       "path-added": "The console was added to your PATH.",
       "path-already-present": "The console was already on your PATH.",
       "path-failed": "Could not add the console to your PATH.",
+      "path-removed": "The console was removed from your PATH.",
+      "path-was-not-present": "Nothing to remove — this entry was not put there by NetRuleRouter.",
+      "path-remove-failed": "Could not remove the console from your PATH.",
       "new-terminal-hint": "Terminals that are already open keep the PATH they started with. Open a new one, or run this line in the current one:",
       "profile-file-hint": "The line was added to %1."
     },
@@ -571,7 +577,8 @@
         "limits": "Configure limits",
         "timeout": "Wait per address, ms",
         "max-targets": "Addresses per check",
-        "repeat": "Do not re-check the same address for, s"
+        "repeat": "Do not re-check the same address for, s",
+        "reset": "Reset to defaults"
       },
       "block-ipv6": "Switch IPv6 off while leak protection is on",
       "block-ipv6-description": "Rules cover IPv4 addresses. A site that also has an IPv6 address could otherwise reach it over the main connection while its IPv4 traffic goes through the additional route. Turn this off only if your network needs IPv6.",
@@ -734,7 +741,13 @@
       "address-local": "IP",
       "address-external": "external",
       "period-all-time": "All time",
-      "period-all-time-note": "Everything counted since the service was installed, split the same way"
+      "period-all-time-note": "Everything counted since the service was installed, split the same way",
+      "history-merge": {
+        "question": "\"{old}\" stopped appearing and \"{new}\" took its place. Is this the same connection, so its history should continue as one?",
+        "hint": "Answered once. If they are different connections, their histories stay apart and you will not be asked again.",
+        "same": "Same connection",
+        "different": "Different connections"
+      }
     },
     "storage": {
       "title": "Storage usage",
@@ -788,16 +801,16 @@
       },
       "conn-trace": {
         "heading": "Connection trace (diagnostic)",
-        "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Requires service restart.",
+        "intro": "Records outgoing connections of all apps and the interface each left through (direct vs the additional adapter). Sees the real socket, so it works even when the browser uses DoH. Observation itself is always on — these two switches decide where it is shown and whether it is written down.",
         "ndjson": {
           "label": "Write connection trace to service log (NDJSON)",
-          "tooltip": "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/additional adapter)."
+          "tooltip": "Each observed connection is written to the operational NDJSON: process, remote IP:port, and egress interface (primary/provider or secondary/additional adapter). Applies at the next service start."
         },
         "gui": {
-          "label": "Show connection trace in diagnostics (GUI)",
-          "tooltip": "Surfaces the connection trace in the diagnostics log view (also writes it to NDJSON)."
+          "label": "Show connection trace in Diagnostics",
+          "tooltip": "Lets the connection-trace panel in Diagnostics show what was observed. Takes effect immediately, no service restart. Switching it off hides the panel's contents only — it does not stop observation, which app routing and rule suggestions rely on."
         },
-        "help": "Privacy-sensitive: the trace contains per-connection process names and remote addresses. Leave off in normal operation."
+        "help": "Privacy-sensitive: the trace carries per-connection process names and remote addresses. Writing it to disk is the part worth leaving off in normal operation."
       },
       "rule-scope": {
         "heading": "When routing rules are enforced",
@@ -1694,10 +1707,8 @@
     "compat-banner-update-description": "Open the project's releases page in the default browser.",
     "include-subdomains-on": "Domain rules now also cover subdomains.",
     "include-subdomains-off": "Domain rules now match the exact domain only.",
-    "include-subdomains-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "include-subdomains-failed": "Could not update the subdomain setting: ",
     "shared-ip-policy-set": "Shared-IP handling updated.",
-    "shared-ip-policy-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "shared-ip-policy-failed": "Could not update shared-IP handling: ",
     "kill-switch-on": "Leak protection enabled: matched traffic is blocked if the additional adapter drops.",
     "kill-switch-off": "Leak protection disabled.",
@@ -1708,15 +1719,12 @@
     "kill-switch-fail-closed-off": "Leak protection set to fail-open: traffic is allowed (with a warning) if the additional adapter can't be found.",
     "kill-switch-block-all-on": "Kill-switch on: while the additional adapter is down, all traffic is blocked except your local network and already-known primary sites.",
     "kill-switch-block-all-off": "Kill-switch: while the additional adapter is down, only its routed sites are blocked now.",
-    "kill-switch-block-all-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "kill-switch-block-all-failed": "Could not update the kill-switch setting: ",
     "kill-switch-enabled-on": "Leak protection enabled. Choose how it blocks in the options below.",
     "kill-switch-enabled-off": "Leak protection disabled. Nothing is blocked — while the additional adapter is down, traffic is allowed to leak (your choice).",
-    "kill-switch-enabled-uac-declined": "Administrator approval was declined; leak protection was not changed.",
     "kill-switch-enabled-failed": "Could not update leak protection: ",
     "allow-dns-over-primary-on": "While blocked, name resolution now works over your main link, so zones keep resolving.",
     "allow-dns-over-primary-off": "Strict: while blocked, DNS is blocked over the main link too.",
-    "allow-dns-over-primary-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "allow-dns-over-primary-failed": "Could not update the DNS setting: ",
     "policy-toggles-restored": "Your saved routing preferences were restored.",
     "kill-switch-restored-from-prefs": "Leak protection was restored from your saved settings.",
@@ -1747,10 +1755,8 @@
     "isp-block-candidates-off": "ISP block-page rule suggestions are off.",
     "isp-block-candidates-failed": "Could not change the ISP block-page rule suggestions setting: ",
     "mode-a-coverage-set": "Fallback blocking behavior updated.",
-    "mode-a-coverage-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "mode-a-coverage-failed": "Could not update the fallback blocking behavior: ",
     "hosts-bypass-set": "Rule-domain resolution updated.",
-    "hosts-bypass-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "hosts-bypass-failed": "Could not update rule-domain resolution: ",
     "auto-rules-added": "Addresses a routed site needs were added to your rules.",
     "auto-rules-added-unsaved-short": "Addresses added — reload to see them",
@@ -1765,7 +1771,6 @@
     "doh-lockdown-on": "Browser DoH/DoT blocking enabled: DNS falls back to plaintext so routed sites are seen.",
     "doh-lockdown-off": "Browser DoH/DoT blocking disabled.",
     "doh-lockdown-scope-set": "DoH/DoT blocking scope updated.",
-    "doh-lockdown-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "doh-lockdown-failed": "Could not update DoH/DoT blocking: ",
     "browser-history-auto-seed-on": "The cache will be seeded from browser history automatically at service start.",
     "browser-history-auto-seed-off": "Automatic browser-history seeding disabled.",
@@ -1778,7 +1783,6 @@
     "liveness-window-uac-declined": "Administrator approval was declined; the liveness window was not changed.",
     "liveness-window-failed": "Could not update the liveness window: ",
     "system-routing-set": "System-level routing setting updated.",
-    "system-routing-uac-declined": "Administrator approval was declined; the setting was not changed.",
     "system-routing-failed": "Could not update the setting: ",
     "verbose-logging-enabled": "Verbose service logging enabled — applies immediately",
     "verbose-logging-disabled": "Verbose service logging disabled — applies immediately",
@@ -1817,7 +1821,9 @@
     "route-binding-keep-service": "Keep what the service applies",
     "route-binding-keep-service-description": "Show the connections the background service is applying and stop offering the ones stored in the app.",
     "route-binding-keep-mine": "Apply what is shown here",
-    "route-binding-keep-mine-description": "Send the connections shown here to the background service, replacing the ones it is applying."
+    "route-binding-keep-mine-description": "Send the connections shown here to the background service, replacing the ones it is applying.",
+    "primary-probe-limits-reset": "Check limits are back to their defaults.",
+    "traffic-history-merge-failed": "Could not save the answer: "
   },
   "interfaces": {
     "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
@@ -1993,7 +1999,9 @@
       "save-as-set": "Save as a set (both routes)...",
       "more": "More...",
       "clean-overlaps": "Remove covered rules ({n})",
-      "clean-overlaps-tooltip": "Some rules name a host one of your wildcard rules already covers. Review them and drop the spare ones."
+      "clean-overlaps-tooltip": "Some rules name a host one of your wildcard rules already covers. Review them and drop the spare ones.",
+      "where-traffic-goes": "Where traffic is going",
+      "where-traffic-goes-tooltip": "Opens the connection trace: which application reached which destination, and over which connection it actually left."
     },
     "bulk": {
       "selected-count": "{n} rule(s) selected",
@@ -2026,6 +2034,7 @@
       "domain": "Domain",
       "exact-ip": "Exact IP"
     },
+    "application-not-leakproof": "On this system an application rule is not airtight: connections the app makes before it is recognised can still get through.",
     "application-routing-note": "Routes everything this app connects to through the additional adapter. NetRuleRouter learns the app's destinations by watching its connections, so routing fills in as the app connects — enable «Connection observation» in Settings → Diagnostics for this to work. Enter the executable name, e.g. chrome.exe.",
     "app-browse": "Browse…",
     "app-browse-title": "Select the application executable",
@@ -2233,7 +2242,12 @@
         "show-dismissed": "Show answered ({n})",
         "show-dismissed-tooltip": "Also list the addresses you told the app not to suggest again, so you can change your mind about one.",
         "empty-but-answered": "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.",
-        "pending-badge": "{n} address(es) waiting for an answer"
+        "pending-badge": "{n} address(es) waiting for an answer",
+        "show-served-by-main-link": "Show ones the main connection already handles ({n})",
+        "show-served-by-main-link-tooltip": "These addresses answer over your main connection, so sending them through the additional one changes nothing. They are listed for completeness, not as work.",
+        "ownership-third-party": "a third-party service the site pulls in",
+        "ownership-own-name": "one of the site's own names",
+        "empty-served-by-main-link": "Connections to these {n} address(es) complete over your main connection. If a site still refuses to open, what you are seeing is not a routing failure — the traffic gets through, so a rule here would not change it."
       },
       "table": {
         "intro": "Every address below was pulled in by a site you route. Adding one <b>sends it through the additional route together with the site that needs it</b> — <i>anything you leave alone keeps going through the main route</i>. A dismissed address <i>only stops being offered</i>; \"Allow again\" lifts that suppression and nothing else.",
@@ -2252,7 +2266,9 @@
       "check-started": "Checking {count} addresses over the main connection...",
       "check-nothing": "Nothing to check: these addresses were checked recently, or none of them has been resolved yet.",
       "nothing-to-check": "There are no address rules to check."
-    }
+    },
+    "invalid-count": "{n} rule(s) will not be applied: the value is not valid.",
+    "invalid-count-show": "Show them"
   },
   "connection": {
     "banner": {
@@ -2378,14 +2394,19 @@
         "brand-related": "shares a name with the site",
         "delivery-name": "looks like a delivery address of the site",
         "co-activity": "keeps appearing together with the site",
-        "isp-block-page": "your provider answered with a notice page instead of this site"
+        "isp-block-page": "your provider answered with a notice page instead of this site",
+        "placeholder-answer": "your provider answered with an address nothing can be reached at",
+        "main-link-blocked": "connections to it kept failing on the main route and none went through"
       },
       "action": {
         "accept": "Add checked",
         "always": "Add automatically from now on",
         "details": "Details",
         "dismiss": "Never suggest checked"
-      }
+      },
+      "title-blocked": "Sites the main route will not carry",
+      "body-blocked": "Connections to {name} keep failing on the main route.",
+      "body-blocked-multi": "Connections to {count} sites keep failing on the main route."
     },
     "auto-rules-mode-confirm": {
       "title": "Turn on “Apply automatically”?",
@@ -2554,7 +2575,9 @@
     },
     "service": {
       "revision-label": "Active revision",
-      "pending-changes-label": "Pending changes"
+      "pending-changes-label": "Pending changes",
+      "started-after-sign-in": "The service started %1 s after this boot reached the sign-in screen.",
+      "started-before-sign-in": "The service started %1 s before this boot reached the sign-in screen."
     },
     "cache": {
       "title": "Cache",
@@ -2631,12 +2654,11 @@
     },
     "conn-trace": {
       "title": "Connection trace",
-      "subtitle": "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. Works on demand, no service restart needed; the list is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.",
+      "subtitle": "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. The list refreshes on its own while it is open and is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.",
       "entries-button": "Show recent connections",
       "entries-refresh": "Refresh",
       "entries-hide": "Hide connection trace",
       "entries-search-placeholder": "Search all fields…",
-      "entries-redacted-notice": "Addresses are masked for privacy. Enable Extended diagnostics for full detail.",
       "entries-failed": "Failed to load connection trace: ",
       "entries-bridge-unavailable": "Service bridge not connected — connection trace unavailable",
       "entries-loading": "Loading connections...",
@@ -2679,7 +2701,14 @@
         "tcp": "TCP",
         "udp": "UDP",
         "other": "Other"
-      }
+      },
+      "auto-refresh": "Refresh automatically",
+      "updated-ago": "updated %1 s ago",
+      "observer-unavailable": "The service is not observing connections right now, so this list stays empty. The service log says why.",
+      "rule-for-address": "Rule for this address…",
+      "rule-for-app": "Rule for this application…",
+      "auto-paused": "Paused — scroll to the top or clear the selection to resume",
+      "gui-stream-off": "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running."
     },
     "explain": {
       "title": "Explain sample",
@@ -2992,6 +3021,16 @@
       "unknown": {
         "title": "Your rules are not being applied",
         "body": "The service reported a state this version does not recognise. Open interfaces and routes to check the setup."
+      },
+      "adapter-gone": {
+        "title": "The saved connection is gone",
+        "body": "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}",
+        "body-empty": "The connection your rules were set to use is no longer on this computer, and there is nothing to replace it with right now."
+      },
+      "adapter-failed": {
+        "title": "The saved connection is broken",
+        "body": "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}",
+        "body-empty": "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps."
       }
     },
     "rules-file-converged": {

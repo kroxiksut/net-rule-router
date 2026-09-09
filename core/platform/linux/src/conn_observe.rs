@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(sockets.len(), 2);
         let established = &sockets[1];
         assert_eq!(established.local, addr("10.0.2.15:51634"));
-        assert_eq!(established.remote, addr("34.216.184.93:443"));
+        assert_eq!(established.remote, addr("23.10.20.131:443"));
         assert_eq!(established.uid, 1000);
         assert_eq!(established.inode, 44551);
         assert_eq!(established.state, TCP_ESTABLISHED);

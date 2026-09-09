@@ -17,6 +17,7 @@
 //! (adapter selections, role confirmations, behavior mode) will be migrated to
 //! service-owned state once real service integration is complete.
 
+pub mod adapter_history_merge;
 pub mod address_class;
 pub mod alert;
 pub mod auto_rule_budget;
@@ -24,6 +25,7 @@ pub mod block8_outputs;
 // Block notices: folds a stream of blocked attempts into readable episodes and
 // owns the mute rules, so every surface answers "show this?" the same way.
 pub mod block_notice;
+pub mod boot_timing;
 pub mod canonical;
 // Co-activity companion affinity: learns which hostnames accompany a rule host
 // so the application can propose routing them the same way. Pure and lazy —

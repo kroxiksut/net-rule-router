@@ -402,6 +402,17 @@ fn run_primary(
     }
 
     let mut command = Command::new(&native_host);
+    // In a cargo tree the Qt host lives deep under `target/<profile>/build/…`,
+    // so the service binary is NOT its sibling and the host's own sibling-only
+    // lookup finds nothing — leaving every service action in the GUI dead with
+    // "Service binary not found", the broker never spawned. This launcher IS
+    // the service's sibling, so it can say where it is. Debug-only, matching
+    // the host side: a shipped layout has them side by side, and the
+    // sibling-only rule there is a trust boundary that must not soften.
+    #[cfg(debug_assertions)]
+    if let Some(service_exe) = sibling_service_binary() {
+        command.env("NRR_SERVICE_BINARY", service_exe);
+    }
     command
         .args(&host_arguments)
         // stdin is piped so the launcher can write `NRR_IPC_RESPONSE:<json>`
@@ -1079,6 +1090,17 @@ fn resolve_qml_path(surface: LauncherSurface) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// The service binary next to THIS executable, if it is there. Only the
+/// sibling counts — the same trust boundary the host and the broker draw.
+#[cfg(debug_assertions)]
+fn sibling_service_binary() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let candidate = exe
+        .parent()?
+        .join(nrr_shared::product_identity::BinaryRole::Service.host_file_name());
+    candidate.is_file().then_some(candidate)
 }
 
 fn resolve_native_icon_path() -> Option<PathBuf> {

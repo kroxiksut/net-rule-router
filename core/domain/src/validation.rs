@@ -1236,8 +1236,8 @@ mod tests {
     fn domain_label_uppercased_is_lowercased() {
         let mut warnings = Vec::new();
         let result =
-            normalize_domain_label("Google.COM", &RuleId("r-1".to_string()), &mut warnings);
-        assert_eq!(result, Ok("google.com".to_string()));
+            normalize_domain_label("Site.EXAMPLE", &RuleId("r-1".to_string()), &mut warnings);
+        assert_eq!(result, Ok("site.example".to_string()));
         assert!(warnings.is_empty());
     }
 
@@ -1367,7 +1367,7 @@ mod tests {
         let zone = canonical_zone(".ru");
         assert!(crate::decision_matching::match_zone("example.ru", &zone));
         assert!(crate::decision_matching::match_zone(
-            "translate.google.ru",
+            "translate.example.ru",
             &zone
         ));
         assert!(!crate::decision_matching::match_zone("example.com", &zone));

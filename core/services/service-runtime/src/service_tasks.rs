@@ -1107,13 +1107,25 @@ fn auto_probe_is_due(cadence: AutoProbeCadence, last: Option<Instant>, now: Inst
 /// Both gates in one place so the caller cannot advance the window on a tick
 /// that did not probe — the defect this replaced. `waiting` is how many
 /// suggestions are actually queued for an answer.
+///
+/// A candidate we have never probed overrides the repeat window. The window
+/// exists to stop us re-measuring the SAME hosts every ten seconds; a host that
+/// just appeared has no measurement at all, and until it gets one it is offered
+/// with "not checked on the main route" — which is exactly how a host the main
+/// link serves perfectly well ends up looking like something to fix. Waiting up
+/// to five minutes for that verdict means the user's first impression of a
+/// fresh rule is formed before we know anything.
 fn auto_probe_should_run(
     cadence: AutoProbeCadence,
     last: Option<Instant>,
     now: Instant,
     waiting: usize,
+    has_unprobed_candidate: bool,
 ) -> bool {
-    waiting > 0 && auto_probe_is_due(cadence, last, now)
+    if waiting == 0 || !cadence.enabled {
+        return false;
+    }
+    has_unprobed_candidate || auto_probe_is_due(cadence, last, now)
 }
 
 pub fn build_auto_rules_task(
@@ -1121,8 +1133,12 @@ pub fn build_auto_rules_task(
     active_sid: Arc<dyn Fn() -> Option<String> + Send + Sync>,
     auto_probe: Option<AutoProbeWiring>,
 ) -> ServiceTask {
-    // Per principal, when their last automatic pass started.
-    let probed_at: Mutex<std::collections::HashMap<String, Instant>> =
+    // Per principal: when their last automatic pass started, and which
+    // candidate ids that pass covered. The ids are what tell a fresh host from
+    // one we already measured — the count alone cannot, since an accepted offer
+    // and a new one arriving in the same window leave it unchanged.
+    type ProbeMark = (Instant, std::collections::HashSet<String>);
+    let probed_at: Mutex<std::collections::HashMap<String, ProbeMark>> =
         Mutex::new(std::collections::HashMap::new());
     ServiceTask::periodic(
         TASK_ID_AUTO_RULES,
@@ -1143,12 +1159,19 @@ pub fn build_auto_rules_task(
                 let now = Instant::now();
                 // Only when something is actually waiting on an answer: a pass
                 // over an empty inbox leaves the machine for nothing.
-                let waiting = engine.candidates(&sid).len();
-                let last = {
+                let pending: Vec<String> =
+                    engine.candidates(&sid).into_iter().map(|c| c.id).collect();
+                let waiting = pending.len();
+                let (last, unprobed) = {
                     let seen = probed_at.lock().unwrap_or_else(|p| p.into_inner());
-                    seen.get(&sid).copied()
+                    match seen.get(&sid) {
+                        Some((at, covered)) => {
+                            (Some(*at), pending.iter().any(|id| !covered.contains(id)))
+                        }
+                        None => (None, !pending.is_empty()),
+                    }
                 };
-                if auto_probe_should_run(cadence, last, now, waiting) {
+                if auto_probe_should_run(cadence, last, now, waiting, unprobed) {
                     // Stamped HERE, not at the due check. Stamping on every due
                     // tick spent the window on ticks where no pass ran: the
                     // inbox is empty most of the time, so the one moment a
@@ -1159,13 +1182,14 @@ pub fn build_auto_rules_task(
                     probed_at
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .insert(sid.clone(), now);
+                        .insert(sid.clone(), (now, pending.iter().cloned().collect()));
                     let accepted = probe.runner.probe(&sid, &[], &[]).accepted;
                     tracing::debug!(
                         target: "nrr::auto-rules",
                         sid = %sid,
                         accepted,
                         waiting,
+                        unprobed,
                         "main-link pass started for parked suggestions",
                     );
                 } else if waiting > 0 {
@@ -1561,6 +1585,42 @@ mod tests {
         ));
     }
 
+    /// A host that has never been measured overrides the window. Until it is
+    /// probed it carries "not checked on the main route", and that is exactly
+    /// how an address the main link serves perfectly well reads as a problem —
+    /// so a fresh candidate must not wait out up to five minutes for its first
+    /// verdict.
+    #[test]
+    fn a_candidate_the_last_pass_did_not_cover_probes_at_once() {
+        let on = AutoProbeCadence {
+            enabled: true,
+            repeat: Duration::from_secs(300),
+        };
+        let start = Instant::now();
+        let just_probed = Some(start);
+        let inside_window = start + Duration::from_secs(30);
+
+        assert!(
+            !auto_probe_should_run(on, just_probed, inside_window, 1, false),
+            "the same host inside the window is not re-measured"
+        );
+        assert!(
+            auto_probe_should_run(on, just_probed, inside_window, 2, true),
+            "a host the last pass never saw has no verdict at all"
+        );
+    }
+
+    /// The override is not a way around the switch: with the automatic pass
+    /// turned off there is nothing to run, new candidate or not.
+    #[test]
+    fn a_fresh_candidate_does_not_start_a_pass_the_user_turned_off() {
+        let off = AutoProbeCadence {
+            enabled: false,
+            repeat: Duration::from_secs(300),
+        };
+        assert!(!auto_probe_should_run(off, None, Instant::now(), 3, true));
+    }
+
     /// The defect this pins: the window used to advance on every DUE tick,
     /// probed or not. The inbox is empty almost all the time, so a suggestion
     /// appearing between two due marks waited out a whole window — and while it
@@ -1579,10 +1639,10 @@ mod tests {
         for step in 0..24 {
             let now = start + Duration::from_secs(step * 10);
             assert!(
-                !auto_probe_should_run(on, last, now, 0),
+                !auto_probe_should_run(on, last, now, 0, false),
                 "an empty inbox never runs a pass"
             );
-            if auto_probe_should_run(on, last, now, 0) {
+            if auto_probe_should_run(on, last, now, 0, false) {
                 last = Some(now);
             }
         }
@@ -1590,21 +1650,25 @@ mod tests {
         // The moment a suggestion appears the pass runs — it did not have to
         // wait for a window that empty ticks had already eaten.
         let appeared = start + Duration::from_secs(240);
-        assert!(auto_probe_should_run(on, last, appeared, 1));
+        assert!(auto_probe_should_run(on, last, appeared, 1, false));
         last = Some(appeared);
 
         // And having run, it holds the user's window like before.
+        // The same candidate the pass already covered, so only the clock can
+        // release it.
         assert!(!auto_probe_should_run(
             on,
             last,
             appeared + Duration::from_secs(299),
-            1
+            1,
+            false
         ));
         assert!(auto_probe_should_run(
             on,
             last,
             appeared + Duration::from_secs(300),
-            1
+            1,
+            false
         ));
     }
 
@@ -2062,8 +2126,8 @@ mod tests {
             progress: ConnectionProgress::Attempt,
         };
         source.push(observed(
-            Some("/usr/bin/telegram"),
-            Ipv4Addr::new(149, 154, 167, 51),
+            Some("/usr/bin/messenger"),
+            Ipv4Addr::new(23, 10, 20, 154),
         ));
         // Nothing to attribute this one to: counted for nobody, or it would widen
         // every enabled app rule.
@@ -2077,15 +2141,15 @@ mod tests {
 
         assert_eq!(fold_observations(&wiring), 1);
         assert_eq!(
-            store.ips_for_app("telegram"),
-            vec![Ipv4Addr::new(149, 154, 167, 51)],
+            store.ips_for_app("messenger"),
+            vec![Ipv4Addr::new(23, 10, 20, 154)],
         );
 
         // A destination already known is not news: re-driving policy for it
         // would make every poll of a busy program a policy pass.
         source.push(observed(
-            Some("/usr/bin/telegram"),
-            Ipv4Addr::new(149, 154, 167, 51),
+            Some("/usr/bin/messenger"),
+            Ipv4Addr::new(23, 10, 20, 154),
         ));
         assert_eq!(fold_observations(&wiring), 0);
     }
@@ -2115,7 +2179,7 @@ mod tests {
         }
 
         let source = Arc::new(MockDnsObservationSource::new());
-        source.push("example.com", vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        source.push("example.com", vec![Ipv4Addr::new(23, 10, 20, 138)]);
 
         let applied: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&applied);

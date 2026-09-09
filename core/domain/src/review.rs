@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 
 use crate::{
-    canonical::{CanonicalProfile, CanonicalRule},
+    canonical::{CanonicalAddressMatch, CanonicalProfile, CanonicalRule},
     revision::{ContentHash, RevisionDiffSummary, RevisionId, UnixTimestamp},
     RouteBehaviorMode, RouteRole, RuleId,
 };
@@ -548,7 +548,37 @@ fn collect_overlapping_apexes(candidate: &CanonicalProfile, changes: &[RuleChang
 /// content key: `CanonicalAddressMatch` / `CanonicalAppMatch` derive
 /// `Eq`, so equal debug output ⟺ equal value within this crate.
 pub fn rule_identity_key(rule: &CanonicalRule) -> String {
-    format!("{:?}\u{1}{:?}", rule.address_match, rule.app_match)
+    rule_identity_key_under(rule, SubdomainCoverage::Off)
+}
+
+/// Whether the reader's subdomain-coverage setting ("a domain rule also covers
+/// its subdomains") is on. It changes what "the same rule" means, so it is
+/// named at every call site rather than passed as a bare `bool`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubdomainCoverage {
+    /// A domain rule covers the apex only; `x` and `*.x` are two rules.
+    Off,
+    /// A domain rule covers the apex and every subdomain; `x` and `*.x` name
+    /// one rule.
+    On,
+}
+
+/// [`rule_identity_key`], with `x` and `*.x` folded into one identity when the
+/// caller's subdomain coverage is on.
+///
+/// Under coverage an `ExactFqdn(d)` rule is enforced as `{ExactFqdn(d),
+/// SuffixDomain(d)}`, and `SuffixDomain(d)` already covers the apex on both the
+/// decision and the enforcement side, so the two forms match exactly the same
+/// traffic — one rule wearing two spellings. Pairing them as one is what keeps
+/// a file that says `*.x` from reading as a rule the service does not have.
+pub fn rule_identity_key_under(rule: &CanonicalRule, coverage: SubdomainCoverage) -> String {
+    let address = match (coverage, &rule.address_match) {
+        (SubdomainCoverage::On, Some(CanonicalAddressMatch::ExactFqdn(d))) => {
+            Some(CanonicalAddressMatch::SuffixDomain(d.clone()))
+        }
+        (_, other) => other.clone(),
+    };
+    format!("{:?}\u{1}{:?}", address, rule.app_match)
 }
 
 /// True when two rules with the same [`rule_identity_key`] and route differ

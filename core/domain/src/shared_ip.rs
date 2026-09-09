@@ -2,8 +2,8 @@
 //!
 //! How NetRuleRouter treats an IPv4 address that a **secondary** (VPN) rule
 //! routes but that is SHARED with other, non-secondary hostnames (the classic
-//! shared-CDN case: `chatgpt.com` and `www.whatismyip.com` both on
-//! `8.6.112.0`). IP-level routing cannot separate two hostnames on one address,
+//! shared-CDN case: `assistant.example` and `www.whatismyip.com` both on
+//! `192.0.2.0`). IP-level routing cannot separate two hostnames on one address,
 //! so committing a shared IP to the secondary link drags the innocent
 //! co-tenants onto the secondary link (collateral), while NOT committing it leaks the
 //! ruled host onto the primary. This enum lets the user pick the trade-off.
