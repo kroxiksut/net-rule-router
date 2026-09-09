@@ -1749,7 +1749,7 @@ fn builtin_vpn_globs_resolve_to_paths_no_glob_in_fail_closed_set() {
 
 /// A client's TRANSPORT is a different process from the binary we resolved, and
 /// it is the transport that talks to the server. Exempting only the resolved
-/// one is why the 2026-09-08 outage held for 88 minutes: every protocol the
+/// one is why an observed outage held for 88 minutes: every protocol the
 /// user tried ran from a nested executable no permit named.
 #[test]
 fn a_clients_nested_transport_is_exempt_while_an_unrelated_app_is_not() {

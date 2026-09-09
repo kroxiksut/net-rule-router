@@ -389,7 +389,7 @@ fn default_vpn_exempt_patterns_present_and_each_emits_an_exempt_permit() {
 
 /// The window is not the tunnel. A client that ships its transports as nested
 /// executables must have THOSE exempt, or fail-closed blocks the handshake and
-/// the outage never ends — the 2026-09-08 shape.
+/// the outage never ends.
 #[test]
 fn a_recognised_client_lends_its_install_tree_to_the_exemption() {
     use nrr_platform_api::app_path_resolver::MockAppPathResolver;
