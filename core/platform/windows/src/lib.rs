@@ -28,12 +28,10 @@
 //!
 //! | Module | Implements |
 //! |--------|------------|
-//! | `apply`    | `WindowsApplyEngine` — main orchestrator |
+//! | `wfp_backend` | `EnforcementBackend` — reconciles the neutral plan onto WFP |
 //! | `wfp`      | `WfpSession`, `WfpTransactionGuard` (RAII) |
 //! | `routing`  | `RoutingTransaction` — compensating-action batch |
 //! | `adapters` | `AdapterMonitor` — realtime adapter events |
-//! | `notify`   | `BlockNotificationEmitter` |
-//! | `verify`   | `verify_apply` — post-apply drift detection |
 //! | `windows_api` | `WindowsApiPort` trait + impls |
 //! | `error`    | `PlatformError`, `ErrorClass` |
 //! | `types`    | `RouteEntry`, `WfpFilterSpec`, `ApplyActionPlan`, … |
@@ -48,7 +46,13 @@ pub mod conn_observe;
 pub mod constants;
 pub mod dns;
 pub mod dns_observe;
+// Is an adapter absent, or here and refusing to start? The enumeration
+// reports both as nothing; the configuration manager can tell them apart.
+pub mod device_status;
 pub mod dns_redirect;
+// Which connection claims which DNS namespace. Read from the per-interface
+// TCP/IP parameters, where a corporate VPN leaves it on connect.
+pub mod dns_scope;
 // One-shot UAC elevation of a single command, for the administrative console.
 // The session-long privileged channel the GUI uses is a different mechanism and
 // lives in `apps/desktop/broker`.
@@ -77,7 +81,6 @@ pub mod key_store;
 // module doc).
 pub mod lower_windows;
 pub mod network_change;
-pub mod notify;
 /// The Windows `EnforcementBackend` — the neutral plan reconciled onto WFP.
 pub mod wfp_backend;
 // Per-user environment mechanism behind

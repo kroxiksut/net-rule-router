@@ -139,8 +139,8 @@ pub struct PerSidPolicySnapshot {
     /// (default, "smart"): IPs the shared-IP census has seen on direct
     /// (non-rule) hosts are EXCLUDED from the kill-switch per-IP pin/block set
     /// — blocking a secondary-routed CDN address must not cut an innocent
-    /// co-tenant site (0719: gemini/youtube share Google front-end IPs with
-    /// www.google.com; strict pinning killed google.com in every browser).
+    /// co-tenant site (0719: gemini/video-site share Google front-end IPs with
+    /// www.search.example; strict pinning killed search.example in every browser).
     /// `true` ("strict"): the historic pin-everything behaviour. Routing
     /// (`/32` while the secondary is up) stays governed by `shared_ip_policy`.
     pub kill_switch_strict_shared_ips: bool,
@@ -203,7 +203,7 @@ pub struct PerSidPolicySnapshot {
 pub struct PerSidBinding {
     pub stable_id: String,
     /// User-facing adapter name stored with the binding (e.g.
-    /// "hidemy.name VPN OpenVPN Adapter"). Used by the route coordinator to
+    /// "swiftvpn VPN OpenVPN Adapter"). Used by the route coordinator to
     /// auto-heal when `stable_id` (a GUID) goes stale after a secondary adapter reinstall —
     /// the friendly name survives the GUID change.
     pub display_name: String,
@@ -579,6 +579,21 @@ pub struct PerSidApplyOrchestrator {
     /// for. The per-SID state mutex is not enough: it is taken pointwise, so
     /// two computes interleave between its acquisitions.
     apply_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// Per-SID fingerprint of the last input the neutral-plan shadow compare
+    /// actually ran on. The compare re-derives the whole plan and lowers it —
+    /// measured at seconds inside a pass that fires every 30 s — to produce one
+    /// log line. On unchanged input that line says exactly what it said last
+    /// time, so the work is skipped and only a real change is re-evidenced.
+    ///
+    /// Windows-only, like the comparison it serves: off-Windows there is no WFP
+    /// filter set to compare against, and an ungated field is dead code that
+    /// only the Linux build reports.
+    #[cfg(windows)]
+    shadow_compare_seen: Mutex<std::collections::HashMap<String, u64>>,
+    /// Last per-band breakdown logged for a SID, so the composition line is
+    /// written when the SET CHANGES rather than on every recompute — the same
+    /// dedup-on-content rule the other periodic lines follow.
+    standing_volume_last: Mutex<std::collections::HashMap<String, String>>,
     session: Arc<WfpSession>,
     policy_source: Arc<dyn RoutePolicySource>,
     rules_provider: Arc<dyn RulesProvider>,
@@ -1246,6 +1261,9 @@ impl PerSidApplyOrchestrator {
     /// Run the neutral pipeline alongside the live one and report whether they
     /// agree. Compares only — nothing here reaches the kernel.
     ///
+    /// Returns whether the comparison actually RAN: `false` means the input was
+    /// the one already evidenced and the work was skipped.
+    ///
     /// This is the evidence step of moving enforcement onto the neutral plan.
     /// The equivalence is already proven by oracle tests over hand-built rule
     /// books; what those cannot cover is the shape of a real user's rules, with
@@ -1264,10 +1282,33 @@ impl PerSidApplyOrchestrator {
         sid: &str,
         behavior_mode: nrr_domain::RouteBehaviorMode,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+        fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
+        secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
         live: &[nrr_platform_api::types::WfpFilterSpec],
-    ) {
-        let Some(verdict) = self.neutral_plan_verdict(sid, behavior_mode, rule_book, live) else {
-            return;
+    ) -> bool {
+        // Same input, same verdict — and the verdict is already in the log.
+        // Re-deriving it costs a full plan plus a lowering on a path that also
+        // carries DNS answers and the GUI's own requests.
+        let fingerprint = shadow_compare_fingerprint(behavior_mode, live);
+        {
+            let mut seen = self
+                .shadow_compare_seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if seen.get(sid) == Some(&fingerprint) {
+                return false;
+            }
+            seen.insert(sid.to_string(), fingerprint);
+        }
+        let Some(verdict) = self.neutral_plan_verdict(
+            sid,
+            behavior_mode,
+            rule_book,
+            fqdn_cache,
+            secondary_ip_denylist,
+            live,
+        ) else {
+            return false;
         };
         if verdict.agrees() {
             tracing::debug!(
@@ -1276,7 +1317,7 @@ impl PerSidApplyOrchestrator {
                 filters = verdict.live,
                 "neutral plan matches the filters actually installed",
             );
-            return;
+            return true;
         }
         // A difference is the whole reason this runs on live input. WARN, not
         // debug: it is the one signal that says the neutral path is not ready
@@ -1293,6 +1334,7 @@ impl PerSidApplyOrchestrator {
             only_neutral = %verdict.only_neutral,
             "neutral plan DIFFERS from the filters actually installed — enforcement is unaffected (the live path applied), but the neutral path cannot take over until this is explained",
         );
+        true
     }
 
     /// The comparison itself, separated from the logging so a test can assert
@@ -1306,6 +1348,8 @@ impl PerSidApplyOrchestrator {
         sid: &str,
         behavior_mode: nrr_domain::RouteBehaviorMode,
         rule_book: &nrr_domain::canonical::CanonicalRuleBook,
+        fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup,
+        secondary_ip_denylist: &std::collections::HashSet<std::net::Ipv4Addr>,
         live: &[nrr_platform_api::types::WfpFilterSpec],
     ) -> Option<NeutralPlanVerdict> {
         use nrr_platform_api::enforcement::{EnforcementPlan, UserPrincipal};
@@ -1314,20 +1358,35 @@ impl PerSidApplyOrchestrator {
         };
 
         let principal = UserPrincipal::from_windows_sid(sid).ok()?;
+        // The SAME cache reading the live path used — not a fresh look at the
+        // live cache. The pass takes one snapshot precisely because the DNS
+        // observer keeps writing; comparing a plan built from the snapshot with
+        // one built from the cache as it stands milliseconds later reports the
+        // clock, not the pipelines. It is why `only_neutral` was never empty
+        // and `only_live` always was: the second reader simply saw more.
         let input = crate::enforcement_planner::PlannerInput {
-            fqdn_cache: self.fqdn_cache.as_ref(),
+            fqdn_cache,
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
             zone_priority_over_ip: false,
+            // The set the live pass hid from the tunnel. Comparing against a
+            // plan that never saw it was comparing a pipeline WITH the
+            // shared-IP policy to one without: every secondary rule then
+            // carried different addresses, and with them different ordinals,
+            // so the two plans could not agree on anything downstream.
+            secondary_ip_denylist,
         };
         let plan = EnforcementPlan {
             principal,
+            // The report is the GUI's business, and this is the shadow
+            // comparison — it looks at filters only.
             flows: crate::enforcement_planner::plan_route_rules(
                 rule_book,
                 sid,
                 behavior_mode,
                 &input,
-            ),
+            )
+            .0,
             routes: Vec::new(),
             policy_rules: Vec::new(),
         };
@@ -1351,6 +1410,37 @@ impl PerSidApplyOrchestrator {
     // `compute_filters_for_sid` lives in `per_sid_orchestrator::plan` — same
     // inherent impl, split across files because one method should not be a
     // quarter of the type.
+}
+
+/// What the shadow compare would run on, as one number.
+///
+/// The installed filter set IS the comparison's input: it is derived from the
+/// same rule book, cache and app resolutions the neutral plan re-derives, so an
+/// unchanged set means unchanged inputs. Ids are content-addressed, which is
+/// what makes them safe to fold; the weight goes in too, because arbitration
+/// order is half of what the comparison checks.
+#[cfg(windows)]
+fn shadow_compare_fingerprint(
+    behavior_mode: nrr_domain::RouteBehaviorMode,
+    live: &[nrr_platform_api::types::WfpFilterSpec],
+) -> u64 {
+    // FNV-1a, the same hash the filter ids themselves are built with.
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut fold = |value: u64| {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    fold(behavior_mode as u64);
+    fold(live.len() as u64);
+    for spec in live {
+        fold(spec.id.raw);
+        fold(spec.weight);
+    }
+    hash
 }
 
 /// Choose the behaviour mode the codegen sees for a SID. The per-SID

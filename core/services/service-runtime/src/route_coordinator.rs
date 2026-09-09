@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use nrr_domain::ipv4_network::Ipv4Network;
 use nrr_domain::RouteBehaviorMode;
 use nrr_platform_api::adapters::AdapterInfo;
+use nrr_platform_api::device_status::NetworkDeviceStatusPort;
 use nrr_platform_api::reachability::ReachabilityProbe;
 use nrr_platform_api::route_table::RouteTablePort;
 use nrr_platform_api::{classify_availability, AdapterAvailability, PlatformError, RouteEntry};
@@ -272,6 +273,11 @@ pub struct SecondaryRouteCoordinator {
     binding_anchor_persist: Option<BindingAnchorPersistFn>,
     /// The user's own answers about local networks (see [`LocalNetworkPolicyFn`]).
     local_networks: Option<LocalNetworkPolicyFn>,
+    /// Asks the OS whether a bound adapter that vanished from the enumeration
+    /// is actually gone or merely refusing to start. `None` keeps the older,
+    /// coarser wording — which is correct, just less useful, so an unwired
+    /// platform loses nothing it had.
+    device_status: Option<Arc<dyn NetworkDeviceStatusPort>>,
     /// Push channel for [`Self::publish_enforcement_status`]. `None` in tests
     /// and in a degraded boot — the resolve then behaves exactly as before.
     events: Option<Arc<crate::ipc_handlers::event_bus::EventBus>>,
@@ -345,6 +351,7 @@ impl SecondaryRouteCoordinator {
             rule_scope_service_driven,
             binding_heal_persist: None,
             binding_anchor_persist: None,
+            device_status: None,
             local_networks: None,
             events: None,
             server_ip_persist: None,
@@ -393,6 +400,15 @@ impl SecondaryRouteCoordinator {
     /// applied in-memory each reconcile but the stored id stays stale.
     pub fn with_binding_heal_persist(mut self, persist: BindingHealPersistFn) -> Self {
         self.binding_heal_persist = Some(persist);
+        self
+    }
+
+    /// Wire the OS question "is this adapter gone, or here and broken?".
+    /// Without it a missing adapter is reported as gone, which is what the
+    /// product said before the port existed.
+    #[must_use]
+    pub fn with_device_status(mut self, port: Arc<dyn NetworkDeviceStatusPort>) -> Self {
+        self.device_status = Some(port);
         self
     }
 
@@ -1110,7 +1126,7 @@ impl SecondaryRouteCoordinator {
         // (id mismatch), down/no-IP, or up-but-no-gateway.
         // resolve by id, but only ACCEPT the by-id match when it is
         // actually usable (Available = up + IPv4). A found-but-DOWN bound adapter
-        // (a GUID-churning VPN like hidemy.name can leave a stale/down TAP instance
+        // (a GUID-churning VPN like swiftvpn can leave a stale/down TAP instance
         // enumerated while the freshly-connected one carries traffic) must NOT short-
         // circuit to fail-closed — it falls into the same name-heal below so we can
         // adopt a live same-name SIBLING. If the bound adapter is genuinely down with
@@ -1220,6 +1236,48 @@ impl SecondaryRouteCoordinator {
                                 );
                             }
                             None => {
+                                // The user has to hear this one. The bound
+                                // adapter is not among the live set and no
+                                // live name answers for it — their rules stop
+                                // and nothing else in the product says why.
+                                // Until now this branch only wrote a log line,
+                                // while its sibling (bound-but-down) published
+                                // a status, so a vendor that replaced its
+                                // adapter outright failed silently.
+                                //
+                                // Every usable adapter is offered as a
+                                // candidate: we cannot know which one replaced
+                                // the old one, and guessing is what the
+                                // ambiguous branch above already refuses to do.
+                                //
+                                // Strictly the ZERO-match case. Several names
+                                // answering is a different question, already
+                                // asked above, and publishing both leaves the
+                                // two statuses overwriting each other in the
+                                // per-role latch — an endless alternating push.
+                                if !ambiguous {
+                                    let choices: Vec<String> = infos
+                                        .iter()
+                                        .filter(|i| {
+                                            classify_availability(i)
+                                                == Some(AdapterAvailability::Available)
+                                        })
+                                        .map(|i| preferred_display_name(i).to_string())
+                                        .collect();
+                                    // "Removed" and "here but its driver
+                                    // will not start" arrive identically —
+                                    // as nothing — yet they need opposite
+                                    // advice: pick another connection, or
+                                    // repair a driver. Only the OS can tell
+                                    // them apart, and only when asked.
+                                    let status = self
+                                        .device_status
+                                        .as_ref()
+                                        .and_then(|p| p.device_state(&binding.stable_id))
+                                        .filter(|s| s.is_present_but_unusable())
+                                        .map_or("adapter-gone", |_| "adapter-failed");
+                                    self.publish_enforcement_status(sid, status, role, choices);
+                                }
                                 let live: Vec<String> = infos
                                     .iter()
                                     .map(|i| {
@@ -1294,20 +1352,21 @@ impl SecondaryRouteCoordinator {
                         // Cache it so we can still route after slice-C2 strips
                         // the catch-all routes we derived it from. Refreshed on
                         // every successful derive (e.g. after a VPN reconnect).
-                        self.next_hop_cache
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(info.index, nh);
-                        // Expected for VPN tunnels — debug, not warn, so it
-                        // does not spam the steady-state log every cycle.
-                        tracing::debug!(
-                            target: "nrr::route-coordinator",
-                            sid = %sid,
-                            role = role,
-                            ifindex = info.index,
-                            next_hop = %nh,
-                            "bound adapter exposes no gateway; derived tunnel next-hop from its catch-all routes",
-                        );
+                        // Caching it is what lets routing survive slice-C2
+                        // stripping the catch-all routes we derived it from;
+                        // the same write says whether this answer is news, so
+                        // an unchanged next-hop stops repeating itself into the
+                        // log every cycle.
+                        if self.note_derived_next_hop(info.index, nh) {
+                            tracing::debug!(
+                                target: "nrr::route-coordinator",
+                                sid = %sid,
+                                role = role,
+                                ifindex = info.index,
+                                next_hop = %nh,
+                                "bound adapter exposes no gateway; derived tunnel next-hop from its catch-all routes",
+                            );
+                        }
                         nh
                     }
                     None => {
@@ -1460,6 +1519,13 @@ impl SecondaryRouteCoordinator {
                         self.liveness.forget(old);
                         self.liveness.forget(t.interface_index);
                     }
+                    // A peerless tunnel (on-link forwarding) has no next-hop to
+                    // echo; an echo to 0.0.0.0 would fail every time and declare
+                    // a working link dead. Nothing is recorded, so the window
+                    // stays empty and the gate stays open.
+                    if t.gateway.is_unspecified() {
+                        continue;
+                    }
                     let reachable = probe.is_reachable(t.gateway, LIVENESS_PROBE_TIMEOUT);
                     self.liveness
                         .record(t.interface_index, reachable, Instant::now());
@@ -1543,6 +1609,17 @@ impl SecondaryRouteCoordinator {
             self.fqdn_cache.as_ref(),
             shared_ip_policy,
         );
+        // The tunnel's own redirect prefixes shape mode A's counter-overlay.
+        // Read here, not cached: a client that reconnects may lay them out
+        // differently, and the reconcile that follows must answer that layout.
+        let tunnel_catch_alls = self
+            .api
+            .get_ip_forward_table()
+            .map(|t| {
+                let t = self.stamped_with_ownership(t);
+                crate::route_codegen::tunnel_catch_all_prefixes(&t, secondary.interface_index)
+            })
+            .unwrap_or_default();
         let mut out = generate_routes(
             resolution.mode,
             &snapshot.rule_book,
@@ -1552,6 +1629,7 @@ impl SecondaryRouteCoordinator {
             self.app_observations.as_ref(),
             &denied,
             zone_order,
+            &tunnel_catch_alls,
         );
         // DNS-over-secondary — the route half of the setting. Emitted here, not
         // in `generate_routes`, because it is not derived from the rule book:
@@ -1626,16 +1704,13 @@ impl SecondaryRouteCoordinator {
             .count();
         let primary_present = resolution.primary.is_some();
         let delta = self.reconciler.reconcile(&out.routes)?;
-        // DISABLED after hardware testing.
-        // `strip_foreign_overlay` (removing the VPN client's redirect `/1`)
-        // destabilises real VPN clients: hidemy.name's OpenVPN treated the route
-        // removal as a fault and forced reconnects, and in mode A it dropped
-        // not-yet-resolved hosts (DoH-only domains with no `/32`) to the primary
-        // with the real IP. We stay ADD-ONLY: never remove the VPN's routes;
-        // our `/32` rules (and the mode-B overlay) ride on top. Mode-A
-        // selectivity ("non-rule → primary") will instead use a `/2`
-        // counter-overlay via primary (more specific than the VPN's `/1`,
-        // no removal → no tunnel disruption) — see project notes.
+        // ADD-ONLY, settled on hardware: we never remove the VPN's own
+        // routes. Stripping its redirect `/1` pair made the client treat the
+        // removal as a fault and reconnect, and in mode A it dropped
+        // not-yet-resolved hosts (DoH-only names with no `/32`) to the primary
+        // with the real IP. Mode-A selectivity rides a `/2` counter-overlay via
+        // the primary instead — more specific than the VPN's `/1`, nothing
+        // removed.
         if delta.is_noop() {
             // Steady state (no change this cycle) — debug, to keep the log
             // quiet once routing has converged.

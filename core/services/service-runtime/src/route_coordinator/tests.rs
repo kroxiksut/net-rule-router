@@ -267,7 +267,7 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
     let sid = "S-1-5-21-A";
     let gw = Ipv4Addr::new(10, 0, 0, 1);
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -320,7 +320,7 @@ fn probe_tick_forgets_the_failing_run_when_the_binding_stops_resolving() {
     // reconnected, working tunnel.
     let sid = "S-1-5-21-A";
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 60, true, true, Some([10, 88, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 60, true, true, Some([10, 88, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -338,7 +338,7 @@ fn probe_tick_forgets_the_failing_run_when_the_binding_stops_resolving() {
         "a failed probe starts a failing run"
     );
     // The adapter drops (VPN mid-reconnect) → the binding stops resolving.
-    api.set_adapter_infos(vec![adapter("hidemyvpn", 60, false, false, None)]);
+    api.set_adapter_infos(vec![adapter("swiftvpnvpn", 60, false, false, None)]);
     coord.probe_active_secondaries(&sids);
     assert!(
         !tracker.in_failing_run(60),
@@ -355,7 +355,7 @@ fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_if
     // declare a healthy tunnel dead on its first probe.
     let sid = "S-1-5-21-A";
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 60, true, true, Some([10, 88, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 60, true, true, Some([10, 88, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let policy = Arc::new(FakePolicy::new());
@@ -375,7 +375,7 @@ fn probe_tick_forgets_the_failing_run_when_the_adapter_comes_back_under_a_new_if
     tracker.record(61, false, Instant::now());
     assert!(tracker.in_failing_run(61));
     api.set_adapter_infos(vec![adapter(
-        "hidemyvpn",
+        "swiftvpnvpn",
         61,
         true,
         true,
@@ -498,6 +498,31 @@ fn note_not_usable_once_dedups_until_cleared_or_changed() {
     assert!(coord.note_not_usable_once(sid, "primary", "win-adapter:{tap}"));
 }
 
+/// The derived next-hop is the answer to a question asked on every resolve, so
+/// only a CHANGED answer is news — and a reconnect that lands on a new peer
+/// must still say so.
+#[test]
+fn note_derived_next_hop_speaks_only_when_the_answer_changes() {
+    let coord = coordinator(Arc::new(MockWindowsApi::new()), Arc::new(FakeRules::new()));
+    let peer = std::net::Ipv4Addr::new(10, 88, 0, 1);
+    let after_reconnect = std::net::Ipv4Addr::new(10, 88, 1, 1);
+
+    assert!(
+        coord.note_derived_next_hop(24, peer),
+        "first derive is news"
+    );
+    assert!(!coord.note_derived_next_hop(24, peer));
+    assert!(!coord.note_derived_next_hop(24, peer));
+    assert!(
+        coord.note_derived_next_hop(24, after_reconnect),
+        "a tunnel that came back on another peer must be said out loud",
+    );
+    assert!(
+        coord.note_derived_next_hop(25, peer),
+        "another adapter is its own answer",
+    );
+}
+
 #[test]
 fn auto_heal_persists_corrected_binding_once() {
     // The stored secondary id is stale (adapter reinstalled → new GUID) but
@@ -552,17 +577,17 @@ fn auto_heal_persists_corrected_binding_once() {
 
 #[test]
 fn a_tunnel_adapter_whose_mac_follows_its_guid_gets_no_anchor() {
-    // Taken from a live run: TAP-Windows reported MAC 00:FF:0C:93:B1:CC under
-    // GUID {0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}. The two rotate together on
+    // Taken from a live run: TAP-Windows reported MAC 00:FF:AA:BB:CC:DD under
+    // GUID {AABBCCDD-1111-2222-3333-444444444444}. The two rotate together on
     // every reconnect, so the MAC is not an identity of its own.
     let mut tap = adapter(
-        "{0C93B1CC-9269-4F48-B0E8-EEE8918BBECC}",
+        "{AABBCCDD-1111-2222-3333-444444444444}",
         14,
         true,
         true,
         None,
     );
-    tap.mac = Some([0x00, 0xFF, 0x0C, 0x93, 0xB1, 0xCC]);
+    tap.mac = Some([0x00, 0xFF, 0xAA, 0xBB, 0xCC, 0xDD]);
     tap.description = "TAP-Windows Adapter V9".into();
     assert_eq!(mac_anchor_id(&tap), None);
 }
@@ -576,10 +601,10 @@ fn a_physical_adapter_anchors_on_its_mac_and_is_found_by_it_after_a_guid_change(
         true,
         None,
     );
-    nic.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2E]);
+    nic.mac = Some([0x00, 0x11, 0x22, 0x33, 0x44, 0xAA]);
     nic.description = "Realtek(R) PCI(e) Ethernet Controller".into();
     let anchor = mac_anchor_id(&nic).expect("a burned-in MAC is an anchor");
-    assert_eq!(anchor, "win-mac:D8-C4-97-14-BA-2E");
+    assert_eq!(anchor, "win-mac:00-11-22-33-44-AA");
 
     // Same card, new GUID and new ifindex (came back on another port): the
     // anchor still names it, which is the whole point.
@@ -600,7 +625,7 @@ fn a_physical_adapter_anchors_on_its_mac_and_is_found_by_it_after_a_guid_change(
         true,
         None,
     );
-    other.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2F]);
+    other.mac = Some([0x00, 0x11, 0x22, 0x33, 0x44, 0xAB]);
     assert!(!adapter_binding_matches(&other, &anchor));
 }
 
@@ -622,7 +647,7 @@ fn a_virtual_software_adapter_gets_no_anchor() {
 fn the_mac_anchor_is_persisted_once_per_binding() {
     let api = Arc::new(MockWindowsApi::new());
     let mut nic = adapter("boundnic", 7, true, true, Some([10, 0, 0, 1]));
-    nic.mac = Some([0xD8, 0xC4, 0x97, 0x14, 0xBA, 0x2E]);
+    nic.mac = Some([0x00, 0x11, 0x22, 0x33, 0x44, 0xAA]);
     api.set_adapter_infos(vec![nic]);
 
     let policy = Arc::new(FakePolicy::new());
@@ -644,7 +669,7 @@ fn the_mac_anchor_is_persisted_once_per_binding() {
     let c = captured.lock().unwrap();
     assert_eq!(
         *c,
-        vec!["S-ANCHOR|secondary|win-mac:D8-C4-97-14-BA-2E".to_string()],
+        vec!["S-ANCHOR|secondary|win-mac:00-11-22-33-44-AA".to_string()],
         "the anchor is learned on resolve and written once, not every reconcile"
     );
 }
@@ -657,15 +682,15 @@ fn two_live_adapters_answering_to_the_saved_name_ask_the_user_instead_of_guessin
     let api = Arc::new(MockWindowsApi::new());
     // Two usable adapters of the same family — the bound GUID is gone.
     let mut a = adapter("tap-a", 21, true, true, Some([10, 0, 0, 1]));
-    a.description = "vpn adapter".into();
-    a.friendly_name = "vpn adapter".into();
+    a.description = "acme vpn adapter".into();
+    a.friendly_name = "acme vpn adapter".into();
     let mut b = adapter("tap-b", 22, true, true, Some([10, 0, 0, 2]));
-    b.description = "vpn adapter".into();
-    b.friendly_name = "vpn adapter".into();
+    b.description = "acme vpn adapter".into();
+    b.friendly_name = "acme vpn adapter".into();
     api.set_adapter_infos(vec![a, b]);
 
     let policy = Arc::new(FakePolicy::new());
-    policy.bind_secondary_named("S-AMBIG", "win-adapter:{gone}", "vpn adapter");
+    policy.bind_secondary_named("S-AMBIG", "win-adapter:{gone}", "acme vpn adapter");
 
     let bus = Arc::new(EventBus::new());
     // The notice names this SID, so it is delivered to that principal;
@@ -706,10 +731,226 @@ fn two_live_adapters_answering_to_the_saved_name_ask_the_user_instead_of_guessin
         vec![(
             "adapter-choice-needed".to_string(),
             "secondary".to_string(),
-            vec!["vpn adapter".to_string(), "vpn adapter".to_string()]
+            vec![
+                "acme vpn adapter".to_string(),
+                "acme vpn adapter".to_string()
+            ]
         )],
         "the choice is announced once, with the adapters to choose from"
     );
+}
+
+/// The vendor replaced its adapter outright: the bound GUID is gone and NO
+/// live name answers for it. The field case is swiftvpn switching from its
+/// OpenVPN adapter to a WireGuard tunnel — a different device with a different
+/// name, while the old one stayed behind as a driver that will not start.
+///
+/// Before this the branch only wrote a log line, so the product went quiet at
+/// the exact moment it stopped routing. The cause cannot be known from here,
+/// but the answer is the same for every cause: hand the choice back.
+#[test]
+fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() {
+    use crate::ipc_handlers::event_bus::EventBus;
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    let api = Arc::new(MockWindowsApi::new());
+    // What is left after the swap: the machine NIC and the new tunnel. Neither
+    // shares a name with the binding.
+    let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
+    nic.description = "Realtek Gaming GbE".into();
+    nic.friendly_name = "Ethernet".into();
+    // The hard case: the replacement carries NOTHING of the vendor's name,
+    // so no amount of token matching can tie it to the binding. A vendor
+    // that keeps its brand (`acme_VPN`) is healed automatically instead —
+    // see the control test below.
+    let mut tun = adapter("wg", 64, true, true, Some([10, 88, 0, 191]));
+    tun.description = "WireGuard Tunnel".into();
+    tun.friendly_name = "Tunnel 1".into();
+    api.set_adapter_infos(vec![nic, tun]);
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named(
+        "S-GONE",
+        "win-adapter:{aaaaaaaa-0000-0000-0000-000000000000}",
+        "acme VPN 3.0 OpenVPN Adapter",
+    );
+
+    let bus = Arc::new(EventBus::new());
+    let sub = bus
+        .subscribe_as("test".into(), Some("S-GONE".into()), None)
+        .subscription_id;
+    let coord = coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    )
+    .with_event_bus(Arc::clone(&bus));
+
+    let r = coord.resolve("S-GONE");
+    assert!(r.secondary.is_none(), "nothing to route through");
+    // The steady state stays quiet: the same missing adapter must not
+    // re-announce itself on every reconcile.
+    let _ = coord.resolve("S-GONE");
+
+    let published: Vec<_> = bus
+        .peek_pending_for(&sub, 16)
+        .iter()
+        .filter_map(|e| match &e.event {
+            StatusUpdateEvent::EnforcementStatusChanged {
+                status,
+                role,
+                candidates,
+                ..
+            } => Some((status.clone(), role.clone(), candidates.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        published,
+        vec![(
+            "adapter-gone".to_string(),
+            "secondary".to_string(),
+            vec!["Ethernet".to_string(), "Tunnel 1".to_string()]
+        )],
+        "said once, and every usable adapter is offered to choose from",
+    );
+}
+
+/// The same missing adapter, told two ways. A device that is merely broken is
+/// still on the machine, and the user's next step is to repair it rather than
+/// to choose a replacement — so the two must not share a sentence.
+#[test]
+fn a_bound_adapter_whose_driver_will_not_start_is_reported_as_broken_not_gone() {
+    use crate::ipc_handlers::event_bus::EventBus;
+    use nrr_platform_api::device_status::{DeviceState, NetworkDeviceStatusPort};
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    struct Fixed(Option<DeviceState>);
+    impl NetworkDeviceStatusPort for Fixed {
+        fn device_state(&self, _adapter_guid: &str) -> Option<DeviceState> {
+            self.0
+        }
+    }
+
+    // Same world for every run: the bound adapter is absent from the
+    // enumeration and nothing answers to its name.
+    let statuses = |port: Option<Arc<dyn NetworkDeviceStatusPort>>| -> Vec<String> {
+        let api = Arc::new(MockWindowsApi::new());
+        let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
+        nic.description = "Realtek Gaming GbE".into();
+        nic.friendly_name = "Ethernet".into();
+        api.set_adapter_infos(vec![nic]);
+        let policy = Arc::new(FakePolicy::new());
+        policy.bind_secondary_named(
+            "S-BROKEN",
+            "win-adapter:{aaaaaaaa-0000-0000-0000-000000000000}",
+            "acme VPN 3.0 OpenVPN Adapter",
+        );
+        let bus = Arc::new(EventBus::new());
+        let sub = bus
+            .subscribe_as("test".into(), Some("S-BROKEN".into()), None)
+            .subscription_id;
+        let mut coord = coordinator_with_policy(
+            Arc::clone(&api),
+            Arc::new(FakeRules::new()),
+            Arc::clone(&policy),
+        )
+        .with_event_bus(Arc::clone(&bus));
+        if let Some(port) = port {
+            coord = coord.with_device_status(port);
+        }
+        let _ = coord.resolve("S-BROKEN");
+        bus.peek_pending_for(&sub, 16)
+            .iter()
+            .filter_map(|e| match &e.event {
+                StatusUpdateEvent::EnforcementStatusChanged { status, role, .. }
+                    if role == "secondary" =>
+                {
+                    Some(status.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        statuses(Some(Arc::new(Fixed(Some(DeviceState::FailedToStart))))),
+        vec!["adapter-failed".to_string()],
+    );
+    assert_eq!(
+        statuses(Some(Arc::new(Fixed(Some(DeviceState::Disabled))))),
+        vec!["adapter-failed".to_string()],
+        "switched off is also present-but-unusable",
+    );
+    assert_eq!(
+        statuses(Some(Arc::new(Fixed(Some(DeviceState::Absent))))),
+        vec!["adapter-gone".to_string()],
+    );
+    // A platform with no mechanism, and a build with none wired, must keep the
+    // wording they had rather than inventing an answer.
+    assert_eq!(
+        statuses(Some(Arc::new(Fixed(None)))),
+        vec!["adapter-gone".to_string()],
+    );
+    assert_eq!(statuses(None), vec!["adapter-gone".to_string()]);
+}
+
+/// Control for the test above, and the field case as it actually stands: the
+/// vendor kept its brand in the connection name when it swapped transport, so
+/// the binding heals itself and the user is asked nothing. This is what makes
+/// the "gone" branch above a genuine last resort rather than the normal path.
+#[test]
+fn a_vendor_that_keeps_its_brand_across_a_transport_change_heals_without_asking() {
+    use crate::ipc_handlers::event_bus::EventBus;
+    use nrr_shared::ipc_payloads::StatusUpdateEvent;
+
+    let api = Arc::new(MockWindowsApi::new());
+    let mut nic = adapter("nic", 19, true, true, Some([192, 168, 0, 2]));
+    nic.description = "Realtek Gaming GbE".into();
+    nic.friendly_name = "Ethernet".into();
+    // OpenVPN adapter replaced by a WireGuard tunnel; only the brand survived.
+    let mut tun = adapter("wg", 64, true, true, Some([10, 88, 0, 191]));
+    tun.description = "WireGuard Tunnel".into();
+    tun.friendly_name = "acme.name_VPN".into();
+    api.set_adapter_infos(vec![nic, tun]);
+
+    let policy = Arc::new(FakePolicy::new());
+    policy.bind_secondary_named(
+        "S-BRAND",
+        "win-adapter:{aaaaaaaa-0000-0000-0000-000000000000}",
+        "acme.name VPN 3.0 OpenVPN Adapter",
+    );
+
+    let bus = Arc::new(EventBus::new());
+    let sub = bus
+        .subscribe_as("test".into(), Some("S-BRAND".into()), None)
+        .subscription_id;
+    let coord = coordinator_with_policy(
+        Arc::clone(&api),
+        Arc::new(FakeRules::new()),
+        Arc::clone(&policy),
+    )
+    .with_event_bus(Arc::clone(&bus));
+
+    assert!(
+        coord.resolve("S-BRAND").secondary.is_some(),
+        "the tunnel that kept the brand is adopted",
+    );
+    // Only the role under test: the fixture binds no primary, and that
+    // notice is a separate, correct statement about a different role.
+    let statuses: Vec<String> = bus
+        .peek_pending_for(&sub, 16)
+        .iter()
+        .filter_map(|e| match &e.event {
+            StatusUpdateEvent::EnforcementStatusChanged { status, role, .. }
+                if role == "secondary" =>
+            {
+                Some(status.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, vec!["ok".to_string()], "nothing to ask about");
 }
 
 #[test]
@@ -770,15 +1011,15 @@ fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
     // `down` = the bound (present-but-down) instance; `sibling` = a live
     // same-family adapter whose version token differs.
     let mut down = adapter("oldtap", 1, false, false, None);
-    down.description = "hidemy vpn 3.0 adapter".into();
+    down.description = "swiftvpn vpn 3.0 adapter".into();
     down.friendly_name = down.description.clone();
     let mut sibling = adapter("newtap", 2, true, true, Some([10, 0, 0, 1]));
-    sibling.description = "hidemy vpn adapter".into();
+    sibling.description = "swiftvpn vpn adapter".into();
     sibling.friendly_name = sibling.description.clone();
     api.set_adapter_infos(vec![down, sibling]);
 
     let policy = Arc::new(FakePolicy::new());
-    policy.bind_secondary_named("S-DOWN", "win-adapter:oldtap", "hidemy vpn 3.0 adapter");
+    policy.bind_secondary_named("S-DOWN", "win-adapter:oldtap", "swiftvpn vpn 3.0 adapter");
 
     let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let cap = Arc::clone(&captured);
@@ -802,7 +1043,7 @@ fn found_but_down_bound_adapter_heals_to_available_same_name_sibling() {
     assert_eq!(c.len(), 1, "the healed sibling id is persisted once");
     assert_eq!(
         c[0],
-        "S-DOWN|secondary|win-adapter:newtap|hidemy vpn adapter"
+        "S-DOWN|secondary|win-adapter:newtap|swiftvpn vpn adapter"
     );
 }
 
@@ -1044,10 +1285,10 @@ fn recompute_active_keeps_slash32_when_paused_persist() {
 fn a_renamed_connection_still_reads_as_a_personal_tunnel() {
     let mut tun = adapter("tap", 7, true, true, None);
     tun.description = "TAP-Windows Adapter V9".into();
-    tun.friendly_name = "hidemy.name VPN OpenVPN Adapter".into();
+    tun.friendly_name = "swiftvpn VPN OpenVPN Adapter".into();
     assert_eq!(
         personal_tunnel_name(&[adapter("wifi", 3, true, true, Some([192, 168, 0, 1])), tun]),
-        Some("hidemy.name VPN OpenVPN Adapter".to_string())
+        Some("swiftvpn VPN OpenVPN Adapter".to_string())
     );
 }
 
@@ -1115,7 +1356,7 @@ fn route_entry(
 
 #[test]
 fn derives_tunnel_next_hop_from_redirect_gateway_split_routes() {
-    // Mirrors a live hidemy.name OpenVPN table: split-default via the
+    // Mirrors a live swiftvpn OpenVPN table: split-default via the
     // peer 10.91.192.1, no adapter gateway, on ifindex 78.
     let routes = vec![
         route_entry([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, 1),
@@ -1145,9 +1386,10 @@ fn derive_prefers_real_default_over_split_halves() {
 
 #[test]
 fn derive_ignores_on_link_and_loopback_but_falls_back_to_gateway_style_routes() {
-    // On-link and loopback rows can never name a peer.
+    // A narrow on-link subnet and a loopback row can never name a peer. (A
+    // WIDE on-link set is a different story — `interface_rows` covers it.)
     let dead_ends = vec![
-        route_entry([0, 0, 0, 0], 1, [0, 0, 0, 0], 5, 1), // on-link (unspecified next-hop)
+        route_entry([10, 0, 0, 0], 8, [0, 0, 0, 0], 5, 1), // on-link (unspecified next-hop)
         route_entry([0, 0, 0, 0], 0, [127, 0, 0, 1], 5, 1), // loopback next-hop
     ];
     assert_eq!(derive_secondary_next_hop(&dead_ends, 5), None);
@@ -1156,7 +1398,7 @@ fn derive_ignores_on_link_and_loopback_but_falls_back_to_gateway_style_routes() 
     // stripped catch-alls did.
     let with_host_route = vec![
         route_entry([10, 0, 0, 0], 8, [10, 0, 0, 1], 5, 1),
-        route_entry([0, 0, 0, 0], 1, [0, 0, 0, 0], 5, 1),
+        route_entry([10, 1, 0, 0], 16, [0, 0, 0, 0], 5, 1),
     ];
     assert_eq!(
         derive_secondary_next_hop(&with_host_route, 5),
@@ -1191,7 +1433,7 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
     // primary; we derive it from the OS default route. Without this fix,
     // unmatched traffic silently rode the VPN's redirect.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let vpn_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -1200,7 +1442,7 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 93, 184, 216, 34)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &vpn_id); // ONLY secondary bound
@@ -1229,7 +1471,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     // now route — resolve_target derives the tunnel peer from the route
     // table and the /32 overlay is installed via it.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, None); // up, IPv4, NO gateway
+    let vpn = adapter("swiftvpnvpn", 78, true, true, None); // up, IPv4, NO gateway
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -1240,7 +1482,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 93, 184, 216, 34)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bound_id);
@@ -1252,7 +1494,7 @@ fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
     let table = api.get_ip_forward_table().unwrap();
     let ours = table
         .iter()
-        .find(|r| r.destination == Ipv4Addr::new(93, 184, 216, 34))
+        .find(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138))
         .expect("our /32 overlay must be present");
     assert_eq!(
         ours.next_hop,
@@ -1269,7 +1511,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
     // the cached next-hop keeps our /32 routes alive instead of tearing them
     // down. Guards the gateway-less-VPN next-hop cache.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, None); // up, IPv4, NO gateway
+    let vpn = adapter("swiftvpnvpn", 78, true, true, None); // up, IPv4, NO gateway
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     api.set_route_table(vec![
@@ -1279,7 +1521,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
     let rules = Arc::new(FakeRules::new());
     rules.set_secondary(
         "S-IVANOV",
-        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 93, 184, 216, 34)]),
+        CanonicalRuleSet::from_rules(vec![ip_rule("r1", 23, 10, 20, 138)]),
     );
     let policy = Arc::new(FakePolicy::new());
     policy.bind_secondary("S-IVANOV", &bound_id);
@@ -1291,13 +1533,13 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
         api.get_ip_forward_table()
             .unwrap()
             .iter()
-            .any(|r| r.destination == Ipv4Addr::new(93, 184, 216, 34)),
+            .any(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138)),
         "our /32 installed in cycle 1"
     );
 
     // The VPN's catch-all routes vanish (reconnect blip) — only our /32 left.
     api.set_route_table(vec![route_entry(
-        [93, 184, 216, 34],
+        [23, 10, 20, 138],
         32,
         [10, 91, 192, 1],
         78,
@@ -1310,7 +1552,7 @@ fn cache_keeps_routes_when_vpn_catch_all_vanishes() {
         api.get_ip_forward_table()
             .unwrap()
             .iter()
-            .any(|r| r.destination == Ipv4Addr::new(93, 184, 216, 34)),
+            .any(|r| r.destination == Ipv4Addr::new(23, 10, 20, 138)),
         "our /32 survives via the cached next-hop (NOT cleared)"
     );
 }
@@ -1321,7 +1563,7 @@ fn resolve_secondary_luid_returns_luid_for_bound_usable_secondary() {
     // orchestrator the secondary interface LUID to pin its egress
     // condition to.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let bound_id = vpn.stable_id();
     api.set_adapter_infos(vec![vpn]);
     let rules = Arc::new(FakeRules::new());
@@ -1352,7 +1594,7 @@ fn resolve_egress_source_ips_returns_the_adapters_own_addresses() {
     // resolved adapter's OWN unicast address, and a down secondary must
     // yield None (the relay then refuses instead of leaking).
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1368,7 +1610,7 @@ fn resolve_egress_source_ips_returns_the_adapters_own_addresses() {
     assert_eq!(secondary, Some(Ipv4Addr::new(192, 168, 1, 50)));
 
     // The secondary goes down → its source disappears, the primary stays.
-    let vpn_down = adapter("hidemyvpn", 78, false, true, Some([10, 0, 0, 1]));
+    let vpn_down = adapter("swiftvpnvpn", 78, false, true, Some([10, 0, 0, 1]));
     let eth_up = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     api.set_adapter_infos(vec![vpn_down, eth_up]);
     let (primary, secondary) = coord.resolve_egress_source_ips("S-IVANOV");
@@ -1382,7 +1624,7 @@ fn kill_switch_exemptions_resolves_luid_servers_and_subnets() {
     // exemptions: the secondary LUID, the VPN server IP (bootstrap host
     // route via the primary gateway), and the primary's connected subnet.
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1416,7 +1658,7 @@ fn kill_switch_exemptions_resolves_luid_servers_and_subnets() {
 #[test]
 fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1460,7 +1702,7 @@ fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
 #[test]
 fn an_unreadable_route_table_keeps_the_kill_switch_off() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1491,7 +1733,7 @@ fn an_unreadable_route_table_keeps_the_kill_switch_off() {
 #[test]
 fn fail_closed_falls_back_to_the_last_known_local_subnets() {
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1525,7 +1767,7 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
     // The VPN client drops the bootstrap route while disconnected; the
     // last-known server IP must survive (else reconnection deadlocks).
     let api = Arc::new(MockWindowsApi::new());
-    let vpn = adapter("hidemyvpn", 78, true, true, Some([10, 0, 0, 1]));
+    let vpn = adapter("swiftvpnvpn", 78, true, true, Some([10, 0, 0, 1]));
     let eth = adapter("eth0", 12, true, true, Some([192, 168, 1, 1]));
     let vpn_id = vpn.stable_id();
     let eth_id = eth.stable_id();
@@ -1566,70 +1808,91 @@ fn kill_switch_exemptions_cache_keeps_server_ip_after_bootstrap_route_vanishes()
 fn description_matches_display_name_version_robust_and_symmetric() {
     // Live description carries an extra version token vs the saved name.
     assert!(description_matches_display_name(
-        "hidemy.name VPN 3.0 OpenVPN Adapter",
-        "hidemy.name VPN OpenVPN Adapter",
+        "SwiftVPN 3.0 OpenVPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
     ));
     // regression: the SAVED name carries the version token and the
     // live adapter dropped it — the "every other day" heal failure. The old
     // directional subset returned false here; symmetric containment heals it.
     assert!(description_matches_display_name(
-        "hidemy.name VPN OpenVPN Adapter",
-        "hidemy.name VPN 3.0 OpenVPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
+        "SwiftVPN 3.0 OpenVPN Adapter",
     ));
     // Both sides versioned, different versions → same family.
     assert!(description_matches_display_name(
-        "hidemy.name VPN 4.1 OpenVPN Adapter",
-        "hidemy.name VPN 3.0 OpenVPN Adapter",
+        "swiftvpn VPN 4.1 OpenVPN Adapter",
+        "SwiftVPN 3.0 OpenVPN Adapter",
     ));
     // Survives a version bump (saved has no version).
     assert!(description_matches_display_name(
-        "hidemy.name VPN 4.1 OpenVPN Adapter",
-        "hidemy.name VPN OpenVPN Adapter",
+        "swiftvpn VPN 4.1 OpenVPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
     ));
     // Case-insensitive.
     assert!(description_matches_display_name(
-        "HIDEMY.NAME vpn openvpn ADAPTER",
-        "hidemy.name VPN OpenVPN Adapter",
+        "SWIFTVPN vpn openvpn ADAPTER",
+        "swiftvpn VPN OpenVPN Adapter",
     ));
     // Different adapter → no match, both directions.
     assert!(!description_matches_display_name(
         "Intel(R) Ethernet Connection (2) I219-V",
-        "hidemy.name VPN OpenVPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
     ));
     assert!(!description_matches_display_name(
-        "hidemy.name VPN OpenVPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
         "Intel(R) Ethernet Connection (2) I219-V",
     ));
     // Empty / whitespace-only display_name never matches.
     assert!(!description_matches_display_name("anything at all", "   "));
     // A name reduced to ONLY a version token has an empty core → no match
     // (never heal to an adapter whose family is unidentifiable).
-    assert!(!description_matches_display_name("3.0", "hidemy.name VPN"));
+    assert!(!description_matches_display_name("3.0", "swiftvpn VPN"));
+    // The vendor spells the same brand with an underscore on its WireGuard
+    // adapter and with spaces on its OpenVPN one. Treating "swiftvpn_VPN"
+    // as one opaque token left a live, connected tunnel unrecognised while the
+    // bound TAP device sat broken, and the route stayed fail-closed.
+    assert!(description_matches_display_name(
+        "swiftvpn_VPN",
+        "swiftvpn VPN OpenVPN Adapter",
+    ));
+    // Category words alone are not evidence: an adapter called just "VPN" is a
+    // token-subset of every VPN name there is.
+    assert!(!description_matches_display_name(
+        "VPN",
+        "swiftvpn VPN OpenVPN Adapter",
+    ));
+    assert!(!description_matches_display_name(
+        "VPN Tunnel",
+        "swiftvpn VPN OpenVPN Adapter",
+    ));
+    // A different vendor's tunnel never answers to ours, even though both
+    // carry the category words.
+    assert!(!description_matches_display_name(
+        "othervendor_VPN Adapter",
+        "swiftvpn VPN OpenVPN Adapter",
+    ));
 }
 
 #[test]
 fn a_renamed_connection_on_a_stock_driver_still_answers_to_its_saved_name() {
-    // The Windows 11 case: hidemy.name renames the CONNECTION but ships the
+    // The Windows 11 case: swiftvpn renames the CONNECTION but ships the
     // stock TAP driver, so the saved name shares no token with the driver
     // description and only the friendly name can identify the adapter.
     let mut vpn = adapter("tap", 9, true, true, Some([10, 88, 0, 1]));
     vpn.description = "TAP-Windows Adapter V9".into();
-    vpn.friendly_name = "hidemy.name VPN OpenVPN Adapter".into();
+    vpn.friendly_name = "swiftvpn VPN OpenVPN Adapter".into();
 
     assert!(!description_matches_display_name(
         &vpn.description,
-        "hidemy.name VPN OpenVPN Adapter"
+        "swiftvpn VPN OpenVPN Adapter"
     ));
     assert!(adapter_answers_to_saved_name(
         &vpn,
-        "hidemy.name VPN OpenVPN Adapter"
+        "swiftvpn VPN OpenVPN Adapter"
     ));
     // The stored name follows the connection, so the GUI keeps the label
     // the user recognises.
-    assert_eq!(
-        preferred_display_name(&vpn),
-        "hidemy.name VPN OpenVPN Adapter"
-    );
+    assert_eq!(preferred_display_name(&vpn), "swiftvpn VPN OpenVPN Adapter");
 
     // An unrelated adapter must not be adopted through either name.
     let mut wifi = adapter("wifi", 17, true, true, Some([192, 168, 0, 1]));
@@ -1637,7 +1900,7 @@ fn a_renamed_connection_on_a_stock_driver_still_answers_to_its_saved_name() {
     wifi.friendly_name = "Wi-Fi".into();
     assert!(!adapter_answers_to_saved_name(
         &wifi,
-        "hidemy.name VPN OpenVPN Adapter"
+        "swiftvpn VPN OpenVPN Adapter"
     ));
 }
 

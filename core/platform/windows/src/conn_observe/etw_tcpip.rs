@@ -459,11 +459,11 @@ mod tests {
 
     #[test]
     fn parses_connect_payload() {
-        // pid=4242, size=0, daddr=188.40.167.82, saddr=10.8.0.6,
+        // pid=4242, size=0, daddr=23.10.20.162, saddr=10.8.0.6,
         // dport=443 (0x01BB), sport=50000 (0xC350) — both network order.
         let mut d = vec![0u8; 24];
         d[0..4].copy_from_slice(&4242u32.to_le_bytes());
-        d[8..12].copy_from_slice(&[188, 40, 167, 82]); // daddr
+        d[8..12].copy_from_slice(&[23, 10, 20, 162]); // daddr
         d[12..16].copy_from_slice(&[10, 8, 0, 6]); // saddr
         d[16..18].copy_from_slice(&443u16.to_be_bytes()); // dport
         d[18..20].copy_from_slice(&50000u16.to_be_bytes()); // sport
@@ -473,7 +473,7 @@ mod tests {
         assert_eq!(local, SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 6), 50000));
         assert_eq!(
             remote,
-            SocketAddrV4::new(Ipv4Addr::new(188, 40, 167, 82), 443)
+            SocketAddrV4::new(Ipv4Addr::new(23, 10, 20, 162), 443)
         );
     }
 

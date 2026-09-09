@@ -90,15 +90,87 @@ pub const OVERLAY_HIGH: (Ipv4Addr, u8) = (Ipv4Addr::new(128, 0, 0, 0), 1); // 12
 /// mode-A counter-overlay: four `/2` blocks that together
 /// cover all of IPv4 and are MORE specific than a redirect VPN's `/1` pair, so
 /// non-rule traffic falls back to the **primary** by longest-prefix WITHOUT our
-/// removing the VPN's own routes (removing them destabilises the client — see
-/// the dormant `route_reconciler::strip_foreign_overlay`). Secondary `/32`
-/// rules stay more specific still → those keep going via the secondary.
+/// removing the VPN's own routes — hardware testing showed that removing them
+/// makes the client treat it as a fault and reconnect. Secondary `/32` rules
+/// stay more specific still → those keep going via the secondary.
 pub const COUNTER_OVERLAY: [(Ipv4Addr, u8); 4] = [
     (Ipv4Addr::new(0, 0, 0, 0), 2),   // 0.0.0.0/2
     (Ipv4Addr::new(64, 0, 0, 0), 2),  // 64.0.0.0/2
     (Ipv4Addr::new(128, 0, 0, 0), 2), // 128.0.0.0/2
     (Ipv4Addr::new(192, 0, 0, 0), 2), // 192.0.0.0/2
 ];
+
+/// The counter-overlay that actually out-specifics THIS tunnel.
+///
+/// The fixed `/2` set assumes the VPN redirects with a `/1` pair. A Wintun
+/// client (swiftvpn over WireGuard) instead covers the internet with a
+/// redirect SET — `0.0.0.0/5`, `8.0.0.0/7`, `16.0.0.0/4`, …, `128.0.0.0/2`,
+/// `192.0.0.0/9` — and against that the `/2`s lose: same length at a better
+/// metric, or shorter outright. Every non-rule connection then rode the
+/// tunnel, `.ru` sites included, and a Russian shop that refuses foreign
+/// addresses stopped opening.
+///
+/// So the counter-overlay is derived from the tunnel's own catch-all
+/// prefixes: each `P/N` the tunnel installs is answered by its two `/(N+1)`
+/// halves via the primary — one bit longer, so longest-prefix picks the
+/// primary regardless of metric, and nothing the tunnel installed is
+/// touched. A `/1` pair yields exactly the classic four `/2`s; an empty list
+/// (the tunnel's catch-alls are not visible, or were stripped) falls back to
+/// them as well. Rule `/32`s stay longer than anything here, so they keep
+/// riding the tunnel. Deduplicated and sorted for a stable reconcile.
+pub fn counter_overlay_for(tunnel_catch_alls: &[(Ipv4Addr, u8)]) -> Vec<(Ipv4Addr, u8)> {
+    let mut halves: Vec<(Ipv4Addr, u8)> = tunnel_catch_alls
+        .iter()
+        .filter(|(_, n)| *n < 31)
+        .flat_map(|&(dest, n)| {
+            let base = u32::from(dest) & prefix_mask(n);
+            let half = 1u32 << (31 - u32::from(n));
+            [
+                (Ipv4Addr::from(base), n + 1),
+                (Ipv4Addr::from(base | half), n + 1),
+            ]
+        })
+        .collect();
+    if halves.is_empty() {
+        return COUNTER_OVERLAY.to_vec();
+    }
+    halves.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
+    halves.dedup();
+    halves
+}
+
+fn prefix_mask(n: u8) -> u32 {
+    if n == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(n))
+    }
+}
+
+/// The on-link and peer routes a tunnel client installs to steer the internet
+/// into itself — the set [`counter_overlay_for`] has to out-specific. Wide
+/// unicast prefixes on `ifindex` only: host routes are the tunnel's own
+/// address, and the multicast block is on every interface.
+pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ipv4Addr, u8)> {
+    let mut out: Vec<(Ipv4Addr, u8)> = routes
+        .iter()
+        .filter(|r| {
+            r.interface_index == ifindex
+                && !r.is_ours
+                && r.prefix_length <= TUNNEL_CATCH_ALL_MAX_PREFIX
+                && r.destination.octets()[0] < 224
+        })
+        .map(|r| (r.destination, r.prefix_length))
+        .collect();
+    out.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
+    out.dedup();
+    out
+}
+
+/// Longest prefix that still reads as "steer a chunk of the internet" rather
+/// than "reach one network": swiftvpn's set bottoms out at `/9`, a corporate
+/// split tunnel names `/16`s and narrower, which are its business, not ours.
+const TUNNEL_CATCH_ALL_MAX_PREFIX: u8 = 12;
 
 /// Where matched traffic is sent: an adapter's gateway + interface index,
 /// resolved by the caller from the active route binding. Used for the
@@ -444,6 +516,9 @@ pub fn generate_routes(
     // principal's `zone_priority_over_ip`. The two can only contest the same
     // address in the ownership arbiter, so this is the whole of its reach here.
     order: crate::address_ownership::ZoneVsIpOrder,
+    // The tunnel's own catch-all prefixes (see [`tunnel_catch_all_prefixes`]);
+    // mode A's counter-overlay is shaped to out-specific exactly these.
+    tunnel_catch_alls: &[(Ipv4Addr, u8)],
 ) -> RouteCodegenOutput {
     match mode {
         RouteBehaviorMode::PreferPrimary => {
@@ -473,7 +548,7 @@ pub fn generate_routes(
             // specific → still via the secondary. Needs a usable primary target.
             match primary_target {
                 Some(pt) => {
-                    for half in COUNTER_OVERLAY {
+                    for half in counter_overlay_for(tunnel_catch_alls) {
                         out.routes.push(overlay_route(half, pt));
                     }
                 }
@@ -586,7 +661,7 @@ fn push_route(
         return false;
     }
     // Never route a non-routable destination. An ad-blocking hosts file
-    // pins domains to loopback/unspecified (e.g. `musical.ly 127.0.0.1`);
+    // pins domains to loopback/unspecified (e.g. `app.example 127.0.0.1`);
     // routing that out the secondary (VPN) link is nonsensical — loopback
     // never leaves the box. Skip WITHOUT signalling a cap hit so the caller
     // keeps scanning this rule's remaining (routable) IPs.
@@ -701,10 +776,10 @@ mod tests {
         let cache = MockFqdnCacheLookup::new();
         let apps = MockAppObservationLookup::new();
         apps.set_ips(
-            "telegram.exe",
-            vec![ip(149, 154, 167, 50), ip(91, 108, 56, 104)],
+            "messenger.exe",
+            vec![ip(23, 10, 20, 153), ip(23, 10, 20, 137)],
         );
-        let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
+        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
 
         let out = generate_secondary_routes(
             &rs,
@@ -718,7 +793,7 @@ mod tests {
 
         let mut dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
         dests.sort();
-        assert_eq!(dests, vec![ip(91, 108, 56, 104), ip(149, 154, 167, 50)]);
+        assert_eq!(dests, vec![ip(23, 10, 20, 137), ip(23, 10, 20, 153)]);
         assert!(out
             .routes
             .iter()
@@ -735,9 +810,9 @@ mod tests {
         let apps = MockAppObservationLookup::new();
         apps.set_ips(
             "assistant.exe",
-            vec![ip(178, 248, 237, 68), ip(203, 0, 113, 9)],
+            vec![ip(203, 0, 113, 68), ip(203, 0, 113, 9)],
         );
-        apps.set_used_outside(ip(178, 248, 237, 68));
+        apps.set_used_outside(ip(203, 0, 113, 68));
         let rs = ruleset(vec![app_rule("R-app", "assistant.exe")]);
 
         let out = generate_secondary_routes(
@@ -755,14 +830,14 @@ mod tests {
         assert!(matches!(
             out.diagnostics.as_slice(),
             [RouteCodegenDiagnostic::AppRuleDestinationUsedByOtherProcess { ip: shared, app, .. }]
-                if *shared == ip(178, 248, 237, 68) && app == "assistant.exe"
+                if *shared == ip(203, 0, 113, 68) && app == "assistant.exe"
         ));
     }
 
     #[test]
     fn app_only_rule_without_observations_diagnoses_and_routes_nothing() {
         let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
+        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
 
         let out = generate_secondary_routes(
             &rs,
@@ -777,7 +852,7 @@ mod tests {
         assert!(out.routes.is_empty());
         assert!(matches!(
             out.diagnostics.as_slice(),
-            [RouteCodegenDiagnostic::AppRuleUnobserved { app, .. }] if app == "telegram.exe"
+            [RouteCodegenDiagnostic::AppRuleUnobserved { app, .. }] if app == "messenger.exe"
         ));
     }
 
@@ -785,8 +860,8 @@ mod tests {
     fn app_only_rule_skips_destinations_the_shared_address_policy_declined() {
         let cache = MockFqdnCacheLookup::new();
         let apps = MockAppObservationLookup::new();
-        apps.set_ips("telegram.exe", vec![ip(8, 8, 8, 8), ip(91, 108, 56, 104)]);
-        let rs = ruleset(vec![app_rule("R-app", "telegram.exe")]);
+        apps.set_ips("messenger.exe", vec![ip(8, 8, 8, 8), ip(23, 10, 20, 137)]);
+        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
         let denied: HashSet<Ipv4Addr> = [ip(8, 8, 8, 8)].into_iter().collect();
 
         let out = generate_secondary_routes(
@@ -800,7 +875,7 @@ mod tests {
         );
 
         let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, vec![ip(91, 108, 56, 104)]);
+        assert_eq!(dests, vec![ip(23, 10, 20, 137)]);
     }
 
     fn target() -> SecondaryRouteTarget {
@@ -830,27 +905,27 @@ mod tests {
         Ipv4Addr::new(a, b, c, d)
     }
 
-    /// The live case (26.08): `*.google.com` on the main link,
-    /// `notebooklm.google.com` on the additional one, one address serving both.
-    /// The tunnel pin used to take translate.google.com with it, and the site
+    /// The live case (26.08): `*.search.example` on the main link,
+    /// `docs.search.example` on the additional one, one address serving both.
+    /// The tunnel pin used to take translate.search.example with it, and the site
     /// was dead in every browser while both rules were honoured individually.
     #[test]
     fn a_shared_address_is_not_pinned_into_the_tunnel() {
-        let shared = ip(172, 217, 17, 206);
-        let only_theirs = ip(142, 250, 150, 101);
+        let shared = ip(23, 10, 20, 161);
+        let only_theirs = ip(23, 10, 20, 150);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.google.com", vec![shared]);
-        cache.set_ips("notebooklm.google.com", vec![shared, only_theirs]);
+        cache.set_ips("translate.search.example", vec![shared]);
+        cache.set_ips("docs.search.example", vec![shared, only_theirs]);
         let book = CanonicalRuleBook {
             primary: ruleset(vec![rule(
                 "p1",
                 true,
-                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+                CanonicalAddressMatch::SuffixDomain("search.example".into()),
             )]),
             secondary: ruleset(vec![rule(
                 "s1",
                 true,
-                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
             )]),
         };
         let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
@@ -883,20 +958,20 @@ mod tests {
     /// same function.
     #[test]
     fn the_main_links_own_rules_are_never_held_back() {
-        let shared = ip(172, 217, 17, 206);
+        let shared = ip(23, 10, 20, 161);
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.google.com", vec![shared]);
-        cache.set_ips("notebooklm.google.com", vec![shared]);
+        cache.set_ips("translate.search.example", vec![shared]);
+        cache.set_ips("docs.search.example", vec![shared]);
         let book = CanonicalRuleBook {
             primary: ruleset(vec![rule(
                 "p1",
                 true,
-                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+                CanonicalAddressMatch::SuffixDomain("search.example".into()),
             )]),
             secondary: ruleset(vec![rule(
                 "s1",
                 true,
-                CanonicalAddressMatch::ExactFqdn("notebooklm.google.com".into()),
+                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
             )]),
         };
         let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
@@ -923,7 +998,7 @@ mod tests {
         let rs = ruleset(vec![rule(
             "r-ip",
             true,
-            CanonicalAddressMatch::ExactIp(ip(93, 184, 216, 34)),
+            CanonicalAddressMatch::ExactIp(ip(23, 10, 20, 138)),
         )]);
         let out = generate_secondary_routes(
             &rs,
@@ -936,7 +1011,7 @@ mod tests {
         );
         assert_eq!(out.routes.len(), 1);
         let r = &out.routes[0];
-        assert_eq!(r.destination, ip(93, 184, 216, 34));
+        assert_eq!(r.destination, ip(23, 10, 20, 138));
         assert_eq!(r.prefix_length, 32);
         assert_eq!(r.next_hop, ip(10, 0, 0, 1));
         assert_eq!(r.interface_index, 7);
@@ -1139,12 +1214,12 @@ mod tests {
         let cache = MockFqdnCacheLookup::new();
         // An ad-blocking hosts file pins the domain to loopback → the cache
         // holds only 127.0.0.1, so the ExactFqdn rule must produce NO route.
-        cache.set_ips("musical.ly", vec![ip(127, 0, 0, 1)]);
+        cache.set_ips("app.example", vec![ip(127, 0, 0, 1)]);
         // A mixed resolution (loopback + a real public IP) must route ONLY
         // the routable IP.
         cache.set_ips(
             "mixed.example.com",
-            vec![ip(127, 0, 0, 1), ip(93, 184, 216, 34)],
+            vec![ip(127, 0, 0, 1), ip(23, 10, 20, 138)],
         );
         let rs = ruleset(vec![
             rule(
@@ -1160,7 +1235,7 @@ mod tests {
             rule(
                 "r-loop-fqdn",
                 true,
-                CanonicalAddressMatch::ExactFqdn("musical.ly".into()),
+                CanonicalAddressMatch::ExactFqdn("app.example".into()),
             ),
             rule(
                 "r-mixed",
@@ -1180,7 +1255,7 @@ mod tests {
         // Only the public IP survives; loopback + unspecified are dropped and
         // the loopback-only FQDN yields nothing.
         let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, BTreeSet::from([ip(93, 184, 216, 34)]));
+        assert_eq!(dests, BTreeSet::from([ip(23, 10, 20, 138)]));
     }
 
     #[test]
@@ -1289,6 +1364,7 @@ mod tests {
                     &apps,
                     &std::collections::HashSet::new(),
                     crate::address_ownership::ZoneVsIpOrder::default(),
+                    &[],
                 );
                 for route in &out.routes {
                     assert!(
@@ -1321,11 +1397,11 @@ mod tests {
     #[test]
     fn mode_a_app_observation_never_pins_an_address_the_main_link_claims() {
         let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("news.example", vec![ip(178, 248, 237, 68)]);
+        cache.set_ips("news.example", vec![ip(203, 0, 113, 68)]);
         let apps = MockAppObservationLookup::new();
         apps.set_ips(
             "assistant.exe",
-            vec![ip(178, 248, 237, 68), ip(203, 0, 113, 9)],
+            vec![ip(203, 0, 113, 68), ip(203, 0, 113, 9)],
         );
         let rb = book(
             vec![rule(
@@ -1345,6 +1421,7 @@ mod tests {
             &apps,
             &std::collections::HashSet::new(),
             crate::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
 
         let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
@@ -1354,7 +1431,7 @@ mod tests {
         assert!(out.diagnostics.iter().any(|d| matches!(
             d,
             RouteCodegenDiagnostic::AppRuleDestinationClaimedByMainLink { ip: claimed, app, .. }
-                if *claimed == ip(178, 248, 237, 68) && app == "assistant.exe"
+                if *claimed == ip(203, 0, 113, 68) && app == "assistant.exe"
         )));
     }
 
@@ -1425,6 +1502,7 @@ mod tests {
             &no_apps(),
             &std::collections::HashSet::new(),
             crate::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
         // No /1 overlay in mode A; only the secondary rule's /32 (primary rule
         // is irrelevant — default already rides primary).
@@ -1432,6 +1510,79 @@ mod tests {
         assert_eq!(out.routes[0].destination, ip(1, 1, 1, 1));
         assert_eq!(out.routes[0].prefix_length, 32);
         assert_eq!(out.routes[0].interface_index, 7); // secondary ifindex
+    }
+
+    #[test]
+    fn the_counter_overlay_is_one_bit_longer_than_whatever_the_tunnel_installed() {
+        let ip = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
+        // No visible catch-alls → the classic four /2.
+        assert_eq!(counter_overlay_for(&[]), COUNTER_OVERLAY.to_vec());
+        // A redirect-gateway /1 pair → the same four /2.
+        assert_eq!(
+            counter_overlay_for(&[(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]),
+            COUNTER_OVERLAY.to_vec()
+        );
+        // swiftvpn over WireGuard: a redirect SET. Against it the /2s lost —
+        // `64.0.0.0/2` and `128.0.0.0/2` tie on length at a better metric and
+        // the rest are longer — so every non-rule connection rode the tunnel.
+        // Each prefix gets its two halves, one bit longer.
+        let set = [
+            (ip(0, 0, 0, 0), 5),
+            (ip(8, 0, 0, 0), 7),
+            (ip(64, 0, 0, 0), 2),
+            (ip(128, 0, 0, 0), 2),
+            (ip(192, 0, 0, 0), 9),
+        ];
+        let got = counter_overlay_for(&set);
+        for expected in [
+            (ip(0, 0, 0, 0), 6),
+            (ip(4, 0, 0, 0), 6),
+            (ip(8, 0, 0, 0), 8),
+            (ip(9, 0, 0, 0), 8),
+            (ip(64, 0, 0, 0), 3),
+            (ip(96, 0, 0, 0), 3),
+            (ip(128, 0, 0, 0), 3),
+            (ip(160, 0, 0, 0), 3),
+            (ip(192, 0, 0, 0), 10),
+            (ip(192, 64, 0, 0), 10),
+        ] {
+            assert!(got.contains(&expected), "missing {expected:?} in {got:?}");
+        }
+        assert_eq!(got.len(), 10);
+        // A tunnel that owns the whole default on-link → two /1 via primary.
+        assert_eq!(
+            counter_overlay_for(&[(ip(0, 0, 0, 0), 0)]),
+            vec![(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]
+        );
+    }
+
+    #[test]
+    fn tunnel_catch_alls_are_the_wide_unicast_routes_on_the_tunnel_that_are_not_ours() {
+        let r = |d: [u8; 4], n: u8, ifx: u32, ours: bool| RouteEntry {
+            destination: Ipv4Addr::from(d),
+            prefix_length: n,
+            next_hop: Ipv4Addr::UNSPECIFIED,
+            interface_index: ifx,
+            metric: 0,
+            is_ours: ours,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        let table = vec![
+            r([64, 0, 0, 0], 2, 66, false),
+            r([192, 0, 0, 0], 9, 66, false),
+            r([224, 0, 0, 0], 3, 66, false), // multicast: every interface has it
+            r([10, 88, 0, 191], 32, 66, false), // the tunnel's own address
+            r([10, 200, 0, 0], 16, 66, false), // a corporate split-tunnel network
+            r([23, 10, 20, 78], 32, 66, true), // our rule route
+            r([0, 0, 0, 0], 0, 19, false),   // the primary's default
+        ];
+        assert_eq!(
+            tunnel_catch_all_prefixes(&table, 66),
+            vec![
+                (Ipv4Addr::new(64, 0, 0, 0), 2),
+                (Ipv4Addr::new(192, 0, 0, 0), 9)
+            ]
+        );
     }
 
     #[test]
@@ -1458,6 +1609,7 @@ mod tests {
             &no_apps(),
             &std::collections::HashSet::new(),
             crate::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
         // Counter-overlay: four /2 via the primary NIC (ifindex 12) — these
         // out-specific a redirect VPN's /1 so non-rule traffic rides primary.
@@ -1513,6 +1665,7 @@ mod tests {
             &no_apps(),
             &std::collections::HashSet::new(),
             crate::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
         // Overlay 0.0.0.0/1 + 128.0.0.0/1 via the secondary (ifindex 7).
         let overlay: Vec<_> = out.routes.iter().filter(|r| r.prefix_length == 1).collect();
@@ -1551,6 +1704,7 @@ mod tests {
             &no_apps(),
             &std::collections::HashSet::new(),
             crate::address_ownership::ZoneVsIpOrder::default(),
+            &[],
         );
         // Only the overlay survives (no exceptions without a primary target).
         assert_eq!(out.routes.len(), 2);

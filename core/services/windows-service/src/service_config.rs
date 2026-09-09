@@ -1,26 +1,26 @@
 //! Service start-mode reconfiguration and the targeted `SERVICE_START`
 //! grant.
 //!
-//! Two jobs, both reached ONLY through the elevated `set-start-mode`
-//! subcommand (the GUI dispatches it via the session broker — never from the
-//! unprivileged GUI directly):
+//! Two jobs, both reached ONLY through elevated subcommands (`install`,
+//! `set-start-auto`, `set-start-demand`; the GUI dispatches them via the
+//! session broker — never from the unprivileged GUI directly):
 //!
 //! 1. [`reconfigure_start_mode`] flips the SCM start type between
 //!    `SERVICE_AUTO_START` (start with Windows) and `SERVICE_DEMAND_START`
 //!    (start on app launch). [`query_start_mode`] reads it back for the GUI.
-//! 2. [`grant_interactive_service_start`] / [`revoke_interactive_service_start`]
-//!    add/remove a single `SERVICE_START` ACE for the well-known `INTERACTIVE`
-//!    group on the service object's DACL, so a DemandStart service can be
-//!    started by the unprivileged launcher with no per-launch UAC prompt. The
-//!    grant is targeted (one right, one trustee) — never a blanket SDDL
-//!    widening, and `SetEntriesInAclW` merges it into the existing DACL.
+//! 2. [`grant_interactive_service_start`] adds a single `SERVICE_START` ACE for
+//!    the well-known `INTERACTIVE` group on the service object's DACL, so the
+//!    unprivileged launcher can start the service with no UAC prompt in EITHER
+//!    start mode. The grant is targeted (one right, one trustee) — never a
+//!    blanket SDDL widening, and `SetEntriesInAclW` merges it into the existing
+//!    DACL.
 //!
 //! The trustee used to be the console user's own SID, which read as tighter
 //! than `INTERACTIVE` and was not: nothing removed it, so every account that
 //! had once been at the console kept the right permanently and the set only
-//! grew. Withdrawing the grant still resolves the console user via WTS
+//! grew. The grant still resolves the console user via WTS
 //! ([`console_session_user_sid`]) to retire that legacy ACE — the LocalSystem-
-//! only `WTSQueryUserToken` path is unusable here because `set-start-mode` runs
+//! only `WTSQueryUserToken` path is unusable here because these verbs run
 //! elevated-as-admin, not as SYSTEM, and the session's logged-on user is also
 //! the right principal under over-the-shoulder elevation (the standard user at
 //! the console, not the admin whose credentials approved the prompt).
@@ -338,34 +338,29 @@ fn lookup_account_sid(account: &str) -> Result<Vec<u8>, StartModeError> {
 /// It also no longer depends on a console session existing: the previous
 /// version resolved the logged-on user through WTS and failed the whole grant
 /// when there was nobody at the console.
-pub fn grant_interactive_service_start() -> Result<(), StartModeError> {
-    edit_service_start_ace(true)
-}
-
-/// Remove the `SERVICE_START` grant (used when switching back to
-/// start-with-Windows). Best-effort: a missing ACE is not an error.
 ///
-/// Takes the legacy per-user ACE with it when a console user can be resolved —
-/// this is the path that means "no grant is needed any more", so it is where an
-/// installation that predates the `INTERACTIVE` trustee gets cleaned up.
-pub fn revoke_interactive_service_start() -> Result<(), StartModeError> {
-    edit_service_start_ace(false)
+/// The grant is held in BOTH start modes. It once tracked the start type —
+/// added for DemandStart, withdrawn for AutoStart on the reasoning that a
+/// service Windows starts needs no manual start. It does: an operator who
+/// stops the service (or whose service stopped on its own) then finds the
+/// GUI's own start button dead, with no way back short of an elevated console.
+/// Starting a service that is already configured to start with Windows is not
+/// a privilege worth withholding from whoever is sitting at the machine.
+pub fn grant_interactive_service_start() -> Result<(), StartModeError> {
+    let sid = interactive_group_sid()?;
+    // Best-effort: an installation that predates the `INTERACTIVE` trustee
+    // carries a per-user ACE granting the same right. `REVOKE_ACCESS` drops
+    // EVERY entry for that trustee, which is the point — the personal grant is
+    // exactly what the well-known group replaces.
+    let legacy_sid = console_session_user_sid().ok();
+    write_service_start_ace(&sid, legacy_sid.as_ref())
 }
 
-/// Read the service DACL, add (`grant`) or remove (`!grant`) a single
-/// `SERVICE_START` ACE for the console user, and write it back. All buffers are
-/// held in scope until `SetServiceObjectSecurity` returns, because the old
-/// DACL, the SID, and the new DACL are referenced by pointer along the way.
-fn edit_service_start_ace(grant: bool) -> Result<(), StartModeError> {
-    let sid = interactive_group_sid()?;
-    // Only when withdrawing the grant, and only best-effort: `REVOKE_ACCESS`
-    // drops EVERY entry for a trustee, so it is not something to fire on a path
-    // that is merely refreshing a grant.
-    let legacy_sid = if grant {
-        None
-    } else {
-        console_session_user_sid().ok()
-    };
+/// Read the service DACL, add the `SERVICE_START` ACE for `sid`, revoke every
+/// entry for `legacy_sid` if one was resolved, and write it back. All buffers
+/// are held in scope until `SetServiceObjectSecurity` returns, because the old
+/// DACL, the SIDs, and the new DACL are referenced by pointer along the way.
+fn write_service_start_ace(sid: &[u8], legacy_sid: Option<&Vec<u8>>) -> Result<(), StartModeError> {
     let (_scm, svc) = open_service(READ_CONTROL | WRITE_DAC)?;
 
     // ── 1. Read the current self-relative security descriptor (DACL only). ──
@@ -415,12 +410,12 @@ fn edit_service_start_ace(grant: bool) -> Result<(), StartModeError> {
     .map_err(|e| StartModeError::Security(format!("get DACL: {e}")))?;
 
     // ── 3. Describe the ACE(s) and merge them into the DACL. ──
-    // `sid` / `legacy_sid` are owned locals: they live until this function
-    // returns, so the raw pointers stashed in `Trustee.ptstrName` stay valid
-    // through the `SetEntriesInAclW` call below.
+    // `sid` / `legacy_sid` are borrowed from the caller's locals: they outlive
+    // this function, so the raw pointers stashed in `Trustee.ptstrName` stay
+    // valid through the `SetEntriesInAclW` call below.
     let mut entries = vec![EXPLICIT_ACCESS_W {
         grfAccessPermissions: SERVICE_START_RIGHT,
-        grfAccessMode: if grant { SET_ACCESS } else { REVOKE_ACCESS },
+        grfAccessMode: SET_ACCESS,
         grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
         Trustee: TRUSTEE_W {
             pMultipleTrustee: std::ptr::null_mut(),
@@ -432,7 +427,7 @@ fn edit_service_start_ace(grant: bool) -> Result<(), StartModeError> {
             ptstrName: PWSTR(sid.as_ptr() as *mut u16),
         },
     }];
-    if let Some(legacy) = legacy_sid.as_ref() {
+    if let Some(legacy) = legacy_sid {
         entries.push(EXPLICIT_ACCESS_W {
             grfAccessPermissions: SERVICE_START_RIGHT,
             grfAccessMode: REVOKE_ACCESS,

@@ -90,7 +90,7 @@ fn foreign_os_sections_survive_parse_then_sidecar_round_trip() {
     let native = native_app_section();
     let [first, second] = foreign_app_sections();
     let preset = format!(
-        "--- Zones\nru\n\n--- Domains\nvk.com\nya.ru\n\n--- IP\n\n--- {native}\ntelegram.exe\n\n\
+        "--- Zones\nru\n\n--- Domains\nab.test\nya.ru\n\n--- IP\n\n--- {native}\nmessenger.exe\n\n\
          --- {first}\n# (reserved - not applied on this host)\nfirefox\nchromium\n\n\
          --- {second}\nSafari\nVivaldi\n"
     );
@@ -185,7 +185,7 @@ fn empty_passthrough_write_clears_previous_state() {
 
     // First import: carries a foreign-OS section into passthrough.
     let foreign = foreign_app_sections()[0];
-    let parsed = parse_canonical_rules(&format!("--- Domains\nvk.com\n--- {foreign}\nfirefox\n"));
+    let parsed = parse_canonical_rules(&format!("--- Domains\nab.test\n--- {foreign}\nfirefox\n"));
     let sections = to_sections_object(&parsed.passthrough);
     handle_sidecar_request(
         &handle,
@@ -224,7 +224,7 @@ fn cyrillic_passthrough_content_survives_round_trip() {
     let handle = fresh_sidecar(&tmp);
 
     // Hypothetical custom section with Cyrillic content.
-    let preset = "--- Domains\nvk.com\n--- Заметки\n# Это пользовательская секция\nпривет\n";
+    let preset = "--- Domains\nab.test\n--- Заметки\n# Это пользовательская секция\nпривет\n";
     let parsed = parse_canonical_rules(preset);
     assert_eq!(parsed.passthrough.len(), 1);
     assert_eq!(parsed.passthrough[0].section_name, "Заметки");
@@ -257,7 +257,7 @@ fn known_section_rules_do_not_leak_into_passthrough() {
     // application section) must produce rules, not passthrough blocks.
     let native = native_app_section();
     let preset = format!(
-        "--- Zones\nru\n--- Domains\nvk.com\n--- IP\n203.0.113.7\n--- {native}\ntelegram.exe\n"
+        "--- Zones\nru\n--- Domains\nab.test\n--- IP\n203.0.113.7\n--- {native}\nmessenger.exe\n"
     );
     let parsed = parse_canonical_rules(&preset);
     assert!(

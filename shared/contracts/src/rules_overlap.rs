@@ -161,12 +161,12 @@ mod tests {
     fn apex_covered_by_its_own_wildcard_in_the_same_route_is_redundant() {
         let dto = book(
             vec![],
-            vec![suffix("r-1", "habr.com"), exact("r-2", "habr.com")],
+            vec![suffix("r-1", "blog.example"), exact("r-2", "blog.example")],
         );
         let found = find_overlaps(&dto);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].covered_rule_id, "r-2");
-        assert_eq!(found[0].apex, "habr.com");
+        assert_eq!(found[0].apex, "blog.example");
         assert!(found[0].redundant);
     }
 

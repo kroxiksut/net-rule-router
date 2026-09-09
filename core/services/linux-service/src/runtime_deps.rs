@@ -712,29 +712,38 @@ pub(crate) fn build_policy_stack(
     // Discovery reads the SAME observations the cache does: a suggestion the
     // user sees must come from the resolutions that actually happened, not from
     // a second, differently-filtered stream.
-    let auto_rules = Arc::new(nrr_service_runtime::auto_rules::AutoRulesEngine::new(
-        Arc::clone(&rules),
-        {
-            let conn = Arc::clone(&state_conn);
-            Arc::new(move |sid: &str| {
-                let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
-                nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
-                    .load_for_sid(sid)
-                    .map(|record| record.auto_rules_mode)
-                    // A read failure must not widen what the service may do
-                    // on the user's behalf: the default suggests and applies
-                    // nothing.
-                    .unwrap_or_default()
-            })
-        },
-        Arc::new(nrr_service_runtime::auto_rules::SqliteDismissalStore::new(
-            Arc::clone(&state_conn),
-        )),
-        Arc::new(nrr_service_runtime::auto_rules::SqlitePendingStore::new(
-            Arc::clone(&state_conn),
-        )),
-        std::time::SystemTime::now(),
-    ));
+    let auto_rules = Arc::new(
+        nrr_service_runtime::auto_rules::AutoRulesEngine::new(
+            Arc::clone(&rules),
+            {
+                let conn = Arc::clone(&state_conn);
+                Arc::new(move |sid: &str| {
+                    let guard = conn.lock().unwrap_or_else(|p| p.into_inner());
+                    nrr_storage::route_bindings::RouteBindingsRepository::new(&guard)
+                        .load_for_sid(sid)
+                        .map(|record| record.auto_rules_mode)
+                        // A read failure must not widen what the service may do
+                        // on the user's behalf: the default suggests and applies
+                        // nothing.
+                        .unwrap_or_default()
+                })
+            },
+            Arc::new(nrr_service_runtime::auto_rules::SqliteDismissalStore::new(
+                Arc::clone(&state_conn),
+            )),
+            Arc::new(nrr_service_runtime::auto_rules::SqlitePendingStore::new(
+                Arc::clone(&state_conn),
+            )),
+            std::time::SystemTime::now(),
+        )
+        // What the main link currently does with a host, by name. Without it
+        // an offer a host made about ITSELF could never learn that the site
+        // started working, and would keep standing after the reason went away.
+        .with_primary_behavior_source({
+            let stalls = nrr_service_runtime::primary_stall_registry::global_primary_stalls();
+            Arc::new(move |hostname: &str| stalls.behavior_of_subtree(hostname))
+        }),
+    );
 
     let dns_consumer = {
         let subject = Arc::clone(&dns_consumer_subject);
@@ -745,7 +754,12 @@ pub(crate) fn build_policy_stack(
                 Arc::clone(&fqdn_cache),
                 Arc::new(move || subject.lock().unwrap_or_else(|p| p.into_inner()).clone()),
             )
-            .with_auto_rules(Arc::clone(&auto_rules)),
+            .with_auto_rules(Arc::clone(&auto_rules))
+            // Names for the hosts the rule index cannot name, so a
+            // destination that fails on the main link can be spoken about.
+            .with_observed_host_names(
+                nrr_service_runtime::observed_host_names::global_observed_host_names(),
+            ),
         )
     };
 

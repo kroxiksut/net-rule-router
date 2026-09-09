@@ -3,7 +3,7 @@
 //! Two rule sets can both claim the same address — one by name, the other by a
 //! wide suffix — and something has to decide which claim is the stronger one.
 //! The shared-IP census is the caller that needs this: an address claimed by
-//! `aistudio.google.com` on the additional route and by `*.google.com` on the
+//! `aistudio.search.example` on the additional route and by `*.search.example` on the
 //! main one is not a tie, and treating it as one let the wide rule cancel the
 //! narrow one's pin.
 //!
@@ -98,13 +98,13 @@ mod tests {
     fn a_longer_suffix_is_the_narrower_claim() {
         let wide = set(vec![rule(
             "r1",
-            CanonicalAddressMatch::SuffixDomain("google.com".into()),
+            CanonicalAddressMatch::SuffixDomain("search.example".into()),
         )]);
         let narrow = set(vec![rule(
             "r2",
-            CanonicalAddressMatch::SuffixDomain("ai.google.com".into()),
+            CanonicalAddressMatch::SuffixDomain("ai.search.example".into()),
         )]);
-        let host = "studio.ai.google.com";
+        let host = "studio.ai.search.example";
         assert!(match_specificity(host, &narrow) > match_specificity(host, &wide));
     }
 
@@ -114,15 +114,15 @@ mod tests {
             rule("z", CanonicalAddressMatch::Zone("com".into())),
             rule(
                 "s",
-                CanonicalAddressMatch::SuffixDomain("google.com".into()),
+                CanonicalAddressMatch::SuffixDomain("search.example".into()),
             ),
             rule(
                 "e",
-                CanonicalAddressMatch::ExactFqdn("aistudio.google.com".into()),
+                CanonicalAddressMatch::ExactFqdn("aistudio.search.example".into()),
             ),
         ]);
         assert_eq!(
-            match_specificity("aistudio.google.com", &mixed),
+            match_specificity("aistudio.search.example", &mixed),
             Some(MatchSpecificity::ExactFqdn)
         );
     }
@@ -133,15 +133,15 @@ mod tests {
         // narrow claim has to win.
         let secondary = set(vec![rule(
             "s1",
-            CanonicalAddressMatch::ExactFqdn("aistudio.google.com".into()),
+            CanonicalAddressMatch::ExactFqdn("aistudio.search.example".into()),
         )]);
         let primary = set(vec![rule(
             "p1",
-            CanonicalAddressMatch::SuffixDomain("google.com".into()),
+            CanonicalAddressMatch::SuffixDomain("search.example".into()),
         )]);
         assert!(
-            match_specificity("aistudio.google.com", &secondary)
-                > match_specificity("workspace.google.com", &primary)
+            match_specificity("aistudio.search.example", &secondary)
+                > match_specificity("workspace.search.example", &primary)
         );
     }
 

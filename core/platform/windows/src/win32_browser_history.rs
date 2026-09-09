@@ -517,10 +517,10 @@ mod tests {
     #[test]
     fn mail_prefs_parser_keeps_only_server_hostnames() {
         let prefs = r#"
-user_pref("mail.server.server1.hostname", "imap.yandex.com");
-user_pref("mail.server.server2.hostname", "MAIL.ISTU.EDU");
+user_pref("mail.server.server1.hostname", "imap.mail.example");
+user_pref("mail.server.server2.hostname", "MAIL.UNIV.EXAMPLE");
 user_pref("mail.server.server2.name", "work account");
-user_pref("mail.smtpserver.smtp1.hostname", "smtp.yandex.com");
+user_pref("mail.smtpserver.smtp1.hostname", "smtp.mail.example");
 user_pref("mail.smtpserver.smtp1.username", "someone@example.com");
 user_pref("mail.identity.id1.useremail", "someone@example.com");
 user_pref("network.dns.disableIPv6", true);
@@ -528,7 +528,11 @@ user_pref("network.dns.disableIPv6", true);
         let hosts = parse_mail_server_hostnames(prefs);
         assert_eq!(
             hosts,
-            vec!["imap.yandex.com", "mail.istu.edu", "smtp.yandex.com"],
+            vec![
+                "imap.mail.example",
+                "mail.univ.example",
+                "smtp.mail.example"
+            ],
             "only *.hostname prefs may cross, lower-cased; identities and \
              usernames must never leak"
         );
@@ -581,15 +585,18 @@ user_pref("network.dns.disableIPv6", true);
             &db,
             "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
             &[
-                "https://dzen.ru/feed",
-                "https://dzen.ru/other", // same host, deduped
-                "https://ya.ru/",
+                "https://feed.example/feed",
+                "https://feed.example/other", // same host, deduped
+                "https://search.example/",
                 "about:blank",       // no host, dropped
                 "chrome://settings", // pseudo-scheme, dropped
             ],
         );
         let hosts = read_hostnames_from_db(&db, "SELECT url FROM urls").unwrap();
-        assert_eq!(hosts, vec!["dzen.ru".to_string(), "ya.ru".to_string()]);
+        assert_eq!(
+            hosts,
+            vec!["feed.example".to_string(), "search.example".to_string()]
+        );
     }
 
     #[test]

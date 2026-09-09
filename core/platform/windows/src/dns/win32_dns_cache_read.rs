@@ -7,7 +7,7 @@
 //! enforcement learns hostnames only from live DNS traffic (ETW event 3008). A
 //! name resolved before the service started — or served straight from the OS
 //! resolver cache so no wire query fires — is invisible to the observer, so its
-//! zone permit is never emitted (e.g. `avito.ru`/`ya.ru` cached before start).
+//! zone permit is never emitted (a name cached before the service started).
 //! Flushing forces a re-query; reading is the passive alternative — snapshot
 //! what the OS already resolved and seed the FQDN cache with the rule-matching
 //! entries, no flush and no wire round-trip.

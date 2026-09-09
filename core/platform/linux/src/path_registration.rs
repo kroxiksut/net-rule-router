@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use nrr_platform_api::path_registration::{
     decide_path_registration, render_entry, PathListStyle, PathRegistrationError,
     PathRegistrationPlan, PathRegistrationPort, PathRegistrationReport, PathRegistrationRequest,
-    PathRegistrationStep, PathScope,
+    PathRegistrationStep, PathRemovalDecision, PathRemovalPlan, PathScope,
 };
 
 /// Comment written above the line we add, so a human reading their start-up
@@ -315,10 +315,11 @@ impl PathRegistrationPort for UnixPathRegistration {
                     append_line(path, line)?;
                     files_written.push(path.clone());
                 }
-                PathRegistrationStep::SetUserEnvironmentVariable { .. }
+                PathRegistrationStep::RemoveShellProfileBlock { .. }
+                | PathRegistrationStep::SetUserEnvironmentVariable { .. }
                 | PathRegistrationStep::AnnounceEnvironmentChange => {
                     return Err(PathRegistrationError::Unsupported {
-                        detail: "Unix has no per-user environment store to write or announce"
+                        detail: "a registration on Unix only ever appends a start-up line"
                             .to_string(),
                     });
                 }
@@ -332,6 +333,142 @@ impl PathRegistrationPort for UnixPathRegistration {
             restart_shell_required: changed,
         })
     }
+
+    fn plan_removal(
+        &self,
+        request: &PathRegistrationRequest,
+    ) -> Result<PathRemovalPlan, PathRegistrationError> {
+        Self::check_scope(request.scope)?;
+        let profile = self.profile_file();
+        let contents = fs::read_to_string(&profile).unwrap_or_default();
+        // OUR block, not "the directory appears somewhere": a line the user
+        // wrote themselves is theirs, and a directory reachable because some
+        // other file exports it is not ours to take away. This is also why the
+        // process `PATH` is not consulted — it would answer a different
+        // question and make the button lie right after a successful removal.
+        if !contents.contains(PROFILE_MARKER) {
+            return Ok(PathRemovalPlan::nothing_to_remove(
+                request.directory.clone(),
+                request.scope,
+            ));
+        }
+        let stripped = strip_profile_block(&contents).unwrap_or_default();
+        Ok(PathRemovalPlan {
+            directory: request.directory.clone(),
+            scope: request.scope,
+            decision: PathRemovalDecision::Remove {
+                updated_list: stripped,
+            },
+            steps: vec![PathRegistrationStep::RemoveShellProfileBlock { path: profile }],
+        })
+    }
+
+    fn apply_removal(
+        &self,
+        plan: &PathRemovalPlan,
+    ) -> Result<PathRegistrationReport, PathRegistrationError> {
+        Self::check_scope(plan.scope)?;
+        let mut files_written = Vec::new();
+
+        for step in &plan.steps {
+            match step {
+                PathRegistrationStep::RemoveShellProfileBlock { path } => {
+                    if remove_profile_block(path)? {
+                        files_written.push(path.clone());
+                    }
+                }
+                PathRegistrationStep::AppendShellProfileLine { .. }
+                | PathRegistrationStep::SetUserEnvironmentVariable { .. }
+                | PathRegistrationStep::AnnounceEnvironmentChange => {
+                    return Err(PathRegistrationError::Unsupported {
+                        detail: "a removal on Unix only ever edits the start-up file".to_string(),
+                    });
+                }
+            }
+        }
+
+        let changed = !files_written.is_empty();
+        Ok(PathRegistrationReport {
+            changed,
+            files_written,
+            // A shell that is already open keeps the PATH it inherited, so the
+            // directory stays reachable there until it restarts — the same
+            // asymmetry registration has, in the other direction.
+            restart_shell_required: changed,
+        })
+    }
+}
+
+/// Cut our own block out of a start-up file's text.
+///
+/// Our block is the [`PROFILE_MARKER`] comment plus the single line under it,
+/// which is exactly what [`render_profile_block`] writes. Only that pair is
+/// removed; a line the user wrote themselves that happens to mention the
+/// directory is left alone — it is their edit, and deleting it is not what a
+/// button called "remove from PATH" promises. A blank line left behind where
+/// the block was is dropped so repeated add/remove cycles do not grow the file.
+///
+/// Returns `None` when the text carries no block of ours.
+pub fn strip_profile_block(contents: &str) -> Option<String> {
+    if !contents.contains(PROFILE_MARKER) {
+        return None;
+    }
+    let ends_with_newline = contents.ends_with('\n');
+    let mut kept: Vec<&str> = Vec::new();
+    let mut skip_next_value_line = false;
+    for line in contents.lines() {
+        if line.trim() == PROFILE_MARKER {
+            // The marker owns the line under it — that is the pair we wrote.
+            skip_next_value_line = true;
+            continue;
+        }
+        if skip_next_value_line {
+            skip_next_value_line = false;
+            // Only a line that actually sets PATH belongs to the block. A file
+            // whose marker lost its partner must not eat an unrelated command.
+            if line.contains("PATH") || line.contains("fish_add_path") {
+                continue;
+            }
+        }
+        kept.push(line);
+    }
+    // Trailing blank lines the removal exposed are ours to clean: they were the
+    // separation around our block, not the user's formatting.
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() && ends_with_newline {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Take our block out of the file at `path`.
+///
+/// A file left with nothing but whitespace is deleted rather than kept: our
+/// fish drop-in (`conf.d/netrulerouter.fish`) exists only to carry that block,
+/// so an empty leftover is litter. A shared start-up file (`~/.bashrc`) that
+/// ends up empty is a file the user had emptied themselves, and removing it
+/// then is equally harmless — but the file is only ever ours to delete when we
+/// created it, so the emptiness test is what decides, not the name.
+fn remove_profile_block(path: &Path) -> Result<bool, PathRegistrationError> {
+    let mechanism = |what: &str, e: std::io::Error| PathRegistrationError::Mechanism {
+        detail: format!("{what} {}: {e}", path.display()),
+    };
+    let Ok(existing) = fs::read_to_string(path) else {
+        // No file, no block: the outcome the caller asked for already holds.
+        return Ok(false);
+    };
+    let Some(stripped) = strip_profile_block(&existing) else {
+        return Ok(false);
+    };
+    if stripped.trim().is_empty() {
+        fs::remove_file(path).map_err(|e| mechanism("cannot delete", e))?;
+        return Ok(true);
+    }
+    fs::write(path, stripped).map_err(|e| mechanism("cannot write to", e))?;
+    Ok(true)
 }
 
 /// Append `line` to `path`, creating the file (and any missing parent
@@ -639,6 +776,149 @@ mod tests {
         let contents = fs::read_to_string(scratch.0.join(".bashrc")).expect("read back");
         assert!(contents.contains(PROFILE_MARKER));
         assert!(contents.contains(&format!("export PATH=\"$PATH:{CONSOLE_DIR}\"")));
+    }
+
+    #[test]
+    fn removing_takes_out_our_pair_and_leaves_the_users_lines() {
+        let scratch = scratch();
+        let profile = scratch.0.join(".bashrc");
+        fs::create_dir_all(&scratch.0).expect("home");
+        fs::write(
+            &profile,
+            format!(
+                "export EDITOR=vim\n{PROFILE_MARKER}\nexport PATH=\"$PATH:{CONSOLE_DIR}\"\nalias ll='ls -l'\n"
+            ),
+        )
+        .expect("seed");
+
+        let p = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            "/usr/bin".into(),
+        );
+        let report = p.unregister(&request()).expect("unregister");
+
+        assert!(report.changed);
+        assert_eq!(report.files_written, vec![profile.clone()]);
+        let contents = fs::read_to_string(&profile).expect("read back");
+        assert_eq!(contents, "export EDITOR=vim\nalias ll='ls -l'\n");
+    }
+
+    #[test]
+    fn a_line_the_user_wrote_themselves_is_not_ours_to_delete() {
+        // Same directory, no marker above it: the user put it there by hand, and
+        // "remove from PATH" does not license editing their own line.
+        let scratch = scratch();
+        let profile = scratch.0.join(".bashrc");
+        fs::create_dir_all(&scratch.0).expect("home");
+        let mine = format!("export PATH=\"$PATH:{CONSOLE_DIR}\"\n");
+        fs::write(&profile, &mine).expect("seed");
+
+        let p = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            "/usr/bin".into(),
+        );
+        let report = p.unregister(&request()).expect("unregister");
+
+        assert!(!report.changed);
+        assert_eq!(fs::read_to_string(&profile).expect("read back"), mine);
+    }
+
+    #[test]
+    fn an_emptied_fish_dropin_is_deleted_rather_than_left_behind() {
+        // The drop-in exists only to carry our block, so an empty leftover is
+        // litter in a directory fish reads on every start.
+        let scratch = scratch();
+        let p = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/usr/bin/fish".into()),
+            "/usr/bin".into(),
+        );
+        p.register(&request()).expect("register");
+        let dropin = scratch.0.join(".config/fish/conf.d/netrulerouter.fish");
+        assert!(dropin.exists(), "the drop-in must exist to be removed");
+
+        p.unregister(&request()).expect("unregister");
+        assert!(!dropin.exists(), "an emptied drop-in must not survive");
+    }
+
+    #[test]
+    fn add_then_remove_leaves_the_file_as_it_was() {
+        let scratch = scratch();
+        let profile = scratch.0.join(".bashrc");
+        fs::create_dir_all(&scratch.0).expect("home");
+        let original = "export EDITOR=vim\n";
+        fs::write(&profile, original).expect("seed");
+
+        let p = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            "/usr/bin".into(),
+        );
+        p.register(&request()).expect("register");
+        p.unregister(&request()).expect("unregister");
+
+        assert_eq!(fs::read_to_string(&profile).expect("read back"), original);
+    }
+
+    #[test]
+    fn the_button_state_follows_our_block_not_the_process_path() {
+        // Nothing of ours in the file, so we own nothing — even though the
+        // directory is reachable in this process. That is exactly the state
+        // right after a removal, and the button must not read "remove".
+        let scratch = scratch();
+        let reachable = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            format!("/usr/bin:{CONSOLE_DIR}"),
+        );
+        assert!(!reachable
+            .owned_entry_present(&request())
+            .expect("reachable"));
+
+        // With the directory NOT already on PATH, registering writes our block
+        // and ownership starts.
+        let fresh = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            "/usr/bin".into(),
+        );
+        fresh.register(&request()).expect("register");
+        assert!(fresh.owned_entry_present(&request()).expect("after add"));
+    }
+
+    #[test]
+    fn a_directory_already_on_path_is_never_adopted_as_ours() {
+        // Someone else put it there (a distro package, another tool, the user).
+        // Registering writes nothing — appending a duplicate would be the only
+        // alternative — so we must not then claim we can take it away.
+        let scratch = scratch();
+        let p = UnixPathRegistration::new(
+            scratch.0.clone(),
+            Some("/bin/bash".into()),
+            format!("/usr/bin:{CONSOLE_DIR}"),
+        );
+        let report = p.register(&request()).expect("register");
+        assert!(!report.changed, "a duplicate entry must never be appended");
+        assert!(
+            !p.owned_entry_present(&request()).expect("ownership"),
+            "writing nothing cannot make the entry ours"
+        );
+        let removal = p.unregister(&request()).expect("unregister");
+        assert!(
+            !removal.changed,
+            "someone else's entry is not ours to remove"
+        );
+    }
+
+    #[test]
+    fn a_marker_whose_partner_is_gone_does_not_eat_the_next_line() {
+        // Someone deleted our export by hand and left the comment. Removing the
+        // orphan marker must not take an unrelated command with it.
+        let text = format!("{PROFILE_MARKER}\nalias ll='ls -l'\n");
+        let stripped = strip_profile_block(&text).expect("marker present");
+        assert_eq!(stripped, "alias ll='ls -l'\n");
     }
 
     #[test]

@@ -322,10 +322,7 @@ mod tests {
     fn addresses_and_the_smallest_ttl_come_back() {
         let message = response(
             7,
-            &[
-                a_record(300, [93, 184, 216, 34]),
-                a_record(60, [1, 2, 3, 4]),
-            ],
+            &[a_record(300, [23, 10, 20, 138]), a_record(60, [1, 2, 3, 4])],
             0,
         );
 
@@ -334,7 +331,7 @@ mod tests {
         assert_eq!(
             answer,
             DnsAnswer::Addresses {
-                addresses: vec![Ipv4Addr::new(93, 184, 216, 34), Ipv4Addr::new(1, 2, 3, 4)],
+                addresses: vec![Ipv4Addr::new(23, 10, 20, 138), Ipv4Addr::new(1, 2, 3, 4)],
                 // The answer is only good while its shortest-lived record is.
                 min_ttl: 60,
             }

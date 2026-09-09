@@ -198,6 +198,28 @@ impl PrimaryStallRegistry {
             .map_or(PrimaryBehavior::Unknown, Tally::behavior)
     }
 
+    /// Verdict for `hostname` AND everything under it, merged.
+    ///
+    /// A rule is written as a suffix, so it carries the whole subtree — and
+    /// asking only about the bare name answers a narrower question than the
+    /// rule poses. A domain whose apex answers while two of its names are cut
+    /// is not a domain the main link carries.
+    ///
+    /// Merging follows [`PrimaryBehavior::merge`]'s rule, which the companion
+    /// ledger already applies to a suffix proposal: one failing member makes
+    /// the whole offer failing, and only unanimity the other way makes it work.
+    #[must_use]
+    pub fn behavior_of_subtree(&self, hostname: &str) -> PrimaryBehavior {
+        let suffix = format!(".{hostname}");
+        self.hosts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(host, _)| *host == hostname || host.ends_with(&suffix))
+            .map(|(_, tally)| tally.behavior())
+            .fold(PrimaryBehavior::Unknown, PrimaryBehavior::merge)
+    }
+
     /// Hosts currently judged to stall, newest sighting first. The diagnostic
     /// answer to "what is not opening right now".
     #[must_use]
@@ -342,6 +364,37 @@ mod tests {
             .note("host.example", PrimaryHealthEvent::Completed)
             .expect("verdict changed");
         assert_eq!(mixed.behavior, PrimaryBehavior::Unknown);
+    }
+
+    /// A rule is written as a suffix, so the question it poses is about the
+    /// whole subtree. The field case: the apex and `www` answered while two
+    /// other names under the domain were cut, and asking only about the apex
+    /// would have called that domain healthy.
+    #[test]
+    fn a_domain_is_judged_by_everything_under_it() {
+        let reg = PrimaryStallRegistry::new();
+        reg.note("talk.example", PrimaryHealthEvent::Completed);
+        reg.note("www.talk.example", PrimaryHealthEvent::Completed);
+        assert_eq!(
+            reg.behavior_of_subtree("talk.example"),
+            PrimaryBehavior::Responds,
+        );
+
+        stall(&reg, "forum.talk.example", 3).expect("stalls");
+        assert_eq!(
+            reg.behavior_of_subtree("talk.example"),
+            PrimaryBehavior::Stalls,
+            "one cut name settles the domain",
+        );
+        // The bare name is unchanged — the two questions are different.
+        assert_eq!(reg.behavior_of("talk.example"), PrimaryBehavior::Responds,);
+        // And a neighbour that merely ENDS with the same letters is not under
+        // it: only a dot-separated label boundary counts.
+        stall(&reg, "nottalk.example", 3).expect("stalls");
+        assert_eq!(
+            reg.behavior_of_subtree("anything.example"),
+            PrimaryBehavior::Unknown
+        );
     }
 
     #[test]

@@ -279,7 +279,7 @@ function pendingOfflineCount(obj) {
 var STABILITY_FIELD_DEFAULTS = {
     "verbose-logging": false,
     "conn-trace-ndjson": false,
-    "conn-trace-gui": false,
+    "conn-trace-gui": true,
     "rule-scope-service-driven": true,
     "routing-stop-policy": "teardown",
     "cache-refresh-interval-secs": 300,
@@ -999,6 +999,16 @@ function autoRuleRowConsumers(row) {
     return [{ "hostname": anchor, "route": String(row.route || "") }]
 }
 
+// Whose name the offer is, as three states. The service omits the field when
+// the offer has no anchor site to be third-party TO, and collapsing that to
+// `false` is what made an ad host read as one of the site's own names.
+// `undefined` -- the question was not posed.
+function autoRuleRowThirdParty(row) {
+    var raw = row["third-party"] !== undefined ? row["third-party"] : row.thirdParty
+    if (raw === undefined || raw === null) return undefined
+    return raw === true
+}
+
 // Merge `autorules.candidates.list` + `autorules.dismissed.list` rows into
 // domain groups, one pass over each input array. Computed ONCE by the caller
 // (a property binding keyed on the two source arrays) and read as plain data
@@ -1015,6 +1025,45 @@ function autoRuleRowConsumers(row) {
 /// decisions look like a screen of forty. `showDismissed` false keeps only the
 /// groups that still hold something pending, and hides the answered hosts
 /// inside them.
+/// Split off the hosts the main route already serves.
+///
+/// The service withholds these from the tray and marks them here. They are not
+/// wrong — they are just not work: the site pulling them reaches them without a
+/// tunnel. Shown behind a toggle rather than dropped, so the answer to "why
+/// isn't this host in the list" is visible instead of absent.
+///
+/// A group whose hosts are ALL served disappears from the main list; a mixed
+/// group keeps the hosts that still carry a question.
+function filterAutoRuleGroupsServedByMainLink(groups, showServed) {
+    if (showServed) return groups || []
+    var out = []
+    for (var i = 0; i < (groups || []).length; i += 1) {
+        var g = groups[i]
+        if (!g) continue
+        var hosts = []
+        for (var h = 0; h < (g.hosts || []).length; h += 1) {
+            if (g.hosts[h] && g.hosts[h].servedByMainLink !== true) hosts.push(g.hosts[h])
+        }
+        if (hosts.length === 0) continue
+        var copy = Object.assign({}, g)
+        copy.hosts = hosts
+        out.push(copy)
+    }
+    return out
+}
+
+/// How many hosts the toggle above is hiding.
+function countAutoRuleHostsServedByMainLink(groups) {
+    var n = 0
+    for (var i = 0; i < (groups || []).length; i += 1) {
+        var hosts = (groups[i] || {}).hosts || []
+        for (var h = 0; h < hosts.length; h += 1) {
+            if (hosts[h] && hosts[h].servedByMainLink === true) n += 1
+        }
+    }
+    return n
+}
+
 function filterAutoRuleGroupsByStatus(groups, showDismissed) {
     if (showDismissed) return groups || []
     var out = []
@@ -1078,6 +1127,9 @@ function groupAutoRuleRows(candidates, dismissed) {
             primaryBehavior: String(row["primary-behavior"] || row.primaryBehavior || ""),
             anchorRefusesMainLink: (row["anchor-refuses-main-link"] === true)
                 || (row.anchorRefusesMainLink === true),
+            servedByMainLink: (row["served-by-main-link"] === true)
+                || (row.servedByMainLink === true),
+            thirdParty: autoRuleRowThirdParty(row),
             observedMembers: (row["observed-members"] || row.observedMembers || []).map(String),
             timestampMs: ts
         })

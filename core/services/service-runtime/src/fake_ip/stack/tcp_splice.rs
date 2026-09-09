@@ -65,7 +65,8 @@ impl FakeIpStack {
         let handle = self.sockets.add(socket);
 
         self.health.record_tcp_relay_flow_opened();
-        let shared = FlowShared::new(Arc::clone(&self.waker));
+        let shared =
+            FlowShared::for_flow(Arc::clone(&self.waker), Arc::clone(&self.ready), packet.key);
         spawn_dial_worker(
             Arc::clone(&shared),
             Arc::clone(&self.dialer),
@@ -74,6 +75,7 @@ impl FakeIpStack {
             Arc::clone(&self.health),
             Arc::clone(&self.instant_rst),
         );
+        self.ready.mark(packet.key);
         self.flows.insert(
             packet.key,
             FlowConn {
@@ -86,12 +88,36 @@ impl FakeIpStack {
         let _ = now_ms;
     }
 
-    /// Move bytes between every socket and its upstream, then reap finished flows.
+    /// Move bytes between the sockets with work and their upstreams, then reap
+    /// finished flows.
+    ///
+    /// Only the flows something happened to are visited — an inbound packet or
+    /// a worker marks them (see `ReadyFlows`). Every `FLOW_SWEEP_INTERVAL_MS`
+    /// the whole map is visited regardless, which is what makes the marking an
+    /// optimisation rather than a correctness dependency: `smoltcp` can close a
+    /// flow on its own idle or keep-alive timeout, and nobody marks that.
     // `pub(super)` because the impl is split across files and the caller
     // is now another module.
-    pub(super) fn service_flows(&mut self) {
+    pub(super) fn service_flows(&mut self, now_ms: u64) {
+        let sweep_due = now_ms.saturating_sub(self.last_flow_sweep_ms) >= FLOW_SWEEP_INTERVAL_MS;
+        let keys: Vec<FlowKey> = if sweep_due {
+            self.last_flow_sweep_ms = now_ms;
+            self.ready.clear();
+            self.flows.keys().copied().collect()
+        } else {
+            self.ready.take()
+        };
+
         let mut finished = Vec::new();
-        for (key, flow) in &mut self.flows {
+        // Flows whose next move needs another step: the RST queued below is only
+        // dispatched by the following poll, and no packet or worker will ask for
+        // that step.
+        let mut revisit = Vec::new();
+        for key in keys {
+            let Some(flow) = self.flows.get_mut(&key) else {
+                continue;
+            };
+            self.health.record_flow_serviced();
             let socket = self.sockets.get_mut::<tcp::Socket>(flow.handle);
 
             // The dial worker gave up: reset the client instead of stalling it.
@@ -100,11 +126,12 @@ impl FakeIpStack {
             if flow.shared.dial_has_failed() && !flow.abort_sent {
                 socket.abort();
                 flow.abort_sent = true;
+                revisit.push(key);
                 continue;
             }
             if flow.abort_sent {
                 flow.shared.mark_dead();
-                finished.push(*key);
+                finished.push(key);
                 continue;
             }
 
@@ -152,6 +179,7 @@ impl FakeIpStack {
             {
                 socket.abort();
                 flow.abort_sent = true;
+                revisit.push(key);
                 continue;
             }
             // Upstream is done and drained: mirror its close to the client once.
@@ -166,8 +194,13 @@ impl FakeIpStack {
 
             if socket.state() == tcp::State::Closed {
                 flow.shared.mark_dead();
-                finished.push(*key);
+                finished.push(key);
             }
+        }
+
+        for key in revisit {
+            self.ready.mark(key);
+            self.waker.wake();
         }
 
         for key in finished {

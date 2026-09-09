@@ -1537,28 +1537,20 @@ impl RelayDatagram for DeadSendDatagram {
 /// Upstream that accepts datagrams but whose reader dies at once — the
 /// Windows shape: `send` keeps succeeding after an ICMP port-unreachable,
 /// only `recv` reports the reset.
-#[derive(Default)]
-struct DeadReadDatagram {
-    read_failed: Arc<std::sync::atomic::AtomicBool>,
-}
+struct DeadReadDatagram;
 
 impl RelayDatagram for DeadReadDatagram {
     fn send(&self, payload: &[u8]) -> Result<usize, RelayError> {
         Ok(payload.len())
     }
     fn receive(&self, _buffer: &mut [u8]) -> Result<usize, RelayError> {
-        self.read_failed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         Err(RelayError::Upstream {
             detail: "connection reset by peer".to_string(),
         })
     }
 }
 
-#[derive(Default)]
-struct DeadReadDialer {
-    read_failed: Arc<std::sync::atomic::AtomicBool>,
-}
+struct DeadReadDialer;
 
 impl RelayDialer for DeadReadDialer {
     fn connect_tcp(
@@ -1573,9 +1565,7 @@ impl RelayDialer for DeadReadDialer {
         &self,
         _target: &super::super::dialer::UpstreamTarget,
     ) -> Result<Box<dyn RelayDatagram>, RelayError> {
-        Ok(Box::new(DeadReadDatagram {
-            read_failed: Arc::clone(&self.read_failed),
-        }))
+        Ok(Box::new(DeadReadDatagram))
     }
 }
 
@@ -1602,7 +1592,7 @@ fn client_bound_after_udp_datagrams(
     dialer: Arc<dyn RelayDialer>,
     health: &Arc<super::super::health::FakeIpHealth>,
     datagrams: usize,
-    ready_for_next: &dyn Fn() -> bool,
+    ready_for_next: &dyn Fn(&FakeIpStack) -> bool,
 ) -> Vec<Vec<u8>> {
     use nrr_platform_api::fake_ip::{FakeIpAllocator, FakeIpScope};
 
@@ -1675,7 +1665,7 @@ fn client_bound_after_udp_datagrams(
         now_ms += 5;
         let t = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
         client.poll(t, &mut client_device, &mut client_sockets);
-        if sent < datagrams && (sent == 0 || ready_for_next()) {
+        if sent < datagrams && (sent == 0 || ready_for_next(&stack)) {
             let socket = client_sockets.get_mut::<udp::Socket>(handle);
             if socket.can_send() {
                 socket
@@ -1722,7 +1712,7 @@ fn a_refused_udp_dial_tells_the_client_the_port_is_unreachable() {
         Arc::new(dialer) as Arc<dyn RelayDialer>,
         &health,
         1,
-        &|| true,
+        &|_| true,
     );
 
     assert!(
@@ -1740,7 +1730,7 @@ fn a_dead_udp_upstream_retires_the_client_and_reports_unreachable() {
         Arc::new(DeadSendDialer) as Arc<dyn RelayDialer>,
         &health,
         1,
-        &|| true,
+        &|_| true,
     );
 
     assert!(
@@ -1754,7 +1744,7 @@ fn a_dead_udp_upstream_retires_the_client_and_reports_unreachable() {
 #[test]
 fn a_hard_read_error_marks_the_udp_flow_dead() {
     let replies = UdpReplies::new(StackWaker::new());
-    let worker = spawn_udp_reader(Arc::new(DeadReadDatagram::default()), Arc::clone(&replies));
+    let worker = spawn_udp_reader(Arc::new(DeadReadDatagram), Arc::clone(&replies));
     worker.join().expect("reader thread");
     assert!(
         replies.is_dead(),
@@ -1767,27 +1757,193 @@ fn a_client_whose_reader_died_is_retired_instead_of_kept_forever() {
     // `send` on this upstream never fails, so the old code refreshed
     // `last_seen_at` on every datagram and the idle reap never came.
     let health = Arc::new(super::super::health::FakeIpHealth::new());
-    let read_failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let dialer = DeadReadDialer {
-        read_failed: Arc::clone(&read_failed),
-    };
+    let probe = Arc::clone(&health);
     let _ = client_bound_after_udp_datagrams(
-        Arc::new(dialer) as Arc<dyn RelayDialer>,
+        Arc::new(DeadReadDialer) as Arc<dyn RelayDialer>,
         &health,
         2,
-        // Send the second datagram only once the reader has actually
-        // failed — otherwise it races a flow that is still alive.
-        &|| {
-            if !read_failed.load(std::sync::atomic::Ordering::SeqCst) {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-            true
-        },
+        // Send the second datagram only once the dead flow has actually been
+        // reaped. "The reader returned an error" is one store earlier than
+        // that, and sleeping over the gap is what made this test flaky: on a
+        // loaded machine the second datagram still met a live flow, which
+        // takes it and refreshes `last_seen_at` instead of re-dialing.
+        &|stack| probe.udp_dial_ok() >= 1 && stack.udp_binds.is_empty(),
     );
     assert!(
         health.udp_dial_ok() >= 2,
         "the dead flow must be dropped and re-dialed, not kept and fed (dials: {})",
         health.udp_dial_ok()
+    );
+}
+
+// ── The cost of one poll: how many flows does a step visit? ──────────────────
+
+/// Park an idle flow in the stack without dialing anything: a listening socket
+/// plus its shared state, exactly as `maybe_open_flow` leaves a flow whose dial
+/// is still in flight. Enough to be walked by the pump, which is what is being
+/// measured.
+fn park_idle_flow(stack: &mut FakeIpStack, client_port: u16) -> FlowKey {
+    let fake = std::net::Ipv4Addr::new(198, 18, 0, 7);
+    let key = FlowKey {
+        protocol: FlowProtocol::Tcp,
+        source: SocketAddr::from((std::net::Ipv4Addr::new(10, 0, 0, 1), client_port)),
+        destination: SocketAddr::from((fake, 443)),
+    };
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; 1024]),
+        tcp::SocketBuffer::new(vec![0u8; 1024]),
+    );
+    socket
+        .listen(IpListenEndpoint {
+            addr: Some(smoltcp_address(key.destination.ip())),
+            port: key.destination.port(),
+        })
+        .expect("listen");
+    let handle = stack.sockets.add(socket);
+    let shared = FlowShared::for_flow(Arc::clone(&stack.waker), Arc::clone(&stack.ready), key);
+    stack.flows.insert(
+        key,
+        FlowConn {
+            handle,
+            shared,
+            client_close_sent: false,
+            abort_sent: false,
+        },
+    );
+    key
+}
+
+fn idle_stack_with_flows(
+    count: u16,
+    health: &Arc<super::super::health::FakeIpHealth>,
+) -> FakeIpStack {
+    let (device, _state) = open_mock_device();
+    let mut stack = FakeIpStack::new(
+        device,
+        &FakeIpPoolConfig::default(),
+        RelayCore::new(
+            Arc::new(StdMutex::new(
+                nrr_platform_api::fake_ip::FakeIpAllocator::default(),
+            )),
+            nrr_platform_api::fake_ip::FakeIpScope::enabled(Vec::<String>::new()),
+            Arc::new(super::super::relay::StaticUpstreamResolver::new()),
+            Arc::new(super::super::relay::FixedRouteSelector(
+                nrr_shared::RouteRole::Primary,
+            )),
+        ),
+        Arc::new(super::super::dialer::MockRelayDialer::new()),
+        StackWaker::new(),
+    )
+    .with_health(Arc::clone(health));
+    for port in 0..count {
+        park_idle_flow(&mut stack, 40_000 + port);
+    }
+    stack
+}
+
+/// A step must cost the flows it has work for, not the flows that exist. With
+/// 300 parked flows and nothing happening, the pump visits none of them; the
+/// old walk-everything pump visited 300 per step, which is what made a busy
+/// relay pay for every idle connection on the machine.
+#[test]
+fn an_idle_step_visits_no_flows_however_many_are_parked() {
+    const FLOWS: u16 = 300;
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut stack = idle_stack_with_flows(FLOWS, &health);
+    // The first step is the periodic sweep (last sweep at 0), so start after it.
+    stack.step(1).expect("step");
+    let after_sweep = health.tcp_flow_visits();
+
+    for step in 0..100u64 {
+        stack.step(2 + step).expect("step");
+    }
+    assert_eq!(
+        health.tcp_flow_visits(),
+        after_sweep,
+        "100 idle steps over {FLOWS} parked flows must visit none of them",
+    );
+}
+
+/// The sweep is the safety net, and it is the one thing that still costs the
+/// whole map — once a second, not once a packet.
+#[test]
+fn the_periodic_sweep_visits_every_flow() {
+    const FLOWS: u16 = 300;
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut stack = idle_stack_with_flows(FLOWS, &health);
+    stack.step(1).expect("step");
+    let before = health.tcp_flow_visits();
+
+    stack.step(1 + FLOW_SWEEP_INTERVAL_MS).expect("step");
+
+    assert_eq!(
+        health.tcp_flow_visits() - before,
+        u64::from(FLOWS),
+        "the sweep visits every parked flow exactly once",
+    );
+}
+
+/// A flow whose upstream spoke has work even though no packet arrived for it —
+/// the worker says so. Without that the flow would wait for the next sweep, and
+/// a failed dial would sit on the client for up to a second.
+#[test]
+fn a_flow_its_worker_woke_is_serviced_before_the_next_sweep() {
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut stack = idle_stack_with_flows(5, &health);
+    stack.step(1).expect("step");
+    let before = health.tcp_flow_visits();
+
+    let key = *stack.flows.keys().next().expect("a parked flow");
+    stack.flows[&key].shared.signal_dial_failed();
+    stack.step(2).expect("step");
+
+    assert_eq!(
+        health.tcp_flow_visits() - before,
+        1,
+        "exactly the woken flow is visited",
+    );
+    // Aborted on this step, reaped on the next one it asks for itself.
+    stack.step(3).expect("step");
+    assert!(
+        !stack.flows.contains_key(&key),
+        "the failed flow is reaped without waiting for the sweep",
+    );
+}
+
+/// The bench behind the change, kept runnable rather than quoted: 300 parked
+/// flows, 20 000 steps, once servicing only the flows with work and once
+/// sweeping everything each step (what the pump did before). Ignored by
+/// default — it is a measurement, not an assertion.
+///
+/// `cargo test -p nrr-service-runtime --lib the_pump_cost_at_scale -- --ignored --nocapture`
+#[test]
+#[ignore = "measurement, not an assertion"]
+fn the_pump_cost_at_scale() {
+    const FLOWS: u16 = 300;
+    const STEPS: u64 = 20_000;
+
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut stack = idle_stack_with_flows(FLOWS, &health);
+    let started = std::time::Instant::now();
+    for step in 0..STEPS {
+        stack.step(step).expect("step");
+    }
+    let event_driven = started.elapsed();
+    let event_visits = health.tcp_flow_visits();
+
+    let health = Arc::new(super::super::health::FakeIpHealth::new());
+    let mut stack = idle_stack_with_flows(FLOWS, &health);
+    let started = std::time::Instant::now();
+    for step in 0..STEPS {
+        stack.last_flow_sweep_ms = 0;
+        stack.step(FLOW_SWEEP_INTERVAL_MS + step).expect("step");
+    }
+    let walk_everything = started.elapsed();
+
+    eprintln!("{FLOWS} flows x {STEPS} steps");
+    eprintln!("  event-driven:     {event_driven:?} over {event_visits} flow visits");
+    eprintln!(
+        "  walk-everything:  {walk_everything:?} over {} flow visits",
+        health.tcp_flow_visits(),
     );
 }

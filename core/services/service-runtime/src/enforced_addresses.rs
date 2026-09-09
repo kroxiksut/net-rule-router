@@ -98,7 +98,7 @@ mod tests {
     use super::*;
 
     fn ip(d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(172, 64, 154, d)
+        Ipv4Addr::new(203, 0, 113, d)
     }
 
     #[test]

@@ -39,7 +39,7 @@
 //! pending (the mock device already returns promptly, so the neutral logic is
 //! exercised in tests today).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -163,6 +163,44 @@ impl StackWaker {
     }
 }
 
+// ── The flows one step has work for ──────────────────────────────────────────
+
+/// The flows something has happened to since the last poll.
+///
+/// Every flow that could need servicing is put here by whoever caused it — an
+/// inbound packet by the reader, upstream bytes or a closed upstream by that
+/// flow's worker — so a step touches the flows with work instead of walking all
+/// of them. Servicing a flow is cheap; doing it for 300 idle flows on every
+/// packet is not, and the relay sits on the data path.
+///
+/// It is an accelerator, never the authority: a periodic full sweep still
+/// visits everything (see `FLOW_SWEEP_INTERVAL_MS`), so a wake-up that never
+/// arrives costs latency, never a stuck flow.
+#[derive(Default)]
+struct ReadyFlows {
+    keys: Mutex<HashSet<FlowKey>>,
+}
+
+impl ReadyFlows {
+    fn mark(&self, key: FlowKey) {
+        guard(&self.keys).insert(key);
+    }
+
+    /// Take the marked flows, leaving the set empty.
+    fn take(&self) -> Vec<FlowKey> {
+        guard(&self.keys).drain().collect()
+    }
+
+    fn clear(&self) {
+        guard(&self.keys).clear();
+    }
+}
+
+/// How often every flow is visited regardless of wake-ups. Bounds the delay of
+/// anything no wake-up covers — `smoltcp` closing a flow on its own idle or
+/// keep-alive timeout, both of which are measured in tens of seconds.
+const FLOW_SWEEP_INTERVAL_MS: u64 = 1_000;
+
 // ── Per-flow splice buffers ──────────────────────────────────────────────────
 
 /// The shared state between the poll loop and one flow's two upstream workers.
@@ -199,6 +237,10 @@ struct FlowShared {
     writer_cv: Condvar,
     /// Wakes the poll loop when `from_upstream` grows or upstream closed.
     stack_waker: Arc<StackWaker>,
+    /// Which flow to hand the poll loop when this state is woken. Absent when
+    /// the state is driven directly (unit tests), where there is no loop to
+    /// steer.
+    ready: Option<(Arc<ReadyFlows>, FlowKey)>,
     /// Wakes the upstream *reader* parked on a full `from_upstream`. Paired
     /// with that queue's mutex, so the poll loop can drain it while the reader
     /// waits.
@@ -206,7 +248,20 @@ struct FlowShared {
 }
 
 impl FlowShared {
+    /// A flow state with no poll loop to steer — tests that drive one flow
+    /// directly.
+    #[cfg(test)]
     fn new(stack_waker: Arc<StackWaker>) -> Arc<Self> {
+        Self::build(stack_waker, None)
+    }
+
+    /// The production constructor: waking this state also tells the poll loop
+    /// WHICH flow to service.
+    fn for_flow(stack_waker: Arc<StackWaker>, ready: Arc<ReadyFlows>, key: FlowKey) -> Arc<Self> {
+        Self::build(stack_waker, Some((ready, key)))
+    }
+
+    fn build(stack_waker: Arc<StackWaker>, ready: Option<(Arc<ReadyFlows>, FlowKey)>) -> Arc<Self> {
         Arc::new(Self {
             to_upstream: Mutex::new(VecDeque::new()),
             from_upstream: Mutex::new(VecDeque::new()),
@@ -220,7 +275,16 @@ impl FlowShared {
             writer_cv: Condvar::new(),
             reader_cv: Condvar::new(),
             stack_waker,
+            ready,
         })
+    }
+
+    /// Wake the poll loop, naming this flow so the step services it directly.
+    fn wake_poll(&self) {
+        if let Some((ready, key)) = &self.ready {
+            ready.mark(*key);
+        }
+        self.stack_waker.wake();
     }
 
     /// Called by the dial worker: adopt the splice workers and open the
@@ -229,12 +293,12 @@ impl FlowShared {
     fn complete_dial(&self, workers: Vec<JoinHandle<()>>) {
         guard(&self.late_workers).extend(workers);
         self.dial_done.store(true, Ordering::SeqCst);
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     fn signal_dial_failed(&self) {
         self.dial_failed.store(true, Ordering::SeqCst);
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     fn dial_is_done(&self) -> bool {
@@ -262,17 +326,17 @@ impl FlowShared {
 
     fn push_from_upstream(&self, bytes: &[u8]) {
         guard(&self.from_upstream).extend(bytes.iter().copied());
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     fn signal_upstream_eof(&self) {
         self.upstream_eof.store(true, Ordering::SeqCst);
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     fn signal_upstream_reset(&self) {
         self.upstream_reset.store(true, Ordering::SeqCst);
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     fn upstream_was_reset(&self) -> bool {
@@ -287,7 +351,7 @@ impl FlowShared {
         self.dead.store(true, Ordering::SeqCst);
         self.writer_cv.notify_all();
         self.reader_cv.notify_all();
-        self.stack_waker.wake();
+        self.wake_poll();
     }
 
     /// Take up to `max` client bytes for a `smoltcp` send; leaves the rest.
@@ -488,6 +552,9 @@ pub struct FakeIpStack {
     /// Rate limit for the lingering-worker warning below.
     last_graveyard_warn: Option<std::time::Instant>,
     last_capacity_warn: Option<std::time::Instant>,
+    /// Flows with work pending, and when every flow was last visited anyway.
+    ready: Arc<ReadyFlows>,
+    last_flow_sweep_ms: u64,
     /// Reusable MTU-sized landing area for the device read.
     ///
     /// This is the data path: a fresh `vec![0u8; mtu]` per `step()` meant an
@@ -561,6 +628,8 @@ impl FakeIpStack {
             worker_graveyard: Vec::new(),
             last_graveyard_warn: None,
             last_capacity_warn: None,
+            ready: Arc::new(ReadyFlows::default()),
+            last_flow_sweep_ms: 0,
             read_buffer: Vec::new(),
         }
     }
@@ -669,7 +738,12 @@ impl FakeIpStack {
             let buf = self.read_buffer[..read].to_vec();
             if let Some(parsed) = parse_packet(&buf) {
                 match parsed.key.protocol {
-                    FlowProtocol::Tcp => self.maybe_open_flow(&parsed, now_ms),
+                    FlowProtocol::Tcp => {
+                        // The packet is about to move this flow's socket, so it
+                        // is the one flow this step certainly has work for.
+                        self.ready.mark(parsed.key);
+                        self.maybe_open_flow(&parsed, now_ms);
+                    }
                     FlowProtocol::Udp => self.maybe_open_udp(&parsed),
                 }
             }
@@ -681,7 +755,7 @@ impl FakeIpStack {
         // queued client-bound bytes the sockets must now emit.
         let now = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        self.service_flows();
+        self.service_flows(now_ms);
         self.service_udp(now_ms);
         self.sweep_worker_graveyard();
 

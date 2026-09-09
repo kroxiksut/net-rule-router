@@ -21,6 +21,11 @@ impl PerSidApplyOrchestrator {
         rules_override: Option<&ActiveRulesSnapshot>,
         intent: ComputeIntent,
     ) -> Result<ComputedFilterSet, OrchestratorError> {
+        // The pass that dominates the periodic path (67% of it, measured) is
+        // this one, and "2.8 s" is not something anyone can act on. Same
+        // treatment as the recompute hook that calls it: the pass says which of
+        // its parts spent the time, and only when it was slow.
+        let mut timings = crate::phase_timings::PhaseTimings::start();
         if sid.is_empty() {
             return Err(OrchestratorError::EmptySid);
         }
@@ -55,6 +60,7 @@ impl PerSidApplyOrchestrator {
         // against the connection the live DNS observation path writes to. It
         // also means the pass now sees ONE state of the cache instead of a
         // slightly newer one at every lookup.
+        timings.mark("policy");
         let cache_snapshot = self.fqdn_cache.snapshot_for_compute();
         let fqdn_cache: &dyn crate::fqdn_cache_lookup::FqdnCacheLookup = match &cache_snapshot {
             Some(snapshot) => snapshot,
@@ -65,6 +71,7 @@ impl PerSidApplyOrchestrator {
         // possible), so a storage read here would still see the PREVIOUS
         // revision. The dispatcher passes the revision content it is applying;
         // every other caller reads the active pointer as before.
+        timings.mark("cache");
         let rules = match rules_override
             .cloned()
             .or_else(|| self.rules_provider.active_rules_for(sid))
@@ -121,6 +128,7 @@ impl PerSidApplyOrchestrator {
             }
         }
 
+        timings.mark("rules");
         // swap: route the policy's behaviour-mode through the codegen.
         let behavior_mode = behavior_mode_for_codegen(&policy, rules.behavior_mode);
         // shared-IP denylist from the SAME enforcement rule
@@ -138,6 +146,7 @@ impl PerSidApplyOrchestrator {
         // appended after codegen. The context is resolved
         // LIVE for this compute; a `None` / disabled context is a no-op, so the
         // non-fake-IP path is byte-for-byte unchanged.
+        timings.mark("census");
         let fake_ip_context = (self.fake_ip_context)();
         // Fake-IP UDP relay — process-wide live flag, read fresh on
         // every compute (mirrors how the fake-IP context itself is resolved
@@ -171,6 +180,7 @@ impl PerSidApplyOrchestrator {
             crate::vpn_client_registry::global_confirmed_vpn_clients()
                 .publish(sid, &policy.link_provider_exe_paths);
         }
+        timings.mark("fake-ip");
         let mut codegen_out = generate_filters(CodegenInput {
             sid,
             rule_book: &rules.rule_book,
@@ -182,7 +192,10 @@ impl PerSidApplyOrchestrator {
             zone_priority_over_ip: false,
         });
         // Shadow-compare the neutral pipeline against the live one, BEFORE the
-        // fake-IP augmentation is folded in (the planner does not model it yet).
+        // fake-IP augmentation is folded in — not because the planner cannot
+        // model it (`plan_fake_ip_pool` does), but because at this point the
+        // live set does not carry it either, and both sides must be read at the
+        // same moment.
         // Compares only, never applies: the point of this step is to learn on
         // real traffic whether the two agree, while the path that actually
         // enforces stays exactly as it was.
@@ -190,10 +203,12 @@ impl PerSidApplyOrchestrator {
         // Guarded rather than stubbed off-Windows: there is no WFP filter set to
         // compare against there, and a no-op body would read as "checked, agreed".
         #[cfg(windows)]
-        self.shadow_compare_neutral_plan(
+        let _ = self.shadow_compare_neutral_plan(
             sid,
             behavior_mode,
             &rules.rule_book,
+            fqdn_cache,
+            &secondary_ip_denylist,
             &codegen_out.filters,
         );
         if let Some(aug) = fake_ip_augmentation {
@@ -343,6 +358,7 @@ impl PerSidApplyOrchestrator {
         {
             status.set_unresolved(unresolved_apps.clone());
         }
+        timings.mark("codegen");
         let mut filters = codegen_out.filters;
         // Reactive VPN-endpoint learning — every kill-switch/fail-closed BLOCK
         // filter spec id emitted for THIS sid below is collected here (rule
@@ -439,15 +455,44 @@ impl PerSidApplyOrchestrator {
                 .as_ref()
                 .map(|provider| provider())
                 .unwrap_or_default();
-            let exempt_patterns: Vec<String> = {
+            // The three sources that mean "this IS a tunnel client": a built-in
+            // VPN pattern resolved to it, the user confirmed it as their link
+            // provider, or our own kill-switch drop verified its role. Their
+            // install trees join the exemption — see
+            // `tunnel_client_tree_exempt_paths` for why one binary is not the
+            // client. `primary_app_patterns` is deliberately NOT among them:
+            // an app the user routes to the main link is not a tunnel client.
+            let recognised_clients: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
                 codegen_out
                     .vpn_default_exempt_paths
                     .iter()
                     .cloned()
-                    .chain(codegen_out.primary_app_patterns.iter().cloned())
                     .chain(policy.link_provider_exe_paths.iter().cloned())
-                    .chain(learned_vpn_client_paths)
+                    .chain(learned_vpn_client_paths.iter().cloned())
+                    .filter(|p| seen.insert(p.to_ascii_lowercase()))
+                    .collect()
+            };
+            let client_tree_paths = crate::killswitch_codegen::tunnel_client_tree_exempt_paths(
+                self.app_resolver.as_ref(),
+                &recognised_clients,
+            );
+            if !client_tree_paths.is_empty() {
+                tracing::debug!(
+                    target: "nrr::per_sid_orchestrator",
+                    sid,
+                    clients = recognised_clients.len(),
+                    tree_paths = client_tree_paths.len(),
+                    "tunnel clients' install trees joined the fail-closed exemption — the transport process is not the binary we resolved",
+                );
+            }
+            let exempt_patterns: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                recognised_clients
+                    .iter()
+                    .cloned()
+                    .chain(client_tree_paths)
+                    .chain(codegen_out.primary_app_patterns.iter().cloned())
                     .filter(|p| seen.insert(p.to_ascii_lowercase()))
                     .collect()
             };
@@ -456,8 +501,8 @@ impl PerSidApplyOrchestrator {
             // on a direct (non-rule) hostname is removed from the kill-switch
             // pin/block set: IP-level blocking cannot separate co-tenants, and
             // the 0719 HW run showed strict pinning of Google front-end IPs
-            // (shared by gemini/youtube secondary rules and www.google.com)
-            // killing google.com in every browser — plus the VPN client's own
+            // (shared by gemini/video-site secondary rules and www.search.example)
+            // killing search.example in every browser — plus the VPN client's own
             // bootstrap. The trade-off is explicit: while excluded, those IPs
             // are not leak-protected (secondary-rule traffic to them can egress
             // the primary when the secondary is down). `strict` restores the
@@ -578,7 +623,7 @@ impl PerSidApplyOrchestrator {
             // - Fake-IP EFFECTIVE → subtract only the IPs actually PINNED this
             //   compute (`ks_dest_ips`, the  relaxation). A
             //   census-shared IP the smart kill-switch declined to pin stays
-            //   exemptible, so its direct co-tenant (workspace.google.com
+            //   exemptible, so its direct co-tenant (workspace.search.example
             //   sharing a front-end IP with a secondary rule host) is not
             //   blocked to death on a link that carries nothing. Safe ONLY
             //   because the rule host itself is still enforced BY NAME: the
@@ -589,7 +634,7 @@ impl PerSidApplyOrchestrator {
             //   datapath is down) → strict subtraction of ALL secondary
             //   destination IPs, census-shared included. The IP pin/block set is
             //   then the ONLY enforcement, and an exempted shared IP is a real
-            //   leak, not a side channel: 39 connections to chatgpt.com
+            //   leak, not a side channel: 39 connections to assistant.example
             //   front-ends (rule host fail-closed) once egressed the primary in
             //   ~10 minutes through exactly this hole, because chatgpt's IPs are
             //   census-shared with direct hosts.
@@ -597,7 +642,7 @@ impl PerSidApplyOrchestrator {
             //   One carve-out: an address whose direct tenant a MAIN-route rule
             //   claims. Blocking it cannot divert that tenant into the tunnel —
             //   the user's own rule sends it the other way — so the block only
-            //   kills it (google.com against a named `aistudio.google.com` on
+            //   kills it (search.example against a named `aistudio.search.example` on
             //   the shared front-end). Two rules of the user's own contradict
             //   each other on one address; honouring the main-route one costs a
             //   possible leak of the other while the link is down, and honouring
@@ -606,7 +651,7 @@ impl PerSidApplyOrchestrator {
             //   opposite trade.
             //
             // The smart PIN partition above stays smart in BOTH modes —
-            // re-pinning shared IPs is what killed google.com in the 0719 run;
+            // re-pinning shared IPs is what killed search.example in the 0719 run;
             // only the exemption subtraction tightens. A fake-IP transition
             // triggers an immediate replan (the settings write hook on
             // toggle/mode flips, the datapath watchdog on health flips), so
@@ -667,6 +712,7 @@ impl PerSidApplyOrchestrator {
                 |resolution: &crate::killswitch_codegen::KillSwitchResolution| {
                     FailClosedExemptions {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                         local_subnets: resolution.local_subnets.clone(),
                         primary_dest_ips: known_primary_dest_ips.clone(),
                         known_direct_ips: self
@@ -744,6 +790,7 @@ impl PerSidApplyOrchestrator {
                             block_all_armed = false;
                             let exemptions = FailClosedExemptions {
                                 bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                                foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                                 local_subnets: resolution.local_subnets.clone(),
                                 // Inert here — this branch calls fail_closed_filters
                                 // with block_all=false (per-IP path), which ignores
@@ -868,7 +915,7 @@ impl PerSidApplyOrchestrator {
                         // off-tunnel flow while the tunnel is UP, and that
                         // includes the VPN client's own primary-side control
                         // traffic (server handshake, connectivity checks
-                        // against ROTATING provider IPs — the hidemy.name 72 s
+                        // against ROTATING provider IPs — the swiftvpn 72 s
                         // hang-per-drop class). The client's egress IS the
                         // tunnel's transport, so the app exemption set is
                         // emitted here too — proactively, at arming — not only
@@ -933,7 +980,7 @@ impl PerSidApplyOrchestrator {
                         // to pin stays exemptible (its direct co-tenant remains
                         // reachable on the primary); with fake-IP off the strict base
                         // keeps it blocked — this exemption was the exact egress path
-                        // of the  chatgpt.com leak.
+                        // of the  assistant.example leak.
                         if let Some(registry) = self.known_direct.as_ref() {
                             exemptions.known_direct_ips = registry
                                 .snapshot()
@@ -1080,6 +1127,7 @@ impl PerSidApplyOrchestrator {
                 }
             }
         }
+        timings.mark("kill-switch");
         // leak-guard disarmed ⇒ reset the posture latch so a
         // later re-arm logs at full level again (recorded silently).
         if !leak_guard_armed {
@@ -1089,6 +1137,7 @@ impl PerSidApplyOrchestrator {
                 if let Some(resolution) = (self.kill_switch_resolver)(sid) {
                     let exemptions = FailClosedExemptions {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                         local_subnets: resolution.local_subnets.clone(),
                         primary_dest_ips: Vec::new(),
                         allow_dns_over_primary: false,
@@ -1116,7 +1165,7 @@ impl PerSidApplyOrchestrator {
         // DoH/DoT lockdown. Independent of the kill-switch pins
         // above: block browser DNS-over-HTTPS to the resolver set (443/IP) + DNS-
         // over-TLS globally (853) so the observer sees plaintext DNS again (the
-        // dzen.ru blind-spot class). Applied when enabled AND in scope — always,
+        // plaintext-DNS blind-spot class). Applied when enabled AND in scope — always,
         // or (the default) only while the kill-switch master toggle is on ("only
         // under leak protection"). The blocks sit in their own weight band above
         // rule permits but below the exemptions, so they never break the tunnel or
@@ -1164,6 +1213,33 @@ impl PerSidApplyOrchestrator {
         // every session and said nothing about the rest of it.
         const STANDING_FILTER_ALARM: usize = 3200;
         if intent.publishes() {
+            // What the standing set is MADE OF, whatever its size. The alarm
+            // only speaks above the line, and by then the composition is
+            // history: this is the line that says which emitter grew, and when.
+            // Debug, and deduped on the breakdown itself — a recompute that
+            // changes nothing has nothing to report.
+            let breakdown = crate::wfp_bands::render_standing_volume(&filters);
+            let changed = {
+                let mut seen = self
+                    .standing_volume_last
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                seen.get(sid) != Some(&breakdown) && {
+                    seen.insert(sid.to_string(), breakdown.clone());
+                    true
+                }
+            };
+            if changed {
+                tracing::debug!(
+                    target: "nrr::per_sid_orchestrator",
+                    sid,
+                    filters = filters.len(),
+                    by_band = %breakdown,
+                    "standing WFP filter set changed composition",
+                );
+            }
+        }
+        if intent.publishes() {
             let mut alarmed = self
                 .standing_volume_alarmed
                 .lock()
@@ -1181,6 +1257,12 @@ impl PerSidApplyOrchestrator {
                     filters = filters.len(),
                     previous_peak = previous,
                     threshold = STANDING_FILTER_ALARM,
+                    // A total says a number is high and nothing about who
+                    // produced it. The first packed run measured 2260 with the
+                    // kill switch at 176 and DoH at 34 — the remaining ~2000
+                    // were the rule band, and finding that out took a hand
+                    // count.
+                    by_band = %crate::wfp_bands::render_standing_volume(&filters),
                     "standing WFP filter volume above the alarm line and still rising — packing regression? Alarm only: dropping guards would trade the BFE crash for a leak",
                 );
             } else if filters.len() <= STANDING_FILTER_ALARM && alarmed.remove(sid).is_some() {
@@ -1202,6 +1284,12 @@ impl PerSidApplyOrchestrator {
             self.note_machine_wide_cut(sid, block_all_armed || ipv6_cut_wanted);
             self.update_killswitch_registry(sid, killswitch_block_ids);
         }
+        timings.mark("publish");
+        crate::phase_timings::report_if_slow(
+            &timings,
+            "compute-filters",
+            std::time::Duration::from_secs(1),
+        );
         Ok(ComputedFilterSet::Install(ComputedPlan {
             filters,
             unresolved_apps,

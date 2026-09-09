@@ -31,6 +31,7 @@ use nrr_domain::merge::{
     MergePolicy, MergeResult, MergedRuleEntry,
 };
 use nrr_domain::preset_canonicalize::canonicalize_preset_rules;
+use nrr_domain::review::SubdomainCoverage;
 use nrr_domain::rules_file::{parse_rules_file, HostPlatform};
 use nrr_domain::rules_json_codec;
 use nrr_domain::rules_revision::RulesRevisionContent;
@@ -119,6 +120,23 @@ impl ProductionMergePreviewSource {
         Self { conn }
     }
 
+    /// The caller's own subdomain-coverage setting, which decides whether `x`
+    /// and `*.x` pair as one rule. Read for the CALLING principal even when the
+    /// rules read through to the baseline — same rule as the enforcement read
+    /// path in [`crate::production_rules_provider`]. A storage error degrades
+    /// to `Off`: the narrower pairing reports the two forms separately, which
+    /// is wrong-but-visible rather than a silent fold.
+    fn coverage(&self, principal: &str) -> SubdomainCoverage {
+        match self.conn.lock() {
+            Ok(guard)
+                if crate::production_rules_provider::include_subdomains_for(&guard, principal) =>
+            {
+                SubdomainCoverage::On
+            }
+            _ => SubdomainCoverage::Off,
+        }
+    }
+
     /// Resolve the caller's active [`CanonicalRuleBook`] (per-SID read-through
     /// to baseline). No active revision anywhere ⇒ an empty book.
     fn service_book(&self, principal: &str) -> Result<CanonicalRuleBook, MergePreviewError> {
@@ -185,6 +203,7 @@ impl MergePreviewSource for ProductionMergePreviewSource {
             policy_domain,
             &resolution_map,
             &keep_secondary,
+            self.coverage(principal),
         );
 
         to_result_dto(result, request.policy)
@@ -425,6 +444,79 @@ mod tests {
             .expect("insert candidate");
         repo.mark_apply_succeeded_for(principal, revision_id, None, 1)
             .expect("activate");
+    }
+
+    fn domain_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+        CanonicalRule {
+            id: RuleId(id.to_string()),
+            enabled: true,
+            address_match: Some(m),
+            app_match: None,
+            comment: String::new(),
+            action: nrr_domain::RuleAction::Route,
+            origin: None,
+        }
+    }
+
+    fn set_include_subdomains(conn: &Arc<Mutex<Connection>>, sid: &str, on: bool) {
+        let g = conn.lock().unwrap();
+        g.execute(
+            "INSERT INTO secondary_block_policy
+                (sid, block_secondary_when_unavailable, kill_switch_fail_closed,
+                 kill_switch_protocols, include_subdomains, updated_at)
+             VALUES (?1, 1, 1, 127, ?2, ?3)",
+            rusqlite::params![sid, on as i64, 1_700_000_000_i64],
+        )
+        .expect("seed policy");
+    }
+
+    /// The caller's own subdomain-coverage setting decides the pairing: with it
+    /// on (the default), a file saying `*.proflcdn.test` and a revision saying
+    /// `proflcdn.test` are one rule, and the merge has nothing to reconcile.
+    #[test]
+    fn the_two_spellings_of_one_domain_are_one_rule_when_coverage_is_on() {
+        let conn = open_state_db_in_memory();
+        seed_active_revision_for(
+            &conn,
+            nrr_storage::BASELINE_PRINCIPAL,
+            CanonicalRuleBook {
+                primary: CanonicalRuleSet::from_rules(vec![domain_rule(
+                    "r-9",
+                    CanonicalAddressMatch::ExactFqdn("proflcdn.test".to_string()),
+                )]),
+                secondary: CanonicalRuleSet::from_rules(vec![]),
+            },
+        );
+        let source = ProductionMergePreviewSource::new(Arc::clone(&conn));
+        let request = || MergePreviewInput {
+            primary_text: "--- DOMAINS
+*.proflcdn.test
+",
+            secondary_text: "",
+            policy: MergePolicyDto::Union,
+            resolutions: &[],
+            keep_secondary: &[],
+            include_child_processes: false,
+        };
+
+        let on = source
+            .merge_preview(nrr_storage::BASELINE_PRINCIPAL, request())
+            .expect("merge preview");
+        assert!(
+            on.file_only.is_empty(),
+            "the file spelling is not a new rule"
+        );
+        assert!(on.service_only.is_empty());
+        assert!(on.conflicts.is_empty());
+
+        // Positive control: with the setting off the two spellings enforce
+        // different traffic, and the merge says so.
+        set_include_subdomains(&conn, nrr_storage::BASELINE_PRINCIPAL, false);
+        let off = source
+            .merge_preview(nrr_storage::BASELINE_PRINCIPAL, request())
+            .expect("merge preview");
+        assert_eq!(off.file_only.len(), 1);
+        assert_eq!(off.service_only.len(), 1);
     }
 
     #[test]

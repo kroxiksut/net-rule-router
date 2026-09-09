@@ -359,6 +359,71 @@ pub struct AdapterMonitor {
     // Per-adapter debounce state, keyed by ifindex.
     confirmed: std::sync::Mutex<HashMap<u32, ConfirmedEntry>>,
     pending: std::sync::Mutex<HashMap<u32, (AdapterAvailability, u64)>>,
+    // Which identity each connection name last carried, and which name each
+    // identity last answered to — see `note_identity_drift`.
+    identity_seen: std::sync::Mutex<IdentityLedger>,
+}
+
+/// Bounded name-to-identity memory behind [`AdapterMonitor::note_identity_drift`].
+///
+/// Two maps rather than one because the two drifts are different facts and a
+/// reader needs to know WHICH happened. Bounded and insertion-ordered: a client
+/// that creates a fresh adapter per connect would otherwise grow this without
+/// end, and the oldest pairing is the one least likely to still matter.
+#[derive(Default)]
+struct IdentityLedger {
+    id_of_name: HashMap<String, String>,
+    name_of_id: HashMap<String, String>,
+    order: std::collections::VecDeque<(String, String)>,
+}
+
+/// How many (name, identity) pairings the drift ledger remembers.
+const IDENTITY_LEDGER_CAP: usize = 64;
+
+impl IdentityLedger {
+    /// Record a pairing, evicting the oldest once the cap is reached.
+    fn remember(&mut self, name: String, id: String) {
+        let already = self.id_of_name.get(&name) == Some(&id);
+        self.id_of_name.insert(name.clone(), id.clone());
+        self.name_of_id.insert(id.clone(), name.clone());
+        if already {
+            return;
+        }
+        self.order.push_back((name, id));
+        while self.order.len() > IDENTITY_LEDGER_CAP {
+            if let Some((old_name, old_id)) = self.order.pop_front() {
+                // Only drop what still points at the evicted pairing: a name
+                // reused under a newer identity must keep the newer one.
+                if self.id_of_name.get(&old_name) == Some(&old_id) {
+                    self.id_of_name.remove(&old_name);
+                }
+                if self.name_of_id.get(&old_id) == Some(&old_name) {
+                    self.name_of_id.remove(&old_id);
+                }
+            }
+        }
+    }
+}
+
+/// One observed identity drift. Named rather than boolean because the two
+/// directions call for opposite designs downstream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityDrift {
+    /// The connection name stayed, the identity behind it changed — a client
+    /// that recreates its adapter. Keying on the identity splits history here.
+    SameNameNewIdentity {
+        name: String,
+        was: String,
+        now: String,
+    },
+    /// The identity stayed, the name changed — a rename, or a client version
+    /// bump that relabels the same adapter. Keying on the name splits history
+    /// here.
+    SameIdentityNewName {
+        id: String,
+        was: String,
+        now: String,
+    },
 }
 
 #[derive(Clone)]
@@ -379,7 +444,68 @@ impl AdapterMonitor {
             debounce_ms,
             confirmed: std::sync::Mutex::new(HashMap::new()),
             pending: std::sync::Mutex::new(HashMap::new()),
+            identity_seen: std::sync::Mutex::new(IdentityLedger::default()),
         }
+    }
+
+    /// Report an adapter that came back wearing a different identity, or the
+    /// same identity under a different name.
+    ///
+    /// Both halves are load-bearing and the product currently answers them
+    /// differently in two places: route bindings anchor on the identity and
+    /// heal by name, while the traffic ledger keys on the name outright. Which
+    /// is right depends on a fact nobody measured — whether a tunnel adapter
+    /// keeps its identity across a reconnect — so the monitor states it when it
+    /// happens instead of leaving both designs to argue from assumption.
+    ///
+    /// Returns the drifts observed this call, so a test can assert on them
+    /// without reading the log.
+    fn note_identity_drift(&self, infos: &[AdapterInfo]) -> Vec<IdentityDrift> {
+        let mut ledger = self.identity_seen.lock().unwrap();
+        let mut drifts = Vec::new();
+        for info in infos {
+            let name = info.friendly_name.trim();
+            let id = info.stable_id();
+            // A nameless adapter carries no pairing worth remembering: the
+            // whole question is what happens to the name and the id TOGETHER.
+            if name.is_empty() || id.is_empty() {
+                continue;
+            }
+            if let Some(previous) = ledger.id_of_name.get(name) {
+                if previous != &id {
+                    drifts.push(IdentityDrift::SameNameNewIdentity {
+                        name: name.to_string(),
+                        was: previous.clone(),
+                        now: id.clone(),
+                    });
+                }
+            }
+            if let Some(previous) = ledger.name_of_id.get(&id) {
+                if previous != name {
+                    drifts.push(IdentityDrift::SameIdentityNewName {
+                        id: id.clone(),
+                        was: previous.clone(),
+                        now: name.to_string(),
+                    });
+                }
+            }
+            ledger.remember(name.to_string(), id);
+        }
+        for drift in &drifts {
+            match drift {
+                IdentityDrift::SameNameNewIdentity { name, was, now } => tracing::info!(
+                    target: "nrr::adapters",
+                    adapter = %name, was = %was, now = %now,
+                    "adapter kept its name and changed identity",
+                ),
+                IdentityDrift::SameIdentityNewName { id, was, now } => tracing::info!(
+                    target: "nrr::adapters",
+                    identity = %id, was = %was, now = %now,
+                    "adapter kept its identity and was renamed",
+                ),
+            }
+        }
+        drifts
     }
 
     /// Poll the source and advance the debounce state machine.
@@ -391,6 +517,7 @@ impl AdapterMonitor {
             Ok(v) => v,
             Err(_) => return Vec::new(), // source unavailable — no changes
         };
+        self.note_identity_drift(&infos);
 
         // Classify current state from the fresh enumeration.
         let mut current: HashMap<u32, (String, AdapterAvailability)> = HashMap::new();
@@ -588,6 +715,99 @@ mod tests {
             ipv4_addresses: ips,
             gateways: gws,
         }
+    }
+
+    /// A tunnel adapter with NO MAC, so `stable_id()` falls back to the GUID —
+    /// the shape a VPN client actually presents, and the only shape where the
+    /// identity question has two possible answers.
+    fn tun(idx: u32, guid: &str, name: &str) -> AdapterInfo {
+        AdapterInfo {
+            index: idx,
+            adapter_name: guid.to_string(),
+            description: "TAP-Windows Adapter V9".to_string(),
+            friendly_name: name.to_string(),
+            mac: None,
+            interface_type: InterfaceType::Tunnel,
+            oper_status: IfOperStatus::Up,
+            ipv4_addresses: vec![Ipv4Addr::new(10, 8, 0, 2)],
+            gateways: vec![Ipv4Addr::new(10, 8, 0, 1)],
+        }
+    }
+
+    fn monitor_with(source: Arc<MockAdapterEventSource>) -> AdapterMonitor {
+        AdapterMonitor::new(source, 0)
+    }
+
+    #[test]
+    fn an_adapter_that_keeps_its_name_and_changes_identity_is_reported() {
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        source.set(vec![tun(30, "{OLD-GUID}", "swiftvpn")]);
+        assert!(
+            monitor
+                .note_identity_drift(&source.enumerate_all().unwrap())
+                .is_empty(),
+            "the first sighting establishes the pairing, it does not drift from anything"
+        );
+
+        // Reconnect: same connection name, adapter recreated under a new GUID.
+        source.set(vec![tun(31, "{NEW-GUID}", "swiftvpn")]);
+        let drifts = monitor.note_identity_drift(&source.enumerate_all().unwrap());
+        assert_eq!(
+            drifts,
+            vec![IdentityDrift::SameNameNewIdentity {
+                name: "swiftvpn".to_string(),
+                was: "{OLD-GUID}".to_string(),
+                now: "{NEW-GUID}".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_adapter_that_keeps_its_identity_and_is_renamed_is_reported() {
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn v2")]);
+        monitor.note_identity_drift(&source.enumerate_all().unwrap());
+
+        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn v3")]);
+        let drifts = monitor.note_identity_drift(&source.enumerate_all().unwrap());
+        assert_eq!(
+            drifts,
+            vec![IdentityDrift::SameIdentityNewName {
+                id: "{SAME-GUID}".to_string(),
+                was: "swiftvpn v2".to_string(),
+                now: "swiftvpn v3".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_steady_adapter_never_reports_drift() {
+        // Positive control for the two above: the detector must be silent on
+        // the case that happens every tick, or its reports mean nothing.
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        source.set(vec![tun(30, "{SAME-GUID}", "swiftvpn")]);
+        for _ in 0..5 {
+            assert!(monitor
+                .note_identity_drift(&source.enumerate_all().unwrap())
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn the_drift_ledger_stays_bounded() {
+        let source = Arc::new(MockAdapterEventSource::new());
+        let monitor = monitor_with(Arc::clone(&source));
+        for i in 0..(IDENTITY_LEDGER_CAP as u32 * 3) {
+            source.set(vec![tun(i, &format!("{{GUID-{i}}}"), &format!("link-{i}"))]);
+            monitor.note_identity_drift(&source.enumerate_all().unwrap());
+        }
+        let ledger = monitor.identity_seen.lock().unwrap();
+        assert!(ledger.order.len() <= IDENTITY_LEDGER_CAP);
+        assert!(ledger.id_of_name.len() <= IDENTITY_LEDGER_CAP);
+        assert!(ledger.name_of_id.len() <= IDENTITY_LEDGER_CAP);
     }
 
     fn eth_up_with_ip(idx: u32) -> AdapterInfo {

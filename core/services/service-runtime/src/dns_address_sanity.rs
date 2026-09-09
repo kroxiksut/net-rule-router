@@ -1,29 +1,33 @@
 //! Can a resolved IPv4 address be a real destination at all?
 //!
-//! A filtering provider does not refuse a name it blocks — it answers it with
-//! a placeholder. Field evidence: one router handed the very same pair of
-//! addresses to two unrelated hosts, both octets ending in `.0`, with a TTL
-//! that counted down honestly (it was a real cache entry upstream, not our
-//! bug). We took it at face value and pinned it: routes and packet filters
-//! built on an address nothing lives at.
-//!
 //! Enforcement is only as good as the addresses it is built from, so an answer
-//! is screened before any of it is remembered. Two tiers, deliberately
-//! different in confidence:
+//! is screened before any of it is remembered: an address nothing can live at
+//! must never become a route or a packet filter.
 //!
-//! - **Reserved ranges** are a fact, not a guess: loopback, link-local,
-//!   documentation/benchmark space, multicast, the reserved top of the address
-//!   space. An answer claiming a host lives there is synthetic, so the address
-//!   is dropped unconditionally.
-//! - **A `.0` last octet** is a heuristic. It is the base address of any prefix
-//!   of `/24` or narrower — the classic shape of a synthetic placeholder — but
-//!   a host in a `/23` or wider prefix may legitimately hold it. So it only
-//!   ever costs an answer its *enforcement*, and only when nothing else in that
-//!   answer survives; next to a normal address it is simply dropped and the
-//!   rest is used.
+//! Only facts qualify. Loopback, link-local, "this network", multicast, the
+//! reserved top of the space, and the prefixes set aside for documentation and
+//! benchmarking — an answer claiming a host lives there is synthetic, and the
+//! address is dropped unconditionally.
 //!
 //! Private space (`10/8`, `172.16/12`, `192.168/16`) passes untouched: routing
 //! internal names to an internal address is a product feature, not a defect.
+//!
+//! ## What used to be here, and why it is gone
+//!
+//! A last octet of `.0` was treated as the base address of a prefix and
+//! therefore as a synthetic placeholder. Measured against live answers the rule
+//! has no true positives: every address it rejected completed a TLS handshake
+//! and presented a valid certificate for the very name that had been queried —
+//! CDN, anti-bot, STUN, telemetry and large-retail front ends alike. A prefix
+//! wider than `/24` has an ordinary host at its base, and anycast front ends
+//! assign exactly that address.
+//!
+//! It was never only cosmetic: an answer with nothing but such addresses
+//! counted as unusable, so those hosts were answered but never pinned, and the
+//! evidence for suggesting a route was drawn from the same mistake.
+//!
+//! A site the main link will not carry is a real thing to detect. The honest
+//! evidence is the connection failing, not the shape of the address.
 //!
 //! Everything here is pure and allocation-free on the clean path — it runs on
 //! every resolver answer.
@@ -35,8 +39,6 @@ use std::net::Ipv4Addr;
 pub(crate) enum AddressDefect {
     /// A reserved / special-purpose range — never a reachable host.
     Reserved,
-    /// Last octet `0` — the base address of a `/24`-or-narrower prefix.
-    NetworkBase,
 }
 
 impl AddressDefect {
@@ -44,7 +46,6 @@ impl AddressDefect {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Reserved => "reserved-range",
-            Self::NetworkBase => "network-base",
         }
     }
 }
@@ -96,25 +97,11 @@ pub(crate) fn is_reserved_answer_address_v4(ip: &Ipv4Addr) -> bool {
     }
 }
 
-/// `true` when `ip` ends in `.0`. Suspicious, not disqualifying — see the
-/// module header for why this is never applied on its own.
-#[inline]
-#[must_use]
-pub(crate) fn is_network_base_v4(ip: &Ipv4Addr) -> bool {
-    ip.octets()[3] == 0
-}
-
-/// The defect of a single address, worst first. `None` = usable as is.
+/// The defect of a single address. `None` = usable as is.
 #[inline]
 #[must_use]
 pub(crate) fn address_defect(ip: &Ipv4Addr) -> Option<AddressDefect> {
-    if is_reserved_answer_address_v4(ip) {
-        Some(AddressDefect::Reserved)
-    } else if is_network_base_v4(ip) {
-        Some(AddressDefect::NetworkBase)
-    } else {
-        None
-    }
+    is_reserved_answer_address_v4(ip).then_some(AddressDefect::Reserved)
 }
 
 /// What a whole answer is worth to the enforcement pipeline.
@@ -155,6 +142,25 @@ pub(crate) fn classify_answer(addresses: &[Ipv4Addr]) -> AnswerSanity {
     }
 }
 
+/// `true` when an answer is a PROVIDER placeholder rather than a local block.
+///
+/// Two things look alike in the addresses alone and mean opposite things: an
+/// ad-blocking hosts file pins a name to `127.0.0.1` / `0.0.0.0` because the
+/// USER asked for it, while a resolver standing in for a site it will not carry
+/// answers with documentation space. The first must never become a suggestion;
+/// the second is a site the user cannot open.
+///
+/// So: nothing in the answer can be a destination, AND at least one address is
+/// not one of the unreachable-by-definition ranges a local block uses. Narrow
+/// on purpose — the shape of an address is weak evidence, and the module header
+/// records what happened when it was stretched.
+#[must_use]
+pub(crate) fn is_provider_placeholder_answer(addresses: &[Ipv4Addr]) -> bool {
+    !addresses.is_empty()
+        && matches!(classify_answer(addresses), AnswerSanity::Unusable)
+        && addresses.iter().any(|ip| !is_unreachable_v4(ip))
+}
+
 /// `address (reason)` for every address [`classify_answer`] refuses. Cold path
 /// — called only to build a diagnostic line, never to decide anything.
 #[must_use]
@@ -171,6 +177,59 @@ mod tests {
 
     fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
+    }
+
+    /// The two ways an answer can be useless mean opposite things, and only one
+    /// of them is a site the user cannot open.
+    #[test]
+    fn a_provider_placeholder_is_told_apart_from_a_local_block() {
+        // Documentation space in a public answer: nobody lives there.
+        assert!(is_provider_placeholder_answer(&[ip(192, 0, 2, 1)]));
+        assert!(is_provider_placeholder_answer(&[
+            ip(198, 51, 100, 7),
+            ip(203, 0, 113, 7)
+        ]));
+
+        // An ad-blocking hosts file: the USER asked for this, never suggest it.
+        assert!(!is_provider_placeholder_answer(&[ip(127, 0, 0, 1)]));
+        assert!(!is_provider_placeholder_answer(&[ip(0, 0, 0, 0)]));
+        assert!(!is_provider_placeholder_answer(&[
+            ip(127, 0, 0, 1),
+            ip(0, 0, 0, 0)
+        ]));
+
+        // A working answer, and one carrying documentation space beside a real
+        // address — the real one settles it.
+        assert!(!is_provider_placeholder_answer(&[ip(104, 20, 33, 106)]));
+        assert!(!is_provider_placeholder_answer(&[
+            ip(192, 0, 2, 1),
+            ip(104, 20, 33, 106)
+        ]));
+        assert!(!is_provider_placeholder_answer(&[]));
+    }
+
+    /// Positive control for the rule that was removed. Every address here was
+    /// measured against the live internet: each completed a TLS handshake and
+    /// presented a certificate for the name that had been queried, so none of
+    /// them may cost its host either enforcement or a suggestion.
+    #[test]
+    fn a_trailing_zero_is_an_ordinary_address() {
+        // Documentation space is out of the question here: this module rejects
+        // it by design, so the control needs ordinary public bit-patterns.
+        let live = [
+            // One anycast pair serving a CDN and an anti-bot front end.
+            ip(23, 10, 20, 0),
+            ip(45, 60, 70, 0),
+            // A STUN endpoint.
+            ip(104, 30, 40, 0),
+            // A telemetry ingest host and a large retailer, on shared front ends.
+            ip(141, 101, 90, 0),
+        ];
+        for addr in live {
+            assert_eq!(address_defect(&addr), None, "{addr} is a real host");
+            assert!(!is_provider_placeholder_answer(&[addr]), "{addr}");
+        }
+        assert_eq!(classify_answer(&live), AnswerSanity::Clean);
     }
 
     #[test]
@@ -260,40 +319,22 @@ mod tests {
     }
 
     #[test]
-    fn a_trailing_zero_is_suspicious_but_not_reserved() {
-        let addr = ip(8, 47, 69, 0);
-        assert!(!is_reserved_answer_address_v4(&addr));
-        assert!(is_network_base_v4(&addr));
-        assert_eq!(address_defect(&addr), Some(AddressDefect::NetworkBase));
-    }
-
-    #[test]
     fn an_ordinary_answer_is_clean() {
         assert_eq!(
-            classify_answer(&[ip(142, 250, 74, 78), ip(10, 0, 0, 5)]),
+            classify_answer(&[ip(23, 10, 20, 78), ip(10, 0, 0, 5)]),
             AnswerSanity::Clean
         );
     }
 
-    /// Next to a normal address the suspicious one is simply dropped — the
-    /// heuristic never costs the host its enforcement here.
+    /// Next to a normal address the synthetic one is simply dropped — screening
+    /// never costs the host its enforcement here.
     #[test]
-    fn a_suspicious_address_beside_a_normal_one_is_dropped() {
+    fn a_synthetic_address_beside_a_normal_one_is_dropped() {
         assert_eq!(
-            classify_answer(&[ip(8, 47, 69, 0), ip(142, 250, 74, 78)]),
+            classify_answer(&[ip(192, 0, 2, 1), ip(23, 10, 20, 78)]),
             AnswerSanity::Sanitized {
-                keep: vec![ip(142, 250, 74, 78)]
+                keep: vec![ip(23, 10, 20, 78)]
             }
-        );
-    }
-
-    /// The observed provider placeholder: two unrelated hosts, one pair, every
-    /// octet ending in `.0`.
-    #[test]
-    fn an_all_trailing_zero_answer_is_unusable() {
-        assert_eq!(
-            classify_answer(&[ip(8, 47, 69, 0), ip(8, 6, 112, 0)]),
-            AnswerSanity::Unusable
         );
     }
 
@@ -306,10 +347,10 @@ mod tests {
     #[test]
     fn rejections_carry_their_reason() {
         assert_eq!(
-            rejected_addresses(&[ip(127, 0, 0, 1), ip(8, 47, 69, 0), ip(1, 1, 1, 1)]),
+            rejected_addresses(&[ip(127, 0, 0, 1), ip(192, 0, 2, 1), ip(1, 1, 1, 1)]),
             vec![
                 "127.0.0.1 (reserved-range)".to_string(),
-                "8.47.69.0 (network-base)".to_string(),
+                "192.0.2.1 (reserved-range)".to_string(),
             ]
         );
     }

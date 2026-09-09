@@ -50,7 +50,7 @@ use crate::event::{rfc3339_local_millis, LogEvent, LOG_EVENT_SCHEMA_VERSION};
 use crate::logs::privacy;
 use crate::logs::writer::LogWriter;
 use crate::sink::DiagnosticsSink;
-use crate::taxonomy::{EventCategory, EventCorrelation, EventLevel};
+use crate::taxonomy::{EventCategory, EventCorrelation, EventLevel, PrivacyClass};
 
 // ── Level mapping ─────────────────────────────────────────────────────────────
 
@@ -292,12 +292,21 @@ where
         // Fields the current mode may not disclose lose their VALUE; the event
         // itself is written either way. Dropping it would take the timeline
         // with it, and the timeline is the reason the log exists.
-        let privacy_class = privacy::classify(payload.as_ref());
+        //
+        // The stamped class must describe the payload AFTER redaction, or the
+        // writer's own privacy gate throws the event away and the redaction was
+        // pointless — that is how 50 924 kill-switch drops in one 90-minute
+        // window left no line naming a single one of them (`log_drop_once`
+        // carries `process`, which is `Sensitive`).
+        let mut privacy_class = privacy::classify(payload.as_ref());
         let ceiling = self.writer.filter().mode().max_privacy();
-        if privacy_class > ceiling {
+        // `SecretNeverLog` is not redactable down to anything: it is dropped,
+        // by the writer, in every mode.
+        if privacy_class > ceiling && privacy_class != PrivacyClass::SecretNeverLog {
             if let Some(payload) = payload.as_mut() {
                 privacy::redact_above(payload, ceiling);
             }
+            privacy_class = ceiling;
         }
 
         let now_ms = std::time::SystemTime::now()
@@ -577,6 +586,7 @@ pub fn install_ndjson_tracing_with_console_and_verbose(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::filter::LoggingMode;
     use crate::logs::writer::LogWriterConfig;
 
     #[test]
@@ -706,6 +716,69 @@ mod tests {
             machine.get("principal").is_none(),
             "a line with no sid belongs to the machine, not to a person: {machine}"
         );
+    }
+
+    /// A field the mode may not disclose costs the VALUE, never the line.
+    /// The negative control alone (the value is gone) passes just as well when
+    /// the whole event was thrown away — which is exactly what happened: the
+    /// layer redacted the payload but stamped the pre-redaction class, and the
+    /// writer's own privacy gate then dropped the event. Every kill-switch drop
+    /// line carries `process`, so a 90-minute outage left nothing to read.
+    #[test]
+    fn an_over_ceiling_field_is_redacted_and_the_event_is_still_written() {
+        for (mode, host_is_readable) in [
+            (LoggingMode::Default, false),
+            (LoggingMode::Diagnostic, true),
+        ] {
+            let dir = tempfile::tempdir().expect("temp");
+            let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+            writer.filter().set_mode(mode);
+            let layer = NdjsonTracingLayer::new(Arc::clone(&writer));
+
+            use tracing_subscriber::prelude::*;
+            let subscriber = tracing_subscriber::registry().with(layer);
+
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(
+                    target: "nrr::conn-trace",
+                    process = "C:\\app\\vpn.exe",
+                    host = "example.test",
+                    count = 3,
+                    "observed BLOCKED connection",
+                );
+            });
+
+            let file = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .next()
+                .unwrap_or_else(|| panic!("{mode:?}: the event must reach a file"));
+            let text = std::fs::read_to_string(file.path()).expect("read log");
+            let line = text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| {
+                    panic!("{mode:?}: redaction must not take the line with it: {text}")
+                });
+            let event: serde_json::Value = serde_json::from_str(line).expect("json");
+
+            assert_eq!(
+                event["payload"]["process"],
+                serde_json::json!(crate::logs::privacy::REDACTED),
+                "{mode:?}: a process path is Sensitive in both modes",
+            );
+            assert_eq!(
+                event["payload"]["count"],
+                serde_json::json!(3),
+                "{mode:?}: a public field keeps its value",
+            );
+            let host = &event["payload"]["host"];
+            if host_is_readable {
+                assert_eq!(host, &serde_json::json!("example.test"));
+            } else {
+                assert_eq!(host, &serde_json::json!(crate::logs::privacy::REDACTED));
+            }
+        }
     }
 
     #[test]

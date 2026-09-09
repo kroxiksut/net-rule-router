@@ -87,6 +87,8 @@ impl DiagnosticsStatusDto {
                 state: "unavailable".to_string(),
                 active_revision_id: None,
                 pending_changes: 0,
+                start_relative_to_sign_in: "unknown".to_string(),
+                start_sign_in_gap_ms: None,
             },
             security_status: SecurityStatusCard {
                 audit_chain_ok: false,
@@ -122,6 +124,25 @@ pub struct ServiceHealthCard {
     pub active_revision_id: Option<String>,
     /// Number of pending changes awaiting review.
     pub pending_changes: u32,
+    /// Where the service's start sits relative to the boot's sign-in phase:
+    /// `"after"`, `"before"` or `"unknown"`. Answers, with evidence, the
+    /// suspicion every background service attracts — that it is what made the
+    /// machine slow to start.
+    ///
+    /// Defaulted so an older service, which sends neither field, reads as
+    /// "cannot tell" instead of as a measurement nobody took.
+    #[serde(default = "unknown_start_relation")]
+    pub start_relative_to_sign_in: String,
+    /// The measured gap in milliseconds, on whichever side it falls. `None`
+    /// when the relation is unknown — never a zero, which would read as "no
+    /// delay" rather than "no answer".
+    #[serde(default)]
+    pub start_sign_in_gap_ms: Option<u64>,
+}
+
+/// The honest default for a service that does not report the relation.
+fn unknown_start_relation() -> String {
+    "unknown".to_string()
 }
 
 /// Security-relevant status card.
@@ -460,6 +481,8 @@ mod tests {
                 state: "running".into(),
                 active_revision_id: Some("rev-001".into()),
                 pending_changes: 0,
+                start_relative_to_sign_in: "unknown".to_string(),
+                start_sign_in_gap_ms: None,
             },
             security_status: SecurityStatusCard {
                 audit_chain_ok: true,

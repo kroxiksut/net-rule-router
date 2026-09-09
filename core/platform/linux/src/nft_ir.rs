@@ -148,10 +148,10 @@ mod tests {
     #[test]
     fn a_host_match_renders_without_a_redundant_prefix() {
         let m = NftMatch::DstV4 {
-            net: Ipv4Addr::new(93, 184, 216, 34),
+            net: Ipv4Addr::new(23, 10, 20, 138),
             prefix: 32,
         };
-        assert_eq!(render_match(&m), "ip daddr 93.184.216.34");
+        assert_eq!(render_match(&m), "ip daddr 23.10.20.138");
     }
 
     #[test]

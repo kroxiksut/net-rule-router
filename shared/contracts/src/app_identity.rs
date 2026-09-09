@@ -82,10 +82,9 @@ mod tests {
 
     #[test]
     fn case_and_path_and_suffix_reduce_to_one_spelling() {
-        let (value, changes) = canonical_exact_process_name(
-            "C:\\Program Files\\hidemy.name VPN 3.0\\hidemy.name VPN 3.0.exe",
-        );
-        assert_eq!(value, "hidemy.name vpn 3.0.exe");
+        let (value, changes) =
+            canonical_exact_process_name("C:\\Program Files\\SwiftVPN 3.0\\SwiftVPN 3.0.exe");
+        assert_eq!(value, "swiftvpn 3.0.exe");
         assert!(changes.stripped_path_from.is_some());
         assert_eq!(changes.appended_exe_to, None);
     }
@@ -104,7 +103,7 @@ mod tests {
             canonical_glob_process_pattern("  DiskO*.exe "),
             "disko*.exe"
         );
-        assert_eq!(canonical_glob_process_pattern("YandexDis*"), "yandexdis*");
+        assert_eq!(canonical_glob_process_pattern("VendorDis*"), "vendordis*");
     }
 
     #[test]

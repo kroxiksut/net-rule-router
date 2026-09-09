@@ -1322,6 +1322,9 @@ ApplicationWindow {
     property int diagCacheExpandRev: 0
     property var diagConnGroupExpanded: ({})
     property int diagConnGroupExpandRev: 0
+    /// Set by another section navigating INTO Diagnostics to open the
+    /// connection trace straight away; the section clears it once it has.
+    property bool diagOpenConnTrace: false
     property var suggestionsExpandedDomains: ({})
     property bool routingDohLockdownDetailsExpanded: false
     property bool routingKsDetailsExpanded: false
@@ -1349,6 +1352,42 @@ ApplicationWindow {
                 || systemMode === "high-contrast") return systemMode
 
         return "light"
+    }
+    /// Re-read the system appearance and, if it moved, re-resolve the theme.
+    ///
+    /// Only "system" is affected: a user who picked light or dark picked it,
+    /// and `resolveThemeModeForPrefs` already returns that untouched. The value
+    /// comes from the launcher's probe rather than from the Qt hint that woke
+    /// us, so high contrast keeps outranking light/dark here exactly as it does
+    /// on a cold start.
+    function refreshSystemAppearance() {
+        var askedAt = Date.now()
+        var correlationId = rpcTransport.rpcSystemTheme()
+        if (!correlationId || correlationId === "") return
+        rpcTransport.registerRpcCallback(correlationId, function(ok, payload) {
+            if (!ok || !payload) return
+            var mode = String(payload.systemMode || "")
+            if (mode !== "light" && mode !== "dark" && mode !== "high-contrast") return
+            var current = context.theme || {}
+            if (String(current.systemMode || "") === mode) return
+            var theme = Object.assign({}, current)
+            theme.systemMode = mode
+            theme.systemModeDetected = payload.systemModeDetected !== false
+            var ctx = Object.assign({}, context)
+            ctx.theme = theme
+            context = ctx
+            // `normalizePrefs` drops the cached `effectiveThemeMode` and
+            // recomputes it, so this is what actually repaints the window.
+            prefs = normalizePrefs(prefs)
+            themeRevision += 1
+            // The title bar is NOT applied here: `wantDarkTitleBar` flips off
+            // this same bump and re-applies to every open window, child ones
+            // included. A second apply from here would repaint the main
+            // window's frame twice and still miss the children.
+            uiRevision += 1
+            console.log("[perf] system appearance ->", mode,
+                        "answered in", (Date.now() - askedAt) + "ms")
+        })
     }
     function normalizePrefs(candidate) {
         var normalized = Object.assign({}, candidate || {})
@@ -1845,11 +1884,16 @@ ApplicationWindow {
     // it on the very first launch, before the user had touched anything.
     // A key absent from here commits when it is written; its writer calls
     // `emitPrefs()` in the same handler.
+    /// Preferences the footer Apply / Cancel pair owns.
+    ///
+    /// Look-and-feel is deliberately NOT in here. Theme, font scale and font
+    /// family apply the instant they are picked — the control IS the preview —
+    /// so a lit Apply asks the user to confirm something they can already see,
+    /// and reads as "it did not take". They commit through `commitPrefs`
+    /// instead, and undoing one means picking the previous value in the same
+    /// control. What stays buffered is everything whose effect is NOT visible
+    /// from the control that sets it.
     readonly property var _bufferedPrefKeys: ({
-        "themeMode": true,
-        "accessibilityHighContrast": true,
-        "fontScalePercent": true,
-        "systemFont": true,
         "enhancedFocus": true,
         "simplifiedLabels": true,
         "tooltipsEnabled": true,
@@ -1967,7 +2011,7 @@ ApplicationWindow {
         if (rulesDirty) {
             reviewFlowController._guardApplyRules(function(ok) {
                 driftController._driftRecheckNow()
-            })
+            }, "footer-apply")
         }
         // Every OTHER section that owns dirty draft state (panels that talk to
         // the service directly rather than through `prefs`) commits through its
@@ -2622,7 +2666,7 @@ ApplicationWindow {
                                 // collector may speak about rules again.
                                 offlineBacklogCollector._offlineRulesHandledByResume = false
                                 driftController._driftRecheckNow()
-                            })
+                            }, "reconnect-resume")
                         })
                     }
                     // Service may have been updated
@@ -3228,6 +3272,32 @@ ApplicationWindow {
             body = tr("notifications.enforcement.adapter-choice.body",
                     "Several adapters answer to the saved name, so your rules are not being applied. Pick the one to use: {list}")
                 .replace("{list}", candidates.join(", "))
+        } else if (status === "adapter-gone") {
+            // A vendor that replaced its adapter outright, a driver that no
+            // longer starts, a connection removed by hand. The cause differs,
+            // the answer does not: nothing here answers to the saved name, so
+            // the choice goes back to the user.
+            title = tr("notifications.enforcement.adapter-gone.title",
+                "The saved connection is gone")
+            body = candidates.length > 0
+                ? tr("notifications.enforcement.adapter-gone.body",
+                        "The connection your rules were set to use is no longer on this computer, so the rules are not being applied. Pick another one: {list}")
+                    .replace("{list}", candidates.join(", "))
+                : tr("notifications.enforcement.adapter-gone.body-empty",
+                    "The connection your rules were set to use is no longer on this computer, and there is nothing to replace it with right now.")
+        } else if (status === "adapter-failed") {
+            // The device is still on the machine and its driver will not
+            // start — usually a second VPN client that installed an older copy
+            // of the same driver. Picking another connection works around it;
+            // repairing the driver fixes it, and only the user can decide.
+            title = tr("notifications.enforcement.adapter-failed.title",
+                "The saved connection is broken")
+            body = candidates.length > 0
+                ? tr("notifications.enforcement.adapter-failed.body",
+                        "The connection your rules use is still installed, but its driver will not start, so the rules are not being applied. Reinstall it, or pick another one: {list}")
+                    .replace("{list}", candidates.join(", "))
+                : tr("notifications.enforcement.adapter-failed.body-empty",
+                    "The connection your rules use is still installed, but its driver will not start, and there is nothing to replace it with right now. Reinstalling it usually helps.")
         } else if (status === "no-primary-route") {
             title = tr("notifications.enforcement.no-primary.title",
                 "Main connection is not set")
@@ -3693,7 +3763,14 @@ ApplicationWindow {
         for (var m = 0; m < modes.length; m += 1) behaviorModeModel.append(modes[m])
         Pure.clearModel(ruleTypesModel)
         var types = ((context.rules || {}).supportedRuleTypes) || []
-        for (var t = 0; t < types.length; t += 1) ruleTypesModel.append(types[t])
+        for (var t = 0; t < types.length; t += 1) {
+            // The backend lists what the RULE MODEL knows; the profile says what
+            // this OS can enforce. Offering an application rule where per-process
+            // routing has no backend would take the user's input and silently
+            // drop it.
+            if (String(types[t].id) === "application" && !supports("appRouting")) continue
+            ruleTypesModel.append(types[t])
+        }
         Pure.clearModel(rulesModel)
         // When the launcher intended the real service
         // (BackendChoice::Ipc) but the service was stopped/unreachable, it
@@ -4823,13 +4900,22 @@ ApplicationWindow {
         // section's onCompleted) keeps it available even when RulesSection is
         // lazily unloaded.
         if (typeof setSaveCallback === "function") {
-            setSaveCallback("rules", function(onDone) { reviewFlowController._guardApplyRules(onDone) })
+            setSaveCallback("rules", function(onDone) {
+                reviewFlowController._guardApplyRules(onDone, "section-save")
+            })
         }
         // Connect to the bridge's RPC
         // response signal exactly once. Each setX/refreshX helper
         // registers a per-correlation-id callback that fires here.
         if (bridgeAvailable && typeof nrrNativeBridge.rpcResponse !== "undefined") {
             nrrNativeBridge.rpcResponse.connect(rpcTransport.handleRpcResponse)
+        }
+
+        // The desktop can switch light/dark while the window is open. The
+        // context file was written before the window existed, so without this
+        // the appearance stays whatever it was at launch until a restart.
+        if (bridgeAvailable && typeof nrrNativeBridge.systemAppearanceChanged !== "undefined") {
+            nrrNativeBridge.systemAppearanceChanged.connect(refreshSystemAppearance)
         }
 
         // Connect to push events and
@@ -6645,6 +6731,12 @@ ApplicationWindow {
     /// onDone(ok) continuation across the async chain (it is also re-enabled
     /// by Cancel/Discard, which stay live while a save is in flight).
     property var _guardRulesResume: null
+    /// Whether an apply CYCLE is running — from the guard's start to its
+    /// resolution, dialog included. Separate from the transport's in-flight
+    /// flag, which only covers the request: the gap between the dry-run
+    /// answering and the user deciding is exactly where a second cycle used to
+    /// slip in and open a second review window.
+    property bool _guardRulesInFlight: false
     /// Build canonical rules-json from the current `rulesModel`
     /// state. Same shared serializer `RulesSection._buildRulesJson` uses, so
     /// the two payloads are byte-identical for identical rules; it lives here

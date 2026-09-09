@@ -356,13 +356,13 @@ fn unenforced_apps_ack_signature_round_trips_through_payload() {
         serde_json::from_str(&payload_with_theme("dark", false)).expect("base payload parses");
     object.insert(
         "unenforcedAppsAckSig".into(),
-        serde_json::json!("2gis.exe|vk.exe"),
+        serde_json::json!("citymap.exe|ab.exe"),
     );
     let payload = serde_json::Value::Object(object).to_string();
     let updated = apply_qt_preferences_payload(&baseline, &payload)
         .expect("ack-signature payload must parse");
     assert_eq!(
-        updated.unenforced_apps_ack_signature, "2gis.exe|vk.exe",
+        updated.unenforced_apps_ack_signature, "citymap.exe|ab.exe",
         "dismiss signature must round-trip through the launcher parse"
     );
 
@@ -370,7 +370,7 @@ fn unenforced_apps_ack_signature_round_trips_through_payload() {
     let kept = apply_qt_preferences_payload(&updated, &payload_with_theme("dark", false))
         .expect("payload without the key must parse");
     assert_eq!(
-        kept.unenforced_apps_ack_signature, "2gis.exe|vk.exe",
+        kept.unenforced_apps_ack_signature, "citymap.exe|ab.exe",
         "a payload omitting the key must not blank the stored signature"
     );
 }

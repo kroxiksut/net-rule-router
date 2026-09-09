@@ -567,7 +567,7 @@ mod tests {
         assert_eq!(r.read_count(), 0);
         assert_eq!(r.read_resolver_cache(), Ok(Vec::new()));
         let entries = vec![OsCachedResolution {
-            canonical_hostname: "avito.ru".into(),
+            canonical_hostname: "shop.example".into(),
             addresses: vec![Ipv4Addr::new(1, 2, 3, 4)],
         }];
         r.set_entries(entries.clone());

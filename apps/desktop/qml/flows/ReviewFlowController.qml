@@ -17,8 +17,26 @@ QtObject {
     id: reviewFlowController
     property var root
 
-    function _guardApplyRules(onDone) {
-        root._guardRulesResume = (typeof onDone === "function") ? onDone : null
+    /// `origin` names the CALLER, and it travels all the way to the service as
+    /// part of the correlation id. Three paths reach this function — the footer
+    /// Apply, a section's save callback, and the resume after a reconnect — and
+    /// until they were named a duplicate cycle in the log could not be traced
+    /// back to whichever of them fired it.
+    function _guardApplyRules(onDone, origin) {
+        var resume = (typeof onDone === "function") ? onDone : null
+        // One apply CYCLE at a time, not one preview at a time. The in-flight
+        // flag on the transport clears when the dry-run answers — before the
+        // review dialog even opens — so anything that starts a cycle from that
+        // point on used to sail straight past it and the user got a second
+        // review window for one click.
+        if (root._guardRulesInFlight) {
+            console.log("review-flow: an apply cycle is already in flight, ignoring start from",
+                        String(origin || "unnamed"))
+            if (resume) resume(false)
+            return
+        }
+        root._guardRulesInFlight = true
+        root._guardRulesResume = resume
         var rulesJson = root._buildRulesJsonFromModel()
         if (!rulesJson) {
             // Serializer failed (already reported by the shell) — release
@@ -62,11 +80,15 @@ QtObject {
             })
             return
         }
-        startRulesReviewFlow(rulesJson, contentHash, false, "apply-guard")
+        startRulesReviewFlow(rulesJson, contentHash, false,
+                             "apply-guard:" + String(origin || "unnamed"))
     }
     function _resolveGuardRulesApply(ok) {
         var cb = root._guardRulesResume
         root._guardRulesResume = null
+        // Released here and nowhere else: every abort path in this flow already
+        // funnels through this function, including the dialog's own dismissal.
+        root._guardRulesInFlight = false
         if (typeof cb === "function") cb(!!ok)
     }
 

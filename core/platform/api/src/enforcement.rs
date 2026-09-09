@@ -126,6 +126,13 @@ pub enum PrecedenceClass {
     KillSwitchBlock,
     /// Per-protocol / reconnection permits that outrank the kill-switch block.
     KillSwitchPermit,
+    /// The fake-IP relay's virtual pool: the permit that lets an application
+    /// reach a fake address (and through it the relay's own stack) under any
+    /// posture, plus the UDP veto that keeps QUIC off the relay while the UDP
+    /// path is switched off. Its own band because the pool is not a
+    /// destination the user named — it is the machinery a rule is served
+    /// through, and cutting it strands every fake-routed host.
+    FakeIpPool,
     /// The terminal veto — a hard block that outranks everything.
     HardBlock,
 }
@@ -149,6 +156,10 @@ impl PrecedenceClass {
             Self::DohBlock => 35,
             Self::KillSwitchBlock => 40,
             Self::KillSwitchPermit => 50,
+            // Above the per-destination kill-switch permits, below the
+            // exemption floor — the pool must survive a block-all, and must
+            // not outrank loopback/LAN upkeep.
+            Self::FakeIpPool => 55,
             Self::CatchAllExempt => 60,
             Self::HardBlock => 70,
         }
@@ -157,6 +168,24 @@ impl PrecedenceClass {
 
 /// A rule's full precedence: its band plus a within-band ordinal the planner
 /// assigns for deterministic, stable ordering (0 = highest within the band).
+/// Ordinal slots one rule reserves inside its weight band.
+///
+/// The plan's `ordinal` is `rule_position * SLOTS_PER_RULE + fanout_index`, so
+/// the number is what lets a lowering recover WHICH rule an ordinal belongs to
+/// — and both lowerings must agree on it, or one of them groups a rule's
+/// addresses differently from the other. It lives here, in the crate both
+/// depend on, rather than in either of them.
+pub const SLOTS_PER_RULE: u64 = 256;
+
+/// Slots a rule reserves for its per-executable app-id filters, before the
+/// range its observed destinations use.
+///
+/// Same reason as [`SLOTS_PER_RULE`]: the ordinal is the only thing a lowering
+/// has to tell "this rule's own addresses" from "the addresses its application
+/// was observed using", and the two must not be packed together — they occupy
+/// different slot ranges by construction.
+pub const APP_PATH_FANOUT_CAP: u64 = 16;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Precedence {
     pub class: PrecedenceClass,
@@ -586,7 +615,7 @@ mod tests {
                 ordinal: 0,
             },
             flow: FlowMatch {
-                dst: DstMatch::HostV4(v4(93, 184, 216, 34)),
+                dst: DstMatch::HostV4(v4(23, 10, 20, 138)),
                 dst_port: None,
                 protocol: None,
             },
@@ -598,9 +627,13 @@ mod tests {
 
         // 2. Secondary suffix/zone fan-out — several resolved /32s pinned to the
         //    secondary (VPN) link, as a domain-suffix rule fans out.
-        for (i, ip) in [v4(157, 240, 0, 35), v4(157, 240, 1, 35), v4(31, 13, 64, 35)]
-            .into_iter()
-            .enumerate()
+        for (i, ip) in [
+            v4(23, 10, 20, 155),
+            v4(23, 10, 20, 157),
+            v4(23, 10, 20, 129),
+        ]
+        .into_iter()
+        .enumerate()
         {
             flows.push(FlowRule {
                 verdict: Verdict::Permit,
@@ -773,7 +806,7 @@ mod tests {
         // Routes + policy routing: a /32 pinned to the secondary in a
         // per-principal table, plus per-user AND per-mark policy-routing rules.
         let routes = vec![RouteIntent {
-            dst: DstMatch::HostV4(v4(157, 240, 0, 35)),
+            dst: DstMatch::HostV4(v4(23, 10, 20, 155)),
             egress: EgressRef::Secondary,
             metric: 1,
             table: RouteTableRef::Principal(user.clone()),

@@ -57,6 +57,7 @@ fn probe_exemptions() -> FailClosedExemptions {
     FailClosedExemptions {
         bootstrap_server_ips: vec![Ipv4Addr::new(203, 0, 113, 10)],
         local_subnets: vec![(Ipv4Addr::new(192, 168, 0, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
         known_direct_ips: Vec::new(),

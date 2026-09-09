@@ -29,7 +29,9 @@ GroupBox {
             currentIndex: Pure.optionIndexByValue(model, root.prefs.themeMode, 2)
             popup.width: root.comboPopupWidth(themeCombo, themeCombo.model, "",
                 function(item) { return root.themeLabel(item) })
-            onActivated: root.updatePrefs({ themeMode: model[currentIndex] })
+            // Committed, not buffered: the window repaints as the item is
+            // picked, so there is nothing left for an Apply to confirm.
+            onActivated: root.commitPrefs({ themeMode: model[currentIndex] })
         }
         Label {
             // Only when "System" is chosen AND the probe came back empty: the
@@ -61,7 +63,7 @@ GroupBox {
                 theme: root.uiTheme
                 text: "-"
                 Layout.preferredWidth: 40
-                onClicked: root.updatePrefs({
+                onClicked: root.commitPrefs({
                     fontScalePercent: Pure.normalizedFontScalePercent(
                         root.prefs.fontScalePercent - fontScaleSlider.stepSize)
                 })
@@ -95,7 +97,7 @@ GroupBox {
                     id: fontScaleCommitTimer
                     interval: 150
                     repeat: false
-                    onTriggered: root.updatePrefs({
+                    onTriggered: root.commitPrefs({
                         fontScalePercent: Pure.normalizedFontScalePercent(
                             fontScaleSlider.value)
                     })
@@ -112,7 +114,7 @@ GroupBox {
                 theme: root.uiTheme
                 text: "+"
                 Layout.preferredWidth: 40
-                onClicked: root.updatePrefs({
+                onClicked: root.commitPrefs({
                     fontScalePercent: Pure.normalizedFontScalePercent(
                         root.prefs.fontScalePercent + fontScaleSlider.stepSize)
                 })

@@ -101,12 +101,12 @@ mod tests {
         let conn = migrated_conn();
         let repo = VpnClientAppsRepository::new(&conn);
         repo.upsert(r"C:\Apps\openvpn.exe", 100).expect("insert");
-        repo.upsert(r"C:\Apps\hidemy.name vpn 3.0.exe", 200)
+        repo.upsert(r"C:\Apps\swiftvpn 3.0.exe", 200)
             .expect("insert");
         assert_eq!(
             repo.load().expect("load"),
             vec![
-                r"C:\Apps\hidemy.name vpn 3.0.exe".to_string(),
+                r"C:\Apps\swiftvpn 3.0.exe".to_string(),
                 r"C:\Apps\openvpn.exe".to_string()
             ]
         );

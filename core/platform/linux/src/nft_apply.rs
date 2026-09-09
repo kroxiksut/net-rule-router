@@ -570,7 +570,7 @@ mod tests {
             matches: vec![
                 NftMatch::SkUid(1000),
                 NftMatch::DstV4 {
-                    net: Ipv4Addr::new(93, 184, 216, 34),
+                    net: Ipv4Addr::new(23, 10, 20, 138),
                     prefix: 32,
                 },
                 NftMatch::OutInterface("tun0".into()),
@@ -579,7 +579,7 @@ mod tests {
             comment: "route-secondary#0".into(),
         }]));
         assert!(json.contains(r#""skuid""#), "{json}");
-        assert!(json.contains("93.184.216.34"), "{json}");
+        assert!(json.contains("23.10.20.138"), "{json}");
         assert!(json.contains(r#""oifname""#), "{json}");
         assert!(json.contains(r#""accept":null"#), "{json}");
         assert!(json.contains("route-secondary#0"), "{json}");

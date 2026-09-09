@@ -17,6 +17,9 @@
 //! |                                 | result. GUI hashes file / rulesModel / service-baseline through   |
 //! |                                 | this op so all three legs of the drift triangle pass through the  |
 //! |                                 | service-equivalent canonicalization SSOT.                         |
+//! | `local.system-theme`            | The system appearance right now, so a desktop that switches       |
+//! |                                 | light/dark under a running window is answered by the same probe   |
+//! |                                 | the cold start used.                                              |
 //!
 //! Slug shape mirrors the IpcOperationName convention
 //! (`<domain>.<resource>.<verb>`) — though `local.*` has no verb tier
@@ -94,8 +97,25 @@ pub fn handle_local_request(
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
+        "local.system-theme" => Ok(handle_system_theme()),
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
+}
+
+/// The system appearance as this process's [`SystemThemePort`] reports it now.
+///
+/// The shell resolves the theme once, from the context file written before the
+/// window existed. When the desktop flips light/dark under a running window,
+/// the host's Qt hint fires and the shell asks HERE instead of reading the OS
+/// itself: one probe, one answer, high contrast included.
+///
+/// [`SystemThemePort`]: nrr_platform_api::system_theme::SystemThemePort
+fn handle_system_theme() -> Value {
+    let resolution = nrr_ui_support::theme::resolve_theme(nrr_shared::ThemeMode::System);
+    json!({
+        "systemMode": resolution.system_mode.slug(),
+        "systemModeDetected": resolution.system_mode_detected,
+    })
 }
 
 /// Scan the machine for likely VPN clients (running processes + installed
@@ -387,6 +407,23 @@ mod tests {
         FakeClient { negotiate: None }
     }
 
+    /// The live probe answers with a slug the shell already knows how to
+    /// resolve, and it never dresses a fallback up as an observation — the
+    /// same contract the cold-start context is held to.
+    #[test]
+    fn the_live_appearance_answer_is_a_slug_the_shell_understands() {
+        let answer = handle_system_theme();
+        let mode = answer["systemMode"].as_str().expect("systemMode");
+        assert!(
+            ["light", "dark", "high-contrast"].contains(&mode),
+            "unknown appearance slug: {mode}"
+        );
+        assert!(
+            answer["systemModeDetected"].is_boolean(),
+            "an undetected system must be told apart from a light one"
+        );
+    }
+
     fn hash_of(payload: &Value) -> String {
         let response = handle_canonical_rules_hash(payload).expect("hash ok");
         response["hash"].as_str().expect("hex string").to_string()
@@ -436,8 +473,8 @@ mod tests {
     /// same routing, different letter case on each side.
     #[test]
     fn the_reported_divergence_folds_away() {
-        let typed = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r1\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"Cloud.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r2\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"DiskO*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r3\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"YandexDis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r4\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"hidemy.name VPN 3.0.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
-        let service = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r93\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"hidemy.name vpn 3.0.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r92\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"yandexdis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r91\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"disko*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r90\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"cloud.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        let typed = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r1\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"Cloud.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r2\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"DiskO*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r3\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"VendorDis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r4\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"SwiftVPN 3.0.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
+        let service = json!({ "rules-json": "{\"schema-version\": 1, \"primary\": [{\"id\": \"r93\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"swiftvpn 3.0.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r92\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"vendordis*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r91\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"glob\", \"value\": \"disko*.exe\"}, \"include-child-processes\": false}}, {\"id\": \"r90\", \"enabled\": true, \"app-match\": {\"pattern\": {\"kind\": \"exact\", \"value\": \"cloud.exe\"}, \"include-child-processes\": false}}], \"secondary\": []}" });
         assert_eq!(hash_of(&typed), hash_of(&service));
     }
 

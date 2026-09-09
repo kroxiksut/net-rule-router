@@ -28,9 +28,27 @@ pub struct SystemEventRecord {
     pub message: String,
 }
 
-/// Writes records into the host's operator log. Best-effort by contract: a log
-/// nobody can write to must never stop the service, so the implementation
-/// swallows its own failures and the caller has nothing to handle.
+/// Writes records into the host's operator log, and reads back the one boot
+/// milestone the product needs from it.
+///
+/// Best-effort by contract on both halves: a log nobody can write to must never
+/// stop the service, and a milestone nobody can read is answered with `None`
+/// rather than an error the caller would have to invent a story for.
 pub trait SystemEventLogPort: Send + Sync {
     fn write(&self, record: &SystemEventRecord);
+
+    /// When THIS boot asked the user to sign in, as Unix milliseconds.
+    ///
+    /// The product is regularly suspected of slowing down boot, and the honest
+    /// answer is a comparison: the service either started before that moment or
+    /// after it. Windows records the moment as `Wininit` event 14; a host with
+    /// no equivalent answers `None`, which the caller renders as "cannot tell"
+    /// — never as "zero delay", because an unanswerable question must not read
+    /// as an exoneration.
+    ///
+    /// Defaulted so a backend that has no such record — and every test double —
+    /// stays honest without writing a stub that lies.
+    fn sign_in_prompt_at_ms(&self) -> Option<u64> {
+        None
+    }
 }

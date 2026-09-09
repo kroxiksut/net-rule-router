@@ -1,10 +1,16 @@
-//! "Does this address answer on the main link?" — asked directly.
+//! "Does this address answer over THIS link?" — asked directly.
 //!
 //! The passive verdict ([`nrr_domain::companion_affinity::PrimaryBehavior`]) is
 //! built from traffic that happened to occur. With the additional route down
 //! there is no such traffic to learn from, so every suggestion stays
 //! unexamined — and the user is asked to decide with no evidence at all. This
 //! module answers the question on demand instead.
+//!
+//! Which link is asked about is the caller's choice: the probe binds the
+//! source address it is given, so the same mechanism answers "does the main
+//! link reach it" and "would the tunnel reach it". The names here stay neutral
+//! for that reason — an offer to move a host into the tunnel is worth nothing
+//! until somebody has checked that the tunnel can carry it.
 //!
 //! Two things it deliberately is NOT:
 //!
@@ -22,8 +28,8 @@ use std::time::{Duration, Instant};
 
 /// What one probe established.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PrimaryPathVerdict {
-    /// The address accepted a connection over the main link.
+pub enum PathVerdict {
+    /// The address accepted a connection over the link that was asked about.
     Answered,
     /// It definitely did not: refused, or silent past the timeout.
     Silent,
@@ -34,38 +40,38 @@ pub enum PrimaryPathVerdict {
 }
 
 /// The mechanism: one bounded TCP connect attempt, optionally from a chosen
-/// source address so the packet leaves by the main link.
-pub trait PrimaryPathProbe: Send + Sync {
+/// source address, which is what decides the link the packet leaves by.
+pub trait PathProbe: Send + Sync {
     fn probe(
         &self,
         target: Ipv4Addr,
         port: u16,
         source: Option<Ipv4Addr>,
         timeout: Duration,
-    ) -> PrimaryPathVerdict;
+    ) -> PathVerdict;
 }
 
 /// Production probe. A refused connection counts as `Silent`: for this question
 /// "the main link cannot get me there" and "there is nothing listening" are the
 /// same answer, and both mean the user's site will not load that way.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SystemPrimaryPathProbe;
+pub struct SystemPathProbe;
 
-impl PrimaryPathProbe for SystemPrimaryPathProbe {
+impl PathProbe for SystemPathProbe {
     fn probe(
         &self,
         target: Ipv4Addr,
         port: u16,
         source: Option<Ipv4Addr>,
         timeout: Duration,
-    ) -> PrimaryPathVerdict {
+    ) -> PathVerdict {
         let address = std::net::SocketAddr::from((target, port));
         let Ok(socket) = socket2::Socket::new(
             socket2::Domain::IPV4,
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         ) else {
-            return PrimaryPathVerdict::Indeterminate;
+            return PathVerdict::Indeterminate;
         };
         if let Some(source) = source {
             // Binding is what decides the link. Without it the OS would pick by
@@ -75,17 +81,17 @@ impl PrimaryPathProbe for SystemPrimaryPathProbe {
                 .bind(&std::net::SocketAddr::from((source, 0)).into())
                 .is_err()
             {
-                return PrimaryPathVerdict::Indeterminate;
+                return PathVerdict::Indeterminate;
             }
         }
         // A zero budget cannot measure anything, and the platform reports the
         // attempt as a timeout — indistinguishable from a host that stayed
         // silent, which is evidence the block-detector acts on.
         if timeout.is_zero() {
-            return PrimaryPathVerdict::Indeterminate;
+            return PathVerdict::Indeterminate;
         }
         match socket.connect_timeout(&address.into(), timeout) {
-            Ok(()) => PrimaryPathVerdict::Answered,
+            Ok(()) => PathVerdict::Answered,
             // Only a refusal or a timeout is evidence that the host did not
             // answer. Everything else — a zero timeout, an unreachable network,
             // a socket the OS would not let us use — means the probe never ran,
@@ -96,8 +102,8 @@ impl PrimaryPathProbe for SystemPrimaryPathProbe {
                 | std::io::ErrorKind::WouldBlock
                 | std::io::ErrorKind::ConnectionRefused
                 | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::ConnectionAborted => PrimaryPathVerdict::Silent,
-                _ => PrimaryPathVerdict::Indeterminate,
+                | std::io::ErrorKind::ConnectionAborted => PathVerdict::Silent,
+                _ => PathVerdict::Indeterminate,
             },
         }
     }
@@ -105,13 +111,13 @@ impl PrimaryPathProbe for SystemPrimaryPathProbe {
 
 /// Test double returning a scripted verdict and counting attempts.
 #[derive(Debug)]
-pub struct MockPrimaryPathProbe {
-    verdict: PrimaryPathVerdict,
+pub struct MockPathProbe {
+    verdict: PathVerdict,
     attempts: Mutex<Vec<(Ipv4Addr, u16, Option<Ipv4Addr>)>>,
 }
 
-impl MockPrimaryPathProbe {
-    pub fn new(verdict: PrimaryPathVerdict) -> Self {
+impl MockPathProbe {
+    pub fn new(verdict: PathVerdict) -> Self {
         Self {
             verdict,
             attempts: Mutex::new(Vec::new()),
@@ -126,14 +132,14 @@ impl MockPrimaryPathProbe {
     }
 }
 
-impl PrimaryPathProbe for MockPrimaryPathProbe {
+impl PathProbe for MockPathProbe {
     fn probe(
         &self,
         target: Ipv4Addr,
         port: u16,
         source: Option<Ipv4Addr>,
         _timeout: Duration,
-    ) -> PrimaryPathVerdict {
+    ) -> PathVerdict {
         self.attempts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -208,8 +214,8 @@ pub struct ProbePassSummary {
 /// auto-rules engine's `note_primary_health`, which is the same channel the
 /// observed traffic uses. One channel means the GUI has one story to tell,
 /// whether the evidence arrived by itself or was asked for.
-pub struct PrimaryPathProber {
-    probe: Arc<dyn PrimaryPathProbe>,
+pub struct PathProber {
+    probe: Arc<dyn PathProbe>,
     last_probed: Mutex<std::collections::HashMap<String, Instant>>,
 }
 
@@ -217,8 +223,8 @@ pub struct PrimaryPathProber {
 /// Indeterminate outcomes are never reported: they are not evidence.
 pub type ProbeVerdictSink = dyn Fn(&str, bool) + Send + Sync;
 
-impl PrimaryPathProber {
-    pub fn new(probe: Arc<dyn PrimaryPathProbe>) -> Self {
+impl PathProber {
+    pub fn new(probe: Arc<dyn PathProbe>) -> Self {
         Self {
             probe,
             last_probed: Mutex::new(std::collections::HashMap::new()),
@@ -255,27 +261,27 @@ impl PrimaryPathProber {
                 continue;
             }
             examined += 1;
-            let mut verdict = PrimaryPathVerdict::Indeterminate;
+            let mut verdict = PathVerdict::Indeterminate;
             for address in &target.addresses {
                 verdict = self.probe.probe(*address, port, source, limits.timeout);
-                if verdict != PrimaryPathVerdict::Indeterminate {
+                if verdict != PathVerdict::Indeterminate {
                     break;
                 }
             }
             match verdict {
-                PrimaryPathVerdict::Answered => {
+                PathVerdict::Answered => {
                     summary.answered += 1;
                     self.mark_probed(&target.hostname, now);
                     report(&target.hostname, true);
                 }
-                PrimaryPathVerdict::Silent => {
+                PathVerdict::Silent => {
                     summary.silent += 1;
                     self.mark_probed(&target.hostname, now);
                     report(&target.hostname, false);
                 }
                 // Not remembered: an attempt that established nothing must not
                 // block the next one behind the repeat window.
-                PrimaryPathVerdict::Indeterminate => summary.indeterminate += 1,
+                PathVerdict::Indeterminate => summary.indeterminate += 1,
             }
         }
         summary
@@ -308,14 +314,14 @@ mod tests {
     /// nothing at all.
     #[test]
     fn a_probe_that_cannot_run_is_indeterminate_not_silent() {
-        let probe = SystemPrimaryPathProbe;
+        let probe = SystemPathProbe;
         let verdict = probe.probe(
             Ipv4Addr::new(203, 0, 113, 1),
             443,
             None,
             std::time::Duration::ZERO,
         );
-        assert_eq!(verdict, PrimaryPathVerdict::Indeterminate);
+        assert_eq!(verdict, PathVerdict::Indeterminate);
     }
 
     fn target(host: &str, last_octet: u8) -> ProbeTarget {
@@ -351,9 +357,7 @@ mod tests {
 
     #[test]
     fn a_pass_stops_at_the_target_limit_and_says_what_it_skipped() {
-        let prober = PrimaryPathProber::new(Arc::new(MockPrimaryPathProbe::new(
-            PrimaryPathVerdict::Answered,
-        )));
+        let prober = PathProber::new(Arc::new(MockPathProbe::new(PathVerdict::Answered)));
         let targets: Vec<ProbeTarget> = (1..=5)
             .map(|i| target(&format!("h{i}.example"), i))
             .collect();
@@ -372,9 +376,7 @@ mod tests {
 
     #[test]
     fn a_recent_verdict_is_not_asked_for_again() {
-        let prober = PrimaryPathProber::new(Arc::new(MockPrimaryPathProbe::new(
-            PrimaryPathVerdict::Silent,
-        )));
+        let prober = PathProber::new(Arc::new(MockPathProbe::new(PathVerdict::Silent)));
         let targets = vec![target("one.example", 1)];
         let (_seen, sink) = collect();
         let limits = ProbeLimits::default();
@@ -401,9 +403,7 @@ mod tests {
 
     #[test]
     fn an_indeterminate_outcome_is_not_reported_as_evidence() {
-        let prober = PrimaryPathProber::new(Arc::new(MockPrimaryPathProbe::new(
-            PrimaryPathVerdict::Indeterminate,
-        )));
+        let prober = PathProber::new(Arc::new(MockPathProbe::new(PathVerdict::Indeterminate)));
         let targets = vec![target("one.example", 1)];
         let (seen, sink) = collect();
 
@@ -435,8 +435,8 @@ mod tests {
 
     #[test]
     fn the_source_address_is_passed_through_so_the_packet_leaves_by_the_main_link() {
-        let probe = Arc::new(MockPrimaryPathProbe::new(PrimaryPathVerdict::Answered));
-        let prober = PrimaryPathProber::new(Arc::clone(&probe) as Arc<dyn PrimaryPathProbe>);
+        let probe = Arc::new(MockPathProbe::new(PathVerdict::Answered));
+        let prober = PathProber::new(Arc::clone(&probe) as Arc<dyn PathProbe>);
         let (_seen, sink) = collect();
         let source = Ipv4Addr::new(192, 168, 0, 105);
 

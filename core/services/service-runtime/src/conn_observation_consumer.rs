@@ -20,6 +20,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -182,6 +183,10 @@ pub struct ConnectionTraceRecord {
 pub struct ConnectionTraceRing {
     inner: Mutex<VecDeque<ConnectionTraceRecord>>,
     cap: usize,
+    /// Set once the observation source actually started. An empty ring means
+    /// two different things to the user — "nothing has happened yet" and "we
+    /// are not watching" — and only the composition root knows which.
+    observer_active: AtomicBool,
 }
 
 impl ConnectionTraceRing {
@@ -190,7 +195,18 @@ impl ConnectionTraceRing {
         Self {
             inner: Mutex::new(VecDeque::new()),
             cap: cap.max(1),
+            observer_active: AtomicBool::new(false),
         }
+    }
+
+    /// Record that the observation source is running and feeding this ring.
+    pub fn mark_observer_active(&self) {
+        self.observer_active.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether an observation source is feeding this ring.
+    pub fn observer_active(&self) -> bool {
+        self.observer_active.load(Ordering::Relaxed)
     }
 
     /// Append the newest record, evicting the oldest when full.
@@ -257,6 +273,15 @@ pub fn classify_connection(
         nrr_drop_spec_id: obs.nrr_drop_spec_id,
         observed_unix_ms: obs.observed_unix_ms,
     }
+}
+
+/// Wall clock in Unix milliseconds — the fallback for a backend that stamps
+/// no event time of its own.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Egress-role wire slug (SSOT for both the NDJSON log and the conn-trace DTO).
@@ -390,6 +415,11 @@ pub struct ConnectionObservationConsumer {
     name_for_address: Option<NameForAddressFn>,
     companion_in_use: Option<CompanionInUseFn>,
     companion_primary_health: Option<CompanionPrimaryHealthFn>,
+    /// Where each attempt is reported for the "did the user go there" measure.
+    navigation_attempt: Option<NavigationAttemptFn>,
+    /// Fallback name source for the health path only — see
+    /// `ConnectionObservationConsumerBuilder::with_health_name_fallback`.
+    health_name_fallback: Option<NameForAddressFn>,
     /// Addresses already reported this session. A page reconnects to the same
     /// host constantly; the ledger needs the fact once.
     companion_reported: Mutex<HashSet<std::net::Ipv4Addr>>,
@@ -400,6 +430,13 @@ pub struct ConnectionObservationConsumer {
     /// below: without it every direct connection on an idle machine would
     /// queue a PTR query.
     last_secondary_at: Mutex<Option<Instant>>,
+    /// Whether the current outage has already been announced. While the
+    /// block-all is armed every routed host is unreachable, so each application
+    /// that tries produces its own episode with the same cause; one notice is
+    /// the news, the rest are the same news with different nouns. Cleared the
+    /// moment the block-all disarms, so the next real outage is announced
+    /// again.
+    outage_announced: std::sync::atomic::AtomicBool,
     /// Block-notice reporting. Resolves a destination address to the name
     /// the user recognizes — the same recent-resolution memory the
     /// companion feature reads, wired independently so block notices work
@@ -463,7 +500,7 @@ pub type RoutedAppsFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 /// answer mean anything. The observation store holds an entry for EVERY process
 /// the observer ever saw, so an "owner" that no rule names never had a pin to
 /// withdraw — a live run produced exactly that: `chrome.exe`, which no rule
-/// mentions, and `claude.exe.old.<stamp>`, an updater's leftover. Both sides are
+/// mentions, and `helper.exe.old.<stamp>`, an updater's leftover. Both sides are
 /// filtered: an intruder that is itself a routed application is no intruder
 /// either, because the route serves both of them the same way.
 ///
@@ -541,6 +578,12 @@ pub type CompanionInUseFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// [`CompanionInUseFn`] because it answers a different question — not "did the
 /// traffic take the wrong link" but "does this host work over that link".
 pub type CompanionPrimaryHealthFn = Arc<dyn Fn(&str, bool) + Send + Sync>;
+
+/// Reports one outbound connection attempt to the navigation measurement:
+/// the initiating image path, the destination's name when it has one, and
+/// when the connection happened. Purely observational — see
+/// [`crate::navigation_registry`].
+pub type NavigationAttemptFn = Arc<dyn Fn(Option<&str>, Option<&str>, u64) + Send + Sync>;
 
 /// Sink for one blocked-connection attempt worth reporting. The production
 /// impl hands it to `block_notice_center::BlockNoticeCenter::record`, which

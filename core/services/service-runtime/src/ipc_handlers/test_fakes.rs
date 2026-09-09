@@ -153,6 +153,8 @@ impl FakeDiagnostics {
                 state: "running".into(),
                 active_revision_id: None,
                 pending_changes: 0,
+                start_relative_to_sign_in: "unknown".to_string(),
+                start_sign_in_gap_ms: None,
             },
             security_status: SecurityStatusCard {
                 audit_chain_ok: true,
@@ -807,6 +809,28 @@ impl FakeRulesLock {
     /// A row that has never carried an opinion (older service, wiped DB).
     pub fn unset() -> Arc<dyn ServiceStabilityConfigProvider> {
         Arc::new(Self { allow: None })
+    }
+}
+
+/// Machine-wide settings source that answers only the "show the connection
+/// trace in the GUI" switch, so the trace-viewer tests state the one thing they
+/// are about.
+pub struct FakeConnTraceGui {
+    show: bool,
+}
+
+impl FakeConnTraceGui {
+    pub fn showing(show: bool) -> Arc<dyn ServiceStabilityConfigProvider> {
+        Arc::new(Self { show })
+    }
+}
+
+impl ServiceStabilityConfigProvider for FakeConnTraceGui {
+    fn get(&self) -> nrr_shared::ipc_payloads::ServiceStabilityConfigDto {
+        nrr_shared::ipc_payloads::ServiceStabilityConfigDto {
+            conn_trace_gui: self.show,
+            ..Default::default()
+        }
     }
 }
 

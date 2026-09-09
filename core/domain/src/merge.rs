@@ -18,6 +18,11 @@
 //! role is tracked separately, so the *same* rule assigned to a *different*
 //! route surfaces as a conflict rather than an add/remove churn.
 //!
+//! Pairing follows the reader's subdomain coverage
+//! ([`SubdomainCoverage`](crate::review::SubdomainCoverage)): with it on, `x`
+//! and `*.x` enforce the same traffic and therefore pair as one rule, and the
+//! side that only differs in spelling keeps the service's.
+//!
 //! **Presence is always a union.** A rule present on only one side is always
 //! kept, under every policy. Without a common ancestor we cannot distinguish
 //! "the file deleted this rule" from "the service added it", so we never drop
@@ -39,7 +44,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::{CanonicalRule, CanonicalRuleBook, CanonicalRuleSet, RuleAction};
-use crate::review::{rule_attributes_differ, rule_identity_key};
+use crate::review::{rule_attributes_differ, rule_identity_key_under, SubdomainCoverage};
 use crate::RouteRole;
 
 /// How a merge resolves rules that exist on both sides but differ.
@@ -220,14 +225,14 @@ struct Side {
 /// enabled, so the rule that is actually enforced is the one that survives, and
 /// the merge cannot drop an enforced rule. Two disabled copies enforce nothing
 /// either way; the first in canonical order wins, deterministically.
-fn index(book: &CanonicalRuleBook) -> BTreeMap<String, Side> {
+fn index(book: &CanonicalRuleBook, coverage: SubdomainCoverage) -> BTreeMap<String, Side> {
     let mut map: BTreeMap<String, Side> = BTreeMap::new();
     for (set, route) in [
         (&book.primary, RouteRole::Primary),
         (&book.secondary, RouteRole::Secondary),
     ] {
         for rule in set.rules() {
-            let key = rule_identity_key(rule);
+            let key = rule_identity_key_under(rule, coverage);
             match map.get(&key) {
                 Some(held) if held.rule.enabled || !rule.enabled => continue,
                 _ => {
@@ -284,13 +289,14 @@ pub struct NormalizedCrossSetRule {
 pub fn normalize_cross_set_duplicates(
     book: &CanonicalRuleBook,
     keep_secondary: &BTreeSet<String>,
+    coverage: SubdomainCoverage,
 ) -> (CanonicalRuleBook, Vec<NormalizedCrossSetRule>) {
     let enabled_primary: BTreeMap<String, &CanonicalRule> = book
         .primary
         .rules()
         .iter()
         .filter(|rule| rule.enabled)
-        .map(|rule| (rule_identity_key(rule), rule))
+        .map(|rule| (rule_identity_key_under(rule, coverage), rule))
         .collect();
     if enabled_primary.is_empty() {
         return (book.clone(), Vec::new());
@@ -300,7 +306,7 @@ pub fn normalize_cross_set_duplicates(
     let mut disable_primary: BTreeSet<String> = BTreeSet::new();
     let mut secondary = Vec::with_capacity(book.secondary.len());
     for rule in book.secondary.rules() {
-        let key = rule_identity_key(rule);
+        let key = rule_identity_key_under(rule, coverage);
         match enabled_primary.get(&key) {
             Some(primary_copy) if rule.enabled => {
                 let user_keeps_secondary = keep_secondary.contains(&key);
@@ -332,7 +338,7 @@ pub fn normalize_cross_set_duplicates(
                 .iter()
                 .map(|rule| {
                     let mut copy = rule.clone();
-                    if disable_primary.contains(&rule_identity_key(rule)) {
+                    if disable_primary.contains(&rule_identity_key_under(rule, coverage)) {
                         copy.enabled = false;
                     }
                     copy
@@ -373,8 +379,16 @@ pub fn merge_rule_books(
     file: &CanonicalRuleBook,
     service: &CanonicalRuleBook,
     policy: MergePolicy,
+    coverage: SubdomainCoverage,
 ) -> MergeResult {
-    merge_rule_books_with_resolutions(file, service, policy, &BTreeMap::new(), &BTreeSet::new())
+    merge_rule_books_with_resolutions(
+        file,
+        service,
+        policy,
+        &BTreeMap::new(),
+        &BTreeSet::new(),
+        coverage,
+    )
 }
 
 /// Reconcile a linked-file rule book with the service rule book, honouring
@@ -404,17 +418,19 @@ pub fn merge_rule_books_with_resolutions(
     policy: MergePolicy,
     resolutions: &BTreeMap<String, ConflictSide>,
     keep_secondary: &BTreeSet<String>,
+    coverage: SubdomainCoverage,
 ) -> MergeResult {
     // Each side is given one enabled copy per match BEFORE anything is paired.
     // Two enabled copies in one book are that book's problem, not a
     // file-versus-service disagreement, and letting them reach the pairing is
     // what made it drop one silently.
-    let (file, file_normalized) = normalize_cross_set_duplicates(file, keep_secondary);
-    let (service, service_normalized) = normalize_cross_set_duplicates(service, keep_secondary);
+    let (file, file_normalized) = normalize_cross_set_duplicates(file, keep_secondary, coverage);
+    let (service, service_normalized) =
+        normalize_cross_set_duplicates(service, keep_secondary, coverage);
     let normalized_duplicates = merge_normalized(file_normalized, service_normalized);
 
-    let file_idx = index(&file);
-    let service_idx = index(&service);
+    let file_idx = index(&file, coverage);
+    let service_idx = index(&service, coverage);
 
     // Union of identity keys in deterministic (sorted) order.
     let mut keys: Vec<&String> = file_idx.keys().chain(service_idx.keys()).collect();
@@ -454,10 +470,18 @@ pub fn merge_rule_books_with_resolutions(
             (Some(f), Some(s)) => {
                 let differs = f.route != s.route || rule_attributes_differ(&f.rule, &s.rule);
                 if !differs {
-                    place(&f.rule, f.route, &mut primary_rules, &mut secondary_rules);
+                    // The service spelling wins when the two sides agree on
+                    // everything but the spelling (`x` versus `*.x`, paired
+                    // only under subdomain coverage). They enforce the same
+                    // traffic, so rewriting the active revision to the file's
+                    // spelling would turn a no-op merge into a rules change the
+                    // user then has to review for nothing.
+                    let same_spelling = f.rule.address_match == s.rule.address_match;
+                    let kept = if same_spelling { &f.rule } else { &s.rule };
+                    place(kept, f.route, &mut primary_rules, &mut secondary_rules);
                     entries.push(MergedRuleEntry {
                         identity_key: key.clone(),
-                        rule: f.rule.clone(),
+                        rule: kept.clone(),
                         route: f.route,
                         origin: MergeOrigin::Both,
                         was_conflict: false,
@@ -578,7 +602,8 @@ mod tests {
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "on primary")],
             vec![ip_rule("r-2", true, [1, 1, 1, 1], "and on secondary")],
         );
-        let (normalized, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
 
         assert_eq!(reported.len(), 1, "the pair must be reported, not hidden");
         assert_eq!(reported[0].kept.id.as_str(), "r-1");
@@ -603,7 +628,8 @@ mod tests {
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
             vec![ip_rule("r-2", false, [1, 1, 1, 1], "")],
         );
-        let (normalized, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
         assert!(reported.is_empty());
         assert_eq!(normalized, file, "an already-settled book is left alone");
     }
@@ -619,7 +645,8 @@ mod tests {
             vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
         );
         let key = {
-            let (_, reported) = normalize_cross_set_duplicates(&file, &BTreeSet::new());
+            let (_, reported) =
+                normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::Off);
             assert_eq!(reported.len(), 1);
             assert_eq!(reported[0].kept.id.as_str(), "r-1", "primary by default");
             reported[0].identity_key.clone()
@@ -627,7 +654,8 @@ mod tests {
 
         let mut keep_secondary = BTreeSet::new();
         keep_secondary.insert(key);
-        let (normalized, reported) = normalize_cross_set_duplicates(&file, &keep_secondary);
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &keep_secondary, SubdomainCoverage::Off);
 
         assert_eq!(reported.len(), 1);
         assert_eq!(reported[0].kept.id.as_str(), "r-2");
@@ -649,7 +677,8 @@ mod tests {
         );
         let mut keep_secondary = BTreeSet::new();
         keep_secondary.insert("not-a-key-in-this-book".to_string());
-        let (normalized, reported) = normalize_cross_set_duplicates(&file, &keep_secondary);
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &keep_secondary, SubdomainCoverage::Off);
 
         assert_eq!(reported[0].kept.id.as_str(), "r-1");
         assert!(normalized.primary.rules()[0].enabled);
@@ -667,7 +696,7 @@ mod tests {
             vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
         );
         let service = book(vec![], vec![]);
-        let result = merge_rule_books(&file, &service, MergePolicy::Union);
+        let result = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
 
         assert!(
             result.normalized_duplicates.is_empty(),
@@ -688,7 +717,7 @@ mod tests {
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "")],
             vec![ip_rule("r-2", true, [1, 1, 1, 1], "")],
         );
-        let result = merge_rule_books(&both, &both, MergePolicy::Union);
+        let result = merge_rule_books(&both, &both, MergePolicy::Union, SubdomainCoverage::Off);
         assert!(!result.normalized_duplicates.is_empty());
         assert!(
             !result.is_noop(),
@@ -707,7 +736,7 @@ mod tests {
             vec![ip_rule("s-1", true, [1, 1, 1, 1], "file wording")],
             vec![ip_rule("s-2", true, [1, 1, 1, 1], "")],
         );
-        let result = merge_rule_books(&file, &service, MergePolicy::Union);
+        let result = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(result.normalized_duplicates.len(), 1);
         assert_eq!(
             result.normalized_duplicates[0].kept.id.as_str(),
@@ -727,7 +756,7 @@ mod tests {
             MergePolicy::FileWins,
             MergePolicy::ServiceWins,
         ] {
-            let r = merge_rule_books(&file, &service, policy);
+            let r = merge_rule_books(&file, &service, policy, SubdomainCoverage::Off);
             assert_eq!(
                 r.merged.secondary.len(),
                 2,
@@ -747,7 +776,7 @@ mod tests {
         // Different ids (regenerated on import) but same content + route.
         let file = book(vec![], vec![rule.clone()]);
         let service = book(vec![], vec![ip_rule("r-77", true, [1, 1, 1, 1], "hi")]);
-        let r = merge_rule_books(&file, &service, MergePolicy::Union);
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(r.merged.secondary.len(), 1);
         assert!(r.conflicts.is_empty());
         assert!(r.is_noop());
@@ -759,18 +788,28 @@ mod tests {
         let file = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
         let service = book(vec![], vec![ip_rule("r-1", false, [1, 1, 1, 1], "")]);
 
-        let union = merge_rule_books(&file, &service, MergePolicy::Union);
+        let union = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(union.conflicts.len(), 1);
         assert_eq!(union.conflicts[0].resolved, ConflictSide::Unresolved);
         // Union keeps the file side provisionally.
         assert!(union.merged.secondary.rules()[0].enabled);
         assert_eq!(union.unresolved_conflicts(), 1);
 
-        let fw = merge_rule_books(&file, &service, MergePolicy::FileWins);
+        let fw = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::FileWins,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(fw.conflicts[0].resolved, ConflictSide::File);
         assert!(fw.merged.secondary.rules()[0].enabled);
 
-        let sw = merge_rule_books(&file, &service, MergePolicy::ServiceWins);
+        let sw = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::ServiceWins,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(sw.conflicts[0].resolved, ConflictSide::Service);
         assert!(!sw.merged.secondary.rules()[0].enabled);
     }
@@ -787,7 +826,7 @@ mod tests {
         let file = book(vec![], vec![routed]);
         let service = book(vec![], vec![blocked]);
 
-        let union = merge_rule_books(&file, &service, MergePolicy::Union);
+        let union = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(
             union.conflicts.len(),
             1,
@@ -798,7 +837,12 @@ mod tests {
         assert_eq!(union.merged.secondary.len(), 1);
 
         // ServiceWins picks the blocking side.
-        let sw = merge_rule_books(&file, &service, MergePolicy::ServiceWins);
+        let sw = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::ServiceWins,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(sw.conflicts[0].resolved, ConflictSide::Service);
         assert_eq!(
             sw.merged.secondary.rules()[0].action,
@@ -814,12 +858,22 @@ mod tests {
         let file = book(vec![ip_rule("r-1", true, [1, 1, 1, 1], "")], vec![]);
         let service = book(vec![], vec![ip_rule("r-1", true, [1, 1, 1, 1], "")]);
 
-        let fw = merge_rule_books(&file, &service, MergePolicy::FileWins);
+        let fw = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::FileWins,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(fw.conflicts.len(), 1);
         assert_eq!(fw.merged.primary.len(), 1, "file wins → primary");
         assert_eq!(fw.merged.secondary.len(), 0);
 
-        let sw = merge_rule_books(&file, &service, MergePolicy::ServiceWins);
+        let sw = merge_rule_books(
+            &file,
+            &service,
+            MergePolicy::ServiceWins,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(sw.merged.primary.len(), 0);
         assert_eq!(sw.merged.secondary.len(), 1, "service wins → secondary");
 
@@ -839,7 +893,7 @@ mod tests {
             vec![],
             vec![ip_rule("r-1", true, [1, 1, 1, 1], "from service")],
         );
-        let r = merge_rule_books(&file, &service, MergePolicy::Union);
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(r.conflicts.len(), 1);
         assert_eq!(r.conflicts[0].file.comment, "from file");
         assert_eq!(r.conflicts[0].service.comment, "from service");
@@ -854,7 +908,7 @@ mod tests {
                 vec![ip_rule("r-2", true, [10, 0, 0, 2], "")],
             )
         };
-        let r = merge_rule_books(&mk(), &mk(), MergePolicy::Union);
+        let r = merge_rule_books(&mk(), &mk(), MergePolicy::Union, SubdomainCoverage::Off);
         assert!(r.is_noop());
         assert_eq!(r.merged.total_rule_count(), 2);
     }
@@ -881,8 +935,18 @@ mod tests {
             ],
         );
         let service = book(vec![], vec![ip_rule("r-3", true, [3, 3, 3, 3], "")]);
-        let ra = merge_rule_books(&file_a, &service, MergePolicy::Union);
-        let rb = merge_rule_books(&file_b, &service, MergePolicy::Union);
+        let ra = merge_rule_books(
+            &file_a,
+            &service,
+            MergePolicy::Union,
+            SubdomainCoverage::Off,
+        );
+        let rb = merge_rule_books(
+            &file_b,
+            &service,
+            MergePolicy::Union,
+            SubdomainCoverage::Off,
+        );
         assert_eq!(ra.merged, rb.merged);
         let keys_a: Vec<_> = ra.entries.iter().map(|e| e.identity_key.clone()).collect();
         let keys_b: Vec<_> = rb.entries.iter().map(|e| e.identity_key.clone()).collect();
@@ -901,7 +965,7 @@ mod tests {
         let file = book(vec![], vec![routed.clone()]);
         let service = book(vec![], vec![blocked]);
 
-        let union = merge_rule_books(&file, &service, MergePolicy::Union);
+        let union = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(union.conflicts.len(), 1);
         assert_eq!(union.conflicts[0].file.action, RuleAction::Route);
         assert_eq!(union.conflicts[0].service.action, RuleAction::Block);
@@ -933,7 +997,7 @@ mod tests {
             ],
         );
 
-        let base = merge_rule_books(&file, &service, MergePolicy::Union);
+        let base = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
         assert_eq!(base.conflicts.len(), 2);
         // Pick Service for 1.1.1.1, File for 2.2.2.2; leave nothing to policy.
         let key_1 = base
@@ -964,6 +1028,7 @@ mod tests {
             MergePolicy::Union,
             &resolutions,
             &BTreeSet::new(),
+            SubdomainCoverage::Off,
         );
 
         assert_eq!(resolved.unresolved_conflicts(), 0, "all picks applied");
@@ -1010,9 +1075,114 @@ mod tests {
             MergePolicy::ServiceWins,
             &empty,
             &BTreeSet::new(),
+            SubdomainCoverage::Off,
         );
         assert_eq!(sw.conflicts[0].resolved, ConflictSide::Service);
         assert!(!sw.merged.secondary.rules()[0].enabled);
+    }
+
+    // ── `x` versus `*.x` under subdomain coverage ───────────────────────────
+
+    fn domain_rule(id: &str, m: CanonicalAddressMatch) -> CanonicalRule {
+        CanonicalRule {
+            id: RuleId(id.to_string()),
+            enabled: true,
+            address_match: Some(m),
+            app_match: None,
+            comment: String::new(),
+            action: crate::canonical::RuleAction::Route,
+            origin: None,
+        }
+    }
+
+    fn exact(host: &str) -> CanonicalAddressMatch {
+        CanonicalAddressMatch::ExactFqdn(host.to_string())
+    }
+
+    fn suffix(host: &str) -> CanonicalAddressMatch {
+        CanonicalAddressMatch::SuffixDomain(host.to_string())
+    }
+
+    /// The file says `*.proflcdn.test`, the service revision says `proflcdn.test`.
+    /// With coverage on the two enforce the same traffic, so the merge must see
+    /// one rule present on both sides — not one rule missing from each.
+    #[test]
+    fn the_two_spellings_of_one_domain_pair_as_one_rule_under_coverage() {
+        let file = book(vec![domain_rule("r-1", suffix("proflcdn.test"))], vec![]);
+        let service = book(vec![domain_rule("r-9", exact("proflcdn.test"))], vec![]);
+
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::On);
+
+        assert_eq!(r.entries.len(), 1);
+        assert_eq!(r.entries[0].origin, MergeOrigin::Both);
+        assert!(r.conflicts.is_empty(), "same traffic is not a disagreement");
+        assert!(r.is_noop(), "nothing to reconcile");
+        assert_eq!(
+            r.merged.primary.rules()[0].address_match,
+            Some(exact("proflcdn.test")),
+            "a spelling-only match keeps the service's, so the revision is left alone",
+        );
+    }
+
+    /// Positive control for the fold: with coverage OFF the same two books are
+    /// two separate rules, one per side — the honest reading when a bare domain
+    /// rule covers only its apex.
+    #[test]
+    fn the_two_spellings_stay_separate_rules_without_coverage() {
+        let file = book(vec![domain_rule("r-1", suffix("proflcdn.test"))], vec![]);
+        let service = book(vec![domain_rule("r-9", exact("proflcdn.test"))], vec![]);
+
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::Off);
+
+        assert_eq!(r.entries.len(), 2);
+        assert!(r.entries.iter().any(|e| e.origin == MergeOrigin::FileOnly));
+        assert!(r
+            .entries
+            .iter()
+            .any(|e| e.origin == MergeOrigin::ServiceOnly));
+    }
+
+    /// Folding the two spellings must not fold anything else: a different host
+    /// under the same suffix is still its own rule.
+    #[test]
+    fn coverage_folds_only_the_apex_spelling_not_a_subdomain_of_it() {
+        let file = book(vec![domain_rule("r-1", exact("www.proflcdn.test"))], vec![]);
+        let service = book(vec![domain_rule("r-9", suffix("proflcdn.test"))], vec![]);
+
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::On);
+
+        assert_eq!(r.entries.len(), 2, "www.x is not the same rule as *.x");
+    }
+
+    /// The two spellings on OPPOSITE routes are a real disagreement: they name
+    /// one rule and the two sides send it to different places.
+    #[test]
+    fn the_two_spellings_on_different_routes_are_a_conflict_under_coverage() {
+        let file = book(vec![], vec![domain_rule("r-1", suffix("proflcdn.test"))]);
+        let service = book(vec![domain_rule("r-9", exact("proflcdn.test"))], vec![]);
+
+        let r = merge_rule_books(&file, &service, MergePolicy::Union, SubdomainCoverage::On);
+
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].resolved, ConflictSide::Unresolved);
+    }
+
+    /// One book naming both spellings across its own two route sets is the
+    /// cross-set duplicate case, and under coverage it must be recognised as
+    /// one — otherwise the pairing would silently drop the copy it did not
+    /// keep.
+    #[test]
+    fn both_spellings_across_one_books_route_sets_normalize_under_coverage() {
+        let file = book(
+            vec![domain_rule("r-1", exact("proflcdn.test"))],
+            vec![domain_rule("r-2", suffix("proflcdn.test"))],
+        );
+        let (normalized, reported) =
+            normalize_cross_set_duplicates(&file, &BTreeSet::new(), SubdomainCoverage::On);
+
+        assert_eq!(reported.len(), 1);
+        assert_eq!(reported[0].kept.id.as_str(), "r-1");
+        assert!(!normalized.secondary.rules()[0].enabled);
     }
 
     #[test]

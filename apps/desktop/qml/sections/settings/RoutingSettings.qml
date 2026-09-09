@@ -50,7 +50,7 @@ ColumnLayout {
     // Kill-switch shared-IP strictness. false (default) =
     // "smart": addresses the census has seen on ordinary (non-rule) sites are
     // NOT pinned/blocked, so a shared CDN front-end never cuts an innocent
-    // co-tenant (the 0719 google.com collateral). true = "strict": pin every
+    // co-tenant (the 0719 search.example collateral). true = "strict": pin every
     // routed address regardless of sharing. Snapshot is the SSOT (no prefs
     // mirror), like the DoH-lockdown toggle.
     property bool ksStrictSharedIps: false
@@ -1390,7 +1390,7 @@ ColumnLayout {
                 root.statusLine = root.tr("status.system-routing-set",
                     "System-level routing setting updated.")
             } else if (code === "uac-declined") {
-                root.statusLine = root.tr("status.system-routing-uac-declined",
+                root.statusLine = root.tr("status.route-policy-uac-declined",
                     "Administrator approval was declined; the setting was not changed.")
             } else {
                 root.statusLine = root.tr("status.system-routing-failed",
@@ -1414,7 +1414,7 @@ ColumnLayout {
                 root.statusLine = root.tr("status.system-routing-set",
                     "System-level routing setting updated.")
             } else if (code === "uac-declined") {
-                root.statusLine = root.tr("status.system-routing-uac-declined",
+                root.statusLine = root.tr("status.route-policy-uac-declined",
                     "Administrator approval was declined; the setting was not changed.")
             } else {
                 root.statusLine = root.tr("status.system-routing-failed",
@@ -1937,8 +1937,12 @@ ColumnLayout {
                 // choice, and the opt-in the user had deliberately left off
                 // counted for nothing. Resolver (mode B) is always offered and
                 // is the default, so nobody gets stranded by hiding mode A.
+                // Mode A learns a rule host's addresses by watching system DNS, so
+                // an OS without that observer cannot run it at all — offering the
+                // choice there would be a mode that silently never enforces.
                 readonly property bool showModeA:
                     root.uiRevision >= 0 && root.prefs.allowModeAKillswitch === true
+                        && root.supports("dnsObserve")
                 onShowModeAChanged: enforcementModeCombo._rebuildModel()
                 model: ListModel {
                     ListElement { slug: "resolver"; label: "" }
@@ -2467,7 +2471,7 @@ ColumnLayout {
                     }
 
                     // Blocking axis. Big sites serve many hostnames from one
-                    // front-end address (gemini.google.com and www.google.com
+                    // front-end address (gemini.search.example and www.search.example
                     // share IPs), so pinning every routed address can cut
                     // ordinary sites. Default OFF = "smart" (shared addresses
                     // are not pinned); ON = strict historic behaviour. Snapshot
@@ -2529,7 +2533,7 @@ ColumnLayout {
                         wrapMode: Text.WordWrap
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                         text: root.tr("settings.routing.kill-switch.shared-strict-note",
-                            "Off (smart, recommended): an address that a routed site shares with an ordinary site is not blocked, so the ordinary site keeps working — at the cost of the routed site's traffic to that shared address not being protected while the additional adapter is down. On (strict): every routed address is blocked, including shared ones — no leak, but co-hosted ordinary sites (for example google.com sharing addresses with routed Google services) stop opening while the block is active.")
+                            "Off (smart, recommended): an address that a routed site shares with an ordinary site is not blocked, so the ordinary site keeps working — at the cost of the routed site's traffic to that shared address not being protected while the additional adapter is down. On (strict): every routed address is blocked, including shared ones — no leak, but co-hosted ordinary sites (for example search.example sharing addresses with routed Google services) stop opening while the block is active.")
                     }
                     Label {
                         Layout.fillWidth: true
@@ -3463,6 +3467,26 @@ ColumnLayout {
                     Accessible.name: root.tr("settings.routing.primary-probe.repeat",
                         "Do not re-check the same address for, s")
                 }
+                ThemedButton {
+                    theme: root.uiTheme
+                    Layout.columnSpan: 2
+                    Layout.alignment: Qt.AlignLeft
+                    text: root.tr("settings.routing.primary-probe.reset",
+                        "Reset to defaults")
+                    // The fields follow the same table the write sends, so the
+                    // three boxes and the service cannot disagree afterwards.
+                    onClicked: {
+                        panel.primaryProbeTimeoutMs = Number(
+                            root.routePolicyDefault("primary-probe-timeout-ms"))
+                        panel.primaryProbeMaxTargets = Number(
+                            root.routePolicyDefault("primary-probe-max-targets"))
+                        panel.primaryProbeRepeatSecs = Number(
+                            root.routePolicyDefault("primary-probe-repeat-secs"))
+                        root.routePolicyController.resetPrimaryProbeLimits()
+                    }
+                    Accessible.role: Accessible.Button
+                    Accessible.name: text
+                }
             }
 
             Label {
@@ -4260,8 +4284,8 @@ ColumnLayout {
 
             // Hosts-bypass: resolve rule domains directly against the
             // upstream DNS server so a local hosts/adblock loopback pin cannot
-            // starve a routed site of its public IP (332× `musical.ly →
-            // 127.0.0.1` in the 0712 log). Per-SID `resolve-hosts-bypass`,
+            // starve a routed site of its public IP (an adblock entry pinning
+            // it to `127.0.0.1`). Per-SID `resolve-hosts-bypass`,
             // default ON. Affects rule-host resolution in both modes. General
             // resolution setting — NOT gated on the kill-switch.
             CheckBox {

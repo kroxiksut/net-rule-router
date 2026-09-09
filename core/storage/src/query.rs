@@ -183,10 +183,10 @@ mod tests {
 
     #[test]
     fn classify_valid_ipv4() {
-        let c = classify_observed_ip("93.184.216.34");
+        let c = classify_observed_ip("23.10.20.138");
         assert_eq!(
             c,
-            ObservedIpClassification::IPv4("93.184.216.34".parse().unwrap())
+            ObservedIpClassification::IPv4("23.10.20.138".parse().unwrap())
         );
     }
 

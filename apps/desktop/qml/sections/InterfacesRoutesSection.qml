@@ -603,6 +603,13 @@ ColumnLayout {
         Layout.fillWidth: true
         Layout.fillHeight: true
         clip: true
+        // Same binding SettingsSection and DiagnosticsSection carry. Without
+        // it the content's UNWRAPPED implicit width becomes contentWidth,
+        // while the child column's width is derived from `availableWidth` —
+        // which the resulting scrollbars then change. The cycle settles on a
+        // content size that does not match the cards actually laid out, and
+        // the list stops scrolling to its last adapter.
+        contentWidth: availableWidth
         ColumnLayout {
             width: adaptersScroll.availableWidth
             spacing: root.uiTheme.spacingSm
@@ -693,28 +700,32 @@ ColumnLayout {
                     }
                 }
             }
+            // Re-sort the shared ListModel in place whenever the sort key
+            // flips. The default value is a no-op (rebuild restores the
+            // snapshot order); for VPN-like / primary-candidate the model is
+            // reshuffled so the Repeater renders the new order directly.
+            // Visibility filtering is done per-delegate.
+            //
+            // Both live OUTSIDE the Repeater: its default property is
+            // `delegate`, so a child object declared inside it competes with
+            // the real delegate instead of being created.
+            Connections {
+                target: section
+                function onAdapterSortByChanged() { section.applyAdapterSort() }
+            }
+            // Re-sort whenever prefs/model change (assignRole and
+            // unassignRole both rebuild interfacesModel and bump
+            // uiRevision via updatePrefs). Without this the newly
+            // assigned secondary stayed at its previous rank position
+            // until the user touched the sort combo manually.
+            Connections {
+                target: root
+                function onUiRevisionChanged() {
+                    Qt.callLater(section.applyAdapterSort)
+                }
+            }
             Repeater {
                 model: root.interfacesModel
-                // Re-sort the shared ListModel in place whenever the sort
-                // key flips. The default value is a no-op (rebuild restores
-                // the snapshot order); for VPN-like / primary-candidate the
-                // model is reshuffled so the Repeater renders the new order
-                // directly. Visibility filtering is done per-delegate.
-                Connections {
-                    target: section
-                    function onAdapterSortByChanged() { section.applyAdapterSort() }
-                }
-                // Re-sort whenever prefs/model change (assignRole and
-                // unassignRole both rebuild interfacesModel and bump
-                // uiRevision via updatePrefs). Without this the newly
-                // assigned secondary stayed at its previous rank position
-                // until the user touched the sort combo manually.
-                Connections {
-                    target: root
-                    function onUiRevisionChanged() {
-                        Qt.callLater(section.applyAdapterSort)
-                    }
-                }
                 Component.onCompleted: section.applyAdapterSort()
                 delegate: ColumnLayout {
                     Layout.fillWidth: true
@@ -728,7 +739,11 @@ ColumnLayout {
                         Layout.fillWidth: true
                         Layout.topMargin: root.uiTheme.spacingSm
                         Layout.bottomMargin: root.uiTheme.spacingSm
-                        height: 1
+                        // A layout ignores plain `height`, so the column's
+                        // implicit height came out one pixel short per card —
+                        // and the ScrollView, which sizes its content from
+                        // that, would not scroll all the way to the last row.
+                        Layout.preferredHeight: 1
                         color: root.uiTheme.stateDefaultBorder
                         opacity: 0.55
                         visible: index > 0

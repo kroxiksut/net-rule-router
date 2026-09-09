@@ -141,8 +141,8 @@ pub use settings_handlers::{
     AutostartGetHandler, AutostartToggleHandler, LocalNetworksGetHandler, LocalNetworksSetHandler,
     LogRetentionConfigGetHandler, LogRetentionConfigSetHandler, RefusingAnchorSetHandler,
     RetentionSettingsGetHandler, RetentionSettingsSetHandler, RoutingPauseGetHandler,
-    RoutingPauseToggleHandler, StorageUsageGetHandler, TrafficStatsClearHandler,
-    TrafficStatsGetHandler, TrafficStatsSetHandler,
+    RoutingPauseToggleHandler, StorageUsageGetHandler, TrafficHistoryMergeSetHandler,
+    TrafficStatsClearHandler, TrafficStatsGetHandler, TrafficStatsSetHandler,
 };
 pub use snapshot_diagnostics::SnapshotDiagnosticsHandler;
 pub use snapshot_initial::SnapshotInitialHandler;
@@ -1248,6 +1248,13 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
                     // When the expectation inputs are wired, rows
                     // carry `expected_route` (leak flagging in the GUI trace).
                     let handler = diagnostics_handlers::ConnTraceEntriesListHandler::new(ring);
+                    // "Show connection trace in the GUI" gates the ANSWER, not
+                    // the observer — the same stream feeds app-routing and the
+                    // learners, which the switch has no business stopping.
+                    let handler = match deps.service_stability_provider.clone() {
+                        Some(settings) => handler.with_gui_stream_gate(settings),
+                        None => handler,
+                    };
                     let handler = match deps.conn_trace_expectation.clone() {
                         Some((rules, fqdn, active_sid)) => {
                             handler.with_route_expectation(rules, fqdn, active_sid)
@@ -1328,6 +1335,14 @@ pub fn register_production_handlers(registry: &mut IpcHandlerRegistry, deps: Arc
             IpcOperationName::TrafficStatsSet => match deps.traffic_stats_writer.clone() {
                 Some(writer) => {
                     registry.register(op, TrafficStatsSetHandler::new(writer));
+                }
+                None => {
+                    registry.register(op, UnimplementedHandler::new(op));
+                }
+            },
+            IpcOperationName::TrafficHistoryMergeSet => match deps.traffic_stats_writer.clone() {
+                Some(writer) => {
+                    registry.register(op, TrafficHistoryMergeSetHandler::new(writer));
                 }
                 None => {
                     registry.register(op, UnimplementedHandler::new(op));

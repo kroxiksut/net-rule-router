@@ -128,6 +128,19 @@ fn raw_line_is_visible(line: &str, owner: Option<&str>, from_ms: Option<i64>) ->
     }
 }
 
+/// One rotated service-log file's worth of raw lines.
+///
+/// The name is the file's own (`nrr_service_YYYYMMDD-N.ndjson`), so a bundle
+/// reader sees the same layout the service writes and can tell which stretch of
+/// the day a line came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawLogFile {
+    /// File name as written on disk, no directory part.
+    pub name: String,
+    /// The lines this file contributed, oldest first.
+    pub lines: Vec<String>,
+}
+
 /// Read-only accessor for operational NDJSON log files.
 pub struct LogReader {
     logs_dir: PathBuf,
@@ -177,15 +190,44 @@ impl LogReader {
         owner: Option<&str>,
         from_ms: Option<i64>,
     ) -> Vec<String> {
+        self.recent_raw_files_for(max_bytes, owner, from_ms)
+            .into_iter()
+            .flat_map(|file| file.lines)
+            .collect()
+    }
+
+    /// The same lines, kept in the FILES they were written to.
+    ///
+    /// A day of service logs is several rotated files, and flattening them into
+    /// one stream throws away the boundary a reader navigates by — which file,
+    /// and therefore which stretch of the day, an event came from. The archive
+    /// ships them as a directory for that reason; the flat form above is kept
+    /// for callers that genuinely want one stream.
+    ///
+    /// Budget, scoping and ordering are unchanged: files are walked
+    /// newest-first so the budget buys the freshest evidence, and what survives
+    /// is handed back oldest-file-first with each file's own lines in the order
+    /// they were written.
+    pub fn recent_raw_files_for(
+        &self,
+        max_bytes: usize,
+        owner: Option<&str>,
+        from_ms: Option<i64>,
+    ) -> Vec<RawLogFile> {
         if max_bytes == 0 {
             return Vec::new();
         }
-        let mut newest_first: Vec<String> = Vec::new();
+        let mut newest_first: Vec<RawLogFile> = Vec::new();
         let mut used: usize = 0;
         'files: for path in self.list_files().into_iter().rev() {
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut lines: Vec<String> = Vec::new();
             for line in contents.lines().rev() {
                 if line.trim().is_empty() {
                     continue;
@@ -198,19 +240,28 @@ impl LogReader {
                 // asking for the tail must not get an empty answer.
                 // Saturating: an unlimited caller passes `usize::MAX`, and
                 // `used + cost` would overflow on the way to comparing.
-                if !newest_first.is_empty() && used.saturating_add(cost) > max_bytes {
+                if !(newest_first.is_empty() && lines.is_empty())
+                    && used.saturating_add(cost) > max_bytes
+                {
+                    // Keep what this file has already yielded before stopping.
+                    if !lines.is_empty() {
+                        lines.reverse();
+                        newest_first.push(RawLogFile { name, lines });
+                    }
                     break 'files;
                 }
                 used += cost;
-                newest_first.push(line.to_string());
+                lines.push(line.to_string());
+            }
+            if !lines.is_empty() {
+                lines.reverse();
+                newest_first.push(RawLogFile { name, lines });
             }
         }
         // Newest-first is how the BUDGET is spent — walking back from the tail
-        // is what keeps the freshest evidence. It is not how a log is read.
-        // Written out unreversed, the archive's `service-logs.ndjson` ran
-        // backwards: its first line was the export itself and its last line the
-        // oldest kept event. The audit twin (`AuditReader::recent_raw_lines`)
-        // has always reversed here; this one forgot, and the two now agree.
+        // is what keeps the freshest evidence. It is not how a log is read, so
+        // the files come back oldest-first (their own lines were reversed as
+        // each file closed above).
         newest_first.reverse();
         newest_first
     }
@@ -292,11 +343,76 @@ mod tests {
         }
     }
 
+    /// Writes one rotation's worth of raw lines under an explicit file name, so
+    /// a test can lay out several rotations of a day.
+    fn write_rotation(dir: &Path, name: &str, ids: &[&str]) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(dir.join(name)).expect("create log file");
+        for id in ids {
+            let event = crate::event::LogEvent::new(
+                (*id).to_string(),
+                1_745_000_000_000,
+                EventLevel::Info,
+                reason::service::STARTED,
+            );
+            writeln!(file, "{}", event.to_ndjson().expect("serialize")).expect("write");
+        }
+    }
+
+    fn ids_of(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).expect("json")["event_id"]
+                    .as_str()
+                    .expect("event_id")
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The archive ships the service's logs as the files they were written to,
+    /// so the reader has to keep that boundary: rotations oldest-first, each
+    /// one's own lines in writing order.
+    #[test]
+    fn raw_files_keep_each_rotation_separate_and_in_order() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_rotation(dir.path(), "nrr_service_20260907-1.ndjson", &["a1", "a2"]);
+        write_rotation(dir.path(), "nrr_service_20260907-2.ndjson", &["b1"]);
+
+        let files = LogReader::new(dir.path()).recent_raw_files_for(usize::MAX, None, None);
+
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].name, "nrr_service_20260907-1.ndjson");
+        assert_eq!(ids_of(&files[0].lines), vec!["a1", "a2"]);
+        assert_eq!(files[1].name, "nrr_service_20260907-2.ndjson");
+        assert_eq!(ids_of(&files[1].lines), vec!["b1"]);
+    }
+
+    /// The budget is spent from the newest end, so a tight one keeps the latest
+    /// rotation and drops the earlier ones entirely.
+    #[test]
+    fn a_tight_budget_keeps_the_newest_rotation() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_rotation(
+            dir.path(),
+            "nrr_service_20260907-1.ndjson",
+            &["old1", "old2"],
+        );
+        write_rotation(dir.path(), "nrr_service_20260907-2.ndjson", &["new1"]);
+
+        let files = LogReader::new(dir.path()).recent_raw_files_for(200, None, None);
+
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].name, "nrr_service_20260907-2.ndjson");
+        assert_eq!(ids_of(&files[0].lines), vec!["new1"]);
+    }
+
     /// The archive's raw log section is read top to bottom by a human. It
     /// shipped backwards: newest-first is how the byte budget is spent, and
-    /// nothing turned it back before writing, so the first line of
-    /// `service-logs.ndjson` was the export itself. The audit twin has always
-    /// reversed; there was no test here to notice this one did not.
+    /// nothing turned it back before writing, so its first line was the export
+    /// itself. The audit twin has always reversed; there was no test here to
+    /// notice this one did not.
     #[test]
     fn raw_lines_come_back_oldest_first() {
         let dir = tempfile::tempdir().expect("temp");

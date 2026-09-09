@@ -266,7 +266,12 @@ impl ServiceStabilityConfigRecord {
             updated_at: 0,
             verbose_logging: false,
             conn_trace_ndjson: false,
-            conn_trace_gui: false,
+            // Showing the trace in the GUI costs nothing on disk and is what
+            // makes the Diagnostics panel useful out of the box; the
+            // privacy-sensitive half is the NDJSON sink above, which stays off.
+            // This is the answer for a state DB that was never written — an
+            // existing row keeps whatever it holds.
+            conn_trace_gui: true,
             rule_scope_service_driven: true,
             routing_stop_policy: RoutingStopPolicy::Teardown,
             cache_refresh_interval_secs: nrr_domain::decision_lookup::CACHE_REFRESH_DEFAULT_SECS,
@@ -1057,14 +1062,15 @@ mod tests {
     }
 
     #[test]
-    fn conn_trace_flags_default_false_and_roundtrip_independently() {
+    fn conn_trace_flags_default_and_roundtrip_independently() {
         let dir = tempfile::tempdir().expect("temp dir");
         let conn = open_state_db(&dir);
         let repo = ServiceStabilityConfigRepository::new(&conn);
 
-        // Implicit default: both off.
+        // Implicit default: the on-disk sink is off, the GUI view is on.
         let d = repo.get_or_default().expect("get");
-        assert!(!d.conn_trace_ndjson && !d.conn_trace_gui);
+        assert!(!d.conn_trace_ndjson, "the disk sink stays opt-in");
+        assert!(d.conn_trace_gui, "an unwritten DB still shows the panel");
 
         // GUI on, NDJSON off — independent toggles.
         repo.set(

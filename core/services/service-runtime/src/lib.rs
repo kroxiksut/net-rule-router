@@ -108,17 +108,26 @@ pub mod known_direct;
 // What the last main-link check found for a rule's address.
 pub mod lifecycle;
 pub mod lifecycle_journal;
+// Ask the machine's own private resolvers before calling a name
+// non-existent: only they can hold a namespace the public internet has
+// never heard of.
+pub mod local_namespace_fallback;
 pub mod logon_rearm;
 pub mod machine_scoped;
 pub mod main_route_verdicts;
 pub mod managers;
 mod net_filter;
 pub mod network_rearm;
+// Names for addresses no rule covers, so a failing host can be named
+// before anyone has a theory about it. Diagnostic; never enforcement.
+pub mod navigation_registry;
+pub mod observed_host_names;
+pub mod path_probe;
 pub mod per_sid_orchestrator;
 pub mod persistent_app_resolver;
+pub mod phase_timings;
 pub mod policy_loader;
 pub mod power_resume;
-pub mod primary_path_probe;
 // Which named destinations stall on the MAIN link. Diagnostic only: the
 // companion ledger keeps this evidence for its own candidates and discards it
 // for every other host, which is precisely the host nobody has a theory about.
@@ -382,6 +391,22 @@ pub const fn service_runtime_orchestration_snapshot() -> ServiceRuntimeOrchestra
         privileged_operations: "ready",
         install_update_hooks: "partial",
     }
+}
+
+/// When this process started, as Unix milliseconds.
+///
+/// Captured on the first call and never again, so every later caller — the
+/// diagnostics card, an archive, a log line — reports the same moment. The
+/// service asks for it during bootstrap, long before anything can read it, so
+/// "first call" is in practice "service start".
+pub fn process_started_at_ms() -> u64 {
+    static STARTED_AT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STARTED_AT.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    })
 }
 
 #[cfg(test)]

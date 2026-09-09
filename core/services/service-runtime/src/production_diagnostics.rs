@@ -143,6 +143,13 @@ pub struct ProductionDiagnosticsFacade {
     /// call re-read the whole current audit file and re-hashed every line;
     /// nothing about that answer changes until the file grows.
     chain_cache: Mutex<Option<(ChainCacheKey, bool)>>,
+    /// The host's operator log, read for one fact: when this boot reached the
+    /// sign-in phase. `None` on a host with no such record, which the card
+    /// reports as "cannot tell".
+    system_event_log: Option<Arc<dyn nrr_platform_api::system_event_log::SystemEventLogPort>>,
+    /// When THIS service process started, Unix ms. Half of the comparison; the
+    /// other half comes from the OS log.
+    started_at_ms: Option<u64>,
 }
 
 type ChainCacheKey = (PathBuf, u64, Option<std::time::SystemTime>);
@@ -197,7 +204,33 @@ impl ProductionDiagnosticsFacade {
             diagnostic_session: DiagnosticSessionHandle::new(),
             log_writer: None,
             chain_cache: Mutex::new(None),
+            system_event_log: None,
+            started_at_ms: None,
         }
+    }
+
+    /// Attach the host log and this process's start moment, so the card can
+    /// answer "did the service delay the boot" with a measurement.
+    ///
+    /// Both or neither: a start time with no log to compare it against is not
+    /// an answer, and the card would have to invent one.
+    pub fn with_boot_timing(
+        mut self,
+        system_event_log: Arc<dyn nrr_platform_api::system_event_log::SystemEventLogPort>,
+        started_at_ms: u64,
+    ) -> Self {
+        self.system_event_log = Some(system_event_log);
+        self.started_at_ms = Some(started_at_ms);
+        self
+    }
+
+    /// Where this service's start sits relative to the boot's sign-in phase.
+    fn start_relative_to_sign_in(&self) -> nrr_domain::boot_timing::ServiceStartRelativeToSignIn {
+        let prompt = self
+            .system_event_log
+            .as_ref()
+            .and_then(|log| log.sign_in_prompt_at_ms());
+        nrr_domain::boot_timing::service_start_relative_to_sign_in(prompt, self.started_at_ms)
     }
 
     /// Attach the installed log writer so the health card can report events
@@ -222,10 +255,13 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
 
         // Service health
         let (active_revision_id, pending_changes) = self.read_revision_summary();
+        let start_relation = self.start_relative_to_sign_in();
         let service_health = ServiceHealthCard {
             state: "running".to_string(),
             active_revision_id,
             pending_changes,
+            start_relative_to_sign_in: start_relation.slug().to_string(),
+            start_sign_in_gap_ms: start_relation.millis(),
         };
 
         // Audit
@@ -356,6 +392,18 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         Ok(
             nrr_diagnostics::logs::reader::LogReader::new(self.logs_dir.clone())
                 .recent_raw_lines_for(max_bytes, audience.principal(), from_ms),
+        )
+    }
+
+    fn recent_log_files_raw(
+        &self,
+        max_bytes: usize,
+        from_ms: Option<i64>,
+        audience: &DiagnosticsAudience,
+    ) -> DiagnosticsResult<Vec<nrr_diagnostics::logs::reader::RawLogFile>> {
+        Ok(
+            nrr_diagnostics::logs::reader::LogReader::new(self.logs_dir.clone())
+                .recent_raw_files_for(max_bytes, audience.principal(), from_ms),
         )
     }
 
@@ -586,7 +634,7 @@ impl ProductionDiagnosticsFacade {
         let behavior_mode = self.behavior_mode_for_sid(caller_sid);
         let zone_policy = self.zone_policy_for_sid(caller_sid);
         // A BARE-IP probe (no hostname) is rule-less by
-        // itself, so a shared CDN IP like `8.6.112.0` would report the DEFAULT
+        // itself, so a shared CDN IP like `192.0.2.0` would report the DEFAULT
         // route even though its owning hostname IS routed — contradicting the
         // by-name probe and the installed /32 overlay. Reverse-resolve the IP
         // against the FQDN cache and, if any cached tenant matches a rule, answer

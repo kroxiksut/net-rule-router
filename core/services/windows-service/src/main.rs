@@ -61,6 +61,10 @@ fn main() -> std::process::ExitCode {
     // diagnostic line. Called BEFORE any handler runs so the first
     // handshake already sees the right value.
     nrr_service_runtime::set_service_binary_version(env!("CARGO_PKG_VERSION"));
+    // Stamp the start moment here, at the first instruction that runs, so the
+    // boot-timing card measures when the SERVICE started — not when the piece
+    // of it that reports the measurement was built.
+    let _ = nrr_service_runtime::process_started_at_ms();
 
     let args: Vec<String> = env::args().collect();
     let mode = args
@@ -72,6 +76,13 @@ fn main() -> std::process::ExitCode {
         #[cfg(windows)]
         "install" => match scm::install_service() {
             Ok(()) => {
+                // The GUI's own start button is unprivileged, so a fresh
+                // installation must carry the grant from the first boot —
+                // otherwise the only way to start a stopped service is an
+                // elevated console.
+                if let Err(e) = service_config::grant_interactive_service_start() {
+                    eprintln!("warning: could not grant SERVICE_START to INTERACTIVE: {e}");
+                }
                 println!("Installed service '{}'.", nrr_service_runtime::SERVICE_NAME);
                 std::process::ExitCode::SUCCESS
             }
@@ -113,13 +124,10 @@ fn main() -> std::process::ExitCode {
         #[cfg(windows)]
         "reinstall" => reinstall_from_this_binary(),
         // Elevated start-mode switch. Two SINGLE-TOKEN verbs, because the
-        // session broker runs exactly one
-        // whitelisted argv token (never a `<mode>` argument). `set-start-auto`
-        // registers SERVICE_AUTO_START and revokes the console user's
-        // SERVICE_START grant; `set-start-demand` grants the interactive console
-        // user the targeted SERVICE_START right FIRST (so we never leave a
-        // DemandStart service they can't start without UAC), then registers
-        // SERVICE_DEMAND_START. See `apply_start_mode`.
+        // session broker runs exactly one whitelisted argv token (never a
+        // `<mode>` argument). Both refresh the `INTERACTIVE` SERVICE_START
+        // grant first, then register SERVICE_AUTO_START / SERVICE_DEMAND_START.
+        // See `apply_start_mode`.
         #[cfg(windows)]
         "set-start-auto" => apply_start_mode(nrr_service_runtime::ServiceStartMode::WithWindows),
         #[cfg(windows)]
@@ -347,26 +355,13 @@ fn reinstall_from_this_binary() -> std::process::ExitCode {
 }
 
 /// Apply a service start mode (shared by the `set-start-auto` /
-/// `set-start-demand` verbs). For `OnAppLaunch` the targeted
-/// `SERVICE_START` grant to `INTERACTIVE` is added BEFORE the start-type flip,
-/// so the service is never left DemandStart-without-grant (unstartable by the
-/// unprivileged launcher). For `WithWindows` the grant is revoked best-effort
-/// afterwards.
+/// `set-start-demand` verbs). The targeted `SERVICE_START` grant to
+/// `INTERACTIVE` is added BEFORE the start-type flip in both modes, so the
+/// service is never left unstartable by the unprivileged launcher.
 #[cfg(windows)]
 fn apply_start_mode(target: nrr_service_runtime::ServiceStartMode) -> std::process::ExitCode {
-    use nrr_service_runtime::ServiceStartMode;
-    let result = match target {
-        ServiceStartMode::OnAppLaunch => service_config::grant_interactive_service_start()
-            .and_then(|()| service_config::reconfigure_start_mode(target)),
-        ServiceStartMode::WithWindows => {
-            service_config::reconfigure_start_mode(target).map(|()| {
-                // Best-effort: drop the now-unneeded SERVICE_START grant.
-                if let Err(e) = service_config::revoke_interactive_service_start() {
-                    eprintln!("warning: could not revoke SERVICE_START grant: {e}");
-                }
-            })
-        }
-    };
+    let result = service_config::grant_interactive_service_start()
+        .and_then(|()| service_config::reconfigure_start_mode(target));
     match result {
         Ok(()) => {
             println!(

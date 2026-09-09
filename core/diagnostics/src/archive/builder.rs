@@ -55,10 +55,11 @@ pub struct ArchiveInput {
     /// them only when the section is present, byte-capped by
     /// `request.max_audit_chain_bytes`.
     pub audit_chain_lines: Vec<String>,
-    /// Raw operational-log NDJSON lines (payloads intact), newest-first, as the
-    /// facade scoped them to the requester. `logs.ndjson` is the payload-
-    /// stripped listing; this is the evidence behind it.
-    pub raw_log_lines: Vec<String>,
+    /// Raw operational-log NDJSON, payloads intact, kept in the FILES the
+    /// service wrote them to and scoped by the facade to the requester.
+    /// `logs.ndjson` is the payload-stripped listing; this is the evidence
+    /// behind it, and it ships as the `service-logs/` directory.
+    pub raw_log_files: Vec<crate::logs::reader::RawLogFile>,
     pub explain_samples: Vec<ExplainResponse>,
     /// Host system information (OS/CPU/RAM) for `system_info.json`.
     /// `None` writes a minimal record noting it was
@@ -105,7 +106,8 @@ impl ArchiveBuilder {
         })?;
 
         // Write section files.
-        let mut sections_written = write_sections(&input, temp_dir.path())?;
+        let staged = write_sections(&input, temp_dir.path())?;
+        let mut sections_written = staged.files;
         if input
             .request
             .all_sections()
@@ -130,8 +132,10 @@ impl ArchiveBuilder {
             app_version: input.request.app_version.clone(),
             redaction_mode: redaction_mode_slug(input.request.redaction_mode),
             included_sections: sections_written.clone(),
-            log_entry_count: input.log_entries.len() as u32,
-            audit_entry_count: input.audit_entries.len() as u32,
+            // What the archive CARRIES, not what was offered: both sections
+            // are capped as they are staged.
+            log_entry_count: staged.log_entries,
+            audit_entry_count: staged.audit_entries,
             // The manifest lives INSIDE the zip, so it cannot state the zip's
             // own size. What it can state truthfully is the staged content it
             // describes; the compressed size comes back in `BuildResult`.
@@ -184,10 +188,34 @@ impl ArchiveBuilder {
 const SERVICE_STDERR_FILENAME: &str = "nrr_service_stderr.log";
 /// Name of the raw operational-log section: the service's own NDJSON lines,
 /// verbatim, next to the payload-stripped `logs.ndjson` listing.
-const SERVICE_LOGS_RAW_FILENAME: &str = "service-logs.ndjson";
+/// Directory the service's own log files are shipped in, one file per
+/// rotation exactly as it sits on disk. A day of logs is several files, and
+/// which file a line came from is how a reader navigates it — the single
+/// flattened `service-logs.ndjson` this replaces threw that away, and with it
+/// any sense of where one run ended and the next began.
+const SERVICE_LOGS_DIRNAME: &str = "service-logs";
 
-fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<String>> {
-    let mut written = Vec::new();
+/// Room left for the sections written after the logs (captured stderr, the
+/// redaction report) once the raw log files have taken their share.
+const TAIL_SECTION_HEADROOM_BYTES: u64 = 1024 * 1024;
+
+/// What the staged sections actually carry.
+///
+/// The counts are read off the files that were written, not off what the
+/// caller offered: both `logs.ndjson` and `audit_summary.json` are capped as
+/// they are staged (a byte budget and an entry cap), so the offered figure
+/// describes an archive nobody received. A manifest that overstates its own
+/// contents sends a triager looking for lines that were never shipped.
+#[derive(Default)]
+struct StagedSections {
+    files: Vec<String>,
+    log_entries: u32,
+    audit_entries: u32,
+}
+
+fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<StagedSections> {
+    let mut staged = StagedSections::default();
+    let written = &mut staged.files;
 
     for section in input.request.all_sections() {
         // The report describes the sections around it, so it is written last,
@@ -195,7 +223,15 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
         if section == ArchiveSection::RedactionReport {
             continue;
         }
-        if write_section(input, dir, section)? {
+        let outcome = write_section(input, dir, section)?;
+        if let Some(entries) = outcome.entries {
+            match section {
+                ArchiveSection::Logs => staged.log_entries = entries,
+                ArchiveSection::AuditSummary => staged.audit_entries = entries,
+                _ => {}
+            }
+        }
+        if outcome.written {
             written.push(section.filename().to_string());
         }
     }
@@ -206,18 +242,52 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
     // They used to be appended by the launcher reading the log directory off
     // disk — which is why that directory had to be readable by every account on
     // the machine, and why one user's bundle carried everyone's lines.
-    if !input.raw_log_lines.is_empty() {
-        let mut content = String::new();
-        for line in &input.raw_log_lines {
-            content.push_str(line);
-            content.push('\n');
-        }
-        std::fs::write(dir.join(SERVICE_LOGS_RAW_FILENAME), content).map_err(|e| {
-            DiagnosticsError::ExportFailed {
-                reason: format!("cannot write {SERVICE_LOGS_RAW_FILENAME}: {e}"),
-            }
+    if !input.raw_log_files.is_empty() {
+        let log_dir = dir.join(SERVICE_LOGS_DIRNAME);
+        std::fs::create_dir_all(&log_dir).map_err(|e| DiagnosticsError::ExportFailed {
+            reason: format!("cannot create {SERVICE_LOGS_DIRNAME}: {e}"),
         })?;
-        written.push(SERVICE_LOGS_RAW_FILENAME.to_string());
+        // How much of the log history a user gets is THEIR choice — the
+        // facade already trimmed these files to the budget the diagnostics
+        // panel names (`0` there means unlimited, and it must keep meaning it).
+        // The only bound applied here is the archive's own hard cap: without
+        // it, a full-history export of a large log directory fails outright and
+        // the user ends up with nothing instead of a slightly shorter bundle.
+        // Newest first, so what drops is the oldest end.
+        let already_staged = staged_bytes(dir);
+        let cap = crate::archive::request::MAX_ARCHIVE_SIZE_BYTES
+            .saturating_sub(already_staged)
+            .saturating_sub(TAIL_SECTION_HEADROOM_BYTES);
+        let mut used: u64 = 0;
+        for file in input.raw_log_files.iter().rev() {
+            // The name comes off our own log directory, never off the wire, but
+            // it still ends up joined to a path — so it is reduced to a bare
+            // file name first.
+            let name = std::path::Path::new(&file.name)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let mut content = String::new();
+            for line in &file.lines {
+                content.push_str(line);
+                content.push('\n');
+            }
+            let size = content.len() as u64;
+            // The newest file always ships whole: half a file is not evidence.
+            if used > 0 && used + size > cap {
+                break;
+            }
+            used += size;
+            std::fs::write(log_dir.join(&name), content).map_err(|e| {
+                DiagnosticsError::ExportFailed {
+                    reason: format!("cannot write {SERVICE_LOGS_DIRNAME}/{name}: {e}"),
+                }
+            })?;
+            written.push(format!("{SERVICE_LOGS_DIRNAME}/{name}"));
+        }
     }
 
     // Not an `ArchiveSection`: it is not a rendering of our own data but a
@@ -239,14 +309,43 @@ fn write_sections(input: &ArchiveInput, dir: &Path) -> DiagnosticsResult<Vec<Str
         written.push(SERVICE_STDERR_FILENAME.to_string());
     }
 
-    Ok(written)
+    Ok(staged)
+}
+
+/// One section's contribution: whether its file was staged, and — for the two
+/// sections the manifest counts — how many entries it actually carries.
+#[derive(Default)]
+struct SectionWrite {
+    written: bool,
+    entries: Option<u32>,
+}
+
+impl SectionWrite {
+    const SKIPPED: Self = Self {
+        written: false,
+        entries: None,
+    };
+
+    const fn staged() -> Self {
+        Self {
+            written: true,
+            entries: None,
+        }
+    }
+
+    const fn staged_with(entries: u32) -> Self {
+        Self {
+            written: true,
+            entries: Some(entries),
+        }
+    }
 }
 
 fn write_section(
     input: &ArchiveInput,
     dir: &Path,
     section: ArchiveSection,
-) -> DiagnosticsResult<bool> {
+) -> DiagnosticsResult<SectionWrite> {
     let path = dir.join(section.filename());
     match section {
         ArchiveSection::Health => {
@@ -280,6 +379,7 @@ fn write_section(
             // page), so the newest lines are kept; the tail beyond the budget is
             // dropped.
             let mut content = String::new();
+            let mut entries: u32 = 0;
             let budget = input.request.max_log_bytes as usize;
             // Session-only trimming: entries older than
             // `logs_from_ms` (when set) never enter the archive, regardless of
@@ -302,8 +402,10 @@ fn write_section(
                 }
                 content.push_str(&line);
                 content.push('\n');
+                entries += 1;
             }
             write_file(&path, content.as_bytes())?;
+            return Ok(SectionWrite::staged_with(entries));
         }
         ArchiveSection::SystemInfo => {
             // Host OS/CPU/RAM + our app version. Best-effort: when the collector
@@ -340,8 +442,18 @@ fn write_section(
                 .collect();
             let json = serde_json::to_string_pretty(&entries).map_err(ser_err)?;
             write_file(&path, json.as_bytes())?;
+            return Ok(SectionWrite::staged_with(entries.len() as u32));
         }
         ArchiveSection::AuditChain => {
+            // Nothing to ship: the caller withholds the raw chain from an
+            // export it may not verify (a subset of a hash chain proves
+            // nothing). Say the section is ABSENT rather than shipping a zero-
+            // byte file the reader has to interpret — the redaction report
+            // lists what is missing, and "not here" is a fact, while "here but
+            // empty" could mean unreadable, truncated or genuinely nothing.
+            if input.audit_chain_lines.is_empty() {
+                return Ok(SectionWrite::SKIPPED);
+            }
             // Raw audit NDJSON verbatim (chain fields intact). The caller only
             // supplies lines for a Diagnostics/DeveloperLocal export, and this
             // section is only in that tier's set — a default export never
@@ -361,6 +473,11 @@ fn write_section(
             write_file(&path, content.as_bytes())?;
         }
         ArchiveSection::ExplainSamples => {
+            // Same rule as the chain above: an empty `[]` reads as an answer,
+            // and it is not one.
+            if input.explain_samples.is_empty() {
+                return Ok(SectionWrite::SKIPPED);
+            }
             let json = serde_json::to_string_pretty(&input.explain_samples).map_err(ser_err)?;
             write_file(&path, json.as_bytes())?;
         }
@@ -399,10 +516,10 @@ fn write_section(
         ArchiveSection::RedactionReport => {
             // Written by `write_redaction_report` after the other sections
             // exist; there is nothing to measure before then.
-            return Ok(false);
+            return Ok(SectionWrite::SKIPPED);
         }
     }
-    Ok(true)
+    Ok(SectionWrite::staged())
 }
 
 /// Writes `redaction_report.json` from what the staged sections actually
@@ -459,11 +576,11 @@ fn count_markers(dir: &Path) -> MarkerCounts {
     };
 
     let mut counts = MarkerCounts::default();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return counts;
-    };
-    for entry in entries.flatten() {
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+    // Every staged file, subdirectories included — the service's own logs ship
+    // as one, and a report that skipped them would undercount what it claims to
+    // describe.
+    for (name, _) in staged_files(dir) {
+        let Ok(text) = std::fs::read_to_string(dir.join(name)) else {
             continue;
         };
         counts.hostnames += text.matches(MARKER_REDACTED).count() as u32;
@@ -569,13 +686,38 @@ fn local_zip_timestamp() -> zip::DateTime {
 
 /// Total uncompressed size of everything staged for the archive.
 fn staged_bytes(dir: &Path) -> u64 {
-    std::fs::read_dir(dir)
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+    staged_files(dir).iter().map(|(_, size)| size).sum()
+}
+
+/// Every staged file as `(path relative to the staging root, size)`, sorted so
+/// a build is reproducible. Recursive because the service's own logs ship as a
+/// directory; a flat walk would silently drop them from both the size figure
+/// and the zip.
+fn staged_files(dir: &Path) -> Vec<(String, u64)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(root, &path, out);
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            // Zip entries are separated by '/' on every platform.
+            let name = relative.to_string_lossy().replace('\\', "/");
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push((name, size));
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
 }
 
 /// Packages `source_dir` into `dest_path`.
@@ -617,24 +759,15 @@ fn write_zip_into(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<()> 
         .compression_method(zip::CompressionMethod::Deflated)
         .last_modified_time(local_zip_timestamp());
 
-    let entries = std::fs::read_dir(source_dir).map_err(|e| DiagnosticsError::ExportFailed {
-        reason: format!("cannot read temp dir: {e}"),
-    })?;
-
     let mut total_uncompressed = 0u64;
 
-    for entry in entries {
-        let entry = entry.map_err(|e| DiagnosticsError::ExportFailed {
-            reason: format!("cannot read dir entry: {e}"),
-        })?;
-        let file_path = entry.path();
-        let file_name = entry.file_name();
-        let file_name_str = file_name.to_string_lossy();
+    for (file_name_str, size) in staged_files(source_dir) {
+        let file_path = source_dir.join(&file_name_str);
 
         // Check the budget against the file's LENGTH before reading it: a guard
         // that first pulls the oversized file into memory does not guard
         // against what it names.
-        total_uncompressed += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        total_uncompressed += size;
         if total_uncompressed > crate::archive::request::MAX_ARCHIVE_SIZE_BYTES {
             return Err(DiagnosticsError::ExportFailed {
                 reason: format!(
@@ -648,7 +781,7 @@ fn write_zip_into(source_dir: &Path, dest_path: &Path) -> DiagnosticsResult<()> 
             reason: format!("cannot read {}: {e}", file_path.display()),
         })?;
 
-        zip.start_file(file_name_str.as_ref(), options)
+        zip.start_file(file_name_str.as_str(), options)
             .map_err(|e| DiagnosticsError::ExportFailed {
                 reason: format!("cannot add {file_name_str} to zip: {e}"),
             })?;
@@ -673,6 +806,7 @@ mod tests {
         CacheHealthCard, DiagnosticModeStateDto, DiagnosticsDataOrigin, DiagnosticsStatusDto,
         LogHealthCard, SecurityStatusCard, ServiceHealthCard,
     };
+    use crate::logs::reader::RawLogFile;
 
     fn sample_health() -> DiagnosticsStatusDto {
         DiagnosticsStatusDto {
@@ -681,6 +815,8 @@ mod tests {
                 state: "running".into(),
                 active_revision_id: Some("rev-001".into()),
                 pending_changes: 0,
+                start_relative_to_sign_in: "unknown".to_string(),
+                start_sign_in_gap_ms: None,
             },
             security_status: SecurityStatusCard {
                 audit_chain_ok: true,
@@ -732,7 +868,7 @@ mod tests {
                 has_payload_summary: false,
             }],
             audit_chain_lines: Vec::new(),
-            raw_log_lines: Vec::new(),
+            raw_log_files: Vec::new(),
             explain_samples: Vec::new(),
             system_info: Some(nrr_shared::system_info::SystemInfo {
                 os: "windows".into(),
@@ -1069,6 +1205,211 @@ mod tests {
         assert!(body.contains("prev_hash"), "{body}");
         assert!(body.contains("event_hash"), "{body}");
         assert_eq!(body.lines().count(), 2);
+    }
+
+    /// The service's own logs ship as the DIRECTORY they live in, one entry per
+    /// rotated file. A day is several files, and which file a line came from is
+    /// how the day is navigated — the single flattened `service-logs.ndjson`
+    /// this replaces threw that away.
+    #[test]
+    fn service_logs_ship_as_a_directory_of_the_files_they_were_written_to() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("diag.zip");
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+        input.raw_log_files = vec![
+            RawLogFile {
+                name: "nrr_service_20260907-1.ndjson".into(),
+                lines: vec![r#"{"seq":1}"#.into(), r#"{"seq":2}"#.into()],
+            },
+            RawLogFile {
+                name: "nrr_service_20260907-2.ndjson".into(),
+                lines: vec![r#"{"seq":3}"#.into()],
+            },
+        ];
+        let result = ArchiveBuilder::build(input, &dest).expect("build");
+
+        for name in [
+            "service-logs/nrr_service_20260907-1.ndjson",
+            "service-logs/nrr_service_20260907-2.ndjson",
+        ] {
+            assert!(
+                result
+                    .manifest
+                    .included_sections
+                    .contains(&name.to_string()),
+                "{name} missing from {:?}",
+                result.manifest.included_sections,
+            );
+        }
+
+        let file = std::fs::File::open(&dest).expect("open zip");
+        let mut zip = zip::ZipArchive::new(file).expect("parse zip");
+        let mut body = String::new();
+        zip.by_name("service-logs/nrr_service_20260907-1.ndjson")
+            .expect("first rotation present")
+            .read_to_string(&mut body)
+            .expect("read");
+        // Lines keep the order they were written in, whole file, nothing merged.
+        assert_eq!(body, "{\"seq\":1}\n{\"seq\":2}\n");
+    }
+
+    /// A full-history export must not fail because the log directory is large:
+    /// what does not fit under the archive's own hard cap drops from the OLD
+    /// end, the newest file survives whole, and the user still gets a bundle.
+    /// (How much history is offered in the first place is the user's budget
+    /// setting, applied before this — `0` there means unlimited.)
+    #[test]
+    fn a_log_history_that_does_not_fit_loses_its_oldest_end_not_the_export() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("diag.zip");
+        let mut input = sample_input(DiagnosticArchiveRequest::default_export("0.1.0-test"));
+        // Four files of ~13 MiB each against the 50 MiB archive cap.
+        let fat_line = format!(r#"{{"pad":"{}"}}"#, "x".repeat(4096));
+        let fat_file = |name: &str| RawLogFile {
+            name: name.into(),
+            lines: (0..3300).map(|_| fat_line.clone()).collect(),
+        };
+        input.raw_log_files = vec![
+            fat_file("nrr_service_20260904-1.ndjson"),
+            fat_file("nrr_service_20260905-1.ndjson"),
+            fat_file("nrr_service_20260906-1.ndjson"),
+            fat_file("nrr_service_20260907-1.ndjson"),
+        ];
+        let result = ArchiveBuilder::build(input, &dest).expect("build must not fail");
+
+        let shipped: Vec<&String> = result
+            .manifest
+            .included_sections
+            .iter()
+            .filter(|n| n.starts_with("service-logs/"))
+            .collect();
+        assert!(
+            shipped.len() < 4 && !shipped.is_empty(),
+            "what fits ships, the rest drops: {shipped:?}",
+        );
+        assert!(
+            shipped
+                .iter()
+                .any(|n| n.ends_with("nrr_service_20260907-1.ndjson")),
+            "the newest file must survive: {shipped:?}",
+        );
+        assert!(
+            !shipped
+                .iter()
+                .any(|n| n.ends_with("nrr_service_20260904-1.ndjson")),
+            "the oldest file is the one that drops: {shipped:?}",
+        );
+    }
+
+    /// The manifest counts what the archive CARRIES. Both capped sections used
+    /// to report what the caller offered, so a bundle holding 10 199 log lines
+    /// announced 92 548 of them and sent the reader looking for the rest.
+    #[test]
+    fn the_manifest_counts_what_was_staged_not_what_was_offered() {
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("diag.zip");
+        let mut req = DiagnosticArchiveRequest::diagnostics_export("0.1.0-test");
+        // Budgets that bite: two log lines fit, one audit entry is allowed.
+        req.max_log_bytes = 400;
+        req.max_audit_entries = 1;
+        let mut input = sample_input(req);
+        let one_log = input.log_entries[0].clone();
+        let one_audit = input.audit_entries[0].clone();
+        input.log_entries = (0..50)
+            .map(|i| LogEntryDto {
+                event_id: format!("evt-{i:03}"),
+                ..one_log.clone()
+            })
+            .collect();
+        input.audit_entries = (0..10)
+            .map(|i| AuditEntryDto {
+                event_id: format!("adt-{i:03}"),
+                seq: i + 1,
+                ..one_audit.clone()
+            })
+            .collect();
+
+        let result = ArchiveBuilder::build(input, &dest).expect("build");
+
+        assert_eq!(
+            result.manifest.audit_entry_count, 1,
+            "the entry cap is what the file carries",
+        );
+        assert!(
+            result.manifest.log_entry_count < 50,
+            "the byte budget dropped the tail; the manifest must say so (got {})",
+            result.manifest.log_entry_count,
+        );
+
+        // And the count is the file's own line count, not an estimate.
+        use std::io::Read;
+        let file = std::fs::File::open(&dest).expect("open zip");
+        let mut zip = zip::ZipArchive::new(file).expect("parse zip");
+        let mut body = String::new();
+        zip.by_name("logs.ndjson")
+            .expect("logs.ndjson")
+            .read_to_string(&mut body)
+            .expect("read");
+        assert_eq!(body.lines().count() as u32, result.manifest.log_entry_count,);
+    }
+
+    /// A section with nothing in it must be ABSENT, not present-and-empty: the
+    /// caller withholds the raw chain from an export it cannot verify, and a
+    /// zero-byte file leaves the reader guessing between "nothing happened",
+    /// "unreadable" and "truncated". The redaction report says it is missing.
+    #[test]
+    fn a_section_with_nothing_in_it_is_absent_rather_than_empty() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().expect("temp");
+        let dest = dir.path().join("diag.zip");
+        let req = DiagnosticArchiveRequest::diagnostics_export("0.1.0-test");
+        let mut input = sample_input(req);
+        // A diagnostics-tier export whose caller supplied neither.
+        input.audit_chain_lines = Vec::new();
+        input.explain_samples = Vec::new();
+        let result = ArchiveBuilder::build(input, &dest).expect("build");
+
+        for name in ["audit_chain.ndjson", "explain_samples.json"] {
+            assert!(
+                !result
+                    .manifest
+                    .included_sections
+                    .contains(&name.to_string()),
+                "{name} was announced but carries nothing",
+            );
+        }
+
+        let file = std::fs::File::open(&dest).expect("open zip");
+        let mut zip = zip::ZipArchive::new(file).expect("parse zip");
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert!(
+            !names.contains(&"audit_chain.ndjson".to_string()),
+            "{names:?}"
+        );
+        assert!(
+            !names.contains(&"explain_samples.json".to_string()),
+            "{names:?}"
+        );
+
+        // What is missing is stated, not left to be noticed.
+        let mut report = String::new();
+        zip.by_name("redaction_report.json")
+            .expect("redaction_report.json")
+            .read_to_string(&mut report)
+            .expect("read");
+        let report: serde_json::Value = serde_json::from_str(&report).expect("parse");
+        let excluded = report["excluded_sections"]
+            .as_array()
+            .expect("excluded_sections");
+        for name in ["audit_chain.ndjson", "explain_samples.json"] {
+            assert!(
+                excluded.iter().any(|v| v == name),
+                "{name} missing from excluded_sections: {excluded:?}",
+            );
+        }
     }
 
     #[test]

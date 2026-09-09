@@ -1547,7 +1547,7 @@ mod tests {
         let mut rec = sample_record(BindingSource::UserAssigned);
         rec.secondary = Some(secondary_binding(
             "win-adapter:{guid-a}",
-            "hidemy.name VPN OpenVPN Adapter",
+            "swiftvpn VPN OpenVPN Adapter",
         ));
         repo.update_for_sid("S", &rec, 1).unwrap();
 
@@ -1556,14 +1556,14 @@ mod tests {
             "S",
             "secondary",
             "win-adapter:{guid-b}",
-            "hidemy.name VPN 3.0 OpenVPN Adapter",
+            "SwiftVPN 3.0 OpenVPN Adapter",
             2,
         )
         .unwrap();
 
         let s = repo.load_for_sid("S").unwrap().secondary.unwrap();
         assert_eq!(s.stable_id, "win-adapter:{guid-b}");
-        assert_eq!(s.display_name, "hidemy.name VPN 3.0 OpenVPN Adapter");
+        assert_eq!(s.display_name, "SwiftVPN 3.0 OpenVPN Adapter");
         assert!(s
             .known_stable_ids
             .contains(&"win-adapter:{guid-a}".to_string()));
@@ -1581,11 +1581,11 @@ mod tests {
         repo.update_for_sid("S", &rec, 1).unwrap();
 
         assert!(repo
-            .remember_stable_id("S", "secondary", "win-mac:D8-C4-97-14-BA-2E", 2)
+            .remember_stable_id("S", "secondary", "win-mac:00-11-22-33-44-AA", 2)
             .unwrap());
         assert!(
             !repo
-                .remember_stable_id("S", "secondary", "win-mac:d8-c4-97-14-ba-2e", 3)
+                .remember_stable_id("S", "secondary", "win-mac:00-11-22-33-44-aa", 3)
                 .unwrap(),
             "a known id, however it is spelled, must not grow the set again"
         );
@@ -1594,7 +1594,7 @@ mod tests {
         assert_eq!(s.stable_id, "win-adapter:{guid-a}");
         assert!(s
             .known_stable_ids
-            .contains(&"win-mac:D8-C4-97-14-BA-2E".to_string()));
+            .contains(&"win-mac:00-11-22-33-44-AA".to_string()));
     }
 
     #[test]

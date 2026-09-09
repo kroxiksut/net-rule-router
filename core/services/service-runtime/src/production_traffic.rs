@@ -291,6 +291,8 @@ impl TrafficStatsProvider for ProductionTrafficStats {
             _ => None,
         };
 
+        let history_merge = pending_merge_question(&sampler);
+
         TrafficStatsGetResponse {
             today,
             session,
@@ -298,8 +300,58 @@ impl TrafficStatsProvider for ProductionTrafficStats {
             session_active: sampler.session_active(),
             settings,
             csv,
+            history_merge,
         }
     }
+}
+
+/// The one merge question worth asking right now, or `None`.
+///
+/// Everything that decides is pure and lives in
+/// [`nrr_domain::adapter_history_merge`]; this reads the two tables it judges
+/// and puts names on the answer. A storage error yields no question rather than
+/// an error: a question that cannot be asked is not a failure of the read the
+/// user actually made.
+fn pending_merge_question(
+    sampler: &TrafficSampler,
+) -> Option<nrr_shared::ipc_payloads::TrafficHistoryMergeDto> {
+    use nrr_domain::adapter_history_merge::{propose_merge, LedgerKeySighting, MergeTiming};
+
+    let sightings = sampler.key_sightings().ok()?;
+    let decided: Vec<(String, String)> = sampler
+        .history_links()
+        .ok()?
+        .into_iter()
+        .map(|l| (l.old_key, l.new_key))
+        .collect();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let input: Vec<LedgerKeySighting> = sightings
+        .iter()
+        .map(|s| LedgerKeySighting {
+            key: s.adapter_key.clone(),
+            display_name: s.display_name.clone(),
+            first_seen_ms: s.first_seen_ms.max(0) as u64,
+            last_seen_ms: s.last_seen_ms.max(0) as u64,
+        })
+        .collect();
+    let proposal = propose_merge(&input, &decided, now_ms, MergeTiming::default())?;
+    let name_of = |key: &str| {
+        sightings
+            .iter()
+            .find(|s| s.adapter_key == key)
+            .map(|s| s.display_name.clone())
+            .unwrap_or_else(|| key.to_string())
+    };
+    Some(nrr_shared::ipc_payloads::TrafficHistoryMergeDto {
+        old_name: name_of(&proposal.old_key),
+        new_name: name_of(&proposal.new_key),
+        old_key: proposal.old_key,
+        new_key: proposal.new_key,
+        shared_token: proposal.shared_token,
+    })
 }
 
 impl TrafficStatsWriter for ProductionTrafficStats {
@@ -344,6 +396,27 @@ impl TrafficStatsWriter for ProductionTrafficStats {
             .map(|s| settings_dto(&s))
             .unwrap_or_else(|_| settings_dto(&TrafficStatsSettings::DEFAULT));
         Ok(settings)
+    }
+
+    fn set_history_link(
+        &self,
+        old_key: &str,
+        new_key: &str,
+        merged: bool,
+    ) -> Result<(), SettingsWriteError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let sampler = lock_sampler(&self.sampler);
+        sampler
+            .set_history_link(&nrr_storage::AdapterHistoryLink {
+                old_key: old_key.to_string(),
+                new_key: new_key.to_string(),
+                merged,
+                decided_at_ms: now_ms,
+            })
+            .map_err(|e| SettingsWriteError::Storage(e.to_string()))
     }
 }
 

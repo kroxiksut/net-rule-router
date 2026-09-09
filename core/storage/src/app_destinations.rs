@@ -181,29 +181,29 @@ mod tests {
     fn forget_removes_one_destination_and_is_idempotent() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1), ip(2)], 1_000)
+        repo.upsert("messenger.exe", &[ip(1), ip(2)], 1_000)
             .expect("upsert");
 
-        assert!(repo.forget("telegram.exe", ip(1)).expect("forget"));
-        assert!(!repo.forget("telegram.exe", ip(1)).expect("forget again"));
+        assert!(repo.forget("messenger.exe", ip(1)).expect("forget"));
+        assert!(!repo.forget("messenger.exe", ip(1)).expect("forget again"));
 
         let loaded = repo.load_confirmed_since(0).expect("load");
-        assert_eq!(loaded, vec![("telegram.exe".to_string(), ip(2))]);
+        assert_eq!(loaded, vec![("messenger.exe".to_string(), ip(2))]);
     }
 
     #[test]
     fn upsert_then_load_round_trips() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1), ip(2)], 1_000)
+        repo.upsert("messenger.exe", &[ip(1), ip(2)], 1_000)
             .expect("upsert");
         let mut loaded = repo.load_confirmed_since(0).expect("load");
         loaded.sort();
         assert_eq!(
             loaded,
             vec![
-                ("telegram.exe".to_string(), ip(1)),
-                ("telegram.exe".to_string(), ip(2))
+                ("messenger.exe".to_string(), ip(1)),
+                ("messenger.exe".to_string(), ip(2))
             ]
         );
     }
@@ -212,8 +212,9 @@ mod tests {
     fn re_confirming_refreshes_instead_of_duplicating() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1)], 1_000).expect("first");
-        repo.upsert("telegram.exe", &[ip(1)], 5_000)
+        repo.upsert("messenger.exe", &[ip(1)], 1_000)
+            .expect("first");
+        repo.upsert("messenger.exe", &[ip(1)], 5_000)
             .expect("second");
         assert_eq!(repo.load_confirmed_since(0).expect("load").len(), 1);
         // The refreshed timestamp is what keeps a still-used address inside the
@@ -225,8 +226,9 @@ mod tests {
     fn app_key_matching_is_case_insensitive() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("Telegram.exe", &[ip(1)], 1_000).expect("first");
-        repo.upsert("telegram.exe", &[ip(1)], 2_000)
+        repo.upsert("Messenger.exe", &[ip(1)], 1_000)
+            .expect("first");
+        repo.upsert("messenger.exe", &[ip(1)], 2_000)
             .expect("second");
         assert_eq!(
             repo.load_confirmed_since(0).expect("load").len(),
@@ -239,14 +241,17 @@ mod tests {
     fn load_withholds_rows_outside_the_window() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1)], 1_000).expect("stale");
-        repo.upsert("telegram.exe", &[ip(2)], 9_000).expect("fresh");
+        repo.upsert("messenger.exe", &[ip(1)], 1_000)
+            .expect("stale");
+        repo.upsert("messenger.exe", &[ip(2)], 9_000)
+            .expect("fresh");
         assert_eq!(
             repo.load_confirmed_since(5_000).expect("load"),
-            vec![("telegram.exe".to_string(), ip(2))]
+            vec![("messenger.exe".to_string(), ip(2))]
         );
         // Withheld, not deleted: a re-confirmation revives it in one write.
-        repo.upsert("telegram.exe", &[ip(1)], 9_500).expect("again");
+        repo.upsert("messenger.exe", &[ip(1)], 9_500)
+            .expect("again");
         assert_eq!(repo.load_confirmed_since(5_000).expect("load").len(), 2);
     }
 
@@ -285,12 +290,12 @@ mod tests {
     fn prune_drops_only_rows_older_than_the_cutoff() {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1)], 1_000).expect("old");
-        repo.upsert("telegram.exe", &[ip(2)], 9_000).expect("new");
+        repo.upsert("messenger.exe", &[ip(1)], 1_000).expect("old");
+        repo.upsert("messenger.exe", &[ip(2)], 9_000).expect("new");
         assert_eq!(repo.prune_before(5_000).expect("prune"), 1);
         assert_eq!(
             repo.load_confirmed_since(0).expect("load"),
-            vec![("telegram.exe".to_string(), ip(2))]
+            vec![("messenger.exe".to_string(), ip(2))]
         );
     }
 
@@ -299,7 +304,7 @@ mod tests {
         let conn = migrated_conn();
         let repo = AppDestinationsRepository::new(&conn);
         repo.upsert("", &[ip(1)], 1_000).expect("empty key");
-        repo.upsert("telegram.exe", &[], 1_000).expect("empty ips");
+        repo.upsert("messenger.exe", &[], 1_000).expect("empty ips");
         assert!(repo.load_confirmed_since(0).expect("load").is_empty());
     }
 
@@ -308,15 +313,15 @@ mod tests {
         let conn = migrated_conn();
         conn.execute(
             "INSERT INTO app_observed_destinations (app_key, ip, learned_at)
-             VALUES ('telegram.exe', 'not-an-ip', 1000)",
+             VALUES ('messenger.exe', 'not-an-ip', 1000)",
             [],
         )
         .expect("inject bad row");
         let repo = AppDestinationsRepository::new(&conn);
-        repo.upsert("telegram.exe", &[ip(1)], 2_000).expect("good");
+        repo.upsert("messenger.exe", &[ip(1)], 2_000).expect("good");
         assert_eq!(
             repo.load_confirmed_since(0).expect("load"),
-            vec![("telegram.exe".to_string(), ip(1))]
+            vec![("messenger.exe".to_string(), ip(1))]
         );
     }
 }

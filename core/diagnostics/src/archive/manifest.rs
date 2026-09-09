@@ -63,13 +63,16 @@ impl DiagnosticArchiveManifest {
          It is a diagnostic snapshot only and cannot be used to restore service state.";
 
     /// Validates that mandatory sections are included.
+    ///
+    /// Reads the list from [`ArchiveSection::MANDATORY`] rather than repeating
+    /// it: a second, hand-written copy of "what an archive must carry" is how a
+    /// caller-dropped section turned into a build failure instead of a smaller
+    /// bundle.
     pub fn validate(&self) -> Result<(), String> {
-        for required in &[
-            "health.json",
-            "logs.ndjson",
-            "audit_summary.json",
-            "troubleshooting.md",
-        ] {
+        for required in crate::archive::request::ArchiveSection::MANDATORY
+            .iter()
+            .map(|s| s.filename())
+        {
             if !self.included_sections.contains(&required.to_string()) {
                 return Err(format!(
                     "mandatory section '{required}' is missing from archive"
@@ -137,6 +140,7 @@ mod tests {
                 "health.json".into(),
                 "logs.ndjson".into(),
                 "audit_summary.json".into(),
+                "system_info.json".into(),
                 "troubleshooting.md".into(),
                 "redaction_report.json".into(),
             ],

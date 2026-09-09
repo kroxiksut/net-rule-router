@@ -407,12 +407,12 @@ mod tests {
 
     #[test]
     fn parse_ipv4_tokens_extracts_dotted_quads() {
-        let ips = parse_ipv4_tokens("type:  1 93.184.216.34;type:  1 93.184.216.35;");
+        let ips = parse_ipv4_tokens("type:  1 23.10.20.138;type:  1 23.10.20.139;");
         assert_eq!(
             ips,
             vec![
-                Ipv4Addr::new(93, 184, 216, 34),
-                Ipv4Addr::new(93, 184, 216, 35)
+                Ipv4Addr::new(23, 10, 20, 138),
+                Ipv4Addr::new(23, 10, 20, 139)
             ]
         );
     }

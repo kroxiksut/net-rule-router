@@ -496,7 +496,7 @@ mod tests {
         // Simulates a full connection: hostname + IPv4 + process context
         let input = NormalizedDecisionInput {
             hostname: NormalizedHostname::Valid("example.com".to_owned()),
-            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(93, 184, 216, 34)),
+            ip: NormalizedIp::ValidIpv4(Ipv4Addr::new(23, 10, 20, 138)),
             app_identity: Some(NormalizedAppIdentity {
                 process_name: "firefox.exe".to_owned(),
                 original_path: Some(r"C:\Program Files\Mozilla Firefox\firefox.exe".to_owned()),

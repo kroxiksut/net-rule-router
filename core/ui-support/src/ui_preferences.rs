@@ -2533,7 +2533,7 @@ mod tests {
             forward_compat: ForwardCompat::default(),
             // Non-default value so the round-trip proves the VPN-split
             // banner ack persists.
-            secondary_split_ack_adapter_name: "hidemy.name VPN 3.0".to_string(),
+            secondary_split_ack_adapter_name: "SwiftVPN 3.0".to_string(),
             // Non-default values so the round-trip proves the per-SID
             // policy mirrors persist across save/load. Subdomain coverage
             // defaults to `true`, so `false` is the non-default value this
@@ -2575,7 +2575,7 @@ mod tests {
                 r#"{"stability":{"verbose-logging":true,"fake-ip-enabled":true}}"#.to_string(),
             // Non-empty signature so the round-trip proves the
             // notification-dismiss state persists across GUI restarts.
-            unenforced_apps_ack_signature: "2gis.exe|hidemy.name VPN 3.0.exe".to_string(),
+            unenforced_apps_ack_signature: "citymap.exe|SwiftVPN 3.0.exe".to_string(),
             // Non-empty so the round-trip proves a kept overlap pair survives
             // a GUI restart.
             rules_overlap_keep_signature: "secondary:example.com>primary:api.example.com"

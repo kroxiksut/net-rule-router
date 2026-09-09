@@ -28,7 +28,7 @@
 //! structured inline comment:
 //!
 //! ```text
-//! rr3---sn-4g5e6nez.googlevideo.com  # auto:site-companion anchor:youtube.com added:
+//! rr3---sn-4g5e6nez.videocdn.test  # auto:site-companion anchor:video.example added:
 //! ```
 //!
 //! The three tokens may appear in any order and are followed by optional free
@@ -403,10 +403,10 @@ mod tests {
 
     #[test]
     fn provenance_comment_renders_all_three_tokens() {
-        let origin = RuleOrigin::auto(AutoRuleReason::SiteCompanion, "youtube.com", "2026-07-31");
+        let origin = RuleOrigin::auto(AutoRuleReason::SiteCompanion, "video.example", "2026-07-31");
         assert_eq!(
             origin.to_provenance_comment(),
-            "auto:site-companion anchor:youtube.com added:2026-07-31"
+            "auto:site-companion anchor:video.example added:2026-07-31"
         );
     }
 
@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn provenance_comment_keeps_trailing_free_text_as_note() {
         let parsed = parse_provenance_comment(
-            "auto:site-companion anchor:youtube.com added:2026-07-31 video CDN",
+            "auto:site-companion anchor:video.example added:2026-07-31 video CDN",
         )
         .expect("provenance");
         assert_eq!(parsed.note.as_deref(), Some("video CDN"));
@@ -437,17 +437,17 @@ mod tests {
     #[test]
     fn provenance_tokens_may_appear_in_any_order() {
         let parsed =
-            parse_provenance_comment("added:2026-07-31 anchor:youtube.com auto:user-confirmed")
+            parse_provenance_comment("added:2026-07-31 anchor:video.example auto:user-confirmed")
                 .expect("provenance");
         assert_eq!(parsed.origin.reason(), &AutoRuleReason::UserConfirmed);
-        assert_eq!(parsed.origin.anchor(), "youtube.com");
+        assert_eq!(parsed.origin.anchor(), "video.example");
         assert_eq!(parsed.origin.added(), "2026-07-31");
     }
 
     #[test]
     fn comment_without_auto_token_is_not_provenance() {
         assert!(parse_provenance_comment("vendor updates").is_none());
-        assert!(parse_provenance_comment("anchor:youtube.com").is_none());
+        assert!(parse_provenance_comment("anchor:video.example").is_none());
         assert!(parse_provenance_comment("").is_none());
         // A bare `auto:` with no slug is free text, not an empty reason.
         assert!(parse_provenance_comment("auto:").is_none());
@@ -474,11 +474,11 @@ mod tests {
 
     #[test]
     fn origin_serialises_with_kebab_case_kind_and_plain_slug() {
-        let origin = RuleOrigin::auto(AutoRuleReason::SiteCompanion, "youtube.com", "2026-07-31");
+        let origin = RuleOrigin::auto(AutoRuleReason::SiteCompanion, "video.example", "2026-07-31");
         let json = serde_json::to_string(&origin).expect("serialize");
         assert_eq!(
             json,
-            r#"{"kind":"auto","reason":"site-companion","anchor":"youtube.com","added":"2026-07-31"}"#
+            r#"{"kind":"auto","reason":"site-companion","anchor":"video.example","added":"2026-07-31"}"#
         );
         let back: RuleOrigin = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, origin);

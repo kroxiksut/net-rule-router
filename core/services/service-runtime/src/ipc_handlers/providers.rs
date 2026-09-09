@@ -402,6 +402,15 @@ pub trait TrafficStatsWriter: Send + Sync {
     /// The settings as they stand. The write path needs them to tell a genuine
     /// change from a client sending the whole settings page back untouched.
     fn settings(&self) -> Result<TrafficStatsSettingsDto, SettingsWriteError>;
+
+    /// Record the user's answer to the merge question. A refusal is stored as
+    /// firmly as an acceptance, so the pair is never offered again.
+    fn set_history_link(
+        &self,
+        old_key: &str,
+        new_key: &str,
+        merged: bool,
+    ) -> Result<(), SettingsWriteError>;
 }
 
 /// The local networks a principal may keep reachable while the kill-switch

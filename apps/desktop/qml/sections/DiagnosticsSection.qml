@@ -1,6 +1,7 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import QtQuick.Window 2.15
 import "../theme"
 import "../components"
 import "../lib/pure.js" as Pure
@@ -228,15 +229,56 @@ ScrollView {
         return 0
     }
 
+    /// One line about where the service's start sits relative to the boot's
+    /// sign-in phase. Empty when the host has no such record — the card then
+    /// says nothing rather than implying the service was measured and cleared.
+    ///
+    /// Seconds, one decimal: the question is "did this take part in a wait the
+    /// user felt", and milliseconds pretend to a precision the answer does not
+    /// need.
+    function _bootTimingText() {
+        var health = section.serviceHealth || {}
+        var relation = String(health.startRelativeToSignIn || "unknown")
+        if (relation !== "after" && relation !== "before") return ""
+        var gapMs = Number(health.startSignInGapMs)
+        if (!isFinite(gapMs) || gapMs < 0) return ""
+        var seconds = (gapMs / 1000).toFixed(1)
+        return relation === "after"
+            ? root.tr("diag.service.started-after-sign-in",
+                "The service started %1 s after this boot reached the sign-in screen.").arg(seconds)
+            : root.tr("diag.service.started-before-sign-in",
+                "The service started %1 s before this boot reached the sign-in screen.").arg(seconds)
+    }
+
     Component.onCompleted: {
         _loadCacheColWidths()
         _refreshServiceHealth()
         _consumePendingExplainHost()
     }
-    // Arriving from a block notice: the host travelled with the action, so the
-    // question is answered here instead of retyped. Consumed once — coming back
-    // to this page later must not re-probe a problem the user already looked at.
-    onVisibleChanged: if (visible) section._consumePendingExplainHost()
+    // Deep links into this section, both consumed once: a block notice carries
+    // the host to probe, and Rules carries a request to open the connection
+    // trace. Coming back later must not re-run what the user already saw.
+    onVisibleChanged: {
+        if (!visible)
+            return
+        section._consumePendingExplainHost()
+        section._consumePendingConnTrace()
+    }
+    // Rules → "Where traffic is going" sets the flag; whichever happens last —
+    // the flag or this section becoming visible — opens the panel.
+    Connections {
+        target: root
+        function onDiagOpenConnTraceChanged() {
+            if (section.visible)
+                section._consumePendingConnTrace()
+        }
+    }
+    function _consumePendingConnTrace() {
+        if (!root.diagOpenConnTrace)
+            return
+        root.diagOpenConnTrace = false
+        section._loadConnTraceEntries(true)
+    }
 
     function _consumePendingExplainHost() {
         var host = String(root.notificationsController.pendingExplainHost || "").trim()
@@ -1156,13 +1198,29 @@ ScrollView {
         section._cacheEntriesShown = false
     }
 
-    // Q3 — read-only connection-trace viewer. On demand, pull recently-observed
-    // outbound connections page-by-page via `conn-trace.entries.list`. Compact
-    // tier masks the local/remote IPs — `_connTraceRedacted` drives the notice.
+    // Q3 — read-only connection-trace viewer. Pulls recently-observed outbound
+    // connections page-by-page via `conn-trace.entries.list`, then keeps the
+    // head fresh on a timer. Addresses arrive unmasked: this is the user's own
+    // machine, and a masked remote defeats the panel.
     property var _connTraceEntries: []
     property string _connTraceCursor: ""
     property bool _connTraceLoading: false
     property bool _connTraceShown: false
+    // Auto-refresh state. The observer is NOT on the data path: the panel pulls
+    // a snapshot on a timer, it never receives an event per packet.
+    property bool _connAutoRefresh: true
+    property double _connLastRefreshMs: 0
+    // Ticks once a second so the "updated N s ago" label re-evaluates — a
+    // binding over Date.now() alone never invalidates itself.
+    property int _connClockRev: 0
+    // False only when the service reports no running observation source, so an
+    // empty table can say which silence it is.
+    property bool _connObserverActive: true
+    // False when the user switched the GUI trace off in Settings: the page is
+    // empty by request, and the panel says so instead of blaming the service.
+    property bool _connGuiStreamEnabled: true
+    // Client-side retention of the merged list, matching the service ring.
+    readonly property int _connTraceRingCap: 1000
     // TASK A — direct row selection for the connection-trace table (mirror of the
     // cache twin). Selection holds the row objects by reference; synthetic group
     // headers (`_isGroupHeader`) are never selectable. Copy/count/highlight filter
@@ -1240,7 +1298,6 @@ ScrollView {
         if (lines.length > 0)
             section._copyToClipboard(lines.join("\n"))
     }
-    property bool _connTraceRedacted: false
     property string _connTraceError: ""
     property string _connTraceFilter: ""
     // View-only trace filters. SESSION-SCOPED ON PURPOSE: they change what the
@@ -1484,7 +1541,11 @@ ScrollView {
             }
             var page = (payload && payload.page) || {}
             var items = page.items || []
-            section._connTraceRedacted = (payload && payload.redacted) === true
+            section._connObserverActive =
+                (payload && payload["observer-active"]) !== false
+            section._connGuiStreamEnabled =
+                (payload && payload["gui-stream-enabled"]) !== false
+            section._connLastRefreshMs = Date.now()
             var merged = section._connTraceEntries.slice()
             for (var i = 0; i < items.length; i++)
                 merged.push(items[i])
@@ -1501,6 +1562,129 @@ ScrollView {
                     && section._connTraceEntries.length < section._connTraceDrainCap)
                 section._loadConnTraceEntries(false)
         })
+    }
+
+    // Set while an Add-rule dialog opened from this panel is on screen, so the
+    // window can follow the user to Rules once the rule is in — a rule added
+    // from Diagnostics is not applied yet, and leaving the user here reads as
+    // nothing having happened.
+    property bool _connRulePending: false
+    // Create a rule from the row the user is looking at. Reuses the shell's own
+    // dialog — no new rule semantics, no second way to author a rule.
+    function _ruleFromConnRow(ruleType, value) {
+        if (!root.ruleDialog || String(value || "") === "")
+            return
+        section._connRulePending = true
+        root.ruleDialog.resetForNew(ruleType, value)
+        root.ruleDialog.open()
+    }
+    Connections {
+        target: root.ruleDialog
+        function onAccepted() {
+            if (!section._connRulePending)
+                return
+            section._connRulePending = false
+            root.section = "rules"
+        }
+        function onRejected() {
+            section._connRulePending = false
+        }
+    }
+
+    // Identity of a trace row across snapshots. A single flow can appear twice
+    // with different verdicts (permitted, then dropped), so the verdict is part
+    // of the key — otherwise the drop, which is the interesting half, is
+    // swallowed as a duplicate.
+    function _connRowKey(e) {
+        return "k" + String((e && e.process_path) || "")
+            + "|" + String((e && e.local) || "")
+            + "|" + String((e && e.remote) || "")
+            + "|" + String((e && e.observed_at_ms) || 0)
+            + "|" + String((e && e.verdict) || "")
+    }
+    // Poll the NEWEST page and prepend what we have not seen. Deliberately not
+    // a re-drain of the whole ring: the open-time drain already pulled it, and
+    // pushing 1000 rows through the pipe every couple of seconds would spend
+    // real money on a diagnostic view. Existing row objects are kept by
+    // reference so an active selection survives the merge.
+    function _refreshConnTraceHead() {
+        if (!section._connTraceShown || section._connTraceLoading)
+            return
+        if (!root.bridgeAvailable
+                || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcConnTraceEntriesList !== "function")
+            return
+        var corr = nrrNativeBridge.rpcConnTraceEntriesList("", 200)
+        root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
+            // Silent on failure: this is a background poll, and the manual
+            // Refresh button is what reports an error the user asked for.
+            if (!ok)
+                return
+            var page = (payload && payload.page) || {}
+            var items = page.items || []
+            section._connObserverActive =
+                (payload && payload["observer-active"]) !== false
+            section._connGuiStreamEnabled =
+                (payload && payload["gui-stream-enabled"]) !== false
+            section._connLastRefreshMs = Date.now()
+            var seen = {}
+            var current = section._connTraceEntries
+            for (var i = 0; i < current.length; i++)
+                seen[section._connRowKey(current[i])] = true
+            var fresh = []
+            for (var j = 0; j < items.length; j++) {
+                if (seen[section._connRowKey(items[j])] !== true)
+                    fresh.push(items[j])
+            }
+            if (fresh.length === 0)
+                return
+            var merged = fresh.concat(current)
+            if (merged.length > section._connTraceRingCap)
+                merged = merged.slice(0, section._connTraceRingCap)
+            section._connTraceEntries = merged
+        })
+    }
+    // Age of the snapshot on screen, or the reason the poll is standing still.
+    function _connRefreshStatusLabel() {
+        if (section._connClockRev < 0 || section._connLastRefreshMs <= 0)
+            return ""
+        // Nothing is being served, so an age would only describe an empty page;
+        // the empty state below already explains itself.
+        if (!section._connGuiStreamEnabled)
+            return ""
+        if (section._connAutoRefresh
+                && (section._connSel.length > 0 || connTraceList.contentY > 1))
+            return root.tr("diag.conn-trace.auto-paused",
+                "Paused — scroll to the top or clear the selection to resume")
+        var secs = Math.max(0,
+            Math.round((Date.now() - section._connLastRefreshMs) / 1000))
+        return root.tr("diag.conn-trace.updated-ago", "updated %1 s ago").arg(secs)
+    }
+
+    // Snapshot poll. Stops when the panel is hidden, the section is off-screen,
+    // the window is minimized, the user has rows selected, or the list is
+    // scrolled away from the top: new rows arrive at the HEAD, so refreshing
+    // under a reader who has scrolled down moves the text they are reading.
+    Timer {
+        id: connAutoRefreshTimer
+        interval: 2000
+        repeat: true
+        running: section._connTraceShown && section._connAutoRefresh
+            && section._connGuiStreamEnabled
+            && section._connSel.length === 0
+            && connTraceList.contentY <= 1
+            && section.visible && root.visible
+            && root.visibility !== Window.Minimized
+        onTriggered: section._refreshConnTraceHead()
+    }
+    // Drives the age label only.
+    Timer {
+        id: connAgeTicker
+        interval: 1000
+        repeat: true
+        running: section._connTraceShown && section.visible
+        onTriggered: section._connClockRev++
     }
 
     function serviceStateLabel(state) {
@@ -1662,6 +1846,17 @@ ScrollView {
                     visible: _pending > 0
                     text: root.tr("diag.service.pending-changes-label", "Pending changes")
                         + ": " + String(_pending)
+                    color: root.mutedTextColor
+                }
+                // "Did this slow my start-up" is what a background service gets
+                // blamed for, so the card answers with the measurement rather
+                // than with a claim. Hidden when the host cannot tell — an
+                // unanswerable question must not read as an exoneration.
+                Label {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    visible: section._bootTimingText() !== ""
+                    text: section._bootTimingText()
                     color: root.mutedTextColor
                 }
             }
@@ -2213,7 +2408,7 @@ ScrollView {
                         visible: section._cacheEntries.length > 0
                             || section._cacheEntriesFilter !== ""
                         placeholderText: root.tr("diag.cache.entries-search-placeholder",
-                            "Exact name or IP; *.google.com — subdomains; *google* — any match")
+                            "Exact name or IP; *.search.example — subdomains; *google* — any match")
                         // Debounce so a single keystroke no longer runs
                         // an O(n) filter + full row rebuild + a recursive page
                         // drain. cacheSearchDebounce applies the filter and drains
@@ -2998,7 +3193,7 @@ ScrollView {
                 Label {
                     Layout.fillWidth: true
                     text: root.tr("diag.conn-trace.subtitle",
-                        "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. Requires the connection trace to be enabled in Settings.")
+                        "Recently-observed outbound connections and which interface they actually left through (primary, or the additional adapter). Observation only — it never changes routing. The list refreshes on its own while it is open and is kept in memory only. (Writing connections to the on-disk log stays an opt-in in Settings.) Shows TCP/UDP connections — a ping (ICMP) leaves no connection to observe, so a pinged address will not appear here.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -3033,6 +3228,31 @@ ScrollView {
                         enabled: !section._connTraceLoading
                         text: root.tr("diag.conn-trace.entries-refresh", "Refresh")
                         onClicked: section._loadConnTraceEntries(true)
+                    }
+                    CheckBox {
+                        id: connAutoRefreshCheck
+                        visible: section._connTraceShown
+                        checked: section._connAutoRefresh
+                        text: root.tr("diag.conn-trace.auto-refresh", "Refresh automatically")
+                        contentItem: Label {
+                            text: connAutoRefreshCheck.text
+                            leftPadding: connAutoRefreshCheck.indicator.width
+                                + connAutoRefreshCheck.spacing
+                            color: root.textColor
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onToggled: {
+                            section._connAutoRefresh = checked
+                            if (checked)
+                                section._refreshConnTraceHead()
+                        }
+                    }
+                    Label {
+                        visible: section._connTraceShown
+                            && section._connRefreshStatusLabel() !== ""
+                        text: section._connRefreshStatusLabel()
+                        color: root.mutedTextColor
+                        font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     }
                     ThemedButton {
                         theme: root.uiTheme
@@ -3131,17 +3351,6 @@ ScrollView {
                     }
                 }
 
-                // Privacy notice — compact tier masks addresses.
-                Label {
-                    Layout.fillWidth: true
-                    visible: section._connTraceShown && section._connTraceRedacted
-                        && section._connTraceEntries.length > 0
-                    text: root.tr("diag.conn-trace.entries-redacted-notice",
-                        "Addresses are masked for privacy. Enable Extended diagnostics for full detail.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: root.uiTheme.baseFontSizePx - 1
-                }
                 // Error state.
                 Label {
                     Layout.fillWidth: true
@@ -3163,8 +3372,16 @@ ScrollView {
                     visible: section._connTraceShown && !section._connTraceLoading
                         && section._connTraceError === ""
                         && section._connTraceEntries.length === 0
-                    text: root.tr("diag.conn-trace.entries-empty", "No connections observed yet")
+                    text: !section._connGuiStreamEnabled
+                        ? root.tr("diag.conn-trace.gui-stream-off",
+                            "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.")
+                        : section._connObserverActive
+                            ? root.tr("diag.conn-trace.entries-empty",
+                                "No connections observed yet")
+                            : root.tr("diag.conn-trace.observer-unavailable",
+                                "The service is not observing connections right now, so this list stays empty. The service log says why.")
                     color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
                 }
                 // No-match state. Covers the search field AND the two view
                 // filters — with "Show blocked" off, an all-blocked trace would
@@ -3449,6 +3666,12 @@ ScrollView {
                             String((modelData && modelData.process_path) || "")
                         readonly property string _vRemote:
                             String((modelData && modelData.remote) || "")
+                        readonly property string _vRemoteIp: {
+                            var raw = connRowItem._vRemote
+                            var at = raw.lastIndexOf(":")
+                            var ip = at > 0 ? raw.substring(0, at) : raw
+                            return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip) ? ip : ""
+                        }
                         readonly property string _vEgress:
                             section._connEgressLabel(modelData && modelData.egress_role)
                         readonly property string _vVerdict:
@@ -3461,6 +3684,25 @@ ScrollView {
                             section._formatCacheTs(modelData && modelData.observed_at_ms)
                         Menu {
                             id: connRowMenu
+                            MenuItem {
+                                visible: connRowItem._vRemoteIp !== ""
+                                text: root.tr("diag.conn-trace.rule-for-address",
+                                    "Rule for this address…")
+                                onTriggered: section._ruleFromConnRow(
+                                    "exact-ip", connRowItem._vRemoteIp)
+                            }
+                            MenuItem {
+                                // Application rules match on the executable
+                                // NAME (the file picker reduces a path the same
+                                // way), so the row's basename is the value.
+                                visible: connRowItem._vProcess !== ""
+                                    && connRowItem._vProcess !== "?"
+                                text: root.tr("diag.conn-trace.rule-for-app",
+                                    "Rule for this application…")
+                                onTriggered: section._ruleFromConnRow(
+                                    "application", connRowItem._vProcess)
+                            }
+                            MenuSeparator { }
                             MenuItem {
                                 text: root.tr("action.copy-row", "Copy row")
                                 onTriggered: section._copyToClipboard(connRowItem._rowTsv)

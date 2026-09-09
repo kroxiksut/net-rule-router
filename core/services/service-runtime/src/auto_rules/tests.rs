@@ -347,17 +347,45 @@ fn a_dedicated_companion_seen_across_two_visits_becomes_a_pending_suggestion() {
     assert_eq!(c.proposed_match, "cdn.example");
     assert_eq!(c.match_kind, AUTO_RULE_MATCH_KIND_SUFFIX);
     assert_eq!(c.route, RouteRole::Secondary.slug());
-    assert_eq!(c.observations, 2);
+    assert_eq!(c.observations, Some(2));
     assert!(c.id.starts_with("arc-"));
     // Nothing was applied — `suggest` offers, it never writes.
     assert!(f.author.calls().is_empty());
 }
 
+/// The tray already withheld a third party the main route serves; the inbox
+/// showed it like any other offer, so the same host read as "your site needs
+/// this" in one surface and as "nothing to do here" in the other. The read path
+/// now carries the same judgement, and it carries "is this the site's own name"
+/// beside it — the user asked to tell those apart.
+#[test]
+fn the_inbox_carries_the_main_link_judgement_and_the_third_party_flag() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+
+    let candidates = f.engine.candidates(SID);
+    assert_eq!(candidates.len(), 1);
+    // `cdn.example` under the anchor `site.example` is a different registrable
+    // domain — a third party by construction.
+    assert_eq!(
+        candidates[0].third_party,
+        Some(true),
+        "a name outside the site's own domain is a third party"
+    );
+    // Nothing measured the main route yet, so nothing is settled: the flag must
+    // not read as "served" merely because no probe has run.
+    assert!(
+        !candidates[0].served_by_main_link,
+        "an unmeasured host is not a served one"
+    );
+}
+
 #[test]
 fn a_companion_of_a_site_on_the_default_route_is_never_offered() {
-    // The user's own report: `mc.yandex.ru` is a primary-route rule host, so its
-    // companion `mc.yandex.md` was offered as a primary rule — a rule that only
-    // restates where uncovered traffic already goes.
+    // The user's own report: a metrics host on the primary route is a rule
+    // host, so its companion under the same brand was offered as a primary rule
+    // — a rule that only restates where uncovered traffic already goes.
     let f = fixture(AutoRulesMode::Suggest);
     two_visits_anchored(&f.engine, RouteRole::Primary, &["cdn.example"]);
 
@@ -785,7 +813,7 @@ fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCan
         match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
         route: RouteRole::Secondary.slug().to_string(),
         affinity,
-        observations: 2,
+        observations: Some(2),
         first_seen_unix_ms: last_seen_unix_ms,
         last_seen_unix_ms,
         signal: AUTO_RULE_SIGNAL_CO_ACTIVITY.to_string(),
@@ -797,6 +825,9 @@ fn candidate_dto(id: &str, affinity: f64, last_seen_unix_ms: i64) -> AutoRuleCan
         primary_behavior: String::new(),
         anchor_refuses_main_link: false,
         observed_members: Vec::new(),
+        served_by_main_link: false,
+        third_party: None,
+        secondary_reach: None,
     }
 }
 
@@ -1087,8 +1118,8 @@ fn an_offer_nothing_refreshes_expires_instead_of_waiting_forever() {
 
 #[test]
 fn one_address_is_one_offer_however_many_sites_pull_it() {
-    // The user's report: `static.cdninstagram.com` arrived twice — once next to
-    // `instagram.com`, once next to an unrelated site that happened to load at
+    // The user's report: `static.cdninsta.test` arrived twice — once next to
+    // `insta.example`, once next to an unrelated site that happened to load at
     // the same time.
     let f = fixture(AutoRulesMode::Suggest);
     two_visits_anchored(&f.engine, RouteRole::Secondary, &["cdn.example"]);
@@ -1345,10 +1376,53 @@ fn classification_prefers_the_secondary_route_and_defaults_to_candidate() {
     );
 }
 
+/// A bus with `SID`'s client already subscribed. An announcement is only
+/// worth recording once somebody can receive it, so every publish test
+/// needs a listener — see the audience check in `publish`.
+fn subscribed_bus() -> Arc<EventBus> {
+    let bus = Arc::new(EventBus::new());
+    bus.subscribe_as("test-client".to_string(), Some(SID.to_string()), None);
+    bus
+}
+
+/// The service and the tray start together and the service usually wins. An
+/// offer announced into that gap reached nobody, yet counted as announced —
+/// and the tray, whose subscription begins at the CURRENT head, never learned
+/// of it. The field case: the tray connected 20 seconds after the offer was
+/// published, and no window ever opened.
+#[test]
+fn an_offer_announced_before_anyone_is_listening_is_announced_again_later() {
+    let f = fixture(AutoRulesMode::Suggest);
+    let bus = Arc::new(EventBus::new());
+    let engine = AutoRulesEngine::new(
+        Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
+        mode_fn(AutoRulesMode::Suggest),
+        Arc::clone(&f.dismissals) as Arc<dyn DismissalStore>,
+        Arc::new(InMemoryPendingStore::new()),
+        SystemTime::UNIX_EPOCH,
+    )
+    .with_event_bus(Arc::clone(&bus));
+
+    two_visits(&engine, &["cdn.example"]);
+    assert!(
+        !engine.tick(SID, later()).published,
+        "nothing is listening, so nothing was announced",
+    );
+
+    // The tray connects.
+    bus.subscribe_as("tray".to_string(), Some(SID.to_string()), None);
+    assert!(
+        engine.tick(SID, later()).published,
+        "the offer still has its news to deliver",
+    );
+    // And it is not repeated once it has actually been delivered.
+    assert!(!engine.tick(SID, later()).published);
+}
+
 #[test]
 fn a_growing_pending_set_is_announced_once_not_on_every_tick() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1390,7 +1464,7 @@ fn a_growing_pending_set_is_announced_once_not_on_every_tick() {
 #[test]
 fn a_suggestion_arriving_after_an_acceptance_is_still_announced() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1436,7 +1510,7 @@ fn a_suggestion_arriving_after_an_acceptance_is_still_announced() {
 #[test]
 fn a_suggestion_muted_by_the_quiet_gap_is_announced_by_a_later_tick() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1478,7 +1552,7 @@ fn a_suggestion_muted_by_the_quiet_gap_is_announced_by_a_later_tick() {
 #[test]
 fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1529,7 +1603,7 @@ fn a_settled_offer_is_counted_but_only_an_unsettled_one_earns_a_popup() {
 #[test]
 fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1560,7 +1634,7 @@ fn a_site_marked_as_refusing_keeps_its_companions_on_offer() {
 #[test]
 fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let up = Arc::new(AtomicBool::new(false));
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
@@ -1601,7 +1675,7 @@ fn suggestions_wait_for_the_additional_route_and_arrive_when_it_returns() {
 #[test]
 fn an_address_of_the_site_itself_still_pops_even_when_the_main_route_answers() {
     let f = fixture(AutoRulesMode::Suggest);
-    let bus = Arc::new(EventBus::new());
+    let bus = subscribed_bus();
     let engine = AutoRulesEngine::new(
         Arc::clone(&f.rules) as Arc<dyn RulesProvider>,
         mode_fn(AutoRulesMode::Suggest),
@@ -1660,8 +1734,8 @@ fn the_eager_opt_in_reaches_the_learner_and_offers_from_the_first_visit() {
 /// The collateral rescue asks this before steering a host onto the primary. An
 /// offer covers its subdomains whatever its match kind, because accepting it
 /// writes a rule that does — `CanonicalRuleSet` expands every exact rule into a
-/// suffix one. Reading it narrower sent `static.cdninstagram.com` to the primary
-/// while `cdninstagram.com` sat in the offer.
+/// suffix one. Reading it narrower sent `static.cdninsta.test` to the primary
+/// while `cdninsta.test` sat in the offer.
 #[test]
 fn a_parked_offer_covers_the_subdomains_of_what_it_proposes() {
     let f = fixture(AutoRulesMode::Suggest);
@@ -1829,6 +1903,557 @@ fn a_host_already_covered_by_a_rule_is_never_offered_as_an_isp_block_candidate()
     assert!(f.engine.candidates(SID).is_empty());
 }
 
+// ── Placeholder answers — the host says the main link cannot carry it ───────
+
+/// Not behind a flag, unlike the notice-page signal: this one reads addresses,
+/// not a page, and an address nothing can be reached at is a fact.
+#[test]
+fn a_placeholder_answer_parks_one_candidate_signed_by_the_host_itself() {
+    let f = fixture(AutoRulesMode::Suggest);
+    assert!(f
+        .engine
+        .note_placeholder_answer_host(SID, "Journal.Example.", wall_clock()));
+    // Seeing it again refreshes the same offer instead of stacking another.
+    assert!(f.engine.note_placeholder_answer_host(
+        SID,
+        "journal.example",
+        wall_clock() + Duration::from_secs(60)
+    ));
+
+    let candidates = f.engine.candidates(SID);
+    assert_eq!(candidates.len(), 1);
+    let c = &candidates[0];
+    assert_eq!(c.anchor, "journal.example", "normalised, and signs itself");
+    assert_eq!(c.proposed_match, "journal.example");
+    assert_eq!(c.route, RouteRole::Secondary.slug());
+    assert_eq!(c.signal, AUTO_RULE_SIGNAL_PLACEHOLDER_ANSWER);
+}
+
+#[test]
+fn a_host_already_covered_by_a_rule_is_never_offered_for_a_placeholder_answer() {
+    let f = fixture(AutoRulesMode::Suggest);
+    // The fixture's own rule book already covers `site.example`.
+    assert!(!f
+        .engine
+        .note_placeholder_answer_host(SID, "site.example", wall_clock()));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+#[test]
+fn a_placeholder_answer_is_silent_while_suggestions_are_off() {
+    let f = fixture(AutoRulesMode::Off);
+    assert!(!f
+        .engine
+        .note_placeholder_answer_host(SID, "journal.example", wall_clock()));
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+// ── A host that fails on the main link signs its own offer ──────────────────
+
+/// A fixture whose main-link verdicts come from a map a test can write, which
+/// is what the stall registry is to production.
+fn fixture_with_main_link_verdicts(
+    verdicts: Arc<Mutex<HashMap<String, PrimaryBehavior>>>,
+) -> Fixture {
+    let mut f = build_fixture(
+        AutoRulesMode::Suggest,
+        Arc::new(InMemoryDismissalStore::new()),
+        Arc::new(InMemoryPendingStore::new()),
+        None,
+    );
+    f.engine = f
+        .engine
+        // Merged over the subtree, exactly as the production source does: an
+        // offer is written as a suffix, so its verdict is about everything
+        // the rule would carry, not about the bare name.
+        .with_primary_behavior_source(Arc::new(move |name: &str| {
+            let suffix = format!(".{name}");
+            verdicts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|(host, _)| host.as_str() == name || host.ends_with(&suffix))
+                .map(|(_, behavior)| *behavior)
+                .fold(PrimaryBehavior::Unknown, PrimaryBehavior::merge)
+        }));
+    f
+}
+
+fn set_verdict(
+    verdicts: &Arc<Mutex<HashMap<String, PrimaryBehavior>>>,
+    host: &str,
+    behavior: PrimaryBehavior,
+) {
+    verdicts
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(host.to_string(), behavior);
+}
+
+/// The field case: connections complete their handshake on the main link and
+/// are then dropped, keyed on the name. Nothing about the address says so — the
+/// failures do.
+#[test]
+fn a_host_that_keeps_failing_on_the_main_link_is_offered_the_other_route() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "Forum.Talk.Example.", wall_clock()));
+    let candidates = f.engine.candidates(SID);
+    assert_eq!(candidates.len(), 1);
+    let c = &candidates[0];
+    assert_eq!(c.proposed_match, "forum.talk.example");
+    assert_eq!(c.anchor, c.proposed_match, "the host signs its own offer");
+    assert_eq!(c.signal, AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED);
+    assert_eq!(c.route, RouteRole::Secondary.slug());
+    assert_eq!(c.primary_behavior, AUTO_RULE_PRIMARY_BEHAVIOR_STALLS);
+}
+
+/// "Whose name is this" is answerable only where a site pulled the name in.
+/// A self-signed offer IS its own anchor, so the comparison used to return
+/// "the site's own name" for every ad host that failed on the main link — the
+/// inbox stated as fact the opposite of the fact. Both sides are asserted
+/// here: an absent answer for the self-signed offer proves nothing unless the
+/// companion beside it still gets one.
+#[test]
+fn only_an_offer_with_a_real_anchor_says_whose_name_it_is() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "ads.tracker.example", wall_clock()));
+
+    let candidates = f.engine.candidates(SID);
+    let companion = candidates
+        .iter()
+        .find(|c| c.proposed_match == "cdn.example")
+        .expect("the companion offer");
+    assert_eq!(
+        companion.third_party,
+        Some(true),
+        "a site pulled this name in, so the question has an answer"
+    );
+    let self_signed = candidates
+        .iter()
+        .find(|c| c.proposed_match == "ads.tracker.example")
+        .expect("the self-signed offer");
+    assert_eq!(
+        self_signed.anchor, self_signed.proposed_match,
+        "the host signs its own offer — there is no site to be third-party to"
+    );
+    assert_eq!(
+        self_signed.third_party, None,
+        "with no anchor site the question was never posed"
+    );
+}
+
+/// A visit count is a fact about a PAIR — this host beside that site, across
+/// distinct visits. An offer a host signs about itself has no pair, and the 1
+/// it used to carry made the inbox say "seen in 1 visit" about a host whose
+/// evidence is three failed connections in a row.
+///
+/// The count also ranks the list, so the second half of this test is the one
+/// that matters: making it optional must not move anything.
+#[test]
+fn a_self_signed_offer_counts_no_visits_and_keeps_its_place_in_the_list() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "ads.tracker.example", wall_clock()));
+
+    let candidates = f.engine.candidates(SID);
+    let companion = candidates
+        .iter()
+        .find(|c| c.proposed_match == "cdn.example")
+        .expect("the companion offer");
+    assert_eq!(
+        companion.observations,
+        Some(2),
+        "a pair seen across two visits still says so"
+    );
+    let self_signed = candidates
+        .iter()
+        .find(|c| c.proposed_match == "ads.tracker.example")
+        .expect("the self-signed offer");
+    assert_eq!(
+        self_signed.observations, None,
+        "no pair means no visits to count"
+    );
+    // Evidence-first ordering, unchanged: the companion carries an affinity and
+    // the self-signed offer carries none, so the companion leads.
+    let order: Vec<&str> = candidates
+        .iter()
+        .map(|c| c.proposed_match.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        vec!["cdn.example", "ads.tracker.example"],
+        "an optional count must not reorder the inbox"
+    );
+}
+
+/// The offer is "move this into the tunnel". When the tunnel turns out not to
+/// reach the host either, the move would trade one route that cannot carry it
+/// for another that cannot — that is somebody else's outage, not a suggestion.
+///
+/// The check that matters is the third case: an offer nobody probed must be
+/// untouched, because "not measured" and "measured as useless" are different
+/// facts and only one of them is a reason to stay silent.
+#[test]
+fn an_offer_the_additional_route_cannot_help_is_withdrawn_and_an_unchecked_one_is_not() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+    set_verdict(&verdicts, "chat.other.example", PrimaryBehavior::Stalls);
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "forum.talk.example", wall_clock()));
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "chat.other.example", wall_clock()));
+    assert_eq!(f.engine.candidates(SID).len(), 2, "both start out offered");
+
+    // Measured: the tunnel reaches neither better nor at all.
+    f.engine
+        .note_secondary_reach(SID, "forum.talk.example", false, wall_clock());
+
+    let after: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert_eq!(
+        after,
+        vec!["chat.other.example".to_string()],
+        "the one the tunnel cannot help is gone; the unchecked one stays",
+    );
+
+    // And the positive control for the gate itself: a host the tunnel DOES
+    // reach keeps its offer, so the rule is about the answer and not about
+    // having been probed at all.
+    f.engine
+        .note_secondary_reach(SID, "chat.other.example", true, wall_clock());
+    let reach = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .find(|c| c.proposed_match == "chat.other.example")
+        .map(|c| c.secondary_reach);
+    assert_eq!(
+        reach,
+        Some(Some(true)),
+        "a reachable host keeps the offer and carries what was found",
+    );
+}
+
+/// A self-signed offer describes the network as it was minutes ago, so it goes
+/// stale faster than a companion offer, which describes which hosts belong
+/// together. Both halves are asserted: a shorter life is only meaningful if the
+/// longer one is still longer.
+#[test]
+fn a_self_signed_offer_goes_stale_sooner_than_a_companion_one() {
+    let f = fixture(AutoRulesMode::Suggest);
+    two_visits(&f.engine, &["cdn.example"]);
+    f.engine.tick(SID, later());
+    // Both offers are stamped from the same clock, or "older" would only mean
+    // "created on a different timeline".
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "ads.tracker.example", later()));
+    assert_eq!(
+        f.engine.candidates(SID).len(),
+        2,
+        "both are offered at first"
+    );
+
+    // Six hours on: past the self-signed horizon, well inside the companion one.
+    let six_hours = later() + Duration::from_secs(6 * 60 * 60);
+    f.engine.tick(SID, six_hours);
+
+    let left: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert_eq!(
+        left,
+        vec!["cdn.example".to_string()],
+        "the self-signed offer expired and the companion one did not",
+    );
+}
+
+/// The whole of the user-facing rule: a site the main link carries is never
+/// offered the additional route. Not "offered and greyed out" — not offered.
+#[test]
+fn a_host_the_main_link_carries_is_never_offered_at_all() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "cdn.tracker.example", PrimaryBehavior::Responds);
+
+    for signal_call in [
+        AutoRulesEngine::note_main_link_blocked_host
+            as fn(&AutoRulesEngine, &str, &str, SystemTime) -> bool,
+        AutoRulesEngine::note_placeholder_answer_host,
+    ] {
+        assert!(!signal_call(
+            &f.engine,
+            SID,
+            "cdn.tracker.example",
+            wall_clock()
+        ));
+    }
+    assert!(f.engine.candidates(SID).is_empty());
+}
+
+/// Positive control for the test above: the SAME calls with the SAME host park
+/// an offer as soon as the main link stops answering for it. Without this the
+/// test above would also pass if the signals were simply dead.
+#[test]
+fn the_same_host_is_offered_once_the_main_link_stops_answering() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "cdn.tracker.example", PrimaryBehavior::Stalls);
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "cdn.tracker.example", wall_clock()));
+    assert_eq!(f.engine.candidates(SID).len(), 1);
+}
+
+/// An offer parked while the host was failing is withdrawn once it works —
+/// from the list a person reads AND from the parked set the badge counts.
+#[test]
+fn an_offer_is_withdrawn_when_the_main_link_starts_carrying_the_host() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "forum.talk.example", wall_clock()));
+    assert_eq!(f.engine.candidates(SID).len(), 1);
+    assert_eq!(f.engine.pending_count(SID), 1);
+
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Responds);
+    assert!(
+        f.engine.candidates(SID).is_empty(),
+        "the reason for the offer stopped being true",
+    );
+    f.engine.tick(SID, wall_clock() + Duration::from_secs(60));
+    assert_eq!(
+        f.engine.pending_count(SID),
+        0,
+        "and the badge stops counting it",
+    );
+}
+
+/// A self-signed offer states what the network is doing now, and nothing
+/// behind it survives a restart — so it must not come back asserting a
+/// condition nobody has re-checked. A companion offer, which rests on evidence
+/// that IS restored, still does: without that control this test would pass on
+/// an engine that simply lost its parked set.
+#[test]
+fn a_self_signed_offer_does_not_come_back_after_a_restart_but_a_companion_does() {
+    let store = Arc::new(InMemoryPendingStore::new());
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    {
+        let mut f = build_fixture(
+            AutoRulesMode::Suggest,
+            Arc::new(InMemoryDismissalStore::new()),
+            Arc::clone(&store),
+            None,
+        );
+        let v = Arc::clone(&verdicts);
+        f.engine = f
+            .engine
+            .with_primary_behavior_source(Arc::new(move |host: &str| {
+                v.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(host)
+                    .copied()
+                    .unwrap_or(PrimaryBehavior::Unknown)
+            }));
+        set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+        assert!(f
+            .engine
+            .note_main_link_blocked_host(SID, "forum.talk.example", wall_clock()));
+        two_visits(&f.engine, &["cdn.example"]);
+        f.engine.tick(SID, later());
+        let parked: Vec<String> = f
+            .engine
+            .candidates(SID)
+            .into_iter()
+            .map(|c| c.proposed_match)
+            .collect();
+        assert!(
+            parked.contains(&"forum.talk.example".to_string()),
+            "{parked:?}"
+        );
+        assert!(parked.contains(&"cdn.example".to_string()), "{parked:?}");
+    }
+
+    let restarted = fixture_with_pending_store(AutoRulesMode::Suggest, store);
+    let after: Vec<String> = restarted
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert!(
+        !after.contains(&"forum.talk.example".to_string()),
+        "a self-signed offer must re-earn itself: {after:?}",
+    );
+    assert!(
+        after.contains(&"cdn.example".to_string()),
+        "a companion offer still survives the restart: {after:?}",
+    );
+}
+
+/// An ad or telemetry endpoint the provider cuts is not a site anyone was
+/// trying to open, and it belongs to everybody — routing it would drag
+/// unrelated traffic along. The four names are the ones a live run actually
+/// offered; every one of them was measured as genuinely cut on the main link,
+/// so the measurement is not what disqualifies them.
+#[test]
+fn shared_ad_and_telemetry_endpoints_are_never_offered_however_badly_they_fail() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    for host in [
+        "ads.googlesyndication.com",
+        "pubads.g.doubleclick.net",
+        "stats.g.doubleclick.net",
+        "www.googletagservices.com",
+    ] {
+        set_verdict(&verdicts, host, PrimaryBehavior::Stalls);
+        assert!(
+            !f.engine
+                .note_main_link_blocked_host(SID, host, wall_clock()),
+            "{host}",
+        );
+    }
+    assert!(f.engine.candidates(SID).is_empty());
+
+    // Positive control: a site host failing the same way IS offered, so the
+    // test above cannot pass on a detector that simply stopped working.
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "forum.talk.example", wall_clock()));
+    assert_eq!(f.engine.candidates(SID).len(), 1);
+}
+
+/// One failing name is one question. The field case says why it must not
+/// become a question about the whole domain: a failing subdomain was cut
+/// while the apex and `www` answered normally on the main link.
+#[test]
+fn one_failing_subdomain_is_offered_by_its_own_name() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "forum.talk.example", PrimaryBehavior::Stalls);
+    assert!(f
+        .engine
+        .note_main_link_blocked_host(SID, "forum.talk.example", wall_clock()));
+    let offered: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert_eq!(offered, vec!["forum.talk.example".to_string()]);
+}
+
+/// A SECOND failing name under the same domain is evidence the domain is what
+/// is being cut, so the two questions collapse into one and the names they
+/// replace are withdrawn.
+#[test]
+fn a_second_failing_name_under_one_domain_collapses_into_one_offer() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    for host in ["a.blocked.example", "b.blocked.example"] {
+        set_verdict(&verdicts, host, PrimaryBehavior::Stalls);
+        assert!(f
+            .engine
+            .note_main_link_blocked_host(SID, host, wall_clock()));
+    }
+    let offered: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert_eq!(offered, vec!["blocked.example".to_string()], "{offered:?}");
+}
+
+/// The field case, both halves. Two names under one domain fail while the
+/// apex answers — and the offer is still about the domain, because two cut
+/// names prove the domain is what is being cut. One site, one question; the
+/// apex travels with the site it belongs to.
+#[test]
+fn two_failing_names_roll_up_even_though_the_apex_still_answers() {
+    let verdicts = Arc::new(Mutex::new(HashMap::new()));
+    let f = fixture_with_main_link_verdicts(Arc::clone(&verdicts));
+    set_verdict(&verdicts, "talk.example", PrimaryBehavior::Responds);
+    for host in ["forum.talk.example", "test.talk.example"] {
+        set_verdict(&verdicts, host, PrimaryBehavior::Stalls);
+        assert!(f
+            .engine
+            .note_main_link_blocked_host(SID, host, wall_clock()));
+    }
+    let offered: Vec<String> = f
+        .engine
+        .candidates(SID)
+        .into_iter()
+        .map(|c| c.proposed_match)
+        .collect();
+    assert_eq!(offered, vec!["talk.example".to_string()], "{offered:?}");
+}
+
+/// The pass probes addresses out of the FQDN cache, and a self-signed offer is
+/// about a host nothing cached. Holding it until an answer that cannot arrive
+/// would silence it for good — the exact defect this whole change is about.
+#[test]
+fn a_self_signed_offer_is_never_held_waiting_for_a_pass_that_cannot_answer() {
+    let mut dto = main_link_dto(
+        "forum.talk.example",
+        "forum.talk.example",
+        AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED,
+        "",
+    );
+    assert!(!awaiting_the_main_link(&dto, true));
+    // A companion with no verdict yet IS held while the pass can still answer.
+    dto.anchor = "site.example".to_string();
+    dto.proposed_match = "cdn.other.example".to_string();
+    dto.signal = AUTO_RULE_SIGNAL_CO_ACTIVITY.to_string();
+    assert!(awaiting_the_main_link(&dto, true));
+}
+
+/// A companion offer is judged differently on purpose: a routed site's OWN
+/// delivery name can complete a connection and still serve a refusal, so
+/// "it answers" does not settle it. Only the self-signed offers are silenced.
+#[test]
+fn a_main_link_answer_does_not_silence_a_companion_of_the_same_brand() {
+    let responding = main_link_dto(
+        "site.example",
+        "cdn.site.example",
+        AUTO_RULE_SIGNAL_CO_ACTIVITY,
+        AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
+    );
+    assert!(!settled_self_signed(&responding));
+    assert!(!settled_by_the_main_link(&responding));
+
+    let mut self_signed = responding.clone();
+    self_signed.anchor = "cdn.site.example".to_string();
+    self_signed.signal = AUTO_RULE_SIGNAL_MAIN_LINK_BLOCKED.to_string();
+    assert!(settled_self_signed(&self_signed));
+    assert!(settled_by_the_main_link(&self_signed));
+}
+
 // ── "It already works on the main link" ──────────────────────────────────────
 
 /// A parked candidate around one DTO — the suffix form the flow always writes.
@@ -1854,7 +2479,7 @@ fn main_link_dto(
         match_kind: AUTO_RULE_MATCH_KIND_SUFFIX.to_string(),
         route: RouteRole::Secondary.slug().to_string(),
         affinity: 0.9,
-        observations: 3,
+        observations: Some(3),
         first_seen_unix_ms: 1,
         last_seen_unix_ms: 2,
         signal: signal.to_string(),
@@ -1863,17 +2488,20 @@ fn main_link_dto(
         primary_behavior: behavior.to_string(),
         anchor_refuses_main_link: false,
         observed_members: Vec::new(),
+        served_by_main_link: false,
+        third_party: None,
+        secondary_reach: None,
     }
 }
 
 /// The reported case, one step earlier than the check that was supposed to
 /// cover it: nothing had measured `cdnjs` yet, and an unmeasured host reads
-/// exactly like an unreachable one. `meduza.io` hit it after `chatgpt.com` did,
+/// exactly like an unreachable one. `news.example` hit it after `assistant.example` did,
 /// because the fix had been aimed at the verdict, not at its absence.
 #[test]
 fn a_third_party_with_no_verdict_yet_waits_instead_of_asking() {
     let unmeasured = main_link_dto(
-        "meduza.io",
+        "news.example",
         "cdnjs.cloudflare.com",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         "", // the pass has not answered for it yet
@@ -1897,8 +2525,8 @@ fn a_third_party_with_no_verdict_yet_waits_instead_of_asking() {
 #[test]
 fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
     let own = main_link_dto(
-        "meduza.io",
-        "cdn.meduza.io",
+        "news.example",
+        "cdn.news.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         "",
     );
@@ -1907,7 +2535,12 @@ fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
         "the site's own delivery name is asked about regardless"
     );
 
-    let brand = main_link_dto("meduza.io", "meduza.ru", AUTO_RULE_SIGNAL_BRAND_RELATED, "");
+    let brand = main_link_dto(
+        "news.example",
+        "news.example.org",
+        AUTO_RULE_SIGNAL_BRAND_RELATED,
+        "",
+    );
     assert!(
         !awaiting_the_main_link(&brand, true),
         "the brand tier never waits on connectivity"
@@ -1919,7 +2552,7 @@ fn the_hold_releases_the_sites_own_names_and_answered_hosts() {
         AUTO_RULE_PRIMARY_BEHAVIOR_CUT,
     ] {
         let answered = main_link_dto(
-            "meduza.io",
+            "news.example",
             "cdnjs.cloudflare.com",
             AUTO_RULE_SIGNAL_DELIVERY_NAME,
             behavior,
@@ -1937,7 +2570,7 @@ fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
     // the tray kept offering it because delivery names skipped the check that
     // co-activity names already had.
     let cdn = main_link_dto(
-        "chatgpt.com",
+        "assistant.example",
         "cdnjs.cloudflare.com",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
@@ -1945,7 +2578,7 @@ fn a_shared_cdn_that_answers_on_the_main_link_is_not_worth_asking_about() {
     assert!(settled_by_the_main_link(&cdn));
 
     let ad = main_link_dto(
-        "chatgpt.com",
+        "assistant.example",
         "casalemedia.com",
         AUTO_RULE_SIGNAL_CO_ACTIVITY,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
@@ -1958,15 +2591,15 @@ fn the_sites_own_name_keeps_its_question_even_when_it_answers() {
     // Answering is not serving: ChatGPT answers main-link addresses with a
     // refusal, so its own names stay on offer whatever the connectivity says.
     let own = main_link_dto(
-        "chatgpt.com",
-        "cdn.chatgpt.com",
+        "assistant.example",
+        "cdn.assistant.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
     assert!(!settled_by_the_main_link(&own));
 
     let brand = main_link_dto(
-        "chatgpt.com",
+        "assistant.example",
         "chatgpt.io",
         AUTO_RULE_SIGNAL_BRAND_RELATED,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
@@ -1985,7 +2618,7 @@ fn a_host_that_fails_on_the_main_link_is_still_asked_about() {
         "",
     ] {
         let dto = main_link_dto(
-            "chatgpt.com",
+            "assistant.example",
             "cdnjs.cloudflare.com",
             AUTO_RULE_SIGNAL_DELIVERY_NAME,
             behavior,
@@ -2006,14 +2639,14 @@ fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
         SystemTime::UNIX_EPOCH,
     );
     let settled = main_link_dto(
-        "chatgpt.com",
+        "assistant.example",
         "cdnjs.cloudflare.com",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_RESPONDS,
     );
     let open = main_link_dto(
-        "chatgpt.com",
-        "oaistatic.example",
+        "assistant.example",
+        "assets.example",
         AUTO_RULE_SIGNAL_DELIVERY_NAME,
         AUTO_RULE_PRIMARY_BEHAVIOR_STALLS,
     );
@@ -2027,5 +2660,36 @@ fn a_settled_candidate_does_not_hold_the_host_on_the_additional_route() {
         !engine.covers_pending_secondary_host("cdnjs.cloudflare.com"),
         "a host the tray will not ask about must not be pinned as if accepted"
     );
-    assert!(engine.covers_pending_secondary_host("oaistatic.example"));
+    assert!(engine.covers_pending_secondary_host("assets.example"));
+}
+
+/// The dropped-companion line is deduped on the SELECTION, not on the event —
+/// otherwise a steady set writes the same names every ten seconds, which is how
+/// a log stops being read.
+#[test]
+fn an_unchanged_dropped_set_is_not_worth_a_second_line() {
+    let note = QuietNote {
+        inert: 2,
+        sample: vec!["ozonru.me (www.ozon.ru)".to_string()],
+    };
+    assert!(
+        quiet_note_is_news(None, &note),
+        "the first sighting is always news"
+    );
+    assert!(!quiet_note_is_news(Some(&note), &note));
+
+    // One companion swapped for another keeps the count — the sample is what
+    // tells them apart, so it has to count as news.
+    let swapped = QuietNote {
+        inert: 2,
+        sample: vec!["cdnjs.cloudflare.com (www.ozon.ru)".to_string()],
+    };
+    assert!(quiet_note_is_news(Some(&note), &swapped));
+
+    // …and a set that grew past what the sample shows is news too.
+    let grown = QuietNote {
+        inert: 3,
+        sample: note.sample.clone(),
+    };
+    assert!(quiet_note_is_news(Some(&note), &grown));
 }

@@ -42,6 +42,7 @@ fn the_catch_all_spares_what_its_twin_spares() {
     let exemptions = FailClosedExemptions {
         bootstrap_server_ips: vec![Ipv4Addr::new(9, 9, 9, 9)],
         local_subnets: Vec::new(),
+        foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: vec![primary],
         allow_dns_over_primary: false,
         known_direct_ips: vec![direct],
@@ -280,7 +281,7 @@ fn ale_permit_outranks_ale_block_outranks_rule_band() {
 fn an_app_block_loses_to_every_primary_rule_permit() {
     let out = app_kill_switch_filters(
         "S",
-        &["claude.exe".to_string()],
+        &["helper.exe".to_string()],
         LUID,
         KillSwitchProtocols::ALL,
     );
@@ -295,7 +296,7 @@ fn an_app_block_loses_to_every_primary_rule_permit() {
     );
     // The fail-closed twin makes the same promise while the link is
     // unresolved.
-    let fc = fail_closed_block_apps("S", &["claude.exe".to_string()], KillSwitchProtocols::ALL);
+    let fc = fail_closed_block_apps("S", &["helper.exe".to_string()], KillSwitchProtocols::ALL);
     assert!(fc.iter().all(|f| f.weight < RULE_PRIMARY_BAND));
 }
 
@@ -342,10 +343,8 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
     // one unconditional ALE Permit per pattern, at the exempt band, outranking
     // every block. No interface/IP condition so it permits egress over the
     // primary even while the secondary adapter is down and block-all is engaged.
-    let out = primary_app_exempt_filters(
-        "S",
-        &["hidemy.name VPN 3.0.exe".to_string(), "*vpn*".to_string()],
-    );
+    let out =
+        primary_app_exempt_filters("S", &["SwiftVPN 3.0.exe".to_string(), "*vpn*".to_string()]);
     assert_eq!(out.len(), 2, "one exempt permit per pattern, no block half");
     for f in &out {
         assert_eq!(f.action, WfpAction::Permit);
@@ -361,10 +360,7 @@ fn primary_app_exempt_emits_unconditional_permit_above_all_bands() {
             "exempt permit must sit in the top exempt band"
         );
     }
-    assert_eq!(
-        out[0].app_pattern.as_deref(),
-        Some("hidemy.name VPN 3.0.exe")
-    );
+    assert_eq!(out[0].app_pattern.as_deref(), Some("SwiftVPN 3.0.exe"));
     assert_eq!(out[1].app_pattern.as_deref(), Some("*vpn*"));
 }
 
@@ -389,6 +385,68 @@ fn default_vpn_exempt_patterns_present_and_each_emits_an_exempt_permit() {
         && f.layer == WfpLayerKey::AleAuthConnectV4
         && f.local_interface_luid.is_none()
         && f.remote_ip.is_none()));
+}
+
+/// The window is not the tunnel. A client that ships its transports as nested
+/// executables must have THOSE exempt, or fail-closed blocks the handshake and
+/// the outage never ends — the 2026-09-08 shape.
+#[test]
+fn a_recognised_client_lends_its_install_tree_to_the_exemption() {
+    use nrr_platform_api::app_path_resolver::MockAppPathResolver;
+    use std::path::PathBuf;
+
+    let client = r"C:\Program Files\vendor vpn\vendor vpn.exe";
+    let resolver = MockAppPathResolver::new().with_siblings(
+        client,
+        vec![
+            PathBuf::from(r"C:\Program Files\vendor vpn\OpenVPN\openvpn.exe"),
+            PathBuf::from(r"C:\Program Files\vendor vpn\XRay\ExternalBinaries\xray.exe"),
+            // Already named as the client — must not be added twice; filter ids
+            // are path-derived, so a duplicate is a duplicate filter.
+            PathBuf::from(client),
+        ],
+    );
+
+    let tree = tunnel_client_tree_exempt_paths(&resolver, &[client.to_string()]);
+
+    assert_eq!(
+        tree.len(),
+        2,
+        "the client's own path is not re-added: {tree:?}"
+    );
+    assert!(tree.iter().any(|p| p.ends_with("openvpn.exe")));
+    assert!(
+        tree.iter().any(|p| p.ends_with("xray.exe")),
+        "a transport matching NO vpn name pattern is exactly what the tree is for: {tree:?}",
+    );
+    // Positive control on the emitter: each added path becomes a real permit.
+    let filters = primary_app_exempt_filters("S", &tree);
+    assert_eq!(filters.len(), 2);
+    assert!(filters
+        .iter()
+        .all(|f| f.action == WfpAction::Permit && f.app_pattern.is_some()));
+}
+
+#[test]
+fn an_unrecognised_app_lends_nothing_and_the_tree_is_capped() {
+    use nrr_platform_api::app_path_resolver::MockAppPathResolver;
+    use std::path::PathBuf;
+
+    let client = r"C:\Program Files\vendor vpn\vendor vpn.exe";
+    let bundle: Vec<PathBuf> = (0..CLIENT_TREE_EXEMPT_CAP + 10)
+        .map(|i| PathBuf::from(format!(r"C:\Program Files\vendor vpn\tool{i}.exe")))
+        .collect();
+    let resolver = MockAppPathResolver::new().with_siblings(client, bundle);
+
+    assert_eq!(
+        tunnel_client_tree_exempt_paths(&resolver, &[client.to_string()]).len(),
+        CLIENT_TREE_EXEMPT_CAP,
+        "a client that ships a toolchain must not decide how many filters we hold",
+    );
+    assert!(
+        tunnel_client_tree_exempt_paths(&resolver, &[]).is_empty(),
+        "no recognised client, no tree",
+    );
 }
 
 #[test]
@@ -589,11 +647,90 @@ fn filters_span_ale_and_packet_layers() {
 
 // ── Catch-all kill-switch (mode B) ──────────────────────────────────────
 
+/// A corporate VPN the user runs beside ours keeps carrying its traffic when
+/// the block-all arms. Cutting it would make the product the reason a working
+/// connection died, and from the outside that is indistinguishable from the
+/// corporate VPN failing on its own.
+///
+/// The permit is on the EGRESS interface, never on an address range: exempting
+/// the tunnel's addresses would open them on the primary link too, which is
+/// the leak this block-all exists to stop.
+#[test]
+fn a_foreign_tunnel_keeps_carrying_its_own_traffic_under_the_block_all() {
+    const FOREIGN: u64 = 0x00AB_CDEF_0000_0001;
+    let exemptions = FailClosedExemptions {
+        bootstrap_server_ips: vec![ip(203, 0, 113, 7)],
+        local_subnets: Vec::new(),
+        foreign_tunnel_luids: vec![FOREIGN],
+        primary_dest_ips: Vec::new(),
+        allow_dns_over_primary: false,
+        known_direct_ips: Vec::new(),
+        probe_target_ips: Vec::new(),
+        secondary_luid: LUID,
+    };
+    let filters =
+        fail_closed_block_all_filters("S-1-5-21-FOREIGN", &exemptions, KillSwitchProtocols::ALL);
+    let permits: Vec<u64> = filters
+        .iter()
+        .filter_map(|f| f.local_interface_luid)
+        .collect();
+    assert!(
+        permits.contains(&FOREIGN),
+        "the corporate tunnel keeps its egress"
+    );
+
+    // Without the claim nothing changes: the exemption is opt-in on evidence,
+    // not a hole that is always open.
+    let strict = FailClosedExemptions {
+        foreign_tunnel_luids: Vec::new(),
+        ..exemptions.clone()
+    };
+    let strict_permits: Vec<u64> =
+        fail_closed_block_all_filters("S-1-5-21-FOREIGN", &strict, KillSwitchProtocols::ALL)
+            .iter()
+            .filter_map(|f| f.local_interface_luid)
+            .collect();
+    assert!(!strict_permits.contains(&FOREIGN));
+}
+
+/// Our own additional route is already permitted by its own field; listing it
+/// twice would emit two filters with the same purpose and different ids.
+#[test]
+fn our_own_tunnel_is_not_permitted_twice() {
+    let exemptions = FailClosedExemptions {
+        bootstrap_server_ips: vec![ip(203, 0, 113, 7)],
+        local_subnets: Vec::new(),
+        foreign_tunnel_luids: vec![LUID],
+        primary_dest_ips: Vec::new(),
+        allow_dns_over_primary: false,
+        known_direct_ips: Vec::new(),
+        probe_target_ips: Vec::new(),
+        secondary_luid: LUID,
+    };
+    let with_ours =
+        fail_closed_block_all_filters("S-1-5-21-FOREIGN", &exemptions, KillSwitchProtocols::ALL);
+    // Same world, minus the redundant claim.
+    let without = fail_closed_block_all_filters(
+        "S-1-5-21-FOREIGN",
+        &FailClosedExemptions {
+            foreign_tunnel_luids: Vec::new(),
+            ..exemptions.clone()
+        },
+        KillSwitchProtocols::ALL,
+    );
+    assert_eq!(
+        with_ours.len(),
+        without.len(),
+        "our own tunnel is already permitted; claiming it again adds nothing",
+    );
+}
+
 fn full_resolution() -> KillSwitchResolution {
     KillSwitchResolution {
         secondary_luid: LUID,
         bootstrap_server_ips: vec![ip(203, 0, 113, 7)],
         local_subnets: vec![(ip(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
     }
 }
 
@@ -612,9 +749,10 @@ fn every_emitted_filter_is_expressible_at_its_layer() {
     let exemptions = FailClosedExemptions {
         bootstrap_server_ips: vec![ip(203, 0, 113, 7)],
         local_subnets: vec![(ip(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: vec![ip(198, 51, 100, 200)],
         allow_dns_over_primary: true,
-        known_direct_ips: vec![ip(178, 248, 237, 68)],
+        known_direct_ips: vec![ip(203, 0, 113, 68)],
         probe_target_ips: vec![ip(10, 91, 192, 1)],
         secondary_luid: 0,
     };
@@ -1151,10 +1289,10 @@ fn fail_closed_block_all_permits_known_primary_at_packet_layer_above_block() {
 
 #[test]
 fn fail_closed_block_all_exempts_known_direct_at_both_layers() {
-    // a known-DIRECT destination (habr.com case) has no
+    // a known-DIRECT destination has no
     // rule permit at all, so it needs BOTH an ALE exempt (TCP/UDP connects)
     // and a packet-layer permit (ICMP), each above its layer's block.
-    let direct = ip(178, 248, 237, 68);
+    let direct = ip(203, 0, 113, 68);
     let ex = FailClosedExemptions {
         known_direct_ips: vec![direct, ip(127, 0, 0, 1)], // loopback filtered
         ..FailClosedExemptions::default()
@@ -1282,6 +1420,7 @@ fn fail_closed_mode_b_blocks_all_except_exemptions() {
     let ex = FailClosedExemptions {
         bootstrap_server_ips: vec![ip(203, 0, 113, 7)],
         local_subnets: vec![(ip(192, 168, 1, 0), 24)],
+        foreign_tunnel_luids: Vec::new(),
         ..FailClosedExemptions::default()
     };
     let out = fail_closed_block_all_filters("S", &ex, KillSwitchProtocols::ALL);

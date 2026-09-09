@@ -40,7 +40,7 @@ pub const RCODE_SERVFAIL: u8 = 2;
 /// answer section would begin) so a response can echo the header + question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedQuestion {
-    /// Lower-cased dotted name, no trailing dot (e.g. `chatgpt.com`).
+    /// Lower-cased dotted name, no trailing dot (e.g. `assistant.example`).
     pub qname: String,
     /// Query type (`A` = [`QTYPE_A`], `AAAA` = 28, …).
     pub qtype: u16,
@@ -677,17 +677,17 @@ mod tests {
 
     #[test]
     fn parses_a_question_name_and_type() {
-        let q = parse_question(&query("chatgpt.com", QTYPE_A)).expect("parse");
-        assert_eq!(q.qname, "chatgpt.com");
+        let q = parse_question(&query("assistant.example", QTYPE_A)).expect("parse");
+        assert_eq!(q.qname, "assistant.example");
         assert_eq!(q.qtype, QTYPE_A);
-        // header(12) + [7]chatgpt + [3]com + 0 + qtype(2) + qclass(2)
-        assert_eq!(q.question_end, 12 + 8 + 4 + 1 + 4);
+        // header(12) + [9]assistant + [7]example + 0 + qtype(2) + qclass(2)
+        assert_eq!(q.question_end, 12 + 10 + 8 + 1 + 4);
     }
 
     #[test]
     fn lowercases_name_and_reads_non_a_type() {
-        let q = parse_question(&query("ChatGPT.COM", 28 /* AAAA */)).expect("parse");
-        assert_eq!(q.qname, "chatgpt.com");
+        let q = parse_question(&query("Assistant.EXAMPLE", 28 /* AAAA */)).expect("parse");
+        assert_eq!(q.qname, "assistant.example");
         assert_eq!(q.qtype, 28);
     }
 
@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn rejects_compression_pointer_in_question() {
-        let mut p = query("chatgpt.com", QTYPE_A);
+        let mut p = query("assistant.example", QTYPE_A);
         // Overwrite the first label length byte with a compression pointer.
         p[DNS_HEADER_LEN] = 0xC0;
         assert!(parse_question(&p).is_none());
@@ -711,8 +711,8 @@ mod tests {
 
     #[test]
     fn builds_a_response_with_pointer_ttl_and_rdata() {
-        let q = query("chatgpt.com", QTYPE_A);
-        let resp = build_a_response(&q, &[ip(172, 64, 155, 209)], 60).expect("resp");
+        let q = query("assistant.example", QTYPE_A);
+        let resp = build_a_response(&q, &[ip(23, 10, 20, 159)], 60).expect("resp");
         // QR set, RA set, RCODE 0.
         assert_eq!(resp[2] & 0x80, 0x80, "QR bit");
         assert_eq!(resp[2] & 0x01, 0x01, "RD preserved");
@@ -731,7 +731,7 @@ mod tests {
             "TTL"
         );
         assert_eq!(u16::from_be_bytes([ans[10], ans[11]]), 4, "RDLENGTH");
-        assert_eq!(&ans[12..16], &[172, 64, 155, 209], "RDATA");
+        assert_eq!(&ans[12..16], &[23, 10, 20, 159], "RDATA");
     }
 
     #[test]
@@ -753,14 +753,17 @@ mod tests {
 
     #[test]
     fn a_query_round_trips_through_own_parser() {
-        let q = build_a_query(0xBEEF, "chatgpt.com").expect("query");
+        let q = build_a_query(0xBEEF, "assistant.example").expect("query");
         assert_eq!(u16::from_be_bytes([q[0], q[1]]), 0xBEEF, "id");
         assert_eq!(q[2] & 0x01, 0x01, "RD set");
         let parsed = parse_question(&q).expect("parse own query");
-        assert_eq!(parsed.qname, "chatgpt.com");
+        assert_eq!(parsed.qname, "assistant.example");
         assert_eq!(parsed.qtype, QTYPE_A);
         // Trailing-dot FQDN encodes identically.
-        assert_eq!(build_a_query(0xBEEF, "chatgpt.com.").expect("fqdn"), q);
+        assert_eq!(
+            build_a_query(0xBEEF, "assistant.example.").expect("fqdn"),
+            q
+        );
     }
 
     #[test]
@@ -775,13 +778,13 @@ mod tests {
 
     #[test]
     fn a_response_parses_answers_and_min_ttl() {
-        let q = build_a_query(7, "chatgpt.com").expect("query");
+        let q = build_a_query(7, "assistant.example").expect("query");
         // Reuse the server-side builder, then rewrite the two answer TTLs to
         // differ so min-TTL selection is observable.
         let mut resp = build_a_response(&q, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 300).expect("resp");
         let ans2_ttl_at = parse_question(&q).expect("q").question_end + 16 + 6;
         resp[ans2_ttl_at..ans2_ttl_at + 4].copy_from_slice(&120u32.to_be_bytes());
-        match parse_a_response(7, "chatgpt.com", &resp) {
+        match parse_a_response(7, "assistant.example", &resp) {
             AResponseOutcome::Answers { addresses, min_ttl } => {
                 assert_eq!(addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
                 assert_eq!(min_ttl, 120);
@@ -869,16 +872,26 @@ mod tests {
     /// guards against.
     #[test]
     fn a_response_rejects_addresses_owned_by_an_unrelated_name() {
-        let q = build_a_query(11, "signal.me").expect("query");
+        let q = build_a_query(11, "secure.example").expect("query");
         let mut resp = response_frame(&q, 3);
-        push_a_rr(&mut resp, &[0xC0, 0x0C], ip(76, 223, 92, 165), 300);
-        push_a_rr(&mut resp, &encoded("chatgpt.com"), ip(8, 47, 69, 0), 300);
-        push_a_rr(&mut resp, &encoded("chatgpt.com"), ip(8, 6, 112, 0), 300);
-        match parse_a_response(11, "signal.me", &resp) {
+        push_a_rr(&mut resp, &[0xC0, 0x0C], ip(23, 10, 20, 135), 300);
+        push_a_rr(
+            &mut resp,
+            &encoded("assistant.example"),
+            ip(198, 51, 100, 0),
+            300,
+        );
+        push_a_rr(
+            &mut resp,
+            &encoded("assistant.example"),
+            ip(192, 0, 2, 0),
+            300,
+        );
+        match parse_a_response(11, "secure.example", &resp) {
             AResponseOutcome::Answers { addresses, .. } => {
                 assert_eq!(
                     addresses,
-                    vec![ip(76, 223, 92, 165)],
+                    vec![ip(23, 10, 20, 135)],
                     "only the question's own address survives"
                 );
             }
@@ -891,11 +904,16 @@ mod tests {
     /// resolvers) runs instead of the addresses being enforced.
     #[test]
     fn a_response_is_empty_when_every_address_is_off_chain() {
-        let q = build_a_query(12, "signal.me").expect("query");
+        let q = build_a_query(12, "secure.example").expect("query");
         let mut resp = response_frame(&q, 1);
-        push_a_rr(&mut resp, &encoded("chatgpt.com"), ip(8, 47, 69, 0), 300);
+        push_a_rr(
+            &mut resp,
+            &encoded("assistant.example"),
+            ip(198, 51, 100, 0),
+            300,
+        );
         assert_eq!(
-            parse_a_response(12, "signal.me", &resp),
+            parse_a_response(12, "secure.example", &resp),
             AResponseOutcome::NoRecords
         );
     }
@@ -1010,8 +1028,8 @@ mod tests {
 
     #[test]
     fn ptr_response_collects_target_names() {
-        let resp = ptr_response(5, ip(93, 184, 216, 34), &["example.com", "www.example.com"]);
-        match parse_ptr_response(5, ip(93, 184, 216, 34), &resp) {
+        let resp = ptr_response(5, ip(23, 10, 20, 138), &["example.com", "www.example.com"]);
+        match parse_ptr_response(5, ip(23, 10, 20, 138), &resp) {
             PtrResponseOutcome::Names(names) => {
                 assert_eq!(names, vec!["example.com", "www.example.com"]);
             }
@@ -1044,7 +1062,7 @@ mod tests {
             resp.extend_from_slice(&rdata);
         }
 
-        let addr = ip(93, 184, 216, 34);
+        let addr = ip(23, 10, 20, 138);
         let mut resp = ptr_response(7, addr, &["example.com"]);
         // A second answer, filed under an unrelated owner.
         resp[6..8].copy_from_slice(&2u16.to_be_bytes());

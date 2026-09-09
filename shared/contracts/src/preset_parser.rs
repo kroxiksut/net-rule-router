@@ -766,10 +766,10 @@ example.org
 
     #[test]
     fn inline_comment_split_at_first_hash() {
-        let result = parse_canonical_rules("--- Domains\nvk.com  # Russian social\n");
+        let result = parse_canonical_rules("--- Domains\nab.test  # Russian social\n");
         assert_eq!(result.rules.len(), 1);
         let r = &result.rules[0];
-        assert_eq!(r.match_value, "vk.com");
+        assert_eq!(r.match_value, "ab.test");
         assert_eq!(r.comment, "Russian social");
     }
 
@@ -785,12 +785,12 @@ example.org
     #[test]
     fn disabled_rule_with_inline_comment() {
         // First # is the disable prefix; second is the inline-comment
-        // separator. Value is `vk.com`, comment is `temporarily off`.
-        let result = parse_canonical_rules("--- Domains\n# vk.com  # temporarily off\n");
+        // separator. Value is `ab.test`, comment is `temporarily off`.
+        let result = parse_canonical_rules("--- Domains\n# ab.test  # temporarily off\n");
         assert_eq!(result.rules.len(), 1);
         let r = &result.rules[0];
         assert!(!r.enabled);
-        assert_eq!(r.match_value, "vk.com");
+        assert_eq!(r.match_value, "ab.test");
         assert_eq!(r.comment, "temporarily off");
     }
 
@@ -853,10 +853,10 @@ example.org
 
     #[test]
     fn blank_lines_between_rules_ignored() {
-        let result = parse_canonical_rules("--- Domains\nvk.com\n\n\nyoutube.com\n");
+        let result = parse_canonical_rules("--- Domains\nab.test\n\n\nvideo.example\n");
         assert_eq!(result.rules.len(), 2);
-        assert_eq!(result.rules[0].match_value, "vk.com");
-        assert_eq!(result.rules[1].match_value, "youtube.com");
+        assert_eq!(result.rules[0].match_value, "ab.test");
+        assert_eq!(result.rules[1].match_value, "video.example");
     }
 
     #[test]
@@ -868,7 +868,7 @@ example.org
 
     #[test]
     fn mixed_line_endings_supported() {
-        let result = parse_canonical_rules("--- Zones\r\nru\n--- Domains\r\nvk.com\n");
+        let result = parse_canonical_rules("--- Zones\r\nru\n--- Domains\r\nab.test\n");
         assert_eq!(result.rules.len(), 2);
     }
 
@@ -959,11 +959,11 @@ example.org
 
     #[test]
     fn duplicate_known_section_merges_rules_and_flags_diagnostic() {
-        let input = "--- Domains\nvk.com\n--- Domains\nya.ru\n";
+        let input = "--- Domains\nab.test\n--- Domains\nya.ru\n";
         let result = parse_canonical_rules(input);
         // Rules from both blocks are present in encounter order.
         assert_eq!(result.rules.len(), 2);
-        assert_eq!(result.rules[0].match_value, "vk.com");
+        assert_eq!(result.rules[0].match_value, "ab.test");
         assert_eq!(result.rules[1].match_value, "ya.ru");
         // Diagnostic fires with `is_known_section = true`.
         assert_eq!(result.duplicate_sections.len(), 1);
@@ -987,7 +987,7 @@ example.org
 
     #[test]
     fn id_hint_increments_sequentially() {
-        let input = "--- Zones\nru\n--- Domains\nvk.com\nya.ru\n";
+        let input = "--- Zones\nru\n--- Domains\nab.test\nya.ru\n";
         let result = parse_canonical_rules(input);
         assert_eq!(result.rules.len(), 3);
         assert_eq!(result.rules[0].id_hint, 1);
@@ -997,10 +997,10 @@ example.org
 
     #[test]
     fn line_numbers_are_one_based_and_track_file_position() {
-        let input = "# prelude\n--- Domains\n\nvk.com\n# disabled.example.com\n";
+        let input = "# prelude\n--- Domains\n\nab.test\n# disabled.example.com\n";
         let result = parse_canonical_rules(input);
         assert_eq!(result.rules.len(), 2);
-        // vk.com is on line 4 (1-based), counting the blank line.
+        // ab.test is on line 4 (1-based), counting the blank line.
         assert_eq!(result.rules[0].line_number, 4);
         assert_eq!(result.rules[1].line_number, 5);
     }
@@ -1124,7 +1124,7 @@ example.org
         // A realistic RU preset shape — verifies the parser behaves
         // identically to the QML reference for a representative file.
         let input = format!(
-            "# NetRuleRouter preset - version 1\n# name: Test\n# preset_version: 1\n\n--- Zones\nru          # Россия (.ru)\nрф          # Россия (.рф, Punycode xn--p1ai)\n\n--- Domains\nvk.com\n*.vk.com\n# *.deprecated.com  # turned off last week\n\n--- IP\n# Intentionally left empty\n\n--- {NATIVE_APP}\ntelegram.exe\n# notepad.exe\n\n--- {FOREIGN_A}\n# (reserved - not applied on this host)\nfirefox\n\n--- {FOREIGN_B}\n# (reserved - not applied on this host)\nSafari\n"
+            "# NetRuleRouter preset - version 1\n# name: Test\n# preset_version: 1\n\n--- Zones\nru          # Россия (.ru)\nрф          # Россия (.рф, Punycode xn--p1ai)\n\n--- Domains\nab.test\n*.ab.test\n# *.deprecated.com  # turned off last week\n\n--- IP\n# Intentionally left empty\n\n--- {NATIVE_APP}\nmessenger.exe\n# notepad.exe\n\n--- {FOREIGN_A}\n# (reserved - not applied on this host)\nfirefox\n\n--- {FOREIGN_B}\n# (reserved - not applied on this host)\nSafari\n"
         );
 
         let result = parse_canonical_rules(&input);
@@ -1137,8 +1137,8 @@ example.org
         assert_eq!(result.rules[0].match_value, "ru");
         assert!(result.rules[0].enabled);
         assert_eq!(result.rules[1].match_value, "рф");
-        assert_eq!(result.rules[2].match_value, "vk.com");
-        assert!(result.rules[5].enabled); // telegram.exe
+        assert_eq!(result.rules[2].match_value, "ab.test");
+        assert!(result.rules[5].enabled); // messenger.exe
         assert!(!result.rules[6].enabled); // # notepad.exe
 
         // Passthrough: the two foreign-OS sections preserved.
@@ -1181,8 +1181,8 @@ example.org
     #[test]
     fn trailing_carriage_returns_stripped() {
         // Single \r at end of value should not become part of match_value.
-        let result = parse_canonical_rules("--- Domains\nvk.com\r\n");
-        assert_eq!(result.rules[0].match_value, "vk.com");
+        let result = parse_canonical_rules("--- Domains\nab.test\r\n");
+        assert_eq!(result.rules[0].match_value, "ab.test");
     }
 
     #[test]
@@ -1219,7 +1219,7 @@ example.org
         // Even though we accept lowercased section headers, the
         // parsed rule's `section_name` field preserves the original
         // case from the file. Useful for diagnostics and exports.
-        let result = parse_canonical_rules("--- domains\nvk.com\n");
+        let result = parse_canonical_rules("--- domains\nab.test\n");
         assert_eq!(result.rules[0].section_name, "domains");
     }
 
@@ -1227,7 +1227,7 @@ example.org
     fn duplicate_known_section_with_passthrough_after_does_not_confuse() {
         // The foreign section is unknown, Domains is known. Two of each.
         let input = format!(
-            "--- Domains\nvk.com\n--- {FOREIGN_A}\nfirefox\n--- Domains\nya.ru\n--- {FOREIGN_A}\nchromium\n"
+            "--- Domains\nab.test\n--- {FOREIGN_A}\nfirefox\n--- Domains\nya.ru\n--- {FOREIGN_A}\nchromium\n"
         );
         let result = parse_canonical_rules(&input);
         assert_eq!(result.rules.len(), 2);
@@ -1261,7 +1261,7 @@ example.org
     #[test]
     fn fixture_minimal_three_known_sections() {
         let result =
-            parse_canonical_rules("--- Zones\nru\n--- Domains\nvk.com\n--- IP\n203.0.113.7\n");
+            parse_canonical_rules("--- Zones\nru\n--- Domains\nab.test\n--- IP\n203.0.113.7\n");
         assert_eq!(result.rules.len(), 3);
         assert_eq!(result.rules[0].rule_type, ParsedRuleType::Zone);
         assert_eq!(result.rules[1].rule_type, ParsedRuleType::Domain);

@@ -25,6 +25,7 @@ The archive is an ordinary `.zip` you can open and read yourself. Every export a
 | `health.json` | A snapshot of service, storage, cache, and log health — states and counters. It does not contain your rules. |
 | `logs.ndjson` | Recent operational log lines, one JSON object per line, newest first, capped at 5 MiB before compression. Each line is a structured event (timestamp, level, category, a translated message key, and a decision/revision correlation id) — not free-text, so it does not carry raw hostnames or IP addresses. See the privacy note below. |
 | `audit_summary.json` | Recent security-audit entries (at most 100). These are **summaries only**: event kind, timestamp, result, and reason code — never the raw event payload. |
+| `service-logs/` | The service's own log files as it wrote them, one file per rotation, named as on disk. `logs.ndjson` above is a compact listing for reading; these are the full lines behind it, covering whichever window the export was asked for. Newest files first: if the whole history will not fit, the oldest files are left out rather than the export failing. |
 | `troubleshooting.md` | A generated troubleshooting guide (common symptoms and remediation steps). This is static text, not your data. |
 
 Today's export additionally includes, by default:
@@ -42,6 +43,8 @@ The export offers two levels, chosen next to the export button:
   - `storage_health.json` — SQLite storage health detail.
   - `explain_samples.json` — a handful of recent routing-decision explanations. Unlike the other files, this one **can** include the destination hostname of the sampled decisions (that is its purpose — showing why a specific decision was made), subject to the applied privacy mode.
 
+  A file appears only when it has something in it: with nothing to explain, or an audit trail this export may not carry whole, the file is left out and named in `redaction_report.json` instead of shipping empty.
+
   Because the full level is less redacted, review the archive before sharing it.
 
 The whole archive is capped at 50 MiB.
@@ -55,7 +58,7 @@ Next to the export button there is a checkbox, **on by default**, that limits ho
 
 In practice that means: restarting the app or the service in the middle of a test does **not** cut the earlier part of that test out of the archive, but this morning's unrelated session (or yesterday's) stays out. Uncheck the box to export the full log history instead.
 
-This window applies both to the merged `logs.ndjson` and to the raw service log files attached to the user copy (see below).
+This window applies both to the merged `logs.ndjson` and to the service's own log files in `service-logs/`.
 
 ## What is never included
 
@@ -78,6 +81,6 @@ Because the archive is a plain, human-readable `.zip`, you can always open any f
 
 The background service builds the archive first, in its own protected data directory (`C:\ProgramData\NetRuleRouter\archives`) — the service runs as SYSTEM and must never write into a location a lower-privileged process could tamper with. Immediately afterwards, the app (the launcher) copies that file into a folder you own outright: `%TEMP%\NetRuleRouter`. That copy is what the "Export diagnostic archive" button reports back and what "Open folder" opens.
 
-The user copy also has extra files the service-side original does not have: `launcher-main.log` and `launcher-tray.log` — the app's own GUI-side log files, appended into the copy because the service (which never reads files from your user profile) cannot see them — plus a `service-logs/` folder with the raw operational NDJSON files for the covered session window, newest first, up to 24 MiB in total (the oldest attached file is trimmed to its tail if it would overflow that budget). If you ever need the untouched, service-built original instead, its path is preserved internally as the export's "service archive path"; in the normal flow you only need the user copy the button gives you.
+The user copy also has two extra files the service-side original does not have: `launcher-main.log` and `launcher-tray.log` — the app's own GUI-side log files, appended into the copy because the service (which never reads files from your user profile) cannot see them. The `service-logs/` folder comes from the service itself, so it is in both copies, and it only ever contains what you are entitled to see. If you ever need the untouched, service-built original, its path is preserved internally as the export's "service archive path"; in the normal flow you only need the user copy the button gives you.
 
 If the copy step fails for any reason (for example, a permissions problem), the export still succeeds — you are simply given the path to the service-owned original instead.

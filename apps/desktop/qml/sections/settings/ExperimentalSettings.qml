@@ -367,6 +367,9 @@ GroupBox {
         Frame {
             Layout.fillWidth: true
             enabled: false
+            // Mode A rides the system-DNS observer; where the OS has none, the
+            // opt-in would reveal a mode the routing settings cannot offer.
+            visible: root.supports("dnsObserve")
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
             ColumnLayout {

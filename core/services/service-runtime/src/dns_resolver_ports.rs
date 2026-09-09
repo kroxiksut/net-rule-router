@@ -210,7 +210,7 @@ pub struct DirectUdpUpstreamResolver {
 ///
 /// A failed draw falls back to the clock rather than to a constant: worse than
 /// random, still not fixed, and it cannot fail the resolution.
-fn next_query_id() -> u16 {
+pub(crate) fn next_query_id() -> u16 {
     let mut bytes = [0u8; 2];
     match getrandom::fill(&mut bytes) {
         Ok(()) => u16::from_ne_bytes(bytes),
@@ -526,7 +526,7 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
 /// The captured ISP upstream is what preserves split-horizon zones, but a
 /// filtering provider answers rule hosts with a placeholder rather than a
 /// destination: loopback/unspecified stubs, a bare NXDOMAIN (observed on
-/// rotating `googlevideo.com` video nodes), or a synthetic address pair handed
+/// rotating `videocdn.test` video nodes), or a synthetic address pair handed
 /// to every blocked name alike. Such an answer is worthless to enforcement, so
 /// this decorator re-asks the public resolvers
 /// ([`crate::dns_egress::PUBLIC_DNS_SERVERS`]). It fires only when the captured
@@ -804,8 +804,8 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
 /// hosts-bypass decorator over the platform [`DnsResolverPort`].
 ///
 /// The seeder / DNS-refresh resolve rule hosts through the OS resolver, which
-/// honours the hosts/adblock file — so a pinned rule host (`musical.ly →
-/// 127.0.0.1`, 332× in the 0712 log) never yields a routable public IP and the
+/// honours the hosts/adblock file — so a pinned rule host (an adblock entry
+/// mapping it to `127.0.0.1`) never yields a routable public IP and the
 /// rule never enforces. When the per-SID `resolve_hosts_bypass` posture is ON
 /// (the default), this decorator resolves rule hosts DIRECTLY against the
 /// captured upstream server over raw UDP instead, skipping the hosts file by
@@ -1362,7 +1362,7 @@ impl ConfirmedHostSink for ConsumerConfirmedHostSink {
 /// known-direct and drive the SAME bounded synchronous reconcile the rule-host
 /// path uses, so the exemption is installed BEFORE the client receives the
 /// answer (its first connect would otherwise race the catch-all and be dropped
-/// with no retry — the habr.com case, HW-0721).
+/// with no retry — the observed first-contact drop).
 ///
 /// Hot-path discipline: `armed()` is a latch read; when the block-all is not
 /// armed (the overwhelming majority of Mode-B traffic) the gate is two loads
@@ -1501,14 +1501,14 @@ mod tests {
 
     #[test]
     fn poison_fallback_leaves_clean_answers_alone() {
-        let inner = FixedUpstream::ok(vec![ip(142, 250, 74, 78)]);
+        let inner = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
         let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
         assert_eq!(
-            r.resolve_a("youtube.com").expect("clean").addresses,
-            vec![ip(142, 250, 74, 78)]
+            r.resolve_a("video.example").expect("clean").addresses,
+            vec![ip(23, 10, 20, 78)]
         );
         assert_eq!(
             fallback.calls.load(Ordering::SeqCst),
@@ -1523,12 +1523,14 @@ mod tests {
         // cache the relay dials from, so an unconfirmed placeholder there is a
         // rule pointing at nowhere that nothing re-queries.
         let port =
-            UpstreamResolverPort::new(FixedUpstream::ok(vec![ip(8, 47, 69, 0), ip(8, 6, 112, 0)])
-                as Arc<dyn UpstreamResolver>);
+            UpstreamResolverPort::new(
+                FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)])
+                    as Arc<dyn UpstreamResolver>,
+            );
         assert_eq!(
-            port.resolve_a("signal.me"),
+            port.resolve_a("secure.example"),
             Err(DnsResolverError::Timeout {
-                hostname: "signal.me".to_string()
+                hostname: "secure.example".to_string()
             }),
             "transient, not NXDOMAIN — the name exists, we were not told where"
         );
@@ -1537,11 +1539,11 @@ mod tests {
     #[test]
     fn the_port_adapter_passes_a_real_answer_through() {
         let port = UpstreamResolverPort::new(
-            FixedUpstream::ok(vec![ip(157, 240, 1, 35)]) as Arc<dyn UpstreamResolver>
+            FixedUpstream::ok(vec![ip(23, 10, 20, 157)]) as Arc<dyn UpstreamResolver>
         );
-        let record = port.resolve_a("WWW.Facebook.com").expect("resolved");
-        assert_eq!(record.canonical_hostname, "www.facebook.com");
-        assert_eq!(record.addresses, vec![ip(157, 240, 1, 35)]);
+        let record = port.resolve_a("WWW.Social.Example").expect("resolved");
+        assert_eq!(record.canonical_hostname, "www.social.example");
+        assert_eq!(record.addresses, vec![ip(23, 10, 20, 157)]);
     }
 
     #[test]
@@ -1551,7 +1553,7 @@ mod tests {
         // first and nothing is ever pinned. The policy is what moves the query
         // somewhere the provider is not.
         let tunnel_resolver = spawn_fake_dns(|query| {
-            vec![build_a_response(query, &[ip(157, 240, 1, 35)], 60).expect("resp")]
+            vec![build_a_response(query, &[ip(23, 10, 20, 157)], 60).expect("resp")]
         });
         struct ViaTunnel(std::net::SocketAddr);
         impl crate::dns_egress::DnsEgressPolicy for ViaTunnel {
@@ -1564,17 +1566,17 @@ mod tests {
             }
         }
 
-        // The pair the provider hands to every name it filters.
-        let inner = FixedUpstream::ok(vec![ip(8, 47, 69, 0), ip(8, 6, 112, 0)]);
+        // Documentation space standing in for the name.
+        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_egress(Arc::new(ViaTunnel(tunnel_resolver)));
 
         assert_eq!(
-            r.resolve_a("www.facebook.com")
+            r.resolve_a("www.social.example")
                 .expect("confirmed")
                 .addresses,
-            vec![ip(157, 240, 1, 35)]
+            vec![ip(23, 10, 20, 157)]
         );
     }
 
@@ -1583,13 +1585,13 @@ mod tests {
         // A filtering upstream answers the rule host with 127.0.0.1 — the
         // fallback's clean answer must win.
         let inner = FixedUpstream::ok(vec![ip(127, 0, 0, 1)]);
-        let fallback = FixedUpstream::ok(vec![ip(142, 250, 74, 78)]);
+        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
         assert_eq!(
-            r.resolve_a("www.youtube.com").expect("rescued").addresses,
-            vec![ip(142, 250, 74, 78)]
+            r.resolve_a("www.video.example").expect("rescued").addresses,
+            vec![ip(23, 10, 20, 78)]
         );
     }
 
@@ -1622,7 +1624,7 @@ mod tests {
         // Original poisoned answer comes back unchanged (downstream
         // sanitization refuses to cache/route it — behaviour unchanged).
         assert_eq!(
-            r.resolve_a("musical.ly").expect("original").addresses,
+            r.resolve_a("app.example").expect("original").addresses,
             vec![ip(127, 0, 0, 1)]
         );
         assert_eq!(dead.calls.load(Ordering::SeqCst), 1);
@@ -1632,23 +1634,23 @@ mod tests {
     /// The observed provider placeholder — a pair of `.0` addresses. It is not
     /// loopback, so only the address-sanity screen catches it.
     #[test]
-    fn poison_fallback_rescues_a_trailing_zero_placeholder() {
-        let inner = FixedUpstream::ok(vec![ip(8, 47, 69, 0), ip(8, 6, 112, 0)]);
-        let fallback = FixedUpstream::ok(vec![ip(76, 223, 92, 165)]);
+    fn poison_fallback_rescues_a_documentation_space_placeholder() {
+        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
+        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 135)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
         assert_eq!(
-            r.resolve_a("signal.me").expect("rescued").addresses,
-            vec![ip(76, 223, 92, 165)]
+            r.resolve_a("secure.example").expect("rescued").addresses,
+            vec![ip(23, 10, 20, 135)]
         );
     }
 
-    /// A `.0` address travelling with a normal one is ordinary enough — no
-    /// second source, no added latency.
+    /// A synthetic address travelling with a real one leaves the answer
+    /// usable — no second source, no added latency.
     #[test]
     fn poison_fallback_ignores_a_single_suspicious_address() {
-        let inner = FixedUpstream::ok(vec![ip(8, 47, 69, 0), ip(142, 250, 74, 78)]);
+        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(23, 10, 20, 78)]);
         let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
@@ -1661,17 +1663,17 @@ mod tests {
     fn address_reuse_by_an_unrelated_host_asks_a_second_source() {
         let recent = Arc::new(RecentRuleAddressIndex::new());
         let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
-        recent.record("signal.me", &shared);
+        recent.record("secure.example", &shared);
 
         let inner = FixedUpstream::ok(shared.clone());
-        let fallback = FixedUpstream::ok(vec![ip(172, 64, 155, 209)]);
+        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 159)]);
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
                 .with_recent_addresses(Arc::clone(&recent));
         assert_eq!(
-            r.resolve_a("chatgpt.com").expect("rescued").addresses,
-            vec![ip(172, 64, 155, 209)]
+            r.resolve_a("assistant.example").expect("rescued").addresses,
+            vec![ip(23, 10, 20, 159)]
         );
     }
 
@@ -1681,7 +1683,7 @@ mod tests {
     fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
         let recent = Arc::new(RecentRuleAddressIndex::new());
         let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
-        recent.record("static.whatsapp.net", &shared);
+        recent.record("static.chatapp.test", &shared);
 
         let inner = FixedUpstream::ok(shared.clone());
         let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
@@ -1691,7 +1693,7 @@ mod tests {
                 .with_recent_addresses(Arc::clone(&recent));
         // Same origin, two labels deep.
         assert_eq!(
-            r.resolve_a("crashlogs.whatsapp.net")
+            r.resolve_a("crashlogs.chatapp.test")
                 .expect("clean")
                 .addresses,
             shared
@@ -1712,7 +1714,7 @@ mod tests {
     }
 
     /// One operator, two registrable domains (`claude.ai` / `api.anthropic.com`,
-    /// `whatsapp.com` / `whatsapp.net`) legitimately share a front end, and the
+    /// `chatapp.example` / `chatapp.test`) legitimately share a front end, and the
     /// origin check cannot see it. The honest second source then answers with
     /// the very address set that raised the alarm — testing IT for the same
     /// suspicion would make confirmation impossible and tax every such query
@@ -1752,7 +1754,7 @@ mod tests {
     fn agreement_on_an_unusable_set_confirms_nothing() {
         let recent = Arc::new(RecentRuleAddressIndex::new());
         let shared = vec![ip(127, 0, 0, 1)];
-        recent.record("signal.me", &shared);
+        recent.record("secure.example", &shared);
 
         let inner = FixedUpstream::ok(shared.clone());
         let agrees = FixedUpstream::ok(shared.clone());
@@ -1762,7 +1764,7 @@ mod tests {
                 .with_recent_addresses(recent);
 
         assert_eq!(
-            r.resolve_a("musical.ly").expect("original").addresses,
+            r.resolve_a("app.example").expect("original").addresses,
             shared
         );
         assert_eq!(agrees.calls.load(Ordering::SeqCst), 1);
@@ -1788,13 +1790,16 @@ mod tests {
     /// upstream answer comes back and the downstream gate refuses to pin it.
     #[test]
     fn a_second_source_repeating_the_placeholder_is_not_a_confirmation() {
-        let stub = vec![ip(8, 47, 69, 0), ip(8, 6, 112, 0)];
+        let stub = vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)];
         let inner = FixedUpstream::ok(stub.clone());
         let echo = FixedUpstream::ok(stub.clone());
         let r =
             PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
                 .with_fallbacks(vec![Arc::clone(&echo) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(r.resolve_a("signal.me").expect("original").addresses, stub);
+        assert_eq!(
+            r.resolve_a("secure.example").expect("original").addresses,
+            stub
+        );
         assert_eq!(echo.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1816,15 +1821,15 @@ mod tests {
         // TTL present → carried through.
         let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
             answer: Ok(ResolvedRecord {
-                canonical_hostname: "chatgpt.com".into(),
-                addresses: vec![ip(172, 64, 155, 209)],
+                canonical_hostname: "assistant.example".into(),
+                addresses: vec![ip(23, 10, 20, 159)],
                 ttl_seconds: Some(42),
             }),
         }));
         assert_eq!(
-            r.resolve_a("chatgpt.com"),
+            r.resolve_a("assistant.example"),
             Ok(ResolvedA {
-                addresses: vec![ip(172, 64, 155, 209)],
+                addresses: vec![ip(23, 10, 20, 159)],
                 ttl_seconds: 42,
             })
         );
@@ -1894,10 +1899,13 @@ mod tests {
     fn oracle_matches_secondary_rule_only() {
         let rules = Arc::new(FakeRules {
             primary: CanonicalRuleSet::from_rules(vec![exact_rule("r-p", "example.com")]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "chatgpt.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "assistant.example")]),
         });
         let oracle = ActiveRuleHostOracle::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())));
-        assert!(oracle.is_rule_host("chatgpt.com"), "secondary rule host");
+        assert!(
+            oracle.is_rule_host("assistant.example"),
+            "secondary rule host"
+        );
         assert!(
             !oracle.is_rule_host("example.com"),
             "primary-only match is not a secondary rule host"
@@ -1909,17 +1917,17 @@ mod tests {
     fn oracle_fails_open_when_no_active_user() {
         let rules = Arc::new(FakeRules {
             primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "chatgpt.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "assistant.example")]),
         });
         // No routing-active SID → nothing is a rule host (fail-open).
         let oracle = ActiveRuleHostOracle::new(rules, Arc::new(|| None));
-        assert!(!oracle.is_rule_host("chatgpt.com"));
+        assert!(!oracle.is_rule_host("assistant.example"));
     }
 
     // ── ActiveSecondaryOwnedIps — direct-answer steering set ─────────────────
 
-    /// The  case: `workspace.google.com` (direct) shares every
-    /// front-end address with `aistudio.google.com` (secondary rule). While the
+    /// The  case: `workspace.search.example` (direct) shares every
+    /// front-end address with `aistudio.search.example` (secondary rule). While the
     /// secondary cannot carry traffic those addresses are BLOCKED by the
     /// fail-closed posture, so the steering set must stay armed — an empty set
     /// here is what handed the direct host a set of addresses that could only
@@ -1928,12 +1936,15 @@ mod tests {
     fn steering_set_stays_armed_so_a_shared_direct_host_is_not_strangled() {
         use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
         use std::time::Instant;
-        let shared = ip(209, 85, 233, 102);
+        let shared = ip(23, 10, 20, 164);
         let fqdn = Arc::new(MockFqdnCacheLookup::new());
-        fqdn.set_ips("aistudio.google.com", vec![shared]);
+        fqdn.set_ips("aistudio.search.example", vec![shared]);
         let rules = Arc::new(FakeRules {
             primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "aistudio.google.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule(
+                "r-s",
+                "aistudio.search.example",
+            )]),
         });
         let owned =
             ActiveSecondaryOwnedIps::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())), fqdn);
@@ -1961,10 +1972,13 @@ mod tests {
         let fqdn = Arc::new(MockFqdnCacheLookup::new());
         // The mock models "the port answered nothing for this host", which is
         // what the SQLite adapter does once every row falls out of the window.
-        fqdn.set_ips("aistudio.google.com", vec![]);
+        fqdn.set_ips("aistudio.search.example", vec![]);
         let rules = Arc::new(FakeRules {
             primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "aistudio.google.com")]),
+            secondary: CanonicalRuleSet::from_rules(vec![exact_rule(
+                "r-s",
+                "aistudio.search.example",
+            )]),
         });
         let owned =
             ActiveSecondaryOwnedIps::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())), fqdn);
@@ -1980,8 +1994,9 @@ mod tests {
             addresses: vec![ip(127, 0, 0, 1), ip(203, 0, 113, 7), ip(0, 0, 0, 0)],
             ttl_seconds: 77,
         };
-        let entry = build_resolution_entry("chatgpt.com", &resolved, now).expect("routable IP");
-        assert_eq!(entry.canonical_hostname, "chatgpt.com");
+        let entry =
+            build_resolution_entry("assistant.example", &resolved, now).expect("routable IP");
+        assert_eq!(entry.canonical_hostname, "assistant.example");
         assert_eq!(entry.resolved_ips, vec![ip(203, 0, 113, 7)]); // loopback + unspecified dropped
         assert_eq!(entry.ttl_seconds, Some(77));
         assert_eq!(entry.source, StorageResolutionSource::Dns);
@@ -2123,7 +2138,7 @@ mod tests {
             vec![build_a_response(query, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 90).expect("resp")]
         });
         let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let resolved = r.resolve_a("chatgpt.com").expect("resolved");
+        let resolved = r.resolve_a("assistant.example").expect("resolved");
         assert_eq!(resolved.addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
         assert_eq!(resolved.ttl_seconds, 90);
     }
@@ -2143,7 +2158,7 @@ mod tests {
             resp.extend_from_slice(&[0x00, 0x01]); // CLASS IN
             resp.extend_from_slice(&3600u32.to_be_bytes());
             let mut rdata = Vec::new();
-            for label in ["dzen", "ru"] {
+            for label in ["feed", "example"] {
                 rdata.push(label.len() as u8);
                 rdata.extend_from_slice(label.as_bytes());
             }
@@ -2153,8 +2168,8 @@ mod tests {
             vec![resp]
         });
         let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let names = r.resolve_ptr(ip(5, 45, 202, 100)).expect("ptr names");
-        assert_eq!(names, vec!["dzen.ru".to_string()]);
+        let names = r.resolve_ptr(ip(203, 0, 113, 100)).expect("ptr names");
+        assert_eq!(names, vec!["feed.example".to_string()]);
     }
 
     #[test]
@@ -2178,7 +2193,7 @@ mod tests {
             vec![wrong_id, good]
         });
         let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let resolved = r.resolve_a("chatgpt.com").expect("resolved");
+        let resolved = r.resolve_a("assistant.example").expect("resolved");
         assert_eq!(resolved.addresses, vec![ip(9, 9, 9, 9)]);
     }
 
@@ -2192,7 +2207,7 @@ mod tests {
             sock.local_addr().expect("addr")
         };
         let r = DirectUdpUpstreamResolver::new(addr, Duration::from_millis(120), 2);
-        match r.resolve_a("chatgpt.com") {
+        match r.resolve_a("assistant.example") {
             Err(ResolveError::Unavailable(_)) => {}
             other => panic!("expected Unavailable, got {other:?}"),
         }

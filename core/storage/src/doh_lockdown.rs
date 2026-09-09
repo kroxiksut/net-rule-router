@@ -1,7 +1,7 @@
 //! DoH/DoT lockdown domain types + persistence.
 //!
 //! The lockdown blocks browser DNS-over-HTTPS/TLS so the DNS observer sees
-//! plaintext queries again (the dzen.ru blind-spot class). Two pieces of state:
+//! plaintext queries again (the plaintext-DNS blind-spot class). Two pieces of state:
 //!
 //! - a **per-SID** enable toggle + application scope (in `secondary_block_policy`,
 //!   alongside the other kill-switch fields) — each user decides whether to apply

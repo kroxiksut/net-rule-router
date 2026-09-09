@@ -238,7 +238,7 @@ mod tests {
         )
         .expect("local_network_rules");
         conn.execute(
-            "INSERT INTO refusing_anchors (sid, hostname, marked_at) VALUES (?1, 'chatgpt.com', 1)",
+            "INSERT INTO refusing_anchors (sid, hostname, marked_at) VALUES (?1, 'assistant.example', 1)",
             params![sid],
         )
         .expect("refusing_anchors");

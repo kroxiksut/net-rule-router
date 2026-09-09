@@ -337,6 +337,21 @@ impl EventBus {
         self.subscribers.lock().expect("subscribers poisoned").len()
     }
 
+    /// Is anyone able to receive `principal`'s own events right now?
+    ///
+    /// A subscription starts at the CURRENT head, so an event published
+    /// before the client connected is never delivered to it. A caller that
+    /// remembers what it has already announced therefore has to know
+    /// whether the announcement had an audience — otherwise "announced"
+    /// records a push into an empty room and the news is never repeated.
+    pub fn has_subscriber_for(&self, principal: &str) -> bool {
+        self.subscribers
+            .lock()
+            .expect("subscribers poisoned")
+            .values()
+            .any(|s| s.principal.as_deref() == Some(principal))
+    }
+
     pub fn buffer_len(&self) -> usize {
         self.buffer.lock().expect("event bus buffer poisoned").len()
     }

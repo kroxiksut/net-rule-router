@@ -180,13 +180,28 @@ impl ProductionPrincipalPlanSource {
         let policy = self.policy.load_for_sid(stored)?;
         let rules = self.rules.active_rules_for(stored)?;
 
+        // The shared-IP policy decides which addresses the tunnel may claim,
+        // and the plan has to be built behind the same decision the Windows
+        // codegen makes — otherwise this path pins addresses the policy
+        // declined.
+        let secondary_ip_denylist = crate::secondary_ip_policy::secondary_ip_denylist(
+            &rules.rule_book.secondary,
+            self.fqdn_cache.as_ref(),
+            policy.shared_ip_policy,
+        );
         let input = PlannerInput {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
             zone_priority_over_ip: policy.zone_priority_over_ip,
+            secondary_ip_denylist: &secondary_ip_denylist,
         };
-        let mut flows = plan_route_rules(&rules.rule_book, stored, rules.behavior_mode, &input);
+        // The report says what did NOT plan (a rule waiting on DNS, an app that
+        // is not installed). This path has no channel to a GUI yet, so it is
+        // named and left — the wire exists, and the day a Linux front-end asks,
+        // the answer is already being produced.
+        let (mut flows, _plan_report) =
+            plan_route_rules(&rules.rule_book, stored, rules.behavior_mode, &input);
         // An empty rule set is not the same as "nothing to enforce". In the
         // tunnel-default modes the protection is the blanket block and the
         // leak-guard, and neither is rule-driven: returning early here left a
@@ -221,6 +236,21 @@ impl ProductionPrincipalPlanSource {
         );
         let block_all_armed = !blanket.is_empty();
         flows.extend(blanket);
+
+        // The strict mode's default catch-all (planned with the rules, above)
+        // blocks everything no rule permitted — loopback, DHCP, the link's own
+        // control traffic and the tunnel's handshake included. The blanket
+        // posture brings its own floor; when it is not armed, nothing else
+        // does, and the block stands over an empty floor. Windows never showed
+        // it because the orchestrator carried a branch of its own.
+        if rules.behavior_mode == RouteBehaviorMode::StrictSecondaryFailClosed && !block_all_armed {
+            let exemptions = self.exemptions_for(&policy);
+            flows.extend(crate::enforcement_planner::plan_default_block_exemptions(
+                stored,
+                &exemptions.server_ips,
+                &exemptions.local_subnets,
+            ));
+        }
 
         // The leak-guard, armed only while the link it guards against is gone.
         // While the secondary is up, every secondary rule is already a pinned
@@ -948,6 +978,46 @@ mod tests {
 
         assert_eq!(coverage.fail_closed_blocks, 0);
         assert_eq!(blocks_on(&plan, SECONDARY_HOST), 0);
+    }
+
+    /// A blanket block with nothing underneath it takes the machine off its own
+    /// network: loopback, DHCP, the link's control traffic and the tunnel's
+    /// handshake are all "traffic no rule permitted". The strict mode's default
+    /// catch-all is planned with the rules, so its floor has to be planned too —
+    /// including on the path where the blanket posture never arms.
+    #[test]
+    fn the_strict_default_block_never_stands_without_its_floor() {
+        for with_server_route in [false, true] {
+            let (plan, _) = plan_on_machine(
+                OneSecondaryRule(RouteBehaviorMode::StrictSecondaryFailClosed),
+                Policy::armed(),
+                true,
+                with_server_route,
+            );
+
+            let has_default_block = plan.flows.iter().any(|f| {
+                f.verdict == Verdict::Block
+                    && f.precedence.class == PrecedenceClass::DefaultCatchAll
+            });
+            assert!(
+                has_default_block,
+                "strict mode is the mode that emits the default block"
+            );
+
+            let exempts_loopback = plan.flows.iter().any(|f| {
+                f.verdict == Verdict::Permit
+                    && f.precedence.class == PrecedenceClass::CatchAllExempt
+                    && matches!(
+                        f.flow.dst,
+                        DstMatch::SubnetV4 { net, prefix }
+                            if net == std::net::Ipv4Addr::new(127, 0, 0, 0) && prefix == 8
+                    )
+            });
+            assert!(
+                exempts_loopback,
+                "with_server_route={with_server_route}: the block stands over an empty floor"
+            );
+        }
     }
 
     /// Fail-OPEN is a decision the user made: a leak is preferable to an outage.

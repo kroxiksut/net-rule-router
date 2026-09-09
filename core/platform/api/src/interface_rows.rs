@@ -214,9 +214,20 @@ pub fn preferred_display_address(addresses: &[std::net::IpAddr]) -> Option<Strin
 ///    On a point-to-point tunnel every gateway-style route names the one
 ///    peer, so recovering it from any of them is sound.
 ///
+/// 4. `Some(0.0.0.0)` — **on-link forwarding**. A Wintun/WireGuard link has
+///    no peer address at all: its client covers the internet with a set of
+///    on-link prefixes (`0.0.0.0/5`, `8.0.0.0/7`, `16.0.0.0/4`, …,
+///    `224.0.0.0/3`, or a plain `0.0.0.0/0`), and the tunnel encapsulates
+///    whatever is handed to the interface. Routes installed through such a
+///    link carry an unspecified next-hop — that is how the client's own
+///    routes look, and how the OS expects an interface route to be spelled.
+///    Recognised when the on-link prefixes on the interface cover at least
+///    half the address space ([`ON_LINK_INTERNET_COVERAGE`]): a host-only
+///    `/24` never gets near that, a redirect set always does.
+///
 /// `None` means there is genuinely nowhere to forward to — an adapter whose
-/// routes are all on-link (the host-only virtual-adapter shape, and a freshly
-/// connected tunnel before its client has installed any gateway route).
+/// routes are all narrow on-link subnets (the host-only virtual-adapter shape,
+/// and a freshly connected tunnel before its client has installed any route).
 ///
 /// Single source of truth: both the routing layer (which installs overlays
 /// through this next-hop) and the interface enumeration (which reports
@@ -225,12 +236,17 @@ pub fn preferred_display_address(addresses: &[std::net::IpAddr]) -> Option<Strin
 /// route through.
 pub fn derive_forwarding_next_hop(routes: &[RouteEntry], ifindex: u32) -> Option<Ipv4Addr> {
     let mut best: Option<(u8, u32, u32)> = None;
+    let mut on_link_coverage: u64 = 0;
     for r in routes {
         if r.interface_index != ifindex {
             continue;
         }
         let nh = r.next_hop;
-        if nh.is_unspecified() || nh.is_loopback() {
+        if nh.is_loopback() {
+            continue;
+        }
+        if nh.is_unspecified() {
+            on_link_coverage += on_link_internet_coverage(r);
             continue;
         }
         // Rank by how "default" the route is (see the doc comment).
@@ -246,7 +262,25 @@ pub fn derive_forwarding_next_hop(routes: &[RouteEntry], ifindex: u32) -> Option
             _ => cand,
         });
     }
-    best.map(|(_, _, nh)| Ipv4Addr::from(nh))
+    best.map(|(_, _, nh)| Ipv4Addr::from(nh)).or_else(|| {
+        (on_link_coverage >= ON_LINK_INTERNET_COVERAGE).then_some(Ipv4Addr::UNSPECIFIED)
+    })
+}
+
+/// Half the IPv4 address space. A redirect set on a peerless tunnel covers
+/// well over this; the widest thing a host-only or NAT adapter ever carries is
+/// a `/8`, which is 1/256 of it.
+const ON_LINK_INTERNET_COVERAGE: u64 = 1 << 31;
+
+/// How many addresses an on-link route contributes towards "covers the
+/// internet". Host routes and the multicast/reserved top of the space count
+/// for nothing: a `/32` is the adapter's own address, and `224.0.0.0/3` is
+/// installed on every interface that carries multicast.
+fn on_link_internet_coverage(r: &RouteEntry) -> u64 {
+    if r.prefix_length >= 32 || r.destination.octets()[0] >= 224 {
+        return 0;
+    }
+    1u64 << (32 - u32::from(r.prefix_length))
 }
 
 /// Build the observed-facts block from local route metadata. Performs no
@@ -921,17 +955,67 @@ mod tests {
     }
 
     #[test]
-    fn a_loopback_or_unspecified_next_hop_never_counts_as_a_way_out() {
+    fn a_loopback_next_hop_or_a_narrow_on_link_route_never_counts_as_a_way_out() {
         let routes = vec![
             route([0, 0, 0, 0], 0, [127, 0, 0, 1], 5, 1),
-            route([0, 0, 0, 0], 1, [0, 0, 0, 0], 5, 1),
+            route([10, 0, 0, 0], 8, [0, 0, 0, 0], 5, 1),
         ];
         assert_eq!(derive_forwarding_next_hop(&routes, 5), None);
     }
 
     #[test]
+    fn a_peerless_tunnel_covering_the_internet_on_link_forwards_through_the_interface() {
+        // swiftvpn over WireGuard (Wintun), 10.88.0.191/32, ifindex 66: no
+        // gateway, no /0, no /1 halves — the client covers the internet with a
+        // redirect SET of on-link prefixes, and traffic flows fine (170 MiB in
+        // one session). The old rule saw "only on-link routes" and failed
+        // closed on a working tunnel.
+        let routes = vec![
+            route([0, 0, 0, 0], 5, [0, 0, 0, 0], 66, 0),
+            route([8, 0, 0, 0], 7, [0, 0, 0, 0], 66, 0),
+            route([11, 0, 0, 0], 8, [0, 0, 0, 0], 66, 0),
+            route([12, 0, 0, 0], 6, [0, 0, 0, 0], 66, 0),
+            route([16, 0, 0, 0], 4, [0, 0, 0, 0], 66, 0),
+            route([32, 0, 0, 0], 3, [0, 0, 0, 0], 66, 0),
+            route([64, 0, 0, 0], 2, [0, 0, 0, 0], 66, 0),
+            route([128, 0, 0, 0], 2, [0, 0, 0, 0], 66, 0),
+            route([192, 0, 0, 0], 9, [0, 0, 0, 0], 66, 0),
+            route([224, 0, 0, 0], 3, [0, 0, 0, 0], 66, 0), // multicast, ignored
+            route([10, 88, 0, 191], 32, [0, 0, 0, 0], 66, 256), // own address
+            route([0, 0, 0, 0], 0, [192, 168, 0, 1], 19, 10), // primary NIC
+        ];
+        assert_eq!(
+            derive_forwarding_next_hop(&routes, 66),
+            Some(Ipv4Addr::UNSPECIFIED)
+        );
+        // A plain on-link default (WireGuard with AllowedIPs = 0.0.0.0/0) is
+        // the same answer.
+        let plain = vec![route([0, 0, 0, 0], 0, [0, 0, 0, 0], 66, 0)];
+        assert_eq!(
+            derive_forwarding_next_hop(&plain, 66),
+            Some(Ipv4Addr::UNSPECIFIED)
+        );
+        // A split-tunnel WireGuard profile routing ONE corporate /16 is not a
+        // way out for the rest of the internet.
+        let split = vec![
+            route([10, 200, 0, 0], 16, [0, 0, 0, 0], 66, 0),
+            route([10, 88, 0, 191], 32, [0, 0, 0, 0], 66, 256),
+        ];
+        assert_eq!(derive_forwarding_next_hop(&split, 66), None);
+        // A real peer, when there is one, still wins over on-link coverage.
+        let mixed = vec![
+            route([0, 0, 0, 0], 0, [0, 0, 0, 0], 66, 0),
+            route([0, 0, 0, 0], 1, [10, 88, 0, 1], 66, 1),
+        ];
+        assert_eq!(
+            derive_forwarding_next_hop(&mixed, 66),
+            Some(Ipv4Addr::new(10, 88, 0, 1))
+        );
+    }
+
+    #[test]
     fn a_tunnel_with_only_on_link_routes_derives_nothing_yet() {
-        // hidemy.name OpenVPN, 10.88.1.41/24, ifindex 60: the
+        // swiftvpn OpenVPN, 10.88.1.41/24, ifindex 60: the
         // adapter is Up with IPv4 but the client has not yet installed any
         // gateway route — the table holds only on-link entries. There is
         // genuinely nothing to derive; the state resolves itself seconds
@@ -952,8 +1036,8 @@ mod tests {
         // last-resort rank recovers 10.88.0.1 from them.
         let routes = vec![
             route([10, 88, 1, 0], 24, [0, 0, 0, 0], 60, 256), // on-link, ignored
-            route([142, 250, 74, 78], 32, [10, 88, 0, 1], 60, 5),
-            route([13, 107, 42, 14], 32, [10, 88, 0, 1], 60, 5),
+            route([23, 10, 20, 78], 32, [10, 88, 0, 1], 60, 5),
+            route([23, 10, 20, 128], 32, [10, 88, 0, 1], 60, 5),
             route([0, 0, 0, 0], 0, [192, 168, 0, 1], 16, 25), // primary NIC
         ];
         assert_eq!(
@@ -967,8 +1051,8 @@ mod tests {
         // A live split-default names the CURRENT peer; stale host routes from
         // a previous session must never outvote it, whatever their metric.
         let routes = vec![
-            route([142, 250, 74, 78], 32, [10, 88, 0, 1], 60, 1), // stale peer
-            route([0, 0, 0, 0], 1, [10, 89, 0, 1], 60, 30),       // current peer
+            route([23, 10, 20, 78], 32, [10, 88, 0, 1], 60, 1), // stale peer
+            route([0, 0, 0, 0], 1, [10, 89, 0, 1], 60, 30),     // current peer
             route([128, 0, 0, 0], 1, [10, 89, 0, 1], 60, 30),
         ];
         assert_eq!(

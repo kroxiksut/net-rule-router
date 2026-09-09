@@ -372,10 +372,10 @@ mod tests {
         // The whole point: session one learned the address the hard way, session
         // two must have its route in place before the app connects at all.
         let table = Arc::new(FakeTable::default());
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
 
         let first = Arc::new(AppObservationStore::new());
-        first.record(r"C:\Users\u\AppData\Telegram\Telegram.exe", ip(7));
+        first.record(r"C:\Users\u\AppData\Messenger\Messenger.exe", ip(7));
         let mem = memory(&first, rules.clone(), &table);
         assert_eq!(
             mem.flush(SystemTime::now()),
@@ -400,7 +400,7 @@ mod tests {
         // The pre-seed is additive: a service that never warm-loads (no state
         // DB, or a first-ever start) produces exactly the pre-existing output —
         // no routes and the "not observed yet" diagnostic.
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
         let store = AppObservationStore::new();
         let out = generate_secondary_routes(
             &rules.secondary,
@@ -417,7 +417,7 @@ mod tests {
             vec![
                 crate::route_codegen::RouteCodegenDiagnostic::AppRuleUnobserved {
                     rule_id: "r1".to_string(),
-                    app: "telegram.exe".to_string(),
+                    app: "messenger.exe".to_string(),
                 }
             ]
         );
@@ -428,7 +428,7 @@ mod tests {
         // The codegen iterates RULES, so a pre-seeded destination for a process
         // nobody routed produces no route — the memory cannot widen enforcement.
         let table = Arc::new(FakeTable::default());
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
         FakeTable::persist_fn(&table)("chrome.exe", &[ip(9)], SystemTime::now());
 
         let store = Arc::new(AppObservationStore::new());
@@ -445,7 +445,7 @@ mod tests {
     fn flush_writes_back_only_route_rule_apps_of_the_additional_link() {
         let table = Arc::new(FakeTable::default());
         let store = Arc::new(AppObservationStore::new());
-        for app in ["telegram.exe", "chrome.exe", "blocked.exe", "paired.exe"] {
+        for app in ["messenger.exe", "chrome.exe", "blocked.exe", "paired.exe"] {
             store.record(app, ip(5));
         }
         let mut blocked = app_rule("r-block", "blocked.exe");
@@ -459,7 +459,7 @@ mod tests {
         paired.address_match = Some(CanonicalAddressMatch::ExactIp(ip(200)));
 
         let mut rules = book(vec![
-            app_rule("r1", "telegram.exe"),
+            app_rule("r1", "messenger.exe"),
             blocked,
             disabled,
             paired,
@@ -481,20 +481,20 @@ mod tests {
         // withdrawal looks the row up by.
         assert_eq!(
             table.rows.lock().unwrap_or_else(|p| p.into_inner())[0].0,
-            "telegram"
+            "messenger"
         );
     }
 
     #[test]
     fn a_destination_outside_the_confirmation_window_is_not_re_seeded() {
         let table = Arc::new(FakeTable::default());
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
         let now = SystemTime::now();
         let stale = now
             .checked_sub(ENFORCEMENT_CONFIRMATION_WINDOW + Duration::from_secs(60))
             .expect("clock past the epoch");
-        FakeTable::persist_fn(&table)("telegram.exe", &[ip(1)], stale);
-        FakeTable::persist_fn(&table)("telegram.exe", &[ip(2)], now);
+        FakeTable::persist_fn(&table)("messenger.exe", &[ip(1)], stale);
+        FakeTable::persist_fn(&table)("messenger.exe", &[ip(2)], now);
 
         let store = Arc::new(AppObservationStore::new());
         let mem = memory(&store, rules.clone(), &table);
@@ -512,9 +512,9 @@ mod tests {
         // long-running app keeps touching its destinations, and each sighting
         // is what carries the address forward through the freshness window.
         let table = Arc::new(FakeTable::default());
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
         let store = Arc::new(AppObservationStore::new());
-        store.record("telegram.exe", ip(1));
+        store.record("messenger.exe", ip(1));
         let mem = memory(&store, rules.clone(), &table);
 
         let long_ago = SystemTime::now()
@@ -523,7 +523,7 @@ mod tests {
         mem.flush(long_ago);
         let now = SystemTime::now();
         assert_eq!(mem.warm_load(now), 0, "the stale stamp is withheld");
-        store.record("telegram.exe", ip(1));
+        store.record("messenger.exe", ip(1));
         mem.flush(now);
 
         let next_session = Arc::new(AppObservationStore::new());
@@ -538,9 +538,9 @@ mod tests {
         // last used hours ago. Stamping those with `now` on every pass kept the
         // confirmation window from ever expiring, so nothing was ever pruned.
         let table = Arc::new(FakeTable::default());
-        let rules = book(vec![app_rule("r1", "telegram.exe")]);
+        let rules = book(vec![app_rule("r1", "messenger.exe")]);
         let store = Arc::new(AppObservationStore::new());
-        store.record("telegram.exe", ip(1));
+        store.record("messenger.exe", ip(1));
         let mem = memory(&store, rules.clone(), &table);
 
         let long_ago = SystemTime::now()
@@ -569,7 +569,7 @@ mod tests {
     fn flush_without_an_active_sid_or_app_rules_does_nothing() {
         let table = Arc::new(FakeTable::default());
         let store = Arc::new(AppObservationStore::new());
-        store.record("telegram.exe", ip(1));
+        store.record("messenger.exe", ip(1));
 
         // No routed app rule at all — one snapshot read, no writes.
         let mem = memory(&store, book(vec![]), &table);
@@ -579,7 +579,7 @@ mod tests {
         let mem = AppDestinationMemory::new(
             Arc::clone(&store),
             Arc::new(FixedRules {
-                book: book(vec![app_rule("r1", "telegram.exe")]),
+                book: book(vec![app_rule("r1", "messenger.exe")]),
             }) as Arc<dyn RulesProvider>,
             Arc::new(Vec::new),
             FakeTable::persist_fn(&table),

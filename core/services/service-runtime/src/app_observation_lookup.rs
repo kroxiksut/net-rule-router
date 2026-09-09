@@ -640,14 +640,14 @@ mod tests {
         // A route serves both the same way, so this is not collateral.
         let store = AppObservationStore::new();
         store.note_process_destination("assistant.exe", addr(10));
-        store.note_process_destination("claude.exe", addr(10));
+        store.note_process_destination("helper.exe", addr(10));
         assert!(
-            !store.destination_used_outside(&friendly(&["assistant.exe", "claude.exe"]), addr(10))
+            !store.destination_used_outside(&friendly(&["assistant.exe", "helper.exe"]), addr(10))
         );
         // …but a third, unnamed one does make it shared.
         store.note_process_destination("chrome.exe", addr(10));
         assert!(
-            store.destination_used_outside(&friendly(&["assistant.exe", "claude.exe"]), addr(10))
+            store.destination_used_outside(&friendly(&["assistant.exe", "helper.exe"]), addr(10))
         );
     }
 
