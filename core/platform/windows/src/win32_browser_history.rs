@@ -694,12 +694,17 @@ fn final_path_is_under(root: &str, file: &str) -> bool {
     }
 }
 
+/// Windows-only, like the handle walk that consumes them: on another OS the
+/// crate still compiles for CI and these would be dead code.
+#[cfg(target_os = "windows")]
 const SYSTEM_SID: &str = "S-1-5-18";
+#[cfg(target_os = "windows")]
 const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 
 /// An administrator's profile and files are owned by the Administrators
 /// group rather than the user, so an exact-SID match would refuse them; any
 /// other ordinary account as owner means the object is not the caller's.
+#[cfg(target_os = "windows")]
 fn owner_is_acceptable(owner: &str, principal: &str) -> bool {
     owner.eq_ignore_ascii_case(principal) || owner == SYSTEM_SID || owner == ADMINISTRATORS_SID
 }
@@ -1037,6 +1042,7 @@ user_pref("network.dns.disableIPv6", true);
         assert!(!final_path_is_under("/home/ann", "/home/annex/History"));
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn only_the_caller_or_a_machine_principal_may_own_the_source() {
         let me = "S-1-5-21-1-2-3-1001";

@@ -133,6 +133,11 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Whether `sha256` is one of the vendored builds this product ships.
+///
+/// Windows-only: its one caller is the pinned-build gate in front of
+/// `LoadLibraryW`. Elsewhere the crate still compiles (CI checks it on Linux),
+/// and an ungated helper there is dead code.
+#[cfg(target_os = "windows")]
 fn is_pinned_wintun(sha256: &str) -> bool {
     WINTUN_COMPONENT
         .known_sha256
@@ -692,6 +697,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
     fn only_the_pinned_builds_pass_the_gate() {
         for pinned in WINTUN_COMPONENT.known_sha256 {
