@@ -742,6 +742,7 @@ mod tests {
             interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
             oper_status: status,
             ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
             gateways: Vec::new(),
         }
     }
@@ -959,6 +960,48 @@ mod tests {
         assert!(lowered.ruleset.rules[0]
             .matches
             .contains(&NftMatch::SkUid(uid)));
+    }
+
+    /// The block-all's IPv6 half is an explicit `::/0` drop. On Linux it must
+    /// stay an `ip6` match: a family-less drop would also swallow the IPv4
+    /// traffic the v4 half exempts.
+    #[test]
+    fn the_ipv6_half_of_a_block_all_lowers_to_an_ip6_match() {
+        let uid = 1000;
+        let plan = EnforcementPlan {
+            principal: UserPrincipal::from_linux_uid(uid),
+            flows: vec![FlowRule {
+                verdict: Verdict::Block,
+                precedence: Precedence {
+                    class: PrecedenceClass::CatchAllBlock,
+                    ordinal: 0,
+                },
+                flow: FlowMatch {
+                    dst: DstMatch::SubnetV6 {
+                        net: std::net::Ipv6Addr::UNSPECIFIED,
+                        prefix: 0,
+                    },
+                    dst_port: None,
+                    protocol: None,
+                },
+                principal: PrincipalScope(Some(UserPrincipal::from_linux_uid(uid))),
+                app: AppScope::Any,
+                egress: EgressConstraint::Any,
+                coverage: Coverage::ConnectOnly,
+            }],
+            routes: Vec::new(),
+            policy_rules: Vec::new(),
+        };
+
+        let lowered = lower_plan(&plan, &EgressNames::default());
+
+        assert_eq!(lowered.ruleset.rules.len(), 1);
+        let rule = &lowered.ruleset.rules[0];
+        assert!(rule.matches.contains(&NftMatch::DstV6 {
+            net: std::net::Ipv6Addr::UNSPECIFIED,
+            prefix: 0,
+        }));
+        assert_eq!(rule.verdict, NftVerdict::Drop);
     }
 
     /// The pruning is per user, and it has to be: one user's blanket drop says

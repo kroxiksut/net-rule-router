@@ -25,12 +25,13 @@
 //!   before" alone cannot mean navigation: on a machine averaging one
 //!   connection per second almost every timer tick would qualify.
 //!
-//! ## What this deliberately does NOT do
+//! ## What it decides
 //!
-//! It changes nothing. No offer is withheld, no verdict is altered, no counter
-//! the user sees moves. It counts and it says what it counted, so the
-//! thresholds below can be chosen from a distribution instead of from
-//! intuition. Acting on the measurement is a separate decision.
+//! One thing: a host that fails on the main link is not offered for the
+//! tunnel when every measured sighting of it was a companion — nobody went
+//! there. A process that never goes quiet cannot be measured, so its
+//! connections are counted apart and never read as "pulled in". The rest is
+//! counted so the thresholds can be chosen from a distribution.
 //!
 //! ## Bounds
 //!
@@ -82,6 +83,10 @@ pub struct HostCounts {
     pub companions: u32,
     /// Quiet before and after: nothing followed it.
     pub solo: u32,
+    /// Arrived close behind its process's previous connection, from a process
+    /// never seen starting a burst. The measure is blind there, so this says
+    /// nothing either way.
+    pub unmeasured: u32,
 }
 
 impl HostCounts {
@@ -90,6 +95,14 @@ impl HostCounts {
         self.navigations
             .saturating_add(self.companions)
             .saturating_add(self.solo)
+            .saturating_add(self.unmeasured)
+    }
+
+    /// Every measured sighting arrived inside somebody else's burst: nothing
+    /// says anyone set out for this host.
+    #[must_use]
+    pub fn only_pulled_in(&self) -> bool {
+        self.companions > 0 && self.navigations == 0 && self.solo == 0
     }
 }
 
@@ -389,7 +402,16 @@ impl NavigationRegistry {
             });
             return None;
         }
-        hostname.map(|host| (host.to_string(), Outcome::Companion))
+        // Close behind the previous connection with no burst open. A companion
+        // only if this process has ever gone quiet and navigated: one that never
+        // does lands every connection here, and "pulled in" would then describe
+        // the process, not the host.
+        let outcome = if entry.navigations > 0 {
+            Outcome::Companion
+        } else {
+            Outcome::Unmeasured
+        };
+        hostname.map(|host| (host.to_string(), outcome))
     }
 
     fn settle(&self, candidate: &Candidate, navigations: &mut u32) -> Outcome {
@@ -413,6 +435,7 @@ impl NavigationRegistry {
             Outcome::Navigation => counts.navigations = counts.navigations.saturating_add(1),
             Outcome::Companion => counts.companions = counts.companions.saturating_add(1),
             Outcome::Solo => counts.solo = counts.solo.saturating_add(1),
+            Outcome::Unmeasured => counts.unmeasured = counts.unmeasured.saturating_add(1),
         }
         while hosts.len() > self.host_cap {
             let Some(oldest) = hosts
@@ -484,6 +507,7 @@ enum Outcome {
     Navigation,
     Companion,
     Solo,
+    Unmeasured,
 }
 
 /// Say how a host was reached, beside the verdict that it does not open.
@@ -498,6 +522,7 @@ pub fn log_counts(hostname: &str, counts: &HostCounts) {
         navigations = counts.navigations,
         companions = counts.companions,
         solo = counts.solo,
+        unmeasured = counts.unmeasured,
         "how this destination was reached before it stopped answering",
     );
 }
@@ -573,7 +598,8 @@ mod tests {
             HostCounts {
                 navigations: 1,
                 companions: 0,
-                solo: 0
+                solo: 0,
+                unmeasured: 0
             },
             "quiet before it and a burst after it is what opening a page looks like"
         );
@@ -584,7 +610,8 @@ mod tests {
             HostCounts {
                 navigations: 0,
                 companions: 1,
-                solo: 0
+                solo: 0,
+                unmeasured: 0
             },
             "a name the page pulled in arrived inside somebody else's burst"
         );
@@ -604,7 +631,8 @@ mod tests {
             HostCounts {
                 navigations: 0,
                 companions: 0,
-                solo: 1
+                solo: 1,
+                unmeasured: 0
             },
             "nothing followed it, so nobody opened anything"
         );
@@ -648,6 +676,39 @@ mod tests {
             reg.process_ever_navigated(PROC),
             "a real page load is what makes the answer true"
         );
+    }
+
+    /// The measure is blind to a process that never goes quiet, so its
+    /// connections are counted apart and never read as "pulled in" — that
+    /// would withhold the offer for every site such a process opens.
+    #[test]
+    fn a_process_that_never_goes_quiet_leaves_its_hosts_unmeasured() {
+        let reg = registry();
+        for i in 0..10_u64 {
+            reg.note_attempt(Some(PROC), Some("noisy.example"), 10_000 + i * 100);
+        }
+        let counts = reg.counts_of("noisy.example");
+        assert_eq!(counts.companions, 0);
+        assert_eq!(
+            counts.unmeasured, 9,
+            "the first sighting only primes the process"
+        );
+        assert!(!counts.only_pulled_in());
+    }
+
+    /// Positive control for the rule above: behind a page the process opened, a
+    /// name that arrives in its burst IS pulled in.
+    #[test]
+    fn a_name_a_page_pulled_in_is_only_pulled_in() {
+        let reg = registry();
+        page_load(
+            &reg,
+            10_000,
+            "site.example",
+            &["ads.tracker.example", "b.example", "c.example"],
+        );
+        assert!(reg.counts_of("ads.tracker.example").only_pulled_in());
+        assert!(!reg.counts_of("site.example").only_pulled_in());
     }
 
     #[test]

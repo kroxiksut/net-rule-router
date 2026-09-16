@@ -23,9 +23,10 @@ The archive is an ordinary `.zip` you can open and read yourself. Every export a
 | `manifest.json` | Archive format version, application version, build provenance (the exact build commit, build profile, and target the binary was compiled from), creation time, the applied privacy mode, and the list of sections included in this specific archive. |
 | `system_info.json` | Basic facts about the computer the archive was built on: operating system and version, CPU architecture and model, number of logical CPU cores, total physical RAM, and the NetRuleRouter version. No user, account, or network-identifying data — hardware/OS facts only. |
 | `health.json` | A snapshot of service, storage, cache, and log health — states and counters. It does not contain your rules. |
-| `logs.ndjson` | Recent operational log lines, one JSON object per line, newest first, capped at 5 MiB before compression. Each line is a structured event (timestamp, level, category, a translated message key, and a decision/revision correlation id) — not free-text, so it does not carry raw hostnames or IP addresses. See the privacy note below. |
+| `logs.ndjson` | A compact listing of recent operational log lines, included only when the service's own log files (`service-logs/` below) are not — otherwise it would repeat the same lines. One JSON object per line, newest first, capped at 5 MiB before compression. Each line is a structured event (timestamp, level, category, a translated message key, and a decision/revision correlation id) — not free-text, so it does not carry raw hostnames or IP addresses. See the privacy note below. |
 | `audit_summary.json` | Recent security-audit entries (at most 100). These are **summaries only**: event kind, timestamp, result, and reason code — never the raw event payload. |
-| `service-logs/` | The service's own log files as it wrote them, one file per rotation, named as on disk. `logs.ndjson` above is a compact listing for reading; these are the full lines behind it, covering whichever window the export was asked for. Newest files first: if the whole history will not fit, the oldest files are left out rather than the export failing. |
+| `service-logs/` | The service's own log files as it wrote them, one file per rotation, named as on disk. They cover whichever window the export was asked for and replace the compact `logs.ndjson` listing. Newest files first: if the whole history will not fit, the oldest files are left out rather than the export failing. |
+| `nrr-broker.log`, `nrr-broker.prev.log` | Present only if the app has asked for administrator approval: the short log of the elevated helper that carries out approved actions (when it started, which service action it ran and whether that succeeded, when it exited), for the latest and the previous approval session. |
 | `troubleshooting.md` | A generated troubleshooting guide (common symptoms and remediation steps). This is static text, not your data. |
 
 Today's export additionally includes, by default:
@@ -58,7 +59,7 @@ Next to the export button there is a checkbox, **on by default**, that limits ho
 
 In practice that means: restarting the app or the service in the middle of a test does **not** cut the earlier part of that test out of the archive, but this morning's unrelated session (or yesterday's) stays out. Uncheck the box to export the full log history instead.
 
-This window applies both to the merged `logs.ndjson` and to the service's own log files in `service-logs/`.
+This window applies to the service's own log files in `service-logs/`, and to `logs.ndjson` when that is shipped instead.
 
 ## What is never included
 

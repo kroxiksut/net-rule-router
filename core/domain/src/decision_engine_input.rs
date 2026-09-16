@@ -29,8 +29,7 @@ use crate::decision_pipeline::{ProcessContext, RuntimeInput};
 /// Normalization rules:
 /// - **hostname**: lowercase, trailing-dot removal, IDNA2008 (Unicode → ASCII).
 /// - **IP**: IPv4 passes through; IPv4-mapped IPv6 (`::ffff:a.b.c.d`) is
-///   converted to IPv4 with a warning; native IPv6 becomes
-///   [`NormalizedIp::UnsupportedNativeIpv6`] and blocks `ExactIp` matching.
+///   converted to IPv4 with a warning; native IPv6 passes through.
 /// - **process identity**: lowercase, path stripped to basename, `.exe`
 ///   suffix ensured.
 ///
@@ -55,7 +54,7 @@ pub fn normalize_runtime_input(input: &RuntimeInput) -> NormalizedDecisionInput 
     let (app_identity, app_signals) = normalize_app_identity_value(&input.process_context);
     availability_signals.extend(app_signals);
 
-    let match_class_availability = derive_match_class_availability(&hostname, &ip, &app_identity);
+    let match_class_availability = derive_match_class_availability(&hostname, &app_identity);
 
     NormalizedDecisionInput {
         hostname,
@@ -150,22 +149,19 @@ fn normalize_hostname_value(raw: Option<&str>) -> (NormalizedHostname, Vec<Norma
 }
 
 fn normalize_ip_value(raw: Option<IpAddr>) -> (NormalizedIp, Vec<NormalizationWarning>) {
-    match raw {
-        None => (NormalizedIp::Unavailable, vec![]),
-        Some(IpAddr::V4(v4)) => (NormalizedIp::ValidIpv4(v4), vec![]),
-        Some(IpAddr::V6(v6)) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                (
-                    NormalizedIp::ValidIpv4(v4),
-                    vec![NormalizationWarning::Ipv4MappedIpv6NormalizedToIpv4 {
-                        original: v6,
-                        normalized: v4,
-                    }],
-                )
-            } else {
-                (NormalizedIp::UnsupportedNativeIpv6 { addr: v6 }, vec![])
-            }
-        }
+    let Some(raw) = raw else {
+        return (NormalizedIp::Unavailable, vec![]);
+    };
+    match (raw, crate::address_class::canonical_ip(raw)) {
+        (IpAddr::V6(original), IpAddr::V4(normalized)) => (
+            NormalizedIp::ValidIpv4(normalized),
+            vec![NormalizationWarning::Ipv4MappedIpv6NormalizedToIpv4 {
+                original,
+                normalized,
+            }],
+        ),
+        (_, IpAddr::V4(v4)) => (NormalizedIp::ValidIpv4(v4), vec![]),
+        (_, IpAddr::V6(v6)) => (NormalizedIp::ValidIpv6(v6), vec![]),
     }
 }
 
@@ -254,19 +250,12 @@ fn normalize_app_identity_value(
 
 fn derive_match_class_availability(
     hostname: &NormalizedHostname,
-    ip: &NormalizedIp,
     app_identity: &Option<NormalizedAppIdentity>,
 ) -> MatchClassAvailability {
     let hostname_block = match hostname {
         NormalizedHostname::Valid(_) => None,
         NormalizedHostname::Unavailable => Some(NormalizationError::DomainEmpty),
         NormalizedHostname::Invalid { error, .. } => Some(error.clone()),
-    };
-    let ip_block = match ip {
-        NormalizedIp::ValidIpv4(_) | NormalizedIp::Unavailable => None,
-        NormalizedIp::UnsupportedNativeIpv6 { addr } => {
-            Some(NormalizationError::IpNativeIpv6Unsupported { addr: *addr })
-        }
     };
     let app_block = if app_identity.is_none() {
         Some(NormalizationError::ApplicationNameEmpty)
@@ -277,7 +266,8 @@ fn derive_match_class_availability(
         exact_fqdn: hostname_block.clone(),
         suffix_domain: hostname_block.clone(),
         zone: hostname_block,
-        exact_ip: ip_block,
+        // Every address a destination can carry is matchable.
+        exact_ip: None,
         application: app_block,
     }
 }
@@ -356,7 +346,6 @@ pub fn match_sample(
     let lookup = LookupResult {
         selected_ip: None,
         is_multi_ip: false,
-        has_conflict: false,
         explain_data: LookupExplainData {
             standard: LookupStandardSignals {
                 cache_hit: false,
@@ -366,7 +355,6 @@ pub fn match_sample(
             },
             extended: LookupExtendedMetadata {
                 all_resolved_ips: Vec::new(),
-                reverse_hostnames: Vec::new(),
                 selected_entry_ttl_secs: None,
                 selected_entry_resolved_at: None,
             },
@@ -456,13 +444,34 @@ mod match_sample_tests {
         let book = book_primary(vec![rule(
             "R-0001",
             true,
-            CanonicalAddressMatch::ExactIp(Ipv4Addr::new(203, 0, 113, 7)),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
         )]);
         let ip = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
         let d = match_sample(
             &book,
             None,
             ip,
+            None,
+            ZonePriorityPolicy::default(),
+            crate::RouteBehaviorMode::PreferPrimary,
+        );
+        assert_eq!(matched_class(&d), Some(MatchClass::ExactIp));
+    }
+
+    #[test]
+    fn an_ipv6_exact_ip_rule_matches_the_observed_ipv6() {
+        let v6: IpAddr = "2001:db8::7"
+            .parse()
+            .unwrap_or_else(|e| panic!("fixture: {e}"));
+        let book = book_primary(vec![rule(
+            "R-0001",
+            true,
+            CanonicalAddressMatch::ExactIp(v6),
+        )]);
+        let d = match_sample(
+            &book,
+            None,
+            Some(v6),
             None,
             ZonePriorityPolicy::default(),
             crate::RouteBehaviorMode::PreferPrimary,
@@ -522,7 +531,6 @@ pub mod test_support {
         LookupResult {
             selected_ip: None,
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: LookupExplainData {
                 standard: LookupStandardSignals {
                     cache_hit: false,
@@ -532,7 +540,6 @@ pub mod test_support {
                 },
                 extended: LookupExtendedMetadata {
                     all_resolved_ips: vec![],
-                    reverse_hostnames: vec![],
                     selected_entry_ttl_secs: None,
                     selected_entry_resolved_at: None,
                 },
@@ -766,12 +773,12 @@ mod tests {
     }
 
     #[test]
-    fn ip_native_ipv6_becomes_unsupported() {
+    fn ip_native_ipv6_passes_through() {
         let v6: Ipv6Addr = "2001:db8::1"
             .parse()
             .unwrap_or_else(|e| panic!("fixture addr: {e}"));
         let (ip, w) = normalize_ip_value(Some(IpAddr::V6(v6)));
-        assert!(matches!(ip, NormalizedIp::UnsupportedNativeIpv6 { .. }));
+        assert_eq!(ip, NormalizedIp::ValidIpv6(v6));
         assert!(w.is_empty());
     }
 
@@ -875,16 +882,15 @@ mod tests {
     }
 
     #[test]
-    fn native_ipv6_blocks_only_exact_ip() {
+    fn native_ipv6_leaves_every_class_open() {
         let v6: Ipv6Addr = "2001:db8::1"
             .parse()
             .unwrap_or_else(|e| panic!("fixture: {e}"));
         let input = make_runtime_input(Some("ipv6host.example.com"), Some(IpAddr::V6(v6)), None);
         let n = normalize_runtime_input(&input);
-        assert!(n.match_class_availability.exact_ip.is_some());
+        assert_eq!(n.ip, NormalizedIp::ValidIpv6(v6));
+        assert!(n.match_class_availability.exact_ip.is_none());
         assert!(n.match_class_availability.exact_fqdn.is_none());
-        assert!(n.match_class_availability.suffix_domain.is_none());
-        assert!(n.match_class_availability.zone.is_none());
     }
 
     #[test]

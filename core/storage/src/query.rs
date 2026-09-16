@@ -54,44 +54,20 @@ pub fn classify_observed_ip(raw: &str) -> ObservedIpClassification {
 // ── AmbiguityKind ─────────────────────────────────────────────────────────────
 
 /// Ambiguity classification of a completed cache lookup.
-///
-/// Computed by [`classify_ambiguity`] from the boolean fields in
-/// [`CacheLookupResult`].  Lets callers avoid interpreting `is_multi_ip` and
-/// `has_conflict` independently.
-///
-/// ## Decision model
-///
-/// The rule engine never relies on reverse lookup as the *sole* routing basis.
-/// [`MultipleReverseHostnames`][AmbiguityKind::MultipleReverseHostnames] is a
-/// diagnostic signal — it does not block routing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AmbiguityKind {
-    /// No ambiguity: at most one IP, consistent with the observed IP (if any).
+    /// At most one IP.
     None,
     /// The hostname resolves to two or more IPs (`is_multi_ip = true`).
     MultipleIps,
-    /// The observed IP is absent from the cached hostname IP set
-    /// (`has_conflict = true`, `is_multi_ip = false`).
-    IpMismatch,
-    /// Both `is_multi_ip` and `has_conflict` hold simultaneously.
-    MultipleIpsAndMismatch,
-    /// The observed IP maps to more than one hostname in the reverse cache
-    /// (diagnostic only; single IP, no forward mismatch).
-    MultipleReverseHostnames,
 }
 
 /// Classifies the ambiguity kind from a cache lookup result.
 pub fn classify_ambiguity(result: &CacheLookupResult) -> AmbiguityKind {
-    match (
-        result.is_multi_ip,
-        result.has_conflict,
-        result.reverse_hostnames.len() > 1,
-    ) {
-        (true, true, _) => AmbiguityKind::MultipleIpsAndMismatch,
-        (true, false, _) => AmbiguityKind::MultipleIps,
-        (false, true, _) => AmbiguityKind::IpMismatch,
-        (false, false, true) => AmbiguityKind::MultipleReverseHostnames,
-        (false, false, false) => AmbiguityKind::None,
+    if result.is_multi_ip {
+        AmbiguityKind::MultipleIps
+    } else {
+        AmbiguityKind::None
     }
 }
 
@@ -153,9 +129,6 @@ pub fn derive_event_state(result: &CacheLookupResult) -> LookupResultState {
     if !result.errors.is_empty() {
         return LookupResultState::Error;
     }
-    if result.has_conflict {
-        return LookupResultState::Conflicting;
-    }
     match &result.overall_freshness {
         None | Some(CacheEntryState::Missing) | Some(CacheEntryState::StaleNotUsable) => {
             LookupResultState::Miss
@@ -176,8 +149,6 @@ mod tests {
     use std::time::SystemTime;
 
     use nrr_domain::decision_lookup::{CacheEntryState, LookupError};
-
-    use crate::dto::CachedHostnameEntry;
 
     // ── classify_observed_ip ─────────────────────────────────────────────────
 
@@ -242,32 +213,21 @@ mod tests {
 
     // ── classify_ambiguity ───────────────────────────────────────────────────
 
-    fn minimal_result(
-        is_multi_ip: bool,
-        has_conflict: bool,
-        reverse_count: usize,
-    ) -> CacheLookupResult {
+    fn minimal_result(is_multi_ip: bool) -> CacheLookupResult {
         CacheLookupResult {
             resolved_ips: Vec::new(),
-            reverse_hostnames: (0..reverse_count)
-                .map(|i| CachedHostnameEntry {
-                    hostname: format!("host{i}.example"),
-                    cache_state: CacheEntryState::Fresh,
-                })
-                .collect(),
             overall_freshness: None,
             best_source: None,
             is_multi_ip,
-            has_conflict,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
     }
 
     #[test]
-    fn ambiguity_none_when_single_ip_no_conflict() {
+    fn ambiguity_none_when_single_ip() {
         assert_eq!(
-            classify_ambiguity(&minimal_result(false, false, 0)),
+            classify_ambiguity(&minimal_result(false)),
             AmbiguityKind::None
         );
     }
@@ -275,49 +235,8 @@ mod tests {
     #[test]
     fn ambiguity_multiple_ips() {
         assert_eq!(
-            classify_ambiguity(&minimal_result(true, false, 0)),
+            classify_ambiguity(&minimal_result(true)),
             AmbiguityKind::MultipleIps
-        );
-    }
-
-    #[test]
-    fn ambiguity_ip_mismatch() {
-        assert_eq!(
-            classify_ambiguity(&minimal_result(false, true, 0)),
-            AmbiguityKind::IpMismatch
-        );
-    }
-
-    #[test]
-    fn ambiguity_multiple_ips_and_mismatch() {
-        assert_eq!(
-            classify_ambiguity(&minimal_result(true, true, 0)),
-            AmbiguityKind::MultipleIpsAndMismatch
-        );
-    }
-
-    #[test]
-    fn ambiguity_multiple_reverse_hostnames() {
-        assert_eq!(
-            classify_ambiguity(&minimal_result(false, false, 2)),
-            AmbiguityKind::MultipleReverseHostnames
-        );
-    }
-
-    #[test]
-    fn ambiguity_multiple_ips_dominates_multiple_reverse() {
-        // MultipleIps takes priority over MultipleReverseHostnames.
-        assert_eq!(
-            classify_ambiguity(&minimal_result(true, false, 3)),
-            AmbiguityKind::MultipleIps
-        );
-    }
-
-    #[test]
-    fn ambiguity_none_with_single_reverse() {
-        assert_eq!(
-            classify_ambiguity(&minimal_result(false, false, 1)),
-            AmbiguityKind::None
         );
     }
 
@@ -326,11 +245,9 @@ mod tests {
     fn result_with_freshness(freshness: Option<CacheEntryState>) -> CacheLookupResult {
         CacheLookupResult {
             resolved_ips: Vec::new(),
-            reverse_hostnames: Vec::new(),
             overall_freshness: freshness,
             best_source: None,
             is_multi_ip: false,
-            has_conflict: false,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
@@ -443,13 +360,6 @@ mod tests {
     }
 
     #[test]
-    fn event_state_conflicting_from_has_conflict_flag() {
-        let mut r = result_with_freshness(Some(CacheEntryState::Fresh));
-        r.has_conflict = true;
-        assert_eq!(derive_event_state(&r), LookupResultState::Conflicting);
-    }
-
-    #[test]
     fn event_state_conflicting_from_freshness_state() {
         assert_eq!(
             derive_event_state(&result_with_freshness(Some(CacheEntryState::Conflicting))),
@@ -460,16 +370,8 @@ mod tests {
     #[test]
     fn event_state_error_takes_priority_over_everything() {
         let mut r = result_with_freshness(Some(CacheEntryState::Fresh));
-        r.has_conflict = true;
         r.errors.push(LookupError::CacheUnavailable);
         assert_eq!(derive_event_state(&r), LookupResultState::Error);
-    }
-
-    #[test]
-    fn event_state_conflict_takes_priority_over_freshness() {
-        let mut r = result_with_freshness(Some(CacheEntryState::StaleNotUsable));
-        r.has_conflict = true;
-        assert_eq!(derive_event_state(&r), LookupResultState::Conflicting);
     }
 
     // ── IPv6 negative cache pathway ──────────────────────────────────────────
@@ -657,56 +559,5 @@ mod tests {
             RefreshHint::ImmediateRequired
         );
         assert_eq!(derive_event_state(&result), LookupResultState::Miss);
-    }
-
-    #[test]
-    fn reverse_lookup_absent_returns_empty() {
-        use crate::repository::CacheRepository;
-        use nrr_domain::decision_lookup::FreshnessThresholds;
-
-        let dir = tempfile::tempdir().expect("tmp");
-        let store = migrated_cache_store_with_raw(&dir, |_conn| {});
-
-        let ip = Ipv4Addr::new(1, 2, 3, 4);
-        let result = store
-            .get_by_ip(ip, &FreshnessThresholds::default_production())
-            .expect("get_by_ip");
-
-        assert!(
-            result.reverse_hostnames.is_empty(),
-            "IP not in cache → reverse lookup must return empty"
-        );
-        assert!(result.overall_freshness.is_none());
-        assert_eq!(
-            compute_refresh_hint(&result),
-            RefreshHint::ImmediateRequired
-        );
-        assert_eq!(derive_event_state(&result), LookupResultState::Miss);
-    }
-
-    #[test]
-    fn reverse_lookup_with_multiple_hostnames_classified_as_ambiguous() {
-        use crate::repository::CacheRepository;
-        use nrr_domain::decision_lookup::FreshnessThresholds;
-
-        let dir = tempfile::tempdir().expect("tmp");
-        let ip = Ipv4Addr::new(8, 8, 8, 8);
-
-        // Two different hostnames map to the same IP.
-        let store = migrated_cache_store_with_raw(&dir, |conn| {
-            let now = now_ms();
-            insert_resolution_raw(conn, "dns1.google", ip, now, now + 300_000, "fresh");
-            insert_resolution_raw(conn, "dns.google", ip, now, now + 300_000, "fresh");
-        });
-
-        let result = store
-            .get_by_ip(ip, &FreshnessThresholds::default_production())
-            .expect("get_by_ip");
-
-        assert_eq!(result.reverse_hostnames.len(), 2);
-        assert_eq!(
-            classify_ambiguity(&result),
-            AmbiguityKind::MultipleReverseHostnames
-        );
     }
 }

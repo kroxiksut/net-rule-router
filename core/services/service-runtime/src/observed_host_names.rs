@@ -54,6 +54,13 @@ impl ObservedHostNames {
         self.0.lookup(ip)
     }
 
+    /// Addresses `name` or a name under it was seen at, newest first. For a
+    /// diagnostic probe only — never for anything that enforces.
+    #[must_use]
+    pub fn addresses_under(&self, name: &str, limit: usize) -> Vec<Ipv4Addr> {
+        self.0.addresses_under(name, limit)
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
@@ -77,6 +84,21 @@ pub fn global_observed_host_names() -> Arc<ObservedHostNames> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn addresses_under_a_name_cover_its_subtree_and_nothing_beside_it() {
+        let names = ObservedHostNames::new();
+        names.record("00.img.cdn.example", &[Ipv4Addr::new(192, 0, 2, 1)]);
+        names.record("cdn.example", &[Ipv4Addr::new(192, 0, 2, 2)]);
+        names.record("notcdn.example", &[Ipv4Addr::new(192, 0, 2, 3)]);
+        let mut found = names.addresses_under("cdn.example", 8);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 2)]
+        );
+        assert_eq!(names.addresses_under("cdn.example", 1).len(), 1, "capped");
+    }
 
     #[test]
     fn a_recorded_host_is_found_by_any_of_its_addresses() {

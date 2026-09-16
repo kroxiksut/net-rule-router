@@ -121,6 +121,59 @@ fn parse_ipv6(packet: &[u8]) -> Option<ParsedPacket> {
     )
 }
 
+const PROTO_ICMP: u8 = 1;
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_HEADER_BYTES: usize = 8;
+
+/// An ICMPv4 echo request, owned so it can travel to the thread that answers it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EchoCall {
+    pub source: Ipv4Addr,
+    pub destination: Ipv4Addr,
+    /// Hop limit the sender set: `traceroute` steps it one router at a time.
+    pub ttl: u8,
+    pub ident: u16,
+    pub seq_no: u16,
+    pub payload: Vec<u8>,
+    /// The first eight ICMP bytes, which an ICMP error must quote verbatim.
+    pub quoted_icmp: [u8; ICMP_HEADER_BYTES],
+}
+
+/// Parse an unfragmented ICMPv4 echo request — what `ping` and `tracert` send.
+#[must_use]
+pub fn parse_echo_request(packet: &[u8]) -> Option<EchoCall> {
+    if packet.first()? >> 4 != 4 || packet.len() < 20 {
+        return None;
+    }
+    let header_len = usize::from(packet[0] & 0x0f) * 4;
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    let more_fragments = packet[6] & 0x20 != 0;
+    let fragment_offset = u16::from_be_bytes([packet[6], packet[7]]) & 0x1fff;
+    if header_len < 20
+        || packet[9] != PROTO_ICMP
+        || more_fragments
+        || fragment_offset != 0
+        || total_len < header_len + ICMP_HEADER_BYTES
+    {
+        return None;
+    }
+    let icmp = packet.get(header_len..total_len)?;
+    if icmp[0] != ICMP_ECHO_REQUEST || icmp[1] != 0 {
+        return None;
+    }
+    let mut quoted_icmp = [0u8; ICMP_HEADER_BYTES];
+    quoted_icmp.copy_from_slice(&icmp[..ICMP_HEADER_BYTES]);
+    Some(EchoCall {
+        source: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
+        destination: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
+        ttl: packet[8],
+        ident: u16::from_be_bytes([icmp[4], icmp[5]]),
+        seq_no: u16::from_be_bytes([icmp[6], icmp[7]]),
+        payload: icmp[ICMP_HEADER_BYTES..].to_vec(),
+        quoted_icmp,
+    })
+}
+
 fn transport_protocol(value: u8) -> Option<FlowProtocol> {
     match value {
         PROTO_TCP => Some(FlowProtocol::Tcp),
@@ -253,6 +306,39 @@ mod tests {
         let parsed = parse_packet(&packet).expect("parses");
         assert_eq!(parsed.key.destination, "[fc00::5]:443".parse().unwrap());
         assert!(parsed.is_connection_open);
+    }
+
+    fn echo(icmp_type: u8, ident: u16, seq_no: u16, payload: &[u8]) -> Vec<u8> {
+        let mut message = vec![icmp_type, 0, 0xab, 0xcd];
+        message.extend_from_slice(&ident.to_be_bytes());
+        message.extend_from_slice(&seq_no.to_be_bytes());
+        message.extend_from_slice(payload);
+        let mut packet = ipv4(PROTO_ICMP, &message);
+        packet[8] = 3;
+        packet
+    }
+
+    #[test]
+    fn an_echo_request_is_read_with_its_hop_limit_and_quote() {
+        let call = parse_echo_request(&echo(8, 0x0102, 7, b"abc")).expect("an echo request");
+        assert_eq!(call.source, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(call.destination, Ipv4Addr::new(198, 18, 0, 5));
+        assert_eq!(call.ttl, 3);
+        assert_eq!((call.ident, call.seq_no), (0x0102, 7));
+        assert_eq!(call.payload, b"abc");
+        assert_eq!(call.quoted_icmp, [8, 0, 0xab, 0xcd, 0x01, 0x02, 0, 7]);
+    }
+
+    #[test]
+    fn only_an_unfragmented_echo_request_is_an_echo_call() {
+        assert!(parse_echo_request(&echo(0, 1, 1, b"")).is_none());
+        assert!(parse_echo_request(&ipv4(PROTO_UDP, &udp(1, 2, b"x"))).is_none());
+        let mut fragment = echo(8, 1, 1, b"abc");
+        fragment[6] = 0x20;
+        assert!(parse_echo_request(&fragment).is_none());
+        let mut truncated = echo(8, 1, 1, b"");
+        truncated.truncate(24);
+        assert!(parse_echo_request(&truncated).is_none());
     }
 
     #[test]

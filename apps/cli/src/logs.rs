@@ -5,6 +5,11 @@
 //! asks for its log. The lines come out verbatim (NDJSON as written) so what a
 //! user pastes into a bug report is the same text the service produced, not this
 //! console's rendering of it.
+//!
+//! The price of reading the file directly is that the log tree is closed to
+//! ordinary users, so a non-elevated console is refused. `diag export` is the
+//! way through without administrator rights — the service builds the archive
+//! and hands it to whoever asked — which is why the refusal names it first.
 
 use std::path::PathBuf;
 
@@ -169,7 +174,10 @@ pub fn report(outcome: Outcome, exe: &str) -> u8 {
         Outcome::Forbidden { directory, detail } => {
             eprintln!("Could not read the log directory {}.", directory.display());
             eprintln!("  {detail}");
-            eprintln!("The directory is readable by the service account; try an elevated console:");
+            eprintln!("Only the service account may read it. Ask the service for the log instead:");
+            eprintln!("  {exe} diag export");
+            eprintln!("That needs no administrator rights and yields the whole log, not a tail.");
+            eprintln!("An elevated console can still read it in place:");
             eprintln!("  {exe} diag logs");
             exit::NEEDS_PRIVILEGE
         }

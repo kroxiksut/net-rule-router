@@ -71,6 +71,12 @@ pub fn production_logs_dir() -> Option<PathBuf> {
     }
 }
 
+/// The elevation broker's lifecycle log, in the production logs directory. The
+/// service ships it in the diagnostic archive.
+pub const BROKER_LOG_FILE: &str = "nrr-broker.log";
+/// The previous broker session's log, kept beside [`BROKER_LOG_FILE`].
+pub const BROKER_PREVIOUS_LOG_FILE: &str = "nrr-broker.prev.log";
+
 /// Directory the desktop surfaces coordinate through at run time: the
 /// single-instance locks, the activation hand-off, the shutdown flag.
 ///

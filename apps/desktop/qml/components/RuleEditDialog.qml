@@ -180,8 +180,8 @@ Dialog {
     // semantic validation runs in `isMatchValueValid()` and gates the
     // OK button.
     //
-    // - `exact-ip` accepts only digits and dots up to 15 chars; full
-    //   IPv4 form + per-octet range is checked in isMatchValueValid().
+    // - `exact-ip` accepts hex digits, dots and colons up to 45 chars, the
+    //   longest IPv6 text form; the full form is checked in isMatchValueValid().
     // - `zone` is a single DNS label — letters/digits/hyphens, no dots
     //   (compound zones like `corp.internal` are rare; if needed, the
     //   user can edit the rules file directly).
@@ -192,7 +192,7 @@ Dialog {
     //   (.ps1/.bat/.sh) and Unicode names all pass.
     function matchValueRegex(ruleType) {
         if (ruleType === "exact-ip") {
-            return new RegExp("^[0-9.]{0,15}$")
+            return new RegExp("^[0-9A-Fa-f.:]{0,45}$")
         }
         // Permissive validators — only enforce the per-type length cap.
         // Qt's `RegularExpressionValidator` rejects characters that don't
@@ -209,9 +209,32 @@ Dialog {
     function matchValueMaxLength(ruleType) {
         if (ruleType === "zone")        return 63
         if (ruleType === "domain")      return 253
-        if (ruleType === "exact-ip")    return 15
+        if (ruleType === "exact-ip")    return 45
         if (ruleType === "application") return 260
         return 260
+    }
+    // An IPv6 literal, RFC 4291 text forms: eight groups, or fewer around one
+    // `::`, optionally ending in a dotted IPv4 that stands for two groups.
+    function isIpv6Literal(v) {
+        if (v.indexOf(":") < 0) return false
+        var head = v
+        var lastColon = v.lastIndexOf(":")
+        var tail = v.substring(lastColon + 1)
+        if (tail.indexOf(".") >= 0) {
+            if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(tail)) return false
+            var octets = tail.split(".")
+            for (var o = 0; o < 4; o += 1)
+                if (parseInt(octets[o], 10) > 255) return false
+            head = v.substring(0, lastColon + 1) + "0:0"
+        }
+        var halves = head.split("::")
+        if (halves.length > 2) return false
+        var groups = []
+        for (var h = 0; h < halves.length; h += 1)
+            if (halves[h] !== "") groups = groups.concat(halves[h].split(":"))
+        for (var g = 0; g < groups.length; g += 1)
+            if (!/^[0-9A-Fa-f]{1,4}$/.test(groups[g])) return false
+        return halves.length === 2 ? groups.length <= 7 : groups.length === 8
     }
     // Strict semantic validation. Empty values are invalid; per-type
     // rules below. First octet of an IPv4 must be ≥ 1 (0.x.x.x is
@@ -221,6 +244,7 @@ Dialog {
         var v = String(raw || "").trim()
         if (v === "") return false
         if (ruleType === "exact-ip") {
+            if (v.indexOf(":") >= 0) return isIpv6Literal(v)
             if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return false
             var parts = v.split(".")
             for (var i = 0; i < 4; i += 1) {
@@ -369,7 +393,7 @@ Dialog {
                 ? ruleDialog.matchValuePlaceholder(ruleDialog.localRuleType)
                 : ""
             // Length cap per rule type — `zone` 63, `domain` 253,
-            // `exact-ip` 15, `application` 260 (Windows MAX_PATH).
+            // `exact-ip` 45, `application` 260 (Windows MAX_PATH).
             maximumLength: ruleDialog.matchValueMaxLength(ruleDialog.localRuleType)
             // Validator uses partial-match-friendly regex so each
             // keystroke is accepted (Qt rejects Invalid intermediate

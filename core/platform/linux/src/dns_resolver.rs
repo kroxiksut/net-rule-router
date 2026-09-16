@@ -29,7 +29,7 @@ use nrr_platform_api::dns::{
 };
 
 use crate::dns_message::{
-    canonical_name, decode_response, encode_query, DnsAnswer, DnsDecodeError,
+    canonical_name, decode_response, encode_query, AddressFamily, DnsAnswer, DnsDecodeError,
 };
 
 /// How long one server gets to answer before the next is tried. Short on
@@ -125,18 +125,24 @@ impl LinuxDnsResolver {
         self
     }
 
-    fn ask(&self, server: Ipv4Addr, canonical: &str) -> Result<DnsAnswer, DnsResolverError> {
+    fn ask(
+        &self,
+        server: Ipv4Addr,
+        canonical: &str,
+        family: AddressFamily,
+    ) -> Result<DnsAnswer, DnsResolverError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let query = encode_query(id, canonical).ok_or_else(|| DnsResolverError::InvalidName {
-            name: canonical.to_owned(),
-        })?;
+        let query =
+            encode_query(id, canonical, family).ok_or_else(|| DnsResolverError::InvalidName {
+                name: canonical.to_owned(),
+            })?;
         let target = SocketAddr::new(server.into(), 53);
 
-        match self.ask_udp(target, &query, id, canonical) {
+        match self.ask_udp(target, &query, id, canonical, family) {
             // The answer did not fit in a datagram. The protocol's own remedy is
             // to ask again over TCP; treating TC as a failure would make every
             // large record set unresolvable.
-            Err(UdpFailure::Truncated) => self.ask_tcp(target, &query, id, canonical),
+            Err(UdpFailure::Truncated) => self.ask_tcp(target, &query, id, canonical, family),
             Err(UdpFailure::Failed(e)) => Err(e),
             Ok(answer) => Ok(answer),
         }
@@ -148,6 +154,7 @@ impl LinuxDnsResolver {
         query: &[u8],
         id: u16,
         canonical: &str,
+        family: AddressFamily,
     ) -> Result<DnsAnswer, UdpFailure> {
         let socket =
             UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| net_error(e, canonical))?;
@@ -165,7 +172,7 @@ impl LinuxDnsResolver {
         let read = socket
             .recv(&mut buffer)
             .map_err(|e| timeout_or_net(e, canonical))?;
-        interpret(&buffer[..read], id, canonical)
+        interpret(&buffer[..read], id, canonical, family)
     }
 
     fn ask_tcp(
@@ -174,6 +181,7 @@ impl LinuxDnsResolver {
         query: &[u8],
         id: u16,
         canonical: &str,
+        family: AddressFamily,
     ) -> Result<DnsAnswer, DnsResolverError> {
         let mut stream = TcpStream::connect_timeout(&target, self.timeout)
             .map_err(|e| plain_net(e, canonical))?;
@@ -199,7 +207,7 @@ impl LinuxDnsResolver {
             .read_exact(&mut body)
             .map_err(|e| plain_timeout_or_net(e, canonical))?;
 
-        match interpret(&body, id, canonical) {
+        match interpret(&body, id, canonical, family) {
             Ok(answer) => Ok(answer),
             // A server that sets TC on a TCP answer is broken; there is no
             // further transport to escalate to.
@@ -219,8 +227,13 @@ enum UdpFailure {
     Failed(DnsResolverError),
 }
 
-fn interpret(message: &[u8], id: u16, canonical: &str) -> Result<DnsAnswer, UdpFailure> {
-    match decode_response(message, id, canonical) {
+fn interpret(
+    message: &[u8],
+    id: u16,
+    canonical: &str,
+    family: AddressFamily,
+) -> Result<DnsAnswer, UdpFailure> {
+    match decode_response(message, id, canonical, family) {
         Ok(answer) => Ok(answer),
         Err(DnsDecodeError::TruncatedByServer) => Err(UdpFailure::Truncated),
         // Everything else means this datagram does not answer our question: a
@@ -273,7 +286,11 @@ fn plain_timeout_or_net(e: std::io::Error, hostname: &str) -> DnsResolverError {
 }
 
 impl DnsResolverPort for LinuxDnsResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
         let canonical = canonical_name(hostname);
         if canonical.is_empty() || canonical.contains('\0') {
             return Err(DnsResolverError::InvalidName { name: canonical });
@@ -289,7 +306,7 @@ impl DnsResolverPort for LinuxDnsResolver {
             hostname: canonical.clone(),
         };
         for candidate in servers {
-            match self.ask(candidate.server, &canonical) {
+            match self.ask(candidate.server, &canonical, family) {
                 Ok(DnsAnswer::Addresses { addresses, min_ttl }) => {
                     return Ok(ResolvedRecord {
                         canonical_hostname: canonical,
@@ -363,7 +380,7 @@ options edns0
         let resolver = LinuxDnsResolver::with_servers(Box::new(NoServers));
 
         assert!(matches!(
-            resolver.resolve_a("example.com"),
+            resolver.resolve("example.com", AddressFamily::Ipv4),
             Err(DnsResolverError::UnsupportedPlatform { .. })
         ));
     }
@@ -373,11 +390,11 @@ options edns0
         let resolver = LinuxDnsResolver::new();
 
         assert!(matches!(
-            resolver.resolve_a("  "),
+            resolver.resolve("  ", AddressFamily::Ipv4),
             Err(DnsResolverError::InvalidName { .. })
         ));
         assert!(matches!(
-            resolver.resolve_a("bad\0name"),
+            resolver.resolve("bad\0name", AddressFamily::Ipv4),
             Err(DnsResolverError::InvalidName { .. })
         ));
     }

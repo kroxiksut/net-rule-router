@@ -21,6 +21,7 @@ use crate::auto_rules::AutoRulesEngine;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::ipc_handlers::providers::AutoRuleProbeRunner;
 use crate::main_route_verdicts::{MainRouteVerdict, MainRouteVerdicts};
+use crate::observed_host_names::ObservedHostNames;
 use crate::path_probe::{PathProber, ProbeLimits, ProbeTarget};
 use crate::route_coordinator::SecondaryRouteCoordinator;
 
@@ -28,6 +29,10 @@ use crate::route_coordinator::SecondaryRouteCoordinator;
 /// and API endpoints. Probing the port the browser would use is the only answer
 /// worth having; a reachable ICMP or port 80 would say something else.
 const PROBE_PORT: u16 = 443;
+
+/// Addresses taken from the observed-name memory per host. The pass stops at
+/// the first one that answers either way, so a few only cover one that is down.
+const MAX_OBSERVED_ADDRESSES: usize = 4;
 
 pub struct ProductionAutoRuleProbe {
     engine: Arc<AutoRulesEngine>,
@@ -43,6 +48,10 @@ pub struct ProductionAutoRuleProbe {
     /// hostname, and sharing one would make the second pass skip every host the
     /// first had just asked about.
     secondary_prober: Option<Arc<PathProber>>,
+    /// Where a suggestion's addresses come from when the FQDN cache has none —
+    /// every host that makes an offer about itself, since no rule covers it.
+    /// `None` keeps the runner cache-only.
+    observed: Option<Arc<ObservedHostNames>>,
 }
 
 impl ProductionAutoRuleProbe {
@@ -61,6 +70,7 @@ impl ProductionAutoRuleProbe {
             limits_for,
             verdicts: None,
             secondary_prober: None,
+            observed: None,
         }
     }
 
@@ -70,6 +80,13 @@ impl ProductionAutoRuleProbe {
     #[must_use]
     pub fn with_secondary_prober(mut self, prober: Arc<PathProber>) -> Self {
         self.secondary_prober = Some(prober);
+        self
+    }
+
+    /// Wire the observed-name memory as the address source of last resort.
+    #[must_use]
+    pub fn with_observed_names(mut self, observed: Arc<ObservedHostNames>) -> Self {
+        self.observed = Some(observed);
         self
     }
 
@@ -92,7 +109,7 @@ impl ProductionAutoRuleProbe {
             .map(|h| h.trim().trim_start_matches("*.").to_ascii_lowercase())
             .filter(|h| !h.is_empty())
             .filter_map(|hostname| {
-                let addresses = self.cache.ips_for_hostname(&hostname);
+                let addresses = crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
                 (!addresses.is_empty()).then_some(ProbeTarget {
                     hostname,
                     addresses,
@@ -103,9 +120,10 @@ impl ProductionAutoRuleProbe {
 
     /// The hosts to examine: the named suggestions, or every pending one.
     ///
-    /// A suggestion whose addresses nothing has cached is skipped rather than
-    /// resolved here: resolving would send a query the user did not ask for, and
-    /// the answer would arrive too late for this pass anyway.
+    /// Addresses come from the FQDN cache, else from the observed-name memory.
+    /// A suggestion neither knows is skipped rather than resolved here:
+    /// resolving would send a query the user did not ask for, and the answer
+    /// would arrive too late for this pass anyway.
     fn targets(&self, sid: &str, ids: &[String]) -> Vec<ProbeTarget> {
         self.engine
             .candidates(sid)
@@ -113,7 +131,13 @@ impl ProductionAutoRuleProbe {
             .filter(|c| ids.is_empty() || ids.contains(&c.id))
             .filter_map(|c| {
                 let hostname = c.proposed_match.trim_start_matches("*.").to_string();
-                let addresses = self.cache.ips_for_hostname(&hostname);
+                let mut addresses =
+                    crate::dns_wire::only_v4(&self.cache.ips_for_hostname(&hostname));
+                if addresses.is_empty() {
+                    if let Some(observed) = &self.observed {
+                        addresses = observed.addresses_under(&hostname, MAX_OBSERVED_ADDRESSES);
+                    }
+                }
                 (!addresses.is_empty()).then_some(ProbeTarget {
                     hostname,
                     addresses,

@@ -44,7 +44,7 @@
 //! behind it).
 
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -103,8 +103,13 @@ pub const ENFORCEMENT_CONFIRMATION_WINDOW: Duration = Duration::from_secs(6 * 60
 /// across threads. Implementations MUST be cheap to call repeatedly
 /// — the codegen issues one query per rule.
 pub trait FqdnCacheLookup: Send + Sync {
-    /// Return every cached IPv4 address mapped to `hostname` that enforcement
-    /// may act on.
+    /// Return every cached address mapped to `hostname` that enforcement may
+    /// act on, EITHER FAMILY.
+    ///
+    /// A caller that can only act on one family narrows for itself and says so
+    /// at the call site. Filtering here would make «not cached» and «cached in
+    /// the other family» indistinguishable, which is the difference between
+    /// «warm up DNS» and «this rule cannot be enforced».
     ///
     /// The production adapter answers only with addresses a live resolution
     /// confirmed within [`ENFORCEMENT_CONFIRMATION_WINDOW`]: the cache retains
@@ -113,7 +118,7 @@ pub trait FqdnCacheLookup: Send + Sync {
     /// another tenant, and pinning or blocking it hits that tenant instead.
     /// Returns an empty list when the hostname is not cached, every cached
     /// address is beyond the window, or the cache reports a negative entry.
-    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr>;
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr>;
 
     /// List every cached canonical hostname that ends with
     /// `.{suffix}` (with leading dot — apex of the suffix itself is
@@ -221,7 +226,7 @@ pub struct MockFqdnCacheLookup {
 #[derive(Default)]
 struct MockState {
     /// `canonical_hostname → cached IPv4 set`.
-    entries: Vec<(String, Vec<Ipv4Addr>)>,
+    entries: Vec<(String, Vec<IpAddr>)>,
 }
 
 // Test-support mock: lock-poisoning `unwrap()` is acceptable scaffolding.
@@ -233,7 +238,14 @@ impl MockFqdnCacheLookup {
 
     /// Register `ips` as the cached resolution set for `hostname`.
     /// Last write wins.
+    /// Takes  because almost every fixture is v4; a v6 fixture uses
+    /// [`Self::set_addresses`].
     pub fn set_ips(&self, hostname: &str, ips: Vec<Ipv4Addr>) {
+        self.set_addresses(hostname, ips.into_iter().map(IpAddr::V4).collect());
+    }
+
+    /// Register `addrs` (either family) as the cached set for `hostname`.
+    pub fn set_addresses(&self, hostname: &str, ips: Vec<IpAddr>) {
         let canonical = canonicalize_hostname(hostname);
         let mut g = self.inner.lock().unwrap();
         g.entries.retain(|(h, _)| h != &canonical);
@@ -250,7 +262,7 @@ impl MockFqdnCacheLookup {
 // Test-support mock: lock-poisoning `unwrap()` is acceptable scaffolding.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl FqdnCacheLookup for MockFqdnCacheLookup {
-    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
         let canonical = canonicalize_hostname(hostname);
         let g = self.inner.lock().unwrap();
         for (h, ips) in g.entries.iter() {
@@ -330,7 +342,7 @@ impl SqliteFqdnCacheLookup {
 
     /// [`FqdnCacheLookup::ips_for_hostname`] with an injected `now`, so the
     /// window is exercised deterministically instead of by sleeping.
-    fn ips_confirmed_at(&self, hostname: &str, now: SystemTime) -> Vec<Ipv4Addr> {
+    fn ips_confirmed_at(&self, hostname: &str, now: SystemTime) -> Vec<IpAddr> {
         let guard = match self.cache.lock() {
             Ok(g) => g,
             Err(_) => {
@@ -343,7 +355,6 @@ impl SqliteFqdnCacheLookup {
         };
         let request = CacheLookupRequest {
             hostname: Some(hostname.to_string()),
-            observed_ip: None,
             direction: nrr_domain::decision_lookup::LookupDirection::HostnameToIp,
             active_revision_id: None,
             requested_at: now,
@@ -405,7 +416,7 @@ impl FqdnCacheLookup for SqliteFqdnCacheLookup {
         ))
     }
 
-    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
         self.ips_confirmed_at(hostname, SystemTime::now())
     }
 
@@ -493,7 +504,7 @@ pub struct FqdnCacheSnapshot {
     /// so filter ids derive identically. Keyed by the string as STORED and
     /// matched exactly, because the query it stands in for is
     /// `WHERE canonical_host = ?1`.
-    by_hostname: HashMap<String, Vec<Ipv4Addr>>,
+    by_hostname: HashMap<String, Vec<IpAddr>>,
     /// Every cached hostname in `last_seen_at DESC, canonical_host ASC` order —
     /// what suffix fan-out walks, and the order that decides which hosts of a
     /// capped zone earn a permit.
@@ -523,8 +534,8 @@ impl FqdnCacheSnapshot {
             }
         };
         let cutoff = now.checked_sub(confirmation_window);
-        let mut by_hostname: HashMap<String, Vec<Ipv4Addr>> = HashMap::new();
-        match guard.snapshot_ipv4_resolutions() {
+        let mut by_hostname: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        match guard.snapshot_resolutions() {
             Ok(rows) => {
                 for (host, addr, resolved_at) in rows {
                     if !confirmed_since(Some(resolved_at), cutoff) {
@@ -583,7 +594,7 @@ impl FqdnCacheSnapshot {
 }
 
 impl FqdnCacheLookup for FqdnCacheSnapshot {
-    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
         // Exact match, like the `WHERE canonical_host = ?1` it replaces.
         self.by_hostname.get(hostname).cloned().unwrap_or_default()
     }
@@ -627,6 +638,7 @@ impl FqdnCacheLookup for FqdnCacheSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
 
     #[test]
     fn mock_returns_empty_for_unknown_hostname() {
@@ -795,7 +807,7 @@ mod tests {
                 .upsert_resolution(ResolutionEntry {
                     canonical_hostname: h.into(),
                     raw_hostname_sample: None,
-                    resolved_ips: vec![ip],
+                    resolved_ips: vec![IpAddr::V4(ip)],
                     ttl_seconds: Some(300),
                     source: StorageResolutionSource::Dns,
                     resolved_at: now,
@@ -928,6 +940,46 @@ mod tests {
         }
     }
 
+    /// The snapshot is the only way cached addresses reach the Windows
+    /// codegens, so a family it drops is a family nothing enforces, whatever the
+    /// planner decides. It carries both; which one is named is the planner's call.
+    #[test]
+    fn the_snapshot_carries_both_families() {
+        use nrr_storage::dto::ResolutionEntry;
+        use nrr_storage::resolution_source::StorageResolutionSource;
+        let store = confirmation_store();
+        let v6: IpAddr = "fd00::1".parse().expect("v6");
+        store
+            .upsert_resolution(ResolutionEntry {
+                canonical_hostname: "dual.example.com".into(),
+                raw_hostname_sample: None,
+                resolved_ips: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)), v6],
+                ttl_seconds: Some(300),
+                source: StorageResolutionSource::Dns,
+                resolved_at: SystemTime::now(),
+                active_revision_id: None,
+            })
+            .expect("upsert");
+        let cache: Arc<Mutex<dyn CacheRepository + Send>> = Arc::new(Mutex::new(store));
+        let live = SqliteFqdnCacheLookup::new(
+            Arc::clone(&cache),
+            FreshnessThresholds::default_production(),
+        );
+        let snapshot = live
+            .snapshot_for_compute()
+            .expect("sqlite adapter snapshots");
+
+        let mut got = snapshot.ips_for_hostname("dual.example.com");
+        got.sort();
+        let mut want = live.ips_for_hostname("dual.example.com");
+        want.sort();
+        assert_eq!(
+            got, want,
+            "the snapshot answers what the per-hostname path answers"
+        );
+        assert!(got.contains(&v6), "{got:?}");
+    }
+
     /// A host whose every address aged out must read as COLD through the
     /// snapshot too — positive control for the filter above, because a snapshot
     /// that forgot the window would look identical on every fresh host.
@@ -995,7 +1047,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: host.into(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip],
+                resolved_ips: vec![IpAddr::V4(ip)],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: at,

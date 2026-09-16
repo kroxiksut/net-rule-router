@@ -294,32 +294,6 @@ QtObject {
                 "Could not update the auto-rules setting: ")
         })
     }
-    /// Skip the co-activity evidence for hosts whose NAME already looks like a
-    /// delivery endpoint, so they are offered on first sight. Trades precision
-    /// for speed: ad and tracking CDNs share that shape, so this can put hosts
-    /// the user did not intend into the rules.
-    /// Cut IPv6 while leak protection is on. ON by default: Free pins IPv4
-    /// only, so a host with an AAAA record otherwise keeps a way out the rules
-    /// never covered — the same site travelling the tunnel over v4 and the main
-    /// link over v6.
-    function applyBlockIpv6WhenProtected(enabled) {
-        var want = enabled === true
-        _applyRoutePolicyKey("block-ipv6-when-protected", want, {
-            onApplied: function(v) {
-                root.updateRoutingState({ blockIpv6WhenProtected: v })
-            },
-            ok: want
-                ? root.tr("status.block-ipv6-on",
-                    "IPv6 is switched off while leak protection is on, so rules cover a site completely.")
-                : root.tr("status.block-ipv6-off",
-                    "IPv6 stays on. Sites with an IPv6 address can bypass your rules over it."),
-            uac: root.tr("status.kill-switch-uac-declined",
-                "Administrator approval was declined; leak protection was not changed."),
-            failPrefix: root.tr("status.kill-switch-failed",
-                "Could not update leak protection: ")
-        })
-    }
-
     /// "Stop asking about local networks I have not seen before." Off by
     /// default: keeping a segment reachable is a hole the user should open
     /// knowingly. It silences the QUESTION, not the record — every network is
@@ -402,6 +376,10 @@ QtObject {
         })
     }
 
+    /// Skip the co-activity evidence for hosts whose NAME already looks like a
+    /// delivery endpoint, so they are offered on first sight. Trades precision
+    /// for speed: ad and tracking CDNs share that shape, so this can put hosts
+    /// the user did not intend into the rules.
     function applyAutoRulesEagerDeliveryNames(enabled) {
         var want = enabled === true
         _applyRoutePolicyKey("auto-rules-eager-delivery-names", want, {
@@ -663,6 +641,30 @@ QtObject {
                 root.emitPrefs()
             }
             root.routeBindingDivergence = plan.divergence
+        })
+    }
+
+    /// The service re-matched a reinstalled adapter while the app kept the old
+    /// id. Same choice, stale copy: follow it without arming Apply or raising
+    /// the disagreement banner.
+    function followServiceBindingHeal() {
+        if (!root.bridgeAvailable
+                || ((root.backendStatus || {}).kind) !== "connected"
+                || typeof nrrNativeBridge === "undefined" || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcSnapshotInitialGet !== "function") return
+        var readCorr = nrrNativeBridge.rpcSnapshotInitialGet()
+        root.rpc.registerRpcCallback(readCorr, function(ok, p, code, msg) {
+            if (!ok) return
+            var cur = (p && (p["route-policy"] || p.routePolicy)) || {}
+            var patch = Pure.routeBindingHealPatch(root.prefs, cur)
+            if (Object.keys(patch).length === 0) return
+            root.commitPrefs(patch)
+            root.routeBindingDivergence = (root.routeBindingDivergence || []).filter(function(d) {
+                return !patch.hasOwnProperty(d.role === "primary"
+                    ? "selectedPrimaryInterfaceId" : "selectedSecondaryInterfaceId")
+            })
+            root.interfacesRolesController._reapplyInterfaceRolesFromPrefs()
+            root.interfacesRolesController.rebuildInterfacesModel()
         })
     }
 

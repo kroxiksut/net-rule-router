@@ -261,7 +261,7 @@ mod tests {
     use super::*;
     use crate::route_table::RouteTablePort;
     use crate::{error::PlatformError, types::RoutingAction, windows_api::MockWindowsApi};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn api() -> Arc<MockWindowsApi> {
         Arc::new(MockWindowsApi::new())
@@ -269,9 +269,9 @@ mod tests {
 
     fn route(dest: [u8; 4], next_hop: [u8; 4], ifindex: u32, ours: bool) -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::from(dest),
+            destination: IpAddr::V4(Ipv4Addr::from(dest)),
             prefix_length: 24,
-            next_hop: Ipv4Addr::from(next_hop),
+            next_hop: IpAddr::V4(Ipv4Addr::from(next_hop)),
             interface_index: ifindex,
             metric: 10,
             is_ours: ours,

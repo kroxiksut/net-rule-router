@@ -481,7 +481,7 @@ SystemTrayIcon {
     /// there without reaching here must still not produce that row.
     function _isSelfSigned(c) {
         var signal = String((c || {}).signal || (c || {})["signal"] || "")
-        if (["isp-block-page", "placeholder-answer", "main-link-blocked"]
+        if (["placeholder-answer", "main-link-blocked", "app-main-link-blocked"]
                 .indexOf(signal) >= 0) return true
         var candidateAnchor = String((c || {}).anchor || (c || {})["anchor"] || "")
         var match = String((c || {})["proposed-match"] || (c || {}).proposedMatch || "")
@@ -547,6 +547,8 @@ SystemTrayIcon {
         // When that is all of them the notice is about sites that do not
         // open, not about addresses some other site needs.
         var selfSignedCount = 0
+        // Of those, how many are whole programs rather than sites.
+        var appCount = 0
         // Group by site so rows of one site sit together; ties break on the
         // name, so the same set always lists in the same order.
         var ordered = (candidates || []).slice().sort(function(a, b) {
@@ -566,6 +568,7 @@ SystemTrayIcon {
             var candidateAnchor = String(c.anchor || c["anchor"] || "")
             var selfSigned = _isSelfSigned(c)
             if (selfSigned) selfSignedCount += 1
+            if (String(c.signal || c["signal"] || "") === "app-main-link-blocked") appCount += 1
             // A host that signed its own offer is not a site whose
             // companions are being listed, so it must not become the
             // heading — that is what read as "this site needs itself".
@@ -625,12 +628,19 @@ SystemTrayIcon {
         // needs" over that list states the wrong problem: nobody is missing
         // a companion, the main route is dropping the site itself.
         var allSelfSigned = selfSignedCount === ids.length
-        var titleText = allSelfSigned
+        var allApps = ids.length > 0 && appCount === ids.length
+        var titleText = allApps
+            ? tr("tray.auto-rules.title-app-blocked", "Programs the main route will not carry")
+            : allSelfSigned
             ? tr("tray.auto-rules.title-blocked",
                     "Sites the main route will not carry")
             : tr("tray.auto-rules.title", "Addresses a site needs")
         var bodyText
-        if (allSelfSigned) {
+        if (allApps) {
+            bodyText = tr("tray.auto-rules.body-app-blocked",
+                    "No connection of {name} goes through on the main route.")
+                .replace("{name}", items.map(function(it) { return it.primaryText }).join(", "))
+        } else if (allSelfSigned) {
             bodyText = ids.length > 1
                 ? tr("tray.auto-rules.body-blocked-multi",
                         "Connections to {count} sites keep failing on the main route.")
@@ -2399,14 +2409,7 @@ SystemTrayIcon {
                 // service was down: retry on the 10s cadence until it succeeds so
                 // the tray resumes receiving live pushes without a restart.
                 if (!_traySubscribed && bridgeAvailable)
-                    // The desktop can switch light/dark while the tray sits in the
-            // notification area for days. Its own prompt windows are themed
-            // from this snapshot, so without the refresh they keep the
-            // appearance the machine had when the tray started.
-            if (typeof nrrNativeBridge.systemAppearanceChanged !== "undefined") {
-                nrrNativeBridge.systemAppearanceChanged.connect(refreshSystemAppearance)
-            }
-            _subscribeStatusUpdatesTray()
+                    _subscribeStatusUpdatesTray()
             })
         }
     }

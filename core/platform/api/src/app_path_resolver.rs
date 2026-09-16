@@ -31,7 +31,7 @@ pub trait AppPathResolver: Send + Sync {
     /// Every executable that ships INSIDE the install directory of `exe`,
     /// `exe` itself excluded.
     ///
-    /// A tunnel client is rarely one binary. `hidemy.name VPN 3.0.exe` carries
+    /// A tunnel client is rarely one binary. `swiftvpn 3.0.exe` carries
     /// its transports in subdirectories — `OpenVPN\openvpn.exe`,
     /// `XRay\ExternalBinaries\xray.exe` — and it is those processes, not the
     /// GUI, that perform the handshake. A kill-switch exemption naming only the

@@ -54,6 +54,31 @@ pub fn offline_reset_verb() -> Option<&'static str> {
     None
 }
 
+/// Creates the elevated relay's report: a new file, refused when a link could
+/// redirect the elevated write somewhere else.
+#[cfg(windows)]
+pub fn create_relay_report(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    nrr_platform_windows::elevation::create_relay_report(path)
+}
+
+/// Creates the elevated relay's report. Only UAC needs the relay; elsewhere
+/// the terminal is kept, so an exclusive create with no link in the way does.
+#[cfg(not(windows))]
+pub fn create_relay_report(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("report directory is a link: {}", dir.display()),
+            ));
+        }
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
 /// The host's way of re-running one command with administrator rights, when
 /// this build has one.
 #[cfg(windows)]

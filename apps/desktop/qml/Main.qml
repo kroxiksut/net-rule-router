@@ -771,6 +771,13 @@ ApplicationWindow {
     // An id is not a property: without the alias `root.aboutWindow` is undefined
     // and the About-on-launch path opens nothing.
     property alias aboutWindow: aboutWindow
+    property alias ruleDiagnosticsWindow: ruleDiagnosticsWindow
+    property alias connTraceWindow: connTraceWindow
+    property alias cacheWindow: cacheWindow
+    // Cache row count, shown both on the Diagnostics summary card and in the
+    // cache window. One number with one writer per refresh, so the two
+    // surfaces cannot disagree. -1 = not read yet.
+    property int diagCacheEntriesTotal: -1
     // Same reason: the extracted startup and backlog controllers re-arm these
     // two timers, and an id alone is not reachable from another file.
     property alias _offlineBacklogCollectTimer: _offlineBacklogCollectTimer
@@ -1264,6 +1271,40 @@ ApplicationWindow {
     // input is lowercased and `_` is normalised to `-` before
     // lookup; an unrecognised slug falls back to the slug itself so
     // operators still see something meaningful in toasts/logs.
+    // Shared by every surface that shows a copyable table (cache,
+    // connection trace). They live here rather than in each window because two
+    // copies of "how a value is copied" is how the status line and the clipboard
+    // start disagreeing.
+    function copyToClipboard(text) {
+        if (typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
+                && typeof nrrNativeBridge.copyToClipboard === "function") {
+            nrrNativeBridge.copyToClipboard(String(text))
+            statusLine = tr("status.copied-to-clipboard", "Copied to clipboard.")
+        }
+    }
+    function copyValueLabel(value) {
+        var text = String((value === undefined || value === null) ? "" : value)
+        if (text.length > 40) text = text.substring(0, 39) + "…"
+        return tr("action.copy-value", "Copy: ") + text
+    }
+    // Bridge-availability check that also tells the user why nothing
+    // happened. Shared by the cache surfaces; a second copy would drift on
+    // the status text.
+    function bridgeReadyOrWarn() {
+        if (!bridgeAvailable
+                || typeof nrrNativeBridge === "undefined"
+                || nrrNativeBridge === null
+                || typeof nrrNativeBridge.rpcCacheClear !== "function") {
+            statusLine = tr("status.bridge-unavailable",
+                "Service bridge not connected.")
+            return false
+        }
+        return true
+    }
+    function connEgressLabel(slug) {
+        return tr("diag.conn-trace.egress." + String(slug || ""), String(slug || ""))
+    }
+
     function ipcErrorLabel(code) {
         var slug = String(code || "").toLowerCase().replace(/_/g, "-")
         if (slug === "") return tr("errors.unknown", "Unknown error")
@@ -3137,6 +3178,23 @@ ApplicationWindow {
                     "actionText": tr("action.open-rules", "Open rules")
                 })
                 break
+            case "host-unreachable-on-both-routes":
+                // The offer was withheld: neither link reaches the host, so
+                // there is nothing to move. In the list only, no popup — it is
+                // somebody else's outage.
+                notificationsController._addPushNotice({
+                    "id": "host-unreachable:" + String(event["host"] || ""),
+                    "severity": "info",
+                    "dismissible": true,
+                    "kind": "host-unreachable",
+                    "refractoryMs": 86400000,
+                    "title": tr("notifications.host-unreachable.title",
+                        "A site does not answer on either link"),
+                    "body": tr("notifications.host-unreachable.body",
+                        "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side.")
+                        .replace("{host}", String(event["host"] || ""))
+                })
+                break
             case "secondary-external-address-observed":
                 _onSecondaryExternalAddress(event, eventId)
                 break
@@ -3254,6 +3312,9 @@ ApplicationWindow {
         notificationsController._dropPushNotice(noticeId)
         var wasDown = _enforcementDownRoles.indexOf(role) >= 0
         if (status === "" || status === "ok") {
+            // Coming back may mean the service re-matched a reinstalled adapter.
+            if (status === "ok" && bridgeAvailable)
+                Qt.callLater(routePolicyController.followServiceBindingHeal)
             if (wasDown) {
                 _enforcementDownRoles = _enforcementDownRoles.filter(
                     function(r) { return r !== role })
@@ -3678,6 +3739,9 @@ ApplicationWindow {
             { win: loadListWindow,           overlay: true,  titleBar: true },
             { win: licenseWindow,            overlay: true,  titleBar: true },
             { win: aboutWindow,              overlay: true,  titleBar: true },
+            { win: ruleDiagnosticsWindow,    overlay: true,  titleBar: true },
+            { win: connTraceWindow,         overlay: true,  titleBar: true },
+            { win: cacheWindow,             overlay: true,  titleBar: true },
             { win: firstRunWindow,           overlay: true,  titleBar: true },
             { win: eulaAgreementWindow,      overlay: false, titleBar: true },
             { win: appGroupRoutingDialog,    overlay: false, titleBar: true },
@@ -4370,11 +4434,19 @@ ApplicationWindow {
         // matters. Non-user origins (read-back re-seeds, the replay itself)
         // must never write intent or they would launder service defaults into
         // "what the user wanted".
+        // Recording the decision must never be able to cost the write. A throw
+        // here used to abort the whole function before the queue below ever saw
+        // the job: no request left the GUI, nothing said so, and every later
+        // save was refused by a loading flag that had no one left to clear it.
         if (originText.indexOf("user:") === 0 || originText === "offline-pending-apply") {
-            serviceIntentController._recordServiceIntent(partial)
-            // A pending replay carries values recorded BEFORE this write, so
-            // letting it run now would undo what the user just chose.
-            _serviceIntentSupersededByUser = true
+            try {
+                serviceIntentController._recordServiceIntent(partial)
+                // A pending replay carries values recorded BEFORE this write, so
+                // letting it run now would undo what the user just chose.
+                serviceIntentController._serviceIntentSupersededByUser = true
+            } catch (e) {
+                console.log("applyServiceStabilityPatch: recording the intent failed:", e)
+            }
         }
         _stabilityPatchQueue.push({ partial: partial, onDone: onDone,
                                     origin: originText })
@@ -4403,19 +4475,27 @@ ApplicationWindow {
                 finish(false, String(code || ""), null)
                 return
             }
-            // The merge base is the live row PLUS the decisions the user has
-            // on record, so this full-row write cannot re-affirm a service
-            // default that contradicts one of them. A recorded decision the
-            // service has not accepted yet (delivery failed, state DB wiped)
-            // would otherwise be cancelled by the next unrelated save.
-            var merged = Pure.mergeStabilityWrite(payload || {},
-                                                  serviceIntentController._readServiceIntent(),
-                                                  window._readPendingOffline()["stability"] || {},
-                                                  job.partial || {})
-            var setCorr = bridge.rpcServiceStabilityConfigSet(merged, job.origin || "")
-            rpcTransport.registerRpcCallback(setCorr, function(ok2, p2, code2, msg2) {
-                finish(!!ok2, String(code2 || ""), p2)
-            })
+            // Whatever happens between here and the Set, the job has to end:
+            // an in-flight slot nobody releases stops every later patch from
+            // every panel, and the only symptom is silence.
+            try {
+                // The merge base is the live row PLUS the decisions the user has
+                // on record, so this full-row write cannot re-affirm a service
+                // default that contradicts one of them. A recorded decision the
+                // service has not accepted yet (delivery failed, state DB wiped)
+                // would otherwise be cancelled by the next unrelated save.
+                var merged = Pure.mergeStabilityWrite(payload || {},
+                                                      serviceIntentController._readServiceIntent(),
+                                                      window._readPendingOffline()["stability"] || {},
+                                                      job.partial || {})
+                var setCorr = bridge.rpcServiceStabilityConfigSet(merged, job.origin || "")
+                rpcTransport.registerRpcCallback(setCorr, function(ok2, p2, code2, msg2) {
+                    finish(!!ok2, String(code2 || ""), p2)
+                })
+            } catch (e) {
+                console.log("_drainStabilityPatchQueue: building the write failed:", e)
+                finish(false, "gui-internal", null)
+            }
         })
     }
 
@@ -7207,8 +7287,7 @@ ApplicationWindow {
     /// happens; this only owns the wording and the yes/no.
     function confirmUnroutableSecondary(row, contextSlug, onProceed, onCancel) {
         var r = row || ({})
-        unroutableSecondaryConfirmDialog.adapterName =
-            String(r.description || r.name || "")
+        unroutableSecondaryConfirmDialog.adapterName = Pure.adapterDisplayName(r)
         unroutableSecondaryConfirmDialog.reasonSlug =
             Pure.unroutableInterfaceReasonSlug(r)
         unroutableSecondaryConfirmDialog.contextSlug = String(contextSlug || "assign")
@@ -7531,6 +7610,17 @@ ApplicationWindow {
     // Safe rollback confirm → RollbackRequest recovery action.
 
     AboutWindow { id: aboutWindow; root: window }
+
+    // Rule diagnostics: the explain probe, moved out of the Diagnostics
+    // section so it can stay open beside the rules table.
+    RuleDiagnosticsWindow { id: ruleDiagnosticsWindow; root: window }
+
+    // Live connection trace, in its own window for the same reason: it is read
+    // while rules are being edited.
+    ConnTraceWindow { id: connTraceWindow; root: window }
+
+    // FQDN/IP cache viewer, same reasoning.
+    CacheWindow { id: cacheWindow; root: window }
 
     // "Licenses" window — Help menu / About "License" button / welcome
     // window "View EULA" button all funnel here. Two tabs: the MPL-2.0

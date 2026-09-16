@@ -136,6 +136,7 @@ pub(super) fn exempt_egress(sid: &str, secondary_luid: u64, weight: u64) -> WfpF
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -169,6 +170,7 @@ pub(super) fn exempt_subnet(
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-subnet", &target),
@@ -190,6 +192,7 @@ pub(super) fn exempt_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec
         action: WfpAction::Permit,
         remote_ip: Some(ip),
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-host", &ip.to_string()),
@@ -214,6 +217,7 @@ pub(super) fn exempt_direct_host(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFil
         action: WfpAction::Permit,
         remote_ip: Some(ip),
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -244,6 +248,7 @@ pub(super) fn exempt_probe_target(sid: &str, ip: Ipv4Addr, weight: u64) -> WfpFi
         action: WfpAction::Permit,
         remote_ip: Some(ip),
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -280,6 +285,7 @@ pub(super) fn exempt_dns_over_primary(sid: &str, base_weight: u64) -> Vec<WfpFil
             action: WfpAction::Permit,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: Some(53),
             weight: base_weight + i as u64,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-ca-dns", tag),

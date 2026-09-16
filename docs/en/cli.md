@@ -120,8 +120,12 @@ text rather than this console's rendering of it. It reads a file and nothing
 else — no service needs to be running, which is the state people are in when
 they want a log. The security audit trail is a separate stream and is never
 printed here; it travels in the diagnostic archive instead. On an installation
-whose data directory is locked down, reading needs an elevated console; the
-command says so and exits with code 3 rather than reporting an empty log.
+whose data directory is locked down — which is every installation where the
+service has run — the log files are readable only by the service account, so
+this command needs an elevated console. It says so and exits with code 3 rather
+than reporting an empty log, and it points at `diag export` first: the service
+hands the archive to whoever asked for it, so that route needs no administrator
+rights and carries the whole log rather than a tail.
 
 `reset-network` is for the machine that lost the network because the service
 died without cleaning up after itself. It does not undo anything by itself: it

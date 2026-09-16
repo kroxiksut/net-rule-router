@@ -9,7 +9,7 @@ pub mod manifest;
 pub mod playbooks;
 pub mod request;
 
-pub use builder::{ArchiveBuilder, ArchiveInput, BuildResult};
+pub use builder::{ArchiveBuilder, ArchiveInput, AttachedLog, BuildResult};
 pub use manifest::{DiagnosticArchiveManifest, RedactionReport, MANIFEST_SCHEMA_VERSION};
 pub use playbooks::{all_playbooks, render_playbooks_markdown};
 pub use request::{

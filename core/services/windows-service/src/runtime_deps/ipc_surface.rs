@@ -510,11 +510,6 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                     // value IS the whole live apply: no replan thread needed.
                     .with_instant_rst_flag(
                         nrr_service_runtime::fake_ip::global_instant_rst_enabled(),
-                    )
-                    // Same lightweight contract; same singleton the engine
-                    // above reads.
-                    .with_isp_block_candidates_flag(
-                        nrr_service_runtime::auto_rules::global_isp_block_candidates_enabled(),
                     );
                 // The writer also flips the LIVE tracing filter on
                 // a `verbose_logging` change, without a restart. `None` on a
@@ -785,11 +780,14 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 // Its own prober: the repeat-suppression is per instance, and a
                 // shared one would skip every host the main-link pass had just
                 // asked about.
-                .with_secondary_prober(Arc::new(
-                    nrr_service_runtime::path_probe::PathProber::new(Arc::new(
-                        nrr_service_runtime::path_probe::SystemPathProbe,
-                    )),
-                )),
+                .with_secondary_prober(Arc::new(nrr_service_runtime::path_probe::PathProber::new(
+                    Arc::new(nrr_service_runtime::path_probe::SystemPathProbe),
+                )))
+                // A host making an offer about itself has no rule, so nothing
+                // cached its addresses.
+                .with_observed_names(
+                    nrr_service_runtime::observed_host_names::global_observed_host_names(),
+                ),
             );
             // The user's own opt-in decides whether the tick runs the pass; the
             // stored repeat window is what keeps it a check rather than a

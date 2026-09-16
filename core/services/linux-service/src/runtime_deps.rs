@@ -203,6 +203,7 @@ pub(crate) fn build_runtime_deps(
         dns_observation_consumer: None,
         sign_in_gate: None,
         fake_ip_shutdown: None,
+        conn_observer_shutdown: None,
         conn_observation_source: None,
         conn_observation_consumer: None,
         // The same engine the observation consumer feeds, so the slow proposal

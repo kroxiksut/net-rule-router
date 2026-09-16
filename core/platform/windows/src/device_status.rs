@@ -16,6 +16,7 @@
 //! opposite places — repair a driver, or pick another connection — so a lookup
 //! that could not be performed must not be spelled as an answer.
 
+#![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
 use nrr_platform_api::device_status::{DeviceState, NetworkDeviceStatusPort};

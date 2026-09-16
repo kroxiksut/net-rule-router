@@ -13,6 +13,7 @@
 //! Static configuration wins over the lease, matching how the DNS client itself
 //! resolves the pair — an administrator who typed a value meant it.
 
+#![cfg(target_os = "windows")]
 #![allow(unsafe_code)]
 
 use std::net::Ipv4Addr;

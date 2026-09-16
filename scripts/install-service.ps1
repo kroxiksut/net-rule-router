@@ -87,8 +87,9 @@ $isAdmin = (
 
 if (-not $isAdmin) {
     Write-Host "Elevating via UAC..." -ForegroundColor Cyan
-    Start-Process -FilePath $exePath -ArgumentList 'install' -Verb RunAs -Wait
-    exit $LASTEXITCODE
+    # $LASTEXITCODE is not set by Start-Process; the child's code comes from -PassThru.
+    $p = Start-Process -FilePath $exePath -ArgumentList 'install' -Verb RunAs -Wait -PassThru
+    exit $p.ExitCode
 }
 
 Write-Host "==> install" -ForegroundColor Cyan

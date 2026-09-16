@@ -19,20 +19,39 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn resolve_icon_path() -> Option<PathBuf> {
-    let manifest_candidate =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/icons/app/icon-256.png");
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
+    bundled_resource("assets/icons/app/icon-256.png")
+}
 
-    let cwd_candidate = env::current_dir()
-        .ok()?
-        .join("assets/icons/app/icon-256.png");
-    if cwd_candidate.exists() {
-        return Some(cwd_candidate);
-    }
+/// A payload path the package ships with the binary, `/`-separated relative to
+/// the package root: beside the executable and, in a debug build only, in the
+/// checkout it was built from. Never a parent or the working directory, where
+/// another local user can plant files.
+fn bundled_resource(relative: &str) -> Option<PathBuf> {
+    let executable_dir = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf));
+    // `apps/desktop/gui` sits three levels below the checkout root.
+    #[cfg(debug_assertions)]
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3);
+    #[cfg(not(debug_assertions))]
+    let checkout = None;
+    find_bundled(executable_dir.as_deref(), checkout, relative)
+}
 
-    None
+fn find_bundled(
+    executable_dir: Option<&Path>,
+    checkout: Option<&Path>,
+    relative: &str,
+) -> Option<PathBuf> {
+    executable_dir
+        .into_iter()
+        .chain(checkout)
+        .map(|root| {
+            relative
+                .split('/')
+                .fold(root.to_path_buf(), |path, segment| path.join(segment))
+        })
+        .find(|candidate| candidate.exists())
 }
 
 /// Emergency network-recovery script shipped beside the executable. Surfaced
@@ -45,27 +64,7 @@ fn resolve_reset_script_path() -> Option<PathBuf> {
     #[cfg(not(windows))]
     const RESET_SCRIPT: &str = "scripts/reset-network.sh";
 
-    if let Ok(exe) = env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..6 {
-            let Some(d) = dir else { break };
-            let candidate = d.join(RESET_SCRIPT);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-            dir = d.parent();
-        }
-    }
-
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../")
-        .join(RESET_SCRIPT);
-    if manifest_candidate.exists() {
-        return manifest_candidate.canonicalize().ok();
-    }
-
-    let cwd_candidate = env::current_dir().ok()?.join(RESET_SCRIPT);
-    cwd_candidate.exists().then_some(cwd_candidate)
+    bundled_resource(RESET_SCRIPT)
 }
 
 /// The console line that runs the recovery script, spelled the way this OS
@@ -128,20 +127,12 @@ fn resolve_logs_directory() -> Option<PathBuf> {
         .find(|candidate| fs::create_dir_all(candidate).is_ok())
 }
 
+/// Embedded: the package does not ship `LICENSE` as a file.
+const LICENSE_EMBEDDED: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../LICENSE"));
+
 fn load_license_text() -> String {
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../LICENSE");
-    if let Ok(content) = fs::read_to_string(&manifest_candidate) {
-        return content;
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        let cwd_candidate = current_dir.join("LICENSE");
-        if let Ok(content) = fs::read_to_string(cwd_candidate) {
-            return content;
-        }
-    }
-
-    "License text could not be loaded.".to_string()
+    LICENSE_EMBEDDED.to_string()
 }
 
 /// The Russian EULA, embedded at compile time so the agreement text is always
@@ -158,18 +149,6 @@ const EULA_EN_EMBEDDED: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../docs/legal/eula.en.md"
 ));
-
-/// Candidate `docs/legal` directories to probe for the EULA markdown at
-/// runtime: the source tree (dev / build-tree runs) and a `docs/legal` beside
-/// the current working directory (a deployed layout that ships the docs).
-fn eula_doc_dirs() -> Vec<std::path::PathBuf> {
-    let mut dirs = Vec::new();
-    dirs.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../docs/legal"));
-    if let Ok(current_dir) = env::current_dir() {
-        dirs.push(current_dir.join("docs/legal"));
-    }
-    dirs
-}
 
 /// Load the end-user agreement text for the given UI language.
 ///
@@ -190,8 +169,8 @@ fn load_eula_text(language: &str) -> String {
     } else {
         ("eula.en.md", EULA_EN_EMBEDDED)
     };
-    for dir in eula_doc_dirs() {
-        if let Ok(content) = fs::read_to_string(dir.join(name)) {
+    if let Some(path) = bundled_resource(&format!("docs/legal/{name}")) {
+        if let Ok(content) = fs::read_to_string(path) {
             if !content.trim().is_empty() {
                 return content;
             }
@@ -1475,304 +1454,7 @@ fn default_liveness_window_secs() -> u32 {
     0
 }
 
-impl QtPreferencesPayload {
-    // `apply_over` writes the adapter-binding fields back into
-    // `UiPreferences`: the app's own store of what the service enforces per
-    // SID, and what every panel shows while the service is stopped.
-    fn apply_over(self, mut current: UiPreferences) -> UiPreferences {
-        // Absent means "not reported", never "set it to the type default".
-        // These nineteen fields used to be mandatory, so one key missing from
-        // the QML payload failed the whole parse — and the launcher then wrote
-        // its start-up baseline back over the file. Making them defaultable
-        // without making them optional would have been worse: a forgotten key
-        // would silently reset the setting instead of failing loudly.
-        if let Some(v) = self.launch_window_on_startup {
-            current.launch_window_on_startup = v;
-        }
-        if let Some(v) = self.minimize_to_tray_instead_of_close {
-            current.minimize_to_tray_instead_of_close = v;
-        }
-        if let Some(v) = self.show_notifications {
-            current.show_notifications = v;
-        }
-        current.notify_suggestion_changes = self.notify_suggestion_changes;
-        current.notify_block_notices = self.notify_block_notices;
-        current.notify_rule_duplicates = self.notify_rule_duplicates;
-        current.hide_block_notice_addresses = self.hide_block_notice_addresses;
-        current.tray_notice_opacity_percent = self.tray_notice_opacity_percent.clamp(
-            nrr_ui_support::ui_preferences::TRAY_NOTICE_OPACITY_MIN_PERCENT,
-            nrr_ui_support::ui_preferences::TRAY_NOTICE_OPACITY_MAX_PERCENT,
-        );
-        if let Some(v) = self.reopen_last_section_on_startup {
-            current.reopen_last_section_on_startup = v;
-        }
-        if let Some(v) = self.first_run_completed {
-            current.first_run_completed = v;
-        }
-        current.accepted_eula_version = self.accepted_eula_version;
-
-        if let Some(mode) = self.theme_mode.as_deref() {
-            current.theme_mode = mode.parse::<ThemeMode>().unwrap_or(current.theme_mode);
-        }
-        if self.accessibility_high_contrast == Some(true) {
-            current.theme_mode = ThemeMode::HighContrast;
-        }
-        current.accessibility_high_contrast = current.theme_mode == ThemeMode::HighContrast;
-        if let Some(scale) = self.font_scale_percent {
-            current.accessibility_ui_font_scale_percent = scale.clamp(80, 300);
-        }
-        if let Some(font) = self.system_font.as_deref() {
-            current.accessibility_system_font = font
-                .parse::<SystemFontFamily>()
-                .unwrap_or(current.accessibility_system_font);
-        }
-        if let Some(v) = self.enhanced_focus {
-            current.accessibility_enhanced_focus_indicator = v;
-        }
-        if let Some(v) = self.simplified_labels {
-            current.accessibility_simplified_labels = v;
-        }
-        if let Some(v) = self.tooltips_enabled {
-            current.tooltips_enabled = v;
-        }
-        if let Some(language_id) = self.language.as_deref().and_then(canonicalize_language_id) {
-            current.language = language_id;
-        }
-        if let Some(label) = self.route_primary_label.filter(|l| !l.trim().is_empty()) {
-            current.route_primary_label = label;
-        }
-        if let Some(label) = self.route_secondary_label.filter(|l| !l.trim().is_empty()) {
-            current.route_secondary_label = label;
-        }
-        current.selected_primary_interface_id = self.selected_primary_interface_id;
-        if let Some(name) = self.selected_primary_interface_name {
-            current.selected_primary_interface_name = name;
-        }
-        current.primary_role_user_confirmed = self.primary_role_user_confirmed;
-        current.selected_secondary_interface_id = self.selected_secondary_interface_id;
-        if let Some(name) = self.selected_secondary_interface_name {
-            current.selected_secondary_interface_name = name;
-        }
-        current.secondary_role_user_confirmed = self.secondary_role_user_confirmed;
-        if let Some(mode) = self.route_behavior_mode.as_deref() {
-            current.route_behavior_mode = mode
-                .parse::<RouteBehaviorMode>()
-                .unwrap_or(current.route_behavior_mode);
-        }
-        // Policy-toggle mirrors. An empty shared-IP slug means the QML
-        // build did not emit it (older payload) — keep the current value
-        // rather than blanking it.
-        current.route_include_subdomains = self.route_include_subdomains;
-        if !self.route_shared_ip_policy.is_empty() {
-            current.route_shared_ip_policy = self.route_shared_ip_policy;
-        }
-        current.route_kill_switch_block_all = self.route_kill_switch_block_all;
-        current.route_kill_switch_fail_closed = self.route_kill_switch_fail_closed;
-        current.route_kill_switch_protocols = self.route_kill_switch_protocols & 0x7F;
-        // Master kill-switch toggle + DNS-over-primary opt-in.
-        current.route_kill_switch_enabled = self.route_kill_switch_enabled;
-        current.route_allow_dns_over_primary = self.route_allow_dns_over_primary;
-        // Mode-A coverage strategy + hosts-bypass. Unknown slug from a
-        // divergent QML build is dropped (keeps the stored value).
-        if matches!(
-            self.route_mode_a_coverage_strategy.as_str(),
-            "per-ip" | "fail-closed-unknown" | "zone-widening"
-        ) {
-            current.route_mode_a_coverage_strategy = self.route_mode_a_coverage_strategy;
-        }
-        current.route_resolve_hosts_bypass = self.route_resolve_hosts_bypass;
-        if matches!(
-            self.route_enforcement_mode.as_str(),
-            "reactive" | "resolver"
-        ) {
-            current.route_enforcement_mode = self.route_enforcement_mode;
-        }
-        // Clamp the liveness window: `0` stays `0` (disabled), any
-        // non-zero value is clamped to `[5, 3600]`.
-        current.route_liveness_window_secs = if self.route_liveness_window_secs == 0 {
-            0
-        } else {
-            self.route_liveness_window_secs.clamp(5, 3600)
-        };
-        // Unconditional carry (an EMPTY string means "pending set
-        // applied/discarded" and must clear the stored value).
-        current.route_pending_offline_json = storable_json_blob_or_empty(
-            "route_pending_offline_json",
-            self.route_pending_offline_json,
-        );
-        // Cache-viewer column widths — unconditional carry (empty clears to
-        // defaults).
-        current.cache_table_column_widths = storable_json_blob_or_empty(
-            "cache_table_column_widths",
-            self.cache_table_column_widths,
-        );
-        // Last-known service-owned values — unconditional carry (an EMPTY
-        // string is the legitimate "nothing mirrored yet" state).
-        current.service_backed_mirror_json = storable_json_blob_or_empty(
-            "service_backed_mirror_json",
-            self.service_backed_mirror_json,
-        );
-        // The user's intent for those same settings. A blob failing the gate
-        // resets to "no intent recorded": replaying a half-parsed intent to the
-        // service would be worse than replaying none.
-        current.service_intent_json =
-            storable_json_blob_or_empty("service_intent_json", self.service_intent_json);
-        current.show_bluetooth_adapters = self.show_bluetooth_adapters;
-        current.show_audit_tab = self.show_audit_tab;
-        // Out-of-range (including the 0 an older QML build emits) keeps whatever
-        // is already stored rather than resetting the user's chosen cadence.
-        if (nrr_ui_support::ui_preferences::SETTINGS_AUTOSAVE_MIN_SECS
-            ..=nrr_ui_support::ui_preferences::SETTINGS_AUTOSAVE_MAX_SECS)
-            .contains(&self.settings_autosave_secs)
-        {
-            current.settings_autosave_secs = self.settings_autosave_secs;
-        }
-        current.admin_auto_revoke_disabled = self.admin_auto_revoke_disabled;
-        // Same out-of-range rule as the autosave cadence above.
-        if (nrr_ui_support::ui_preferences::ADMIN_AUTO_REVOKE_MIN_MINUTES
-            ..=nrr_ui_support::ui_preferences::ADMIN_AUTO_REVOKE_MAX_MINUTES)
-            .contains(&self.admin_auto_revoke_minutes)
-        {
-            current.admin_auto_revoke_minutes = self.admin_auto_revoke_minutes;
-        }
-        current.allow_mode_a_killswitch = self.allow_mode_a_killswitch;
-        current.routing_detailed_mode = self.routing_detailed_mode;
-        current.show_remembered_adapters = self.show_remembered_adapters;
-        current.auto_confirm_adapter_id_change = self.auto_confirm_adapter_id_change;
-        // Block-all banner opt-out (device-local display pref).
-        current.warn_kill_switch_block_all = self.warn_kill_switch_block_all;
-        // Block-all banner acknowledgement (device-local display state).
-        current.kill_switch_banner_acknowledged = self.kill_switch_banner_acknowledged;
-        // "Additional adapter not found" banner acknowledgement (device-local).
-        current.missing_secondary_banner_acknowledged = self.missing_secondary_banner_acknowledged;
-        // Traffic-statistics period slug. Non-empty gate so an older QML build
-        // that omits the key keeps the stored value.
-        if !self.traffic_stats_period.trim().is_empty() {
-            current.traffic_stats_period = self.traffic_stats_period;
-        }
-        // Only a known unit slug is stored, so neither an older client nor a
-        // typo can leave the panel pointing at a unit the exporter cannot use.
-        if nrr_ui_support::ui_preferences::TRAFFIC_EXPORT_UNITS
-            .contains(&self.traffic_export_unit.as_str())
-        {
-            current.traffic_export_unit = self.traffic_export_unit;
-        }
-        // Support-archive privacy tier: same allow-list gate, so neither an
-        // older client nor a typo can request a tier the archive writer does
-        // not implement. An absent key arrives as the empty string and is
-        // rejected here, which keeps the stored value.
-        if nrr_ui_support::ui_preferences::DIAGNOSTICS_ARCHIVE_REDACTION_LEVELS
-            .contains(&self.diagnostics_archive_redaction_level.as_str())
-        {
-            current.diagnostics_archive_redaction_level = self.diagnostics_archive_redaction_level;
-        }
-        // "Current session only" archive scope (device-local display state).
-        current.diagnostics_archive_session_only = self.diagnostics_archive_session_only;
-        // Raw-log attachment cap (MiB, `0` = unlimited). Key absent (older QML
-        // build) → keep the stored value.
-        if let Some(mib) = self.archive_log_budget_mib {
-            current.archive_log_budget_mib = mib;
-        }
-        // Key present → take the value (single line only; the signature
-        // is `|`-joined exe patterns and must not break the line-oriented
-        // prefs file); key absent (older QML) → keep stored.
-        if let Some(sig) = self.unenforced_apps_ack_sig {
-            current.unenforced_apps_ack_signature = storable_line_or(
-                "unenforced_apps_ack_signature",
-                sig,
-                current.unenforced_apps_ack_signature,
-            );
-        }
-        // Same shape as the signature above: single line only, absent key
-        // keeps what is stored.
-        if let Some(sig) = self.rules_overlap_keep_sig {
-            current.rules_overlap_keep_signature = storable_line_or(
-                "rules_overlap_keep_signature",
-                sig,
-                current.rules_overlap_keep_signature,
-            );
-        }
-        // Key present → take the value (single line only, so the
-        // line-oriented prefs file stays intact); key absent (older QML) →
-        // keep stored.
-        if let Some(path) = self.confirmed_vpn_exe_path {
-            current.confirmed_vpn_exe_path = storable_line_or(
-                "confirmed_vpn_exe_path",
-                path,
-                current.confirmed_vpn_exe_path,
-            );
-        }
-        // Key present → take the whole set (single line only); key
-        // absent (older QML) → keep stored.
-        if let Some(paths) = self.confirmed_vpn_exe_paths {
-            current.confirmed_vpn_exe_paths = storable_line_or(
-                "confirmed_vpn_exe_paths",
-                paths,
-                current.confirmed_vpn_exe_paths,
-            );
-        }
-        if let Some(section) = self.last_opened_section.as_deref() {
-            current.last_opened_section = section
-                .parse::<AppSection>()
-                .unwrap_or(current.last_opened_section);
-        }
-
-        // Carry through the eight file-source-state fields verbatim.
-        // Empty-string round-trips through `parse_optional_string` as
-        // None, so QML can either omit the key (serde-default None) or
-        // send empty string (still None).
-        current.last_saved_path_primary = self.last_saved_path_primary;
-        current.last_saved_path_secondary = self.last_saved_path_secondary;
-        current.last_loaded_path_primary = self.last_loaded_path_primary;
-        current.last_loaded_path_secondary = self.last_loaded_path_secondary;
-        current.auto_open_on_launch_path_primary = self.auto_open_on_launch_path_primary;
-        current.auto_open_on_launch_path_secondary = self.auto_open_on_launch_path_secondary;
-        current.last_file_synced_revision_id_primary = self.last_file_synced_revision_id_primary;
-        current.last_file_synced_revision_id_secondary =
-            self.last_file_synced_revision_id_secondary;
-        current.last_file_synced_hash_primary = self.last_file_synced_hash_primary;
-        current.last_file_synced_hash_secondary = self.last_file_synced_hash_secondary;
-        current.service_install_uac_declined_at_epoch = self.service_install_uac_declined_at_epoch;
-        current.service_install_uac_declined_count = self.service_install_uac_declined_count;
-        current.service_install_prompt_suppressed = self.service_install_prompt_suppressed;
-        current.auto_load_rules_on_launch = self.auto_load_rules_on_launch;
-        current.export_include_comments = self.export_include_comments;
-        current.import_only_active = self.import_only_active;
-        current.compat_banner_mode = allowed_slug_or(
-            &self.compat_banner_mode,
-            &COMPAT_BANNER_MODES,
-            &current.compat_banner_mode,
-        );
-        current.update_page_url = self.update_page_url;
-        current.show_bundled_presets = self.show_bundled_presets;
-        // Key present → take the value (single line only, so the
-        // line-oriented prefs file stays intact); key absent (older QML) →
-        // keep the folder the user configured.
-        if let Some(dir) = self.user_presets_dir {
-            if !dir.contains(['\n', '\r']) {
-                current.user_presets_dir = dir;
-            }
-        }
-        // Same contract for the remembered set: present → take it (single line
-        // only), absent → keep what the user picked in an earlier session.
-        if let Some(selected) = self.selected_preset_set {
-            if !selected.contains(['\n', '\r']) {
-                current.selected_preset_set = selected;
-            }
-        }
-        current.allow_saving_into_bundled_presets = self.allow_saving_into_bundled_presets;
-        current.rules_folder_suggestion_dismissed = self.rules_folder_suggestion_dismissed;
-        current.merge_conflict_policy = allowed_slug_or(
-            &self.merge_conflict_policy,
-            &MERGE_CONFLICT_POLICIES,
-            &current.merge_conflict_policy,
-        );
-        current.secondary_split_ack_adapter_name = self.secondary_split_ack_adapter_name;
-
-        current
-    }
-}
-
+mod preferences_payload;
 // ── Backend status payload helper ─────────────────────────────────────────
 
 /// Maps a [`BackendConnectionStatus`] to the kebab-case JSON shape
@@ -1830,100 +1512,10 @@ fn backend_provider_is_service_backed(kind: BackendProviderKind) -> bool {
 }
 
 #[cfg(test)]
-mod reset_script_tests {
-    use super::*;
-
-    #[test]
-    fn recovery_script_resolves_and_its_command_quotes_the_path() {
-        let path = resolve_reset_script_path()
-            .expect("the source tree always carries the recovery script");
-        let path = path.to_string_lossy().into_owned();
-        let command = reset_script_command_line(&path);
-        assert!(
-            command.contains(&format!("\"{path}\"")),
-            "the path must be quoted so a space in it cannot split the command: {command}"
-        );
-    }
-}
+mod reset_script_tests;
 
 #[cfg(test)]
-mod backend_provider_tests {
-    use super::*;
-
-    #[test]
-    fn mock_and_preview_local_are_not_service_backed() {
-        assert!(!backend_provider_is_service_backed(
-            BackendProviderKind::Mock
-        ));
-        assert!(!backend_provider_is_service_backed(
-            BackendProviderKind::PreviewLocal
-        ));
-    }
-
-    /// Every IPC variant counts as service-backed, including the degraded ones:
-    /// the transport is real and the reconnect worker keeps trying, so the GUI
-    /// must fall back to `backendStatus.kind` (which already paints the banner)
-    /// rather than treating a transient outage as "no service at all".
-    #[test]
-    fn every_ipc_variant_is_service_backed() {
-        for kind in [
-            BackendProviderKind::IpcConnected,
-            BackendProviderKind::IpcDisconnected,
-            BackendProviderKind::IpcServiceNotInstalled,
-            BackendProviderKind::IpcProtocolMismatch,
-        ] {
-            assert!(backend_provider_is_service_backed(kind), "{kind:?}");
-        }
-    }
-
-    /// The launcher hands the GUI a `MockBackendFacade` when the IPC probe
-    /// fails, so the cold-start snapshot is mock data even on the production
-    /// path — and the flag must say so.
-    #[test]
-    fn ipc_fallback_to_mock_reports_not_service_backed() {
-        use nrr_application::backend_facade::MockBackendFacade;
-        let facade = MockBackendFacade;
-        let backend: &dyn BackendFacade = &facade;
-        assert!(!backend_provider_is_service_backed(backend.provider_kind()));
-    }
-}
+mod backend_provider_tests;
 
 #[cfg(test)]
-mod backend_status_payload_tests {
-    use super::*;
-
-    #[test]
-    fn connected_payload_has_kind_only() {
-        let payload = backend_connection_status_to_payload(&BackendConnectionStatus::Connected);
-        assert_eq!(payload, json!({"kind": "connected"}));
-    }
-
-    #[test]
-    fn disconnected_payload_carries_last_error() {
-        let payload =
-            backend_connection_status_to_payload(&BackendConnectionStatus::Disconnected {
-                last_error: "pipe broken".into(),
-            });
-        assert_eq!(
-            payload,
-            json!({"kind": "disconnected", "lastError": "pipe broken"})
-        );
-    }
-
-    #[test]
-    fn protocol_mismatch_payload_carries_versions() {
-        let payload =
-            backend_connection_status_to_payload(&BackendConnectionStatus::ProtocolMismatch {
-                server_version: 3,
-                client_version: 1,
-            });
-        assert_eq!(
-            payload,
-            json!({
-                "kind": "protocol-mismatch",
-                "serverVersion": 3,
-                "clientVersion": 1,
-            })
-        );
-    }
-}
+mod backend_status_payload_tests;

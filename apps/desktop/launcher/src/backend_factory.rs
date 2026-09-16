@@ -171,10 +171,15 @@ fn build_ipc_bundle() -> BackendBundle {
     } else if let Some(bundle) = try_demand_start_on_this_os(&client) {
         bundle
     } else {
-        let status = ipc_status_to_backend_status(client.connection_status());
-        eprintln!("nrr-launcher: IPC connect probe failed ({status:?}); using mock backend");
-        fallback_with_status(status)
+        unreachable_bundle(client.connection_status())
     }
+}
+
+/// The service did not answer: serve the mock, and say why.
+fn unreachable_bundle(status: ConnectionStatus) -> BackendBundle {
+    let status = ipc_status_to_backend_status(status);
+    eprintln!("nrr-launcher: IPC connect probe failed ({status:?}); using mock backend");
+    fallback_with_status(status)
 }
 
 /// When the first IPC probe fails, the service may be configured
@@ -342,19 +347,15 @@ mod tests {
         let _ = bundle.facade.status_snapshot();
     }
 
-    /// IPC mode in a test environment falls back to mock because no
-    /// service is bound on the test pipe. The fallback is observable
-    /// through `BackendConnectionStatus::Disconnected` (or one of the
-    /// sibling failure variants); the facade still serves snapshots
-    /// from the mock so the GUI never sees `None`.
+    /// Tested on the mapping, not on the machine: the live path opens the real
+    /// service pipe, and on Windows may even start a DemandStart service.
     #[test]
-    fn create_backend_ipc_falls_back_to_mock_when_service_unreachable() {
-        // Constrain the probe so the test isn't slow.
-        let bundle = create_backend(BackendChoice::Ipc);
+    fn an_unreachable_service_falls_back_to_the_mock() {
+        let bundle = unreachable_bundle(ConnectionStatus::ServiceStopped);
         assert_eq!(bundle.choice, BackendChoice::Ipc);
         assert!(
-            !matches!(bundle.status, BackendConnectionStatus::Connected),
-            "expected non-Connected fallback status, got {:?}",
+            matches!(bundle.status, BackendConnectionStatus::ServiceStopped),
+            "{:?}",
             bundle.status
         );
         // Mock fallback must still be callable.

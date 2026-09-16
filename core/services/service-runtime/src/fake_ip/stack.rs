@@ -62,7 +62,7 @@ use smoltcp::wire::{
 };
 
 use super::dialer::{RelayDatagram, RelayDialer, RelayError, RelaySplit};
-use super::flow::{parse_packet, FlowKey, FlowProtocol, ParsedPacket};
+use super::flow::{parse_echo_request, parse_packet, FlowKey, FlowProtocol, ParsedPacket};
 use super::relay::{RelayCore, RelayDecision, DEFAULT_SESSION_IDLE_MS};
 
 /// Per-socket receive/transmit buffer (64 KiB each). Large enough for a full
@@ -121,6 +121,7 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 // `stack::tcp_splice`, datagrams in `stack::datagrams`. NOT `udp` —
 // `smoltcp::socket::udp` is already imported here under that name.
 mod datagrams;
+mod echo;
 mod phy;
 mod tcp_splice;
 
@@ -561,6 +562,7 @@ pub struct FakeIpStack {
     /// allocation on every poll, including the far more numerous polls that
     /// read nothing at all.
     read_buffer: Vec<u8>,
+    echo_answers: Arc<echo::EchoAnswers>,
 }
 
 /// Graveyard size at which lingering workers become worth a warning.
@@ -631,6 +633,7 @@ impl FakeIpStack {
             ready: Arc::new(ReadyFlows::default()),
             last_flow_sweep_ms: 0,
             read_buffer: Vec::new(),
+            echo_answers: Arc::default(),
         }
     }
 
@@ -733,23 +736,31 @@ impl FakeIpStack {
         let read = self.device.read_raw(&mut self.read_buffer)?;
         if read > 0 {
             self.health.record_ingress();
-            // `smoltcp` consumes the packet buffer, so this copy is the one the
-            // device hand-off needs — sized to the PACKET rather than the MTU.
-            let buf = self.read_buffer[..read].to_vec();
-            if let Some(parsed) = parse_packet(&buf) {
-                match parsed.key.protocol {
-                    FlowProtocol::Tcp => {
-                        // The packet is about to move this flow's socket, so it
-                        // is the one flow this step certainly has work for.
-                        self.ready.mark(parsed.key);
-                        self.maybe_open_flow(&parsed, now_ms);
+            // An echo the relay carries is answered by its worker; smoltcp has
+            // nothing to add to it.
+            let carried = match parse_echo_request(&self.read_buffer[..read]) {
+                Some(call) => self.relay_echo(call),
+                None => false,
+            };
+            if !carried {
+                // `smoltcp` consumes the packet buffer, so this copy is the one the
+                // device hand-off needs — sized to the PACKET rather than the MTU.
+                let buf = self.read_buffer[..read].to_vec();
+                if let Some(parsed) = parse_packet(&buf) {
+                    match parsed.key.protocol {
+                        FlowProtocol::Tcp => {
+                            // The packet is about to move this flow's socket, so it
+                            // is the one flow this step certainly has work for.
+                            self.ready.mark(parsed.key);
+                            self.maybe_open_flow(&parsed, now_ms);
+                        }
+                        FlowProtocol::Udp => self.maybe_open_udp(&parsed),
                     }
-                    FlowProtocol::Udp => self.maybe_open_udp(&parsed),
                 }
+                self.device.ingest(buf);
+                let now = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
+                self.iface.poll(now, &mut self.device, &mut self.sockets);
             }
-            self.device.ingest(buf);
-            let now = SmolInstant::from_millis(i64::try_from(now_ms).unwrap_or(i64::MAX));
-            self.iface.poll(now, &mut self.device, &mut self.sockets);
         }
         // Poll again even with no inbound packet: upstream workers may have
         // queued client-bound bytes the sockets must now emit.
@@ -757,6 +768,7 @@ impl FakeIpStack {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_flows(now_ms);
         self.service_udp(now_ms);
+        self.flush_echo_answers();
         self.sweep_worker_graveyard();
 
         Ok(read > 0)
@@ -998,6 +1010,12 @@ impl DialLogGate {
     }
 
     fn log_refusal(&self, destination: &SocketAddr, refusal: &RelayDecision) {
+        // A packet nobody owns is not a refused flow, and calling it one put
+        // every mDNS/LLMNR/NetBIOS datagram on this link into the log as if the
+        // product had cut it.
+        if matches!(refusal, RelayDecision::NotAFlow) {
+            return;
+        }
         let slug = refusal.slug();
         let hostname = match refusal {
             RelayDecision::Relay { .. } => return,

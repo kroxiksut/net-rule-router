@@ -110,6 +110,8 @@ fn the_blanket_block_lands_below_the_escapes_it_must_not_cut() {
         "unix:uid:1000",
         &[SERVER],
         &[LAN],
+        // No IPv6 on this fixture: the subject is the v4 blanket block.
+        nrr_service_runtime::enforcement_planner::Ipv6Exemptions::default(),
         KillSwitchProtocols::from_bits(0x7F),
     );
     assert!(!flows.is_empty(), "the planner refused to plan the block");

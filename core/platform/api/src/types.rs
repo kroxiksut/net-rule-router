@@ -16,10 +16,11 @@
 //! [`WfpFilterSpec::remote_subnet_v6`]. Everything else uses
 //! `std::net::Ipv4Addr`.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::dns::AddressFamily;
 use crate::enforcement::RouteTableRef;
 
 // ── WFP identity ────────────────────────────────────────────────────────────
@@ -53,16 +54,22 @@ pub const FILTER_WEIGHT_BASE: u64 = 0x0010_0000;
 
 // ── Route table ───────────────────────────────────────────────────────────────
 
-/// One IPv4 route entry in the Windows forwarding table.
-/// Mirrors the relevant fields of `MIB_IPFORWARDROW2`.
+/// One route entry in the host forwarding table, either address family.
+/// Mirrors the relevant fields of `MIB_IPFORWARD_ROW2`.
+///
+/// `destination` and `next_hop` must belong to the SAME family — no route table
+/// can hold a v4 prefix reached through a v6 gateway. The invariant is checked
+/// by [`RouteEntry::family`], which the per-OS lowering consults before it
+/// touches the kernel: a mismatch is a bug in our own planner, and it must
+/// surface there rather than be handed to the OS.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteEntry {
-    /// Destination network address (IPv4 only — see module doc).
-    pub destination: Ipv4Addr,
-    /// CIDR prefix length (0–32).
+    /// Destination network address.
+    pub destination: IpAddr,
+    /// CIDR prefix length (0–32 for IPv4, 0–128 for IPv6).
     pub prefix_length: u8,
-    /// Next-hop gateway address.
-    pub next_hop: Ipv4Addr,
+    /// Next-hop gateway address, same family as `destination`.
+    pub next_hop: IpAddr,
     /// Interface index (`IfIndex`).
     pub interface_index: u32,
     /// Route metric. Lower = preferred.
@@ -78,6 +85,37 @@ pub struct RouteEntry {
     /// populates `Principal` / `Tagged`.
     #[serde(skip)]
     pub table: RouteTableRef,
+}
+
+impl RouteEntry {
+    /// The family this route belongs to, or `None` when destination and next
+    /// hop disagree — a shape no forwarding table can hold.
+    #[must_use]
+    pub fn family(&self) -> Option<AddressFamily> {
+        let family = AddressFamily::of(self.destination);
+        // An unspecified next hop is the on-link form: no gateway, so nothing
+        // to disagree with.
+        if self.next_hop.is_unspecified() || AddressFamily::of(self.next_hop) == family {
+            Some(family)
+        } else {
+            None
+        }
+    }
+
+    /// Widest prefix this route's family allows.
+    #[must_use]
+    pub fn max_prefix_length(&self) -> u8 {
+        match self.destination {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        }
+    }
+
+    /// A single-host route (`/32` or `/128`) — what a resolved rule host gets.
+    #[must_use]
+    pub fn is_host_route(&self) -> bool {
+        self.prefix_length == self.max_prefix_length()
+    }
 }
 
 // ── WFP types ─────────────────────────────────────────────────────────────────
@@ -173,6 +211,16 @@ impl WfpLayerKey {
         )
     }
 
+    /// Whether this layer classifies IPv6. The layer fixes the family, so an
+    /// address condition of the wrong family simply never matches — a filter
+    /// that installs, reports success and enforces nothing.
+    pub fn is_v6(self) -> bool {
+        matches!(
+            self,
+            WfpLayerKey::AleAuthConnectV6 | WfpLayerKey::OutboundIpPacketV6
+        )
+    }
+
     /// Whether `FWPM_CONDITION_ALE_USER_ID` / `FWPM_CONDITION_ALE_APP_ID` are
     /// valid conditions at this layer (ALE layers only).
     pub fn supports_ale_scoping(self) -> bool {
@@ -210,6 +258,15 @@ pub struct WfpFilterSpec {
     /// follow its chunk).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_ip_set: Vec<Ipv4Addr>,
+    /// Match condition: a SET of remote IPv6 hosts, each lowered as a `/128`
+    /// `FWP_V6_ADDR_AND_MASK`. The IPv6 twin of [`Self::remote_ip_set`], and
+    /// packed by the same partition: the remote-address field is one field
+    /// whichever family the layer is, so an unpacked v6 half would grow the
+    /// standing set linearly again. Mutually exclusive with
+    /// [`Self::remote_subnet_v6`] (a host is a `/128`; the subnet form is for
+    /// real prefixes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_set_v6: Vec<Ipv6Addr>,
     /// Match condition: specific remote port (None = any).
     pub remote_port: Option<u16>,
     /// Filter weight within our sub-layer.
@@ -305,12 +362,26 @@ impl WfpFilterSpec {
         self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
     }
 
+    /// Whether this filter's v6 destination conditions cover `ip` — the packed
+    /// set or a `/128` subnet condition, the two spellings of one host.
+    pub fn covers_v6(&self, ip: Ipv6Addr) -> bool {
+        self.remote_ip_set_v6.contains(&ip) || self.remote_subnet_v6 == Some((ip, 128))
+    }
+
     pub fn validate_layer_conditions(&self) -> Result<(), &'static str> {
         if self.ip_protocol.is_some() && !self.layer.supports_ip_protocol() {
             return Err("FWPM_CONDITION_IP_PROTOCOL is not available at the IPPACKET layers");
         }
         if self.remote_ip.is_some() && !self.remote_ip_set.is_empty() {
             return Err("remote_ip and remote_ip_set are mutually exclusive");
+        }
+        if !self.remote_ip_set_v6.is_empty() {
+            if self.remote_subnet_v6.is_some() {
+                return Err("remote_ip_set_v6 and remote_subnet_v6 are mutually exclusive");
+            }
+            if !self.layer.is_v6() {
+                return Err("an IPv6 address condition needs an IPv6 layer");
+            }
         }
         if !self.layer.supports_ale_scoping() {
             if self.user_sid.is_some() {
@@ -337,6 +408,11 @@ pub struct WfpFilterRecord {
     /// exact-host condition, so live records carry the whole set back.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote_ip_set: Vec<Ipv4Addr>,
+    /// The packed remote IPv6 host set. Mirrors
+    /// `WfpFilterSpec::remote_ip_set_v6`; enumeration recovers every `/128`
+    /// condition, so a live record carries the whole set back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_ip_set_v6: Vec<Ipv6Addr>,
     pub remote_port: Option<u16>,
     pub weight: u64,
     /// `FWPM_CONDITION_ALE_USER_ID` value when the
@@ -389,6 +465,11 @@ impl WfpFilterRecord {
     pub fn covers_v4(&self, ip: Ipv4Addr) -> bool {
         self.remote_ip == Some(ip) || self.remote_ip_set.contains(&ip)
     }
+
+    /// Twin of [`WfpFilterSpec::covers_v6`].
+    pub fn covers_v6(&self, ip: Ipv6Addr) -> bool {
+        self.remote_ip_set_v6.contains(&ip) || self.remote_subnet_v6 == Some((ip, 128))
+    }
 }
 
 // ── Apply action plan ─────────────────────────────────────────────────────────
@@ -408,19 +489,6 @@ impl ApplyActionPlan {
     pub fn is_empty(&self) -> bool {
         self.routing_actions.is_empty() && self.wfp_actions.is_empty()
     }
-}
-
-/// One IPv6 route as the OS reports it. Read-only, diagnostics-only: the
-/// product does not install v6 routes, but "what does the v6 table look like"
-/// is the first question any IPv6 report raises, and answering it from a log
-/// beats asking the user to run `route print -6`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Ipv6RouteRow {
-    pub destination: std::net::Ipv6Addr,
-    pub prefix_length: u8,
-    pub next_hop: std::net::Ipv6Addr,
-    pub interface_index: u32,
-    pub metric: u32,
 }
 
 /// A single routing table mutation.

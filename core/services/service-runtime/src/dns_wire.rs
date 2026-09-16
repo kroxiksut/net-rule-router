@@ -2,26 +2,28 @@
 //!
 //! Just enough of the DNS message format (RFC 1035 §4) for the loopback
 //! resolver listener: (a) extract the FIRST question's name + type so the
-//! listener can decide whether a query is an `A` query for a rule host, and
-//! (b) build an `A` (or error) response for the *intercept* case. Everything
-//! the listener does NOT intercept — AAAA, TXT, non-rule `A`, EDNS, … — is
-//! forwarded upstream as **raw bytes** with no parse, so this codec covers only
-//! the narrow A-record path: robust by delegation, and dependency-free (no
-//! hickory / async framework — the service runtime is blocking, not tokio).
+//! listener can decide whether a query is an address query for a rule host, and
+//! (b) build an address (or error) response for the *intercept* case. Both
+//! address families ride the same code: `A` and `AAAA` differ only in QTYPE and
+//! RDATA width, so parameterising by qtype is what keeps one family from
+//! drifting away from the other. Everything the listener does NOT intercept
+//! — TXT, EDNS, … — is forwarded upstream as **raw bytes** with no parse:
+//! robust by delegation, and dependency-free (no hickory / async framework
+//! — the service runtime is blocking, not tokio).
 //!
 //! Names in a QUESTION are uncompressed (stub resolvers never compress the
 //! question). Anything we cannot parse confidently returns `None`, and the
 //! listener forwards it raw — so a codec limitation degrades to a transparent
 //! proxy, never to a wrong answer.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Fixed DNS header length (RFC 1035 §4.1.1).
 pub const DNS_HEADER_LEN: usize = 12;
 /// `QTYPE`/`TYPE` value for an `A` record.
 pub const QTYPE_A: u16 = 1;
 /// `TYPE` value for a `CNAME` record — the only alias an `A` answer may be
-/// delivered under (see [`parse_a_response`]).
+/// delivered under (see [`parse_address_response`]).
 pub const QTYPE_CNAME: u16 = 5;
 /// `QTYPE`/`TYPE` value for a `PTR` record (reverse DNS).
 pub const QTYPE_PTR: u16 = 12;
@@ -32,6 +34,11 @@ pub const QTYPE_HTTPS: u16 = 65;
 /// `CLASS` value for `IN` (the only class we accept).
 const CLASS_IN: u16 = 1;
 /// `RCODE` 3 — authoritative "name does not exist".
+/// `QTYPE`/`TYPE` value for an `AAAA` record.
+pub const QTYPE_AAAA: u16 = 28;
+/// No error. With zero answer records this is NODATA — "the name exists,
+/// just not with this record type" — which is what suppression must say.
+pub const RCODE_NOERROR: u8 = 0;
 pub const RCODE_NXDOMAIN: u8 = 3;
 /// `RCODE` 2 — server failure (upstream unreachable).
 pub const RCODE_SERVFAIL: u8 = 2;
@@ -126,26 +133,43 @@ fn response_prefix(query: &[u8], question_end: usize, rcode: u8, ancount: u16) -
     resp
 }
 
-/// Build an `A` response for `query` answering with `ips` at `ttl` seconds.
+/// Shared body of [`build_a_response`] / [`build_aaaa_response`]: an address
+/// answer differs between the families only in QTYPE and RDATA width.
+///
 /// Each answer RR points its NAME at the question via the `0xC00C` compression
 /// pointer (the question always starts at offset 12). `None` when `query` has no
-/// parseable question or `ips` is empty (use [`build_error_response`] instead).
-pub fn build_a_response(query: &[u8], ips: &[Ipv4Addr], ttl: u32) -> Option<Vec<u8>> {
-    if ips.is_empty() {
+/// parseable question or `rdata` is empty (use [`build_error_response`] instead).
+fn build_address_response<I, R>(query: &[u8], qtype: u16, rdata: I, ttl: u32) -> Option<Vec<u8>>
+where
+    I: ExactSizeIterator<Item = R>,
+    R: AsRef<[u8]>,
+{
+    if rdata.len() == 0 {
         return None;
     }
     let q = parse_question(query)?;
-    let ancount = ips.len().min(u16::MAX as usize) as u16;
+    let ancount = rdata.len().min(u16::MAX as usize) as u16;
     let mut resp = response_prefix(query, q.question_end, 0, ancount);
-    for ip in ips.iter().take(ancount as usize) {
+    for octets in rdata.take(ancount as usize) {
+        let octets = octets.as_ref();
         resp.extend_from_slice(&[0xC0, 0x0C]); // NAME → pointer to question (offset 12)
-        resp.extend_from_slice(&QTYPE_A.to_be_bytes()); // TYPE A
+        resp.extend_from_slice(&qtype.to_be_bytes());
         resp.extend_from_slice(&[0x00, 0x01]); // CLASS IN
         resp.extend_from_slice(&ttl.to_be_bytes()); // TTL
-        resp.extend_from_slice(&[0x00, 0x04]); // RDLENGTH = 4
-        resp.extend_from_slice(&ip.octets()); // RDATA
+        resp.extend_from_slice(&(octets.len() as u16).to_be_bytes()); // RDLENGTH
+        resp.extend_from_slice(octets); // RDATA
     }
     Some(resp)
+}
+
+/// Build an `A` response for `query` answering with `ips` at `ttl` seconds.
+pub fn build_a_response(query: &[u8], ips: &[Ipv4Addr], ttl: u32) -> Option<Vec<u8>> {
+    build_address_response(query, QTYPE_A, ips.iter().map(|ip| ip.octets()), ttl)
+}
+
+/// Build an `AAAA` response for `query` answering with `ips` at `ttl` seconds.
+pub fn build_aaaa_response(query: &[u8], ips: &[Ipv6Addr], ttl: u32) -> Option<Vec<u8>> {
+    build_address_response(query, QTYPE_AAAA, ips.iter().map(|ip| ip.octets()), ttl)
 }
 
 /// Build an answer-less response carrying `rcode` (e.g. [`RCODE_NXDOMAIN`] for
@@ -236,9 +260,10 @@ fn encode_qname(qname: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Build a recursive `A` query for `qname` with message id `id` (one question,
-/// RD set, no EDNS). `None` when the name cannot be encoded.
-pub fn build_a_query(id: u16, qname: &str) -> Option<Vec<u8>> {
+/// Build a recursive address query for `qname` with message id `id` (one
+/// question, RD set, no EDNS). `qtype` is [`QTYPE_A`] or [`QTYPE_AAAA`].
+/// `None` when the name cannot be encoded.
+pub fn build_address_query(id: u16, qname: &str, qtype: u16) -> Option<Vec<u8>> {
     let name = encode_qname(qname)?;
     let mut p = Vec::with_capacity(DNS_HEADER_LEN + name.len() + 4);
     p.extend_from_slice(&id.to_be_bytes());
@@ -246,7 +271,7 @@ pub fn build_a_query(id: u16, qname: &str) -> Option<Vec<u8>> {
     p.extend_from_slice(&[0x00, 0x01]); // QDCOUNT=1
     p.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR
     p.extend_from_slice(&name);
-    p.extend_from_slice(&QTYPE_A.to_be_bytes());
+    p.extend_from_slice(&qtype.to_be_bytes());
     p.extend_from_slice(&[0x00, 0x01]); // QCLASS IN
     Some(p)
 }
@@ -287,7 +312,7 @@ pub enum PtrResponseOutcome {
     /// Any other RCODE (SERVFAIL, REFUSED, …) — transient upstream failure.
     Failed(u8),
     /// Not OUR response: wrong id, not a response frame, or a different
-    /// question. Same off-path-spoofing hygiene as [`parse_a_response`].
+    /// question. Same off-path-spoofing hygiene as [`parse_address_response`].
     Mismatch,
 }
 
@@ -408,15 +433,16 @@ pub fn parse_ptr_response(expect_id: u16, ip: Ipv4Addr, packet: &[u8]) -> PtrRes
 
 /// What one upstream response datagram means for an `A` query.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AResponseOutcome {
-    /// NOERROR with at least one `A` record. `min_ttl` is the smallest TTL
-    /// across the returned `A` records (the safe cache horizon).
+pub enum AddressResponseOutcome {
+    /// NOERROR with at least one address record of the asked-for family.
+    /// `min_ttl` is the smallest TTL across them (the safe cache horizon).
     Answers {
-        addresses: Vec<Ipv4Addr>,
+        addresses: Vec<IpAddr>,
         min_ttl: u32,
     },
     /// Authoritative "no usable records": NXDOMAIN, or NOERROR whose answer
-    /// section carries no `A` record (e.g. a CNAME chain ending off-answer).
+    /// section carries no record of that family (e.g. a CNAME chain ending
+    /// off-answer).
     NoRecords,
     /// TC=1 — the answer did not fit the datagram. The caller treats this as
     /// transient (no TCP fallback in phase 1; the passive observer backstops).
@@ -529,45 +555,94 @@ fn answer_owner_closure(
     names
 }
 
-/// Parse an upstream response to [`build_a_query`]`(expect_id, expect_qname)`.
+/// RDATA width of one address record of `qtype`. `None` for a qtype that does
+/// not carry an address — the caller must not treat it as an address query.
+fn address_rdlen(qtype: u16) -> Option<usize> {
+    match qtype {
+        QTYPE_A => Some(4),
+        QTYPE_AAAA => Some(16),
+        _ => None,
+    }
+}
+
+/// Keep only the IPv4 addresses of an answer.
 ///
-/// Accepts an `A`/`IN` record only when its owner name is the question name or
-/// a name reachable from it through the response's own `CNAME` chain. An
+/// An answer to an `A` question is entirely IPv4 by construction, so this
+/// narrows nothing away where it is used today. It exists to mark the call
+/// sites that still act on one family only — each is a place the IPv6 work has
+/// to grow a v6 twin, and a grep for it is the list of them.
+pub fn only_v4(addresses: &[IpAddr]) -> Vec<Ipv4Addr> {
+    addresses
+        .iter()
+        .filter_map(|a| match a {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// Read one address out of an RDATA slice already known to be 4 or 16 octets.
+fn address_from_rdata(rdata: &[u8]) -> Option<IpAddr> {
+    match rdata.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            rdata[0], rdata[1], rdata[2], rdata[3],
+        ))),
+        16 => {
+            let octets: [u8; 16] = rdata.try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
+}
+
+/// Parse an upstream response to
+/// [`build_address_query`]`(expect_id, expect_qname, qtype)`.
+///
+/// Accepts an address/`IN` record only when its owner name is the question name
+/// or a name reachable from it through the response's own `CNAME` chain. An
 /// address record filed under an unrelated owner is dropped: it cannot be an
 /// answer to this question, and accepting it would let an upstream (or an
 /// off-path forgery that guessed id + question) place arbitrary addresses in
 /// the enforcement set under someone else's name. Never panics on malformed
 /// input — any structural surprise inside the answer section stops the walk and
 /// returns what was collected.
-pub fn parse_a_response(expect_id: u16, expect_qname: &str, packet: &[u8]) -> AResponseOutcome {
+pub fn parse_address_response(
+    expect_id: u16,
+    expect_qname: &str,
+    qtype: u16,
+    packet: &[u8],
+) -> AddressResponseOutcome {
+    let Some(rdlen) = address_rdlen(qtype) else {
+        return AddressResponseOutcome::Mismatch;
+    };
     if packet.len() < DNS_HEADER_LEN {
-        return AResponseOutcome::Mismatch;
+        return AddressResponseOutcome::Mismatch;
     }
     if u16::from_be_bytes([packet[0], packet[1]]) != expect_id {
-        return AResponseOutcome::Mismatch;
+        return AddressResponseOutcome::Mismatch;
     }
     if packet[2] & 0x80 == 0 {
-        return AResponseOutcome::Mismatch; // QR=0 — a query, not a response
+        return AddressResponseOutcome::Mismatch; // QR=0 — a query, not a response
     }
     let Some(q) = parse_question(packet) else {
-        return AResponseOutcome::Mismatch;
+        return AddressResponseOutcome::Mismatch;
     };
     let expect = expect_qname
         .strip_suffix('.')
         .unwrap_or(expect_qname)
         .to_ascii_lowercase();
-    if q.qname != expect || q.qtype != QTYPE_A {
-        return AResponseOutcome::Mismatch;
+    if q.qname != expect || q.qtype != qtype {
+        return AddressResponseOutcome::Mismatch;
     }
     if packet[2] & 0x02 != 0 {
-        return AResponseOutcome::Truncated; // TC bit
+        return AddressResponseOutcome::Truncated; // TC bit
     }
     let rcode = packet[3] & 0x0F;
     if rcode == RCODE_NXDOMAIN {
-        return AResponseOutcome::NoRecords;
+        return AddressResponseOutcome::NoRecords;
     }
     if rcode != 0 {
-        return AResponseOutcome::Failed(rcode);
+        return AddressResponseOutcome::Failed(rcode);
     }
     let ancount = u16::from_be_bytes([packet[6], packet[7]]) as usize;
     let records = read_answer_records(packet, q.question_end, ancount);
@@ -577,31 +652,35 @@ pub fn parse_a_response(expect_id: u16, expect_qname: &str, packet: &[u8]) -> AR
     let mut off_chain = 0usize;
     for rr in records
         .iter()
-        .filter(|r| r.rtype == QTYPE_A && r.rclass == CLASS_IN && r.rdlen == 4)
+        .filter(|r| r.rtype == qtype && r.rclass == CLASS_IN && r.rdlen == rdlen)
     {
         if !rr.owner.as_deref().is_some_and(|o| owners.contains(o)) {
             off_chain += 1;
             continue;
         }
-        let Some(rdata) = packet.get(rr.rdata_start..rr.rdata_start + 4) else {
+        let Some(rdata) = packet.get(rr.rdata_start..rr.rdata_start + rdlen) else {
             continue;
         };
-        addresses.push(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]));
+        let Some(addr) = address_from_rdata(rdata) else {
+            continue;
+        };
+        addresses.push(addr);
         min_ttl = min_ttl.min(rr.ttl);
     }
     if off_chain > 0 {
         tracing::debug!(
             target: "nrr::dns-resolver",
             host = %q.qname,
+            qtype,
             off_chain,
             kept = addresses.len(),
-            "dropped A records filed under an owner name the question's CNAME chain never reaches",
+            "dropped address records filed under an owner name the question's CNAME chain never reaches",
         );
     }
     if addresses.is_empty() {
-        return AResponseOutcome::NoRecords;
+        return AddressResponseOutcome::NoRecords;
     }
-    AResponseOutcome::Answers {
+    AddressResponseOutcome::Answers {
         addresses,
         min_ttl: if min_ttl == u32::MAX { 0 } else { min_ttl },
     }
@@ -613,7 +692,8 @@ mod tests {
     /// every lookup — the DoH canary was answered once per page load.
     #[test]
     fn a_negative_answer_carries_an_soa_the_client_can_cache() {
-        let query = super::build_a_query(0x1234, "canary.example.net").expect("query");
+        let query =
+            super::build_address_query(0x1234, "canary.example.net", QTYPE_A).expect("query");
         let resp = super::build_negative_response(&query, super::RCODE_NXDOMAIN, 60).expect("resp");
 
         assert_eq!(resp[3] & 0x0F, super::RCODE_NXDOMAIN, "rcode preserved");
@@ -753,7 +833,7 @@ mod tests {
 
     #[test]
     fn a_query_round_trips_through_own_parser() {
-        let q = build_a_query(0xBEEF, "assistant.example").expect("query");
+        let q = build_address_query(0xBEEF, "assistant.example", QTYPE_A).expect("query");
         assert_eq!(u16::from_be_bytes([q[0], q[1]]), 0xBEEF, "id");
         assert_eq!(q[2] & 0x01, 0x01, "RD set");
         let parsed = parse_question(&q).expect("parse own query");
@@ -761,31 +841,123 @@ mod tests {
         assert_eq!(parsed.qtype, QTYPE_A);
         // Trailing-dot FQDN encodes identically.
         assert_eq!(
-            build_a_query(0xBEEF, "assistant.example.").expect("fqdn"),
+            build_address_query(0xBEEF, "assistant.example.", QTYPE_A).expect("fqdn"),
             q
         );
     }
 
     #[test]
     fn a_query_rejects_unencodable_names() {
-        assert!(build_a_query(1, "").is_none());
-        assert!(build_a_query(1, "a..b").is_none(), "empty label");
-        assert!(build_a_query(1, &"x".repeat(64)).is_none(), "label > 63");
-        assert!(build_a_query(1, "приложение.ru").is_none(), "non-ASCII");
+        assert!(build_address_query(1, "", QTYPE_A).is_none());
+        assert!(
+            build_address_query(1, "a..b", QTYPE_A).is_none(),
+            "empty label"
+        );
+        assert!(
+            build_address_query(1, &"x".repeat(64), QTYPE_A).is_none(),
+            "label > 63"
+        );
+        assert!(
+            build_address_query(1, "приложение.ru", QTYPE_A).is_none(),
+            "non-ASCII"
+        );
         let long = ["abcdefgh"; 32].join("."); // 8×32 + dots > 255
-        assert!(build_a_query(1, &long).is_none(), "name > 255");
+        assert!(
+            build_address_query(1, &long, QTYPE_A).is_none(),
+            "name > 255"
+        );
+    }
+
+    fn ip6(s: &str) -> IpAddr {
+        IpAddr::V6(s.parse::<Ipv6Addr>().expect("v6 literal"))
+    }
+
+    /// The AAAA half of the codec has to survive its own round trip, or the
+    /// family that is not on today's data path is the one that rots.
+    #[test]
+    fn aaaa_response_round_trips_through_own_parser() {
+        let q = build_address_query(0x2A2A, "assistant.example", QTYPE_AAAA).expect("query");
+        let parsed = parse_question(&q).expect("question");
+        assert_eq!(parsed.qtype, QTYPE_AAAA);
+
+        let ips = [
+            "2001:db8::1".parse::<Ipv6Addr>().expect("v6"),
+            "2001:db8::2".parse::<Ipv6Addr>().expect("v6"),
+        ];
+        let resp = build_aaaa_response(&q, &ips, 300).expect("resp");
+        match parse_address_response(0x2A2A, "assistant.example", QTYPE_AAAA, &resp) {
+            AddressResponseOutcome::Answers { addresses, min_ttl } => {
+                assert_eq!(addresses, vec![ip6("2001:db8::1"), ip6("2001:db8::2")]);
+                assert_eq!(min_ttl, 300);
+            }
+            other => panic!("expected answers, got {other:?}"),
+        }
+    }
+
+    /// RDLENGTH is what separates the families on the wire. A 16-octet record
+    /// answering an `A` question (or the reverse) must not become an address:
+    /// accepting it would file one family's bytes under the other's name.
+    #[test]
+    fn address_parse_refuses_the_other_family() {
+        let a_q = build_address_query(1, "host.example", QTYPE_A).expect("query");
+        let aaaa_q = build_address_query(1, "host.example", QTYPE_AAAA).expect("query");
+
+        let v6 = ["2001:db8::5".parse::<Ipv6Addr>().expect("v6")];
+        let v6_resp = build_aaaa_response(&aaaa_q, &v6, 60).expect("resp");
+        // The question itself differs, so an A asker rejects the frame outright.
+        assert_eq!(
+            parse_address_response(1, "host.example", QTYPE_A, &v6_resp),
+            AddressResponseOutcome::Mismatch,
+        );
+
+        // Same question type, wrong record width inside: the answer section is
+        // an AAAA record delivered under an `A` question.
+        let mut forged = build_a_response(&a_q, &[ip(1, 2, 3, 4)], 60).expect("resp");
+        let rr_start = parse_question(&a_q).expect("q").question_end;
+        forged[rr_start + 2..rr_start + 4].copy_from_slice(&QTYPE_AAAA.to_be_bytes());
+        assert_eq!(
+            parse_address_response(1, "host.example", QTYPE_A, &forged),
+            AddressResponseOutcome::NoRecords,
+            "a record whose TYPE is not the asked-for family is not an address",
+        );
+    }
+
+    /// A qtype that carries no address must not be parsed as one — the guard
+    /// is what keeps a caller from asking for TXT and getting "addresses".
+    #[test]
+    fn address_parse_rejects_a_non_address_qtype() {
+        let q = build_address_query(5, "host.example", QTYPE_PTR).expect("query");
+        assert_eq!(
+            parse_address_response(5, "host.example", QTYPE_PTR, &q),
+            AddressResponseOutcome::Mismatch,
+        );
+    }
+
+    /// The narrowing helper is load-bearing at every call site that still acts
+    /// on one family: it must drop v6 rather than mangle it.
+    #[test]
+    fn only_v4_keeps_the_v4_half() {
+        let mixed = [
+            IpAddr::V4(ip(1, 2, 3, 4)),
+            ip6("2001:db8::1"),
+            IpAddr::V4(ip(5, 6, 7, 8)),
+        ];
+        assert_eq!(
+            only_v4(&mixed),
+            vec![Ipv4Addr::new(1, 2, 3, 4), Ipv4Addr::new(5, 6, 7, 8)],
+        );
     }
 
     #[test]
     fn a_response_parses_answers_and_min_ttl() {
-        let q = build_a_query(7, "assistant.example").expect("query");
+        let q = build_address_query(7, "assistant.example", QTYPE_A).expect("query");
         // Reuse the server-side builder, then rewrite the two answer TTLs to
         // differ so min-TTL selection is observable.
         let mut resp = build_a_response(&q, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 300).expect("resp");
         let ans2_ttl_at = parse_question(&q).expect("q").question_end + 16 + 6;
         resp[ans2_ttl_at..ans2_ttl_at + 4].copy_from_slice(&120u32.to_be_bytes());
-        match parse_a_response(7, "assistant.example", &resp) {
-            AResponseOutcome::Answers { addresses, min_ttl } => {
+        match parse_address_response(7, "assistant.example", QTYPE_A, &resp) {
+            AddressResponseOutcome::Answers { addresses, min_ttl } => {
                 assert_eq!(addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
                 assert_eq!(min_ttl, 120);
             }
@@ -796,7 +968,7 @@ mod tests {
     #[test]
     fn a_response_skips_cname_and_collects_terminal_a() {
         // NOERROR answer: CNAME (uncompressed owner) then an A record.
-        let q = build_a_query(9, "www.example.com").expect("query");
+        let q = build_address_query(9, "www.example.com", QTYPE_A).expect("query");
         let question_end = parse_question(&q).expect("q").question_end;
         let mut resp = q.clone();
         resp[2] = 0x80 | (resp[2] & 0x79); // QR=1
@@ -826,8 +998,8 @@ mod tests {
         resp.extend_from_slice(&45u32.to_be_bytes());
         resp.extend_from_slice(&[0x00, 0x04]);
         resp.extend_from_slice(&[9, 9, 9, 9]);
-        match parse_a_response(9, "www.example.com", &resp) {
-            AResponseOutcome::Answers { addresses, min_ttl } => {
+        match parse_address_response(9, "www.example.com", QTYPE_A, &resp) {
+            AddressResponseOutcome::Answers { addresses, min_ttl } => {
                 assert_eq!(addresses, vec![ip(9, 9, 9, 9)]);
                 assert_eq!(min_ttl, 45, "CNAME TTL must not participate");
             }
@@ -872,7 +1044,7 @@ mod tests {
     /// guards against.
     #[test]
     fn a_response_rejects_addresses_owned_by_an_unrelated_name() {
-        let q = build_a_query(11, "secure.example").expect("query");
+        let q = build_address_query(11, "secure.example", QTYPE_A).expect("query");
         let mut resp = response_frame(&q, 3);
         push_a_rr(&mut resp, &[0xC0, 0x0C], ip(23, 10, 20, 135), 300);
         push_a_rr(
@@ -887,8 +1059,8 @@ mod tests {
             ip(192, 0, 2, 0),
             300,
         );
-        match parse_a_response(11, "secure.example", &resp) {
-            AResponseOutcome::Answers { addresses, .. } => {
+        match parse_address_response(11, "secure.example", QTYPE_A, &resp) {
+            AddressResponseOutcome::Answers { addresses, .. } => {
                 assert_eq!(
                     addresses,
                     vec![ip(23, 10, 20, 135)],
@@ -904,7 +1076,7 @@ mod tests {
     /// resolvers) runs instead of the addresses being enforced.
     #[test]
     fn a_response_is_empty_when_every_address_is_off_chain() {
-        let q = build_a_query(12, "secure.example").expect("query");
+        let q = build_address_query(12, "secure.example", QTYPE_A).expect("query");
         let mut resp = response_frame(&q, 1);
         push_a_rr(
             &mut resp,
@@ -913,8 +1085,8 @@ mod tests {
             300,
         );
         assert_eq!(
-            parse_a_response(12, "secure.example", &resp),
-            AResponseOutcome::NoRecords
+            parse_address_response(12, "secure.example", QTYPE_A, &resp),
+            AddressResponseOutcome::NoRecords
         );
     }
 
@@ -922,7 +1094,7 @@ mod tests {
     /// closure is order-independent.
     #[test]
     fn a_response_accepts_a_record_preceding_its_cname() {
-        let q = build_a_query(13, "www.example.com").expect("query");
+        let q = build_address_query(13, "www.example.com", QTYPE_A).expect("query");
         let mut resp = response_frame(&q, 2);
         push_a_rr(&mut resp, &encoded("edge.example.com"), ip(9, 9, 9, 9), 45);
         // CNAME www.example.com → edge.example.com, emitted last.
@@ -933,8 +1105,8 @@ mod tests {
         let target = encoded("edge.example.com");
         resp.extend_from_slice(&(target.len() as u16).to_be_bytes());
         resp.extend_from_slice(&target);
-        match parse_a_response(13, "www.example.com", &resp) {
-            AResponseOutcome::Answers { addresses, min_ttl } => {
+        match parse_address_response(13, "www.example.com", QTYPE_A, &resp) {
+            AddressResponseOutcome::Answers { addresses, min_ttl } => {
                 assert_eq!(addresses, vec![ip(9, 9, 9, 9)]);
                 assert_eq!(min_ttl, 45);
             }
@@ -944,43 +1116,43 @@ mod tests {
 
     #[test]
     fn a_response_classifies_errors_and_mismatches() {
-        let q = build_a_query(3, "x.example").expect("query");
+        let q = build_address_query(3, "x.example", QTYPE_A).expect("query");
         let nx = build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
         assert_eq!(
-            parse_a_response(3, "x.example", &nx),
-            AResponseOutcome::NoRecords
+            parse_address_response(3, "x.example", QTYPE_A, &nx),
+            AddressResponseOutcome::NoRecords
         );
         let servfail = build_error_response(&q, RCODE_SERVFAIL).expect("sf");
         assert_eq!(
-            parse_a_response(3, "x.example", &servfail),
-            AResponseOutcome::Failed(RCODE_SERVFAIL)
+            parse_address_response(3, "x.example", QTYPE_A, &servfail),
+            AddressResponseOutcome::Failed(RCODE_SERVFAIL)
         );
         // NOERROR + zero answers = authoritative empty.
         let empty = build_error_response(&q, 0).expect("empty");
         assert_eq!(
-            parse_a_response(3, "x.example", &empty),
-            AResponseOutcome::NoRecords
+            parse_address_response(3, "x.example", QTYPE_A, &empty),
+            AddressResponseOutcome::NoRecords
         );
         // Wrong id / wrong question / a query frame → Mismatch.
         let ok = build_a_response(&q, &[ip(1, 1, 1, 1)], 60).expect("ok");
         assert_eq!(
-            parse_a_response(4, "x.example", &ok),
-            AResponseOutcome::Mismatch
+            parse_address_response(4, "x.example", QTYPE_A, &ok),
+            AddressResponseOutcome::Mismatch
         );
         assert_eq!(
-            parse_a_response(3, "y.example", &ok),
-            AResponseOutcome::Mismatch
+            parse_address_response(3, "y.example", QTYPE_A, &ok),
+            AddressResponseOutcome::Mismatch
         );
         assert_eq!(
-            parse_a_response(3, "x.example", &q),
-            AResponseOutcome::Mismatch
+            parse_address_response(3, "x.example", QTYPE_A, &q),
+            AddressResponseOutcome::Mismatch
         );
         // TC bit → Truncated.
         let mut tc = ok;
         tc[2] |= 0x02;
         assert_eq!(
-            parse_a_response(3, "x.example", &tc),
-            AResponseOutcome::Truncated
+            parse_address_response(3, "x.example", QTYPE_A, &tc),
+            AddressResponseOutcome::Truncated
         );
     }
 

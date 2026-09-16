@@ -29,11 +29,17 @@
 //!
 //! ## IPv6
 //!
-//! IPv6 adapters and addresses are out-of-scope.
-//! `AdapterInfo` only carries IPv4 addresses. `classify_availability`
-//! works on IPv4 state only.
+//! `AdapterInfo` carries the unicast addresses of both families, because a
+//! connection is attributed to an interface by its local address and a family
+//! absent here is a family with no route on screen. Availability is a
+//! different question: `classify_availability` still judges on IPv4 state,
+//! since nothing yet routes over v6.
 
-use std::{collections::HashMap, net::Ipv4Addr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, Ipv6Addr},
+    sync::Arc,
+};
 
 use crate::error::PlatformError;
 
@@ -98,8 +104,10 @@ impl InterfaceType {
 
 /// Platform-level snapshot of one network adapter's current state.
 ///
-/// Populated by `WindowsApiPort::get_adapter_infos()`. IPv6 addresses are
-/// excluded (out-of-scope).
+/// Populated by `WindowsApiPort::get_adapter_infos()`. Both address families
+/// are carried: an observed connection is attributed to an interface by
+/// matching its LOCAL address against these lists, so a family missing here is
+/// a family whose traffic has no route and no verdict on screen.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterInfo {
     /// Windows `IfIndex`.
@@ -119,7 +127,12 @@ pub struct AdapterInfo {
     pub oper_status: IfOperStatus,
     /// All IPv4 unicast addresses currently assigned.
     pub ipv4_addresses: Vec<Ipv4Addr>,
-    /// Default gateways via this adapter (IPv4 only).
+    /// All IPv6 unicast addresses currently assigned, link-local included —
+    /// on a machine with no global v6 the link-local address is the only one
+    /// there is, and a connection over it still has to be attributed.
+    pub ipv6_addresses: Vec<Ipv6Addr>,
+    /// Default gateways via this adapter (IPv4 only). The v6 counterpart
+    /// belongs with v6 route reconciliation, not with observation.
     pub gateways: Vec<Ipv4Addr>,
 }
 
@@ -713,6 +726,7 @@ mod tests {
             interface_type: itype,
             oper_status: status,
             ipv4_addresses: ips,
+            ipv6_addresses: Vec::new(),
             gateways: gws,
         }
     }
@@ -730,6 +744,7 @@ mod tests {
             interface_type: InterfaceType::Tunnel,
             oper_status: IfOperStatus::Up,
             ipv4_addresses: vec![Ipv4Addr::new(10, 8, 0, 2)],
+            ipv6_addresses: Vec::new(),
             gateways: vec![Ipv4Addr::new(10, 8, 0, 1)],
         }
     }

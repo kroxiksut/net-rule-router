@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::SystemTime;
 
 use nrr_domain::decision_lookup::{CacheEntryState, LookupDirection, LookupError};
@@ -8,15 +8,10 @@ use crate::resolution_source::StorageResolutionSource;
 // ── Lookup input / output ─────────────────────────────────────────────────────
 
 /// Input to a cache lookup operation.
-///
-/// At least one of `hostname` or `observed_ip` must be `Some`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheLookupRequest {
     /// Normalized hostname (lowercase, no trailing dot, IDNA-encoded).
     pub hostname: Option<String>,
-    /// Observed IPv4 address from WFP (already normalized; native IPv6 excluded
-    /// in Free edition).
-    pub observed_ip: Option<Ipv4Addr>,
     /// Lookup direction(s) to attempt.
     pub direction: LookupDirection,
     /// Active revision id at the time of this lookup — stored in the lookup
@@ -29,7 +24,7 @@ pub struct CacheLookupRequest {
 /// A single IPv4 address entry retrieved from the cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedIpEntry {
-    pub addr: Ipv4Addr,
+    pub addr: IpAddr,
     pub cache_state: CacheEntryState,
     pub source: StorageResolutionSource,
     /// When this mapping was resolved.  `None` for entries without recorded
@@ -45,13 +40,6 @@ pub struct CachedIpEntry {
     pub active_revision_id: Option<String>,
 }
 
-/// A single hostname entry from a reverse lookup.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CachedHostnameEntry {
-    pub hostname: String,
-    pub cache_state: CacheEntryState,
-}
-
 /// Result of a cache lookup — storage side, before conversion to
 /// [`LookupResult`][nrr_domain::decision_lookup::LookupResult].
 ///
@@ -61,8 +49,6 @@ pub struct CachedHostnameEntry {
 pub struct CacheLookupResult {
     /// All IPv4 addresses cached for the requested hostname (forward lookup).
     pub resolved_ips: Vec<CachedIpEntry>,
-    /// Hostnames associated with the observed IP (reverse lookup, diagnostic only).
-    pub reverse_hostnames: Vec<CachedHostnameEntry>,
     /// Freshness of the best entry across `resolved_ips`.  `None` if no entry
     /// exists at all (`Missing` state).
     pub overall_freshness: Option<CacheEntryState>,
@@ -70,9 +56,6 @@ pub struct CacheLookupResult {
     pub best_source: Option<StorageResolutionSource>,
     /// True when multiple IPs exist for the hostname (multi-IP result).
     pub is_multi_ip: bool,
-    /// True when the observed IP is not present in the cached hostname IP set
-    /// (observed vs cached mismatch).
-    pub has_conflict: bool,
     /// Lookup errors encountered (timeout, cache unavailable, etc.).
     pub errors: Vec<LookupError>,
     /// When the negative cache entry expires (`retry_after` column).
@@ -90,8 +73,8 @@ pub struct ResolutionEntry {
     pub canonical_hostname: String,
     /// Raw hostname as observed (may differ from canonical in mixed-case traffic).
     pub raw_hostname_sample: Option<String>,
-    /// Resolved usable IPv4 addresses.
-    pub resolved_ips: Vec<Ipv4Addr>,
+    /// Resolved usable addresses, either family.
+    pub resolved_ips: Vec<IpAddr>,
     /// TTL from the DNS response.  `None` when unavailable — fallback TTL is
     /// applied by the repository.
     pub ttl_seconds: Option<u32>,

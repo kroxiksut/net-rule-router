@@ -69,11 +69,15 @@ impl DiagnosticArchiveManifest {
     /// caller-dropped section turned into a build failure instead of a smaller
     /// bundle.
     pub fn validate(&self) -> Result<(), String> {
-        for required in crate::archive::request::ArchiveSection::MANDATORY
-            .iter()
-            .map(|s| s.filename())
-        {
-            if !self.included_sections.contains(&required.to_string()) {
+        use crate::archive::request::ArchiveSection;
+        let raw_logs = format!("{}/", crate::archive::builder::SERVICE_LOGS_DIRNAME);
+        for section in ArchiveSection::MANDATORY.iter().copied() {
+            let required = section.filename();
+            let present = self.included_sections.iter().any(|s| s == required)
+                // The raw log files replace the listing of the same lines.
+                || (section == ArchiveSection::Logs
+                    && self.included_sections.iter().any(|s| s.starts_with(&raw_logs)));
+            if !present {
                 return Err(format!(
                     "mandatory section '{required}' is missing from archive"
                 ));
@@ -167,6 +171,17 @@ mod tests {
         m.included_sections.retain(|s| s != "health.json");
         let err = m.validate().unwrap_err();
         assert!(err.contains("health.json"));
+    }
+
+    #[test]
+    fn the_raw_log_files_stand_in_for_the_logs_listing() {
+        let mut m = sample_manifest();
+        m.included_sections.retain(|s| s != "logs.ndjson");
+        assert!(m.validate().unwrap_err().contains("logs.ndjson"));
+
+        m.included_sections
+            .push("service-logs/nrr_service_20260907-1.ndjson".into());
+        assert!(m.validate().is_ok());
     }
 
     #[test]

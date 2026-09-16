@@ -378,25 +378,35 @@ GroupBox {
         }
         _stabilityLoading = true
         _stabilityErrorCode = ""
-        var corr = bridge.rpcServiceStabilityConfigGet()
-        root.rpc.registerRpcCallback(corr,
-            function(ok, payload, errorCode, errorMessage) {
-                group._stabilityLoading = false
-                if (!ok) {
-                    group._stabilityErrorCode = String(errorCode || "unknown")
-                    // The service is present but did not answer (stopped
-                    // mid-flight, RPC refused): show what is known offline
-                    // instead of leaving the drafts at the QML literals.
-                    group._seedStabilityFromOfflineSources()
-                    return
-                }
-                // ServiceStabilityConfigGetResponse is a type alias to
-                // ServiceStabilityConfigDto — both `ipc-accept-policy`
-                // and the S3 `verbose-logging` flag sit at the payload
-                // root. Pass the whole payload so the applier can read
-                // both in one place.
-                group._applyStabilityFromPayload(payload || {})
-            })
+        // The flag above is cleared by the callback and by nothing else, so
+        // leaving here without one registered has to be impossible: a stuck
+        // flag refuses every later save of this panel without saying a word.
+        try {
+            var corr = bridge.rpcServiceStabilityConfigGet()
+            root.rpc.registerRpcCallback(corr,
+                function(ok, payload, errorCode, errorMessage) {
+                    group._stabilityLoading = false
+                    if (!ok) {
+                        group._stabilityErrorCode = String(errorCode || "unknown")
+                        // The service is present but did not answer (stopped
+                        // mid-flight, RPC refused): show what is known offline
+                        // instead of leaving the drafts at the QML literals.
+                        group._seedStabilityFromOfflineSources()
+                        return
+                    }
+                    // ServiceStabilityConfigGetResponse is a type alias to
+                    // ServiceStabilityConfigDto — both `ipc-accept-policy`
+                    // and the S3 `verbose-logging` flag sit at the payload
+                    // root. Pass the whole payload so the applier can read
+                    // both in one place.
+                    group._applyStabilityFromPayload(payload || {})
+                })
+        } catch (e) {
+            console.log("_fetchStabilityConfig: the read could not be issued:", e)
+            _stabilityLoading = false
+            _stabilityErrorCode = "gui-internal"
+            _seedStabilityFromOfflineSources()
+        }
     }
 
     function _resetStabilityToDefaults() {
@@ -434,14 +444,23 @@ GroupBox {
         // are offered for delivery on the connect edge. Previously the write
         // simply failed with "bridge unavailable" and the user's ticks were lost.
         if (!root._routingBackendConnected()) {
-            root._recordOfflineRoutingIntent(
-                "stability", "ipc-accept-policy", _buildAcceptPolicy())
-            root._recordOfflineRoutingIntent(
-                "stability", "conn-trace-ndjson", _stabilityDraftConnTraceNdjson)
-            root._recordOfflineRoutingIntent(
-                "stability", "conn-trace-gui", _stabilityDraftConnTraceGui)
-            root._recordOfflineRoutingIntent(
-                "stability", "cache-refresh-interval-secs", _stabilityDraftCacheRefreshSecs)
+            try {
+                root._recordOfflineRoutingIntent(
+                    "stability", "ipc-accept-policy", _buildAcceptPolicy())
+                root._recordOfflineRoutingIntent(
+                    "stability", "conn-trace-ndjson", _stabilityDraftConnTraceNdjson)
+                root._recordOfflineRoutingIntent(
+                    "stability", "conn-trace-gui", _stabilityDraftConnTraceGui)
+                root._recordOfflineRoutingIntent(
+                    "stability", "cache-refresh-interval-secs", _stabilityDraftCacheRefreshSecs)
+            } catch (e) {
+                // Reporting the failure keeps the drafts dirty and the guard
+                // honest; swallowing it would park nothing and claim a save.
+                console.log("_saveStabilityConfig: parking the offline intent failed:", e)
+                _stabilityErrorCode = "gui-internal"
+                if (typeof onComplete === "function") onComplete(false)
+                return
+            }
             _stabilityDirty = false
             _stabilityJustSaved = true
             _stabilityErrorCode = ""
@@ -461,23 +480,33 @@ GroupBox {
         // Verbose-logging is NOT sent here anymore: it applies
         // on-change through `_applyVerboseLogging`. Leaving it in this Save
         // patch is what silently carried verbose=false when Save was skipped.
-        root.applyServiceStabilityPatch({
-            "ipc-accept-policy": policy,
-            "conn-trace-ndjson": _stabilityDraftConnTraceNdjson,
-            "conn-trace-gui": _stabilityDraftConnTraceGui,
-            "cache-refresh-interval-secs": _stabilityDraftCacheRefreshSecs
-        }, function(ok, code, payload) {
-            group._stabilityLoading = false
-            if (!ok) {
-                group._stabilityErrorCode = (code === "") ? "unknown" : code
-                if (typeof onComplete === "function") onComplete(false)
-                return
-            }
-            // Set response echoes the DTO directly (same shape as Get).
-            group._applyStabilityFromPayload(payload || {})
-            group._stabilityJustSaved = true
-            if (typeof onComplete === "function") onComplete(true)
-        }, "user:diagnostics-save")
+        try {
+            root.applyServiceStabilityPatch({
+                "ipc-accept-policy": policy,
+                "conn-trace-ndjson": _stabilityDraftConnTraceNdjson,
+                "conn-trace-gui": _stabilityDraftConnTraceGui,
+                "cache-refresh-interval-secs": _stabilityDraftCacheRefreshSecs
+            }, function(ok, code, payload) {
+                group._stabilityLoading = false
+                if (!ok) {
+                    group._stabilityErrorCode = (code === "") ? "unknown" : code
+                    if (typeof onComplete === "function") onComplete(false)
+                    return
+                }
+                // Set response echoes the DTO directly (same shape as Get).
+                group._applyStabilityFromPayload(payload || {})
+                group._stabilityJustSaved = true
+                if (typeof onComplete === "function") onComplete(true)
+            }, "user:diagnostics-save")
+        } catch (e) {
+            // Same reason as the read above: the loading flag has no other
+            // owner, and a panel that refuses to save in silence is worse than
+            // one that says why.
+            console.log("_saveStabilityConfig: the write could not be issued:", e)
+            _stabilityLoading = false
+            _stabilityErrorCode = "gui-internal"
+            if (typeof onComplete === "function") onComplete(false)
+        }
     }
 
     // Idle-commit for this panel's drafts. There is no local Save button any
@@ -982,7 +1011,7 @@ GroupBox {
                         icon.source: root.uiIconSource("open-file")
                         onClicked: {
                             if (exportState.lastArchiveDir === "") return
-                            Qt.openUrlExternally(
+                            Pure.openExternalUrl(
                                 "file:///" + exportState.lastArchiveDir.replace(/\\/g, "/"))
                         }
                     }

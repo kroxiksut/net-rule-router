@@ -636,7 +636,7 @@ QtObject {
     }
     function _vpnConflictSecondaryDisplayName() {
         var r = _vpnConflictSecondaryRow()
-        return r ? String(r.description || r.name || "") : ""
+        return r ? Pure.adapterDisplayName(r) : ""
     }
     function _enabledSecondaryRuleCount() {
         var n = 0

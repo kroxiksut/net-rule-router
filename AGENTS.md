@@ -130,7 +130,7 @@ shared/contracts/   — nrr-shared crate: GUI/tray/service contracts + IPC types
 
 - **GUI subsystem.** `nrr-launcher` sets `windows_subsystem = "windows"`; the C++ Qt host is built `WIN32`. No process in the runtime chain allocates a console. When launched from a console, `println!`/`eprintln!` still write to the parent because stdio handles inherit.
 - **Embedded icon.** `nrr-launcher` has `build.rs` using `embed-resource = "2"` that compiles `resources/app.rc` into the PE resource section of *both* `NetRuleRouter.exe` and `NetRuleRouterTray.exe`. The `.rc` file references `../../../../assets/icons/app/app.ico` — same ICO the C++ Qt host's CMake build embeds via `generated_app.rc`. Single source of truth.
-- **QML path resolution (C++ Qt host order):** `--qml=<absolute>` arg → `NRR_QML_MAIN`/`NRR_QML_TRAY` env → `findUpwardFile` from binary location → CMake-baked absolute paths (`NRR_QML_MAIN_DEFAULT` etc. as `target_compile_definitions`). The CMake fallback enables redirected `[build] target-dir`. Consequence: binary is not portable between machines without shipping the QML/locale tree.
+- **Payload path resolution (QML, icons, presets, locales, provisioning sheet):** `--qml=<absolute>` arg → `NRR_QML_MAIN`/`NRR_QML_TRAY` env → beside the binary → in a non-release cargo profile only, the checkout baked at build time (`NRR_DEV_LAYOUT` / `NRR_DEV_REPO_ROOT` from `qt-host/build.rs`; `CARGO_MANIFEST_DIR` under `debug_assertions` on the Rust side). **Never a parent directory:** a folder planted above the binary (drive root, shared temp) would run its QML in another user's GUI. Consequence: a release binary finds its payload only in the package layout (`scripts/package-windows.ps1`), not straight from `target\release`.
 - **DWM dark title bar.** The native title bar ignores Qt palette / QML theme. The C++ Qt host links `dwmapi.lib` and exposes `Q_INVOKABLE NrrNativeBridge::setMainWindowDarkTitleBar(bool)` and `setWindowDarkTitleBar(QObject*, bool)` which call `DwmSetWindowAttribute(hwnd, 20, ...)` (with attribute 19 fallback for Win10 1809–1909). Cold-start: host registers main `QWindow` in the bridge **before** `window->show()`. Theme switches re-apply via `SetWindowPos(SWP_FRAMECHANGED)`. Same flow used for child windows on each `onVisibleChanged: visible == true`.
 
 ### IPC Between Launcher, Qt Host, Tray, and Service
@@ -215,7 +215,7 @@ Key design decisions:
 - Retention defaults: operational logs 90 days / 50 MB; audit NDJSON 365 days / 50 MB. Configurable via Settings → «Диагностика и логи».
 - `ExplainQuery` has two variants: `HistoricalDecision { decision_id }` and `Synthetic { input_sample }`.
 - `SecretNeverLog<T>` deliberately does NOT implement `serde::Serialize` — compile error on accidental inclusion in any output.
-- Archive format: `.zip` with `manifest.json` + `health.json` + `logs.ndjson` + `audit_summary.json` + `troubleshooting.md` + optional sections.
+- Archive format: `.zip` with `manifest.json` + `health.json` + `service-logs/` (the raw log files; the payload-stripped `logs.ndjson` listing ships only when they are absent) + `audit_summary.json` + `troubleshooting.md` + optional sections.
 
 ### Localization
 

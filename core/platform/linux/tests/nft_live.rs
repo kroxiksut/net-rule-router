@@ -89,6 +89,15 @@ fn live_ruleset(table: &str) -> NftRuleset {
                 verdict: NftVerdict::Accept,
                 comment: "catch-all-exempt#0".to_owned(),
             },
+            // The v6 half of a block-all: `inet` carries both families.
+            NftRule {
+                matches: vec![NftMatch::DstV6 {
+                    net: "2001:db8::7".parse().expect("test address"),
+                    prefix: 128,
+                }],
+                verdict: NftVerdict::Drop,
+                comment: "block-all#0 v6".to_owned(),
+            },
         ],
     }
 }
@@ -143,6 +152,10 @@ fn the_kernel_accepts_what_we_generate_and_teardown_removes_it() {
     assert!(
         listed.contains("203.0.113.0/24"),
         "the subnet rule must keep its prefix: {listed}"
+    );
+    assert!(
+        listed.contains("ip6 daddr 2001:db8::7"),
+        "the v6 host rule must be present: {listed}"
     );
     assert!(
         listed.contains("route-secondary#0 leak-guard"),

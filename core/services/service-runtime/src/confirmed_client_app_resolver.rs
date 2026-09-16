@@ -177,8 +177,10 @@ mod tests {
 
     #[test]
     fn an_uninstalled_confirmed_path_is_not_resurrected() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let missing = dir.path().join("missing.exe");
         let confirmed = Arc::new(ConfirmedVpnClients::new());
-        confirmed.publish("S-1-5-21-1", &[r"C:\definitely\missing.exe".to_string()]);
+        confirmed.publish("S-1-5-21-1", &[missing.to_string_lossy().into_owned()]);
         let resolver =
             ConfirmedClientAppPathResolver::new(Arc::new(ScriptedInner::default()), confirmed);
         assert!(resolver.resolve("missing.exe").is_empty());

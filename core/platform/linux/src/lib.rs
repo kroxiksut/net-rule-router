@@ -238,6 +238,9 @@ pub mod route_table;
 /// every host; only the socket half is Linux-only.
 pub mod reachability;
 
+/// ICMP echo with a chosen hop limit and source address, over a raw socket.
+pub mod icmp_echo;
+
 /// Linux adapter enumeration — the answer Windows gets from one
 /// `GetAdaptersAddresses` call, assembled from `/sys/class/net` (identity, link
 /// state), `/proc/net/route` (gateways) and `getifaddrs` (addresses). Parsers
@@ -430,9 +433,9 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn sample_route() -> RouteEntry {
         RouteEntry {
-            destination: std::net::Ipv4Addr::new(10, 0, 0, 0),
+            destination: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)),
             prefix_length: 8,
-            next_hop: std::net::Ipv4Addr::new(0, 0, 0, 0),
+            next_hop: std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
             interface_index: 1,
             metric: 0,
             is_ours: true,

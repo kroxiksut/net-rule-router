@@ -56,6 +56,17 @@ pub enum DnsResolverRunOutcome {
 /// the machine resolving past us for minutes without a single log line.
 const REDIRECT_GUARD_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Raised when something happened that can change which namespaces are claimed
+/// — a link appearing or going away.
+///
+/// A VPN that connects hands its own DNS suffix to the machine, and until we
+/// step out of that namespace its names resolve through us and fail. Waiting
+/// for the next guard tick costs up to [`REDIRECT_GUARD_INTERVAL`], and the
+/// client then caches our answer for [`crate::dns_wire::NEGATIVE_TTL_SECS`] on
+/// top — so a link that comes up between ticks can leave a corporate name
+/// unresolvable for a minute and a half after it was ready.
+pub type NamespaceRecheck = Arc<AtomicBool>;
+
 /// Owns the Mode-B intercept listener plus the system-DNS redirect port and
 /// drives their combined lifecycle in one blocking call.
 /// Which namespaces the product should stay out of, asked afresh each time.
@@ -70,6 +81,7 @@ pub struct DnsResolverService {
     redirect: Arc<dyn SystemDnsRedirectPort>,
     listen_addr: SocketAddr,
     guard_interval: Duration,
+    recheck: Option<NamespaceRecheck>,
     /// `None` claims every name, which is what the product did before it
     /// learned to step aside.
     exemptions: Option<DnsNamespaceExemptionsFn>,
@@ -86,6 +98,7 @@ impl DnsResolverService {
             redirect,
             listen_addr,
             guard_interval: REDIRECT_GUARD_INTERVAL,
+            recheck: None,
             exemptions: None,
         }
     }
@@ -95,6 +108,15 @@ impl DnsResolverService {
     #[must_use]
     pub fn with_namespace_exemptions(mut self, source: DnsNamespaceExemptionsFn) -> Self {
         self.exemptions = Some(source);
+        self
+    }
+
+    /// Wire the flag a link change raises, so the claimed namespaces are
+    /// re-read at once instead of at the next guard tick. See
+    /// [`NamespaceRecheck`] for why the tick alone is too slow.
+    #[must_use]
+    pub fn with_namespace_recheck(mut self, recheck: NamespaceRecheck) -> Self {
+        self.recheck = Some(recheck);
         self
     }
 
@@ -148,11 +170,20 @@ impl DnsResolverService {
         stop: Arc<AtomicBool>,
         exemptions: Option<DnsNamespaceExemptionsFn>,
         mut applied: Vec<DnsNamespaceExemption>,
+        recheck: Option<NamespaceRecheck>,
     ) {
         let slice = Duration::from_millis(50).min(interval);
         loop {
             let mut waited = Duration::ZERO;
             while waited < interval && !stop.load(Ordering::SeqCst) {
+                // A link change cuts the wait short: the namespaces it may have
+                // claimed are the whole reason this loop exists.
+                if recheck
+                    .as_ref()
+                    .is_some_and(|r| r.swap(false, Ordering::SeqCst))
+                {
+                    break;
+                }
                 std::thread::sleep(slice);
                 waited += slice;
             }
@@ -288,7 +319,12 @@ impl DnsResolverService {
                 // The set arm time installed: the guard starts from it so an
                 // unchanged machine writes nothing on its first tick.
                 let applied = applied.clone();
-                move || Self::guard(redirect, handle, interval, stop, exemptions, applied)
+                let recheck = self.recheck.clone();
+                move || {
+                    Self::guard(
+                        redirect, handle, interval, stop, exemptions, applied, recheck,
+                    )
+                }
             })
             .ok();
 
@@ -605,9 +641,10 @@ impl DnsResolverController {
 mod tests {
     use super::*;
     use crate::dns_resolver::{
-        FactSink, ReconcileOutcome, ResolveError, ResolvedA, RuleHostOracle, SyncReconciler,
-        UpstreamResolver,
+        FactSink, ReconcileOutcome, ResolveError, ResolvedAddresses, RuleHostOracle,
+        SyncReconciler, UpstreamResolver,
     };
+    use nrr_platform_api::dns::AddressFamily;
     use nrr_platform_api::dns_redirect::{RedirectHandle, RedirectState};
     use nrr_platform_api::PlatformError;
     use std::sync::atomic::Ordering;
@@ -623,13 +660,17 @@ mod tests {
     }
     struct DeadUpstream;
     impl UpstreamResolver for DeadUpstream {
-        fn resolve_a(&self, _hostname: &str) -> Result<ResolvedA, ResolveError> {
+        fn resolve(
+            &self,
+            _hostname: &str,
+            _family: AddressFamily,
+        ) -> Result<ResolvedAddresses, ResolveError> {
             Err(ResolveError::NoRecords)
         }
     }
     struct NoopSink;
     impl FactSink for NoopSink {
-        fn record(&self, _hostname: &str, _resolved: &ResolvedA) {}
+        fn record(&self, _hostname: &str, _resolved: &ResolvedAddresses) {}
     }
     struct OkReconciler;
     impl SyncReconciler for OkReconciler {
@@ -787,6 +828,73 @@ mod tests {
         assert_eq!(
             redirect.exempted.lock().unwrap().clone(),
             vec![vec!["branch.corp.example".to_string()]],
+        );
+    }
+
+    /// A link that appears between guard ticks claims its namespace at once.
+    ///
+    /// Without the wake the names inside it resolve through us for up to a
+    /// guard interval, and the client then caches that answer for the negative
+    /// TTL on top — a corporate host stays unreachable long after its VPN was
+    /// ready. Measured on hardware 10.09: link up 13:30:49, namespace conceded
+    /// 13:31:03.
+    #[test]
+    fn a_link_that_appears_between_ticks_is_honoured_at_once() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let redirect = Arc::new(RecordingRedirect::default());
+        let recheck: NamespaceRecheck = Arc::new(AtomicBool::new(false));
+        let claimed = Arc::new(AtomicBool::new(false));
+
+        let source: DnsNamespaceExemptionsFn = {
+            let claimed = Arc::clone(&claimed);
+            Arc::new(move || {
+                if claimed.load(Ordering::SeqCst) {
+                    vec![exemption("branch.corp.example")]
+                } else {
+                    Vec::new()
+                }
+            })
+        };
+
+        let mut applied = Vec::new();
+        // A guard interval far longer than the test: only the wake can end it.
+        let guard = std::thread::spawn({
+            let redirect: Arc<dyn SystemDnsRedirectPort> = redirect.clone();
+            let stop = Arc::clone(&stop);
+            let recheck = Arc::clone(&recheck);
+            move || {
+                DnsResolverService::guard(
+                    redirect,
+                    RedirectHandle {
+                        marker: "test".to_string(),
+                        listener: "127.0.0.1:0".parse().expect("addr"),
+                    },
+                    Duration::from_secs(3600),
+                    stop,
+                    Some(source),
+                    std::mem::take(&mut applied),
+                    Some(recheck),
+                );
+            }
+        });
+
+        claimed.store(true, Ordering::SeqCst);
+        recheck.store(true, Ordering::SeqCst);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !redirect.exempted.lock().expect("lock").is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+        let _ = guard.join();
+
+        assert_eq!(
+            redirect.exempted.lock().expect("lock").clone(),
+            vec![vec!["branch.corp.example".to_string()]],
+            "the wake must not wait out the guard interval"
         );
     }
 

@@ -30,7 +30,7 @@
 //! WFP-block filters apply to **new** connection attempts
 //! (`ALE_AUTH_CONNECT`); already-established flows are not terminated.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::adapters::AdapterAvailability;
 
@@ -69,13 +69,38 @@ impl BlockReason {
 
 // ── Exemption checks ──────────────────────────────────────────────────────────
 
-/// Returns `true` if this IP must never be blocked (loopback or link-local).
+/// Returns `true` if this address must never be blocked (loopback or
+/// link-local), in either family.
 ///
 /// - `127.0.0.0/8` — loopback; system services, IPC, mDNS stub resolvers
 /// - `169.254.0.0/16` — APIPA / link-local; mDNS, LLMNR
-pub fn is_exempt_from_blocking(ip: Ipv4Addr) -> bool {
+/// - `::1/128` — the v6 loopback
+/// - `fe80::/10` — the unicast half of SLAAC/NDP
+/// - `ff02::/16` — link-local multicast: NDP, DAD, MLD, mDNS, LLMNR, DHCPv6 all
+///   address the GROUP, so the unicast exemption above never covers them. It
+///   cannot cross a router, so exempting it leaks nothing.
+///
+/// Takes anything that IS an address so one predicate answers for both
+/// families: a second `_v6` spelling would be a second place to forget a case.
+pub fn is_exempt_from_blocking(ip: impl Into<IpAddr>) -> bool {
+    match ip.into() {
+        IpAddr::V4(v4) => is_exempt_v4(v4),
+        // One address in two spellings must get one answer.
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_exempt_v4(v4),
+            None => is_exempt_v6(v6),
+        },
+    }
+}
+
+fn is_exempt_v4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     o[0] == 127 || (o[0] == 169 && o[1] == 254)
+}
+
+fn is_exempt_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    ip == Ipv6Addr::LOCALHOST || (s[0] & 0xffc0) == 0xfe80 || s[0] == 0xff02
 }
 
 // ── Deterministic filter ID ───────────────────────────────────────────────────
@@ -102,6 +127,47 @@ mod tests {
     fn link_local_169_254_is_always_exempt() {
         assert!(is_exempt_from_blocking(ip(169, 254, 0, 1)));
         assert!(is_exempt_from_blocking(ip(169, 254, 99, 99)));
+    }
+
+    #[test]
+    fn v6_loopback_and_link_local_scopes_are_exempt() {
+        assert!(is_exempt_from_blocking(Ipv6Addr::LOCALHOST));
+        assert!(is_exempt_from_blocking(
+            "fe80::1".parse::<Ipv6Addr>().expect("literal")
+        ));
+        // The top of fe80::/10 — a /16 read of the prefix would miss it.
+        assert!(is_exempt_from_blocking(
+            "febf::1".parse::<Ipv6Addr>().expect("literal")
+        ));
+        assert!(is_exempt_from_blocking(
+            "ff02::fb".parse::<Ipv6Addr>().expect("literal")
+        ));
+    }
+
+    #[test]
+    fn a_mapped_v4_answers_as_its_v4_self() {
+        assert!(is_exempt_from_blocking(
+            "::ffff:127.0.0.1".parse::<Ipv6Addr>().expect("literal")
+        ));
+        assert!(!is_exempt_from_blocking(
+            "::ffff:8.8.8.8".parse::<Ipv6Addr>().expect("literal")
+        ));
+    }
+
+    #[test]
+    fn routable_v6_is_not_exempt() {
+        // fec0::/10 was site-local and is now ordinary space: the /10 mask must
+        // not swallow it.
+        assert!(!is_exempt_from_blocking(
+            "fec0::1".parse::<Ipv6Addr>().expect("literal")
+        ));
+        assert!(!is_exempt_from_blocking(
+            "2001:db8::1".parse::<Ipv6Addr>().expect("literal")
+        ));
+        // Global multicast is not link-scoped.
+        assert!(!is_exempt_from_blocking(
+            "ff0e::1".parse::<Ipv6Addr>().expect("literal")
+        ));
     }
 
     #[test]

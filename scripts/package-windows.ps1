@@ -346,17 +346,15 @@ if (-not $Full) {
 
 # Not `<package>\qml`, despite that being the tidier name: the QML addresses
 # icons as `../../../assets/icons/...`, three levels up from Main.qml. Keeping
-# the same depth as the checkout is what makes those icons resolve; the
-# launcher already looks for this exact path when walking up from the binary.
+# the same depth as the checkout is what makes those icons resolve, and the
+# launcher looks for exactly this path beside the binary.
 Copy-Payload 'apps\desktop\qml' (Join-Path $packageRoot 'apps\desktop\qml')
 Copy-Payload 'locales' (Join-Path $packageRoot 'locales')
 Copy-Payload 'presets' (Join-Path $packageRoot 'presets')
 Copy-Payload 'configs' (Join-Path $packageRoot 'configs')
 Copy-Payload 'assets\icons' (Join-Path $packageRoot 'assets\icons')
-# The startup splash paints the logo lockup before the QML engine loads, and it
-# looks for the file by walking up from the binary. Left out of the package, the
-# splash silently does not appear — which is how a packaged build came to start
-# with several seconds of nothing.
+# The startup splash paints the logo lockup before the QML engine loads; left out
+# of the package, it silently does not appear.
 Copy-Payload 'assets\images' (Join-Path $packageRoot 'assets\images')
 Copy-Payload 'scripts' (Join-Path $packageRoot 'scripts')
 Write-Step 'copied the QML, locales, presets, configs, icons, images and scripts'

@@ -554,7 +554,7 @@ mod tests {
     use nrr_shared::ipc::IpcClientProfile;
     use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
     use nrr_storage::repository::MigrationRunner;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     struct Fx {
         coord: Arc<RoutingPauseCoordinator>,
@@ -758,9 +758,9 @@ mod tests {
 
     fn route_entry(dest: [u8; 4], prefix: u8, next_hop: [u8; 4], ifindex: u32) -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::from(dest),
+            destination: IpAddr::V4(Ipv4Addr::from(dest)),
             prefix_length: prefix,
-            next_hop: Ipv4Addr::from(next_hop),
+            next_hop: IpAddr::V4(Ipv4Addr::from(next_hop)),
             interface_index: ifindex,
             metric: 5,
             is_ours: true,
@@ -873,7 +873,6 @@ mod tests {
                     false,
                     true,
                     true,
-                    false,
                     None,
                     0,
                 )
@@ -926,7 +925,6 @@ mod tests {
                     false,
                     true,
                     true,
-                    false,
                     None,
                     0,
                 )

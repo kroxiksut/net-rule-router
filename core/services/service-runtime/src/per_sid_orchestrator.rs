@@ -73,14 +73,11 @@
 //!   weight map keyed by (SID, role).
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nrr_domain::canonical::CanonicalRuleBook;
-use nrr_platform_api::types::{
-    WfpAction, WfpFilterAction, WfpFilterId, WfpFilterSpec, WfpLayerKey,
-};
+use nrr_platform_api::types::{WfpAction, WfpFilterAction, WfpFilterId, WfpFilterSpec};
 use nrr_platform_api::wfp::{FilterFailureMode, WfpSession};
 use nrr_shared::RouteBehaviorMode;
 
@@ -185,10 +182,6 @@ pub struct PerSidPolicySnapshot {
     pub primary_probe_timeout_ms: u32,
     pub primary_probe_max_targets: u32,
     pub primary_probe_repeat_secs: u32,
-    /// Cut IPv6 while leak protection is on. Free pins IPv4 only, so a host with
-    /// an AAAA record otherwise keeps a second, unpinned way out — the same site
-    /// travelling the tunnel over v4 and the main link over v6.
-    pub block_ipv6_when_protected: bool,
     /// Answer for a newly discovered local network without asking. Off by
     /// default; it suppresses the question, never the record.
     pub local_networks_auto_accept: bool,
@@ -281,13 +274,12 @@ impl RulesProvider for NoopRulesProvider {
 
 // ── Orchestrator state ───────────────────────────────────────────────────────
 
-/// The two switches that decide the SHAPE of a fail-closed set: cut everything
-/// or only the enumerated destinations, and whether the IPv6 family goes with
-/// it. Grouped because they always travel together.
+/// What SHAPE a fail-closed set takes: cut everything, or only the enumerated
+/// destinations. IPv6 is no longer a second switch — a rule host's v6
+/// addresses are enumerated alongside its v4 ones and blocked by name.
 #[derive(Clone, Copy, Debug)]
 struct FailClosedPosture {
     block_all: bool,
-    block_ipv6: bool,
 }
 
 /// Filters the orchestrator currently has installed for one SID.
@@ -464,6 +456,17 @@ pub type FilterFailureModeSource = Arc<dyn Fn() -> FilterFailureMode + Send + Sy
 /// (`kill_switch_exemptions`); tests inject a closure.
 pub type KillSwitchResolver = Arc<dyn Fn(&str) -> Option<KillSwitchResolution> + Send + Sync>;
 
+/// Answers what policy may do about IPv6 for one SID's bindings this pass.
+///
+/// A resolver rather than a value because the answer changes with the links:
+/// a tunnel that comes up carrying IPv6 turns a family that could only be
+/// blocked into one that can be steered. Defaults to
+/// [`Ipv6Guard::Off`][crate::enforcement_planner::Ipv6Guard::Off], which is the
+/// shape from before the family existed; production resolves it through the
+/// route coordinator.
+pub type Ipv6GuardResolver =
+    Arc<dyn Fn(&str) -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
+
 /// resolves the fail-closed exemptions for a SID when the
 /// secondary is unresolvable but a fail-closed kill-switch must still arm.
 /// Returns the primary's local subnets + any cached VPN-server IPs so a
@@ -579,6 +582,11 @@ pub struct PerSidApplyOrchestrator {
     /// for. The per-SID state mutex is not enough: it is taken pointwise, so
     /// two computes interleave between its acquisitions.
     apply_locks: Mutex<std::collections::HashMap<String, Arc<Mutex<()>>>>,
+    /// "Has the stop teardown begun?" A filter added behind it outlives the
+    /// process — the WFP session is non-dynamic, so nothing takes it down when
+    /// we exit. Injected rather than read from the static directly so a test
+    /// can flip it for itself alone.
+    teardown_gate: Arc<dyn Fn() -> bool + Send + Sync>,
     /// Per-SID fingerprint of the last input the neutral-plan shadow compare
     /// actually ran on. The compare re-derives the whole plan and lowers it —
     /// measured at seconds inside a pass that fires every 30 s — to produce one
@@ -618,6 +626,7 @@ pub struct PerSidApplyOrchestrator {
     /// kill-switch off, so the feature is inert until production wires a
     /// real resolver via [`Self::with_kill_switch_resolver`].
     kill_switch_resolver: KillSwitchResolver,
+    ipv6_guard_resolver: Ipv6GuardResolver,
     /// fail-closed exemptions resolver. Used when the
     /// secondary is unresolvable yet the user requested a kill-switch with
     /// the fail-closed posture: mode B then blocks *all* egress except these
@@ -851,16 +860,16 @@ type KillswitchBlockIds = crate::killswitch_drop_registry::ScopedBlockIds;
 /// never qualify — only a BLOCK can be the filter that produced a drop.
 /// App-only blocks are additionally recorded as app-scoped.
 ///
-/// Blocks at a V6 layer are the blanket IPv6 cut and go to `ipv6_cut` INSTEAD:
-/// role verification exists to prove something about the tunnel, and every
-/// consumer of that proof is IPv4-only. Keeping them out also lets the notice
-/// path name the real cause instead of blaming a rule.
+/// A V6 block that names NO destination is the blanket family cut and goes to
+/// `ipv6_cut` INSTEAD: role verification exists to prove something about the
+/// tunnel, and every consumer of that proof is IPv4-only. Keeping it out also
+/// lets the notice path name the real cause instead of blaming a rule. A v6
+/// block that DOES name a destination is an ordinary pin — the criterion is the
+/// destination, not the layer, or a real v6 pin would be reported as "we closed
+/// the family".
 fn collect_block_ids(specs: &[WfpFilterSpec], into: &mut KillswitchBlockIds) {
     for spec in specs.iter().filter(|s| s.action == WfpAction::Block) {
-        if matches!(
-            spec.layer,
-            WfpLayerKey::AleAuthConnectV6 | WfpLayerKey::OutboundIpPacketV6
-        ) {
+        if spec.layer.is_v6() && !names_a_destination(spec) {
             into.ipv6_cut.insert(spec.id.raw);
             continue;
         }
@@ -900,6 +909,47 @@ fn is_app_only_block(spec: &WfpFilterSpec) -> bool {
 }
 
 /// Whether `ip` sits in any of `subnets`, given as `(network, prefix_len)`.
+/// Whether a spec carries any destination condition at all.
+fn names_a_destination(spec: &WfpFilterSpec) -> bool {
+    spec.remote_ip.is_some()
+        || !spec.remote_ip_set.is_empty()
+        || !spec.remote_ip_set_v6.is_empty()
+        || spec.remote_subnet.is_some()
+        || spec.remote_subnet_v6.is_some()
+}
+
+/// The IPv4 half of a mixed-family address list, in order.
+///
+/// Named at every call site that narrows, so the places still waiting for the
+/// other family are a grep away rather than an implicit `match`.
+pub(crate) fn only_v4_of(ips: &[std::net::IpAddr]) -> Vec<std::net::Ipv4Addr> {
+    ips.iter()
+        .filter_map(|ip| match ip {
+            std::net::IpAddr::V4(v4) => Some(*v4),
+            std::net::IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// The protected set minus the tunnel's own endpoints, in either family.
+///
+/// Blocking the address the tunnel dials is how an outage becomes permanent:
+/// the guard arms because the link is gone, and the handshake that would bring
+/// it back is the first thing the guard drops.
+fn exempt_tunnel_servers(
+    protected: &[std::net::IpAddr],
+    exemptions: &FailClosedExemptions,
+) -> Vec<std::net::IpAddr> {
+    protected
+        .iter()
+        .copied()
+        .filter(|ip| match ip {
+            std::net::IpAddr::V4(v4) => !exemptions.bootstrap_server_ips.contains(v4),
+            std::net::IpAddr::V6(v6) => !exemptions.bootstrap_server_ips_v6.contains(v6),
+        })
+        .collect()
+}
+
 fn in_any_subnet(ip: std::net::Ipv4Addr, subnets: &[(std::net::Ipv4Addr, u8)]) -> bool {
     let addr = u32::from(ip);
     subnets.iter().any(|(net, prefix)| {
@@ -1006,6 +1056,7 @@ impl PerSidApplyOrchestrator {
             .unwrap_or_else(|p| p.into_inner())
             .remove(sid);
         crate::enforced_addresses::global_enforced_addresses().forget(sid);
+        crate::ipv6_disposition::global_ipv6_dispositions().forget(sid);
         self.note_block_all_state(sid, false);
         self.note_fail_closed_state(sid, false);
         self.update_killswitch_registry(sid, KillswitchBlockIds::default());
@@ -1155,15 +1206,12 @@ impl PerSidApplyOrchestrator {
         &self,
         sid: &str,
         mode: RouteBehaviorMode,
-        protected_secondary_ips: &[Ipv4Addr],
+        protected_secondary_ips: &[std::net::IpAddr],
         exemptions: &FailClosedExemptions,
         protocols: crate::killswitch_codegen::KillSwitchProtocols,
         posture: FailClosedPosture,
     ) -> Vec<WfpFilterSpec> {
-        let FailClosedPosture {
-            block_all,
-            block_ipv6,
-        } = posture;
+        let FailClosedPosture { block_all } = posture;
         match mode {
             RouteBehaviorMode::PreferPrimary => {
                 // with `kill_switch_block_all` the split-mode
@@ -1184,27 +1232,15 @@ impl PerSidApplyOrchestrator {
                     // exempts bootstrap_server_ips. (The per-app primary exemption
                     // above is the primary deadlock fix; this closes the IP-overlap
                     // corner case as defence-in-depth.)
-                    let protected: Vec<Ipv4Addr> = protected_secondary_ips
-                        .iter()
-                        .copied()
-                        .filter(|ip| !exemptions.bootstrap_server_ips.contains(ip))
-                        .collect();
-                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
+                    // The protected set carries both families now, so a rule
+                    // host's v6 addresses are blocked here by name — where the
+                    // family used to be cut wholesale, taking every unrelated
+                    // v6 destination with it.
+                    let protected: Vec<std::net::IpAddr> =
+                        exempt_tunnel_servers(protected_secondary_ips, exemptions);
+                    crate::killswitch_codegen::fail_closed_block_destinations(
                         sid, &protected, protocols,
-                    );
-                    // The per-IP path is the ONE posture that used to leave IPv6
-                    // wide open: the family is cut while the tunnel is up and was
-                    // un-cut the moment it dropped, so a host whose v4 we had just
-                    // blocked stayed reachable over its AAAA — exactly when the
-                    // guard was supposed to be strictest. The block-all branches
-                    // carry the cut already.
-                    if block_ipv6 {
-                        out.extend(crate::killswitch_codegen::catch_all_v6_filters(
-                            sid,
-                            exemptions.secondary_luid,
-                        ));
-                    }
-                    out
+                    )
                 }
             }
             RouteBehaviorMode::PreferSecondaryWhenAvailable
@@ -1220,21 +1256,11 @@ impl PerSidApplyOrchestrator {
                         sid, exemptions, protocols,
                     )
                 } else {
-                    let protected: Vec<Ipv4Addr> = protected_secondary_ips
-                        .iter()
-                        .copied()
-                        .filter(|ip| !exemptions.bootstrap_server_ips.contains(ip))
-                        .collect();
-                    let mut out = crate::killswitch_codegen::fail_closed_block_destinations(
+                    let protected: Vec<std::net::IpAddr> =
+                        exempt_tunnel_servers(protected_secondary_ips, exemptions);
+                    crate::killswitch_codegen::fail_closed_block_destinations(
                         sid, &protected, protocols,
-                    );
-                    if block_ipv6 {
-                        out.extend(crate::killswitch_codegen::catch_all_v6_filters(
-                            sid,
-                            exemptions.secondary_luid,
-                        ));
-                    }
-                    out
+                    )
                 }
             }
         }
@@ -1375,6 +1401,11 @@ impl PerSidApplyOrchestrator {
             // carried different addresses, and with them different ordinals,
             // so the two plans could not agree on anything downstream.
             secondary_ip_denylist,
+            // The drift check compares the neutral plan with what the live pass
+            // produced, and the live pass is the one that decides whether a link
+            // can carry IPv6. Naming the family here would compare two different
+            // questions.
+            ipv6: crate::enforcement_planner::Ipv6Guard::Off,
         };
         let plan = EnforcementPlan {
             principal,

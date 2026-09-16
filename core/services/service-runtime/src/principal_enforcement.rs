@@ -210,7 +210,10 @@ impl PrincipalEnforcementCycle {
     /// Run one pass. Passes are serialised: see `last_applied`.
     pub fn tick(&self) -> CycleOutcome {
         let mut last = self.last_applied.lock().unwrap_or_else(|p| p.into_inner());
-        if self.stopped.load(Ordering::Acquire) {
+        // The cycle's own stop flag is set by `teardown`, which runs after the
+        // tasks are drained; the process-wide latch flips the moment the stop
+        // is requested. Policy applied between the two outlives the daemon.
+        if self.stopped.load(Ordering::Acquire) || crate::teardown_in_progress() {
             return CycleOutcome::Stopped;
         }
         let active = match self.principals.active_principals() {
@@ -249,6 +252,10 @@ impl PrincipalEnforcementCycle {
 
         let changed = last.as_deref() != Some(plans.as_slice());
 
+        // Planning above is not instant, and a stop can land inside it.
+        if crate::teardown_in_progress() {
+            return CycleOutcome::Stopped;
+        }
         match self.enforcer.enforce(&plans) {
             Ok(report) => {
                 let principals = plans

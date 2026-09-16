@@ -141,10 +141,8 @@ Window {
     /// availability says whether it is up right now.
     function _adapterLabel(row) {
         if (!row) return ""
-        var name = String(row.name || "")
-        var descr = String(row.description || "")
-        var out = name
-        if (descr !== "" && descr !== name) out += " — " + descr
+        // One rule for how an adapter reads, shared with every dialog.
+        var out = Pure.adapterDisplayName(row)
         var state = String(row.availability || "") === "available"
             ? root.tr("interfaces.connectivity.available", "Connected")
             : root.tr("interfaces.connectivity.unavailable", "No connection")

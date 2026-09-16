@@ -136,15 +136,14 @@ fn bare_glob_in_windows_section_is_rejected_at_canonicalize() {
     }
 }
 
-/// An IPv6 address in the IP section is rejected (Free edition only supports IPv4).
+/// An IPv6 address in the IP section is an exact-address rule like any other.
 #[test]
-fn ipv6_address_in_ip_section_is_rejected_at_canonicalize() {
+fn ipv6_address_in_ip_section_is_accepted_at_canonicalize() {
     let outcome = validate_preset_bytes(NEG_IPV6);
     assert!(
         outcome.is_accepted(),
         "IPv6 file must pass byte-level validation"
     );
-
     let parse_outcome = accepted_parse_outcome(outcome);
     let canon = canonicalize_preset_rules(
         &parse_outcome,
@@ -153,18 +152,9 @@ fn ipv6_address_in_ip_section_is_rejected_at_canonicalize() {
         false,
     );
     assert!(
-        !canon.is_accepted(),
-        "IPv6 address must be rejected at canonicalization"
+        canon.is_accepted(),
+        "an IPv6 address is a valid exact-address rule"
     );
-
-    if let PresetRulesCanonicalizeOutcome::Rejected { errors } = &canon {
-        assert!(
-            errors
-                .iter()
-                .any(|e| matches!(e, ValidationError::Ipv6NotSupported { .. })),
-            "expected Ipv6NotSupported error, got: {errors:?}"
-        );
-    }
 }
 
 /// Duplicate domains produce an `AcceptedWithWarnings` outcome; second copy is dropped.

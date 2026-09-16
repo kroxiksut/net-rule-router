@@ -10,10 +10,11 @@
 //! ## How events are generated
 //!
 //! `FwpmEngineSetOption0(FWPM_ENGINE_COLLECT_NET_EVENTS = 1)` turns on net-event
-//! collection; `FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS` adds the
-//! `CLASSIFY_ALLOW` keyword so *permitted* connections are reported too (drops
-//! are reported regardless). The engine then invokes our C-ABI callback on its
-//! own worker threads — there is no `ProcessTrace`-style pump to run.
+//! collection; drops are then reported regardless. Permitted connections need
+//! the `CLASSIFY_ALLOW` keyword on top, which costs one event per permitted
+//! classify of every process on the host — see [`NetEventScope`] for when that
+//! is worth asking for. The engine invokes our C-ABI callback on its own worker
+//! threads — there is no `ProcessTrace`-style pump to run.
 //!
 //! **HW-tuning knob (documented risk):** on hosts where the inbox firewall has
 //! no permit filter that hard-permits a given flow, `CLASSIFY_ALLOW` events may
@@ -153,9 +154,14 @@ pub fn restore_engine_options() {
         .copied()
         .filter(|p| *p != (None, None))
         .or_else(read_prior_options_note);
-    let Some(prior) = prior else {
-        return;
-    };
+    // No record at all, from this process or an earlier one. Put the options
+    // back to the Windows default rather than leave them: an instance that was
+    // killed before this file existed left them on, and reading "already at the
+    // value we want" as "somebody else owns it" is what made the setting stick
+    // for good — every start confirmed it and no stop ever undid it. The write
+    // below still only lands while the option holds what WE write, so a product
+    // that took it over after us is not overwritten.
+    let prior = prior.unwrap_or((Some(0), Some(0)));
     // NOT latched here. Claiming the restore before the engine has even been
     // opened means one failed open — a wedged BFE, the documented reason this
     // project budgets its WFP calls at all — permanently short-circuits every
@@ -193,6 +199,26 @@ pub fn restore_engine_options() {
     clear_prior_options_note();
 }
 
+/// What the machine-wide options should be handed back to when this observer
+/// stops.
+///
+/// `note` is what a PREVIOUS instance recorded before it turned them on, and it
+/// outranks anything read now: finding collection already on almost always
+/// means an instance that was killed never put it back. With no note and
+/// nothing changed, the target is the Windows default (off) rather than
+/// "nothing to do" — reading "already at the value we want" as "somebody else
+/// owns it" is what let the setting stick for good, since every start then
+/// confirmed it and no stop ever undid it. The write is still conditional on
+/// the option holding what WE wrote, so a product that took it over after us is
+/// left alone.
+fn restore_target(
+    note: Option<(Option<u32>, Option<u32>)>,
+    found_collect: Option<u32>,
+    found_keywords: Option<u32>,
+) -> (Option<u32>, Option<u32>) {
+    note.unwrap_or((found_collect.or(Some(0)), found_keywords))
+}
+
 /// Put both options back over an already-open engine handle.
 ///
 /// # Safety
@@ -207,6 +233,22 @@ unsafe fn restore_engine_options_with(engine: HANDLE, prior: (Option<u32>, Optio
     );
 }
 
+/// What this observer asks the Base Filtering Engine to record.
+///
+/// Both settings are MACHINE-WIDE, and the second one is expensive out of all
+/// proportion to what it buys: `CLASSIFY_ALLOW` makes BFE write an event for
+/// every PERMITTED classify of every process on the host.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetEventScope {
+    /// Drops only — reported as soon as collection is on. Everything
+    /// downstream branches on a BLOCK verdict; permitted connections come from
+    /// the ETW backend, which reports every connect with its pid anyway.
+    DropsOnly,
+    /// Drops plus allows. Only worth its cost when nothing else reports
+    /// connections at all — the WFP-only diagnostic backend.
+    DropsAndAllows,
+}
+
 /// A running WFP net-event subscription. Events arrive on WFP's own threads
 /// into [`Self`]'s buffer; [`ConnectionObservationSource::drain`] empties it.
 pub struct WfpConnectionObserver {
@@ -215,6 +257,8 @@ pub struct WfpConnectionObserver {
     events_raw: u64,
     /// Leaked `Arc<Mutex<…>>` ref handed to the callback; reclaimed on drop.
     ctx: *mut c_void,
+    /// One unsubscribe, whoever asks first — the teardown step or `Drop`.
+    stopped: AtomicBool,
 }
 
 // The raw handles are owned solely by this struct (closed once, on drop); the
@@ -224,6 +268,13 @@ unsafe impl Sync for WfpConnectionObserver {}
 
 impl ConnectionObservationSource for WfpConnectionObserver {
     fn drain(&self) -> Vec<ConnectionObservation> {
+        // The attribution below asks the engine about each dropping filter, and
+        // after `shutdown` the handle is closed — a value Windows is free to
+        // hand to the next open in this process. A tick that arrives after the
+        // stop gets nothing rather than a question put to a stranger.
+        if self.stopped.load(Ordering::Acquire) {
+            return Vec::new();
+        }
         let mut out = match self.buffer.lock() {
             Ok(mut g) => std::mem::take(&mut *g),
             Err(_) => Vec::new(),
@@ -256,7 +307,7 @@ impl WfpConnectionObserver {
     /// Open a WFP engine, enable net-event collection (drops + allows), and
     /// subscribe. Returns an error (and leaves nothing running) on any setup
     /// failure — the caller degrades to no connection observation.
-    pub fn start() -> Result<Self, PlatformError> {
+    pub fn start(scope: NetEventScope) -> Result<Self, PlatformError> {
         let buffer: Buffer = Arc::new(Mutex::new(Vec::new()));
 
         // ── Open a dedicated engine session for the subscription lifetime. ──
@@ -288,23 +339,48 @@ impl WfpConnectionObserver {
         // machine back the way it was found.
         // SAFETY: each call passes a stack `FWP_VALUE0` (UINT32) by const ptr,
         // valid for the call; `engine` is the just-opened handle.
-        let (prior_collect, opt1) =
+        // What a previous instance found before IT turned these on. It outranks
+        // what we read now: finding them already on usually means an instance
+        // that was killed never put them back, not that another product owns
+        // them.
+        let note = read_prior_options_note();
+        let (found_collect, opt1) =
             unsafe { set_uint32_option_restorable(engine, FWPM_ENGINE_COLLECT_NET_EVENTS, 1) };
-        let (prior_keywords, opt2) = unsafe {
-            set_uint32_option_restorable(
-                engine,
-                FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
-                FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
-            )
+        let (found_keywords, opt2) = match scope {
+            NetEventScope::DropsAndAllows => unsafe {
+                set_uint32_option_restorable(
+                    engine,
+                    FWPM_ENGINE_NET_EVENT_MATCH_ANY_KEYWORDS,
+                    FWPM_NET_EVENT_KEYWORD_CLASSIFY_ALLOW,
+                )
+            },
+            NetEventScope::DropsOnly => (None, 0),
         };
-        let _ = PRIOR_ENGINE_OPTIONS.set((prior_collect, prior_keywords));
-        if (prior_collect, prior_keywords) != (None, None) {
-            write_prior_options_note((prior_collect, prior_keywords));
-        }
+        // Record the dependency even when we changed nothing: a note is the
+        // only thing that lets a later `cleanup` — or the next start — undo a
+        // change made by an instance that is long gone.
+        let prior = restore_target(note, found_collect, found_keywords);
+        // Say it out loud: the alternative is reading a file only SYSTEM can
+        // open to find out whether a stop will hand the machine back.
+        tracing::info!(
+            target: "nrr::conn-observe",
+            source = if note.is_some() {
+                "note-from-an-earlier-instance"
+            } else if found_collect.is_some() {
+                "we-changed-it"
+            } else {
+                "found-on-with-nothing-recorded"
+            },
+            collect_restores_to = prior.0,
+            keywords_restore_to = prior.1,
+            "machine-wide net-event options: what the stop will hand back",
+        );
+        let _ = PRIOR_ENGINE_OPTIONS.set(prior);
+        write_prior_options_note(prior);
         if opt1 != 0 || opt2 != 0 {
             // SAFETY: `engine` is open; undo whatever did take, then close.
             unsafe {
-                restore_engine_options_with(engine, (prior_collect, prior_keywords));
+                restore_engine_options_with(engine, prior);
                 let _ = FwpmEngineClose0(engine);
             }
             let code = if opt1 != 0 { opt1 } else { opt2 };
@@ -344,7 +420,7 @@ impl WfpConnectionObserver {
                 drop(Arc::from_raw(
                     ctx as *const Mutex<Vec<ConnectionObservation>>,
                 ));
-                restore_engine_options_with(engine, (prior_collect, prior_keywords));
+                restore_engine_options_with(engine, prior);
                 let _ = FwpmEngineClose0(engine);
             }
             return Err(PlatformError::Win32 {
@@ -363,6 +439,7 @@ impl WfpConnectionObserver {
             engine_raw: engine.0 as usize as u64,
             events_raw: events_handle.0 as usize as u64,
             ctx,
+            stopped: AtomicBool::new(false),
         })
     }
 }
@@ -408,8 +485,18 @@ fn resolve_owner(engine: HANDLE, fid: u64) -> Option<(bool, Option<u64>)> {
     Some((is_ours, spec_id))
 }
 
-impl Drop for WfpConnectionObserver {
-    fn drop(&mut self) {
+impl WfpConnectionObserver {
+    /// Unsubscribe, hand the machine-wide engine options back and close the
+    /// engine — without waiting for `Drop`.
+    ///
+    /// `Drop` is not something the stop path may rely on: the consumer threads
+    /// hold their own `Arc` to this source, and a source still referenced when
+    /// the process exits is never dropped. A live subscription at exit leaves
+    /// BFE calling into a dead process, and the options on.
+    pub fn shutdown(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let engine = HANDLE(self.engine_raw as usize as *mut c_void);
         let events = HANDLE(self.events_raw as usize as *mut c_void);
         // Order is load-bearing: stop the callback first, so no event arrives
@@ -433,6 +520,16 @@ impl Drop for WfpConnectionObserver {
                 self.ctx as *const Mutex<Vec<ConnectionObservation>>,
             ));
         }
+        tracing::info!(
+            target: "nrr::conn-observe",
+            "WFP net-event connection observer stopped",
+        );
+    }
+}
+
+impl Drop for WfpConnectionObserver {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -689,5 +786,27 @@ mod tests {
     fn zero_filetime_is_none() {
         let ft = windows::Win32::Foundation::FILETIME::default();
         assert_eq!(filetime_to_unix_ms(&ft), None);
+    }
+
+    /// Net-event collection found already on, with nothing recorded: that is an
+    /// instance of ours that was killed, not another product's setting. Taking
+    /// it for foreign is what left BFE recording every classify on the host for
+    /// months — each start confirmed the value and no stop ever undid it.
+    #[test]
+    fn collection_found_already_on_is_still_handed_back() {
+        assert_eq!(restore_target(None, None, None), (Some(0), None));
+    }
+
+    /// A note from an instance that never got to run its own restore outranks
+    /// what this one reads now.
+    #[test]
+    fn a_note_from_an_earlier_instance_outranks_what_we_read() {
+        let note = Some((Some(0), Some(0)));
+        assert_eq!(restore_target(note, None, None), (Some(0), Some(0)));
+    }
+
+    #[test]
+    fn what_we_actually_changed_is_what_goes_back() {
+        assert_eq!(restore_target(None, Some(0), Some(7)), (Some(0), Some(7)));
     }
 }

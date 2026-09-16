@@ -17,8 +17,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
-use std::process::{Command, Stdio};
 
 /// Outcome of attempting to spawn the elevated broker.
 #[derive(Debug)]
@@ -58,8 +56,12 @@ fn random_hex(n_bytes: usize) -> Result<String, io::Error> {
 /// Directory the broker uses for its temp artefacts (token file). Created
 /// on demand; lives under the per-user temp root so default ACLs already
 /// keep other interactive users out.
+///
+/// On Windows the root is the one the shell names, not `%TEMP%`: the elevated
+/// broker inherits this user's environment, and a planted `%TEMP%` would point
+/// an administrator's read and delete at a directory of the user's choosing.
 pub fn broker_temp_dir() -> PathBuf {
-    std::env::temp_dir().join("NetRuleRouter")
+    handoff::dir()
 }
 
 /// Write the nonce to a freshly named token file and return its path. The
@@ -84,27 +86,18 @@ pub fn write_token_file(launcher_pid: u32, suffix: &str, nonce: &str) -> io::Res
     Ok(path)
 }
 
-/// Absolute path of the system PowerShell.
-///
-/// `%SystemRoot%` rather than a literal `C:\Windows`: the directory is where
-/// Windows says it is, and the fallback is only for an environment that has
-/// been stripped of it.
-#[cfg(windows)]
-fn system_powershell() -> std::path::PathBuf {
-    let root = std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    root.join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe")
-}
-
-/// Read and consume (delete) the nonce token file. Called by the broker on
-/// startup. Deletion is best-effort — a leftover empty file is harmless.
+/// Read and consume (delete) the nonce token file. Called by the ELEVATED
+/// broker on a path inside a directory its unprivileged user controls, so a
+/// link swapped in while the UAC prompt is up must not turn this into an
+/// administrator's read or delete elsewhere. Deletion is best-effort.
 pub fn read_and_delete_token_file(path: &Path) -> io::Result<String> {
-    let nonce = std::fs::read_to_string(path)?.trim().to_string();
-    let _ = std::fs::remove_file(path);
+    if !is_token_file_path(path) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a broker token file: {}", path.display()),
+        ));
+    }
+    let nonce = handoff::take(path)?.trim().to_string();
     if nonce.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -112,6 +105,61 @@ pub fn read_and_delete_token_file(path: &Path) -> io::Result<String> {
         ));
     }
     Ok(nonce)
+}
+
+/// Whether `path` has the shape [`write_token_file`] gives it. Narrows what a
+/// redirected path could ever name to a token-shaped file in our directory.
+fn is_token_file_path(path: &Path) -> bool {
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with("broker-") && n.ends_with(".token"));
+    let in_our_dir = path.parent().and_then(Path::file_name) == broker_temp_dir().file_name();
+    path.is_absolute() && named && in_our_dir
+}
+
+#[cfg(windows)]
+mod handoff {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    /// Falls back to `%TEMP%` only when the shell cannot name the folder at
+    /// all — a machine in that state has no better answer to offer.
+    pub fn dir() -> PathBuf {
+        nrr_platform_windows::pinned_file::handoff_dir().unwrap_or_else(|_| {
+            std::env::temp_dir().join(nrr_shared::product_identity::PRODUCT_NAME)
+        })
+    }
+
+    pub fn take(path: &Path) -> io::Result<String> {
+        let root = nrr_platform_windows::pinned_file::user_temp_root()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        nrr_platform_windows::pinned_file::take(&root, path)
+    }
+}
+
+#[cfg(not(windows))]
+mod handoff {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    pub fn dir() -> PathBuf {
+        std::env::temp_dir().join(nrr_shared::product_identity::PRODUCT_NAME)
+    }
+
+    pub fn take(path: &Path) -> io::Result<String> {
+        for p in [path.parent().unwrap_or(path), path] {
+            if std::fs::symlink_metadata(p)?.file_type().is_symlink() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("token path is a link: {}", p.display()),
+                ));
+            }
+        }
+        let text = std::fs::read_to_string(path)?;
+        let _ = std::fs::remove_file(path);
+        Ok(text)
+    }
 }
 
 /// Spawn the elevated broker via PowerShell `Start-Process -Verb RunAs`
@@ -123,45 +171,24 @@ pub fn read_and_delete_token_file(path: &Path) -> io::Result<String> {
 /// elevated verb goes through `platform-api::elevation` instead.
 #[cfg(windows)]
 pub fn spawn_elevated_broker(exe: &Path, argv: &[String]) -> SpawnOutcome {
-    let exe_ps = ps_single_quote(&exe.to_string_lossy());
-    let arg_list = argv
-        .iter()
-        .map(|a| ps_single_quote(a))
-        .collect::<Vec<_>>()
-        .join(",");
-    // `-Wait` is deliberately absent: the broker must survive this call.
-    // `$ErrorActionPreference='Stop'` + `-NonInteractive` makes a declined
-    // UAC (ERROR_CANCELLED) surface as a non-zero PowerShell exit code.
-    let command = format!(
-        "$ErrorActionPreference='Stop'; \
-         Start-Process -FilePath {exe_ps} -ArgumentList @({arg_list}) -Verb RunAs"
-    );
-    // Absolute, never the bare name. This is the process that RAISES the UAC
-    // prompt, so which binary answers to "powershell" decides what the user is
-    // about to approve — and a bare name is resolved against a PATH that any
-    // process of this user can prepend to.
-    let mut cmd = Command::new(system_powershell());
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let command = nrr_platform_windows::elevation::start_elevated_script(exe, argv);
+    // Absolute, never the bare name: this process RAISES the UAC prompt, and a
+    // bare name resolves against a PATH any process of this user can prepend to.
+    let mut cmd = Command::new(nrr_platform_windows::system_shell::system_powershell());
     cmd.args(["-NoProfile", "-NonInteractive", "-Command", &command])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     match cmd.status() {
         Ok(status) if status.success() => SpawnOutcome::Launched,
         // Non-zero exit overwhelmingly means the user dismissed UAC.
         Ok(_) => SpawnOutcome::Declined,
         Err(e) => SpawnOutcome::Failed(format!("spawn powershell: {e}")),
     }
-}
-
-/// Quote a string as a PowerShell single-quoted literal (doubling embedded
-/// single quotes). Prevents injection through the `-Command` string.
-fn ps_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
 }
 
 #[cfg(test)]
@@ -181,9 +208,14 @@ mod tests {
     }
 
     #[test]
-    fn ps_single_quote_doubles_embedded_quotes() {
-        assert_eq!(ps_single_quote("C:/a/b.exe"), "'C:/a/b.exe'");
-        assert_eq!(ps_single_quote("it's"), "'it''s'");
+    fn a_path_not_shaped_like_a_token_is_refused_untouched() {
+        let dir = broker_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("broker-shape-test.txt");
+        std::fs::write(&path, "nonce").unwrap();
+        assert!(read_and_delete_token_file(&path).is_err());
+        assert!(path.exists(), "a refused path must not be deleted");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

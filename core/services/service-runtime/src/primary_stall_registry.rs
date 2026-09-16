@@ -4,7 +4,8 @@
 //! ## The gap this closes
 //!
 //! The connection observer already reports how each named destination fares on
-//! the primary route: a resent segment is a stall, an orderly close is a
+//! the primary route: a connection still resending after a retransmission
+//! timeout is a stall, an orderly close is a
 //! completion ([`nrr_domain::companion_affinity::PrimaryHealthEvent`]). Until
 //! now the only consumer was the companion-affinity ledger, and it keeps that
 //! evidence solely for hosts it already tracks as CANDIDATES — a companion of a
@@ -51,19 +52,10 @@ pub const ENTRY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 /// TTL window, and the point is only that the map cannot grow with traffic.
 pub const MAX_HOSTS: usize = 4096;
 
-/// Whether early teardowns count towards the verdict here.
-///
-/// They do not, matching the companion ledger's default: a connection killed
-/// right after the handshake has causes of its own (a server closing an idle
-/// keep-alive), and this registry exists to find the silent-drop case, where
-/// nothing answers at all.
-const COUNT_CUTS: bool = false;
-
 /// What was seen for one hostname on the main link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tally {
     stalls: u32,
-    cuts: u32,
     completions: u32,
     last_seen: Instant,
     /// The verdict already reported, so a steady state is not re-logged on
@@ -75,7 +67,6 @@ impl Tally {
     fn new(now: Instant) -> Self {
         Self {
             stalls: 0,
-            cuts: 0,
             completions: 0,
             last_seen: now,
             reported: None,
@@ -83,11 +74,19 @@ impl Tally {
     }
 
     fn behavior(&self) -> PrimaryBehavior {
-        primary_behavior_from(
-            self.completions,
-            self.stalls,
-            if COUNT_CUTS { self.cuts } else { 0 },
-        )
+        primary_behavior_from(self.completions, self.stalls)
+    }
+
+    /// What this name contributes to a subtree verdict. Anything completed
+    /// counts as carried: a self-signed offer claims the main link will not
+    /// carry the host, and one finished connection refutes that however many
+    /// stalled beside it.
+    fn subtree_behavior(&self) -> PrimaryBehavior {
+        if self.completions > 0 {
+            PrimaryBehavior::Responds
+        } else {
+            self.behavior()
+        }
     }
 }
 
@@ -164,7 +163,6 @@ impl PrimaryStallRegistry {
         entry.last_seen = now;
         match event {
             PrimaryHealthEvent::Stalled => entry.stalls = entry.stalls.saturating_add(1),
-            PrimaryHealthEvent::Cut => entry.cuts = entry.cuts.saturating_add(1),
             PrimaryHealthEvent::Completed => {
                 entry.completions = entry.completions.saturating_add(1)
             }
@@ -208,6 +206,8 @@ impl PrimaryStallRegistry {
     /// Merging follows [`PrimaryBehavior::merge`]'s rule, which the companion
     /// ledger already applies to a suffix proposal: one failing member makes
     /// the whole offer failing, and only unanimity the other way makes it work.
+    /// A member that completed anything counts as working (see
+    /// `Tally::subtree_behavior`).
     #[must_use]
     pub fn behavior_of_subtree(&self, hostname: &str) -> PrimaryBehavior {
         let suffix = format!(".{hostname}");
@@ -216,7 +216,7 @@ impl PrimaryStallRegistry {
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .filter(|(host, _)| *host == hostname || host.ends_with(&suffix))
-            .map(|(_, tally)| tally.behavior())
+            .map(|(_, tally)| tally.subtree_behavior())
             .fold(PrimaryBehavior::Unknown, PrimaryBehavior::merge)
     }
 
@@ -274,11 +274,6 @@ pub fn log_report(report: &StallReport) {
             hostname = %report.hostname,
             stalls = report.stalls,
             "destination does not answer on the main link — connections start and nothing comes back",
-        ),
-        PrimaryBehavior::Cut => tracing::info!(
-            target: "nrr::primary-stall",
-            hostname = %report.hostname,
-            "destination is answered and then cut on the main link",
         ),
         PrimaryBehavior::Responds => tracing::debug!(
             target: "nrr::primary-stall",
@@ -364,6 +359,26 @@ mod tests {
             .note("host.example", PrimaryHealthEvent::Completed)
             .expect("verdict changed");
         assert_eq!(mixed.behavior, PrimaryBehavior::Unknown);
+    }
+
+    /// The field case: a CDN name stalled in one loss burst and then finished
+    /// its transfer. Its own evidence points both ways, but the offer built on
+    /// it claimed the main link will not carry it — and that is refuted.
+    #[test]
+    fn a_name_that_completed_after_stalling_no_longer_holds_its_offer() {
+        let reg = PrimaryStallRegistry::new();
+        stall(&reg, "img.cdn.example", 3).expect("stalls");
+        assert_eq!(
+            reg.behavior_of_subtree("cdn.example"),
+            PrimaryBehavior::Stalls
+        );
+
+        reg.note("img.cdn.example", PrimaryHealthEvent::Completed);
+        assert_eq!(reg.behavior_of("img.cdn.example"), PrimaryBehavior::Unknown);
+        assert_eq!(
+            reg.behavior_of_subtree("cdn.example"),
+            PrimaryBehavior::Responds
+        );
     }
 
     /// A rule is written as a suffix, so the question it poses is about the

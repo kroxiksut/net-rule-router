@@ -16,57 +16,6 @@ GroupBox {
     readonly property var diagCtx: root.context.diagnosticsSettings || {}
     readonly property var modeState: diagCtx.diagnosticMode || {}
 
-    // ISP block-page rule suggestions. GLOBAL service setting, read/written
-    // via the same stability RPC as the Routing panel's toggles.
-    property bool ispBlockCandidatesEnabled: false
-    function _refreshIspBlockCandidatesEnabled() {
-        if (typeof root._readServiceMirror === "function") {
-            var stability = root._readServiceMirror()["stability"] || {}
-            if (stability["isp-block-candidates-enabled"] !== undefined)
-                group.ispBlockCandidatesEnabled =
-                    stability["isp-block-candidates-enabled"] === true
-        }
-        var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
-                || typeof bridge.rpcServiceStabilityConfigGet !== "function")
-            return
-        var corr = bridge.rpcServiceStabilityConfigGet()
-        root.rpc.registerRpcCallback(corr, function(ok, payload) {
-            if (!ok) return
-            group.ispBlockCandidatesEnabled =
-                (payload && payload["isp-block-candidates-enabled"]) === true
-            if (typeof root._rememberServiceValues === "function")
-                root._rememberServiceValues("stability",
-                    { "isp-block-candidates-enabled": group.ispBlockCandidatesEnabled })
-        })
-    }
-    Component.onCompleted: group._refreshIspBlockCandidatesEnabled()
-
-    // Read-modify-write the WHOLE service-stability config, mutating ONLY
-    // isp-block-candidates-enabled (Set is a full-config write — omitting a
-    // field resets it to its default). Global, admin-gated.
-    function _applyIspBlockCandidatesEnabled(want) {
-        var v = (want === true)
-        root.applyServiceStabilityPatch({ "isp-block-candidates-enabled": v },
-            function(ok, code, payload) {
-                if (ok) {
-                    if (payload && payload["isp-block-candidates-enabled"] !== undefined)
-                        group.ispBlockCandidatesEnabled =
-                            payload["isp-block-candidates-enabled"] === true
-                    root.statusLine = group.ispBlockCandidatesEnabled
-                        ? root.tr("status.isp-block-candidates-on",
-                            "ISP block-page rule suggestions are on.")
-                        : root.tr("status.isp-block-candidates-off",
-                            "ISP block-page rule suggestions are off.")
-                    return
-                }
-                root.statusLine = root.tr("status.isp-block-candidates-failed",
-                    "Could not change the ISP block-page rule suggestions setting: ")
-                    + ((typeof root.ipcErrorLabel === "function") ? root.ipcErrorLabel(code) : code)
-                group._refreshIspBlockCandidatesEnabled()
-            }, "user:isp-block-candidates-enabled")
-    }
-
     function formatRemaining(ms) {
         var n = Number(ms || 0)
         if (!isFinite(n) || n <= 0) return "-"
@@ -169,53 +118,6 @@ GroupBox {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.detailed-mode.note",
                         "Shows manual switches for individual DNS and address-routing mechanisms under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for those mechanisms and keeps this screen simple.")
-                    color: root.mutedTextColor
-                    wrapMode: Text.WordWrap
-                }
-            }
-        }
-
-        // ISP block-page rule suggestions. Working end to end, but not yet
-        // verified on a live machine — hence the badge and living here.
-        Frame {
-            Layout.fillWidth: true
-            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
-            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
-            ColumnLayout {
-                anchors.fill: parent
-                spacing: root.uiTheme.spacingSm
-                RowLayout {
-                    Layout.fillWidth: true
-                    spacing: root.uiTheme.spacingSm
-                    CheckBox {
-                        id: ispBlockCandidatesCheck
-                        text: root.tr("settings.experimental.isp-block-candidates.label",
-                            "Suggest a rule when a site is blocked by your provider")
-                        checked: group.ispBlockCandidatesEnabled
-                        Accessible.role: Accessible.CheckBox
-                        Accessible.name: text
-                        Accessible.description: root.tr("settings.experimental.in-development",
-                            "In development")
-                        contentItem: Label {
-                            text: ispBlockCandidatesCheck.text
-                            leftPadding: ispBlockCandidatesCheck.indicator.width + ispBlockCandidatesCheck.spacing
-                            color: root.textColor
-                            wrapMode: Text.WordWrap
-                            verticalAlignment: Text.AlignVCenter
-                        }
-                        onToggled: group._applyIspBlockCandidatesEnabled(checked)
-                    }
-                    Label {
-                        text: root.tr("settings.experimental.in-development", "In development")
-                        color: root.uiTheme.colorAccent
-                        font.bold: true
-                    }
-                    Item { Layout.fillWidth: true }
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.tr("settings.experimental.isp-block-candidates.note",
-                        "When a site will not open because your internet provider is blocking it, NetRuleRouter offers to move that site to your additional route instead of leaving it unreachable.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }

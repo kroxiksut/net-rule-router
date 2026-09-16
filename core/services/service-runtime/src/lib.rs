@@ -58,6 +58,7 @@ pub mod activation_coordinator;
 pub mod active_sid_registry;
 pub mod app_destination_memory;
 pub mod app_enforcement_status;
+pub mod app_main_link_reach;
 pub mod app_observation_lookup;
 /// Companion-domain discovery — learns the hosts a routed site
 /// needs and, depending on the user's `auto_rules_mode`, offers or applies them.
@@ -100,8 +101,8 @@ pub mod health;
 pub mod ipc;
 pub mod ipc_handlers;
 pub mod ipc_push;
+pub mod ipv6_disposition;
 pub mod ipv6_route_log;
-pub mod isp_block_page_learner;
 pub mod killswitch_codegen;
 pub mod killswitch_drop_registry;
 pub mod known_direct;
@@ -163,6 +164,7 @@ pub mod route_coordinator;
 /// mechanisms, so they cannot disagree about it.
 pub mod address_ownership;
 pub mod catch_all_exemptions;
+pub mod recompute_coalescer;
 pub mod route_apply;
 pub mod route_reconciler;
 pub mod routed_host_flow_refresh;

@@ -122,9 +122,13 @@ $isAdmin = (
 # `cleanup` call would skip every step past the first.
 if (-not $isAdmin) {
     Write-Host "Elevating via UAC..." -ForegroundColor Cyan
-    $argv = @('-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Profile', $Profile)
-    if ($Reboot) { $argv += '-Reboot' }
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argv -Verb RunAs -Wait -PassThru
+    # One pre-quoted string: Windows PowerShell joins an -ArgumentList array with
+    # bare spaces, which splits a script path containing a space.
+    $argv = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Profile $Profile"
+    if ($Reboot) { $argv += ' -Reboot' }
+    # Absolute: a bare name resolves against a PATH the user can prepend to.
+    $powershell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
+    $p = Start-Process -FilePath $powershell -ArgumentList $argv -Verb RunAs -Wait -PassThru
     exit $p.ExitCode
 }
 

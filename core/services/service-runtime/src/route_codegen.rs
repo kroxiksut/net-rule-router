@@ -31,7 +31,7 @@
 //! global table.
 
 use std::collections::{BTreeSet, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_domain::canonical::{
     CanonicalAddressMatch, CanonicalAppPattern, CanonicalRuleBook, CanonicalRuleSet,
@@ -43,7 +43,7 @@ use crate::address_ownership::AppDestinationRefusal;
 use crate::app_observation_lookup::AppObservationLookup;
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 use crate::net_filter::is_non_routable_v4;
-use crate::wfp_codegen::{PER_HOSTNAME_IP_CAP, SUFFIX_FANOUT_BACKSTOP};
+use crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP;
 
 /// Upper bound on routes emitted for a single rule, so a pathological
 /// suffix fan-out cannot flood the route table.  — raised 256 →
@@ -56,6 +56,9 @@ pub const MAX_ROUTES_PER_RULE: usize = 4096;
 /// Prefix length of a host route — the shape every address rule fans out to.
 pub const HOST_PREFIX: u8 = 32;
 
+/// The same shape in IPv6.
+pub const HOST_PREFIX_V6: u8 = 128;
+
 /// Whether `prefix_length` is a shape THIS codegen emits.
 ///
 /// Startup orphan adoption identifies our leftovers by metric plus shape, and
@@ -65,12 +68,21 @@ pub const HOST_PREFIX: u8 = 32;
 /// no longer there, and nothing reclaimed the table. Derived from the overlay
 /// constants rather than restated, and pinned by a test that generates every
 /// mode and asserts each emitted shape is recognised here.
+/// The FAMILY is part of the shape. `/32` in IPv6 is a prefix, not a host
+/// route, so a family-blind answer adopts a stranger and hands the reconciler
+/// a route to delete that was never ours. Only host routes are emitted over
+/// IPv6 — the overlay halves and the counter-overlay are IPv4 mechanisms.
 #[must_use]
-pub fn is_owned_prefix_length(prefix_length: u8) -> bool {
-    prefix_length == HOST_PREFIX
-        || prefix_length == OVERLAY_LOW.1
-        || prefix_length == OVERLAY_HIGH.1
-        || COUNTER_OVERLAY.iter().any(|(_, p)| *p == prefix_length)
+pub fn is_owned_shape(destination: IpAddr, prefix_length: u8) -> bool {
+    match destination {
+        IpAddr::V4(_) => {
+            prefix_length == HOST_PREFIX
+                || prefix_length == OVERLAY_LOW.1
+                || prefix_length == OVERLAY_HIGH.1
+                || COUNTER_OVERLAY.iter().any(|(_, p)| *p == prefix_length)
+        }
+        IpAddr::V6(_) => prefix_length == HOST_PREFIX_V6,
+    }
 }
 
 /// Metric for our secondary routes. Low = preferred over the default
@@ -154,13 +166,19 @@ fn prefix_mask(n: u8) -> u32 {
 pub fn tunnel_catch_all_prefixes(routes: &[RouteEntry], ifindex: u32) -> Vec<(Ipv4Addr, u8)> {
     let mut out: Vec<(Ipv4Addr, u8)> = routes
         .iter()
-        .filter(|r| {
+        .filter_map(|r| match r.destination {
+            // The tunnel catch-all it feeds is an IPv4 construction
+            // (`0.0.0.0/1` + `128.0.0.0/1`), so only v4 rows inform it.
+            IpAddr::V4(d) => Some((r, d)),
+            IpAddr::V6(_) => None,
+        })
+        .filter(|(r, d)| {
             r.interface_index == ifindex
                 && !r.is_ours
                 && r.prefix_length <= TUNNEL_CATCH_ALL_MAX_PREFIX
-                && r.destination.octets()[0] < 224
+                && d.octets()[0] < 224
         })
-        .map(|r| (r.destination, r.prefix_length))
+        .map(|(r, d)| (d, r.prefix_length))
         .collect();
     out.sort_unstable_by_key(|&(d, n)| (u32::from(d), n));
     out.dedup();
@@ -179,6 +197,14 @@ const TUNNEL_CATCH_ALL_MAX_PREFIX: u8 = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecondaryRouteTarget {
     pub gateway: Ipv4Addr,
+    /// The IPv6 next hop out of the same interface, when it has one.
+    ///
+    /// `None` means this link carries no IPv6 forwarding path, and it is what
+    /// keeps a `/128` out of the table: a host route through a link that
+    /// cannot deliver the family is a black hole, which the user reads as a
+    /// hung site rather than as protection. `Some(::)` is the on-link form a
+    /// peerless tunnel uses, exactly as `0.0.0.0` is on the IPv4 side.
+    pub gateway_v6: Option<Ipv6Addr>,
     pub interface_index: u32,
 }
 
@@ -235,7 +261,7 @@ pub enum RouteCodegenDiagnostic {
     /// hundreds and a line each would bury the log.
     AddressClaimedByMainLink {
         rule_id: String,
-        ip: Ipv4Addr,
+        ip: IpAddr,
         count: usize,
     },
     /// a mode wanted to send some traffic to the **primary**
@@ -269,7 +295,7 @@ pub fn generate_secondary_routes(
     link: crate::address_ownership::Link,
 ) -> RouteCodegenOutput {
     let mut out = RouteCodegenOutput::default();
-    let mut seen: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    let mut seen: BTreeSet<IpAddr> = BTreeSet::new();
     // Ownership and the outside-use census are asked as one question, through
     // the one gate every mechanism shares.
     let gate = crate::address_ownership::AppDestinationGate::for_rule_set(
@@ -372,7 +398,9 @@ pub fn generate_secondary_routes(
                 if denied.contains(&ip) {
                     continue;
                 }
-                if !push_route(ip, target, &mut seen, &mut out, &mut per_rule) {
+                // App observations are IPv4: nothing records a v6 destination
+                // for a process yet.
+                if !push_route(IpAddr::V4(ip), target, &mut seen, &mut out, &mut per_rule) {
                     break;
                 }
             }
@@ -381,19 +409,19 @@ pub fn generate_secondary_routes(
         let mut per_rule = 0usize;
         // An address this rule may not steer — the other link's address rules
         // name it too. Held back rather than pinned, reported once per rule.
-        let mut held: Option<(Ipv4Addr, usize)> = None;
-        let steerable = |ip: Ipv4Addr| ownership.address_rule_may_steer(ip, link);
+        let mut held: Option<(IpAddr, usize)> = None;
+        let steerable = |ip: IpAddr| ownership.address_rule_may_steer(ip, link);
         match &rule.address_match {
             Some(CanonicalAddressMatch::ExactIp(ip)) => {
-                if steerable(*ip) {
-                    push_route(*ip, target, &mut seen, &mut out, &mut per_rule);
+                let ip = *ip;
+                if steerable(ip) {
+                    push_route(ip, target, &mut seen, &mut out, &mut per_rule);
                 } else {
-                    note_held(&mut held, *ip);
+                    note_held(&mut held, ip);
                 }
             }
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
-                let ips = cache.ips_for_hostname(host);
-                if ips.is_empty() {
+                if cache.ips_for_hostname(host).is_empty() {
                     out.diagnostics
                         .push(RouteCodegenDiagnostic::HostnameUnresolved {
                             rule_id: rule.id.as_str().to_string(),
@@ -401,7 +429,17 @@ pub fn generate_secondary_routes(
                         });
                     continue;
                 }
-                for ip in ips.into_iter().take(PER_HOSTNAME_IP_CAP) {
+                // Both families, capped per family — the same view of the host
+                // the filter codegen pins. The family GATE is not asked here:
+                // whether a route may be installed is a question about the
+                // link, and `push_route` answers it from the link's own next
+                // hop. Asking the guard as well would be two answers to one
+                // question, and they could disagree.
+                for ip in crate::enforcement_planner::capped_for_host(
+                    cache,
+                    host,
+                    crate::enforcement_planner::FamilyScope::Both,
+                ) {
                     if !steerable(ip) {
                         note_held(&mut held, ip);
                         continue;
@@ -470,7 +508,7 @@ pub fn generate_secondary_routes(
 
 /// Record one held-back address: the first is kept as the example, all of them
 /// count.
-fn note_held(held: &mut Option<(Ipv4Addr, usize)>, ip: Ipv4Addr) {
+fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
     match held {
         Some((_, count)) => *count += 1,
         None => *held = Some((ip, 1)),
@@ -623,9 +661,9 @@ pub fn dns_via_secondary_routes(
         .copied()
         .filter(|ip| !is_non_routable_v4(ip))
         .map(|ip| RouteEntry {
-            destination: ip,
+            destination: IpAddr::V4(ip),
             prefix_length: 32,
-            next_hop: target.gateway,
+            next_hop: IpAddr::V4(target.gateway),
             interface_index: target.interface_index,
             metric: SECONDARY_ROUTE_METRIC,
             is_ours: true,
@@ -637,9 +675,9 @@ pub fn dns_via_secondary_routes(
 /// Build one overlay route (`0.0.0.0/1` or `128.0.0.0/1`) via `target`.
 fn overlay_route((dest, prefix): (Ipv4Addr, u8), target: &SecondaryRouteTarget) -> RouteEntry {
     RouteEntry {
-        destination: dest,
+        destination: IpAddr::V4(dest),
         prefix_length: prefix,
-        next_hop: target.gateway,
+        next_hop: IpAddr::V4(target.gateway),
         interface_index: target.interface_index,
         metric: SECONDARY_ROUTE_METRIC,
         is_ours: true,
@@ -651,9 +689,9 @@ fn overlay_route((dest, prefix): (Ipv4Addr, u8), target: &SecondaryRouteTarget) 
 /// rule). Returns `false` only when the per-rule cap is hit so the caller
 /// stops fanning out.
 fn push_route(
-    ip: Ipv4Addr,
+    ip: IpAddr,
     target: &SecondaryRouteTarget,
-    seen: &mut BTreeSet<Ipv4Addr>,
+    seen: &mut BTreeSet<IpAddr>,
     out: &mut RouteCodegenOutput,
     per_rule: &mut usize,
 ) -> bool {
@@ -665,7 +703,7 @@ fn push_route(
     // routing that out the secondary (VPN) link is nonsensical — loopback
     // never leaves the box. Skip WITHOUT signalling a cap hit so the caller
     // keeps scanning this rule's remaining (routable) IPs.
-    if is_non_routable_v4(&ip) {
+    if is_non_routable(ip) {
         tracing::debug!(
             target: "nrr::route-codegen",
             ip = %ip,
@@ -673,6 +711,13 @@ fn push_route(
         );
         return true;
     }
+    // The next hop this link offers for the address's own family. `None` means
+    // the link has no way out for it, and a host route through such a link is a
+    // black hole: the user reads a hang, not protection. Not a cap hit — the
+    // rule's other addresses may well be routable.
+    let Some(next_hop) = next_hop_for(ip, target) else {
+        return true;
+    };
     // Already routed by an earlier rule → not a new route, but not a cap
     // hit either: keep scanning this rule.
     if !seen.insert(ip) {
@@ -680,8 +725,8 @@ fn push_route(
     }
     out.routes.push(RouteEntry {
         destination: ip,
-        prefix_length: 32,
-        next_hop: target.gateway,
+        prefix_length: host_prefix_for(ip),
+        next_hop,
         interface_index: target.interface_index,
         metric: SECONDARY_ROUTE_METRIC,
         is_ours: true,
@@ -689,6 +734,38 @@ fn push_route(
     });
     *per_rule += 1;
     true
+}
+
+/// The next hop `target` offers for `ip`'s family, if it has one.
+fn next_hop_for(ip: IpAddr, target: &SecondaryRouteTarget) -> Option<IpAddr> {
+    match ip {
+        IpAddr::V4(_) => Some(IpAddr::V4(target.gateway)),
+        IpAddr::V6(_) => target.gateway_v6.map(IpAddr::V6),
+    }
+}
+
+/// The single-host prefix for an address's family.
+fn host_prefix_for(ip: IpAddr) -> u8 {
+    match ip {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
+/// `true` for a destination no route should ever be installed for, in either
+/// family: loopback, the unspecified address, and (v6) the link-local and
+/// multicast scopes, which never leave the link they are on.
+fn is_non_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_non_routable_v4(&v4),
+        IpAddr::V6(v6) => {
+            let head = v6.segments()[0];
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (head & 0xffc0) == 0xfe80
+                || (head & 0xff00) == 0xff00
+        }
+    }
 }
 
 /// Fan a domain suffix / zone out to the cached sub-hostnames' IPs and
@@ -712,9 +789,9 @@ fn fanout_suffix(
     include_apex: bool,
     target: &SecondaryRouteTarget,
     cache: &dyn FqdnCacheLookup,
-    steerable: &dyn Fn(Ipv4Addr) -> bool,
-    held: &mut Option<(Ipv4Addr, usize)>,
-    seen: &mut BTreeSet<Ipv4Addr>,
+    steerable: &dyn Fn(IpAddr) -> bool,
+    held: &mut Option<(IpAddr, usize)>,
+    seen: &mut BTreeSet<IpAddr>,
     out: &mut RouteCodegenOutput,
     per_rule: &mut usize,
 ) -> bool {
@@ -725,11 +802,11 @@ fn fanout_suffix(
     };
     let had_subhosts = !subhosts.is_empty();
     for sub in subhosts {
-        for ip in cache
-            .ips_for_hostname(&sub)
-            .into_iter()
-            .take(PER_HOSTNAME_IP_CAP)
-        {
+        for ip in crate::enforcement_planner::capped_for_host(
+            cache,
+            &sub,
+            crate::enforcement_planner::FamilyScope::Both,
+        ) {
             if !steerable(ip) {
                 note_held(held, ip);
                 continue;
@@ -743,998 +820,4 @@ fn fanout_suffix(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::app_observation_lookup::MockAppObservationLookup;
-    use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
-    use nrr_domain::canonical::{CanonicalAppMatch, CanonicalRule};
-    use nrr_domain::RuleId;
-
-    /// No application has been observed connecting anywhere — the state every
-    /// address-rule test runs in.
-    fn no_apps() -> MockAppObservationLookup {
-        MockAppObservationLookup::new()
-    }
-
-    fn app_rule(id: &str, pattern: &str) -> CanonicalRule {
-        CanonicalRule {
-            id: RuleId(id.to_string()),
-            enabled: true,
-            address_match: None,
-            app_match: Some(CanonicalAppMatch {
-                pattern: CanonicalAppPattern::Exact(pattern.to_string()),
-                include_child_processes: false,
-            }),
-            comment: String::new(),
-            action: nrr_domain::RuleAction::Route,
-            origin: None,
-        }
-    }
-
-    #[test]
-    fn app_only_rule_routes_every_observed_destination() {
-        let cache = MockFqdnCacheLookup::new();
-        let apps = MockAppObservationLookup::new();
-        apps.set_ips(
-            "messenger.exe",
-            vec![ip(23, 10, 20, 153), ip(23, 10, 20, 137)],
-        );
-        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
-
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &apps,
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-
-        let mut dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        dests.sort();
-        assert_eq!(dests, vec![ip(23, 10, 20, 137), ip(23, 10, 20, 153)]);
-        assert!(out
-            .routes
-            .iter()
-            .all(|r| r.prefix_length == 32 && r.interface_index == target().interface_index));
-        assert!(out.diagnostics.is_empty());
-    }
-
-    /// The case the census exists for: the browser reached the address an hour
-    /// before the routed application ever touched it. Pinning it would have
-    /// taken the browser's traffic into the tunnel with it.
-    #[test]
-    fn app_only_rule_skips_a_destination_another_process_already_uses() {
-        let cache = MockFqdnCacheLookup::new();
-        let apps = MockAppObservationLookup::new();
-        apps.set_ips(
-            "assistant.exe",
-            vec![ip(203, 0, 113, 68), ip(203, 0, 113, 9)],
-        );
-        apps.set_used_outside(ip(203, 0, 113, 68));
-        let rs = ruleset(vec![app_rule("R-app", "assistant.exe")]);
-
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &apps,
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-
-        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, vec![ip(203, 0, 113, 9)]);
-        assert!(matches!(
-            out.diagnostics.as_slice(),
-            [RouteCodegenDiagnostic::AppRuleDestinationUsedByOtherProcess { ip: shared, app, .. }]
-                if *shared == ip(203, 0, 113, 68) && app == "assistant.exe"
-        ));
-    }
-
-    #[test]
-    fn app_only_rule_without_observations_diagnoses_and_routes_nothing() {
-        let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
-
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-
-        assert!(out.routes.is_empty());
-        assert!(matches!(
-            out.diagnostics.as_slice(),
-            [RouteCodegenDiagnostic::AppRuleUnobserved { app, .. }] if app == "messenger.exe"
-        ));
-    }
-
-    #[test]
-    fn app_only_rule_skips_destinations_the_shared_address_policy_declined() {
-        let cache = MockFqdnCacheLookup::new();
-        let apps = MockAppObservationLookup::new();
-        apps.set_ips("messenger.exe", vec![ip(8, 8, 8, 8), ip(23, 10, 20, 137)]);
-        let rs = ruleset(vec![app_rule("R-app", "messenger.exe")]);
-        let denied: HashSet<Ipv4Addr> = [ip(8, 8, 8, 8)].into_iter().collect();
-
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &apps,
-            &denied,
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-
-        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, vec![ip(23, 10, 20, 137)]);
-    }
-
-    fn target() -> SecondaryRouteTarget {
-        SecondaryRouteTarget {
-            gateway: Ipv4Addr::new(10, 0, 0, 1),
-            interface_index: 7,
-        }
-    }
-
-    fn rule(id: &str, enabled: bool, m: CanonicalAddressMatch) -> CanonicalRule {
-        CanonicalRule {
-            id: RuleId(id.to_string()),
-            enabled,
-            address_match: Some(m),
-            app_match: None,
-            comment: String::new(),
-            action: nrr_domain::RuleAction::Route,
-            origin: None,
-        }
-    }
-
-    fn ruleset(rules: Vec<CanonicalRule>) -> CanonicalRuleSet {
-        CanonicalRuleSet::from_rules(rules)
-    }
-
-    fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(a, b, c, d)
-    }
-
-    /// The live case (26.08): `*.search.example` on the main link,
-    /// `docs.search.example` on the additional one, one address serving both.
-    /// The tunnel pin used to take translate.search.example with it, and the site
-    /// was dead in every browser while both rules were honoured individually.
-    #[test]
-    fn a_shared_address_is_not_pinned_into_the_tunnel() {
-        let shared = ip(23, 10, 20, 161);
-        let only_theirs = ip(23, 10, 20, 150);
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.search.example", vec![shared]);
-        cache.set_ips("docs.search.example", vec![shared, only_theirs]);
-        let book = CanonicalRuleBook {
-            primary: ruleset(vec![rule(
-                "p1",
-                true,
-                CanonicalAddressMatch::SuffixDomain("search.example".into()),
-            )]),
-            secondary: ruleset(vec![rule(
-                "s1",
-                true,
-                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
-            )]),
-        };
-        let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
-
-        let out = generate_secondary_routes(
-            &book.secondary,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &ownership,
-            crate::address_ownership::Link::Additional,
-        );
-
-        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, vec![only_theirs], "the shared address must stay put");
-        assert!(
-            out.diagnostics.iter().any(|d| matches!(
-                d,
-                RouteCodegenDiagnostic::AddressClaimedByMainLink { rule_id, ip, count }
-                    if rule_id == "s1" && *ip == shared && *count == 1
-            )),
-            "{:?}",
-            out.diagnostics
-        );
-    }
-
-    /// The main link is never the one held back: its own rules are what the
-    /// gate protects, and mode B carves them back off the tunnel through this
-    /// same function.
-    #[test]
-    fn the_main_links_own_rules_are_never_held_back() {
-        let shared = ip(23, 10, 20, 161);
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("translate.search.example", vec![shared]);
-        cache.set_ips("docs.search.example", vec![shared]);
-        let book = CanonicalRuleBook {
-            primary: ruleset(vec![rule(
-                "p1",
-                true,
-                CanonicalAddressMatch::SuffixDomain("search.example".into()),
-            )]),
-            secondary: ruleset(vec![rule(
-                "s1",
-                true,
-                CanonicalAddressMatch::ExactFqdn("docs.search.example".into()),
-            )]),
-        };
-        let ownership = crate::address_ownership::AddressOwnership::resolve(&book, &cache);
-
-        let out = generate_secondary_routes(
-            &book.primary,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &ownership,
-            crate::address_ownership::Link::Main,
-        );
-
-        assert_eq!(
-            out.routes.iter().map(|r| r.destination).collect::<Vec<_>>(),
-            vec![shared]
-        );
-    }
-
-    #[test]
-    fn exact_ip_emits_one_host_route_via_secondary() {
-        let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![rule(
-            "r-ip",
-            true,
-            CanonicalAddressMatch::ExactIp(ip(23, 10, 20, 138)),
-        )]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert_eq!(out.routes.len(), 1);
-        let r = &out.routes[0];
-        assert_eq!(r.destination, ip(23, 10, 20, 138));
-        assert_eq!(r.prefix_length, 32);
-        assert_eq!(r.next_hop, ip(10, 0, 0, 1));
-        assert_eq!(r.interface_index, 7);
-        assert!(r.is_ours);
-        assert!(out.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn disabled_rule_is_skipped() {
-        let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![rule(
-            "r-off",
-            false,
-            CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
-        )]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert!(out.routes.is_empty());
-    }
-
-    #[test]
-    fn block_action_rule_produces_no_route() {
-        let cache = MockFqdnCacheLookup::new();
-        let mut blocked = rule(
-            "r-block",
-            true,
-            CanonicalAddressMatch::ExactIp(ip(203, 0, 113, 5)),
-        );
-        blocked.action = nrr_domain::RuleAction::Block;
-        let rs = ruleset(vec![blocked]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        // A dropped destination gets no /32 route — the WFP block enforces it.
-        assert!(out.routes.is_empty());
-    }
-
-    #[test]
-    fn exact_fqdn_warm_cache_routes_each_ip_cold_cache_diagnoses() {
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("api.example.com", vec![ip(20, 0, 0, 1), ip(20, 0, 0, 2)]);
-        let rs = ruleset(vec![
-            rule(
-                "r-warm",
-                true,
-                CanonicalAddressMatch::ExactFqdn("api.example.com".into()),
-            ),
-            rule(
-                "r-cold",
-                true,
-                CanonicalAddressMatch::ExactFqdn("cold.example.com".into()),
-            ),
-        ]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, BTreeSet::from([ip(20, 0, 0, 1), ip(20, 0, 0, 2)]));
-        assert!(out
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, RouteCodegenDiagnostic::HostnameUnresolved { hostname, .. } if hostname == "cold.example.com")));
-    }
-
-    #[test]
-    fn suffix_and_zone_fan_out_to_cached_subdomain_ips() {
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("a.corp.example", vec![ip(30, 0, 0, 1)]);
-        cache.set_ips("b.corp.example", vec![ip(30, 0, 0, 2)]);
-        // A host under a different suffix must NOT leak in.
-        cache.set_ips("x.other.example", vec![ip(99, 0, 0, 9)]);
-
-        let suffix_rules = ruleset(vec![rule(
-            "r-suffix",
-            true,
-            CanonicalAddressMatch::SuffixDomain("corp.example".into()),
-        )]);
-        let out = generate_secondary_routes(
-            &suffix_rules,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, BTreeSet::from([ip(30, 0, 0, 1), ip(30, 0, 0, 2)]));
-
-        // Zone uses the same fan-out.
-        let zone_rules = ruleset(vec![rule(
-            "r-zone",
-            true,
-            CanonicalAddressMatch::Zone("example".into()),
-        )]);
-        let out2 = generate_secondary_routes(
-            &zone_rules,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert!(out2.routes.iter().any(|r| r.destination == ip(99, 0, 0, 9)));
-    }
-
-    #[test]
-    fn suffix_routes_its_apex_while_a_zone_never_routes_its_bare_label() {
-        //  — `*.corp.example` covers "corp.example" itself, so the
-        // apex gets a `/32`. A zone rule keeps ignoring its own bare label,
-        // otherwise a host literally named "example" would be swept in.
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("corp.example", vec![ip(30, 0, 0, 7)]);
-        cache.set_ips("a.corp.example", vec![ip(30, 0, 0, 1)]);
-        cache.set_ips("example", vec![ip(88, 0, 0, 8)]);
-
-        let suffix_rules = ruleset(vec![rule(
-            "r-suffix",
-            true,
-            CanonicalAddressMatch::SuffixDomain("corp.example".into()),
-        )]);
-        let out = generate_secondary_routes(
-            &suffix_rules,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, BTreeSet::from([ip(30, 0, 0, 7), ip(30, 0, 0, 1)]));
-
-        let zone_rules = ruleset(vec![rule(
-            "r-zone",
-            true,
-            CanonicalAddressMatch::Zone("example".into()),
-        )]);
-        let out2 = generate_secondary_routes(
-            &zone_rules,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert!(
-            !out2.routes.iter().any(|r| r.destination == ip(88, 0, 0, 8)),
-            "the bare zone label must not be routed"
-        );
-    }
-
-    #[test]
-    fn empty_suffix_emits_diagnostic_no_route() {
-        let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![rule(
-            "r-empty",
-            true,
-            CanonicalAddressMatch::SuffixDomain("nothing.cached".into()),
-        )]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert!(out.routes.is_empty());
-        assert!(out
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, RouteCodegenDiagnostic::SuffixEmpty { .. })));
-    }
-
-    #[test]
-    fn loopback_and_unspecified_destinations_are_not_routed() {
-        let cache = MockFqdnCacheLookup::new();
-        // An ad-blocking hosts file pins the domain to loopback → the cache
-        // holds only 127.0.0.1, so the ExactFqdn rule must produce NO route.
-        cache.set_ips("app.example", vec![ip(127, 0, 0, 1)]);
-        // A mixed resolution (loopback + a real public IP) must route ONLY
-        // the routable IP.
-        cache.set_ips(
-            "mixed.example.com",
-            vec![ip(127, 0, 0, 1), ip(23, 10, 20, 138)],
-        );
-        let rs = ruleset(vec![
-            rule(
-                "r-loop-ip",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(127, 0, 0, 1)),
-            ),
-            rule(
-                "r-unspec-ip",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(0, 0, 0, 0)),
-            ),
-            rule(
-                "r-loop-fqdn",
-                true,
-                CanonicalAddressMatch::ExactFqdn("app.example".into()),
-            ),
-            rule(
-                "r-mixed",
-                true,
-                CanonicalAddressMatch::ExactFqdn("mixed.example.com".into()),
-            ),
-        ]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        // Only the public IP survives; loopback + unspecified are dropped and
-        // the loopback-only FQDN yields nothing.
-        let dests: BTreeSet<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, BTreeSet::from([ip(23, 10, 20, 138)]));
-    }
-
-    #[test]
-    fn duplicate_destination_across_rules_is_routed_once() {
-        let cache = MockFqdnCacheLookup::new();
-        let rs = ruleset(vec![
-            rule("r1", true, CanonicalAddressMatch::ExactIp(ip(40, 0, 0, 1))),
-            rule("r2", true, CanonicalAddressMatch::ExactIp(ip(40, 0, 0, 1))),
-        ]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert_eq!(out.routes.len(), 1, "same destination must route once");
-    }
-
-    #[test]
-    fn combined_app_and_address_rule_is_not_routed_in_free() {
-        // A rule with BOTH an app condition and an address is block-only in
-        // Free — it must NOT produce a route (routing the address would
-        // ignore the app scoping and over-route every process).
-        use nrr_domain::canonical::{CanonicalAppMatch, CanonicalAppPattern};
-        let cache = MockFqdnCacheLookup::new();
-        let combined = CanonicalRule {
-            id: RuleId("r-app-ip".into()),
-            enabled: true,
-            address_match: Some(CanonicalAddressMatch::ExactIp(ip(50, 0, 0, 1))),
-            app_match: Some(CanonicalAppMatch {
-                pattern: CanonicalAppPattern::Exact("chrome.exe".into()),
-                include_child_processes: true,
-            }),
-            comment: String::new(),
-            action: nrr_domain::RuleAction::Route,
-            origin: None,
-        };
-        let rs = ruleset(vec![combined]);
-        let out = generate_secondary_routes(
-            &rs,
-            &target(),
-            &cache,
-            &no_apps(),
-            &HashSet::new(),
-            &crate::address_ownership::AddressOwnership::default(),
-            crate::address_ownership::Link::Additional,
-        );
-        assert!(
-            out.routes.is_empty(),
-            "combined app+address rule must not route the address globally"
-        );
-        assert!(out.diagnostics.iter().any(|d| matches!(
-            d,
-            RouteCodegenDiagnostic::AppRuleAddressAndAppNotRouted { .. }
-        )));
-    }
-
-    // ── mode-aware generate_routes (block 16.18.vpn) ──
-
-    /// Startup orphan adoption recognises our leftovers by metric plus shape.
-    /// Its shape list is derived from the overlay constants — this is the other
-    /// end: every route any mode actually emits must be recognised, so a mode
-    /// that grows a new shape fails here instead of leaving that shape orphaned
-    /// in the table after a crash.
-    #[test]
-    fn every_shape_the_codegen_emits_is_one_adoption_recognises() {
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("news.example", vec![ip(198, 51, 100, 7)]);
-        let apps = MockAppObservationLookup::new();
-        apps.set_ips("assistant.exe", vec![ip(203, 0, 113, 9)]);
-        let rb = book(
-            vec![rule(
-                "R-main",
-                true,
-                CanonicalAddressMatch::ExactFqdn("news.example".to_string()),
-            )],
-            vec![
-                rule(
-                    "R-sec",
-                    true,
-                    CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
-                ),
-                app_rule("R-app", "assistant.exe"),
-            ],
-        );
-        let primary = SecondaryRouteTarget {
-            gateway: ip(192, 168, 1, 1),
-            interface_index: 12,
-        };
-
-        for mode in [
-            RouteBehaviorMode::PreferPrimary,
-            RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            RouteBehaviorMode::StrictSecondaryFailClosed,
-        ] {
-            for primary_opt in [None, Some(&primary)] {
-                let out = generate_routes(
-                    mode,
-                    &rb,
-                    primary_opt,
-                    &target(),
-                    &cache,
-                    &apps,
-                    &std::collections::HashSet::new(),
-                    crate::address_ownership::ZoneVsIpOrder::default(),
-                    &[],
-                );
-                for route in &out.routes {
-                    assert!(
-                        is_owned_prefix_length(route.prefix_length),
-                        "{mode:?} emits /{} but orphan adoption would not recognise it:                          a crash leaves that route steering traffic into a dead tunnel",
-                        route.prefix_length,
-                    );
-                    assert_eq!(
-                        route.metric, SECONDARY_ROUTE_METRIC,
-                        "adoption also keys on the metric",
-                    );
-                }
-            }
-        }
-    }
-
-    fn book(primary: Vec<CanonicalRule>, secondary: Vec<CanonicalRule>) -> CanonicalRuleBook {
-        CanonicalRuleBook {
-            primary: CanonicalRuleSet::from_rules(primary),
-            secondary: CanonicalRuleSet::from_rules(secondary),
-        }
-    }
-
-    /// The regression: an application routed over the additional link reaches
-    /// a site the user put on the MAIN link by name. The destination is learned
-    /// from that first blocked attempt, and a `/32` pin would then take the
-    /// address away from every other process on the machine — the browser
-    /// included. Address rules outrank application rules; the pin must not
-    /// appear.
-    #[test]
-    fn mode_a_app_observation_never_pins_an_address_the_main_link_claims() {
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("news.example", vec![ip(203, 0, 113, 68)]);
-        let apps = MockAppObservationLookup::new();
-        apps.set_ips(
-            "assistant.exe",
-            vec![ip(203, 0, 113, 68), ip(203, 0, 113, 9)],
-        );
-        let rb = book(
-            vec![rule(
-                "R-main",
-                true,
-                CanonicalAddressMatch::ExactFqdn("news.example".to_string()),
-            )],
-            vec![app_rule("R-app", "assistant.exe")],
-        );
-
-        let out = generate_routes(
-            RouteBehaviorMode::PreferPrimary,
-            &rb,
-            None,
-            &target(),
-            &cache,
-            &apps,
-            &std::collections::HashSet::new(),
-            crate::address_ownership::ZoneVsIpOrder::default(),
-            &[],
-        );
-
-        let dests: Vec<Ipv4Addr> = out.routes.iter().map(|r| r.destination).collect();
-        assert_eq!(dests, vec![ip(203, 0, 113, 9)], "only the unclaimed one");
-        // `PrimaryExceptionsUnavailable` rides along (no primary target here),
-        // so look for the one that matters rather than matching the whole slice.
-        assert!(out.diagnostics.iter().any(|d| matches!(
-            d,
-            RouteCodegenDiagnostic::AppRuleDestinationClaimedByMainLink { ip: claimed, app, .. }
-                if *claimed == ip(203, 0, 113, 68) && app == "assistant.exe"
-        )));
-    }
-
-    /// A main-link rule can only defend addresses it actually resolves to, and
-    /// a suffix rule defends its whole cached fan-out.
-    #[test]
-    fn address_rule_ips_expands_names_and_ignores_app_and_block_rules() {
-        let cache = MockFqdnCacheLookup::new();
-        cache.set_ips("news.example", vec![ip(10, 0, 0, 1)]);
-        cache.set_ips("cdn.news.example", vec![ip(10, 0, 0, 2)]);
-        let mut blocked = rule(
-            "R-block",
-            true,
-            CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 3)),
-        );
-        blocked.action = nrr_domain::RuleAction::Block;
-        let mut disabled = rule(
-            "R-off",
-            false,
-            CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 4)),
-        );
-        disabled.enabled = false;
-        let rs = ruleset(vec![
-            rule(
-                "R-suffix",
-                true,
-                CanonicalAddressMatch::SuffixDomain("news.example".to_string()),
-            ),
-            rule(
-                "R-ip",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(10, 0, 0, 5)),
-            ),
-            app_rule("R-app", "assistant.exe"),
-            blocked,
-            disabled,
-        ]);
-
-        let claimed = address_rule_ips(&rs, &cache);
-
-        assert_eq!(
-            claimed,
-            HashSet::from([ip(10, 0, 0, 1), ip(10, 0, 0, 2), ip(10, 0, 0, 5)])
-        );
-    }
-
-    #[test]
-    fn mode_a_prefer_primary_emits_secondary_host_routes_no_overlay() {
-        let cache = MockFqdnCacheLookup::new();
-        let rb = book(
-            vec![rule(
-                "p",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(8, 8, 8, 8)),
-            )],
-            vec![rule(
-                "s",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
-            )],
-        );
-        let out = generate_routes(
-            RouteBehaviorMode::PreferPrimary,
-            &rb,
-            None,
-            &target(),
-            &cache,
-            &no_apps(),
-            &std::collections::HashSet::new(),
-            crate::address_ownership::ZoneVsIpOrder::default(),
-            &[],
-        );
-        // No /1 overlay in mode A; only the secondary rule's /32 (primary rule
-        // is irrelevant — default already rides primary).
-        assert_eq!(out.routes.len(), 1);
-        assert_eq!(out.routes[0].destination, ip(1, 1, 1, 1));
-        assert_eq!(out.routes[0].prefix_length, 32);
-        assert_eq!(out.routes[0].interface_index, 7); // secondary ifindex
-    }
-
-    #[test]
-    fn the_counter_overlay_is_one_bit_longer_than_whatever_the_tunnel_installed() {
-        let ip = |a, b, c, d| Ipv4Addr::new(a, b, c, d);
-        // No visible catch-alls → the classic four /2.
-        assert_eq!(counter_overlay_for(&[]), COUNTER_OVERLAY.to_vec());
-        // A redirect-gateway /1 pair → the same four /2.
-        assert_eq!(
-            counter_overlay_for(&[(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]),
-            COUNTER_OVERLAY.to_vec()
-        );
-        // swiftvpn over WireGuard: a redirect SET. Against it the /2s lost —
-        // `64.0.0.0/2` and `128.0.0.0/2` tie on length at a better metric and
-        // the rest are longer — so every non-rule connection rode the tunnel.
-        // Each prefix gets its two halves, one bit longer.
-        let set = [
-            (ip(0, 0, 0, 0), 5),
-            (ip(8, 0, 0, 0), 7),
-            (ip(64, 0, 0, 0), 2),
-            (ip(128, 0, 0, 0), 2),
-            (ip(192, 0, 0, 0), 9),
-        ];
-        let got = counter_overlay_for(&set);
-        for expected in [
-            (ip(0, 0, 0, 0), 6),
-            (ip(4, 0, 0, 0), 6),
-            (ip(8, 0, 0, 0), 8),
-            (ip(9, 0, 0, 0), 8),
-            (ip(64, 0, 0, 0), 3),
-            (ip(96, 0, 0, 0), 3),
-            (ip(128, 0, 0, 0), 3),
-            (ip(160, 0, 0, 0), 3),
-            (ip(192, 0, 0, 0), 10),
-            (ip(192, 64, 0, 0), 10),
-        ] {
-            assert!(got.contains(&expected), "missing {expected:?} in {got:?}");
-        }
-        assert_eq!(got.len(), 10);
-        // A tunnel that owns the whole default on-link → two /1 via primary.
-        assert_eq!(
-            counter_overlay_for(&[(ip(0, 0, 0, 0), 0)]),
-            vec![(ip(0, 0, 0, 0), 1), (ip(128, 0, 0, 0), 1)]
-        );
-    }
-
-    #[test]
-    fn tunnel_catch_alls_are_the_wide_unicast_routes_on_the_tunnel_that_are_not_ours() {
-        let r = |d: [u8; 4], n: u8, ifx: u32, ours: bool| RouteEntry {
-            destination: Ipv4Addr::from(d),
-            prefix_length: n,
-            next_hop: Ipv4Addr::UNSPECIFIED,
-            interface_index: ifx,
-            metric: 0,
-            is_ours: ours,
-            table: nrr_platform_api::RouteTableRef::Main,
-        };
-        let table = vec![
-            r([64, 0, 0, 0], 2, 66, false),
-            r([192, 0, 0, 0], 9, 66, false),
-            r([224, 0, 0, 0], 3, 66, false), // multicast: every interface has it
-            r([10, 88, 0, 191], 32, 66, false), // the tunnel's own address
-            r([10, 200, 0, 0], 16, 66, false), // a corporate split-tunnel network
-            r([23, 10, 20, 78], 32, 66, true), // our rule route
-            r([0, 0, 0, 0], 0, 19, false),   // the primary's default
-        ];
-        assert_eq!(
-            tunnel_catch_all_prefixes(&table, 66),
-            vec![
-                (Ipv4Addr::new(64, 0, 0, 0), 2),
-                (Ipv4Addr::new(192, 0, 0, 0), 9)
-            ]
-        );
-    }
-
-    #[test]
-    fn mode_a_with_primary_adds_counter_overlay_via_primary() {
-        let cache = MockFqdnCacheLookup::new();
-        let rb = book(
-            vec![], // primary rules irrelevant — the /2 counter-overlay covers all non-secondary
-            vec![rule(
-                "s",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(1, 1, 1, 1)),
-            )], // foreign → secondary
-        );
-        let primary = SecondaryRouteTarget {
-            gateway: ip(192, 168, 1, 1),
-            interface_index: 12,
-        };
-        let out = generate_routes(
-            RouteBehaviorMode::PreferPrimary,
-            &rb,
-            Some(&primary),
-            &target(),
-            &cache,
-            &no_apps(),
-            &std::collections::HashSet::new(),
-            crate::address_ownership::ZoneVsIpOrder::default(),
-            &[],
-        );
-        // Counter-overlay: four /2 via the primary NIC (ifindex 12) — these
-        // out-specific a redirect VPN's /1 so non-rule traffic rides primary.
-        let co: Vec<_> = out.routes.iter().filter(|r| r.prefix_length == 2).collect();
-        assert_eq!(co.len(), 4);
-        assert!(co
-            .iter()
-            .all(|r| r.interface_index == 12 && r.next_hop == ip(192, 168, 1, 1)));
-        let dests: BTreeSet<Ipv4Addr> = co.iter().map(|r| r.destination).collect();
-        assert_eq!(
-            dests,
-            BTreeSet::from([
-                ip(0, 0, 0, 0),
-                ip(64, 0, 0, 0),
-                ip(128, 0, 0, 0),
-                ip(192, 0, 0, 0)
-            ])
-        );
-        // Foreign /32 stays via the secondary (VPN, ifindex 7) — more specific
-        // than the /2, so it wins by longest-prefix.
-        let f = out
-            .routes
-            .iter()
-            .find(|r| r.destination == ip(1, 1, 1, 1))
-            .expect("secondary /32 route");
-        assert_eq!(f.prefix_length, 32);
-        assert_eq!(f.interface_index, 7);
-        // No /1 overlay in mode A.
-        assert!(!out.routes.iter().any(|r| r.prefix_length == 1));
-    }
-
-    #[test]
-    fn mode_b_owns_overlay_via_secondary_and_pulls_primary_exceptions() {
-        let cache = MockFqdnCacheLookup::new();
-        let rb = book(
-            vec![rule(
-                "p",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(8, 8, 8, 8)),
-            )],
-            vec![],
-        );
-        let primary = SecondaryRouteTarget {
-            gateway: ip(192, 168, 1, 1),
-            interface_index: 12,
-        };
-        let out = generate_routes(
-            RouteBehaviorMode::PreferSecondaryWhenAvailable,
-            &rb,
-            Some(&primary),
-            &target(),
-            &cache,
-            &no_apps(),
-            &std::collections::HashSet::new(),
-            crate::address_ownership::ZoneVsIpOrder::default(),
-            &[],
-        );
-        // Overlay 0.0.0.0/1 + 128.0.0.0/1 via the secondary (ifindex 7).
-        let overlay: Vec<_> = out.routes.iter().filter(|r| r.prefix_length == 1).collect();
-        assert_eq!(overlay.len(), 2);
-        assert!(overlay.iter().all(|r| r.interface_index == 7));
-        assert!(overlay.iter().any(|r| r.destination == ip(0, 0, 0, 0)));
-        assert!(overlay.iter().any(|r| r.destination == ip(128, 0, 0, 0)));
-        // Exception: primary rule 8.8.8.8/32 via the PRIMARY NIC (ifindex 12).
-        let exc = out
-            .routes
-            .iter()
-            .find(|r| r.destination == ip(8, 8, 8, 8))
-            .expect("primary exception route");
-        assert_eq!(exc.prefix_length, 32);
-        assert_eq!(exc.interface_index, 12);
-        assert_eq!(exc.next_hop, ip(192, 168, 1, 1));
-    }
-
-    #[test]
-    fn mode_b_without_primary_target_keeps_overlay_and_diagnoses() {
-        let cache = MockFqdnCacheLookup::new();
-        let rb = book(
-            vec![rule(
-                "p",
-                true,
-                CanonicalAddressMatch::ExactIp(ip(8, 8, 8, 8)),
-            )],
-            vec![],
-        );
-        let out = generate_routes(
-            RouteBehaviorMode::StrictSecondaryFailClosed,
-            &rb,
-            None,
-            &target(),
-            &cache,
-            &no_apps(),
-            &std::collections::HashSet::new(),
-            crate::address_ownership::ZoneVsIpOrder::default(),
-            &[],
-        );
-        // Only the overlay survives (no exceptions without a primary target).
-        assert_eq!(out.routes.len(), 2);
-        assert!(out.routes.iter().all(|r| r.prefix_length == 1));
-        assert!(out
-            .diagnostics
-            .iter()
-            .any(|d| matches!(d, RouteCodegenDiagnostic::PrimaryExceptionsUnavailable)));
-    }
-
-    #[test]
-    fn dns_via_secondary_routes_pin_each_resolver_to_the_secondary() {
-        let servers = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(8, 8, 8, 8)];
-        let routes = dns_via_secondary_routes(&servers, &target());
-        assert_eq!(routes.len(), 2);
-        for (route, expected) in routes.iter().zip(servers.iter()) {
-            assert_eq!(route.destination, *expected);
-            // A /32 is what makes the source-bound query socket actually leave
-            // over the tunnel; anything wider would not out-specific the
-            // default route.
-            assert_eq!(route.prefix_length, 32);
-            assert_eq!(route.interface_index, target().interface_index);
-            assert_eq!(route.next_hop, target().gateway);
-            assert!(route.is_ours);
-        }
-    }
-
-    #[test]
-    fn dns_via_secondary_routes_skip_non_routable_servers() {
-        let servers = [Ipv4Addr::LOCALHOST, Ipv4Addr::UNSPECIFIED];
-        assert!(dns_via_secondary_routes(&servers, &target()).is_empty());
-    }
-}
+mod tests;

@@ -64,7 +64,7 @@ fn service_unavailable_playbook() -> TroubleshootingPlaybook {
             },
             TroubleshootingStep {
                 title: "If it starts and stops again, read the last lines before the stop",
-                description: "`logs.ndjson` in this archive holds the service's own \
+                description: "`service-logs/` in this archive holds the service's own \
                               account of what it was doing. A service that exits on its \
                               own says why on the way out.",
             },
@@ -204,7 +204,7 @@ pub fn render_playbooks_markdown(playbooks: &[TroubleshootingPlaybook]) -> Strin
     let mut md = String::new();
     md.push_str("# NetRuleRouter — Troubleshooting Guide\n\n");
     md.push_str("Common symptoms and what to check for each. Everything referenced\n");
-    md.push_str("here (`health.json`, `logs.ndjson`, `audit_summary.json`) is in this\n");
+    md.push_str("here (`health.json`, `service-logs/`, `audit_summary.json`) is in this\n");
     md.push_str("archive next to this file.\n\n");
     md.push_str("---\n\n");
 

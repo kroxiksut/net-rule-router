@@ -265,13 +265,14 @@ subdomains one way and the bare domain the other.
 
 #### IP (`--- IP`)
 
-Exact IPv4 address. IPv6 and CIDR notation are not supported yet.
+Exact IPv4 or IPv6 address. CIDR notation is not supported yet.
 
 ```
 203.0.113.7
+2001:db8::7
 ```
 
-> Whole subnets are not written here — the rules file matches single IPv4
+> Whole subnets are not written here — the rules file matches single
 > addresses only. A whole subnet belongs to the **Local networks** list in
 > Settings, a separate mechanism that is the only place accepting CIDR
 > notation. That list has a different job: it names local network segments —

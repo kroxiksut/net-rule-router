@@ -37,6 +37,8 @@ pub enum AuthoredMatchKind {
     ExactHost,
     /// A domain and its subdomains.
     SuffixDomain,
+    /// A whole program: every connection it opens.
+    Application,
 }
 
 /// One rule to author.
@@ -244,6 +246,8 @@ fn hosts_to_refresh(landed: &[&AuthoredRule]) -> Vec<RoutedHost> {
         let routed = match rule.match_kind {
             AuthoredMatchKind::ExactHost => RoutedHost::Exact(rule.value.clone()),
             AuthoredMatchKind::SuffixDomain => RoutedHost::Suffix(rule.value.clone()),
+            // A program has no host to refresh; its next connection takes the rule.
+            AuthoredMatchKind::Application => continue,
         };
         if seen.insert(rule.value.clone()) {
             hosts.push(routed);
@@ -295,6 +299,7 @@ fn append_rule(
     let address_match = match rule.match_kind {
         AuthoredMatchKind::ExactHost => CanonicalAddressMatch::ExactFqdn(rule.value.clone()),
         AuthoredMatchKind::SuffixDomain => CanonicalAddressMatch::SuffixDomain(rule.value.clone()),
+        AuthoredMatchKind::Application => return append_app_rule(book, rule, reason, added),
     };
     let set = match rule.route {
         RouteRole::Primary => &mut book.primary,
@@ -325,6 +330,43 @@ fn append_rule(
     true
 }
 
+/// Appends a rule for a whole program, or returns `false` when the route already
+/// names it.
+fn append_app_rule(
+    book: &mut CanonicalRuleBook,
+    rule: &AuthoredRule,
+    reason: &AutoRuleReason,
+    added: &str,
+) -> bool {
+    let set = match rule.route {
+        RouteRole::Primary => &mut book.primary,
+        RouteRole::Secondary => &mut book.secondary,
+    };
+    if set.rules().iter().any(|r| {
+        r.address_match.is_none()
+            && r.app_match.as_ref().is_some_and(|m| {
+                nrr_platform_api::app_path_resolver::glob_match(m.pattern.as_str(), &rule.value)
+            })
+    }) {
+        return false;
+    }
+    let mut rules: Vec<CanonicalRule> = set.rules().to_vec();
+    rules.push(CanonicalRule {
+        id: RuleId(hashed_rule_id(rule.route, "app", &rule.value)),
+        enabled: true,
+        address_match: None,
+        app_match: Some(nrr_domain::canonical::CanonicalAppMatch {
+            pattern: nrr_domain::canonical::CanonicalAppPattern::Exact(rule.value.clone()),
+            include_child_processes: false,
+        }),
+        comment: String::new(),
+        action: RuleAction::Route,
+        origin: Some(RuleOrigin::auto(reason.clone(), &rule.anchor, added)),
+    });
+    *set = CanonicalRuleSet::from_rules(rules);
+    true
+}
+
 /// Deterministic rule id: the same (route, match) always yields the same id, so
 /// re-authoring after an export/import round trip does not mint a second
 /// identity for the same rule.
@@ -337,6 +379,11 @@ fn auto_rule_id(route: RouteRole, address_match: &CanonicalAddressMatch) -> Stri
         // stays total rather than growing a panic path.
         CanonicalAddressMatch::ExactIp(_) => ("ip", ""),
     };
+    hashed_rule_id(route, kind, value)
+}
+
+/// `auto-` plus the head of a digest over (route, kind, value).
+fn hashed_rule_id(route: RouteRole, kind: &str, value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(route.slug().as_bytes());
     hasher.update([0]);
@@ -404,6 +451,36 @@ mod tests {
         assert_eq!(origin.reason(), &AutoRuleReason::SiteCompanion);
         assert_eq!(origin.anchor(), "site.example");
         assert_eq!(origin.added(), "2026-07-31");
+    }
+
+    #[test]
+    fn a_program_offer_becomes_an_application_rule_once() {
+        let mut book = empty_book();
+        let app = AuthoredRule {
+            route: RouteRole::Secondary,
+            match_kind: AuthoredMatchKind::Application,
+            value: "messenger.exe".into(),
+            anchor: "messenger.exe".into(),
+        };
+        assert!(append_rule(
+            &mut book,
+            &app,
+            &AutoRuleReason::SiteCompanion,
+            "2026-09-11"
+        ));
+        let rule = book.secondary.rules().first().expect("one rule");
+        assert_eq!(rule.address_match, None);
+        assert_eq!(
+            rule.app_match.as_ref().map(|m| m.pattern.as_str()),
+            Some("messenger.exe")
+        );
+        assert!(!append_rule(
+            &mut book,
+            &app,
+            &AutoRuleReason::SiteCompanion,
+            "2026-09-11"
+        ));
+        assert!(hosts_to_refresh(&[&app]).is_empty());
     }
 
     #[test]

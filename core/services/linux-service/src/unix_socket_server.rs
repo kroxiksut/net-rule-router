@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use nrr_platform_linux::peer_cred::classify_unix_client;
 use nrr_service_runtime::ipc_push::{
-    extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
 };
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, EventBus, IpcAcceptor, IpcBindError, IpcError,
@@ -494,16 +494,20 @@ fn handle_connection(
                     caller_pid: u32::try_from(identity.pid).ok(),
                 };
                 let response = router.dispatch(request, ctx);
-                if subscription_id.is_none() && response.ok {
-                    subscription_id = extract_subscription_id(&response);
-                    if let Some(sub_id) = subscription_id.as_deref() {
-                        tracing::info!(
-                            target: "nrr::ipc-push",
-                            subscription_id = sub_id,
-                            bus_wired = event_bus.is_some(),
-                            "push subscription opened"
-                        );
-                    }
+                match adopt_subscription(&mut subscription_id, &response, event_bus.as_deref()) {
+                    SubscriptionChange::Unchanged => {}
+                    SubscriptionChange::Opened(sub_id) => tracing::info!(
+                        target: "nrr::ipc-push",
+                        subscription_id = %sub_id,
+                        bus_wired = event_bus.is_some(),
+                        "push subscription opened"
+                    ),
+                    SubscriptionChange::Replaced { previous, current } => tracing::debug!(
+                        target: "nrr::ipc-push",
+                        previous = %previous,
+                        subscription_id = %current,
+                        "push subscription replaced by a re-subscribe on the same connection"
+                    ),
                 }
                 if write_frame(&mut stream, &response).is_err() {
                     break;
@@ -610,6 +614,7 @@ fn error_response(code: IpcErrorCode, message: &str) -> IpcResponseEnvelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrr_service_runtime::ipc_push::extract_subscription_id;
     use nrr_service_runtime::{IpcAuditEmitter, IpcHandlerRegistry, NoopIpcAuditEmitter};
     use std::sync::atomic::AtomicU32;
     use std::time::{Duration, Instant};

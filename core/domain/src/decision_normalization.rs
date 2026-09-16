@@ -11,7 +11,7 @@
 //! |----------------------|--------------------------------------------------------------|
 //! | `destination_hostname` | lowercase, trailing dot removal, IDNA2008/punycode         |
 //! | `destination_ip`     | IPv4 → pass through; IPv4-mapped IPv6 → IPv4 + warning;     |
-//! |                      | native IPv6 → `UnsupportedNativeIpv6` (blocks `ExactIp` only)   |
+//! |                      | native IPv6 → pass through                                    |
 //! | `process_context`    | lowercase basename, path stripped, `.exe` suffix ensured     |
 //! | zone name (rule-side)| lowercase, leading dot stripped; empty/whitespace → error    |
 //!
@@ -109,11 +109,6 @@ pub enum NormalizationError {
     /// resolver would answer.
     DomainMalformedLabels { raw: String },
 
-    // ── IP errors — block ExactIp ─────────────────────────────────────────────
-    /// A native IPv6 address was observed.  Free edition does not support
-    /// `ExactIp` matching for IPv6.  Hostname and application matching continue.
-    IpNativeIpv6Unsupported { addr: Ipv6Addr },
-
     // ── Zone name errors — block Zone matching for that specific rule ──────────
     /// A zone name from a saved rule was empty after trimming.
     ZoneNameEmpty,
@@ -169,22 +164,21 @@ impl NormalizedHostname {
 /// - `ValidIpv4` → used for `ExactIp` matching.
 /// - `Unavailable` → explain signal `ip_unavailable`; `ExactIp` skipped.  The
 ///   lookup stage may attempt DNS resolution from the hostname.
-/// - `UnsupportedNativeIpv6` → explain signal `ip_native_ipv6_unsupported`; `ExactIp`
-///   skipped in Free.  All hostname and application matching continues normally.
+/// - `ValidIpv6` → used for `ExactIp` matching, as `ValidIpv4` is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NormalizedIp {
     /// IPv4 address ready for `ExactIp` matching.
     ValidIpv4(Ipv4Addr),
     /// No IP was present in `RuntimeInput`.
     Unavailable,
-    /// A native IPv6 address was observed — not used for matching in Free edition.
-    UnsupportedNativeIpv6 { addr: Ipv6Addr },
+    /// IPv6 address ready for `ExactIp` matching.
+    ValidIpv6(Ipv6Addr),
 }
 
 impl NormalizedIp {
-    /// Returns `true` if a valid IPv4 address is available for `ExactIp` matching.
+    /// Returns `true` if an address is available for `ExactIp` matching.
     pub fn is_usable(&self) -> bool {
-        matches!(self, Self::ValidIpv4(_))
+        matches!(self, Self::ValidIpv4(_) | Self::ValidIpv6(_))
     }
 }
 
@@ -243,7 +237,7 @@ pub enum InputAvailabilitySignal {
 /// | `ExactFqdn`    | hostname unavailable or invalid                           |
 /// | `SuffixDomain` | hostname unavailable or invalid                           |
 /// | `Zone`         | hostname unavailable or invalid                           |
-/// | `ExactIp`      | IP unavailable, or native IPv6 (`IpNativeIpv6Unsupported`)    |
+/// | `ExactIp`      | never — every address a destination carries is matchable  |
 /// | `Application`  | process name absent or empty (`ApplicationNameEmpty`)     |
 ///
 /// The `Default` route is never blocked — it is the guaranteed final fallback.
@@ -367,10 +361,9 @@ mod tests {
     }
 
     #[test]
-    fn normalized_ip_unsupported_native_ipv6_is_not_usable() {
+    fn normalized_ip_native_ipv6_is_usable() {
         let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let ip = NormalizedIp::UnsupportedNativeIpv6 { addr };
-        assert!(!ip.is_usable());
+        assert!(NormalizedIp::ValidIpv6(addr).is_usable());
     }
 
     #[test]
@@ -417,9 +410,9 @@ mod tests {
             exact_fqdn: Some(NormalizationError::DomainEmpty),
             suffix_domain: Some(NormalizationError::DomainEmpty),
             zone: Some(NormalizationError::DomainEmpty),
-            exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported {
-                addr: "2001:db8::1".parse().unwrap(),
-            }),
+            // No input blocks `ExactIp` any more; the struct does not care
+            // which error closes a class, so a hostname one stands in.
+            exact_ip: Some(NormalizationError::DomainEmpty),
             application: Some(NormalizationError::ApplicationNameEmpty),
         }
     }
@@ -440,9 +433,9 @@ mod tests {
             exact_fqdn: Some(NormalizationError::DomainEmpty),
             suffix_domain: Some(NormalizationError::DomainEmpty),
             zone: Some(NormalizationError::DomainEmpty),
-            exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported {
-                addr: "2001:db8::1".parse().unwrap(),
-            }),
+            // No input blocks `ExactIp` any more; the struct does not care
+            // which error closes a class, so a hostname one stands in.
+            exact_ip: Some(NormalizationError::DomainEmpty),
             application: None,
         };
         assert!(mca.all_address_classes_blocked());
@@ -513,32 +506,6 @@ mod tests {
         assert!(input.hostname.is_usable());
         assert!(input.ip.is_usable());
         assert!(input.app_identity.is_some());
-    }
-
-    #[test]
-    fn normalized_decision_input_native_ipv6_blocks_exact_ip_only() {
-        let addr: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        let input = NormalizedDecisionInput {
-            hostname: NormalizedHostname::Valid("ipv6host.example.com".to_owned()),
-            ip: NormalizedIp::UnsupportedNativeIpv6 { addr },
-            app_identity: None,
-            match_class_availability: MatchClassAvailability {
-                exact_fqdn: None,
-                suffix_domain: None,
-                zone: None,
-                exact_ip: Some(NormalizationError::IpNativeIpv6Unsupported { addr }),
-                application: Some(NormalizationError::ApplicationNameEmpty),
-            },
-            availability_signals: vec![InputAvailabilitySignal::AppContextUnavailable],
-            warnings: vec![],
-        };
-        // ExactIp is blocked but hostname classes are still available
-        assert!(input.match_class_availability.exact_ip.is_some());
-        assert!(input.match_class_availability.exact_fqdn.is_none());
-        assert!(input.match_class_availability.suffix_domain.is_none());
-        assert!(input.match_class_availability.zone.is_none());
-        // Not all address classes blocked (hostname classes are still open)
-        assert!(!input.match_class_availability.all_address_classes_blocked());
     }
 
     // ── Zone name errors ──────────────────────────────────────────────────────

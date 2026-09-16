@@ -868,37 +868,29 @@ fn resolve_bundled_locales_dir() -> Option<PathBuf> {
         }
     }
 
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../locales");
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
+    let executable_dir = env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_path_buf));
+    // `shared/contracts` sits two levels below the checkout root; the path is
+    // the build machine's, so only a debug build trusts it.
+    #[cfg(debug_assertions)]
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2);
+    #[cfg(not(debug_assertions))]
+    let checkout = None;
+    bundled_locales_dir_in(executable_dir.as_deref(), checkout)
+}
 
-    if let Ok(current_executable) = env::current_exe() {
-        if let Some(mut directory) = current_executable.parent().map(PathBuf::from) {
-            loop {
-                let candidate = directory.join("locales");
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-                if !directory.pop() {
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut directory = env::current_dir().ok()?;
-    loop {
-        let candidate = directory.join("locales");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-        if !directory.pop() {
-            break;
-        }
-    }
-
-    None
+/// Beside the binary, then the checkout — never a parent directory or the
+/// working directory, where another local user can plant a `locales` folder.
+fn bundled_locales_dir_in(
+    executable_dir: Option<&Path>,
+    checkout: Option<&Path>,
+) -> Option<PathBuf> {
+    executable_dir
+        .into_iter()
+        .chain(checkout)
+        .map(|root| root.join("locales"))
+        .find(|candidate| candidate.is_dir())
 }
 
 fn resolve_user_locales_dir() -> Option<PathBuf> {
@@ -1069,13 +1061,29 @@ fn emit_locale_reports(reports: &[LocaleLoadReport]) {
 mod tests {
     use super::{
         add_missing_baseline_coverage_warnings, build_effective_locale_bundles,
-        normalize_locale_id, read_locale_candidate, reject_fallback_cycles,
+        bundled_locales_dir_in, normalize_locale_id, read_locale_candidate, reject_fallback_cycles,
         require_metadata_string, resolve_catalog_text, sorted_unique_descriptors, strip_utf8_bom,
         validate_candidate_root, validate_cross_locale_rules, LocaleCandidate, LocaleDescriptor,
         LocaleLoadStatus, LocaleSource,
     };
+
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn bundled_locales_are_never_taken_from_above_the_binary() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let binary_dir = root.path().join("bin");
+        std::fs::create_dir_all(root.path().join("locales")).expect("planted locales");
+        std::fs::create_dir_all(&binary_dir).expect("binary dir");
+        assert_eq!(bundled_locales_dir_in(Some(&binary_dir), None), None);
+
+        std::fs::create_dir_all(binary_dir.join("locales")).expect("shipped locales");
+        assert_eq!(
+            bundled_locales_dir_in(Some(&binary_dir), Some(root.path())),
+            Some(binary_dir.join("locales"))
+        );
+    }
 
     /// One malformed key must cost that key, not the language.
     ///

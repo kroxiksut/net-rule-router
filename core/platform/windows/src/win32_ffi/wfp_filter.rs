@@ -274,6 +274,19 @@ pub fn add_filter(
         },
     };
 
+    // Packed IPv6 host set backing. Each `/128` is its own
+    // `FWP_V6_ADDR_AND_MASK`, and WFP OR's same-field conditions, so the whole
+    // chunk rides one filter. Built in full BEFORE any pointer is taken: a
+    // later push would reallocate and dangle the ones already handed out.
+    let mut v6_host_masks: Vec<FWP_V6_ADDR_AND_MASK> = spec
+        .remote_ip_set_v6
+        .iter()
+        .map(|ip| FWP_V6_ADDR_AND_MASK {
+            addr: ip.octets(),
+            prefixLength: 128,
+        })
+        .collect();
+
     // --- 5. Condition sub-buffers. -----------------------------------
     let mut app_id_blob: Option<FWP_BYTE_BLOB> = None;
     if let Some(bytes) = app_id_bytes.as_ref() {
@@ -295,7 +308,7 @@ pub fn add_filter(
     // Sub-pointers inside each condition reference variables on this
     // same stack frame; they all outlive the FwpmFilterAdd0 call.
     let mut conditions: Vec<FWPM_FILTER_CONDITION0> =
-        Vec::with_capacity(8 + spec.remote_ip_set.len());
+        Vec::with_capacity(8 + spec.remote_ip_set.len() + spec.remote_ip_set_v6.len());
 
     if let Some(addr) = spec.remote_ip {
         conditions.push(condition_remote_ip_v4(addr));
@@ -309,6 +322,9 @@ pub fn add_filter(
     }
     if spec.remote_subnet_v6.is_some() {
         conditions.push(condition_remote_subnet_v6(&mut subnet_value_v6));
+    }
+    for mask in v6_host_masks.iter_mut() {
+        conditions.push(condition_remote_subnet_v6(mask));
     }
     if let Some(port) = spec.remote_port {
         conditions.push(condition_remote_port(port));
@@ -681,19 +697,28 @@ fn decode_filter_row(row: &FWPM_FILTER0) -> Option<WfpFilterRecord> {
         1 => (decoded.v4_hosts.first().copied(), Vec::new()),
         _ => (None, decoded.v4_hosts),
     };
+    // The v6 twin: one `/128` reads back as the host form the exemptions emit,
+    // several as the packed set. `remote_subnet_v6` already holds any real
+    // prefix, and the two cannot both be present on a filter we emit.
+    let (remote_subnet_v6, remote_ip_set_v6) = match decoded.v6_hosts.len() {
+        0 => (decoded.remote_subnet_v6, Vec::new()),
+        1 => (decoded.v6_hosts.first().map(|ip| (*ip, 128)), Vec::new()),
+        _ => (decoded.remote_subnet_v6, decoded.v6_hosts),
+    };
     Some(WfpFilterRecord {
         id,
         layer,
         action,
         remote_ip,
         remote_ip_set,
+        remote_ip_set_v6,
         remote_port: decoded.remote_port,
         weight,
         user_sid: None,
         app_pattern: None,
         local_interface_luid: decoded.local_interface_luid,
         remote_subnet: decoded.remote_subnet,
-        remote_subnet_v6: decoded.remote_subnet_v6,
+        remote_subnet_v6,
         ip_protocol: decoded.ip_protocol,
     })
 }
@@ -707,6 +732,9 @@ struct DecodedConditions {
     remote_port: Option<u16>,
     local_interface_luid: Option<u64>,
     remote_subnet: Option<(Ipv4Addr, u8)>,
+    /// Every `/128` `IP_REMOTE_ADDRESS` condition — one is a host, several are
+    /// a packed set. A shorter prefix is a real subnet and goes below.
+    v6_hosts: Vec<Ipv6Addr>,
     remote_subnet_v6: Option<(Ipv6Addr, u8)>,
     ip_protocol: Option<u8>,
 }
@@ -756,7 +784,11 @@ fn decode_conditions(row: &FWPM_FILTER0) -> DecodedConditions {
             if !p.is_null() {
                 // SAFETY: pointer valid per above.
                 let am = unsafe { *p };
-                out.remote_subnet_v6 = Some((Ipv6Addr::from(am.addr), am.prefixLength));
+                if am.prefixLength == 128 {
+                    out.v6_hosts.push(Ipv6Addr::from(am.addr));
+                } else {
+                    out.remote_subnet_v6 = Some((Ipv6Addr::from(am.addr), am.prefixLength));
+                }
             }
         } else if cond.fieldKey == FWPM_CONDITION_IP_REMOTE_PORT
             && cond.conditionValue.r#type == FWP_UINT16
@@ -1126,6 +1158,7 @@ mod tests {
             action: WfpAction::Block,
             remote_ip: Some(Ipv4Addr::new(203, 0, 113, 17)),
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: Some(8443),
             weight: 0x0010_0000,
             id: WfpFilterId {

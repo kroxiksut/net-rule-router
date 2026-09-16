@@ -73,8 +73,8 @@ pub struct LoadedProvisioning {
 }
 
 /// Search order: next to the executable (portable copy, installer payload),
-/// then up to five directories above it (a dev checkout runs the binary from
-/// `target/<profile>/`), then the machine state root.
+/// then the machine state root. Never a directory above the executable: a
+/// sheet there could be planted by another local user and would seed policy.
 pub fn load() -> Option<LoadedProvisioning> {
     for candidate in candidate_paths() {
         match read_answers(&candidate) {
@@ -97,19 +97,19 @@ pub fn load() -> Option<LoadedProvisioning> {
 }
 
 fn candidate_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..6 {
-            let Some(d) = dir else { break };
-            out.push(d.join(PROVISIONING_FILE_NAME));
-            dir = d.parent();
-        }
-    }
-    if let Some(root) = nrr_platform_api::paths::production_data_root() {
-        out.push(root.join(PROVISIONING_FILE_NAME));
-    }
-    out
+    let executable = env::current_exe().ok();
+    candidate_paths_for(
+        executable.as_deref().and_then(Path::parent),
+        nrr_platform_api::paths::production_data_root().as_deref(),
+    )
+}
+
+fn candidate_paths_for(executable_dir: Option<&Path>, state_root: Option<&Path>) -> Vec<PathBuf> {
+    executable_dir
+        .into_iter()
+        .chain(state_root)
+        .map(|dir| dir.join(PROVISIONING_FILE_NAME))
+        .collect()
 }
 
 /// `Ok(None)` = no file there. `Err` = the file exists but could not be used.
@@ -129,6 +129,19 @@ fn read_answers(path: &Path) -> Result<Option<ProvisioningAnswers>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sheet_is_looked_for_only_beside_the_binary_and_under_the_state_root() {
+        let binary_dir = Path::new("package").join("bin");
+        let state_root = Path::new("state");
+        assert_eq!(
+            candidate_paths_for(Some(&binary_dir), Some(state_root)),
+            vec![
+                binary_dir.join(PROVISIONING_FILE_NAME),
+                state_root.join(PROVISIONING_FILE_NAME),
+            ]
+        );
+    }
 
     #[test]
     fn a_sheet_answering_every_gate_question_skips_the_wizard() {

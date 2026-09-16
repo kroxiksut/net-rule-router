@@ -189,12 +189,16 @@ impl ProductionPrincipalPlanSource {
             self.fqdn_cache.as_ref(),
             policy.shared_ip_policy,
         );
+        // What policy may do about IPv6: naming the family and STEERING it are
+        // separate answers, and only the machine reading knows either.
+        let ipv6 = self.ipv6_guard(&policy);
         let input = PlannerInput {
             fqdn_cache: self.fqdn_cache.as_ref(),
             app_resolver: self.app_resolver.as_ref(),
             app_observations: self.app_observations.as_ref(),
             zone_priority_over_ip: policy.zone_priority_over_ip,
             secondary_ip_denylist: &secondary_ip_denylist,
+            ipv6,
         };
         // The report says what did NOT plan (a rule waiting on DNS, an app that
         // is not installed). This path has no channel to a GUI yet, so it is
@@ -252,6 +256,20 @@ impl ProductionPrincipalPlanSource {
             ));
         }
 
+        // A rule the tunnel cannot carry over IPv6 is BLOCKED, not leaked.
+        //
+        // This path steers by ROUTE: a secondary rule lowers to a plain permit
+        // plus a route out the tunnel, so an address with no route simply takes
+        // the default one — the main link. Windows never needs this stated
+        // because its kill-switch pins every protected address to the tunnel's
+        // interface, and a pin over a link with no IPv6 is a permit that cannot
+        // match. Here the block has to be written down.
+        //
+        // Only under `FiltersOnly`: with `FiltersAndRoutes` the route exists and
+        // the rule is honoured; with `Off` no v6 destination was ever named.
+        let unroutable_v6 = self.unroutable_v6_blocks(stored, &policy, ipv6, &flows, &ownership);
+        flows.extend(unroutable_v6);
+
         // The leak-guard, armed only while the link it guards against is gone.
         // While the secondary is up, every secondary rule is already a pinned
         // pair — permit over that link, block the same destination anywhere
@@ -278,6 +296,7 @@ impl ProductionPrincipalPlanSource {
             // empty denylist is the permissive answer, and the census exists to
             // TAKE addresses away — its absence cannot invent a block.
             &std::collections::HashSet::new(),
+            ipv6.route_families(),
             crate::address_ownership::ZoneVsIpOrder::from_zone_priority_over_ip(
                 policy.zone_priority_over_ip,
             ),
@@ -341,6 +360,10 @@ impl ProductionPrincipalPlanSource {
                 stored,
                 &exemptions.server_ips,
                 &exemptions.local_subnets,
+                crate::enforcement_planner::Ipv6Exemptions {
+                    server_ips: &exemptions.server_ips_v6,
+                    local_subnets: &exemptions.local_subnets_v6,
+                },
                 protocols,
             )
         } else {
@@ -353,6 +376,10 @@ impl ProductionPrincipalPlanSource {
                 &exemptions.local_subnets,
                 &primary_destinations(rule_flows, ownership),
                 &[],
+                crate::enforcement_planner::Ipv6Exemptions {
+                    server_ips: &exemptions.server_ips_v6,
+                    local_subnets: &exemptions.local_subnets_v6,
+                },
                 policy.allow_dns_over_primary,
                 protocols,
             )
@@ -361,6 +388,23 @@ impl ProductionPrincipalPlanSource {
 
     /// What this principal's blanket block must not cut, from the pass's reading
     /// of the machine.
+    /// What policy may do about IPv6 for this principal's bindings.
+    ///
+    /// Unreadable machine state answers [`Ipv6Guard::Off`]: without knowing
+    /// what the links carry, naming the family would pin destinations on a
+    /// guess.
+    fn ipv6_guard(&self, policy: &PerSidPolicySnapshot) -> crate::enforcement_planner::Ipv6Guard {
+        use crate::enforcement_planner::Ipv6Guard;
+        let Some(reading) = self.machine_reading() else {
+            return Ipv6Guard::Off;
+        };
+        let secondary = crate::catch_all_exemptions::bound_adapter(
+            &reading.adapters,
+            policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+        );
+        Ipv6Guard::from_links(&reading.adapters, secondary)
+    }
+
     fn exemptions_for(&self, policy: &PerSidPolicySnapshot) -> CatchAllExemptions {
         let Some(reading) = self.machine_reading() else {
             return CatchAllExemptions::default();
@@ -370,6 +414,42 @@ impl ProductionPrincipalPlanSource {
             &reading.adapters,
             policy.primary.as_ref().map(|b| b.display_name.as_str()),
             policy.secondary.as_ref().map(|b| b.display_name.as_str()),
+        )
+    }
+
+    /// Blocks over the secondary rules' IPv6 destinations when the tunnel
+    /// cannot carry the family at all.
+    ///
+    /// Gated on the leak-guard exactly like [`Self::fail_closed_flows`]: a user
+    /// who turned the guard off has said they prefer a leak to an outage, and
+    /// this is that same trade on a different axis.
+    fn unroutable_v6_blocks(
+        &self,
+        stored: &str,
+        policy: &PerSidPolicySnapshot,
+        ipv6: crate::enforcement_planner::Ipv6Guard,
+        rule_flows: &[FlowRule],
+        ownership: &crate::address_ownership::AddressOwnership,
+    ) -> Vec<FlowRule> {
+        if ipv6 != crate::enforcement_planner::Ipv6Guard::FiltersOnly
+            || !policy.kill_switch_enabled
+            || !policy.block_secondary_when_unavailable
+            || !policy.kill_switch_fail_closed
+        {
+            return Vec::new();
+        }
+        let protected: Vec<std::net::IpAddr> = secondary_destinations(rule_flows)
+            .into_iter()
+            .filter(|ip| ip.is_ipv6())
+            .filter(|ip| ownership.may_block(*ip))
+            .collect();
+        if protected.is_empty() {
+            return Vec::new();
+        }
+        plan_fail_closed_destinations(
+            stored,
+            &protected,
+            KillSwitchProtocols::from_bits(policy.kill_switch_protocols),
         )
     }
 
@@ -395,7 +475,7 @@ impl ProductionPrincipalPlanSource {
         // An address the user's own main-link rules name is never blocked: the
         // guard would be cancelling one of their rules against the other, and
         // the destination ends up dead for every process on the machine.
-        let protected: Vec<std::net::Ipv4Addr> = secondary_destinations(rule_flows)
+        let protected: Vec<std::net::IpAddr> = secondary_destinations(rule_flows)
             .into_iter()
             .filter(|ip| ownership.may_block(*ip))
             .collect();
@@ -431,7 +511,9 @@ fn primary_destinations(
             // exception is an address the main link's own ADDRESS rules name —
             // there the user stated the destination itself, and the claim on
             // the other side is an application rule's learned collateral.
-            if !secondary.contains(&ip) || ownership.main_named().contains(&ip) {
+            if !secondary.contains(&std::net::IpAddr::V4(ip))
+                || ownership.main_named().contains(&std::net::IpAddr::V4(ip))
+            {
                 seen.insert(ip);
             }
         }
@@ -445,7 +527,7 @@ fn primary_destinations(
 /// Read back off the planned flows rather than re-derived from the rule book:
 /// the planner already did the fan-out and the caps, and deriving them a second
 /// time is how the guarded set drifts from the routed one.
-fn secondary_destinations(flows: &[FlowRule]) -> Vec<std::net::Ipv4Addr> {
+fn secondary_destinations(flows: &[FlowRule]) -> Vec<std::net::IpAddr> {
     let mut seen = std::collections::BTreeSet::new();
     for flow in flows {
         if flow.verdict != Verdict::Permit
@@ -453,8 +535,14 @@ fn secondary_destinations(flows: &[FlowRule]) -> Vec<std::net::Ipv4Addr> {
         {
             continue;
         }
-        if let DstMatch::HostV4(ip) = flow.flow.dst {
-            seen.insert(ip);
+        match flow.flow.dst {
+            DstMatch::HostV4(ip) => {
+                seen.insert(std::net::IpAddr::V4(ip));
+            }
+            DstMatch::HostV6(ip) => {
+                seen.insert(std::net::IpAddr::V6(ip));
+            }
+            _ => {}
         }
     }
     seen.into_iter().collect()
@@ -624,7 +712,7 @@ mod tests {
         CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
     };
     use nrr_domain::{RuleAction, RuleId};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use crate::per_sid_orchestrator::{ActiveRulesSnapshot, PerSidBehaviorMode, PerSidBinding};
 
@@ -655,7 +743,9 @@ mod tests {
                     secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
                         id: RuleId("s-0".into()),
                         enabled: true,
-                        address_match: Some(CanonicalAddressMatch::ExactIp(SECONDARY_HOST)),
+                        address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(
+                            SECONDARY_HOST,
+                        ))),
                         app_match: None,
                         comment: String::new(),
                         action: RuleAction::Route,
@@ -682,6 +772,14 @@ mod tests {
                 block_when_unavailable: true,
                 fail_closed: true,
                 block_all: false,
+            }
+        }
+
+        /// The user chose leak-over-outage: the guard installs nothing.
+        fn disarmed() -> Self {
+            Self {
+                enabled: false,
+                ..Self::armed()
             }
         }
     }
@@ -716,7 +814,6 @@ mod tests {
                 primary_probe_timeout_ms: 1500,
                 primary_probe_max_targets: 8,
                 primary_probe_repeat_secs: 300,
-                block_ipv6_when_protected: false,
                 local_networks_auto_accept: false,
                 zone_priority_over_ip: false,
             })
@@ -727,10 +824,22 @@ mod tests {
         rules: Arc<dyn RulesProvider>,
         policy: Arc<dyn RoutePolicySource>,
     ) -> ProductionPrincipalPlanSource {
-        ProductionPrincipalPlanSource::new(
+        source_with_cache(
             rules,
             policy,
             Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default()),
+        )
+    }
+
+    fn source_with_cache(
+        rules: Arc<dyn RulesProvider>,
+        policy: Arc<dyn RoutePolicySource>,
+        cache: Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+    ) -> ProductionPrincipalPlanSource {
+        ProductionPrincipalPlanSource::new(
+            rules,
+            policy,
+            cache,
             Arc::new(nrr_platform_api::app_path_resolver::NoopAppPathResolver),
             Arc::new(crate::app_observation_lookup::MockAppObservationLookup::default()),
         )
@@ -759,6 +868,7 @@ mod tests {
             interface_type: InterfaceType::Ethernet,
             oper_status: IfOperStatus::Up,
             ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 10)],
+            ipv6_addresses: Vec::new(),
             gateways,
         };
         let links = Arc::new(nrr_platform_api::adapters::MockAdapterEventSource::new());
@@ -767,9 +877,9 @@ mod tests {
 
         let route =
             |dst: Ipv4Addr, prefix: u8, next_hop: Ipv4Addr| nrr_platform_api::types::RouteEntry {
-                destination: dst,
+                destination: IpAddr::V4(dst),
                 prefix_length: prefix,
-                next_hop,
+                next_hop: IpAddr::V4(next_hop),
                 interface_index: 2,
                 metric: 0,
                 is_ours: false,
@@ -1137,5 +1247,101 @@ mod tests {
             "the per-IP guard duplicated the block-all"
         );
         assert!(coverage.kill_switch_complete);
+    }
+
+    // ── IPv6 the tunnel cannot carry ─────────────────────────────────────────
+
+    const HOST: &str = "example.test";
+    const HOST_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9);
+
+    struct OneSecondaryHostRule;
+    impl RulesProvider for OneSecondaryHostRule {
+        fn active_rules(&self) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            Some(crate::per_sid_orchestrator::ActiveRulesSnapshot {
+                rule_book: CanonicalRuleBook {
+                    primary: CanonicalRuleSet::from_rules(Vec::new()),
+                    secondary: CanonicalRuleSet::from_rules(vec![CanonicalRule {
+                        id: RuleId("s-0".into()),
+                        enabled: true,
+                        address_match: Some(CanonicalAddressMatch::ExactFqdn(HOST.into())),
+                        app_match: None,
+                        comment: String::new(),
+                        action: RuleAction::Route,
+                        origin: None,
+                    }]),
+                },
+                behavior_mode: nrr_domain::RouteBehaviorMode::PreferPrimary,
+            })
+        }
+        fn active_rules_for(
+            &self,
+            _sid: &str,
+        ) -> Option<crate::per_sid_orchestrator::ActiveRulesSnapshot> {
+            self.active_rules()
+        }
+    }
+
+    /// A machine whose MAIN link carries IPv6 and whose tunnel does not — the
+    /// `FiltersOnly` disposition.
+    fn plan_with_v6_on_the_main_link_only(policy: Policy) -> (EnforcementPlan, PlanCoverage) {
+        let (api, links) = machine(true);
+        {
+            let mut adapters = links.adapters.lock().unwrap_or_else(|p| p.into_inner());
+            adapters[0].ipv6_addresses = vec![Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)];
+        }
+        let cache = Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::default());
+        cache.set_addresses(
+            HOST,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4)),
+                IpAddr::V6(HOST_V6),
+            ],
+        );
+        source_with_cache(Arc::new(OneSecondaryHostRule), Arc::new(policy), cache)
+            .with_machine_facts(
+                api as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,
+                links as Arc<dyn nrr_platform_api::adapters::AdapterEventSource>,
+            )
+            .plan_with_coverage(&user(), availability(true))
+            .expect("the rule must plan")
+    }
+
+    fn blocks_v6(plan: &EnforcementPlan) -> usize {
+        plan.flows
+            .iter()
+            .filter(|f| {
+                f.verdict == Verdict::Block
+                    && f.precedence.class == PrecedenceClass::KillSwitchBlock
+                    && f.flow.dst == DstMatch::HostV6(HOST_V6)
+            })
+            .count()
+    }
+
+    /// The tunnel is UP and healthy, so nothing here is about a lost link: the
+    /// rule simply cannot be honoured over a family the tunnel does not carry.
+    /// This path steers by ROUTE, so without the block the address would leave
+    /// over the main link — the rule ignored, silently.
+    #[test]
+    fn a_rule_host_the_tunnel_cannot_reach_over_v6_is_blocked_not_leaked() {
+        let (plan, _) = plan_with_v6_on_the_main_link_only(Policy::armed());
+        assert!(
+            blocks_v6(&plan) > 0,
+            "the v6 half of a tunnel-routed host went out the main link unblocked",
+        );
+        assert!(
+            !plan
+                .routes
+                .iter()
+                .any(|r| r.dst == DstMatch::HostV6(HOST_V6)),
+            "a /128 out of a link with no IPv6 attracts traffic it cannot deliver",
+        );
+    }
+
+    /// The guard is opt-in on this axis too: a user who chose leak-over-outage
+    /// gets the leak.
+    #[test]
+    fn a_disarmed_guard_leaves_that_v6_alone() {
+        let (plan, _) = plan_with_v6_on_the_main_link_only(Policy::disarmed());
+        assert_eq!(blocks_v6(&plan), 0);
     }
 }

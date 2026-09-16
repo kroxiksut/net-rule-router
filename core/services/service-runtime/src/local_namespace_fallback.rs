@@ -35,8 +35,9 @@ use std::time::Duration;
 
 use nrr_platform_api::dns::{SystemDnsServersPort, UpstreamDnsCandidate};
 
-use crate::dns_resolver::{ResolveError, ResolvedA, UpstreamResolver};
+use crate::dns_resolver::{ResolveError, ResolvedAddresses, UpstreamResolver};
 use crate::dns_resolver_ports::DirectUdpUpstreamResolver;
+use nrr_platform_api::dns::AddressFamily;
 
 /// How many private resolvers are tried before giving up. A machine has one or
 /// two; the bound only stops a pathological configuration from turning one
@@ -89,8 +90,12 @@ impl LocalNamespaceFallbackResolver {
 }
 
 impl UpstreamResolver for LocalNamespaceFallbackResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedA, ResolveError> {
-        let first = self.inner.resolve_a(hostname);
+    fn resolve(
+        &self,
+        hostname: &str,
+        _family: AddressFamily,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        let first = self.inner.resolve(hostname, AddressFamily::Ipv4);
         // Only a clean non-existence is worth a second opinion. Everything else
         // either succeeded or is being retried below us.
         if !matches!(first, Err(ResolveError::NoRecords)) {
@@ -104,7 +109,7 @@ impl UpstreamResolver for LocalNamespaceFallbackResolver {
                 // resolver that does not answer promptly has nothing to add.
                 1,
             );
-            if let Ok(resolved) = direct.resolve_a(hostname) {
+            if let Ok(resolved) = direct.resolve(hostname, AddressFamily::Ipv4) {
                 if !resolved.addresses.is_empty() {
                     tracing::info!(
                         target: "nrr::dns-resolver",
@@ -143,11 +148,16 @@ pub fn is_private_resolver(server: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::Mutex;
 
-    struct Fixed(Result<ResolvedA, ResolveError>, Mutex<u32>);
+    struct Fixed(Result<ResolvedAddresses, ResolveError>, Mutex<u32>);
     impl UpstreamResolver for Fixed {
-        fn resolve_a(&self, _hostname: &str) -> Result<ResolvedA, ResolveError> {
+        fn resolve(
+            &self,
+            _hostname: &str,
+            _family: AddressFamily,
+        ) -> Result<ResolvedAddresses, ResolveError> {
             *self.1.lock().unwrap() += 1;
             self.0.clone()
         }
@@ -195,8 +205,8 @@ mod tests {
     #[test]
     fn an_answered_name_never_reaches_the_fallback() {
         let inner = Arc::new(Fixed(
-            Ok(ResolvedA {
-                addresses: vec![Ipv4Addr::new(23, 10, 20, 138)],
+            Ok(ResolvedAddresses {
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(23, 10, 20, 138))],
                 ttl_seconds: 60,
             }),
             Mutex::new(0),
@@ -206,7 +216,7 @@ mod tests {
             Arc::new(Servers(vec![corp()])),
             Duration::from_millis(1),
         );
-        assert!(r.resolve_a("host.example").is_ok());
+        assert!(r.resolve("host.example", AddressFamily::Ipv4).is_ok());
     }
 
     /// A transport failure is retried by the layers below; re-asking here would
@@ -223,7 +233,7 @@ mod tests {
             Duration::from_millis(1),
         );
         assert!(matches!(
-            r.resolve_a("host.example"),
+            r.resolve("host.example", AddressFamily::Ipv4),
             Err(ResolveError::Unavailable(_))
         ));
     }
@@ -239,7 +249,7 @@ mod tests {
             Duration::from_millis(1),
         );
         assert!(matches!(
-            r.resolve_a("host.example"),
+            r.resolve("host.example", AddressFamily::Ipv4),
             Err(ResolveError::NoRecords)
         ));
     }

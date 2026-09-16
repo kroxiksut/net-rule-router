@@ -55,6 +55,7 @@ mod tests {
             interface_type: InterfaceType::Ethernet,
             oper_status: IfOperStatus::Up,
             ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 5)],
+            ipv6_addresses: Vec::new(),
             gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
         }]);
         let src = WindowsApiAdapterSource::new(Arc::clone(&api) as Arc<dyn WindowsApiPort>);

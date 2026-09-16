@@ -307,7 +307,7 @@ mod tests {
 
     const TCP_TABLE: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
    0: 0100007F:0035 00000000:0000 0A 00000000:00000000 00:00000000 00000000   991        0 28942 1 0000000000000000 100 0 0 10 5
-   1: 0F02000A:C9B2 5DB8D822:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 44551 1 0000000000000000 20 4 30 10 -1
+   1: 0F02000A:C9B2 330200C0:01BB 01 00000000:00000000 00:00000000 00000000  1000        0 44551 1 0000000000000000 20 4 30 10 -1
 ";
 
     fn addr(text: &str) -> SocketAddr {
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(sockets.len(), 2);
         let established = &sockets[1];
         assert_eq!(established.local, addr("10.0.2.15:51634"));
-        assert_eq!(established.remote, addr("23.10.20.131:443"));
+        assert_eq!(established.remote, addr("192.0.2.51:443"));
         assert_eq!(established.uid, 1000);
         assert_eq!(established.inode, 44551);
         assert_eq!(established.state, TCP_ESTABLISHED);
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn a_malformed_row_is_skipped_rather_than_guessed() {
         let table = "  sl  local_address rem_address   st
-   0: 0F02000A:C9B2 5DB8D822
+   0: 0F02000A:C9B2 330200C0
    1: nonsense
 ";
         assert!(parse_socket_table(table, false).is_empty());

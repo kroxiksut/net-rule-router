@@ -10,17 +10,25 @@
 use super::*;
 
 impl ConnectionObservationConsumer {
-    /// One connection to a named destination stalled or finished cleanly on the
-    /// primary link. Unlike [`Self::note_companion_in_use`] this is NOT deduped
-    /// per address: the verdict is built from how often each outcome happened,
-    /// so collapsing repeats would erase the evidence.
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
-    pub(super) fn note_companion_primary_health(&self, remote: IpAddr, stalled: bool) {
-        let Some(sink) = self.companion_primary_health.as_ref() else {
+    /// A resend or an orderly close on the primary link, reported as at most
+    /// one outcome per connection: the verdict counts connections, and one loss
+    /// burst resends many segments at once. NOT deduped per address — the
+    /// verdict is built from how often each outcome happened.
+    // `pub(super)`: the impl is split across files.
+    pub(super) fn note_companion_primary_health(&self, obs: &ConnectionObservation, now_ms: u64) {
+        if self.companion_primary_health.is_none() && self.app_main_link.is_none() {
+            return;
+        }
+        let IpAddr::V4(ip) = obs.remote.ip() else {
             return;
         };
-        let IpAddr::V4(ip) = remote else {
+        let at_ms = obs.observed_unix_ms.unwrap_or(now_ms);
+        let Some(stalled) = self
+            .primary_stall_evidence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .note(obs.local, obs.remote, obs.progress, at_ms)
+        else {
             return;
         };
         // Rule hosts first, then the rule-less ones. A host with a rule
@@ -35,9 +43,55 @@ impl ConnectionObservationConsumer {
                     .as_ref()
                     .and_then(|name_of| name_of(ip))
             });
-        if let Some(hostname) = hostname {
+        if let Some(app) = self.app_main_link.as_ref() {
+            let program = self
+                .connection_programs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&(obs.local, obs.remote))
+                .map(|(program, _)| program.clone());
+            if let Some(program) = program {
+                app(&program, obs.remote.ip(), stalled, hostname.is_some());
+            }
+        }
+        if let (Some(sink), Some(hostname)) = (self.companion_primary_health.as_ref(), hostname) {
             sink(&hostname, stalled);
         }
+    }
+
+    /// Which program opened this connection, for the application measure: the
+    /// stack's resends and closes carry only a pid, and by then it may be gone.
+    /// The operating system's own programs and tunnel clients are never
+    /// offered, so they are not remembered.
+    pub(super) fn remember_program(&self, rec: &super::ConnectionTraceRecord, at_ms: u64) {
+        const MAX_REMEMBERED: usize = 4096;
+        const REMEMBERED_MS: u64 = 120_000;
+        if self.app_main_link.is_none() {
+            return;
+        }
+        let Some(path) = rec.process_path.as_deref() else {
+            return;
+        };
+        if nrr_domain::app_offer::is_os_program(path)
+            || super::connection_facts::process_name_matches_vpn(Some(path))
+        {
+            return;
+        }
+        let program = nrr_domain::app_offer::program_name(path);
+        if program.is_empty() {
+            return;
+        }
+        let mut programs = self
+            .connection_programs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if programs.len() >= MAX_REMEMBERED {
+            programs.retain(|_, (_, at)| at_ms.saturating_sub(*at) < REMEMBERED_MS);
+            if programs.len() >= MAX_REMEMBERED {
+                programs.clear();
+            }
+        }
+        programs.insert((rec.local, rec.remote), (program, at_ms));
     }
 
     /// One outbound connection attempt, reported to the navigation measure.

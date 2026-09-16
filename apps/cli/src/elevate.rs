@@ -201,11 +201,24 @@ pub fn decode_result(raw: &str) -> Option<RelayResult> {
 /// already-open stdout without reaching for the platform's handle table, and the
 /// point of the relay is precisely that its own console is a window nobody sees.
 pub fn run_relay(request: &RelayRequest) -> u8 {
+    // Claimed before anything privileged runs: a path that is not ours, or one
+    // that cannot be created fresh, means nobody trustworthy is waiting for it.
+    if !is_report_path(&request.result_path) {
+        eprintln!("elevated run: refusing a report path that is not this console's");
+        return exit::FAILED;
+    }
+    let mut report = match crate::platform::create_relay_report(&request.result_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("elevated run: cannot create the report: {e}");
+            return exit::FAILED;
+        }
+    };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => {
             write_report(
-                &request.result_path,
+                &mut report,
                 &RelayResult {
                     code: exit::FAILED,
                     stdout: String::new(),
@@ -226,7 +239,7 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
                 .and_then(|c| u8::try_from(c).ok())
                 .unwrap_or(exit::FAILED);
             write_report(
-                &request.result_path,
+                &mut report,
                 &RelayResult {
                     code,
                     stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -237,7 +250,7 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
         }
         Err(e) => {
             write_report(
-                &request.result_path,
+                &mut report,
                 &RelayResult {
                     code: exit::FAILED,
                     stdout: String::new(),
@@ -251,28 +264,63 @@ pub fn run_relay(request: &RelayRequest) -> u8 {
 
 /// Best-effort: a report that cannot be written leaves the parent saying "the
 /// elevated run reported nothing", which is true and is the only honest answer.
-fn write_report(path: &std::path::Path, result: &RelayResult) {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn write_report(file: &mut std::fs::File, result: &RelayResult) {
+    let _ = file.write_all(encode_result(result).as_bytes());
+}
+
+const REPORT_PREFIX: &str = "cli-elevated-";
+const REPORT_SUFFIX: &str = ".json";
+
+/// The exchange directory both sides compute independently.
+///
+/// On Windows it comes from the shell, not `%TEMP%`: the elevated child
+/// inherits this user's environment, so a planted variable would decide where
+/// an administrator creates a file.
+fn report_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(dir) = nrr_platform_windows::elevation::relay_report_dir() {
+            return dir;
+        }
     }
-    let _ = std::fs::write(path, encode_result(result));
+    std::env::temp_dir().join(PRODUCT_NAME)
 }
 
 /// Where the elevated copy writes its report.
 ///
 /// The per-user temp directory: the elevated child is the SAME user (this is
-/// consent, not impersonation), so it resolves to the same place, and the
-/// directory's default permissions already keep other interactive users out.
-/// The name only has to be unique, not unguessable — the file holds this
-/// console's own output, which the user is about to read anyway.
+/// consent, not impersonation), so it resolves to the same place. The name is
+/// unpredictable so another process of this user cannot stage something at it
+/// before the elevated side creates the file.
 fn report_path() -> PathBuf {
+    use std::hash::{BuildHasher, Hasher};
+
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    std::env::temp_dir()
-        .join(PRODUCT_NAME)
-        .join(format!("cli-elevated-{}-{stamp}.json", std::process::id()))
+    // Randomly keyed per process by the OS generator; no crate needed for 64 bits.
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(stamp);
+    let random = hasher.finish();
+    report_dir().join(format!(
+        "{REPORT_PREFIX}{}-{stamp}-{random:016x}{REPORT_SUFFIX}",
+        std::process::id()
+    ))
+}
+
+/// Whether the elevated side may create `path`: the shape [`report_path`]
+/// gives, so a redirected argument can never name anything else.
+fn is_report_path(path: &std::path::Path) -> bool {
+    let named = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(REPORT_PREFIX) && n.ends_with(REPORT_SUFFIX));
+    let in_our_dir = path
+        .parent()
+        .and_then(std::path::Path::file_name)
+        .is_some_and(|dir| dir == PRODUCT_NAME);
+    path.is_absolute() && named && in_our_dir
 }
 
 // ── The offer ────────────────────────────────────────────────────────────────
@@ -339,6 +387,10 @@ pub fn retry(
     }
 
     let report = report_path();
+    // Made here, unelevated, so the elevated side only ever creates a file.
+    if let Some(dir) = report.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let mut relay_argv = Vec::with_capacity(argv.len() + 2);
     relay_argv.push(RELAY_FLAG.to_string());
     relay_argv.push(report.to_string_lossy().into_owned());
@@ -529,5 +581,31 @@ mod tests {
     fn the_report_path_is_unique_per_invocation() {
         // Two consoles elevating at once must not read each other's report.
         assert_ne!(report_path(), report_path());
+    }
+
+    #[test]
+    fn the_relay_writes_only_where_this_console_would_have_asked() {
+        assert!(is_report_path(&report_path()));
+        let dir = report_dir();
+        for foreign in [
+            dir.join("cli-elevated-1.dll"),
+            dir.join("other.json"),
+            std::env::temp_dir().join("cli-elevated-1.json"),
+            PathBuf::from("NetRuleRouter/cli-elevated-1.json"),
+        ] {
+            assert!(!is_report_path(&foreign), "{}", foreign.display());
+        }
+    }
+
+    #[test]
+    fn a_foreign_report_path_is_refused_before_anything_runs() {
+        let target = std::env::temp_dir().join("nrr-cli-foreign-report.json");
+        let _ = std::fs::remove_file(&target);
+        let code = run_relay(&RelayRequest {
+            result_path: target.clone(),
+            args: vec!["version".to_string()],
+        });
+        assert_eq!(code, exit::FAILED);
+        assert!(!target.exists(), "nothing may be written at a foreign path");
     }
 }

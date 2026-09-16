@@ -198,7 +198,7 @@ pub fn build_negative_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::time::{Duration, SystemTime};
 
     use nrr_domain::decision_lookup::CacheEntryState;
@@ -259,11 +259,9 @@ mod tests {
     fn result_with_freshness(freshness: Option<CacheEntryState>) -> CacheLookupResult {
         CacheLookupResult {
             resolved_ips: Vec::new(),
-            reverse_hostnames: Vec::new(),
             overall_freshness: freshness,
             best_source: None,
             is_multi_ip: false,
-            has_conflict: false,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
@@ -354,7 +352,7 @@ mod tests {
 
     fn make_ip_entry(freshness: CacheEntryState, expires_at: Option<SystemTime>) -> CachedIpEntry {
         CachedIpEntry {
-            addr: Ipv4Addr::new(1, 2, 3, 4),
+            addr: IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)),
             cache_state: freshness,
             source: StorageResolutionSource::Dns,
             resolved_at: None,
@@ -574,7 +572,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "multi.example".to_string(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip1],
+                resolved_ips: vec![IpAddr::V4(ip1)],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: SystemTime::now(),
@@ -587,7 +585,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "multi.example".to_string(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip1, ip2],
+                resolved_ips: vec![IpAddr::V4(ip1), IpAddr::V4(ip2)],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: SystemTime::now(),
@@ -635,7 +633,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "manual.example".to_string(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip],
+                resolved_ips: vec![IpAddr::V4(ip)],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::ManualRefresh,
                 resolved_at: SystemTime::now(),
@@ -687,7 +685,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: "expire.example".to_string(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip],
+                resolved_ips: vec![IpAddr::V4(ip)],
                 ttl_seconds: Some(300),
                 source: StorageResolutionSource::Dns,
                 resolved_at: SystemTime::now(),

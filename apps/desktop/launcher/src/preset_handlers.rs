@@ -331,21 +331,21 @@ ru
 
     /// Rows from a service revision arrive carrying `validation-status` and the
     /// table paints them; rows from an imported file carried nothing and
-    /// defaulted to "valid". An IPv6 address in a hand-edited file looked
+    /// defaulted to "valid". A malformed address in a hand-edited file looked
     /// accepted until the apply refused the whole file.
     #[test]
     fn a_row_the_service_would_refuse_is_flagged_before_the_apply() {
-        let text = "--- IP\n192.168.1.1\n2001:db8::1\n";
+        let text = "--- IP\n192.168.1.1\n192.168.1.0/24\n";
         let res = handle_preset_request("preset.parse", &json!({ "text": text })).expect("call");
         let flagged = res["validation"].as_array().expect("validation array");
         assert_eq!(flagged.len(), 1, "only the bad row travels: {flagged:?}");
         // `id-hint` is what pairs the verdict with its row; the parser numbers
-        // rules from 1, so the IPv6 line is the second rule.
+        // rules from 1, so the subnet line is the second rule.
         assert_eq!(flagged[0]["id-hint"], json!(2));
         assert_eq!(flagged[0]["status"], json!("error"));
         assert_eq!(
             flagged[0]["message-key"],
-            json!("rules.validation.match-value-invalid.exact-ip-v6")
+            json!("rules.validation.match-value-invalid.exact-ip")
         );
     }
 

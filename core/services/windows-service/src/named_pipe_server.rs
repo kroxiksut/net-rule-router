@@ -89,7 +89,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 
 use nrr_service_runtime::ipc_push::{
-    extract_subscription_id, flush_push_frames, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
+    adopt_subscription, flush_push_frames, SubscriptionChange, PUSH_BATCH_SIZE, PUSH_POLL_INTERVAL,
 };
 use nrr_service_runtime::{
     AcceptError, AcceptErrorCategory, AcceptOutcome, ActiveSidRegistry, EventBus, IpcAcceptor,
@@ -640,20 +640,25 @@ fn handle_connection(
                     "request dispatched"
                 );
 
-                // The push pump only flushes once this connection has
-                // subscribed; the handler returns the id in its payload.
-                if subscription_id.is_none() && response.ok {
-                    subscription_id = extract_subscription_id(&response);
-                    if let Some(sub_id) = subscription_id.as_deref() {
-                        tracing::info!(
-                            target: "nrr::ipc-push",
-                            subscription_id = sub_id,
-                            profile = ?identity.profile,
-                            subscribers = event_bus.as_ref().map(|b| b.subscriber_count()).unwrap_or(0),
-                            bus_wired = event_bus.is_some(),
-                            "push subscription opened"
-                        );
-                    }
+                // The push pump flushes the connection's newest subscription;
+                // the handler returns its id in the payload.
+                match adopt_subscription(&mut subscription_id, &response, event_bus.as_deref()) {
+                    SubscriptionChange::Unchanged => {}
+                    SubscriptionChange::Opened(sub_id) => tracing::info!(
+                        target: "nrr::ipc-push",
+                        subscription_id = %sub_id,
+                        profile = ?identity.profile,
+                        subscribers = event_bus.as_ref().map(|b| b.subscriber_count()).unwrap_or(0),
+                        bus_wired = event_bus.is_some(),
+                        "push subscription opened"
+                    ),
+                    SubscriptionChange::Replaced { previous, current } => tracing::debug!(
+                        target: "nrr::ipc-push",
+                        previous = %previous,
+                        subscription_id = %current,
+                        profile = ?identity.profile,
+                        "push subscription replaced by a re-subscribe on the same connection"
+                    ),
                 }
 
                 if let Err(e) = write_frame(&mut writer, &response) {

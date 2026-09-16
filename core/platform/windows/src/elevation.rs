@@ -1,10 +1,9 @@
 //! Windows implementation of the privileged-relaunch port: one UAC prompt.
 //!
-//! Elevation is delegated to PowerShell `Start-Process -Verb RunAs`, the same
-//! idiom the elevation broker uses (`apps/desktop/broker/src/spawn.rs`), so this
-//! module needs no `unsafe` to raise the prompt. Unlike the broker's spawn this
-//! one is `-Wait`: the caller is a console that must not return before the work
-//! it asked for is done.
+//! Elevation is delegated to PowerShell `Start-Process -Verb RunAs`, so raising
+//! the prompt needs no `unsafe`. The console's relaunch is `-Wait`: it must not
+//! return before the work it asked for is done. The session broker starts
+//! through [`start_elevated_script`] instead, which does not wait.
 //!
 //! ## Why the child's output cannot come back through here
 //!
@@ -97,24 +96,14 @@ pub fn classify_exit(code: Option<i32>) -> ElevatedRun {
 /// Build the PowerShell script that elevates `program` with `args` and waits.
 ///
 /// Pure and public so the quoting — the one injection surface of this module —
-/// is tested rather than trusted.
+/// is tested rather than trusted. The arguments go over as ONE pre-quoted
+/// command line: Windows PowerShell joins an `-ArgumentList` array with bare
+/// spaces, which splits a report path under a user name containing a space.
 pub fn relaunch_script(program: &Path, args: &[String]) -> String {
-    let program = ps_single_quote(&program.to_string_lossy());
-    // `-ArgumentList` rejects an empty array, so a no-argument relaunch omits
-    // the parameter rather than passing `@()`.
-    let argument_list = if args.is_empty() {
-        String::new()
-    } else {
-        let list = args
-            .iter()
-            .map(|a| ps_single_quote(a))
-            .collect::<Vec<_>>()
-            .join(",");
-        format!(" -ArgumentList @({list})")
-    };
+    let target = start_process_target(program, args);
     format!(
         "$ErrorActionPreference='Stop'; \
-         try {{ $p = Start-Process -FilePath {program}{argument_list} \
+         try {{ $p = Start-Process {target} \
          -Verb RunAs -WindowStyle Hidden -PassThru -Wait }} \
          catch {{ exit {ELEVATION_REFUSED} }}; \
          if ($null -eq $p) {{ exit {ELEVATION_REFUSED} }}; \
@@ -123,11 +112,90 @@ pub fn relaunch_script(program: &Path, args: &[String]) -> String {
     )
 }
 
-/// Quote a string as a PowerShell single-quoted literal, doubling embedded
-/// single quotes. The only defence against a path or argument closing the
-/// literal and continuing as script.
+/// The PowerShell that elevates `program` with `args` and returns at once, for
+/// a long-lived elevated child. A declined prompt exits non-zero.
+pub fn start_elevated_script(program: &Path, args: &[String]) -> String {
+    let target = start_process_target(program, args);
+    format!("$ErrorActionPreference='Stop'; Start-Process {target} -Verb RunAs")
+}
+
+/// `-FilePath` and `-ArgumentList` of one `Start-Process` call.
+fn start_process_target(program: &Path, args: &[String]) -> String {
+    let program = ps_single_quote(&program.to_string_lossy());
+    // `-ArgumentList` rejects an empty value, so a no-argument call omits it.
+    if args.is_empty() {
+        format!("-FilePath {program}")
+    } else {
+        let list = ps_single_quote(&win32_command_line(args));
+        format!("-FilePath {program} -ArgumentList {list}")
+    }
+}
+
+/// Arguments joined into a Win32 command line, each quoted by the rules
+/// `CommandLineToArgvW` and the Rust runtime parse back.
+pub fn win32_command_line(args: &[String]) -> String {
+    args.iter()
+        .map(|a| win32_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn win32_quote(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are escapes: double them, then
+                // escape the quote itself.
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Trailing backslashes would otherwise escape the closing quote.
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// Quote a string as a PowerShell single-quoted literal. The only defence
+/// against a path or argument closing the literal and continuing as script;
+/// PowerShell also closes a literal on the typographic single quotes, so those
+/// are doubled too.
 fn ps_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// Creates the file the elevated relay reports into: new, and in the directory
+/// the path names rather than wherever a link swapped in by the user points.
+pub fn create_relay_report(path: &Path) -> std::io::Result<std::fs::File> {
+    let root = crate::pinned_file::user_temp_root()?;
+    crate::pinned_file::create_new(&root, path)
+}
+
+/// Where the unelevated side must put the report path it hands to the elevated
+/// one. Same directory both sides compute independently, from the shell rather
+/// than from `%TEMP%`.
+pub fn relay_report_dir() -> std::io::Result<std::path::PathBuf> {
+    crate::pinned_file::handoff_dir()
 }
 
 #[cfg(test)]
@@ -155,14 +223,70 @@ mod tests {
             script.contains(r"'C:\Program Files\nrr\nrr-cli.exe'"),
             "the path is passed as one quoted literal: {script}"
         );
-        assert!(script.contains("@('stop')"), "{script}");
+        assert!(script.contains(r#"-ArgumentList '"stop"'"#), "{script}");
     }
 
     #[test]
     fn an_argument_cannot_close_the_literal_and_continue_as_script() {
         // The one injection surface: a quote in an argument must stay data.
         let script = relaunch_script(Path::new("nrr-cli"), &["it's; rm -rf /".to_string()]);
-        assert!(script.contains("'it''s; rm -rf /'"), "{script}");
+        assert!(script.contains(r#"'"it''s; rm -rf /"'"#), "{script}");
+        let script = relaunch_script(Path::new("nrr-cli"), &["it\u{2019}s".to_string()]);
+        assert!(script.contains("'\"it\u{2019}\u{2019}s\"'"), "{script}");
+    }
+
+    /// What the elevated child's runtime sees, parsed by Windows itself.
+    #[allow(unsafe_code)]
+    fn parsed_by_windows(command_line: &str) -> Vec<String> {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+
+        // A program name first: its token follows different rules.
+        let wide = HSTRING::from(format!("nrr-cli.exe {command_line}"));
+        let mut count = 0i32;
+        // SAFETY: a NUL-terminated string that outlives the call; the returned
+        // array holds `count` valid strings until it is released with LocalFree.
+        unsafe {
+            let argv = CommandLineToArgvW(&wide, &mut count);
+            assert!(!argv.is_null());
+            let words = (1..count as usize)
+                .map(|i| (*argv.add(i)).to_string().expect("utf-16"))
+                .collect();
+            let _ = LocalFree(HLOCAL(argv.cast()));
+            words
+        }
+    }
+
+    #[test]
+    fn every_argument_reaches_the_elevated_child_whole() {
+        // A report path under a user name with a space, a quote, a trailing
+        // backslash and an empty value must each arrive as exactly one argument.
+        let args = vec![
+            "--elevated-relay".to_string(),
+            r"C:\Users\Ann O'Neil\AppData\Local\Temp\NetRuleRouter\cli-elevated-1.json".to_string(),
+            r#"say "hi" \"#.to_string(),
+            r"C:\dir\".to_string(),
+            String::new(),
+        ];
+        assert_eq!(parsed_by_windows(&win32_command_line(&args)), args);
+        let script = relaunch_script(Path::new("nrr-cli"), &args);
+        assert!(
+            script.contains(&ps_single_quote(&win32_command_line(&args))),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn the_start_script_elevates_without_waiting() {
+        let script = start_elevated_script(Path::new("broker.exe"), &["a b".to_string()]);
+        assert!(
+            script.contains(r#"-ArgumentList '"a b"' -Verb RunAs"#),
+            "{script}"
+        );
+        assert!(!script.contains("-Wait"), "{script}");
+        let bare = start_elevated_script(Path::new("broker.exe"), &[]);
+        assert!(!bare.contains("-ArgumentList"), "{bare}");
     }
 
     #[test]

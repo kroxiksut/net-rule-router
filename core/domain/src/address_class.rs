@@ -13,6 +13,55 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Which IP address family an address belongs to, or a lookup is asking for.
+///
+/// One spelling for the whole product: the DNS resolver asks in it, the cache
+/// files rows under it, and the rule book matches on it. The string form is the
+/// one persisted in `ip_addresses.address_family`, so it is not free to change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AddressFamily {
+    Ipv4,
+    Ipv6,
+}
+
+impl AddressFamily {
+    #[must_use]
+    pub fn of(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(_) => Self::Ipv4,
+            IpAddr::V6(_) => Self::Ipv6,
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv4 => "ipv4",
+            Self::Ipv6 => "ipv6",
+        }
+    }
+
+    /// Does `ip` belong to this family?
+    #[must_use]
+    pub fn holds(self, ip: IpAddr) -> bool {
+        Self::of(ip) == self
+    }
+}
+
+/// The persisted spelling is the only accepted input; anything else is a row we
+/// did not write.
+impl std::str::FromStr for AddressFamily {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ipv4" => Ok(Self::Ipv4),
+            "ipv6" => Ok(Self::Ipv6),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Address kinds that change how a destination should be talked about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AddressClass {
@@ -210,8 +259,68 @@ fn port_purpose(port: u16) -> Option<&'static str> {
     }
 }
 
+/// The canonical form of an address: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) is its IPv4 address, anything else is itself.
+///
+/// One address written two ways would otherwise be two rule keys and two
+/// matches; every place that compares addresses asks this.
+#[must_use]
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        IpAddr::V4(_) => ip,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mapped_address_is_its_ipv4_and_every_other_address_is_itself() {
+        use super::canonical_ip;
+        use std::net::{IpAddr, Ipv4Addr};
+        let mapped: IpAddr = "::ffff:192.0.2.7".parse().expect("mapped");
+        assert_eq!(
+            canonical_ip(mapped),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))
+        );
+        let v6: IpAddr = "2001:db8::7".parse().expect("v6");
+        assert_eq!(canonical_ip(v6), v6);
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(canonical_ip(v4), v4);
+    }
+
+    /// The string form is what sits in `ip_addresses.address_family`, so it is
+    /// a stored format, not a display choice: the round trip is the guard that
+    /// a rename would have to break loudly.
+    #[test]
+    fn address_family_round_trips_through_its_stored_spelling() {
+        use std::str::FromStr;
+        for (variant, s) in [
+            (super::AddressFamily::Ipv4, "ipv4"),
+            (super::AddressFamily::Ipv6, "ipv6"),
+        ] {
+            assert_eq!(variant.as_str(), s);
+            assert_eq!(super::AddressFamily::from_str(s), Ok(variant));
+        }
+        assert!(super::AddressFamily::from_str("IPv4").is_err());
+        assert!(super::AddressFamily::from_str("").is_err());
+    }
+
+    /// `of` and `holds` are the pair the resolver narrows answers with; if they
+    /// disagreed, a v6 address could be filed under a v4 question.
+    #[test]
+    fn family_of_an_address_is_the_one_that_holds_it() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert_eq!(super::AddressFamily::of(v4), super::AddressFamily::Ipv4);
+        assert_eq!(super::AddressFamily::of(v6), super::AddressFamily::Ipv6);
+        assert!(super::AddressFamily::Ipv4.holds(v4));
+        assert!(!super::AddressFamily::Ipv4.holds(v6));
+        assert!(super::AddressFamily::Ipv6.holds(v6));
+        assert!(!super::AddressFamily::Ipv6.holds(v4));
+    }
+
     use super::*;
 
     fn ip(s: &str) -> IpAddr {

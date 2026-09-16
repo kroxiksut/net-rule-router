@@ -90,8 +90,9 @@ if (-not $isAdmin) {
     if ($Purge) {
         Write-Host "  -Purge: %ProgramData%\NetRuleRouter\ will be removed." -ForegroundColor Yellow
     }
-    Start-Process -FilePath $exePath -ArgumentList $uninstallArgs -Verb RunAs -Wait
-    exit $LASTEXITCODE
+    # $LASTEXITCODE is not set by Start-Process; the child's code comes from -PassThru.
+    $p = Start-Process -FilePath $exePath -ArgumentList ($uninstallArgs -join ' ') -Verb RunAs -Wait -PassThru
+    exit $p.ExitCode
 }
 
 Write-Host "==> sc stop NetRuleRouter (best-effort)" -ForegroundColor Cyan

@@ -314,3 +314,98 @@ fn run_node(program: &str) -> Option<String> {
     );
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
+
+/// Collect the `_`-prefixed properties a QML file declares.
+fn declared_underscore_properties(source: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in source.lines() {
+        let line = line.trim();
+        let body = line.strip_prefix("readonly ").unwrap_or(line);
+        let Some(rest) = body.strip_prefix("property ") else {
+            continue;
+        };
+        for token in rest.split_whitespace() {
+            let token = token.trim_end_matches(':');
+            if token.starts_with('_') {
+                names.insert(token.to_string());
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// True when `source` assigns `name` without an object in front of it.
+fn assigns_unqualified(source: &str, name: &str) -> Option<usize> {
+    for (number, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        for (at, _) in line.match_indices(name) {
+            let before = at.checked_sub(1).map(|i| bytes[i] as char);
+            if matches!(before, Some(c) if c == '.' || c == '_' || c.is_alphanumeric()) {
+                continue;
+            }
+            let after = &line[at + name.len()..];
+            let mut chars = after.chars().skip_while(|c| *c == ' ');
+            if chars.next() != Some('=') || chars.next() == Some('=') {
+                continue;
+            }
+            return Some(number + 1);
+        }
+    }
+    None
+}
+
+/// A flag that a `flows/*.qml` controller owns has to be written THROUGH that
+/// controller. Written bare from a shell the assignment parses, survives
+/// `qmllint`, and throws only when the line finally runs — "Invalid write to
+/// global property". That is what aborted `applyServiceStabilityPatch` before
+/// it queued anything: no Get, no Set, and `_stabilityLoading` left true
+/// forever, so every later Apply and every "Save and continue" in
+/// Settings -> Diagnostics returned false without a word on screen. The
+/// service's stability row went eight days without a write.
+#[test]
+fn a_shell_never_writes_a_controller_owned_flag_unqualified() {
+    let flows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../desktop/qml/flows");
+    let mut owned: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(&flows).expect("the flows directory must exist") {
+        let path = entry.expect("readable directory entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("qml") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("readable controller");
+        let file = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        for name in declared_underscore_properties(&source) {
+            owned.push((file.clone(), name));
+        }
+    }
+    assert!(
+        !owned.is_empty(),
+        "no controller-owned properties found — the scan stopped seeing the flows"
+    );
+
+    for shell in ["apps/desktop/qml/Main.qml", "apps/desktop/qml/Tray.qml"] {
+        let source = repo_file(shell);
+        // A shell may legitimately own a property of the same name.
+        let shell_owned = declared_underscore_properties(&source);
+        for (controller, name) in &owned {
+            if shell_owned.contains(name) {
+                continue;
+            }
+            if let Some(line) = assigns_unqualified(&source, name) {
+                panic!(
+                    "{shell}:{line} writes `{name}`, which `flows/{controller}` owns, without \
+                     naming the controller — that throws at runtime and silently kills whatever \
+                     function it sits in"
+                );
+            }
+        }
+    }
+}

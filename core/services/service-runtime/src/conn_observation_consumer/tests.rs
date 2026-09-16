@@ -9,7 +9,7 @@ use super::*;
 // imports the type its verdicts are made of.
 use nrr_domain::block_notice::BlockReason;
 use nrr_platform_api::conn_observe::TransportProtocol;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 
 const ETHERNET: u32 = 16;
 const VPN: u32 = 20;
@@ -434,7 +434,6 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
             primary_probe_timeout_ms: 1500,
             primary_probe_max_targets: 8,
             primary_probe_repeat_secs: 300,
-            block_ipv6_when_protected: true,
             local_networks_auto_accept: false,
             zone_priority_over_ip: false,
         })
@@ -455,6 +454,7 @@ fn test_consumer_with_live_secondary() -> ConnectionObservationConsumer {
         interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
         oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
         ipv4_addresses: vec![Ipv4Addr::new(10, 88, 1, 41)],
+        ipv6_addresses: Vec::new(),
         gateways: vec![Ipv4Addr::new(10, 88, 0, 1)],
     };
     let stable_id = vpn.stable_id();
@@ -652,11 +652,59 @@ fn build_unicast_table_flattens_adapter_addresses() {
             Ipv4Addr::new(192, 168, 0, 50),
             Ipv4Addr::new(192, 168, 0, 51),
         ],
+        ipv6_addresses: Vec::new(),
         gateways: vec![Ipv4Addr::new(192, 168, 0, 1)],
     }];
     let table = build_unicast_table(&infos);
     assert_eq!(table.len(), 2);
     assert!(table.contains(&(v4(Ipv4Addr::new(192, 168, 0, 50)), ETHERNET)));
+}
+
+/// Both families land in the table. Before this, adapter enumeration carried
+/// IPv4 only, so every IPv6 connection resolved to an unknown egress and
+/// reached the Diagnostics panel with no route and no verdict — measured on a
+/// live host: 41 570 observed connections, 4 of them v6, all shown as "other".
+#[test]
+fn build_unicast_table_carries_both_address_families() {
+    let infos = vec![AdapterInfo {
+        index: ETHERNET,
+        adapter_name: "{eth}".into(),
+        description: "Ethernet".into(),
+        friendly_name: "Ethernet".into(),
+        mac: None,
+        interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
+        oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
+        ipv4_addresses: vec![Ipv4Addr::new(192, 168, 0, 50)],
+        ipv6_addresses: vec![
+            Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7),
+        ],
+        gateways: vec![Ipv4Addr::new(192, 168, 0, 1)],
+    }];
+    let table = build_unicast_table(&infos);
+    assert_eq!(table.len(), 3, "one v4 plus two v6");
+    assert!(table.contains(&(
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 7)),
+        ETHERNET
+    )));
+}
+
+/// A link-local source counts too: on a machine with no global v6 it is the
+/// only v6 address there is, and that is exactly the case that produced the
+/// unattributed rows.
+#[test]
+fn classify_resolves_an_ipv6_source_to_its_interface() {
+    let local = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x27b2);
+    let unicast = vec![(IpAddr::V6(local), VPN)];
+    let mut observation = obs(Ipv4Addr::new(10, 8, 0, 6), Ipv4Addr::new(23, 10, 20, 162));
+    observation.local = SocketAddr::new(IpAddr::V6(local), 50000);
+    observation.remote = SocketAddr::new(
+        IpAddr::V6(Ipv6Addr::new(0x2620, 0x2d, 0, 1, 0, 0, 0, 0x28)),
+        443,
+    );
+    let rec = classify_connection(&observation, &unicast, Some(ETHERNET), Some(VPN));
+    assert_eq!(rec.egress.role, EgressRole::Secondary);
+    assert_eq!(rec.egress.ifindex, VPN);
 }
 
 #[test]
@@ -953,6 +1001,31 @@ fn block_notice_consumer(
         consumer = consumer.with_killswitch_drop_check(check);
     }
     (consumer, notices)
+}
+
+/// The trace names which of our filters dropped a connection, with the same
+/// reading the block notice gives; a foreign drop names none.
+#[test]
+fn the_trace_says_which_of_our_filters_dropped_a_connection() {
+    let check: KillswitchDropCheckFn = Arc::new(|id| id == 777);
+    let (consumer, _notices) = block_notice_consumer(Some(check));
+    let ring = Arc::new(ConnectionTraceRing::new(16));
+    let consumer = consumer.with_trace_ring(Arc::clone(&ring));
+    consumer.consume(
+        &[
+            block_obs(Some(true), Some(777)),
+            block_obs(Some(true), Some(42)),
+            block_obs(Some(false), Some(9)),
+        ],
+        SystemTime::now(),
+    );
+    let (rows, _) = ring.snapshot(0, 16);
+    let mut reasons: Vec<Option<&str>> = rows.iter().map(|r| r.nrr_block_reason).collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![None, Some("blocked-by-rule"), Some("route-unavailable")]
+    );
 }
 
 #[test]

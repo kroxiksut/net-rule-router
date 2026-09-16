@@ -11,7 +11,7 @@
 //! [`RouteTablePort`], and an egress target is an interface index plus an
 //! optional gateway on every platform this product targets.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use nrr_platform_api::adapters::{AdapterEventSource, AdapterInfo, IfOperStatus};
@@ -142,6 +142,11 @@ fn target_for(adapters: &[AdapterInfo], name: &str) -> Option<RouteTarget> {
             .first()
             .copied()
             .unwrap_or(Ipv4Addr::UNSPECIFIED),
+        // No v6 gateway is modelled on an adapter yet, and a tunnel commonly
+        // carries no v6 address at all — so a v6 route out of this egress is
+        // on-link, addressed by interface alone. The same shape the
+        // gateway-less v4 tunnel already uses.
+        gateway_v6: Ipv6Addr::UNSPECIFIED,
         interface_index: adapter.index,
     })
 }
@@ -165,6 +170,7 @@ mod tests {
                 IfOperStatus::Down
             },
             ipv4_addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
             gateways: gw.into_iter().collect(),
         }
     }

@@ -58,6 +58,29 @@ impl ConnectionObservationConsumer {
             .is_some_and(|(spec_id, check)| check(spec_id))
     }
 
+    /// Which of our filters dropped `rec` — one reading for the block notice
+    /// and the connection trace, so the two never name different causes.
+    pub(super) fn reason_for_drop(
+        &self,
+        rec: &ConnectionTraceRecord,
+        killswitch_verified: bool,
+        default_block_id: Option<u64>,
+    ) -> nrr_domain::block_notice::BlockReason {
+        let ipv6_cut = rec
+            .nrr_drop_spec_id
+            .zip(self.ipv6_cut_drop_check.as_ref())
+            .is_some_and(|(spec_id, check)| check(spec_id));
+        let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
+        block_reason_for(
+            rec.nrr_drop_spec_id,
+            killswitch_verified,
+            default_block_id,
+            armed,
+            ipv6_cut,
+            self.is_dns_lockdown_drop(rec),
+        )
+    }
+
     /// Turn one OUR-attributed Block into a `BlockAttempt` and hand it to the
     /// wired sink. A foreign filter (`blocked_by_nrr == Some(false)`) never
     /// reaches this method — see the `consume` call site — because blaming
@@ -84,20 +107,8 @@ impl ConnectionObservationConsumer {
         ) {
             return;
         }
-        let ipv6_cut = rec
-            .nrr_drop_spec_id
-            .zip(self.ipv6_cut_drop_check.as_ref())
-            .is_some_and(|(spec_id, check)| check(spec_id));
-        let dns_lockdown = self.is_dns_lockdown_drop(rec);
         let armed = self.fail_closed_armed.as_ref().is_some_and(|armed| armed());
-        let reason = block_reason_for(
-            rec.nrr_drop_spec_id,
-            killswitch_verified,
-            default_block_id,
-            armed,
-            ipv6_cut,
-            dns_lockdown,
-        );
+        let reason = self.reason_for_drop(rec, killswitch_verified, default_block_id);
         // The outage is one fact about the machine, not one fact per
         // application that ran into it. A disarmed block-all means the wait is
         // over, so the next one is news again — this is also what keeps the

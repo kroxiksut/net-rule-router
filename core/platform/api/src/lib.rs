@@ -64,6 +64,8 @@ pub mod file_handoff;
 // testable on every platform.
 pub mod fake_ip;
 pub mod hosts_file;
+// One ICMP echo with a chosen hop limit and source (ping/traceroute over a link).
+pub mod icmp_echo;
 pub mod interface_rows;
 // Neutral per-interface octet-counter port. Mechanism is per-OS (`GetIfTable2`
 // / `/proc/net/dev` / `if_data`); this holds the value type + trait only.
@@ -109,7 +111,6 @@ pub mod service_control;
 // object on Windows, an abstract socket on Linux — anything the user cannot
 // delete and the OS releases when the owner dies.
 pub mod single_instance;
-pub mod strategy;
 // The host's operator log (Windows event log; the journal on Linux, which needs
 // no implementation because stdout already lands there).
 pub mod system_event_log;
@@ -138,7 +139,7 @@ pub mod windows_api;
 // `nrr-platform-windows` crate root so consumers (`service-runtime`,
 // `mock-backend`) can write `nrr_platform_api::RouteEntry` exactly as they
 // wrote `nrr_platform_windows::RouteEntry`. Windows-only concretes
-// (ProductionWindowsApi, the WFP enforcement backend, fail_closed/strategy,
+// (ProductionWindowsApi, the WFP enforcement backend, fail_closed,
 // the Etw*/Wfp*/Dpapi impls, collect_interfaces_rows) are
 // intentionally NOT re-exported here — they live only in the Windows backend
 // and are consumed under `#[cfg(windows)]`.
@@ -203,7 +204,6 @@ pub use power::{
     NoopPowerEventObserver, PowerEvent, PowerEventCallback, PowerEventObserver,
     PowerEventSubscription,
 };
-pub use strategy::{is_ipv6_address, rule_strategy, RuleImplementationStrategy};
 pub use third_party::{
     IntegrityVerdict, MockThirdPartyIntegrity, NoopThirdPartyIntegrity, SignatureStatus,
     ThirdPartyComponent, ThirdPartyComponentStatus, ThirdPartyIntegrityPort,

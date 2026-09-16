@@ -160,10 +160,9 @@ mod tests {
     #[test]
     fn missing_dir_keeps_requested_cutoff() {
         let requested = 1_700_000_000_000;
-        assert_eq!(
-            refine_session_cutoff_ms(Path::new("Z:/definitely/absent"), requested),
-            requested
-        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("definitely-absent");
+        assert_eq!(refine_session_cutoff_ms(&missing, requested), requested);
     }
 
     #[test]

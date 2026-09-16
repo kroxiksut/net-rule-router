@@ -67,7 +67,7 @@ four ways:
 | Exact domain | `api.example.com` | only this host |
 | Domain with subdomains | `*.example.com` | the domain and all subdomains |
 | Domain zone | `.ru` | all domains in the zone |
-| Exact IPv4 | `203.0.113.7` | only that address |
+| Exact IP | `203.0.113.7`, `2001:db8::7` | only that address |
 | Application | `chrome.exe` | all traffic from that process |
 
 Rules are applied from specific to general: an exact domain beats

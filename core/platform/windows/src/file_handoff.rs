@@ -69,22 +69,13 @@ fn is_windows_sid(value: &str) -> bool {
 }
 
 fn run_icacls(args: &[&str]) -> Result<(), PlatformError> {
-    // `%SystemRoot%` rather than the bare name: this runs as LocalSystem, and
-    // the process search path includes the current directory.
-    let icacls = match std::env::var_os("SystemRoot") {
-        Some(root) => std::path::PathBuf::from(root)
-            .join("System32")
-            .join("icacls.exe"),
-        None => std::path::PathBuf::from("icacls.exe"),
-    };
-    let output =
-        Command::new(icacls)
-            .args(args)
-            .output()
-            .map_err(|e| PlatformError::Transient {
-                operation: "file_handoff.icacls.spawn",
-                detail: e.to_string(),
-            })?;
+    let output = Command::new(crate::system_shell::system32_exe("icacls.exe"))
+        .args(args)
+        .output()
+        .map_err(|e| PlatformError::Transient {
+            operation: "file_handoff.icacls.spawn",
+            detail: e.to_string(),
+        })?;
     if output.status.success() {
         return Ok(());
     }
@@ -126,7 +117,7 @@ mod tests {
     fn a_non_sid_principal_is_refused_without_running_anything() {
         let port = IcaclsFileHandoff;
         let err = port
-            .grant_read(Path::new("C:/nonexistent/x.zip"), "unix:uid:1000")
+            .grant_read(Path::new("dir-a/x.zip"), "unix:uid:1000")
             .expect_err("must refuse");
         assert!(matches!(err, PlatformError::NotSupported { .. }));
     }

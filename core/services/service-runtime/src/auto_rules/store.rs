@@ -496,8 +496,6 @@ struct CandidateJson {
     #[serde(default)]
     stalls: u32,
     #[serde(default)]
-    cuts: u32,
-    #[serde(default)]
     done: u32,
     #[serde(default)]
     p: Vec<PairJson>,
@@ -530,7 +528,6 @@ impl EvidenceSnapshotJson {
                     th: c.total_hits,
                     used: c.seen_in_use,
                     stalls: c.primary_stalls,
-                    cuts: c.primary_cuts,
                     done: c.primary_completions,
                     p: c.pairs
                         .iter()
@@ -581,7 +578,6 @@ impl EvidenceSnapshotJson {
                     total_hits: c.th,
                     seen_in_use: c.used,
                     primary_stalls: c.stalls,
-                    primary_cuts: c.cuts,
                     primary_completions: c.done,
                     pairs: c
                         .p

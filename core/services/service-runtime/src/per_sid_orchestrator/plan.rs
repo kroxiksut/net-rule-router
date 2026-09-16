@@ -181,6 +181,13 @@ impl PerSidApplyOrchestrator {
                 .publish(sid, &policy.link_provider_exe_paths);
         }
         timings.mark("fake-ip");
+        // What the machine's links can carry decides whether policy names IPv6
+        // at all. Resolved per pass, not per session: a tunnel that comes up
+        // with a v6 address changes the answer.
+        let ipv6 = (self.ipv6_guard_resolver)(sid);
+        if intent.publishes() {
+            crate::ipv6_disposition::global_ipv6_dispositions().set(sid, ipv6);
+        }
         let mut codegen_out = generate_filters(CodegenInput {
             sid,
             rule_book: &rules.rule_book,
@@ -190,6 +197,7 @@ impl PerSidApplyOrchestrator {
             app_resolver: self.app_resolver.as_ref(),
             secondary_ip_denylist: &secondary_ip_denylist,
             zone_priority_over_ip: false,
+            families: ipv6.families(),
         });
         // Shadow-compare the neutral pipeline against the live one, BEFORE the
         // fake-IP augmentation is folded in — not because the planner cannot
@@ -372,13 +380,6 @@ impl PerSidApplyOrchestrator {
         // posture they asked for; the fail-OPEN escape hatch stays
         // `kill_switch_fail_closed = false`, not a disarmed guard.
         let leak_guard_armed = policy.kill_switch_enabled;
-        // Closing the IPv6 family is about rules that point at the additional
-        // route: a host with an AAAA record could otherwise take it while its
-        // v4 is pinned or blocked. With no such rule there is nothing to
-        // bypass, so the family stays up. (The catch-all postures cut v6 as
-        // part of cutting everything — that is decided in their own codegen.)
-        let ipv6_cut_wanted =
-            policy.block_ipv6_when_protected && !rules.rule_book.secondary.is_empty();
         // whether THIS compute produced a fail-closed
         // block-all set (feeds the arming-edge OS resolver-cache flush at the
         // end of the function; per-IP pinning and fail-open never flush).
@@ -544,24 +545,40 @@ impl PerSidApplyOrchestrator {
             // also names stays pinned — there the pin is the only guard. Gated
             // on the app pair being armable at all (TCP/UDP selected); with
             // neither selected the historic per-destination posture stands.
+            // App observations are IPv4 today, so this set is too — it is
+            // SUBTRACTED from the pin set, and an empty v6 half simply pins
+            // what an app rule would have covered had it seen the family.
             let app_covered: std::collections::HashSet<std::net::Ipv4Addr> =
                 if protocols.wants_ale_block() {
                     codegen_out
                         .app_observed_secondary_ips
                         .iter()
                         .copied()
-                        .filter(|ip| !ownership.additional_named().contains(ip))
+                        .filter(|ip| {
+                            !ownership
+                                .additional_named()
+                                .contains(&std::net::IpAddr::V4(*ip))
+                        })
                         .collect()
                 } else {
                     std::collections::HashSet::new()
                 };
-            let protectable: Vec<std::net::Ipv4Addr> = codegen_out
+            let protectable: Vec<std::net::IpAddr> = codegen_out
                 .secondary_dest_ips
                 .iter()
                 .copied()
                 .filter(|ip| ownership.may_block(*ip))
-                .filter(|ip| !in_any_subnet(*ip, &local_subnets))
-                .filter(|ip| !app_covered.contains(ip))
+                .filter(|ip| match ip {
+                    // "Sits in a subnet the main link is attached to" is asked
+                    // of the family that has one; the v6 local prefixes reach
+                    // the blanket block's exemptions, not the pin set.
+                    std::net::IpAddr::V4(v4) => !in_any_subnet(*v4, &local_subnets),
+                    std::net::IpAddr::V6(_) => true,
+                })
+                .filter(|ip| match ip {
+                    std::net::IpAddr::V4(v4) => !app_covered.contains(v4),
+                    std::net::IpAddr::V6(_) => true,
+                })
                 .collect();
             if protectable.len() != codegen_out.secondary_dest_ips.len() {
                 tracing::info!(
@@ -573,9 +590,12 @@ impl PerSidApplyOrchestrator {
                     "kill-switch pin set trimmed: main-route-claimed addresses (blocking one kills a destination the user routed the other way) and app-observed destinations (their app's own pair is the guard)",
                 );
             }
+            // The shared-address census is IPv4: it counts direct hosts seen
+            // on an address, and nothing observes v6 co-tenancy yet. A v6
+            // address is therefore never "shared" and stays pinned.
             let (ks_dest_ips, ks_shared_excluded_ips): (
-                Vec<std::net::Ipv4Addr>,
-                Vec<std::net::Ipv4Addr>,
+                Vec<std::net::IpAddr>,
+                Vec<std::net::IpAddr>,
             ) = if policy.kill_switch_strict_shared_ips {
                 (protectable, Vec::new())
             } else {
@@ -584,7 +604,10 @@ impl PerSidApplyOrchestrator {
                     (protectable, Vec::new())
                 } else {
                     let (kept, excluded): (Vec<_>, Vec<_>) =
-                        protectable.into_iter().partition(|ip| !shared.contains(ip));
+                        protectable.into_iter().partition(|ip| match ip {
+                            std::net::IpAddr::V4(v4) => !shared.contains(v4),
+                            std::net::IpAddr::V6(_) => true,
+                        });
                     (kept, excluded)
                 }
             };
@@ -594,7 +617,7 @@ impl PerSidApplyOrchestrator {
                 .filter(|_| intent.publishes())
             {
                 let prev = status.count();
-                status.set(&ks_shared_excluded_ips);
+                status.set(&only_v4_of(&ks_shared_excluded_ips));
                 if prev != ks_shared_excluded_ips.len() as u32 && !ks_shared_excluded_ips.is_empty()
                 {
                     tracing::info!(
@@ -657,25 +680,28 @@ impl PerSidApplyOrchestrator {
             // toggle/mode flips, the datapath watchdog on health flips), so
             // this gate is re-evaluated promptly, never left waiting for an
             // unrelated recompute.
+            // Every exemption this set is subtracted from is IPv4 (the
+            // packet-layer primary permits, the known-direct rescues), so the
+            // set is too: there is no v6 exemption for a v6 address to have to
+            // stay out of.
             let never_exempt_secondary_ips: std::collections::HashSet<std::net::Ipv4Addr> =
                 if fake_ip_name_enforcement_active {
                     // App-observed destinations ride along even though they are
                     // no longer pinned: their guard is the per-app block, and an
                     // exemption permit outranks it — rescuing one would hand the
                     // app a primary-egress path while the tunnel is down.
-                    ks_dest_ips
-                        .iter()
-                        .copied()
+                    only_v4_of(&ks_dest_ips)
+                        .into_iter()
                         .chain(app_covered.iter().copied())
                         .collect()
                 } else if policy.kill_switch_strict_shared_ips {
-                    codegen_out.secondary_dest_ips.iter().copied().collect()
+                    only_v4_of(&codegen_out.secondary_dest_ips)
+                        .into_iter()
+                        .collect()
                 } else {
                     let main_route_claimed = fqdn_cache.shared_direct_ips_primary_ruled();
-                    codegen_out
-                        .secondary_dest_ips
-                        .iter()
-                        .copied()
+                    only_v4_of(&codegen_out.secondary_dest_ips)
+                        .into_iter()
                         .filter(|ip| !main_route_claimed.contains(ip))
                         .collect()
                 };
@@ -697,7 +723,10 @@ impl PerSidApplyOrchestrator {
                 let mut named: Vec<std::net::Ipv4Addr> = ownership
                     .main_named()
                     .iter()
-                    .copied()
+                    .filter_map(|ip| match ip {
+                        std::net::IpAddr::V4(v4) => Some(*v4),
+                        std::net::IpAddr::V6(_) => None,
+                    })
                     .filter(|ip| !never_exempt_secondary_ips.contains(ip))
                     .collect();
                 named.sort_unstable();
@@ -712,8 +741,10 @@ impl PerSidApplyOrchestrator {
                 |resolution: &crate::killswitch_codegen::KillSwitchResolution| {
                     FailClosedExemptions {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
                         foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                         local_subnets: resolution.local_subnets.clone(),
+                        local_subnets_v6: resolution.local_subnets_v6.clone(),
                         primary_dest_ips: known_primary_dest_ips.clone(),
                         known_direct_ips: self
                             .known_direct
@@ -790,8 +821,10 @@ impl PerSidApplyOrchestrator {
                             block_all_armed = false;
                             let exemptions = FailClosedExemptions {
                                 bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                                bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
                                 foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                                 local_subnets: resolution.local_subnets.clone(),
+                                local_subnets_v6: resolution.local_subnets_v6.clone(),
                                 // Inert here — this branch calls fail_closed_filters
                                 // with block_all=false (per-IP path), which ignores
                                 // primary_dest_ips; primary IPs are never blocked
@@ -828,10 +861,7 @@ impl PerSidApplyOrchestrator {
                                 &ks_dest_ips,
                                 &exemptions,
                                 protocols,
-                                FailClosedPosture {
-                                    block_all: false,
-                                    block_ipv6: ipv6_cut_wanted,
-                                },
+                                FailClosedPosture { block_all: false },
                             );
                             // App-observed destinations left the per-IP pin set,
                             // so a secondary-routed app is cut here by its own
@@ -929,26 +959,6 @@ impl PerSidApplyOrchestrator {
                                 &exempt_patterns,
                             ));
                         }
-                        // IPv6 with the tunnel UP and per-destination pins in
-                        // place — the one posture that never closed the family.
-                        // A host with an AAAA record keeps a way out we never
-                        // pinned (Free resolves A only), so the same site can
-                        // travel the tunnel over v4 and the main link over v6.
-                        // Closing the family is the honest answer; leaving the
-                        // rule applied to half the host is not. Opt-out per
-                        // principal for a network that genuinely needs v6.
-                        //
-                        // Only in `PreferPrimary`: the other modes arm the
-                        // catch-all, which emits this very set already, and a
-                        // second copy would be identical filters twice.
-                        if behavior_mode == RouteBehaviorMode::PreferPrimary && ipv6_cut_wanted {
-                            let v6_cut = crate::killswitch_codegen::catch_all_v6_filters(
-                                sid,
-                                resolution.secondary_luid,
-                            );
-                            collect_block_ids(&v6_cut, &mut killswitch_block_ids);
-                            filters.extend(v6_cut);
-                        }
                     }
                 }
                 None => {
@@ -1018,7 +1028,6 @@ impl PerSidApplyOrchestrator {
                             protocols,
                             FailClosedPosture {
                                 block_all: effective_block_all,
-                                block_ipv6: ipv6_cut_wanted,
                             },
                         );
                         // A secondary-routed app is cut whole while its link is
@@ -1137,8 +1146,10 @@ impl PerSidApplyOrchestrator {
                 if let Some(resolution) = (self.kill_switch_resolver)(sid) {
                     let exemptions = FailClosedExemptions {
                         bootstrap_server_ips: resolution.bootstrap_server_ips.clone(),
+                        bootstrap_server_ips_v6: resolution.bootstrap_server_ips_v6.clone(),
                         foreign_tunnel_luids: resolution.foreign_tunnel_luids.clone(),
                         local_subnets: resolution.local_subnets.clone(),
+                        local_subnets_v6: resolution.local_subnets_v6.clone(),
                         primary_dest_ips: Vec::new(),
                         allow_dns_over_primary: false,
                         known_direct_ips: Vec::new(),
@@ -1281,7 +1292,7 @@ impl PerSidApplyOrchestrator {
             self.note_fail_closed_state(sid, fail_closed_armed);
             // Both postures cut at the packet layer, which has no user
             // condition — see `note_machine_wide_cut`.
-            self.note_machine_wide_cut(sid, block_all_armed || ipv6_cut_wanted);
+            self.note_machine_wide_cut(sid, block_all_armed);
             self.update_killswitch_registry(sid, killswitch_block_ids);
         }
         timings.mark("publish");

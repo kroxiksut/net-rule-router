@@ -1,0 +1,52 @@
+#pragma once
+
+#include <QApplication>
+#include <QClipboard>
+#include <QCoreApplication>
+#include <QCryptographicHash>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDebug>
+#include <QDir>
+#include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
+#include <QGuiApplication>
+#include <QIcon>
+#include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QLabel>
+#include <QLockFile>
+#include <QJsonValue>
+#include <QLocale>
+#include <QPainter>
+#include <QPen>
+#include <QQmlApplicationEngine>
+#include <QQmlContext>
+#include <QQuickStyle>
+#include <QProcess>
+#include <QScreen>
+#include <QSplashScreen>
+#include <QStandardPaths>
+#include <QStringList>
+#include <QStyleHints>
+#include <QTimer>
+#include <QThread>
+#include <QUrl>
+#include <QVariant>
+#include <QWindow>
+
+#include <atomic>
+#include <cstdio>
+#include <memory>
+#include <iostream>
+#include <string>
+
+#ifdef Q_OS_WIN
+#include <shobjidl_core.h>
+#include <dwmapi.h>
+#include <windows.h>
+#include <io.h>
+#endif

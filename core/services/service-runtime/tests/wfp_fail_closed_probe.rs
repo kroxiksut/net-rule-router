@@ -33,7 +33,7 @@
 #![allow(clippy::expect_used)]
 #![cfg(windows)]
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use nrr_platform_api::types::WfpFilterSpec;
 use nrr_platform_windows::win32_ffi::wfp_engine::engine_open;
@@ -56,7 +56,9 @@ const PROBE_SID: &str = "S-1-5-32-545";
 fn probe_exemptions() -> FailClosedExemptions {
     FailClosedExemptions {
         bootstrap_server_ips: vec![Ipv4Addr::new(203, 0, 113, 10)],
+        bootstrap_server_ips_v6: Vec::new(),
         local_subnets: vec![(Ipv4Addr::new(192, 168, 0, 0), 24)],
+        local_subnets_v6: Vec::new(),
         foreign_tunnel_luids: Vec::new(),
         primary_dest_ips: Vec::new(),
         allow_dns_over_primary: false,
@@ -157,9 +159,14 @@ fn probe_catch_all_fail_closed_filters_materialize_on_windows() {
 #[test]
 #[ignore = "requires admin: FwpmEngineOpen0/FwpmTransactionBegin0/FwpmFilterAdd0 need elevation"]
 fn probe_per_destination_fail_closed_filters_materialize_on_windows() {
+    // Both families: the v6 half rides the same `IP_REMOTE_ADDRESS` field with
+    // an `FWP_V6_ADDR_AND_MASK` value, and whether THAT materializes is exactly
+    // what a probe is for.
     let protected = [
-        Ipv4Addr::new(198, 51, 100, 7),
-        Ipv4Addr::new(203, 0, 113, 44),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 44)),
+        IpAddr::V6("2001:db8::7".parse().expect("literal")),
+        IpAddr::V6("2001:db8::2c".parse().expect("literal")),
     ];
     let specs = fail_closed_block_destinations(PROBE_SID, &protected, KillSwitchProtocols::ALL);
     let failures = probe_specs("per-dest", &specs);
@@ -189,7 +196,10 @@ fn probe_per_destination_fail_closed_filters_materialize_on_windows() {
 fn probe_leak_proof_pair_and_dns_exempt_filters_materialize_on_windows() {
     let mut specs = kill_switch_filters(
         PROBE_SID,
-        &[Ipv4Addr::new(198, 51, 100, 7)],
+        &[
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)),
+            IpAddr::V6("2001:db8::7".parse().expect("literal")),
+        ],
         0x0011_2233_4455_6677,
         KillSwitchProtocols::ALL,
     );

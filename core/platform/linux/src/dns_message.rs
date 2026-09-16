@@ -10,10 +10,13 @@
 //! Pure over bytes, so every test runs on any host — the socket lives in
 //! [`crate::dns_resolver`].
 
-use std::net::Ipv4Addr;
+pub use nrr_platform_api::dns::AddressFamily;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Resource-record type for an IPv4 address.
 const TYPE_A: u16 = 1;
+/// Resource-record type for an IPv6 address.
+const TYPE_AAAA: u16 = 28;
 /// Resource-record type for a canonical-name alias.
 const TYPE_CNAME: u16 = 5;
 /// The only class this product speaks.
@@ -27,20 +30,52 @@ const MAX_NAME: usize = 255;
 /// at itself, and a reader without this bound loops forever on a hostile answer.
 const MAX_JUMPS: usize = 16;
 
+/// Wire record type carrying an address of `family`.
+const fn record_type(family: AddressFamily) -> u16 {
+    match family {
+        AddressFamily::Ipv4 => TYPE_A,
+        AddressFamily::Ipv6 => TYPE_AAAA,
+    }
+}
+
+/// RDATA width of one address record of `family`.
+const fn record_rdlength(family: AddressFamily) -> usize {
+    match family {
+        AddressFamily::Ipv4 => 4,
+        AddressFamily::Ipv6 => 16,
+    }
+}
+
+/// Read an address out of RDATA already known to be 4 or 16 octets wide.
+fn address_from(rdata: &[u8]) -> IpAddr {
+    if let Ok(octets) = <[u8; 4]>::try_from(rdata) {
+        return IpAddr::V4(Ipv4Addr::from(octets));
+    }
+    match <[u8; 16]>::try_from(rdata) {
+        Ok(octets) => IpAddr::V6(Ipv6Addr::from(octets)),
+        // Unreachable: the caller matched RDLENGTH against the family width
+        // before calling. The unspecified address is the inert answer, and it
+        // is dropped downstream like any other non-routable one.
+        Err(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
 /// What a server said about a name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsAnswer {
-    /// The name resolved. `addresses` is never empty here.
+    /// The name resolved. `addresses` is never empty here, and every entry
+    /// belongs to the family that was asked for.
     Addresses {
-        addresses: Vec<Ipv4Addr>,
+        addresses: Vec<IpAddr>,
         /// Smallest TTL across the records, which is when the answer as a whole
         /// stops being trustworthy.
         min_ttl: u32,
     },
     /// The name does not exist. Authoritative — worth caching as a negative.
     NxDomain,
-    /// The name exists but has no A record (a `CNAME`-only or AAAA-only name),
-    /// or the answer section carried nothing we asked for.
+    /// The name exists but has no record of the family asked for (a
+    /// `CNAME`-only name, or one that lives on the other family), or the
+    /// answer section carried nothing we asked for.
     NoAddresses,
     /// The server refused to answer.
     Refused,
@@ -73,12 +108,12 @@ pub fn canonical_name(hostname: &str) -> String {
     hostname.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Build a standard recursive query for `hostname`'s A records.
+/// Build a standard recursive query for `hostname`'s records of `family`.
 ///
 /// Returns `None` for a name no query can be built from: empty, an over-long
 /// label, or one carrying bytes that cannot appear in the wire format.
 #[must_use]
-pub fn encode_query(transaction_id: u16, hostname: &str) -> Option<Vec<u8>> {
+pub fn encode_query(transaction_id: u16, hostname: &str, family: AddressFamily) -> Option<Vec<u8>> {
     let canonical = canonical_name(hostname);
     if canonical.is_empty() || canonical.len() > MAX_NAME || canonical.contains('\0') {
         return None;
@@ -100,7 +135,7 @@ pub fn encode_query(transaction_id: u16, hostname: &str) -> Option<Vec<u8>> {
         message.extend_from_slice(label.as_bytes());
     }
     message.push(0); // root label ends the name
-    message.extend_from_slice(&TYPE_A.to_be_bytes());
+    message.extend_from_slice(&record_type(family).to_be_bytes());
     message.extend_from_slice(&CLASS_IN.to_be_bytes());
     Some(message)
 }
@@ -115,7 +150,10 @@ pub fn decode_response(
     message: &[u8],
     expected_id: u16,
     asked: &str,
+    family: AddressFamily,
 ) -> Result<DnsAnswer, DnsDecodeError> {
+    let want = record_type(family);
+    let want_rdlength = record_rdlength(family);
     if message.len() < 12 {
         return Err(DnsDecodeError::Truncated);
     }
@@ -142,7 +180,10 @@ pub fn decode_response(
         let (name, next) = read_name(message, at)?;
         // The question is echoed back; a mismatch means this datagram is not
         // about our name, whatever else it claims.
-        if question_count == 1 && name != canonical_name(asked) {
+        let echoed_type = message
+            .get(next..next + 2)
+            .map(|t| u16::from_be_bytes([t[0], t[1]]));
+        if question_count == 1 && (name != canonical_name(asked) || echoed_type != Some(want)) {
             return Err(DnsDecodeError::WrongQuestion {
                 asked: canonical_name(asked),
                 answered: name,
@@ -183,13 +224,8 @@ pub fn decode_response(
         if rdata_end > message.len() {
             return Err(DnsDecodeError::Truncated);
         }
-        if rclass == CLASS_IN && rtype == TYPE_A && rdlength == 4 {
-            addresses.push(Ipv4Addr::new(
-                message[header_end],
-                message[header_end + 1],
-                message[header_end + 2],
-                message[header_end + 3],
-            ));
+        if rclass == CLASS_IN && rtype == want && rdlength == want_rdlength {
+            addresses.push(address_from(&message[header_end..rdata_end]));
             min_ttl = min_ttl.min(ttl);
         } else if rclass == CLASS_IN && rtype == TYPE_CNAME {
             // The alias itself is not an address; its own A records follow in
@@ -259,6 +295,10 @@ fn read_name(message: &[u8], start: usize) -> Result<(String, usize), DnsDecodeE
 mod tests {
     use super::*;
 
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
     fn header(id: u16, flags: u16, questions: u16, answers: u16) -> Vec<u8> {
         let mut h = Vec::new();
         h.extend_from_slice(&id.to_be_bytes());
@@ -290,10 +330,25 @@ mod tests {
         r
     }
 
+    fn aaaa_record(ttl: u32, ip: [u8; 16]) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&[0xC0, 0x0C]); // pointer to the question's name
+        r.extend_from_slice(&TYPE_AAAA.to_be_bytes());
+        r.extend_from_slice(&CLASS_IN.to_be_bytes());
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&16u16.to_be_bytes());
+        r.extend_from_slice(&ip);
+        r
+    }
+
     fn response(id: u16, answers: &[Vec<u8>], rcode: u16) -> Vec<u8> {
+        response_of(id, answers, rcode, TYPE_A)
+    }
+
+    fn response_of(id: u16, answers: &[Vec<u8>], rcode: u16, qtype: u16) -> Vec<u8> {
         let mut m = header(id, 0x8180 | rcode, 1, answers.len() as u16);
         m.extend_from_slice(&name(&["example", "com"]));
-        m.extend_from_slice(&TYPE_A.to_be_bytes());
+        m.extend_from_slice(&qtype.to_be_bytes());
         m.extend_from_slice(&CLASS_IN.to_be_bytes());
         for answer in answers {
             m.extend_from_slice(answer);
@@ -301,9 +356,47 @@ mod tests {
         m
     }
 
+    /// The v6 half of the decoder is not on today's data path, which is exactly
+    /// why it needs its own round trip.
+    #[test]
+    fn an_aaaa_answer_decodes_to_v6_addresses() {
+        let ip = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let message = response_of(3, &[aaaa_record(90, ip)], 0, TYPE_AAAA);
+
+        assert_eq!(
+            decode_response(&message, 3, "example.com", AddressFamily::Ipv6),
+            Ok(DnsAnswer::Addresses {
+                addresses: vec![IpAddr::V6(Ipv6Addr::from(ip))],
+                min_ttl: 90,
+            })
+        );
+    }
+
+    /// RDLENGTH and TYPE together are what keep one family out of the other's
+    /// answer: an `A` record must never satisfy an `AAAA` question.
+    #[test]
+    fn an_answer_of_the_other_family_is_not_an_address() {
+        // Right question type, wrong record inside.
+        let message = response_of(4, &[a_record(60, [1, 2, 3, 4])], 0, TYPE_AAAA);
+        assert_eq!(
+            decode_response(&message, 4, "example.com", AddressFamily::Ipv6),
+            Ok(DnsAnswer::NoAddresses)
+        );
+
+        // Right record, wrong question echoed back: not an answer to ours.
+        let crossed = response_of(5, &[a_record(60, [1, 2, 3, 4])], 0, TYPE_A);
+        assert!(matches!(
+            decode_response(&crossed, 5, "example.com", AddressFamily::Ipv6),
+            Err(DnsDecodeError::WrongQuestion { .. })
+        ));
+    }
+
     #[test]
     fn a_query_carries_the_name_as_length_prefixed_labels() {
-        let query = encode_query(0x1234, "Example.COM.").expect("a plain name must encode");
+        let query = encode_query(0x1234, "Example.COM.", AddressFamily::Ipv4)
+            .expect("a plain name must encode");
 
         assert_eq!(&query[0..2], &[0x12, 0x34]);
         assert_eq!(u16::from_be_bytes([query[2], query[3]]) & 0x0100, 0x0100);
@@ -312,10 +405,10 @@ mod tests {
 
     #[test]
     fn a_name_that_cannot_be_asked_about_is_refused_rather_than_mangled() {
-        assert!(encode_query(1, "").is_none());
-        assert!(encode_query(1, "a..b").is_none());
-        assert!(encode_query(1, &"x".repeat(64)).is_none());
-        assert!(encode_query(1, "bad\0name").is_none());
+        assert!(encode_query(1, "", AddressFamily::Ipv4).is_none());
+        assert!(encode_query(1, "a..b", AddressFamily::Ipv4).is_none());
+        assert!(encode_query(1, &"x".repeat(64), AddressFamily::Ipv4).is_none());
+        assert!(encode_query(1, "bad\0name", AddressFamily::Ipv4).is_none());
     }
 
     #[test]
@@ -326,12 +419,13 @@ mod tests {
             0,
         );
 
-        let answer = decode_response(&message, 7, "example.com").expect("a well-formed answer");
+        let answer = decode_response(&message, 7, "example.com", AddressFamily::Ipv4)
+            .expect("a well-formed answer");
 
         assert_eq!(
             answer,
             DnsAnswer::Addresses {
-                addresses: vec![Ipv4Addr::new(23, 10, 20, 138), Ipv4Addr::new(1, 2, 3, 4)],
+                addresses: vec![v4(23, 10, 20, 138), v4(1, 2, 3, 4)],
                 // The answer is only good while its shortest-lived record is.
                 min_ttl: 60,
             }
@@ -345,11 +439,11 @@ mod tests {
         let message = response(7, &[a_record(60, [1, 2, 3, 4])], 0);
 
         assert!(matches!(
-            decode_response(&message, 8, "example.com"),
+            decode_response(&message, 8, "example.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::WrongTransaction { .. })
         ));
         assert!(matches!(
-            decode_response(&message, 7, "other.com"),
+            decode_response(&message, 7, "other.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::WrongQuestion { .. })
         ));
     }
@@ -360,11 +454,11 @@ mod tests {
         let empty = response(1, &[], 0);
 
         assert_eq!(
-            decode_response(&nx, 1, "example.com"),
+            decode_response(&nx, 1, "example.com", AddressFamily::Ipv4),
             Ok(DnsAnswer::NxDomain)
         );
         assert_eq!(
-            decode_response(&empty, 1, "example.com"),
+            decode_response(&empty, 1, "example.com", AddressFamily::Ipv4),
             Ok(DnsAnswer::NoAddresses)
         );
     }
@@ -375,11 +469,11 @@ mod tests {
         let odd = response(1, &[], 9);
 
         assert_eq!(
-            decode_response(&refused, 1, "example.com"),
+            decode_response(&refused, 1, "example.com", AddressFamily::Ipv4),
             Ok(DnsAnswer::Refused)
         );
         assert_eq!(
-            decode_response(&odd, 1, "example.com"),
+            decode_response(&odd, 1, "example.com", AddressFamily::Ipv4),
             Ok(DnsAnswer::ServerFailure { rcode: 9 })
         );
     }
@@ -393,7 +487,7 @@ mod tests {
         message[2] |= 0x02;
 
         assert_eq!(
-            decode_response(&message, 1, "example.com"),
+            decode_response(&message, 1, "example.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::TruncatedByServer)
         );
     }
@@ -411,7 +505,7 @@ mod tests {
         message.extend_from_slice(&[0xC0 | (loop_at >> 8) as u8, loop_at as u8]);
 
         assert_eq!(
-            decode_response(&message, 1, "example.com"),
+            decode_response(&message, 1, "example.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::MalformedName)
         );
     }
@@ -424,7 +518,7 @@ mod tests {
         message.truncate(message.len() - 2);
 
         assert_eq!(
-            decode_response(&message, 1, "example.com"),
+            decode_response(&message, 1, "example.com", AddressFamily::Ipv4),
             Err(DnsDecodeError::Truncated)
         );
     }
@@ -443,9 +537,9 @@ mod tests {
         let message = response(2, &[cname, a_record(300, [10, 0, 0, 7])], 0);
 
         assert_eq!(
-            decode_response(&message, 2, "example.com"),
+            decode_response(&message, 2, "example.com", AddressFamily::Ipv4),
             Ok(DnsAnswer::Addresses {
-                addresses: vec![Ipv4Addr::new(10, 0, 0, 7)],
+                addresses: vec![v4(10, 0, 0, 7)],
                 // The alias's own TTL bounds the answer too.
                 min_ttl: 30,
             })
