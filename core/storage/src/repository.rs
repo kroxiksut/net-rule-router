@@ -27,7 +27,6 @@
 //!   → service snapshot exposed
 //! ```
 
-use std::net::Ipv4Addr;
 use std::time::SystemTime;
 
 use nrr_domain::decision_lookup::{FreshnessThresholds, LookupResult};
@@ -62,21 +61,12 @@ pub trait CacheRepository {
         strategy: crate::resolution_source::CachePriorityStrategy,
     ) -> StorageResult<CacheLookupResult>;
 
-    /// Look up all cached hostnames associated with an IP (reverse lookup).
-    ///
-    /// Results are diagnostic context only — never the sole basis for a match.
-    fn get_by_ip(
-        &self,
-        ip: Ipv4Addr,
-        thresholds: &FreshnessThresholds,
-    ) -> StorageResult<CacheLookupResult>;
-
-    /// Combined forward + optional reverse lookup, converted into the
+    /// Forward lookup, converted into the
     /// [`LookupResult`] type expected by the rule engine.
     ///
     /// This is the single call the service layer makes on the critical path.
-    /// Internally it calls `get_by_hostname` / `get_by_ip`, selects the best
-    /// IP (Fresh > StaleUsable > ObservedFromTraffic), and maps storage types
+    /// Internally it calls `get_by_hostname`, selects the best IP
+    /// (Fresh > StaleUsable), and maps storage types
     /// to domain types without leaking SQL or storage details to the engine.
     ///
     /// `strategy` is the caller's (active user's) cache-source priority; it
@@ -139,8 +129,8 @@ pub trait CacheRepository {
         limit: usize,
     ) -> StorageResult<Vec<ExpiredHostname>>;
 
-    /// Every IPv4 resolution in the cache, as `(canonical_host, ip,
-    /// resolved_at)`, in ONE query.
+    /// Every resolution in the cache, both families, as `(canonical_host,
+    /// ip, resolved_at)`, in ONE query.
     ///
     /// The filter codegen needs the addresses of thousands of hostnames per
     /// pass and used to ask for them one hostname at a time — a prepared
@@ -151,9 +141,7 @@ pub trait CacheRepository {
     /// Rows carry the same join and ordering `get_by_hostname` uses
     /// (`resolved_at DESC` within a hostname), so a snapshot built from them
     /// answers exactly what the per-hostname path answers.
-    fn snapshot_ipv4_resolutions(
-        &self,
-    ) -> StorageResult<Vec<(String, std::net::Ipv4Addr, SystemTime)>>;
+    fn snapshot_resolutions(&self) -> StorageResult<Vec<(String, std::net::IpAddr, SystemTime)>>;
 
     /// Every cached hostname as `(canonical_host, last_seen_at_ms)`, in ONE
     /// query, ordered exactly like [`Self::list_hostnames_under_suffix`]

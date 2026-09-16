@@ -215,6 +215,24 @@ impl PerSidApplyOrchestrator {
         })
     }
 
+    /// Whether a filter ADD is still allowed. A filter installed after the stop
+    /// teardown began outlives the process — the WFP session is non-dynamic, so
+    /// nothing takes it down when we exit, and it keeps dropping traffic with no
+    /// service left to lift it. Checked at entry AND right before the engine
+    /// call: a pass that entered before the latch is still running.
+    fn adds_refused(&self, sid: &str, stage: &'static str) -> bool {
+        if !(self.teardown_gate)() {
+            return false;
+        }
+        tracing::info!(
+            target: "nrr::per_sid_orchestrator",
+            sid = %sid,
+            stage,
+            "teardown in progress — filter adds refused (an added filter outlives the process)",
+        );
+        true
+    }
+
     fn install_for_sid_with(
         &self,
         sid: &str,
@@ -222,6 +240,9 @@ impl PerSidApplyOrchestrator {
     ) -> Result<usize, OrchestratorError> {
         if sid.is_empty() {
             return Err(OrchestratorError::EmptySid);
+        }
+        if self.adds_refused(sid, "install") {
+            return Ok(0);
         }
         // the admin baseline is never enforced as its
         // own machine-wide filter set. It only ever reaches the wire as a
@@ -287,6 +308,11 @@ impl PerSidApplyOrchestrator {
             .filter(|_| filters.iter().any(is_destination_block))
         {
             route_sync();
+        }
+        // The compute above can run for seconds; the latch may have flipped
+        // inside it.
+        if self.adds_refused(sid, "install-apply") {
+            return Ok(0);
         }
         let actions: Vec<WfpFilterAction> = filters
             .iter()
@@ -414,6 +440,9 @@ impl PerSidApplyOrchestrator {
     /// inactive / not-yet-installed SID is owned by [`Self::reconcile`]).
     /// Returns the count of filters added.
     pub fn reconcile_secondary_coverage(&self, sid: &str) -> Result<usize, OrchestratorError> {
+        if self.adds_refused(sid, "leak-guard-coverage") {
+            return Ok(0);
+        }
         let lock = self.apply_lock_for(sid);
         let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
         // Snapshot the currently-tracked filters; skip SIDs we have not installed.
@@ -460,6 +489,11 @@ impl PerSidApplyOrchestrator {
         audit_note: &str,
         audit_no_op: bool,
     ) -> Result<(usize, usize), OrchestratorError> {
+        // Entered before the latch flipped, still running after it. Leave the
+        // tracked set exactly as it is: the stop strip deletes by tracked id.
+        if self.adds_refused(sid, "reconcile-to-desired") {
+            return Ok((0, 0));
+        }
         let tracked_ids: std::collections::HashSet<u64> = tracked.iter().map(|id| id.raw).collect();
         let desired_ids: std::collections::HashSet<u64> =
             desired.iter().map(|s| s.id.raw).collect();

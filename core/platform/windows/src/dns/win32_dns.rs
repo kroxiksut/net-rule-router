@@ -40,14 +40,17 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::core::PCWSTR;
 use windows::Win32::NetworkManagement::Dns::{
     DnsFree, DnsFreeRecordList, DnsQuery_W, DNS_QUERY_STANDARD, DNS_RECORDA, DNS_TYPE, DNS_TYPE_A,
+    DNS_TYPE_AAAA,
 };
 
-use super::{canonicalize_hostname, DnsResolverError, DnsResolverPort, ResolvedRecord};
+use super::{
+    canonicalize_hostname, AddressFamily, DnsResolverError, DnsResolverPort, ResolvedRecord,
+};
 
 #[allow(dead_code)] // referenced by structured-logging hooks in the supervisor task and by a sanity test
 const OPERATION: &str = "DnsQuery_W";
@@ -58,7 +61,7 @@ const DNS_ERROR_RCODE_NAME_ERROR: u32 = 9003;
 const DNS_ERROR_RCODE_REFUSED: u32 = 9005;
 /// `DNS_INFO_NO_RECORDS` — query succeeded but no records were
 /// returned for the requested type. Treated as NXDOMAIN for our
-/// negative-cache purposes (no A record == cannot reach).
+/// negative-cache purposes (no record of that type == cannot reach).
 const DNS_INFO_NO_RECORDS: u32 = 9501;
 /// `DNS_REQUEST_PENDING` — should not appear in synchronous mode but
 /// surface defensively as a timeout if it does.
@@ -84,7 +87,15 @@ impl WindowsDnsResolver {
 }
 
 impl DnsResolverPort for WindowsDnsResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
+        let (query_type, record_type) = match family {
+            AddressFamily::Ipv4 => (DNS_TYPE_A, DNS_TYPE_A),
+            AddressFamily::Ipv6 => (DNS_TYPE_AAAA, DNS_TYPE_AAAA),
+        };
         let canonical = canonicalize_hostname(hostname);
         if canonical.is_empty() || canonical.contains('\0') {
             return Err(DnsResolverError::InvalidName { name: canonical });
@@ -103,7 +114,7 @@ impl DnsResolverPort for WindowsDnsResolver {
         let win_err = unsafe {
             DnsQuery_W(
                 PCWSTR(wide.as_ptr()),
-                DNS_TYPE_A,
+                query_type,
                 DNS_QUERY_STANDARD,
                 None,
                 &mut records,
@@ -126,7 +137,7 @@ impl DnsResolverPort for WindowsDnsResolver {
             // cast to the wide-form `DNS_RECORDW` reading the
             // identical underlying layout; only `pName` differs in
             // typed form (PSTR vs PWSTR) and we don't dereference it.
-            let collected = unsafe { collect_a_records(records, &canonical) };
+            let collected = unsafe { collect_address_records(records, record_type, &canonical) };
             if collected.addresses.is_empty() {
                 Err(DnsResolverError::NxDomain {
                     hostname: canonical,
@@ -148,16 +159,24 @@ impl DnsResolverPort for WindowsDnsResolver {
     }
 }
 
-/// Walk the `DNS_RECORDA`-typed chain and collect every IPv4 (`A`)
-/// record into a [`ResolvedRecord`].
+/// Walk the `DNS_RECORDA`-typed chain and collect every address record of
+/// `want` (`A` or `AAAA`) into a [`ResolvedRecord`].
+///
+/// The answer may carry records of both families and of other types; only
+/// `want` is read, so a record of the other family can never be filed under
+/// the requested one.
 ///
 /// # Safety
 ///
 /// `head` must be a non-null pointer to a Win32-allocated DNS record
 /// linked list, not yet freed. The chain is walked via the in-struct
 /// `pNext` pointer; we never advance past a NULL terminator.
-unsafe fn collect_a_records(head: *mut DNS_RECORDA, canonical: &str) -> ResolvedRecord {
-    let mut addresses: Vec<Ipv4Addr> = Vec::new();
+unsafe fn collect_address_records(
+    head: *mut DNS_RECORDA,
+    want: DNS_TYPE,
+    canonical: &str,
+) -> ResolvedRecord {
+    let mut addresses: Vec<IpAddr> = Vec::new();
     let mut min_ttl: Option<u32> = None;
     let mut current = head;
     // Bound the walk defensively — a corrupted chain should not put
@@ -167,18 +186,29 @@ unsafe fn collect_a_records(head: *mut DNS_RECORDA, canonical: &str) -> Resolved
     let mut visited = 0usize;
 
     while !current.is_null() && visited < MAX_CHAIN_LEN {
-        // SAFETY: `current` is a valid `DNS_RECORDA`. Reading the
-        // `wType`, `dwTtl`, and union `Data.A.IpAddress` arm is sound
-        // when the record actually carries an A answer; we check
-        // `wType == DNS_TYPE_A` before reading the union.
+        // SAFETY: `current` is a valid `DNS_RECORDA`. Reading `wType`, `dwTtl`
+        // and the `Data` union is sound only for the arm the type selects, so
+        // each arm below is read under its own `wType` check.
         let record = unsafe { &*current };
         let wtype = DNS_TYPE(record.wType);
-        if wtype == DNS_TYPE_A {
+        let addr = if wtype == want && wtype == DNS_TYPE_A {
             // SAFETY: `wtype == DNS_TYPE_A` selects the `A: DNS_A_DATA`
             // arm of the `Data` union. `IpAddress` is a u32 in
             // network byte order per the Win32 contract.
             let net_order = unsafe { record.Data.A.IpAddress };
-            addresses.push(Ipv4Addr::from(u32::from_be(net_order)));
+            Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(net_order))))
+        } else if wtype == want && wtype == DNS_TYPE_AAAA {
+            // SAFETY: `wtype == DNS_TYPE_AAAA` selects the `AAAA: DNS_AAAA_DATA`
+            // arm. Read the octet view of `IN6_ADDR` rather than its word
+            // views: the 16 bytes are already in network order, so no
+            // endianness reasoning stands between the wire and the address.
+            let octets = unsafe { record.Data.AAAA.Ip6Address.IP6Byte };
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        } else {
+            None
+        };
+        if let Some(addr) = addr {
+            addresses.push(addr);
             let ttl = record.dwTtl;
             min_ttl = Some(match min_ttl {
                 Some(prev) => prev.min(ttl),
@@ -272,17 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_a_rejects_empty_hostname() {
+    fn resolve_rejects_empty_hostname() {
         let r = WindowsDnsResolver::new();
-        let err = r.resolve_a("").expect_err("empty hostname must error");
+        let err = r
+            .resolve("", AddressFamily::Ipv4)
+            .expect_err("empty hostname must error");
         assert!(matches!(err, DnsResolverError::InvalidName { .. }));
     }
 
     #[test]
-    fn resolve_a_rejects_hostname_with_embedded_nul() {
+    fn resolve_rejects_hostname_with_embedded_nul() {
         let r = WindowsDnsResolver::new();
         let err = r
-            .resolve_a("bad\0name.test")
+            .resolve("bad\0name.test", AddressFamily::Ipv4)
             .expect_err("embedded NUL must error");
         assert!(matches!(err, DnsResolverError::InvalidName { .. }));
     }
@@ -299,7 +331,7 @@ mod tests {
     fn resolve_a_resolves_known_host_on_windows() {
         let r = WindowsDnsResolver::new();
         let record = r
-            .resolve_a("cloudflare.com")
+            .resolve("cloudflare.com", AddressFamily::Ipv4)
             .expect("cloudflare.com must resolve via system resolver");
         assert!(
             !record.addresses.is_empty(),
@@ -318,7 +350,7 @@ mod tests {
     fn resolve_a_returns_nxdomain_for_invalid_test_name_on_windows() {
         let r = WindowsDnsResolver::new();
         let err = r
-            .resolve_a("never-resolves.invalid")
+            .resolve("never-resolves.invalid", AddressFamily::Ipv4)
             .expect_err("invalid TLD must NXDOMAIN");
         assert!(
             matches!(

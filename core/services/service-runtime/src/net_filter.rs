@@ -44,6 +44,18 @@ pub(crate) fn is_non_routable_v4(ip: &Ipv4Addr) -> bool {
         || FakeIpPoolConfig::is_default_pool_addr(IpAddr::V4(*ip))
 }
 
+/// The same screen over an address of either family.
+#[inline]
+pub(crate) fn is_non_routable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_non_routable_v4(v4),
+        IpAddr::V6(v6) => {
+            crate::dns_address_sanity::is_unreachable_v6(v6)
+                || FakeIpPoolConfig::is_default_pool_addr(*ip)
+        }
+    }
+}
+
 /// `true` when at least one address comes from the fake-IP pool. Under Mode B
 /// the OS resolver path is intercepted by our own resolver, so a system-level
 /// re-resolution of a hostname returns OUR virtual address back to us. Such an
@@ -51,9 +63,8 @@ pub(crate) fn is_non_routable_v4(ip: &Ipv4Addr) -> bool {
 /// provider poisoning) — callers use this to skip the answer WITHOUT walking
 /// their hosts-file backoff ladder.
 #[inline]
-pub(crate) fn contains_fake_pool_addr(ips: &[Ipv4Addr]) -> bool {
-    ips.iter()
-        .any(|ip| FakeIpPoolConfig::is_default_pool_addr(IpAddr::V4(*ip)))
+pub(crate) fn contains_fake_pool_addr(ips: impl IntoIterator<Item = IpAddr>) -> bool {
+    ips.into_iter().any(FakeIpPoolConfig::is_default_pool_addr)
 }
 
 #[cfg(test)]

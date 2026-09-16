@@ -34,7 +34,7 @@
 //!    steering it, so they never make an address "owned" for the purposes above.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleBook, CanonicalRuleSet};
 use nrr_domain::RuleAction;
@@ -45,6 +45,7 @@ use crate::fqdn_cache_lookup::FqdnCacheLookup;
 // The fan-out caps come from the filter codegen rather than being restated
 // here: ownership must cover exactly the addresses enforcement can act on, and a
 // second copy of a cap is a second thing to keep in step.
+use crate::enforcement_planner::FamilyScope;
 use crate::wfp_codegen::{PER_HOSTNAME_IP_CAP, SUFFIX_FANOUT_BACKSTOP};
 
 /// Which link a rule set claims an address for.
@@ -60,8 +61,8 @@ pub enum Link {
 /// and the kill-switch, so all three answer "whose address is this" identically.
 #[derive(Clone, Debug, Default)]
 pub struct AddressOwnership {
-    main: HashSet<Ipv4Addr>,
-    additional: HashSet<Ipv4Addr>,
+    main: HashSet<IpAddr>,
+    additional: HashSet<IpAddr>,
     /// Every address the MAIN link's rules name, whether or not it won the
     /// steering contest.
     ///
@@ -71,7 +72,7 @@ pub struct AddressOwnership {
     /// address off the main link, reading `main` for the second question said
     /// "yes, block it" about an address the main link still names — the third
     /// outcome rule 2 exists to forbid.
-    main_claimed: HashSet<Ipv4Addr>,
+    main_claimed: HashSet<IpAddr>,
 }
 
 impl AddressOwnership {
@@ -114,11 +115,11 @@ impl AddressOwnership {
         let (main_names, main_literal) = name_claims(&rule_book.primary, cache);
         let (additional_names, additional_literal) = name_claims(&rule_book.secondary, cache);
 
-        let mut main: HashSet<Ipv4Addr> = main_literal.clone();
-        let mut additional: HashSet<Ipv4Addr> = additional_literal.clone();
+        let mut main: HashSet<IpAddr> = main_literal.clone();
+        let mut additional: HashSet<IpAddr> = additional_literal.clone();
         // The strongest claim the main link holds on each address it carries,
         // which is what the literal contest below compares against.
-        let mut main_claim: HashMap<Ipv4Addr, NameClaim> = HashMap::new();
+        let mut main_claim: HashMap<IpAddr, NameClaim> = HashMap::new();
 
         let mut hosts: Vec<&str> = main_names
             .keys()
@@ -129,11 +130,15 @@ impl AddressOwnership {
         hosts.dedup();
 
         for host in hosts {
-            let ips: Vec<Ipv4Addr> = cache
-                .ips_for_hostname(host)
-                .into_iter()
-                .take(PER_HOSTNAME_IP_CAP)
-                .collect();
+            // The same per-family view of the host the codegens pin, so the
+            // arbiter and the emitters cannot disagree about which addresses a
+            // rule covers. BOTH families unconditionally: the ledger answers
+            // "whose address is this", and that answer does not depend on
+            // whether this machine can currently carry the family — a caller
+            // that cannot simply never asks about a v6 address.
+            let ips: Vec<IpAddr> =
+                crate::enforcement_planner::capped_for_host(cache, host, FamilyScope::Both)
+                    .collect();
             match (main_names.get(host), additional_names.get(host)) {
                 // A tie goes to the main link -- see `owner_of`.
                 (Some(m), Some(a)) if a > m => additional.extend(ips),
@@ -176,7 +181,7 @@ impl AddressOwnership {
     /// Build from already-resolved sets. For callers that hold one side only
     /// (and for tests that want an exact shape without a cache).
     #[must_use]
-    pub fn from_sets(main: HashSet<Ipv4Addr>, additional: HashSet<Ipv4Addr>) -> Self {
+    pub fn from_sets(main: HashSet<IpAddr>, additional: HashSet<IpAddr>) -> Self {
         Self {
             main_claimed: main.clone(),
             main,
@@ -189,7 +194,7 @@ impl AddressOwnership {
     /// outcome a user can still see and correct — the reverse is a site that
     /// works only while the tunnel is up.
     #[must_use]
-    pub fn owner_of(&self, ip: Ipv4Addr) -> Option<Link> {
+    pub fn owner_of(&self, ip: IpAddr) -> Option<Link> {
         if self.main.contains(&ip) {
             Some(Link::Main)
         } else if self.additional.contains(&ip) {
@@ -208,7 +213,7 @@ impl AddressOwnership {
     /// on one link touches an address the user routed over the other, and the
     /// address follows the program instead of the rule written for it.
     #[must_use]
-    pub fn app_rule_may_claim(&self, ip: Ipv4Addr, for_link: Link) -> bool {
+    pub fn app_rule_may_claim(&self, ip: IpAddr, for_link: Link) -> bool {
         match self.owner_of(ip) {
             None => true,
             Some(owner) => owner == for_link,
@@ -230,7 +235,7 @@ impl AddressOwnership {
     /// them was already settled per host in [`Self::resolve`] — what is left is
     /// genuinely one address wanted in two directions.
     #[must_use]
-    pub fn address_rule_may_steer(&self, ip: Ipv4Addr, for_link: Link) -> bool {
+    pub fn address_rule_may_steer(&self, ip: IpAddr, for_link: Link) -> bool {
         match for_link {
             Link::Main => true,
             Link::Additional => !self.main.contains(&ip),
@@ -244,7 +249,7 @@ impl AddressOwnership {
     /// literally is still an address a main-link rule points at, and blocking
     /// it is the outcome neither of their rules asked for.
     #[must_use]
-    pub fn may_block(&self, ip: Ipv4Addr) -> bool {
+    pub fn may_block(&self, ip: IpAddr) -> bool {
         !self.main_claimed.contains(&ip)
     }
 
@@ -256,13 +261,13 @@ impl AddressOwnership {
     /// main-named address keeps working, and that need does not disappear when
     /// the steering contest went the other way.
     #[must_use]
-    pub fn main_named(&self) -> &HashSet<Ipv4Addr> {
+    pub fn main_named(&self) -> &HashSet<IpAddr> {
         &self.main_claimed
     }
 
     /// The additional link's named addresses.
     #[must_use]
-    pub fn additional_named(&self) -> &HashSet<Ipv4Addr> {
+    pub fn additional_named(&self) -> &HashSet<IpAddr> {
         &self.additional
     }
 
@@ -275,7 +280,7 @@ impl AddressOwnership {
         candidates
             .iter()
             .copied()
-            .filter(|ip| !self.app_rule_may_claim(*ip, for_link))
+            .filter(|ip| !self.app_rule_may_claim(IpAddr::V4(*ip), for_link))
             .filter(|ip| seen.insert(*ip))
             .collect()
     }
@@ -332,9 +337,9 @@ fn label_count(name: &str) -> usize {
 fn name_claims(
     rules: &CanonicalRuleSet,
     cache: &dyn FqdnCacheLookup,
-) -> (HashMap<String, NameClaim>, HashSet<Ipv4Addr>) {
+) -> (HashMap<String, NameClaim>, HashSet<IpAddr>) {
     let mut names: HashMap<String, NameClaim> = HashMap::new();
-    let mut literal: HashSet<Ipv4Addr> = HashSet::new();
+    let mut literal: HashSet<IpAddr> = HashSet::new();
     let claim = |names: &mut HashMap<String, NameClaim>, host: String, c: NameClaim| {
         names
             .entry(host)
@@ -391,13 +396,13 @@ pub fn address_rule_ips(
             continue;
         }
         match &rule.address_match {
-            Some(CanonicalAddressMatch::ExactIp(ip)) => {
+            Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip))) => {
                 out.insert(*ip);
             }
+            Some(CanonicalAddressMatch::ExactIp(IpAddr::V6(_))) => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 out.extend(
-                    cache
-                        .ips_for_hostname(host)
+                    crate::dns_wire::only_v4(&cache.ips_for_hostname(host))
                         .into_iter()
                         .take(PER_HOSTNAME_IP_CAP),
                 );
@@ -405,8 +410,7 @@ pub fn address_rule_ips(
             Some(CanonicalAddressMatch::SuffixDomain(suffix)) => {
                 for sub in cache.hostnames_for_suffix_domain(suffix, SUFFIX_FANOUT_BACKSTOP) {
                     out.extend(
-                        cache
-                            .ips_for_hostname(&sub)
+                        crate::dns_wire::only_v4(&cache.ips_for_hostname(&sub))
                             .into_iter()
                             .take(PER_HOSTNAME_IP_CAP),
                     );
@@ -415,8 +419,7 @@ pub fn address_rule_ips(
             Some(CanonicalAddressMatch::Zone(zone)) => {
                 for sub in cache.hostnames_under_suffix(zone, SUFFIX_FANOUT_BACKSTOP) {
                     out.extend(
-                        cache
-                            .ips_for_hostname(&sub)
+                        crate::dns_wire::only_v4(&cache.ips_for_hostname(&sub))
                             .into_iter()
                             .take(PER_HOSTNAME_IP_CAP),
                     );
@@ -494,7 +497,7 @@ impl<'a> AppDestinationGate<'a> {
     pub fn admit(&self, pattern: &str, for_link: Link) -> AppDestinations {
         let mut out = AppDestinations::default();
         for ip in self.observations.ips_for_app(pattern) {
-            if !self.ownership.app_rule_may_claim(ip, for_link) {
+            if !self.ownership.app_rule_may_claim(IpAddr::V4(ip), for_link) {
                 out.refused
                     .push((ip, AppDestinationRefusal::ClaimedByAddressRule));
             } else if self
@@ -585,11 +588,11 @@ mod tests {
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(shared), Some(Link::Main));
-        assert!(!ownership.address_rule_may_steer(shared, Link::Additional));
-        assert!(ownership.address_rule_may_steer(shared, Link::Main));
+        assert_eq!(ownership.owner_of(IpAddr::V4(shared)), Some(Link::Main));
+        assert!(!ownership.address_rule_may_steer(IpAddr::V4(shared), Link::Additional));
+        assert!(ownership.address_rule_may_steer(IpAddr::V4(shared), Link::Main));
         // And it is still never blocked — rule 2 of the module doc.
-        assert!(!ownership.may_block(shared));
+        assert!(!ownership.may_block(IpAddr::V4(shared)));
     }
 
     /// The other half of the same case, and the reason the two sets are
@@ -615,8 +618,11 @@ mod tests {
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(private), Some(Link::Additional));
-        assert!(ownership.address_rule_may_steer(private, Link::Additional));
+        assert_eq!(
+            ownership.owner_of(IpAddr::V4(private)),
+            Some(Link::Additional)
+        );
+        assert!(ownership.address_rule_may_steer(IpAddr::V4(private), Link::Additional));
     }
 
     /// Specificity decides between the two sets, not which set is read first:
@@ -639,7 +645,7 @@ mod tests {
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(ip), Some(Link::Additional));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Additional));
     }
 
     /// Equal claims are a tie, and a tie goes to the main link.
@@ -661,7 +667,7 @@ mod tests {
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(ip), Some(Link::Main));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Main));
     }
 
     /// A zone rule is the weakest claim; an exact FQDN on the other link wins.
@@ -683,7 +689,7 @@ mod tests {
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(ip), Some(Link::Additional));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Additional));
     }
 
     /// The incident, stated as a question to the arbiter: the app rule asks for
@@ -700,13 +706,13 @@ mod tests {
         );
         let ownership = AddressOwnership::resolve(&book, &cache());
 
-        assert!(!ownership.app_rule_may_claim(NAMED, Link::Additional));
-        assert!(!ownership.may_block(NAMED));
-        assert_eq!(ownership.owner_of(NAMED), Some(Link::Main));
+        assert!(!ownership.app_rule_may_claim(IpAddr::V4(NAMED), Link::Additional));
+        assert!(!ownership.may_block(IpAddr::V4(NAMED)));
+        assert_eq!(ownership.owner_of(IpAddr::V4(NAMED)), Some(Link::Main));
         // Nothing else is affected: an address nobody named stays claimable.
-        assert!(ownership.app_rule_may_claim(OTHER, Link::Additional));
-        assert!(ownership.may_block(OTHER));
-        assert_eq!(ownership.owner_of(OTHER), None);
+        assert!(ownership.app_rule_may_claim(IpAddr::V4(OTHER), Link::Additional));
+        assert!(ownership.may_block(IpAddr::V4(OTHER)));
+        assert_eq!(ownership.owner_of(IpAddr::V4(OTHER)), None);
     }
 
     /// A rule the user turned off, and a rule that blocks rather than routes,
@@ -715,21 +721,21 @@ mod tests {
     fn disabled_and_blocking_rules_claim_nothing() {
         let mut disabled = address_rule(
             "r-off",
-            CanonicalAddressMatch::ExactIp(NAMED),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(NAMED)),
             RuleAction::Route,
         );
         disabled.enabled = false;
         let blocking = address_rule(
             "r-block",
-            CanonicalAddressMatch::ExactIp(OTHER),
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(OTHER)),
             RuleAction::Block,
         );
         let book = book(vec![disabled, blocking], Vec::new());
 
         let ownership = AddressOwnership::resolve(&book, &cache());
 
-        assert!(ownership.app_rule_may_claim(NAMED, Link::Additional));
-        assert!(ownership.app_rule_may_claim(OTHER, Link::Additional));
+        assert!(ownership.app_rule_may_claim(IpAddr::V4(NAMED), Link::Additional));
+        assert!(ownership.app_rule_may_claim(IpAddr::V4(OTHER), Link::Additional));
     }
 
     /// The additional link's own address rules are recorded too — an app rule
@@ -741,19 +747,22 @@ mod tests {
             Vec::new(),
             vec![address_rule(
                 "r-sec",
-                CanonicalAddressMatch::ExactIp(OTHER),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(OTHER)),
                 RuleAction::Route,
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache());
 
-        assert_eq!(ownership.owner_of(OTHER), Some(Link::Additional));
+        assert_eq!(
+            ownership.owner_of(IpAddr::V4(OTHER)),
+            Some(Link::Additional)
+        );
         // An app rule on the SAME link adds nothing to argue with...
-        assert!(ownership.app_rule_may_claim(OTHER, Link::Additional));
+        assert!(ownership.app_rule_may_claim(IpAddr::V4(OTHER), Link::Additional));
         // ...and one on the other link may not take it: the address rule is the
         // statement about that destination, whichever link it names.
-        assert!(!ownership.app_rule_may_claim(OTHER, Link::Main));
-        assert!(ownership.may_block(OTHER));
+        assert!(!ownership.app_rule_may_claim(IpAddr::V4(OTHER), Link::Main));
+        assert!(ownership.may_block(IpAddr::V4(OTHER)));
     }
 
     /// An address both sides name goes to the main link. The other way round is
@@ -764,19 +773,19 @@ mod tests {
         let book = book(
             vec![address_rule(
                 "r-main",
-                CanonicalAddressMatch::ExactIp(NAMED),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(NAMED)),
                 RuleAction::Route,
             )],
             vec![address_rule(
                 "r-sec",
-                CanonicalAddressMatch::ExactIp(NAMED),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(NAMED)),
                 RuleAction::Route,
             )],
         );
         let ownership = AddressOwnership::resolve(&book, &cache());
 
-        assert_eq!(ownership.owner_of(NAMED), Some(Link::Main));
-        assert!(!ownership.may_block(NAMED));
+        assert_eq!(ownership.owner_of(IpAddr::V4(NAMED)), Some(Link::Main));
+        assert!(!ownership.may_block(IpAddr::V4(NAMED)));
     }
 
     #[test]
@@ -814,16 +823,16 @@ mod tests {
             )],
             vec![address_rule(
                 "s1",
-                CanonicalAddressMatch::ExactIp(ip),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)),
                 RuleAction::Route,
             )],
         );
 
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(ip), Some(Link::Additional));
-        assert!(ownership.address_rule_may_steer(ip, Link::Additional));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Additional));
+        assert!(ownership.address_rule_may_steer(IpAddr::V4(ip), Link::Additional));
         // Still never blocked — rule 2 of the module doc holds either way.
-        assert!(!ownership.may_block(ip));
+        assert!(!ownership.may_block(IpAddr::V4(ip)));
     }
 
     /// And the switch actually switches: with `zone_priority_over_ip` the same
@@ -841,7 +850,7 @@ mod tests {
             )],
             vec![address_rule(
                 "s1",
-                CanonicalAddressMatch::ExactIp(ip),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)),
                 RuleAction::Route,
             )],
         );
@@ -851,7 +860,7 @@ mod tests {
             &cache,
             ZoneVsIpOrder::from_zone_priority_over_ip(true),
         );
-        assert_eq!(ownership.owner_of(ip), Some(Link::Main));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Main));
     }
 
     /// The collateral guarantee is untouched: a SUFFIX is a closer claim than a
@@ -871,13 +880,13 @@ mod tests {
             )],
             vec![address_rule(
                 "s1",
-                CanonicalAddressMatch::ExactIp(ip),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(ip)),
                 RuleAction::Route,
             )],
         );
 
         let ownership = AddressOwnership::resolve(&book, &cache);
-        assert_eq!(ownership.owner_of(ip), Some(Link::Main));
-        assert!(!ownership.address_rule_may_steer(ip, Link::Additional));
+        assert_eq!(ownership.owner_of(IpAddr::V4(ip)), Some(Link::Main));
+        assert!(!ownership.address_rule_may_steer(IpAddr::V4(ip), Link::Additional));
     }
 }

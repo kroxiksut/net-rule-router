@@ -260,6 +260,7 @@ mod tests {
             action: WfpAction::Permit,
             remote_ip: Some(remote),
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight,
             id: WfpFilterId::from_raw(id_raw),

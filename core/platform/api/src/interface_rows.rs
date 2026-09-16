@@ -9,7 +9,7 @@
 //! enumeration (`collect_interfaces_rows`, which reads the OS adapter table)
 //! stays in `nrr-platform-windows` and re-exports these definitions.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_shared::{
     ConnectivityState, DerivedLikelihood, ExternalIpStatus, RecommendationClass,
@@ -241,22 +241,26 @@ pub fn derive_forwarding_next_hop(routes: &[RouteEntry], ifindex: u32) -> Option
         if r.interface_index != ifindex {
             continue;
         }
-        let nh = r.next_hop;
-        if nh.is_loopback() {
+        // This block answers "which IPv4 gateway does this interface use";
+        // an IPv6 route says nothing about that.
+        let (IpAddr::V4(dst), IpAddr::V4(nh_v4)) = (r.destination, r.next_hop) else {
+            continue;
+        };
+        if nh_v4.is_loopback() {
             continue;
         }
-        if nh.is_unspecified() {
+        if nh_v4.is_unspecified() {
             on_link_coverage += on_link_internet_coverage(r);
             continue;
         }
         // Rank by how "default" the route is (see the doc comment).
-        let pref = match (r.destination, r.prefix_length) {
+        let pref = match (dst, r.prefix_length) {
             (d, 0) if d.is_unspecified() => 0u8,
             (d, 1) if d.is_unspecified() => 1, // 0.0.0.0/1
             (d, 1) if d == Ipv4Addr::new(128, 0, 0, 0) => 1, // 128.0.0.0/1
             _ => 2,                            // any other gateway-style route
         };
-        let cand = (pref, r.metric, u32::from(nh));
+        let cand = (pref, r.metric, u32::from(nh_v4));
         best = Some(match best {
             Some(b) if b <= cand => b,
             _ => cand,
@@ -265,6 +269,78 @@ pub fn derive_forwarding_next_hop(routes: &[RouteEntry], ifindex: u32) -> Option
     best.map(|(_, _, nh)| Ipv4Addr::from(nh)).or_else(|| {
         (on_link_coverage >= ON_LINK_INTERNET_COVERAGE).then_some(Ipv4Addr::UNSPECIFIED)
     })
+}
+
+/// The IPv6 twin of [`derive_forwarding_next_hop`].
+///
+/// Same four cases in the same order, in v6 spelling: the default is `::/0`,
+/// the redirect halves a client installs are `::/1` and `8000::/1`, and a
+/// peerless tunnel is recognised the same way — by on-link prefixes covering
+/// at least half the space.
+///
+/// The scopes that say nothing about forwarding are skipped: `fe80::/10` is on
+/// every interface whether or not the network offers IPv6 at all, and
+/// `ff00::/8` is multicast. Counting either would call a link routable on the
+/// strength of what the OS puts there by default.
+///
+/// `None` means this interface has no IPv6 forwarding path, which is the
+/// answer that keeps a `/128` from being installed through a link that cannot
+/// deliver it.
+#[must_use]
+pub fn derive_forwarding_next_hop_v6(routes: &[RouteEntry], ifindex: u32) -> Option<Ipv6Addr> {
+    let mut best: Option<(u8, u32, Ipv6Addr)> = None;
+    let mut on_link_coverage: u128 = 0;
+    for r in routes {
+        if r.interface_index != ifindex {
+            continue;
+        }
+        let (IpAddr::V6(dst), IpAddr::V6(nh)) = (r.destination, r.next_hop) else {
+            continue;
+        };
+        if nh.is_loopback() {
+            continue;
+        }
+        if nh.is_unspecified() {
+            on_link_coverage = on_link_coverage.saturating_add(on_link_internet_coverage_v6(r));
+            continue;
+        }
+        let pref = match (dst.segments()[0], r.prefix_length) {
+            (_, 0) if dst.is_unspecified() => 0u8,
+            (0x0000, 1) => 1, // ::/1
+            (0x8000, 1) => 1, // 8000::/1
+            _ => 2,           // any other gateway-style route
+        };
+        let cand = (pref, r.metric, nh);
+        best = Some(match best {
+            Some(b) if (b.0, b.1) <= (cand.0, cand.1) => b,
+            _ => cand,
+        });
+    }
+    best.map(|(_, _, nh)| nh).or_else(|| {
+        (on_link_coverage >= ON_LINK_INTERNET_COVERAGE_V6).then_some(Ipv6Addr::UNSPECIFIED)
+    })
+}
+
+/// Half the IPv6 address space, for the same reason the IPv4 twin uses half of
+/// its own.
+const ON_LINK_INTERNET_COVERAGE_V6: u128 = 1u128 << 127;
+
+/// How many addresses an on-link IPv6 route contributes towards "covers the
+/// internet". A `/128` is the interface's own address; the link-local and
+/// multicast scopes are furniture every interface carries.
+fn on_link_internet_coverage_v6(r: &RouteEntry) -> u128 {
+    let IpAddr::V6(dst) = r.destination else {
+        return 0;
+    };
+    let head = dst.segments()[0];
+    if r.prefix_length >= 128 || (head & 0xffc0) == 0xfe80 || (head & 0xff00) == 0xff00 {
+        return 0;
+    }
+    // `1 << 128` does not exist; a `/0` IS the whole space.
+    if r.prefix_length == 0 {
+        return u128::MAX;
+    }
+    1u128 << (128 - u32::from(r.prefix_length))
 }
 
 /// Half the IPv4 address space. A redirect set on a peerless tunnel covers
@@ -277,7 +353,10 @@ const ON_LINK_INTERNET_COVERAGE: u64 = 1 << 31;
 /// for nothing: a `/32` is the adapter's own address, and `224.0.0.0/3` is
 /// installed on every interface that carries multicast.
 fn on_link_internet_coverage(r: &RouteEntry) -> u64 {
-    if r.prefix_length >= 32 || r.destination.octets()[0] >= 224 {
+    let IpAddr::V4(dst) = r.destination else {
+        return 0; // an IPv4 gateway is never learned from an IPv6 route
+    };
+    if r.prefix_length >= 32 || dst.octets()[0] >= 224 {
         return 0;
     }
     1u64 << (32 - u32::from(r.prefix_length))
@@ -895,9 +974,9 @@ mod tests {
         metric: u32,
     ) -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::from(dest),
+            destination: IpAddr::V4(Ipv4Addr::from(dest)),
             prefix_length: prefix,
-            next_hop: Ipv4Addr::from(next_hop),
+            next_hop: IpAddr::V4(Ipv4Addr::from(next_hop)),
             interface_index: ifindex,
             metric,
             is_ours: false,
@@ -1263,5 +1342,99 @@ mod tests {
         // Decoration slots are reset for the caller to re-apply.
         assert_eq!(back.selected_role, None);
         assert_eq!(back.route_state, RouteSelectionState::NotSelected);
+    }
+
+    // ── The IPv6 forwarding path ──────────────────────────────────────────
+
+    fn v6_route(dst: &str, prefix: u8, next_hop: &str, ifindex: u32) -> RouteEntry {
+        RouteEntry {
+            destination: IpAddr::V6(dst.parse().expect("literal")),
+            prefix_length: prefix,
+            next_hop: IpAddr::V6(next_hop.parse().expect("literal")),
+            interface_index: ifindex,
+            metric: 0,
+            is_ours: false,
+            table: crate::RouteTableRef::Main,
+        }
+    }
+
+    #[test]
+    fn a_v6_default_route_names_the_peer() {
+        let routes = [v6_route("::", 0, "fe80::1", 7)];
+        assert_eq!(
+            derive_forwarding_next_hop_v6(&routes, 7),
+            Some("fe80::1".parse().expect("literal"))
+        );
+    }
+
+    #[test]
+    fn the_v6_redirect_halves_name_the_peer_too() {
+        let routes = [
+            v6_route("::", 1, "2001:db8::1", 7),
+            v6_route("8000::", 1, "2001:db8::1", 7),
+        ];
+        assert_eq!(
+            derive_forwarding_next_hop_v6(&routes, 7),
+            Some("2001:db8::1".parse().expect("literal"))
+        );
+    }
+
+    #[test]
+    fn a_peerless_v6_tunnel_forwards_on_link() {
+        // The client covers the space with on-link halves and no peer at all.
+        let routes = [v6_route("::", 1, "::", 7), v6_route("8000::", 1, "::", 7)];
+        assert_eq!(
+            derive_forwarding_next_hop_v6(&routes, 7),
+            Some(Ipv6Addr::UNSPECIFIED),
+            "an on-link redirect set IS a forwarding path"
+        );
+    }
+
+    #[test]
+    fn the_scopes_every_interface_carries_are_not_a_forwarding_path() {
+        // What a link with no IPv6 service still has: its own address, the
+        // link-local prefix and the multicast scope.
+        let routes = [
+            v6_route("fe80::", 64, "::", 7),
+            v6_route("fe80::abcd", 128, "::", 7),
+            v6_route("ff00::", 8, "::", 7),
+        ];
+        assert_eq!(derive_forwarding_next_hop_v6(&routes, 7), None);
+    }
+
+    #[test]
+    fn a_narrow_on_link_prefix_is_not_the_internet() {
+        let routes = [v6_route("2001:db8::", 64, "::", 7)];
+        assert_eq!(derive_forwarding_next_hop_v6(&routes, 7), None);
+    }
+
+    #[test]
+    fn a_v6_peer_beats_a_less_default_route_and_a_worse_metric() {
+        let mut far = v6_route("2001:db8:1::", 48, "2001:db8::9", 7);
+        far.metric = 1;
+        let mut near = v6_route("::", 0, "2001:db8::1", 7);
+        near.metric = 5;
+        assert_eq!(
+            derive_forwarding_next_hop_v6(&[far, near], 7),
+            Some("2001:db8::1".parse().expect("literal")),
+            "how DEFAULT the route is outranks its metric"
+        );
+    }
+
+    #[test]
+    fn the_v6_derivation_ignores_other_interfaces_and_the_other_family() {
+        let routes = [
+            v6_route("::", 0, "fe80::1", 9),
+            RouteEntry {
+                destination: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                prefix_length: 0,
+                next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+                interface_index: 7,
+                metric: 0,
+                is_ours: false,
+                table: crate::RouteTableRef::Main,
+            },
+        ];
+        assert_eq!(derive_forwarding_next_hop_v6(&routes, 7), None);
     }
 }

@@ -27,6 +27,12 @@
 //! fail "database is locked". Copy + read is best-effort per profile: any browser
 //! that is absent or unreadable is skipped, and partial results are valid.
 //!
+//! Everything under a profile is writable by its user while this runs as
+//! LocalSystem, so a source is read only through a handle proven to be the
+//! principal's own file, reached from the profile root without a link (see
+//! [`open_verified`]); otherwise a planted junction would hand the caller
+//! another account's history.
+//!
 //! Profile discovery is rooted at the PRINCIPAL's profile, not
 //! this process's environment. The service runs as LocalSystem, whose
 //! `%LOCALAPPDATA%` is the systemprofile (no browsers), so the env-based
@@ -35,6 +41,8 @@
 //! `ProfileList` registry key; the process environment remains the fallback
 //! for console/dev runs where that lookup fails.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use nrr_platform_api::browser_history::{
@@ -61,6 +69,8 @@ impl Default for WindowsBrowserHistoryRead {
 struct HistorySource {
     /// The live (locked) DB path.
     db_path: PathBuf,
+    /// Root the DB must stay under once every link is resolved.
+    anchor: PathBuf,
     /// `SELECT <url-col> FROM <table>` for this browser family.
     query: &'static str,
     /// Short label for the temp-copy filename + diagnostics.
@@ -85,7 +95,7 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         // so history alone leaves it cold in the cache and it can be blocked
         // under block-all before its first resolution. Only hostnames cross
         // the boundary, same contract as history.
-        let mail_hosts = thunderbird_server_hostnames(&roots);
+        let mail_hosts = thunderbird_server_hostnames(&roots, principal);
         if !mail_hosts.is_empty() {
             tracing::info!(
                 target: "nrr::browser-history",
@@ -99,8 +109,9 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
         let mut hosts: Vec<String> = mail_hosts;
         let mut any_ok = !hosts.is_empty();
         let mut last_err: Option<String> = None;
+        let copy_dirs = copy_dirs();
         for src in &sources {
-            match read_source_hostnames(src) {
+            match read_source_hostnames(src, principal, &copy_dirs) {
                 Ok(mut h) => {
                     any_ok = true;
                     hosts.append(&mut h);
@@ -130,10 +141,12 @@ impl BrowserHistoryReadPort for WindowsBrowserHistoryRead {
 /// Account-server hostnames from every Thunderbird profile under the
 /// principal's Roaming AppData (`Thunderbird\Profiles\*\prefs.js`).
 /// Best-effort: an absent install or unreadable profile contributes nothing.
-fn thunderbird_server_hostnames(roots: &AppDataRoots) -> Vec<String> {
+fn thunderbird_server_hostnames(roots: &AppDataRoots, principal: &str) -> Vec<String> {
+    const MAX_PREFS_BYTES: u64 = 16 * 1024 * 1024;
     let Some(roaming) = roots.roaming.as_ref() else {
         return Vec::new();
     };
+    let anchor = roots.anchor(roaming);
     let profiles_dir = roaming.join("Thunderbird").join("Profiles");
     let Ok(entries) = std::fs::read_dir(&profiles_dir) else {
         return Vec::new();
@@ -141,7 +154,25 @@ fn thunderbird_server_hostnames(roots: &AppDataRoots) -> Vec<String> {
     let mut hosts = Vec::new();
     for entry in entries.flatten() {
         let prefs = entry.path().join("prefs.js");
-        let Ok(text) = std::fs::read_to_string(&prefs) else {
+        if !prefs.is_file() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        let read = open_verified(anchor, &prefs, principal, MAX_PREFS_BYTES).and_then(|f| {
+            (&f).take(MAX_PREFS_BYTES)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("read: {e}"))
+        });
+        if let Err(reason) = read {
+            tracing::debug!(
+                target: "nrr::browser-history",
+                source = "thunderbird",
+                error = %reason,
+                "skipping mail-client profile",
+            );
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes) else {
             continue;
         };
         hosts.extend(parse_mail_server_hostnames(&text));
@@ -190,6 +221,15 @@ struct AppDataRoots {
     local: Option<PathBuf>,
     /// `<profile>\AppData\Roaming` — Firefox profile home.
     roaming: Option<PathBuf>,
+    /// The profile directory both legs sit under; `None` when the legs came
+    /// from the environment, and each then anchors itself.
+    profile: Option<PathBuf>,
+}
+
+impl AppDataRoots {
+    fn anchor<'a>(&'a self, leg: &'a Path) -> &'a Path {
+        self.profile.as_deref().unwrap_or(leg)
+    }
 }
 
 /// Resolve the AppData roots for `principal` (a Windows SID). Prefers the
@@ -201,11 +241,13 @@ fn profile_roots_for(principal: &str) -> AppDataRoots {
         return AppDataRoots {
             local: Some(root.join("AppData").join("Local")),
             roaming: Some(root.join("AppData").join("Roaming")),
+            profile: Some(root),
         };
     }
     AppDataRoots {
         local: std::env::var("LOCALAPPDATA").ok().map(PathBuf::from),
         roaming: std::env::var("APPDATA").ok().map(PathBuf::from),
+        profile: None,
     }
 }
 
@@ -237,6 +279,7 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
                 if db.is_file() {
                     out.push(HistorySource {
                         db_path: db,
+                        anchor: roots.anchor(local).to_path_buf(),
                         query: CHROMIUM_QUERY,
                         label,
                     });
@@ -260,6 +303,7 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
                     if db.is_file() {
                         out.push(HistorySource {
                             db_path: db,
+                            anchor: roots.anchor(local).to_path_buf(),
                             query: CHROMIUM_QUERY,
                             label: "arc",
                         });
@@ -279,6 +323,7 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
             if db.is_file() {
                 out.push(HistorySource {
                     db_path: db,
+                    anchor: roots.anchor(roaming).to_path_buf(),
                     query: CHROMIUM_QUERY,
                     label,
                 });
@@ -296,6 +341,7 @@ fn discover_history_sources(roots: &AppDataRoots) -> Vec<HistorySource> {
                     if db.is_file() {
                         out.push(HistorySource {
                             db_path: db,
+                            anchor: roots.anchor(roaming).to_path_buf(),
                             query: FIREFOX_QUERY,
                             label,
                         });
@@ -469,22 +515,384 @@ fn chromium_profile_dirs(user_data: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Copy `src.db_path` to a temp file and read its URL column into hostnames.
-fn read_source_hostnames(src: &HistorySource) -> Result<Vec<String>, String> {
-    // Copy under a per-source temp name so concurrent sources don't collide, and
-    // clean it up on the way out (best-effort).
-    let mut tmp = std::env::temp_dir();
-    tmp.push(format!("nrr-bh-{}.sqlite", src.label));
-    std::fs::copy(&src.db_path, &tmp).map_err(|e| format!("copy {}: {e}", src.label))?;
-    let result = read_hostnames_from_db(&tmp, src.query);
-    let _ = std::fs::remove_file(&tmp);
-    result
+/// Largest History DB copied; a bigger one is skipped rather than letting a
+/// user-supplied file fill the service's disk.
+const MAX_HISTORY_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Upper bound on URL rows read from one source.
+const MAX_HISTORY_ROWS: usize = 2_000_000;
+
+/// Copy `src.db_path` to a private temp file and read its URL column into
+/// hostnames.
+fn read_source_hostnames(
+    src: &HistorySource,
+    principal: &str,
+    copy_dirs: &[PathBuf],
+) -> Result<Vec<String>, String> {
+    let source = open_verified(&src.anchor, &src.db_path, principal, MAX_HISTORY_BYTES)?;
+    let mut copy = TempCopy::create_in(copy_dirs, src.label)?;
+    // Read through the verified handle: re-opening the path would reopen the
+    // race the checks just closed.
+    let copied = copy.fill_from(&source, MAX_HISTORY_BYTES)?;
+    drop(source);
+    if copied > MAX_HISTORY_BYTES {
+        return Err("source exceeds the size cap".into());
+    }
+    read_hostnames_from_db(copy.path(), src.query)
+}
+
+/// Directories the copy may be written to, most private first: the service's
+/// own data root when it is machine-owned, else this process's temp directory.
+fn copy_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(2);
+    if let Some(root) = nrr_platform_api::paths::production_data_root() {
+        if !is_link(&root) && os::is_machine_owned_dir(&root) {
+            dirs.push(root);
+        }
+    }
+    dirs.push(std::env::temp_dir());
+    dirs
+}
+
+/// A uniquely named copy that is removed however the read ends.
+struct TempCopy {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl TempCopy {
+    /// Create an unpredictable, not-yet-existing file in the first usable
+    /// directory. `create_new` refuses an existing name, including a planted
+    /// link, so the name can be neither guessed nor pre-empted.
+    fn create_in(dirs: &[PathBuf], label: &str) -> Result<Self, String> {
+        let mut last = String::from("no temp directory");
+        for dir in dirs {
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).map_err(|e| format!("temp name: {e}"))?;
+            let hex: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+            let path = dir.join(format!("nrr-bh-{label}-{hex}.sqlite"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    })
+                }
+                Err(e) => last = format!("create temp copy: {e}"),
+            }
+        }
+        Err(last)
+    }
+
+    /// Copy at most `cap + 1` bytes from `source`, returning how many were
+    /// written; the file handle is closed before SQLite opens the path.
+    fn fill_from(&mut self, source: &File, cap: u64) -> Result<u64, String> {
+        let mut out = self
+            .file
+            .take()
+            .ok_or_else(|| String::from("temp copy already filled"))?;
+        let mut limited = source.take(cap.saturating_add(1));
+        std::io::copy(&mut limited, &mut out).map_err(|e| format!("copy: {e}"))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempCopy {
+    fn drop(&mut self) {
+        self.file = None;
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Open `path` for reading only once it is proven to be the principal's own
+/// regular file, reached from `anchor` without any link. Checks, in order:
+/// no link on any component below `anchor`; `anchor` is owned by the
+/// principal (or a machine principal); the file, opened without following a
+/// final link, is a plain single-link file owned likewise; its final path is
+/// still under `anchor`'s final path; its size is within `max_bytes`.
+fn open_verified(
+    anchor: &Path,
+    path: &Path,
+    principal: &str,
+    max_bytes: u64,
+) -> Result<File, String> {
+    first_redirect_below(anchor, path)?;
+    let root = os::open_directory(anchor).map_err(|e| format!("open profile root: {e}"))?;
+    os::check_owner(&root, principal)?;
+    let root_final = os::final_path(&root).ok_or("profile root has no final path")?;
+
+    let file = os::open_no_follow(path).map_err(|e| format!("open source: {e}"))?;
+    os::check_plain_file(&file)?;
+    os::check_owner(&file, principal)?;
+    let file_final = os::final_path(&file).ok_or("source has no final path")?;
+    if !final_path_is_under(&root_final, &file_final) {
+        return Err("source resolves outside its profile".into());
+    }
+    let len = file
+        .metadata()
+        .map_err(|e| format!("stat source: {e}"))?
+        .len();
+    if len > max_bytes {
+        return Err("source exceeds the size cap".into());
+    }
+    Ok(file)
+}
+
+/// `Err` when `path` is not under `anchor` or any component from just below
+/// `anchor` down to `path` itself is a link or reparse point. `anchor` is
+/// trusted as given: a relocated profile root is legitimately a junction.
+fn first_redirect_below(anchor: &Path, path: &Path) -> Result<(), &'static str> {
+    let relative = path
+        .strip_prefix(anchor)
+        .map_err(|_| "source is not under its profile root")?;
+    let mut current = anchor.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => current.push(part),
+            _ => return Err("source path is not plain"),
+        }
+        if is_link(&current) {
+            return Err("a source path component is a link");
+        }
+    }
+    Ok(())
+}
+
+/// Whether `path` itself (not its target) is a symlink, junction or other
+/// reparse point. An unreadable component counts as one: refusing is safe.
+fn is_link(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return true;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Whether final path `file` lies strictly inside final path `root`,
+/// compared case-insensitively on a component boundary.
+fn final_path_is_under(root: &str, file: &str) -> bool {
+    let root = root.trim_end_matches(['\\', '/']).to_lowercase();
+    let file = file.to_lowercase();
+    match file.strip_prefix(&root) {
+        Some(rest) => rest.len() > 1 && (rest.starts_with('\\') || rest.starts_with('/')),
+        None => false,
+    }
+}
+
+const SYSTEM_SID: &str = "S-1-5-18";
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// An administrator's profile and files are owned by the Administrators
+/// group rather than the user, so an exact-SID match would refuse them; any
+/// other ordinary account as owner means the object is not the caller's.
+fn owner_is_acceptable(owner: &str, principal: &str) -> bool {
+    owner.eq_ignore_ascii_case(principal) || owner == SYSTEM_SID || owner == ADMINISTRATORS_SID
+}
+
+/// Handle-based file checks for the Windows service.
+#[cfg(windows)]
+mod os {
+    #![allow(unsafe_code)]
+
+    use std::fs::File;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
+    };
+    use windows::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID};
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
+    };
+
+    use super::{owner_is_acceptable, ADMINISTRATORS_SID, SYSTEM_SID};
+
+    fn handle(file: &File) -> HANDLE {
+        HANDLE(file.as_raw_handle().cast())
+    }
+
+    /// Directories need backup semantics to be opened at all; the root's own
+    /// link is followed on purpose (see `first_redirect_below`).
+    pub fn open_directory(path: &Path) -> std::io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+            .open(path)
+    }
+
+    /// Opens a final-component link as itself, so `check_plain_file` sees it.
+    pub fn open_no_follow(path: &Path) -> std::io::Result<File> {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path)
+    }
+
+    /// A hard link would carry another file's content under a name inside
+    /// the profile, and the final path would not reveal it.
+    pub fn check_plain_file(file: &File) -> Result<(), String> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is live for the borrow of `file`; `info` is a
+        // properly sized out-param.
+        unsafe { GetFileInformationByHandle(handle(file), &mut info) }
+            .map_err(|e| format!("query source: {e}"))?;
+        if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err("source is a link".into());
+        }
+        if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+            return Err("source is a directory".into());
+        }
+        if info.nNumberOfLinks != 1 {
+            return Err("source has more than one link".into());
+        }
+        Ok(())
+    }
+
+    pub fn final_path(file: &File) -> Option<String> {
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: the handle is live for the borrow of `file`; the buffer
+            // length is passed with the slice.
+            let len =
+                unsafe { GetFinalPathNameByHandleW(handle(file), &mut buf, FILE_NAME_NORMALIZED) }
+                    as usize;
+            if len == 0 {
+                return None;
+            }
+            if len < buf.len() {
+                return Some(String::from_utf16_lossy(&buf[..len]));
+            }
+            // On overflow the return value is the size required, NUL included.
+            buf.resize(len + 1, 0);
+        }
+    }
+
+    pub fn owner_sid(file: &File) -> Option<String> {
+        let mut owner = PSID::default();
+        let mut descriptor = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+        // SAFETY: the handle is live for the borrow of `file`; `owner` points
+        // into `descriptor`, which is freed only after the SID is converted.
+        unsafe {
+            let rc = GetSecurityInfo(
+                handle(file),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                Some(std::ptr::addr_of_mut!(owner)),
+                None,
+                None,
+                None,
+                Some(std::ptr::addr_of_mut!(descriptor)),
+            );
+            if rc != ERROR_SUCCESS {
+                return None;
+            }
+            let mut text = PWSTR::null();
+            let sid = if ConvertSidToStringSidW(owner, &mut text).is_ok() && !text.is_null() {
+                text.to_string().ok()
+            } else {
+                None
+            };
+            if !text.is_null() {
+                let _ = LocalFree(HLOCAL(text.0.cast()));
+            }
+            let _ = LocalFree(HLOCAL(descriptor.0));
+            sid
+        }
+    }
+
+    pub fn check_owner(file: &File, principal: &str) -> Result<(), String> {
+        let owner = owner_sid(file).ok_or("owner unreadable")?;
+        if owner_is_acceptable(&owner, principal) {
+            Ok(())
+        } else {
+            Err("not owned by the requesting user".into())
+        }
+    }
+
+    /// Only SYSTEM or Administrators may own a directory the copy is written
+    /// to; a directory an ordinary user created first stays theirs to rewrite.
+    pub fn is_machine_owned_dir(path: &Path) -> bool {
+        let Ok(dir) = open_directory(path) else {
+            return false;
+        };
+        matches!(
+            owner_sid(&dir).as_deref(),
+            Some(SYSTEM_SID | ADMINISTRATORS_SID)
+        )
+    }
+}
+
+/// Portable stand-ins so the discovery and copy logic stays testable off
+/// Windows; the production reader of this crate runs only in the Windows
+/// service.
+#[cfg(not(windows))]
+mod os {
+    use std::fs::File;
+    use std::path::Path;
+
+    pub fn open_directory(path: &Path) -> std::io::Result<File> {
+        File::open(path)
+    }
+
+    pub fn open_no_follow(path: &Path) -> std::io::Result<File> {
+        File::open(path)
+    }
+
+    pub fn check_plain_file(file: &File) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata().map_err(|e| format!("stat source: {e}"))?;
+        if !meta.is_file() {
+            return Err("source is not a regular file".into());
+        }
+        if meta.nlink() != 1 {
+            return Err("source has more than one link".into());
+        }
+        Ok(())
+    }
+
+    pub fn final_path(file: &File) -> Option<String> {
+        use std::os::unix::io::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    pub fn check_owner(_file: &File, _principal: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn is_machine_owned_dir(_path: &Path) -> bool {
+        false
+    }
 }
 
 /// Open `db` READ-ONLY and project `query`'s single URL column into distinct
 /// hostnames. Testable in isolation against a synthetic DB. `immutable=1` lets us
-/// read even a copy that still carries a stale WAL/lock header.
+/// read even a copy that still carries a stale WAL/lock header. The file is
+/// user-supplied, so SQLite's defensive mode is on and the schema untrusted.
 pub fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, String> {
+    use rusqlite::config::DbConfig;
     use rusqlite::OpenFlags;
     let uri = format!(
         "file:{}?mode=ro&immutable=1",
@@ -495,12 +903,16 @@ pub fn read_hostnames_from_db(db: &Path, query: &str) -> Result<Vec<String>, Str
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|e| format!("open: {e}"))?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|e| format!("harden: {e}"))?;
+    conn.execute_batch("PRAGMA trusted_schema = OFF; PRAGMA cell_size_check = ON;")
+        .map_err(|e| format!("harden: {e}"))?;
     let mut stmt = conn.prepare(query).map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| format!("query: {e}"))?;
     let mut hosts: Vec<String> = Vec::new();
-    for url in rows.flatten() {
+    for url in rows.take(MAX_HISTORY_ROWS).flatten() {
         if let Some(host) = hostname_from_history_url(&url) {
             hosts.push(host);
         }
@@ -555,17 +967,199 @@ user_pref("network.dns.disableIPv6", true);
         let roots = AppDataRoots {
             local: None,
             roaming: Some(dir.path().to_path_buf()),
+            profile: None,
         };
+        let me = test_principal(dir.path());
         assert_eq!(
-            thunderbird_server_hostnames(&roots),
+            thunderbird_server_hostnames(&roots, &me),
             vec!["pop.example.org"]
         );
         // Absent install → empty, never an error.
         let empty_roots = AppDataRoots {
             local: None,
             roaming: Some(dir.path().join("nope")),
+            profile: None,
         };
-        assert!(thunderbird_server_hostnames(&empty_roots).is_empty());
+        assert!(thunderbird_server_hostnames(&empty_roots, &me).is_empty());
+    }
+
+    /// The owner the OS stamps on files this test process creates, i.e. the
+    /// SID the checks must accept as "the requesting user".
+    fn test_principal(dir: &Path) -> String {
+        #[cfg(windows)]
+        {
+            os::owner_sid(&os::open_directory(dir).unwrap()).unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = dir;
+            "S-1-5-21-1-2-3-1000".to_string()
+        }
+    }
+
+    /// Link `link` to directory `target` the way an unprivileged user can
+    /// (a junction on Windows). `false` when this environment cannot.
+    fn make_dir_link(target: &Path, link: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+    }
+
+    #[test]
+    fn final_path_containment_needs_a_component_boundary() {
+        let root = r"\\?\C:\Users\ann";
+        assert!(final_path_is_under(
+            root,
+            r"\\?\C:\Users\ann\AppData\Local\History"
+        ));
+        assert!(final_path_is_under(
+            r"\\?\c:\users\ANN\",
+            r"\\?\C:\Users\ann\x"
+        ));
+        assert!(!final_path_is_under(root, r"\\?\C:\Users\anna\History"));
+        assert!(!final_path_is_under(root, r"\\?\C:\Users\bob\History"));
+        assert!(!final_path_is_under(root, r"\\?\C:\Users\ann"));
+        assert!(!final_path_is_under(root, r"\\?\C:\Users\ann\"));
+        assert!(final_path_is_under("/home/ann", "/home/ann/History"));
+        assert!(!final_path_is_under("/home/ann", "/home/annex/History"));
+    }
+
+    #[test]
+    fn only_the_caller_or_a_machine_principal_may_own_the_source() {
+        let me = "S-1-5-21-1-2-3-1001";
+        assert!(owner_is_acceptable(me, me));
+        assert!(owner_is_acceptable("s-1-5-21-1-2-3-1001", me));
+        assert!(owner_is_acceptable(SYSTEM_SID, me));
+        assert!(owner_is_acceptable(ADMINISTRATORS_SID, me));
+        assert!(!owner_is_acceptable("S-1-5-21-1-2-3-1002", me));
+        assert!(!owner_is_acceptable("S-1-5-32-545", me));
+    }
+
+    #[test]
+    fn a_link_below_the_profile_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let foreign = dir.path().join("foreign").join("Default");
+        std::fs::create_dir_all(profile.join("Local").join("Real")).unwrap();
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("History"), b"x").unwrap();
+        std::fs::write(profile.join("Local").join("Real").join("History"), b"x").unwrap();
+        let me = test_principal(dir.path());
+
+        let real = profile.join("Local").join("Real").join("History");
+        assert!(open_verified(&profile, &real, &me, 1024).is_ok());
+
+        let link = profile.join("Local").join("Default");
+        if !make_dir_link(&foreign, &link) {
+            eprintln!("skipping: cannot create a directory link here");
+            return;
+        }
+        let redirected = link.join("History");
+        assert!(
+            redirected.is_file(),
+            "the link must resolve for the test to mean anything"
+        );
+        assert_eq!(
+            first_redirect_below(&profile, &redirected),
+            Err("a source path component is a link")
+        );
+        assert!(open_verified(&profile, &redirected, &me, 1024).is_err());
+    }
+
+    #[test]
+    fn a_source_outside_its_anchor_or_over_the_cap_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let inside = profile.join("History");
+        let outside = dir.path().join("History");
+        std::fs::write(&inside, b"12").unwrap();
+        std::fs::write(&outside, b"12").unwrap();
+        let me = test_principal(dir.path());
+
+        assert!(open_verified(&profile, &inside, &me, 2).is_ok());
+        assert!(open_verified(&profile, &inside, &me, 1).is_err());
+        assert!(open_verified(&profile, &outside, &me, 2).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_source_owned_by_another_account_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("History");
+        std::fs::write(&file, b"x").unwrap();
+        let me = test_principal(dir.path());
+        assert!(open_verified(dir.path(), &file, &me, 16).is_ok());
+        // Placeholder SID no local account carries.
+        let stranger = "S-1-5-21-0-0-0-4242";
+        if me == ADMINISTRATORS_SID || me == SYSTEM_SID {
+            eprintln!("skipping: this process's files are machine-owned");
+            return;
+        }
+        assert!(open_verified(dir.path(), &file, stranger, 16).is_err());
+    }
+
+    #[test]
+    fn a_source_is_read_through_a_private_copy_that_is_always_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let copies = dir.path().join("copies");
+        std::fs::create_dir_all(profile.join("Default")).unwrap();
+        std::fs::create_dir_all(&copies).unwrap();
+        let db = profile.join("Default").join("History");
+        make_db(
+            &db,
+            "CREATE TABLE urls (id INTEGER PRIMARY KEY, url TEXT)",
+            &["https://feed.example/a"],
+        );
+        let me = test_principal(dir.path());
+        let src = HistorySource {
+            db_path: db.clone(),
+            anchor: profile.clone(),
+            query: "SELECT url FROM urls",
+            label: "chrome",
+        };
+        let copy_dirs = [copies.clone()];
+        assert_eq!(
+            read_source_hostnames(&src, &me, &copy_dirs).unwrap(),
+            vec!["feed.example".to_string()]
+        );
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+
+        // A corrupt source fails the read, and its copy is still removed.
+        std::fs::write(&db, b"not a database").unwrap();
+        assert!(read_source_hostnames(&src, &me, &copy_dirs).is_err());
+        assert_eq!(std::fs::read_dir(&copies).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn temp_copies_get_distinct_names_and_never_reuse_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = [dir.path().to_path_buf()];
+        let a = TempCopy::create_in(&dirs, "chrome").unwrap();
+        let b = TempCopy::create_in(&dirs, "chrome").unwrap();
+        assert_ne!(a.path(), b.path());
+        let a_path = a.path().to_path_buf();
+        drop(a);
+        assert!(!a_path.exists());
+        // An unusable directory falls through to the next one.
+        let dirs = [dir.path().join("missing"), dir.path().to_path_buf()];
+        let c = TempCopy::create_in(&dirs, "chrome").unwrap();
+        assert!(c.path().starts_with(dir.path()));
+        assert!(TempCopy::create_in(&[dir.path().join("missing")], "chrome").is_err());
     }
 
     fn make_db(path: &Path, ddl: &str, urls: &[&str]) {
@@ -615,6 +1209,7 @@ user_pref("network.dns.disableIPv6", true);
         AppDataRoots {
             local: Some(base.join("Local")),
             roaming: Some(base.join("Roaming")),
+            profile: None,
         }
     }
 

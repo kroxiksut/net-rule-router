@@ -19,7 +19,7 @@
 use std::io::Write;
 use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_broker::BrokerHandle;
 use nrr_ipc_client::{ipc_operation_timeout, IpcClient};
@@ -86,59 +86,46 @@ pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// concurrent dispatcher threads can serialise their writes.
 pub type SharedStdin = Arc<Mutex<ChildStdin>>;
 
-/// Does this request line have to run on a SEPARATE service connection?
+/// Which service connection a request line travels on.
 ///
-/// One `NamedPipeIpcClient` owns exactly one pipe connection and serialises
-/// every call on it, so a request that takes tens of seconds stalls everything
-/// queued behind it — including the 3 s health poll, whose timeout is what
-/// paints the "Connecting to service" banner. Building a diagnostic archive
-/// (zip of logs + audit, tens of MB) is exactly that kind of request: during an
-/// export the GUI looked disconnected although nothing was wrong.
+/// One `NamedPipeIpcClient` owns one pipe connection and serves one call at a
+/// time, so a slow request stalls everything queued behind it — including the
+/// health probe, whose 1 s budget counts queue wait and whose second timeout in
+/// a row paints "Connecting to service" while the service is fine.
 ///
-/// `ServiceHealthGet` rides the same side channel for the mirror-image reason:
-/// its 1 s budget (`backend_facade_impl::timeout_for`) is measured INCLUDING
-/// queue wait, so any main-channel op that legitimately takes longer than 1 s
-/// (`rules.list` 5 s, `snapshot.initial.get` 3 s, `interfaces.refresh` 5 s)
-/// starves the probe and paints the SAME false banner even though the pipe is
-/// healthy. Moving the probe off the main channel makes it structurally
-/// immune to those routine, frequent stalls. It can still queue behind a
-/// concurrent `DiagnosticsExportArchive` (10 s budget) on this side channel —
-/// that collision is accepted: exports are rare and user-initiated, unlike
-/// the main-channel ops this fix targets, and the QML-side debounce (two
-/// consecutive timeouts before the banner flips) absorbs a stray tick either
-/// way.
-///
-/// Only side-effect-free, long-running reads belong here. Ordering between the
-/// two connections is not guaranteed, so anything that MUTATES state must keep
-/// using the main channel, where "issued after the previous response" also
-/// means "executed after it".
-pub fn request_uses_side_channel(line: &str) -> bool {
-    match parse_request_line(line) {
-        Some(Ok(req)) => match IpcOperationName::from_slug(&req.operation) {
-            // The push subscription lives on the connection it was made on, and
-            // the forwarder streams from that client — it must stay on the main
-            // one whatever its class says.
-            Some(IpcOperationName::StatusUpdatesSubscribe)
-            | Some(IpcOperationName::StatusUpdatesPoll) => false,
-            // Classified as a DiagnosticAction for AUDIT (the archive is a
-            // file write), but for transport it is the one long-running
-            // request the side channel exists for: on the main connection a
-            // 30-second build parks every mutation behind it.
-            Some(IpcOperationName::DiagnosticsExportArchive) => true,
-            Some(op) => side_channel_class(op, &req.payload),
-            None => false,
-        },
-        _ => false,
+/// - `Main`: mutations and the push subscription. Ordering between connections
+///   is not guaranteed, so anything that MUTATES state stays here, where
+///   "issued after the previous response" also means "executed after it".
+/// - `Side`: side-effect-free reads and diagnostic queries, the health probe
+///   among them, so a mutation with a 30 s budget cannot starve them.
+/// - `Export`: the diagnostic archive alone. A build with raw logs runs for
+///   seconds; on `Side` it starved the health probe into the same false banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcLane {
+    Main,
+    Side,
+    Export,
+}
+
+pub fn request_lane(line: &str) -> RpcLane {
+    let Some(Ok(req)) = parse_request_line(line) else {
+        return RpcLane::Main;
+    };
+    match IpcOperationName::from_slug(&req.operation) {
+        // The forwarder streams pushes from the client the subscription was
+        // made on, whatever its class says.
+        Some(IpcOperationName::StatusUpdatesSubscribe | IpcOperationName::StatusUpdatesPoll) => {
+            RpcLane::Main
+        }
+        // Audited as a DiagnosticAction (the archive is a file write), but for
+        // transport it is a long read.
+        Some(IpcOperationName::DiagnosticsExportArchive) => RpcLane::Export,
+        Some(op) if side_channel_class(op, &req.payload) => RpcLane::Side,
+        _ => RpcLane::Main,
     }
 }
 
-/// Reads and diagnostic queries go on the second connection.
-///
-/// A client serves one request at a time per connection, so a mutation with a
-/// 30-second budget parked every health read and every snapshot behind it and
-/// the whole window went to "no connection to the service" — while the service
-/// was fine. The service already lets these two classes bypass its mutation
-/// queue; the second connection is what stops the CLIENT from serialising them.
+/// The classes the service already lets bypass its mutation queue.
 fn side_channel_class(op: IpcOperationName, payload: &serde_json::Value) -> bool {
     matches!(
         nrr_shared::ipc_transport::canonical_operation_class(op, payload),
@@ -147,38 +134,81 @@ fn side_channel_class(op: IpcOperationName, payload: &serde_json::Value) -> bool
     )
 }
 
+/// One service connection per [`RpcLane`], each opened on first use.
+#[derive(Default)]
+pub struct LaneClients {
+    main: Option<LaneClient>,
+    side: Option<LaneClient>,
+    export: Option<LaneClient>,
+}
+
+struct LaneClient {
+    client: Arc<dyn IpcClient>,
+    started: Instant,
+}
+
+impl LaneClients {
+    /// The lane's client, and how long a request may wait for it to connect.
+    ///
+    /// Every client is created by the request that first needs it, and `call`
+    /// fails at once while it is still connecting: the first export, and the
+    /// tray's startup subscribe, returned `transport-disconnected` from a
+    /// healthy service. Side and export requests always wait. The main lane
+    /// waits only while its client is young — later, a disconnect is a real one
+    /// and its callers must hear so at once, not after the budget.
+    pub fn client_for(
+        &mut self,
+        lane: RpcLane,
+        now: Instant,
+        start: impl FnOnce() -> Arc<dyn IpcClient>,
+    ) -> (Arc<dyn IpcClient>, Duration) {
+        let slot = match lane {
+            RpcLane::Main => &mut self.main,
+            RpcLane::Side => &mut self.side,
+            RpcLane::Export => &mut self.export,
+        };
+        let entry = slot.get_or_insert_with(|| LaneClient {
+            client: start(),
+            started: now,
+        });
+        let budget = match lane {
+            RpcLane::Main => {
+                CONNECT_BUDGET.saturating_sub(now.saturating_duration_since(entry.started))
+            }
+            RpcLane::Side | RpcLane::Export => CONNECT_BUDGET,
+        };
+        (Arc::clone(&entry.client), budget)
+    }
+}
+
 /// Spawn a worker thread that runs the dispatcher for one parsed
 /// request line. Returns the `JoinHandle` so callers can join on
 /// shutdown if needed; the launcher today fires-and-forgets and
 /// relies on the child's stdout EOF to signal everything has settled.
 ///
-/// `wait_for_connect` is set for side-channel requests: the side client is
-/// created lazily on the FIRST such request, and `IpcClient::call` fails
-/// immediately while the background worker is still connecting — so without
-/// a bounded wait the first export deterministically returned
-/// `transport-disconnected` even though the service was healthy.
+/// `connect_budget` comes from [`LaneClients::client_for`]; zero dispatches at once.
 pub fn spawn_dispatch_worker(
     line: String,
     client: Arc<dyn IpcClient>,
     sidecar: SidecarHandle,
     broker: BrokerHandle,
     stdin: SharedStdin,
-    wait_for_connect: bool,
+    connect_budget: Duration,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        if wait_for_connect {
-            wait_until_connected(client.as_ref(), SIDE_CHANNEL_CONNECT_BUDGET);
+        if !connect_budget.is_zero() {
+            wait_until_connected(client.as_ref(), connect_budget);
         }
         dispatch_request(&line, &client, &sidecar, &broker, &stdin);
     })
 }
 
-/// Upper bound on how long a side-channel request waits for its freshly
-/// started client to finish connect + handshake before dispatching anyway
-/// (and surfacing the honest `transport-disconnected`). Generous enough for
-/// a pipe open + `ContractNegotiate` round-trip; far below every side-channel
-/// op timeout, so the caller's deadline still dominates.
-const SIDE_CHANNEL_CONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+/// Upper bound on how long a request waits for a freshly started client to
+/// finish connect + handshake before dispatching anyway (and surfacing the
+/// honest `transport-disconnected`). Generous enough for a pipe open +
+/// `ContractNegotiate` round-trip; far below every op's timeout, so the
+/// caller's deadline still dominates.
+const CONNECT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Block until `client` reports `Connected`, a state that cannot progress
 /// without user action (service stopped / not installed / protocol mismatch),
@@ -453,6 +483,17 @@ pub fn dispatch_request(
         None
     };
 
+    // The prepared channel takes over only now, when the subscribe is known to
+    // have gone through. A failed one leaves the channel that was already
+    // delivering exactly where it was.
+    if is_subscribe {
+        if subscription_id.is_some() {
+            client.commit_push();
+        } else {
+            client.abandon_push();
+        }
+    }
+
     write_response(stdin, &response);
 
     if let (Some(rx), Some(sub_id)) = (push_rx, subscription_id) {
@@ -490,9 +531,14 @@ fn run_push_forwarder(
             Err(_) => {
                 // The sending half is gone: the IPC client shut down, or its
                 // push channel was replaced by a newer subscription.
+                // Which forwarder died matters, and until now the line did
+                // not say: it fires once per re-subscribe, so a reader sees
+                // a stream of identical retirements with no way to tell the
+                // one that was carrying events from the one a retry had
+                // replaced a moment earlier.
                 eprintln!(
-                    "nrr-launcher: push forwarder retired — client push channel closed \
-                     after {forwarded} frame(s)"
+                    "nrr-launcher: push forwarder retired (sub={initial_subscription_id}) — \
+                     client push channel closed after {forwarded} frame(s)"
                 );
                 return;
             }
@@ -755,6 +801,7 @@ fn write_response(stdin: &SharedStdin, resp: &LauncherRpcResponse) {
 mod tests {
     use super::*;
     use nrr_ipc_client::{ConnectionStatus, IpcClientError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
     /// Pre-scripted outcome variants for the `ScriptedClient`. Avoids
@@ -775,6 +822,9 @@ mod tests {
     struct ScriptedClient {
         outcome: StdMutex<Option<ScriptedOutcome>>,
         last_call: StdMutex<Option<(IpcOperationName, serde_json::Value)>>,
+        /// Which of the two push phases the dispatcher reached.
+        committed: AtomicUsize,
+        abandoned: AtomicUsize,
     }
 
     impl ScriptedClient {
@@ -782,6 +832,8 @@ mod tests {
             Self {
                 outcome: StdMutex::new(Some(outcome)),
                 last_call: StdMutex::new(None),
+                committed: AtomicUsize::new(0),
+                abandoned: AtomicUsize::new(0),
             }
         }
     }
@@ -810,6 +862,18 @@ mod tests {
             ConnectionStatus::Connected
         }
         fn force_reconnect(&self) {}
+        fn subscribe_push(&self) -> Option<std::sync::mpsc::Receiver<serde_json::Value>> {
+            let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+            // The sender is dropped with this call: the test only cares which
+            // phase the dispatcher reaches, not what travels afterwards.
+            Some(rx)
+        }
+        fn commit_push(&self) {
+            self.committed.fetch_add(1, Ordering::SeqCst);
+        }
+        fn abandon_push(&self) {
+            self.abandoned.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     fn parse_response_from_buffer(buffer: &[u8]) -> LauncherRpcResponse {
@@ -1070,69 +1134,101 @@ mod tests {
         assert_eq!(err.message, "non-admin GUI cannot mutate");
     }
 
+    fn lane_of(op: IpcOperationName, payload: serde_json::Value) -> RpcLane {
+        let req = LauncherRpcRequest {
+            correlation_id: format!("c-{}", op.slug()),
+            operation: op.slug().to_string(),
+            payload,
+        };
+        request_lane(&nrr_shared::launcher_rpc::encode_request_line(&req).unwrap())
+    }
+
+    /// The health probe must not queue behind a multi-second archive build.
     #[test]
-    fn request_uses_side_channel_covers_reads_but_never_mutations_or_subscribe() {
-        use nrr_shared::launcher_rpc::encode_request_line;
+    fn the_archive_export_has_a_lane_of_its_own() {
+        assert_eq!(
+            lane_of(
+                IpcOperationName::DiagnosticsExportArchive,
+                serde_json::json!({})
+            ),
+            RpcLane::Export
+        );
+        assert_eq!(
+            lane_of(IpcOperationName::ServiceHealthGet, serde_json::json!({})),
+            RpcLane::Side
+        );
+    }
 
-        let side_ops = [
-            IpcOperationName::DiagnosticsExportArchive,
-            IpcOperationName::ServiceHealthGet,
-        ];
-        for op in side_ops {
-            let req = LauncherRpcRequest {
-                correlation_id: format!("c-{}", op.slug()),
-                operation: op.slug().to_string(),
-                payload: serde_json::json!({}),
-            };
-            let line = encode_request_line(&req).unwrap();
-            assert!(
-                request_uses_side_channel(&line),
-                "{} must use the side channel",
-                op.slug()
-            );
-        }
-
-        // Reads go there too now: one connection serves one request at a
-        // time, so a long mutation used to park every health read behind it.
+    #[test]
+    fn reads_take_the_side_lane_while_mutations_and_the_subscription_stay_on_main() {
         for op in [
             IpcOperationName::RulesList,
             IpcOperationName::SnapshotInitialGet,
             IpcOperationName::SnapshotInterfacesGet,
         ] {
-            let req = LauncherRpcRequest {
-                correlation_id: format!("c-{}", op.slug()),
-                operation: op.slug().to_string(),
-                payload: serde_json::json!({}),
-            };
-            let line = encode_request_line(&req).unwrap();
-            assert!(
-                request_uses_side_channel(&line),
-                "{} is a read and belongs on the side channel",
+            assert_eq!(
+                lane_of(op, serde_json::json!({})),
+                RpcLane::Side,
+                "{}",
                 op.slug()
             );
         }
-
-        // Mutations keep strict ordering on the primary connection.
-        let main_req = LauncherRpcRequest {
-            correlation_id: "c-main".into(),
-            operation: IpcOperationName::MutationSubmit.slug().to_string(),
-            payload: serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false }),
-        };
-        let main_line = encode_request_line(&main_req).unwrap();
-        assert!(!request_uses_side_channel(&main_line));
-
-        // The subscription must stay where its push stream is, whatever its
-        // class says: the forwarder streams from THAT client.
-        let sub_req = LauncherRpcRequest {
-            correlation_id: "c-sub".into(),
-            operation: IpcOperationName::StatusUpdatesSubscribe.slug().to_string(),
-            payload: serde_json::json!({}),
-        };
-        let sub_line = encode_request_line(&sub_req).unwrap();
-        assert!(
-            !request_uses_side_channel(&sub_line),
+        assert_eq!(
+            lane_of(
+                IpcOperationName::MutationSubmit,
+                serde_json::json!({ "mutation-kind": "rules-update", "dry-run": false }),
+            ),
+            RpcLane::Main
+        );
+        assert_eq!(
+            lane_of(
+                IpcOperationName::StatusUpdatesSubscribe,
+                serde_json::json!({})
+            ),
+            RpcLane::Main,
             "the subscribe call must stay on the connection that carries pushes"
         );
+        assert_eq!(request_lane("not a request"), RpcLane::Main);
+    }
+
+    #[test]
+    fn each_lane_opens_its_own_connection_once() {
+        let mut clients = LaneClients::default();
+        let opened = std::cell::Cell::new(0);
+        let start = || -> Arc<dyn IpcClient> {
+            opened.set(opened.get() + 1);
+            Arc::new(ServiceStoppedClient)
+        };
+        let now = std::time::Instant::now();
+        let (side, _) = clients.client_for(RpcLane::Side, now, start);
+        let (export, _) = clients.client_for(RpcLane::Export, now, start);
+        let (side_again, _) = clients.client_for(RpcLane::Side, now, start);
+        assert!(Arc::ptr_eq(&side, &side_again));
+        assert!(!Arc::ptr_eq(&side, &export));
+        assert_eq!(opened.get(), 2);
+    }
+
+    #[test]
+    fn the_main_lane_waits_for_its_client_only_while_it_is_young() {
+        // The tray's startup subscribe was the first main-lane request, made
+        // while the client it created was still connecting.
+        let mut clients = LaneClients::default();
+        let start = || -> Arc<dyn IpcClient> { Arc::new(ServiceStoppedClient) };
+        let t0 = std::time::Instant::now();
+        let (_, first) = clients.client_for(RpcLane::Main, t0, start);
+        assert_eq!(first, CONNECT_BUDGET);
+        let (_, later) = clients.client_for(RpcLane::Main, t0 + Duration::from_secs(2), start);
+        assert_eq!(later, CONNECT_BUDGET - Duration::from_secs(2));
+        let (_, settled) = clients.client_for(RpcLane::Main, t0 + Duration::from_secs(60), start);
+        assert!(
+            settled.is_zero(),
+            "a settled main lane must fail a disconnect at once"
+        );
+        let (_, side) = clients.client_for(RpcLane::Side, t0, start);
+        let (_, side_later) =
+            clients.client_for(RpcLane::Side, t0 + Duration::from_secs(60), start);
+        assert_eq!(side, CONNECT_BUDGET);
+        assert_eq!(side_later, CONNECT_BUDGET, "side requests keep waiting");
     }
 
     #[test]

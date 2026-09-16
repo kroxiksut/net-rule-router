@@ -9,7 +9,7 @@
 //! network changes.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -83,7 +83,9 @@ fn probe_id() -> u16 {
 impl UpstreamProbe for UdpUpstreamProbe {
     fn responds(&self, server: SocketAddr) -> bool {
         let id = probe_id();
-        let Some(query) = crate::dns_wire::build_a_query(id, PROBE_NAME) else {
+        let Some(query) =
+            crate::dns_wire::build_address_query(id, PROBE_NAME, crate::dns_wire::QTYPE_A)
+        else {
             return false;
         };
         let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) else {
@@ -151,6 +153,9 @@ pub struct UpstreamDnsPool {
     /// the same probes beside the first.
     sweep: Mutex<()>,
     state: Mutex<PoolState>,
+    /// A background re-selection is under way; see
+    /// [`Self::note_network_change_in_background`].
+    background_refresh: AtomicBool,
 }
 
 impl UpstreamDnsPool {
@@ -167,6 +172,7 @@ impl UpstreamDnsPool {
                 last_refresh: None,
                 last_empty_sweep: None,
             }),
+            background_refresh: AtomicBool::new(false),
         }
     }
 
@@ -209,6 +215,7 @@ impl UpstreamDnsPool {
                 last_refresh: Some(Instant::now()),
                 last_empty_sweep: None,
             }),
+            background_refresh: AtomicBool::new(false),
         }
     }
 
@@ -295,6 +302,35 @@ impl UpstreamDnsPool {
             return self.current();
         }
         self.refresh()
+    }
+
+    /// [`Self::note_network_change`] on a worker thread, handing the selection
+    /// to `then`. Probing dead servers costs up to a probe timeout each, and the
+    /// enforcement pass that notices a network change must not wait on it.
+    /// While one background re-selection runs, another request is dropped:
+    /// that one already answers for the current network.
+    pub fn note_network_change_in_background<F>(self: &Arc<Self>, then: F)
+    where
+        F: FnOnce(Option<SocketAddr>) + Send + 'static,
+    {
+        if self.background_refresh.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let pool = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("nrr-dns-upstream-refresh".into())
+            .spawn(move || {
+                let selected = pool.note_network_change();
+                pool.background_refresh.store(false, Ordering::SeqCst);
+                then(selected);
+            });
+        if let Err(e) = spawned {
+            self.background_refresh.store(false, Ordering::SeqCst);
+            tracing::warn!(
+                target: "nrr::dns-resolver",
+                "could not start the upstream DNS re-selection worker: {e}",
+            );
+        }
     }
 
     /// Pick the first candidate that answers, preferring anything over `avoid`.
@@ -640,5 +676,44 @@ mod tests {
             Some(SocketAddr::from((ip(0), 53)))
         );
         assert_eq!(probe.calls.load(Ordering::Relaxed), 1, "one sweep, not two");
+    }
+
+    /// The caller is an enforcement pass: it must not wait out probes of dead
+    /// servers, and the selection still has to reach it.
+    #[test]
+    fn a_background_reselection_does_not_hold_the_caller_and_reports_its_choice() {
+        struct SlowProbe;
+        impl UpstreamProbe for SlowProbe {
+            fn responds(&self, _server: SocketAddr) -> bool {
+                std::thread::sleep(Duration::from_millis(300));
+                true
+            }
+        }
+        let pool = Arc::new(UpstreamDnsPool::new(
+            Arc::new(StaticDnsServers::new(vec![ip(7)])),
+            Arc::new(SlowProbe),
+        ));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        pool.note_network_change_in_background(move |selected| {
+            let _ = sender.send(selected);
+        });
+        assert!(started.elapsed() < Duration::from_millis(200));
+        // A second request while the first probes is absorbed by it.
+        let second_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let second_ran = Arc::clone(&second_ran);
+            pool.note_network_change_in_background(move |_| {
+                second_ran.store(true, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("selection"),
+            Some(SocketAddr::from((ip(7), 53)))
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!second_ran.load(Ordering::SeqCst));
     }
 }

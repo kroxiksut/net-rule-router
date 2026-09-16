@@ -20,16 +20,18 @@
 //! - `Description` and `FriendlyName` are wide (UTF-16) — read via
 //!   [`super::wide::pwstr_lossy`].
 //!
-//! ## IPv6 policy
+//! ## Address families
 //!
-//! Only `AF_INET` (IPv4) is requested. Any IPv6 unicast or gateway
-//! addresses present on the adapter are silently filtered out at the
-//! `sin_family` check — `AdapterInfo` carries IPv4 only by design (see
-//! `core/platform/windows/src/types.rs` module doc).
+//! `AF_UNSPEC` is requested, so unicast addresses of BOTH families are
+//! collected and split by `sa_family`. Win32 returns the same adapter set
+//! either way — the family argument narrows the address lists, not the
+//! adapters — so asking for both cannot add or drop an adapter. Gateways
+//! stay IPv4-only: a v6 gateway belongs with v6 route reconciliation, and
+//! nothing reads one yet.
 
 #![allow(unsafe_code)]
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -37,7 +39,9 @@ use windows::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
     IP_ADAPTER_GATEWAY_ADDRESS_LH, IP_ADAPTER_UNICAST_ADDRESS_LH,
 };
-use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR, SOCKADDR_IN};
+use windows::Win32::Networking::WinSock::{
+    AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
+};
 
 use crate::adapters::{AdapterInfo, IfOperStatus, InterfaceType};
 use crate::error::PlatformError;
@@ -57,7 +61,8 @@ const MAX_RETRIES: u8 = 4;
 
 const OPERATION: &str = "GetAdaptersAddresses";
 
-/// Enumerate all IPv4 adapters via `GetAdaptersAddresses`.
+/// Enumerate every adapter via `GetAdaptersAddresses`, with the unicast
+/// addresses of both families.
 ///
 /// Returns adapters as observed by the Win32 API at call time. The
 /// caller is responsible for filtering virtual / loopback adapters
@@ -82,7 +87,13 @@ pub fn enumerate_adapters() -> Result<Vec<AdapterInfo>, PlatformError> {
         // `out_size` bytes, and on overflow updates `out_size` with the
         // required length. Lifetime of `buf` covers the call.
         let code = unsafe {
-            GetAdaptersAddresses(u32::from(AF_INET.0), flags, None, Some(head), &mut out_size)
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC.0),
+                flags,
+                None,
+                Some(head),
+                &mut out_size,
+            )
         };
 
         if code == NO_ERROR.0 {
@@ -184,7 +195,7 @@ unsafe fn read_entry(entry: &IP_ADAPTER_ADDRESSES_LH) -> Option<AdapterInfo> {
     let oper_status = decode_oper_status(entry.OperStatus.0);
 
     // SAFETY: linked-list head pointers remain valid for buffer lifetime.
-    let ipv4_addresses = unsafe { walk_unicast(entry.FirstUnicastAddress) };
+    let (ipv4_addresses, ipv6_addresses) = unsafe { walk_unicast(entry.FirstUnicastAddress) };
     let gateways = unsafe { walk_gateways(entry.FirstGatewayAddress) };
 
     Some(AdapterInfo {
@@ -196,6 +207,7 @@ unsafe fn read_entry(entry: &IP_ADAPTER_ADDRESSES_LH) -> Option<AdapterInfo> {
         interface_type,
         oper_status,
         ipv4_addresses,
+        ipv6_addresses,
         gateways,
     })
 }
@@ -225,26 +237,36 @@ fn decode_oper_status(raw: i32) -> IfOperStatus {
     }
 }
 
-/// Walk the unicast address linked list, collecting IPv4 only.
+/// Walk the unicast address linked list once, splitting by family.
+///
+/// One pass rather than two: the list is walked for both families anyway, and
+/// a second traversal would be a second chance for the two results to disagree
+/// about which addresses the adapter had at that instant.
 ///
 /// # Safety
 ///
 /// `head` must be either null or a valid pointer to an
 /// `IP_ADAPTER_UNICAST_ADDRESS_LH` list as filled by Win32.
-unsafe fn walk_unicast(head: *const IP_ADAPTER_UNICAST_ADDRESS_LH) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
+unsafe fn walk_unicast(
+    head: *const IP_ADAPTER_UNICAST_ADDRESS_LH,
+) -> (Vec<Ipv4Addr>, Vec<Ipv6Addr>) {
+    let mut v4 = Vec::new();
+    let mut v6 = Vec::new();
     let mut cur = head;
     let mut guard = 0u32;
     while !cur.is_null() && guard < MAX_ADDRS_GUARD {
         // SAFETY: Win32-produced linked-list node, alive for buffer lifetime.
         let node = unsafe { &*cur };
-        if let Some(addr) = unsafe { sockaddr_to_ipv4(node.Address.lpSockaddr) } {
-            out.push(addr);
+        let ptr = node.Address.lpSockaddr;
+        if let Some(addr) = unsafe { sockaddr_to_ipv4(ptr) } {
+            v4.push(addr);
+        } else if let Some(addr) = unsafe { sockaddr_to_ipv6(ptr) } {
+            v6.push(addr);
         }
         cur = node.Next;
         guard += 1;
     }
-    out
+    (v4, v6)
 }
 
 /// Walk the gateway address linked list, collecting IPv4 only.
@@ -294,6 +316,32 @@ unsafe fn sockaddr_to_ipv4(ptr: *const SOCKADDR) -> Option<Ipv4Addr> {
     let net_order = unsafe { sa_in.sin_addr.S_un.S_addr };
     let host_order = u32::from_be(net_order);
     Some(Ipv4Addr::from(host_order))
+}
+
+/// Decode a `SOCKADDR*` into an `Ipv6Addr` if (and only if) it is `AF_INET6`.
+///
+/// The scope id is deliberately dropped: the address is used to answer "which
+/// adapter is this connection leaving through", and the adapter is already
+/// known from the entry that owns the list.
+///
+/// # Safety
+///
+/// Same contract as [`sockaddr_to_ipv4`].
+unsafe fn sockaddr_to_ipv6(ptr: *const SOCKADDR) -> Option<Ipv6Addr> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is non-null and points at a valid SOCKADDR header.
+    let family = unsafe { (*ptr).sa_family };
+    if family != AF_INET6 {
+        return None;
+    }
+    // SAFETY: when `sa_family == AF_INET6`, the layout is `SOCKADDR_IN6`.
+    let sa_in6 = unsafe { &*(ptr as *const SOCKADDR_IN6) };
+    // SAFETY: `Byte` is a valid arm of the IN6_ADDR union — 16 bytes in
+    // network order, which is the order `Ipv6Addr::from([u8; 16])` expects.
+    let octets = unsafe { sa_in6.sin6_addr.u.Byte };
+    Some(Ipv6Addr::from(octets))
 }
 
 #[cfg(test)]

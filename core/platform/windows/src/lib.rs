@@ -56,6 +56,7 @@ pub mod dns_scope;
 // One-shot UAC elevation of a single command, for the administrative console.
 // The session-long privileged channel the GUI uses is a different mechanism and
 // lives in `apps/desktop/broker`.
+#[cfg(windows)]
 pub mod elevation;
 pub mod error;
 // Operator-facing Windows event log (install-time source registration + the
@@ -68,6 +69,8 @@ pub mod file_handoff;
 // Windows TUN mechanism on WireGuard LLC's signed Wintun driver, plus the
 // third-party integrity report the GUI shows.
 pub mod fake_ip;
+#[cfg(target_os = "windows")]
+mod tun_network_name;
 // VPN self-heal mechanism: name the process that owns a relayed TCP flow via
 // the OS connection table.
 pub mod flow_owner;
@@ -89,10 +92,16 @@ pub mod wfp_backend;
 // broadcasts the change. The planning logic is generic over the store, so it
 // compiles and is tested on every host; only the registry backend is Win32.
 pub mod path_registration;
+// Create / take a file in a user-writable directory without following a link
+// swapped in by that user.
+#[cfg(windows)]
+pub mod pinned_file;
 /// Windows mechanism for pointing this process's error stream at a file, so a
 /// process started by another process stops writing into its parent's log.
 pub mod process_error_stream;
 pub mod reachability;
+// ICMP echo with a chosen hop limit and source address.
+pub mod icmp_echo;
 pub mod routing;
 // SCM mechanism behind `nrr_platform_api::service_control::ServiceControlPort`.
 // Windows-only: the module talks to the Service Control Manager.
@@ -105,13 +114,17 @@ pub mod single_instance;
 // Fake-IP mechanism behind `nrr_platform_api::fake_ip::stale_flows::StaleFlowReset`:
 // tears down TCP flows a restart left pointing at now-dead fake addresses.
 pub mod stale_flows;
-pub mod strategy;
 // Local civil-time offset (traffic ledger keys rows by the user's local day).
 pub mod local_time;
 pub mod system_info;
-mod system_shell;
+#[cfg(windows)]
+pub mod system_shell;
 /// Windows implementation of the system light/dark probe.
 pub mod system_theme;
+// Whether a path a privileged process relies on is out of reach of ordinary
+// accounts, and making the service data tree so.
+#[cfg(windows)]
+pub mod trusted_location;
 pub mod types;
 // Windows VPN-client discovery (processes + Uninstall registry).
 // `#![cfg(target_os = "windows")]` inside the module file.
@@ -189,7 +202,6 @@ pub use nrr_platform_api::vpn_discovery::{
     looks_like_vpn, MockVpnDiscovery, NoopVpnDiscovery, VpnCandidate, VpnCandidateSource,
     VpnDiscoveryPort,
 };
-pub use strategy::{is_ipv6_address, rule_strategy, RuleImplementationStrategy};
 pub use types::{
     ApplyActionPlan, RouteEntry, RoutingAction, WfpAction, WfpFilterAction, WfpFilterId,
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,

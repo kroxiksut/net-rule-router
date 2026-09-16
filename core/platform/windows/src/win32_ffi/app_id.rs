@@ -305,8 +305,9 @@ mod tests {
     /// is missing. We accept both — both are "no such executable".
     #[test]
     fn app_id_from_path_rejects_missing_file() {
-        let path = Path::new(r"C:\Definitely\Does\Not\Exist\nrr-test.exe");
-        let err = app_id_from_path(path).expect_err("missing file must error");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist-nrr-test.exe");
+        let err = app_id_from_path(&path).expect_err("missing file must error");
         match err {
             PlatformError::Win32 { code, .. } => {
                 assert!(

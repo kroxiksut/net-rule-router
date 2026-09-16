@@ -252,6 +252,7 @@ mod tests {
     };
     use nrr_domain::{RouteBehaviorMode, RuleId};
     use std::collections::HashSet;
+    use std::net::IpAddr;
     use std::sync::Mutex;
 
     fn ip(d: u8) -> Ipv4Addr {
@@ -347,6 +348,7 @@ mod tests {
     fn target() -> SecondaryRouteTarget {
         SecondaryRouteTarget {
             gateway: Ipv4Addr::new(10, 8, 0, 1),
+            gateway_v6: None,
             interface_index: 20,
         }
     }
@@ -364,7 +366,13 @@ mod tests {
             &crate::address_ownership::AddressOwnership::default(),
             crate::address_ownership::Link::Additional,
         );
-        out.routes.into_iter().map(|r| r.destination).collect()
+        out.routes
+            .into_iter()
+            .filter_map(|r| match r.destination {
+                IpAddr::V4(d) => Some(d),
+                IpAddr::V6(_) => None,
+            })
+            .collect()
     }
 
     #[test]
@@ -456,7 +464,7 @@ mod tests {
         // match as AND and a route cannot be process-scoped), so its
         // destinations are not worth remembering either.
         let mut paired = app_rule("r-pair", "paired.exe");
-        paired.address_match = Some(CanonicalAddressMatch::ExactIp(ip(200)));
+        paired.address_match = Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(ip(200))));
 
         let mut rules = book(vec![
             app_rule("r1", "messenger.exe"),

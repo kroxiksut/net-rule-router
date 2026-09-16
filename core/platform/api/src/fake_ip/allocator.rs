@@ -182,6 +182,34 @@ impl FakeIpPoolConfig {
     /// no hostname currently holds, so the stack can recognise (and drop)
     /// traffic to a stale fake address instead of forwarding it somewhere real.
     #[must_use]
+    /// Is `addr` a HOST inside this pool — an address a binding could hold?
+    ///
+    /// [`contains`](Self::contains) answers about the range, which includes the
+    /// range's own network and broadcast addresses. Those are not endpoints:
+    /// the broadcast one is where the host sends NetBIOS and other discovery
+    /// datagrams on this link, and treating it as a recycled binding is how a
+    /// name lookup gets answered with a refusal.
+    pub fn holds_host(&self, addr: IpAddr) -> bool {
+        if !self.contains(addr) {
+            return false;
+        }
+        match addr {
+            IpAddr::V4(v4) => {
+                let mask = prefix_mask_v4(self.v4_prefix_len);
+                let host_bits = u32::from(v4) & !mask;
+                // The all-ones host part is the subnet broadcast; the all-zeros
+                // one is the network address.
+                host_bits != 0 && host_bits != !mask
+            }
+            // IPv6 has no broadcast, and the all-zeros host part is the subnet
+            // router anycast address rather than a binding of ours.
+            IpAddr::V6(v6) => {
+                let mask = prefix_mask_v6(self.v6_prefix_len);
+                (u128::from(v6) & !mask) != 0
+            }
+        }
+    }
+
     pub fn contains(&self, addr: IpAddr) -> bool {
         match addr {
             IpAddr::V4(v4) => {
@@ -528,6 +556,14 @@ impl FakeIpAllocator {
     #[must_use]
     pub fn is_fake_address(&self, addr: IpAddr) -> bool {
         self.config.contains(addr)
+    }
+
+    /// Whether `addr` could be a HOST in the fake range — the range minus its
+    /// own network and broadcast addresses. See
+    /// [`FakeIpPoolConfig::holds_host`].
+    #[must_use]
+    pub fn holds_host(&self, addr: IpAddr) -> bool {
+        self.config.holds_host(addr)
     }
 
     /// Drop `domain`'s binding, returning its index to the pool. True when a

@@ -568,15 +568,15 @@ mod tests {
     use super::*;
     use crate::canonical::CanonicalAddressMatch;
     use crate::RuleId;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn ip_rule(id: &str, enabled: bool, ip: [u8; 4], comment: &str) -> CanonicalRule {
         CanonicalRule {
             id: RuleId(id.to_string()),
             enabled,
-            address_match: Some(CanonicalAddressMatch::ExactIp(Ipv4Addr::new(
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(
                 ip[0], ip[1], ip[2], ip[3],
-            ))),
+            )))),
             app_match: None,
             comment: comment.to_string(),
             action: crate::canonical::RuleAction::Route,
@@ -1005,7 +1005,7 @@ mod tests {
             .iter()
             .find(|c| {
                 matches!(&c.rule.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(1, 1, 1, 1))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
             })
             .map(|c| c.identity_key.clone())
             .expect("conflict for 1.1.1.1");
@@ -1014,7 +1014,7 @@ mod tests {
             .iter()
             .find(|c| {
                 matches!(&c.rule.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(2, 2, 2, 2))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
             })
             .map(|c| c.identity_key.clone())
             .expect("conflict for 2.2.2.2");
@@ -1034,10 +1034,14 @@ mod tests {
         assert_eq!(resolved.unresolved_conflicts(), 0, "all picks applied");
         for c in &resolved.conflicts {
             match &c.rule.address_match {
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(1, 1, 1, 1) => {
+                Some(CanonicalAddressMatch::ExactIp(a))
+                    if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)) =>
+                {
                     assert_eq!(c.resolved, ConflictSide::Service);
                 }
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(2, 2, 2, 2) => {
+                Some(CanonicalAddressMatch::ExactIp(a))
+                    if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)) =>
+                {
                     assert_eq!(c.resolved, ConflictSide::File);
                 }
                 other => panic!("unexpected conflict rule {other:?}"),
@@ -1049,7 +1053,7 @@ mod tests {
             .iter()
             .find(|r| {
                 matches!(&r.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(1, 1, 1, 1))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
             })
             .expect("merged 1.1.1.1");
         assert!(!r1.enabled, "service side (disabled) chosen for 1.1.1.1");
@@ -1057,7 +1061,7 @@ mod tests {
             .iter()
             .find(|r| {
                 matches!(&r.address_match,
-                Some(CanonicalAddressMatch::ExactIp(a)) if *a == Ipv4Addr::new(2, 2, 2, 2))
+                Some(CanonicalAddressMatch::ExactIp(a)) if *a == IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2)))
             })
             .expect("merged 2.2.2.2");
         assert_eq!(r2.comment, "file", "file side chosen for 2.2.2.2");

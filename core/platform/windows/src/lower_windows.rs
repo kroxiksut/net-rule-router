@@ -38,14 +38,14 @@
 //!   [`RouteIntent`](nrr_platform_api::enforcement::RouteIntent)s into
 //!   route-table entries (`route_codegen::generate_routes`).
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::enforcement::{
     AppScope, Coverage, DstMatch, EgressConstraint, EgressRef, EnforcementPlan, FlowRule, L4Proto,
     PrecedenceClass, Verdict,
 };
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
-use nrr_platform_api::wfp_slotting::{pack_v4, V4SlotChunk};
+use nrr_platform_api::wfp_slotting::{pack_both, pack_v4, FamilyChunk, V4SlotChunk};
 use nrr_shared::RouteRole;
 
 // Weight base bands, mirrored from the current `wfp_codegen` so the RELATIVE
@@ -148,7 +148,7 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
     // `wfp_slotting` so both pipelines produce identical chunk keys and the
     // behavioural oracle still compares like with like.
     let mut out = Vec::new();
-    let mut rules: Vec<(RuleChunkKey, Vec<Ipv4Addr>)> = Vec::new();
+    let mut rules: Vec<(RuleChunkKey, Vec<IpAddr>)> = Vec::new();
     for flow in &plan.flows {
         match rule_chunk_key(flow) {
             Some((key, ip)) => match rules.iter_mut().find(|(k, _)| *k == key) {
@@ -159,16 +159,23 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
         }
     }
     for (key, ips) in rules {
-        for (idx, chunk) in nrr_platform_api::wfp_slotting::pack_v4(ips)
-            .into_iter()
-            .enumerate()
-        {
+        for (idx, chunk) in pack_both(ips).into_iter().enumerate() {
             let weight = key.base
                 + key.rule_position * nrr_platform_api::enforcement::SLOTS_PER_RULE
                 + key.slot_base
                 + idx as u64;
+            let (ale, packet) = match chunk {
+                FamilyChunk::V4(_) => (
+                    WfpLayerKey::AleAuthConnectV4,
+                    WfpLayerKey::OutboundIpPacketV4,
+                ),
+                FamilyChunk::V6(_) => (
+                    WfpLayerKey::AleAuthConnectV6,
+                    WfpLayerKey::OutboundIpPacketV6,
+                ),
+            };
             out.push(make_chunk_filter(
-                WfpLayerKey::AleAuthConnectV4,
+                ale,
                 key.action,
                 &chunk,
                 weight,
@@ -178,7 +185,7 @@ pub fn lower_route_rules(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
             // layer too; that layer exposes no ALE user id.
             if key.action == WfpAction::Block && key.all_packets {
                 out.push(make_chunk_filter(
-                    WfpLayerKey::OutboundIpPacketV4,
+                    packet,
                     WfpAction::Block,
                     &chunk,
                     weight,
@@ -213,13 +220,15 @@ struct RuleChunkKey {
 
 /// `Some((key, ip))` for a plain per-address rule flow; `None` for anything
 /// that is not one (an app filter, the default catch-all, a non-rule class).
-fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, Ipv4Addr)> {
+fn rule_chunk_key(flow: &FlowRule) -> Option<(RuleChunkKey, IpAddr)> {
     let base = base_for_class(flow.precedence.class)?;
     if matches!(flow.app, AppScope::Program { .. }) {
         return None;
     }
-    let DstMatch::HostV4(ip) = flow.flow.dst else {
-        return None;
+    let ip = match flow.flow.dst {
+        DstMatch::HostV4(ip) => IpAddr::V4(ip),
+        DstMatch::HostV6(ip) => IpAddr::V6(ip),
+        _ => return None,
     };
     let action = match flow.verdict {
         Verdict::Permit => WfpAction::Permit,
@@ -314,19 +323,29 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
                         ));
                     }
                     // 4a — ALE egress-conditional pin (proto-agnostic): collect.
+                    // Either family: the chunk's own family picks the layer,
+                    // and a v6 pin over a tunnel that carries no v6 is a
+                    // permit that cannot match — which is the block the rule
+                    // asked for, stated once.
                     (
                         EgressConstraint::OnlyVia(EgressRef::Secondary),
                         Coverage::ConnectOnly,
                         DstMatch::HostV4(ip),
                         None,
-                    ) => ale_pins.push(ip, user_sid),
+                    ) => ale_pins.push(IpAddr::V4(ip), user_sid),
+                    (
+                        EgressConstraint::OnlyVia(EgressRef::Secondary),
+                        Coverage::ConnectOnly,
+                        DstMatch::HostV6(ip),
+                        None,
+                    ) => ale_pins.push(IpAddr::V6(ip), user_sid),
                     // 4b — packet-layer egress-conditional pin: collect per proto.
                     (
                         EgressConstraint::OnlyVia(EgressRef::Secondary),
                         Coverage::AllPackets,
                         DstMatch::HostV4(ip),
                         None,
-                    ) => packet_pins.push(proto, ip, None),
+                    ) => packet_pins.push(proto, IpAddr::V4(ip), None),
                     // 4b — a lone packet permit so an UN-selected protocol keeps flowing
                     // above the "Other" block-all (no egress condition, no block twin).
                     (EgressConstraint::Any, Coverage::AllPackets, DstMatch::HostV4(ip), None) => {
@@ -349,11 +368,17 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
                     }
                     // ALE destination block (narrowed to the ALE protocol): collect.
                     (Coverage::ConnectOnly, DstMatch::HostV4(ip), None) => {
-                        fc_ale.push(proto, ip, user_sid);
+                        fc_ale.push(proto, IpAddr::V4(ip), user_sid);
+                    }
+                    // Same group as its v4 twin: the codegen packs one address
+                    // set across both families, and a separate group here would
+                    // restart the chunk index and shift every v6 weight.
+                    (Coverage::ConnectOnly, DstMatch::HostV6(ip), None) => {
+                        fc_ale.push(proto, IpAddr::V6(ip), user_sid);
                     }
                     // packet destination block: collect per proto.
                     (Coverage::AllPackets, DstMatch::HostV4(ip), None) => {
-                        fc_packet.push(proto, ip, None);
+                        fc_packet.push(proto, IpAddr::V4(ip), None);
                     }
                     _ => {}
                 }
@@ -364,7 +389,7 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
 
     // Packed emission. Chunk index plays the destination index's old role in
     // the weight formulas; the packet window stays 16 wide per chunk.
-    for (idx, chunk) in pack_v4(ale_pins.ips.iter().copied()).iter().enumerate() {
+    for (idx, chunk) in pack_both(ale_pins.ips.iter().copied()).iter().enumerate() {
         let idx = idx as u64;
         out.push(ale_set_filter(
             WfpAction::Permit,
@@ -384,7 +409,7 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
         ));
     }
     for (k, (proto, ips)) in packet_pins.groups.iter().enumerate() {
-        for (idx, chunk) in pack_v4(ips.iter().copied()).iter().enumerate() {
+        for (idx, chunk) in pack_v4(only_v4(ips)).iter().enumerate() {
             let w = (idx as u64) * 16 + k as u64;
             out.push(packet_set_filter(
                 WfpAction::Permit,
@@ -406,7 +431,7 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
     // collapses TCP/UDP into a single `ale_protocol`), so the plain `+ idx`
     // weight — the codegen's exact formula — cannot collide across groups.
     for (proto, ips) in &fc_ale.groups {
-        for (idx, chunk) in pack_v4(ips.iter().copied()).iter().enumerate() {
+        for (idx, chunk) in pack_both(ips.iter().copied()).iter().enumerate() {
             out.push(ale_set_filter(
                 WfpAction::Block,
                 chunk,
@@ -418,7 +443,7 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
         }
     }
     for (k, (proto, ips)) in fc_packet.groups.iter().enumerate() {
-        for (idx, chunk) in pack_v4(ips.iter().copied()).iter().enumerate() {
+        for (idx, chunk) in pack_v4(only_v4(ips)).iter().enumerate() {
             out.push(packet_set_filter(
                 WfpAction::Block,
                 chunk,
@@ -431,16 +456,28 @@ pub fn lower_kill_switch(plan: &EnforcementPlan, secondary_luid: u64) -> Vec<Wfp
     out
 }
 
+/// The IPv4 half of a mixed collection. The below-ALE layers this build models
+/// are IPv4 only, so their collectors narrow here rather than pretending the
+/// other family never arrived.
+fn only_v4(ips: &[IpAddr]) -> Vec<Ipv4Addr> {
+    ips.iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 /// Destination collector for the packed ALE pin pair. The principal is
 /// identical across a per-SID plan's flows; the first one seen is kept.
 #[derive(Default)]
 struct SetCollect {
     user_sid: Option<String>,
-    ips: Vec<Ipv4Addr>,
+    ips: Vec<IpAddr>,
 }
 
 impl SetCollect {
-    fn push(&mut self, ip: Ipv4Addr, user_sid: Option<String>) {
+    fn push(&mut self, ip: IpAddr, user_sid: Option<String>) {
         if self.user_sid.is_none() {
             self.user_sid = user_sid;
         }
@@ -453,11 +490,11 @@ impl SetCollect {
 #[derive(Default)]
 struct ProtoSetCollect {
     user_sid: Option<String>,
-    groups: Vec<(Option<u8>, Vec<Ipv4Addr>)>,
+    groups: Vec<(Option<u8>, Vec<IpAddr>)>,
 }
 
 impl ProtoSetCollect {
-    fn push(&mut self, proto: Option<u8>, ip: Ipv4Addr, user_sid: Option<String>) {
+    fn push(&mut self, proto: Option<u8>, ip: IpAddr, user_sid: Option<String>) {
         if self.user_sid.is_none() {
             self.user_sid = user_sid;
         }
@@ -474,26 +511,29 @@ impl ProtoSetCollect {
 /// `ale_block` in their packed form.
 fn ale_set_filter(
     action: WfpAction,
-    chunk: &V4SlotChunk,
+    chunk: &FamilyChunk,
     proto: Option<u8>,
     weight: u64,
     user_sid: Option<String>,
     egress_luid: Option<u64>,
 ) -> WfpFilterSpec {
+    let layer = match chunk {
+        FamilyChunk::V4(_) => WfpLayerKey::AleAuthConnectV4,
+        FamilyChunk::V6(_) => WfpLayerKey::AleAuthConnectV6,
+    };
+    let (members_v4, members_v6) = match chunk {
+        FamilyChunk::V4(c) => (c.members.clone(), Vec::new()),
+        FamilyChunk::V6(c) => (Vec::new(), c.members.clone()),
+    };
     WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
+        layer,
         action,
         remote_ip: None,
-        remote_ip_set: chunk.members.clone(),
+        remote_ip_set: members_v4,
+        remote_ip_set_v6: members_v6,
         remote_port: None,
         weight,
-        id: derive_set_id(
-            user_sid.as_deref(),
-            WfpLayerKey::AleAuthConnectV4,
-            action,
-            &chunk.id_seg(),
-            weight,
-        ),
+        id: derive_set_id(user_sid.as_deref(), layer, action, &chunk.id_seg(), weight),
         user_sid,
         app_pattern: None,
         local_interface_luid: egress_luid,
@@ -519,6 +559,7 @@ fn packet_set_filter(
         action,
         remote_ip: None,
         remote_ip_set: chunk.members.clone(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: derive_set_id(None, layer, action, &chunk.id_seg(), weight),
@@ -621,6 +662,7 @@ fn doh_port_block(
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: scope.map(|c| c.members.clone()).unwrap_or_default(),
+        remote_ip_set_v6: Vec::new(),
         remote_port,
         weight,
         id,
@@ -657,6 +699,7 @@ fn ale_app_egress_permit(
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: derive_app_id(user_sid.as_deref(), WfpAction::Permit, pattern, weight),
@@ -677,6 +720,7 @@ fn ale_app_block(pattern: &str, weight: u64, user_sid: Option<String>) -> WfpFil
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: derive_app_id(user_sid.as_deref(), WfpAction::Block, pattern, weight),
@@ -729,6 +773,7 @@ fn packet_permit(ip: Ipv4Addr, weight: u64, proto: Option<u8>) -> WfpFilterSpec 
         action: WfpAction::Permit,
         remote_ip: Some(ip),
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: derive_filter_id(None, layer, WfpAction::Permit, ip, weight),
@@ -776,6 +821,7 @@ fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
             action: WfpAction::Block,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight,
             id: derive_catch_all_id(
@@ -807,6 +853,7 @@ fn lower_flow(flow: &FlowRule) -> Vec<WfpFilterSpec> {
                     action,
                     remote_ip: None,
                     remote_ip_set: Vec::new(),
+                    remote_ip_set_v6: Vec::new(),
                     remote_port: None,
                     weight,
                     id: derive_app_id(user_sid.as_deref(), action, &path.to_string_lossy(), weight),
@@ -933,6 +980,7 @@ pub fn lower_catch_all_kill_switch(
             action,
             remote_ip: df.remote_ip,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             // 4d — DNS-over-primary exemptions are port-scoped (remote 53).
             remote_port: flow.flow.dst_port,
             weight,
@@ -1119,6 +1167,7 @@ fn make_host_filter(
         action,
         remote_ip: Some(ip),
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id,
@@ -1137,16 +1186,21 @@ fn make_host_filter(
 fn make_chunk_filter(
     layer: WfpLayerKey,
     action: WfpAction,
-    chunk: &nrr_platform_api::wfp_slotting::V4SlotChunk,
+    chunk: &FamilyChunk,
     weight: u64,
     user_sid: Option<String>,
 ) -> WfpFilterSpec {
     let id = derive_catch_all_id(user_sid.as_deref(), layer, action, weight, &chunk.id_seg());
+    let (members_v4, members_v6) = match chunk {
+        FamilyChunk::V4(c) => (c.members.clone(), Vec::new()),
+        FamilyChunk::V6(c) => (Vec::new(), c.members.clone()),
+    };
     WfpFilterSpec {
         layer,
         action,
         remote_ip: None,
-        remote_ip_set: chunk.members.clone(),
+        remote_ip_set: members_v4,
+        remote_ip_set_v6: members_v6,
         remote_port: None,
         weight,
         id,
@@ -1304,6 +1358,7 @@ pub fn lower_fake_ip_pool(plan: &EnforcementPlan) -> Vec<WfpFilterSpec> {
             action,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight,
             id: derive_subnet_filter_id(user_sid.as_deref(), layer, action, weight),

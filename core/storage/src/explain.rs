@@ -23,7 +23,7 @@
 //! - `diagnostic_flags` bitfield (`DiagnosticFlags`) must never appear in
 //!   `Compact` output — only aggregated boolean signals are safe.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::SystemTime;
 
 use nrr_domain::decision_lookup::CacheEntryState;
@@ -63,10 +63,10 @@ pub enum DiagnosticRedactionLevel {
 /// - `cache_hit`, `freshness_label`, `source_label`, `has_errors`
 ///
 /// **Standard** (present when `level >= Standard`):
-/// - `selected_ip`, `is_multi_ip`, `has_conflict`, `ttl_seconds`
+/// - `selected_ip`, `is_multi_ip`, `ttl_seconds`
 ///
 /// **Diagnostics** (present when `level >= Diagnostics`):
-/// - `all_resolved_ips`, `reverse_hostnames`, `resolved_at`, `expires_at`
+/// - `all_resolved_ips`, `resolved_at`, `expires_at`
 #[derive(Clone, Debug)]
 pub struct LookupExplainSummary {
     // ── Compact tier (always populated) ──────────────────────────────────────
@@ -83,19 +83,15 @@ pub struct LookupExplainSummary {
 
     // ── Standard tier (populated when level >= Standard) ──────────────────
     /// The IPv4 address that was selected for `ExactIp` matching.
-    pub selected_ip: Option<Ipv4Addr>,
+    pub selected_ip: Option<IpAddr>,
     /// Whether multiple IPs map to the same hostname (ambiguity marker).
     pub is_multi_ip: bool,
-    /// Whether the observed IP was not found in the cached hostname IP set.
-    pub has_conflict: bool,
     /// TTL of the selected cache entry (seconds).
     pub ttl_seconds: Option<u32>,
 
     // ── Diagnostics tier (populated when level >= Diagnostics) ────────────
-    /// All resolved IPv4 addresses for the hostname.
-    pub all_resolved_ips: Option<Vec<Ipv4Addr>>,
-    /// Reverse-resolved hostnames for the observed IP.
-    pub reverse_hostnames: Option<Vec<String>>,
+    /// All resolved addresses for the hostname, either family.
+    pub all_resolved_ips: Option<Vec<IpAddr>>,
     /// When the selected entry was resolved.
     pub resolved_at: Option<SystemTime>,
     /// When the selected entry expires (absolute time).
@@ -134,10 +130,8 @@ pub fn build_explain_summary(
             has_errors,
             selected_ip: None,
             is_multi_ip: false,
-            has_conflict: false,
             ttl_seconds: None,
             all_resolved_ips: None,
-            reverse_hostnames: None,
             resolved_at: None,
             expires_at: None,
         };
@@ -146,7 +140,6 @@ pub fn build_explain_summary(
     // ── Standard ─────────────────────────────────────────────────────────────
     let selected_ip = best.map(|e| e.addr);
     let is_multi_ip = result.is_multi_ip;
-    let has_conflict = result.has_conflict;
     let ttl_seconds = best.and_then(|e| e.ttl_seconds);
 
     if level == DiagnosticRedactionLevel::Standard {
@@ -157,10 +150,8 @@ pub fn build_explain_summary(
             has_errors,
             selected_ip,
             is_multi_ip,
-            has_conflict,
             ttl_seconds,
             all_resolved_ips: None,
-            reverse_hostnames: None,
             resolved_at: None,
             expires_at: None,
         };
@@ -174,16 +165,8 @@ pub fn build_explain_summary(
         has_errors,
         selected_ip,
         is_multi_ip,
-        has_conflict,
         ttl_seconds,
         all_resolved_ips: Some(result.resolved_ips.iter().map(|e| e.addr).collect()),
-        reverse_hostnames: Some(
-            result
-                .reverse_hostnames
-                .iter()
-                .map(|h| h.hostname.clone())
-                .collect(),
-        ),
         resolved_at: best.and_then(|e| e.resolved_at),
         expires_at: best.and_then(|e| e.expires_at),
     }
@@ -352,7 +335,7 @@ mod tests {
 
     use nrr_domain::decision_lookup::{CacheEntryState, LookupError};
 
-    use crate::dto::{CacheLookupResult, CachedHostnameEntry, CachedIpEntry};
+    use crate::dto::{CacheLookupResult, CachedIpEntry};
     use crate::resolution_source::StorageResolutionSource;
 
     fn fresh_result(ip: Ipv4Addr) -> CacheLookupResult {
@@ -360,7 +343,7 @@ mod tests {
         let expires = now + Duration::from_secs(300);
         CacheLookupResult {
             resolved_ips: vec![CachedIpEntry {
-                addr: ip,
+                addr: IpAddr::V4(ip),
                 cache_state: CacheEntryState::Fresh,
                 source: StorageResolutionSource::Dns,
                 resolved_at: Some(now),
@@ -368,11 +351,9 @@ mod tests {
                 expires_at: Some(expires),
                 active_revision_id: None,
             }],
-            reverse_hostnames: Vec::new(),
             overall_freshness: Some(CacheEntryState::Fresh),
             best_source: Some(StorageResolutionSource::Dns),
             is_multi_ip: false,
-            has_conflict: false,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
@@ -381,20 +362,12 @@ mod tests {
     fn missing_result() -> CacheLookupResult {
         CacheLookupResult {
             resolved_ips: Vec::new(),
-            reverse_hostnames: Vec::new(),
             overall_freshness: None,
             best_source: None,
             is_multi_ip: false,
-            has_conflict: false,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
-    }
-
-    fn conflict_result(cached_ip: Ipv4Addr) -> CacheLookupResult {
-        let mut r = fresh_result(cached_ip);
-        r.has_conflict = true;
-        r
     }
 
     fn multi_ip_result() -> CacheLookupResult {
@@ -402,7 +375,7 @@ mod tests {
         CacheLookupResult {
             resolved_ips: vec![
                 CachedIpEntry {
-                    addr: Ipv4Addr::new(1, 1, 1, 1),
+                    addr: IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
                     cache_state: CacheEntryState::Fresh,
                     source: StorageResolutionSource::Dns,
                     resolved_at: Some(now),
@@ -411,7 +384,7 @@ mod tests {
                     active_revision_id: None,
                 },
                 CachedIpEntry {
-                    addr: Ipv4Addr::new(1, 0, 0, 1),
+                    addr: IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
                     cache_state: CacheEntryState::Fresh,
                     source: StorageResolutionSource::Dns,
                     resolved_at: Some(now),
@@ -420,11 +393,9 @@ mod tests {
                     active_revision_id: None,
                 },
             ],
-            reverse_hostnames: Vec::new(),
             overall_freshness: Some(CacheEntryState::Fresh),
             best_source: Some(StorageResolutionSource::Dns),
             is_multi_ip: true,
-            has_conflict: false,
             errors: Vec::new(),
             negative_cache_expires_at: None,
         }
@@ -469,11 +440,9 @@ mod tests {
             "IP must be hidden in Compact mode"
         );
         assert!(summary.all_resolved_ips.is_none());
-        assert!(summary.reverse_hostnames.is_none());
         assert!(summary.resolved_at.is_none());
         assert!(summary.expires_at.is_none());
         assert!(!summary.is_multi_ip, "multi_ip flag hidden in Compact mode");
-        assert!(!summary.has_conflict);
     }
 
     #[test]
@@ -501,15 +470,11 @@ mod tests {
         let result = fresh_result(ip);
         let summary = build_explain_summary(&result, DiagnosticRedactionLevel::Standard);
 
-        assert_eq!(summary.selected_ip, Some(ip));
+        assert_eq!(summary.selected_ip, Some(IpAddr::V4(ip)));
     }
 
     #[test]
-    fn standard_reveals_conflict_and_multi_ip_flags() {
-        let result = conflict_result(Ipv4Addr::new(5, 6, 7, 8));
-        let summary = build_explain_summary(&result, DiagnosticRedactionLevel::Standard);
-        assert!(summary.has_conflict);
-
+    fn standard_reveals_the_multi_ip_flag() {
         let multi = multi_ip_result();
         let ms = build_explain_summary(&multi, DiagnosticRedactionLevel::Standard);
         assert!(ms.is_multi_ip);
@@ -546,8 +511,8 @@ mod tests {
             .all_resolved_ips
             .expect("all_resolved_ips must be Some at Diagnostics");
         assert_eq!(ips.len(), 2);
-        assert!(ips.contains(&Ipv4Addr::new(1, 1, 1, 1)));
-        assert!(ips.contains(&Ipv4Addr::new(1, 0, 0, 1)));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(ips.contains(&IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1))));
     }
 
     #[test]
@@ -558,22 +523,6 @@ mod tests {
 
         assert!(summary.resolved_at.is_some());
         assert!(summary.expires_at.is_some());
-    }
-
-    #[test]
-    fn diagnostics_reveals_reverse_hostnames() {
-        let ip = Ipv4Addr::new(9, 9, 9, 9);
-        let mut result = fresh_result(ip);
-        result.reverse_hostnames = vec![CachedHostnameEntry {
-            hostname: "dns.quad9.net".to_string(),
-            cache_state: CacheEntryState::Fresh,
-        }];
-        let summary = build_explain_summary(&result, DiagnosticRedactionLevel::Diagnostics);
-
-        let hosts = summary
-            .reverse_hostnames
-            .expect("reverse hostnames at Diagnostics");
-        assert_eq!(hosts, ["dns.quad9.net"]);
     }
 
     // ── RetentionKnobs ───────────────────────────────────────────────────────

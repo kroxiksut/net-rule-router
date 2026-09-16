@@ -294,7 +294,9 @@ fn rule_dto_to_row(dto: &nrr_shared::rules_json::RuleDto, route: &str) -> RuleRo
                 ("domain".to_string(), format!("*.{suffix}"))
             }
             AddressMatchDto::Zone { name } => ("zone".to_string(), name.clone()),
-            AddressMatchDto::ExactIpv4 { address } => ("exact-ip".to_string(), address.clone()),
+            AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
+                ("exact-ip".to_string(), address.clone())
+            }
         }
     } else if let Some(app) = &dto.app_match {
         let value = match &app.pattern {
@@ -443,7 +445,7 @@ impl ProductionRoutePolicySource {
                 DohTarget::Ip(ip) => ips.push(ip),
                 DohTarget::Host(host) => {
                     if let Some(cache) = self.fqdn_cache.as_ref() {
-                        ips.extend(cache.ips_for_hostname(&host));
+                        ips.extend(crate::dns_wire::only_v4(&cache.ips_for_hostname(&host)));
                     }
                 }
             }
@@ -502,7 +504,6 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             primary_probe_timeout_ms: record.primary_probe_timeout_ms,
             primary_probe_max_targets: record.primary_probe_max_targets,
             primary_probe_repeat_secs: record.primary_probe_repeat_secs,
-            block_ipv6_when_protected: record.block_ipv6_when_protected,
             local_networks_auto_accept: record.local_networks_auto_accept,
             zone_priority_over_ip: record.zone_priority_over_ip,
         })
@@ -695,7 +696,6 @@ impl RoutePolicyWriter for ProductionRoutePolicyWriter {
             primary_probe_timeout_ms: request.primary_probe_timeout_ms,
             primary_probe_max_targets: request.primary_probe_max_targets,
             primary_probe_repeat_secs: request.primary_probe_repeat_secs,
-            block_ipv6_when_protected: request.block_ipv6_when_protected,
             local_networks_auto_accept: request.local_networks_auto_accept,
             zone_priority_over_ip: request.zone_priority_over_ip,
             binding_source: dto_source_to_storage(request.binding_source),
@@ -867,7 +867,6 @@ fn record_to_dto(
         primary_probe_timeout_ms: rec.primary_probe_timeout_ms,
         primary_probe_max_targets: rec.primary_probe_max_targets,
         primary_probe_repeat_secs: rec.primary_probe_repeat_secs,
-        block_ipv6_when_protected: rec.block_ipv6_when_protected,
         local_networks_auto_accept: rec.local_networks_auto_accept,
         zone_priority_over_ip: rec.zone_priority_over_ip,
         binding_source: storage_source_to_dto(rec.binding_source),
@@ -875,10 +874,16 @@ fn record_to_dto(
 }
 
 fn record_binding_to_dto(rec: RouteBindingRecord) -> RouteBindingDto {
+    let known_stable_ids = rec
+        .known_stable_ids
+        .into_iter()
+        .filter(|id| !id.eq_ignore_ascii_case(&rec.stable_id))
+        .collect();
     RouteBindingDto {
         stable_id: rec.stable_id,
         display_name: rec.display_name,
         user_confirmed: rec.user_confirmed,
+        known_stable_ids,
     }
 }
 
@@ -887,9 +892,7 @@ fn dto_binding_to_record(b: &RouteBindingDto) -> RouteBindingRecord {
         stable_id: b.stable_id.clone(),
         display_name: b.display_name.clone(),
         user_confirmed: b.user_confirmed,
-        // Ignored on write — `update_for_sid` derives known_stable_ids from the
-        // DB (carry forward / reset) rather than trusting the GUI, which does
-        // not track healed adapter identities.
+        // Ignored on write: the DB owns the healed-id history.
         known_stable_ids: Vec::new(),
     }
 }
@@ -1470,746 +1473,44 @@ fn adapter_to_entry(
 }
 
 #[cfg(test)]
-mod adapters_snapshot_tests {
-    use super::*;
-    use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
-    use nrr_platform_api::route_table::RouteTablePort;
-    use nrr_platform_api::windows_api::MockWindowsApi;
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn empty_adapter_list_yields_empty_wire_response() {
-        let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
-        let resp = provider.adapters_snapshot(false);
-        assert!(resp.adapters.is_empty());
-        // The spelling used to be hardcoded `windows-live`, which is also what
-        // this assertion pinned. Which of the two the enumeration reaches is a
-        // property of the HOST (a Windows box with adapters answers live, a
-        // Linux one answers with the placeholder), so the assertion below is
-        // the honesty invariant instead: the label has to be one the contract
-        // defines, and it must round-trip.
-        let source = nrr_platform_api::InterfacesDataSource::from_title(&resp.data_source);
-        assert_eq!(source.title(), resp.data_source);
-    }
-
-    /// The placeholder dataset must never be announced as a live enumeration:
-    /// four invented adapters presented as this machine's own are what a user
-    /// binds a route to (§36.15.1).
-    #[test]
-    fn placeholder_rows_are_never_announced_as_live() {
-        let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
-        let resp = provider.adapters_snapshot(false);
-        let placeholder_shipped = resp
-            .rows
-            .iter()
-            .any(|row| row.adapter_name.starts_with("{FAKE-"));
-        if placeholder_shipped {
-            assert_eq!(
-                resp.data_source,
-                nrr_platform_api::InterfacesDataSource::FallbackMock.title(),
-                "placeholder rows announced as a live enumeration",
-            );
-        }
-    }
-
-    #[test]
-    fn projection_carries_mac_and_index() {
-        use nrr_platform_api::adapters::AdapterInfo;
-        let api = Arc::new(MockWindowsApi::new());
-        api.set_adapter_infos(vec![AdapterInfo {
-            index: 17,
-            adapter_name: "{ABCD-EFGH}".into(),
-            description: "Test Wi-Fi".into(),
-            friendly_name: "Wi-Fi".into(),
-            mac: Some([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01]),
-            interface_type: InterfaceType::Wireless,
-            oper_status: IfOperStatus::Up,
-            ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 5)],
-            gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
-        }]);
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
-        let resp = provider.adapters_snapshot(false);
-        assert_eq!(resp.adapters.len(), 1);
-        let entry = &resp.adapters[0];
-        assert_eq!(entry.ipv6_if_index, 17);
-        assert_eq!(entry.physical_address.as_deref(), Some("DE:AD:BE:EF:00:01"));
-        assert_eq!(entry.persistent_id, "de:ad:be:ef:00:01");
-        assert_eq!(entry.interface_description, "Test Wi-Fi");
-    }
-
-    // ── AdapterAddressRecorder wiring ─────────────────────────────────────────
-
-    struct FakeAddressRecorder {
-        calls: Mutex<Vec<(String, String, String)>>,
-        /// What the STORE holds: `adapter_key -> (local_ip, external_ip)`.
-        /// Separate from `calls` because the guard reads the persisted pair,
-        /// not the calls made to it.
-        stored: Mutex<std::collections::HashMap<String, (String, Option<String>)>>,
-        forgotten: Mutex<Vec<String>>,
-    }
-
-    impl FakeAddressRecorder {
-        fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                stored: Mutex::new(std::collections::HashMap::new()),
-                forgotten: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl AdapterAddressRecorder for FakeAddressRecorder {
-        fn record(&self, adapter_key: &str, local_ip: &str, external_ip: &str, _ms: i64) {
-            self.calls.lock().expect("lock").push((
-                adapter_key.to_string(),
-                local_ip.to_string(),
-                external_ip.to_string(),
-            ));
-        }
-
-        fn remembered_local_ip(&self, adapter_key: &str) -> Option<String> {
-            let stored = self.stored.lock().expect("lock");
-            stored.get(adapter_key).map(|pair| pair.0.clone())
-        }
-
-        fn forget_external(&self, adapter_key: &str, local_ip: &str, _ms: i64) {
-            self.forgotten
-                .lock()
-                .expect("lock")
-                .push(adapter_key.to_string());
-            self.stored
-                .lock()
-                .expect("lock")
-                .insert(adapter_key.to_string(), (local_ip.to_string(), None));
-        }
-    }
-
-    /// A fresh probe result on the Ethernet row. The placeholder dataset no
-    /// longer ships one — it never ran a probe, and pretending otherwise is what
-    /// made the adapter panel print an invented address — so the test states the
-    /// precondition it is actually about.
-    fn rows_with_fresh_ethernet_probe() -> Vec<nrr_platform_api::interface_rows::InterfaceRouteRow>
-    {
-        let mut rows = nrr_platform_api::interface_rows::fallback_rows();
-        for row in &mut rows {
-            if row.windows_name == "Ethernet" {
-                nrr_platform_api::interface_rows::apply_external_probe(
-                    &mut row.observed_facts,
-                    nrr_platform_api::ExternalIpProbeOutcome::Resolved(std::net::Ipv4Addr::new(
-                        203, 0, 113, 10,
-                    )),
-                );
-            }
-        }
-        rows
-    }
-
-    #[test]
-    fn fold_cached_external_persists_fresh_resolution_keyed_by_windows_name() {
-        // The Ethernet entry's `adapter_name` ("{FAKE-ETHERNET-ADAPTER}", a
-        // GUID) is deliberately distinct from `windows_name` ("Ethernet") —
-        // proves the join key used is `windows_name`, matching the traffic
-        // ledger's `Alias`-derived key, not the low-level identity GUID.
-        let api = Arc::new(MockWindowsApi::new());
-        let recorder = Arc::new(FakeAddressRecorder::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
-            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
-
-        let mut rows = rows_with_fresh_ethernet_probe();
-        provider.fold_cached_external(&mut rows);
-
-        let calls = recorder.calls.lock().expect("lock");
-        assert_eq!(
-            calls.len(),
-            1,
-            "only the Ethernet row carries a fresh probe result"
-        );
-        assert_eq!(
-            calls[0],
-            (
-                "Ethernet".to_string(),
-                "192.168.1.20".to_string(),
-                "203.0.113.10".to_string(),
-            )
-        );
-    }
-
-    /// The stored pair belongs to whatever adapter answered to this NAME last
-    /// time. A rename — or a reinstall that took the name back — leaves the
-    /// previous adapter's external address under it, and the traffic screen
-    /// prints that pair verbatim, with no freshness or identity check of its
-    /// own. So the moment a snapshot sees a different local address under a
-    /// remembered name, the external half has to go.
-    ///
-    /// Compared against the STORE, not against the in-process cache: after a
-    /// service restart that cache is empty, and "restarted, and the adapter was
-    /// renamed meanwhile" is the likeliest way into this state.
-    #[test]
-    fn a_remembered_address_under_a_reused_name_is_forgotten_not_shown() {
-        let api = Arc::new(MockWindowsApi::new());
-        let recorder = Arc::new(FakeAddressRecorder::new());
-        // Someone else's pair is already on disk under "Ethernet".
-        recorder.stored.lock().expect("lock").insert(
-            "Ethernet".to_string(),
-            ("10.9.9.9".to_string(), Some("198.51.100.200".to_string())),
-        );
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
-            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
-
-        // A snapshot with NO fresh probe — the common one, and the only kind
-        // that reads the stored pair instead of overwriting it.
-        let mut rows = rows_with_fresh_ethernet_probe();
-        for row in &mut rows {
-            row.observed_facts.external_ip = None;
-        }
-        provider.fold_cached_external(&mut rows);
-
-        assert_eq!(
-            recorder.forgotten.lock().expect("lock").as_slice(),
-            ["Ethernet".to_string()],
-            "the stale external address must be dropped"
-        );
-
-        // Positive control: the same fold with a MATCHING stored local address
-        // forgets nothing — the guard must not throw away a legitimate memory.
-        let recorder = Arc::new(FakeAddressRecorder::new());
-        recorder.stored.lock().expect("lock").insert(
-            "Ethernet".to_string(),
-            ("192.168.1.20".to_string(), Some("203.0.113.10".to_string())),
-        );
-        let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
-            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
-        let mut rows = rows_with_fresh_ethernet_probe();
-        for row in &mut rows {
-            row.observed_facts.external_ip = None;
-        }
-        provider.fold_cached_external(&mut rows);
-        assert!(recorder.forgotten.lock().expect("lock").is_empty());
-    }
-
-    #[test]
-    fn fold_cached_external_does_not_persist_a_replayed_address() {
-        // Second call: nothing in the fresh set has changed, so
-        // `apply_external_ip_probes` was never re-run — simulate that by
-        // clearing `external_ip` on a copy and folding again. The replay
-        // path (carry-forward from `last_external`) must NOT call the
-        // recorder — only a genuinely fresh resolution does.
-        let api = Arc::new(MockWindowsApi::new());
-        let recorder = Arc::new(FakeAddressRecorder::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>)
-            .with_address_recorder(Arc::clone(&recorder) as Arc<dyn AdapterAddressRecorder>);
-
-        let mut first = rows_with_fresh_ethernet_probe();
-        provider.fold_cached_external(&mut first);
-        assert_eq!(recorder.calls.lock().expect("lock").len(), 1);
-
-        let mut second = rows_with_fresh_ethernet_probe();
-        for row in &mut second {
-            row.observed_facts.external_ip = None;
-        }
-        provider.fold_cached_external(&mut second);
-        assert_eq!(
-            recorder.calls.lock().expect("lock").len(),
-            1,
-            "a replayed (cached) address must not be persisted again"
-        );
-    }
-
-    #[test]
-    fn without_a_recorder_fold_cached_external_is_a_noop_for_persistence() {
-        let api = Arc::new(MockWindowsApi::new());
-        let provider = MonitoredAdaptersSnapshotProvider::new(api as Arc<dyn RouteTablePort>);
-        let mut rows = nrr_platform_api::interface_rows::fallback_rows();
-        // Must not panic without a recorder wired.
-        provider.fold_cached_external(&mut rows);
-    }
-}
+mod adapters_snapshot_tests;
 
 // ── hosts-override annotation tests ───────────────────────────────────────────
 
 #[cfg(test)]
-mod hosts_override_tests {
-    use super::*;
-    use nrr_platform_api::hosts_file::HostsPin;
-    use std::collections::HashMap;
-    use std::net::Ipv4Addr;
-
-    fn row(rule_type: &str, match_value: &str) -> RuleRowEntry {
-        RuleRowEntry {
-            id: "R-1".into(),
-            rule_type: rule_type.into(),
-            match_value: match_value.into(),
-            target_route: "primary".into(),
-            comment: None,
-            enabled: true,
-            validation_status: "ok".into(),
-            validation_message_key: None,
-            main_route: None,
-            hosts_override: None,
-            origin: None,
-            pinned_destinations: None,
-            pinned_destinations_total: None,
-        }
-    }
-
-    fn resp(rows: Vec<RuleRowEntry>) -> RulesListResponse {
-        RulesListResponse {
-            rows,
-            supported_rule_types: rule_type_slugs(),
-            active_revision_id: Some("rev-1".into()),
-        }
-    }
-
-    fn hosts_map() -> HashMap<String, HostsPin> {
-        let mut m = HashMap::new();
-        m.insert(
-            "ads.example.com".into(),
-            HostsPin {
-                ip: Ipv4Addr::LOCALHOST,
-                blocking: true,
-            },
-        );
-        m.insert(
-            "mirror.example.com".into(),
-            HostsPin {
-                ip: Ipv4Addr::new(203, 0, 113, 7),
-                blocking: false,
-            },
-        );
-        m
-    }
-
-    #[test]
-    fn blocking_entry_annotates_domain_row() {
-        let mut r = resp(vec![row("domain", "ads.example.com")]);
-        annotate_hosts_overrides(&mut r, &hosts_map());
-        let ov = r.rows[0].hosts_override.as_ref().expect("annotated");
-        assert!(ov.blocking);
-        assert_eq!(ov.ip, "127.0.0.1");
-    }
-
-    #[test]
-    fn redirect_entry_carries_real_ip() {
-        let mut r = resp(vec![row("domain", "mirror.example.com")]);
-        annotate_hosts_overrides(&mut r, &hosts_map());
-        let ov = r.rows[0].hosts_override.as_ref().expect("annotated");
-        assert!(!ov.blocking);
-        assert_eq!(ov.ip, "203.0.113.7");
-    }
-
-    #[test]
-    fn matching_is_case_insensitive_and_dot_tolerant() {
-        let mut r = resp(vec![row("domain", "ADS.Example.COM.")]);
-        annotate_hosts_overrides(&mut r, &hosts_map());
-        assert!(r.rows[0].hosts_override.is_some());
-    }
-
-    #[test]
-    fn non_matching_and_non_domain_rows_are_untouched() {
-        let mut r = resp(vec![
-            row("domain", "not-in-hosts.example.com"), // no hosts entry
-            row("domain", "*.example.com"),            // suffix wildcard — skipped
-            row("zone", "ads.example.com"),            // zone type — skipped
-            row("exact-ip", "127.0.0.1"),              // IP rule — skipped
-            row("application", "browser.exe"),         // app rule — skipped
-        ]);
-        annotate_hosts_overrides(&mut r, &hosts_map());
-        for row in &r.rows {
-            assert!(
-                row.hosts_override.is_none(),
-                "row {} annotated",
-                row.match_value
-            );
-        }
-    }
-
-    #[test]
-    fn empty_hosts_map_is_a_noop() {
-        let mut r = resp(vec![row("domain", "ads.example.com")]);
-        annotate_hosts_overrides(&mut r, &HashMap::new());
-        assert!(r.rows[0].hosts_override.is_none());
-    }
-
-    #[test]
-    fn provider_annotate_uses_injected_reader() {
-        use nrr_platform_api::hosts_file::StaticHostsFileReader;
-        let reader = Arc::new(StaticHostsFileReader::from_pairs([(
-            "ads.example.com",
-            Ipv4Addr::LOCALHOST,
-        )]));
-        // The DB connection is never touched by `annotate`, so a throwaway
-        // in-memory connection is fine for exercising the reader path.
-        let conn = Arc::new(Mutex::new(
-            rusqlite::Connection::open_in_memory().expect("open in-memory"),
-        ));
-        let provider = ProductionRulesSnapshotProvider::with_hosts_reader(conn, reader);
-        let mut r = resp(vec![row("domain", "ads.example.com")]);
-        provider.annotate(&mut r, "");
-        assert!(
-            r.rows[0]
-                .hosts_override
-                .as_ref()
-                .expect("annotated")
-                .blocking
-        );
-    }
-}
+mod hosts_override_tests;
 
 // ── ProductionFailClosedProbe tests ───────────────────────────────────────────
 
 #[cfg(test)]
-mod fail_closed_probe_tests {
+mod fail_closed_probe_tests;
+
+#[cfg(test)]
+mod route_binding_dto_tests {
     use super::*;
-    use crate::ipc_handlers::payloads::AdapterEntry;
-    use crate::ipc_handlers::providers::FailClosedStateProbe;
-    use nrr_storage::migration::{open_connection, SqliteMigrationRunner};
-    use nrr_storage::repository::MigrationRunner;
-    use nrr_storage::route_bindings::{
-        BehaviorMode, BindingSource, RouteBindingRecord, RoutePolicyRecord,
-    };
 
-    const TEST_SID: &str = "S-1-5-21-test";
-    const SECONDARY_ID: &str = "vpn-adapter-stable-id";
-
-    fn open_state_db() -> (tempfile::TempDir, Arc<Mutex<Connection>>) {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("state.db");
-        let conn = open_connection(&path).expect("open");
-        let runner = SqliteMigrationRunner::for_state_db(conn);
-        runner.run_pending_migrations().expect("migrate");
-        let conn = runner.into_connection();
-        (dir, Arc::new(Mutex::new(conn)))
-    }
-
-    fn seed_policy(
-        conn: &Arc<Mutex<Connection>>,
-        mode: BehaviorMode,
-        block_when_unavailable: bool,
-    ) {
-        // Default posture is fail-closed (block) — the common case.
-        seed_policy_posture(conn, mode, block_when_unavailable, true);
-    }
-
-    fn seed_policy_posture(
-        conn: &Arc<Mutex<Connection>>,
-        mode: BehaviorMode,
-        block_when_unavailable: bool,
-        kill_switch_fail_closed: bool,
-    ) {
-        let guard = conn.lock().unwrap();
-        let repo = RouteBindingsRepository::new(&guard);
-        repo.update_for_sid(
-            TEST_SID,
-            &RoutePolicyRecord {
-                primary: Some(RouteBindingRecord {
-                    stable_id: "primary-id".into(),
-                    display_name: "Primary".into(),
-                    user_confirmed: true,
-                    known_stable_ids: vec![],
-                }),
-                secondary: Some(RouteBindingRecord {
-                    stable_id: SECONDARY_ID.into(),
-                    display_name: "Secondary VPN".into(),
-                    user_confirmed: true,
-                    known_stable_ids: vec![],
-                }),
-                mode,
-                block_secondary_when_unavailable: block_when_unavailable,
-                kill_switch_fail_closed,
-                kill_switch_protocols: 0x7F,
-                kill_switch_block_all: false,
-                // This fixture drives fail-closed behaviour tests; keep
-                // the master toggle ON so the armed path is exercised.
-                kill_switch_enabled: true,
-                allow_dns_over_primary: false,
-                include_subdomains: false,
-                shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-                mode_a_coverage_strategy:
-                    nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
-                resolve_hosts_bypass: true,
-                doh_lockdown_enabled: false,
-                doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
-                browser_history_auto_seed: false,
-                kill_switch_strict_shared_ips: false,
-                auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
-                auto_rules_eager_delivery_names: false,
-                primary_probe_auto: false,
-                primary_probe_timeout_ms: 1500,
-                primary_probe_max_targets: 8,
-                primary_probe_repeat_secs: 300,
-                block_ipv6_when_protected: true,
-                local_networks_auto_accept: false,
-                zone_priority_over_ip: false,
-                binding_source: BindingSource::UserAssigned,
-            },
-            100,
-        )
-        .expect("update_for_sid");
-    }
-
-    fn adapter(id: &str, oper_status: &str) -> AdapterEntry {
-        AdapterEntry {
-            persistent_id: id.into(),
-            adapter_name: id.into(),
-            ipv6_if_index: 0,
-            physical_address: None,
-            windows_name: id.into(),
-            interface_description: String::new(),
-            interface_type: "Ethernet".into(),
-            oper_status: oper_status.into(),
-        }
+    #[test]
+    fn the_snapshot_names_the_ids_a_binding_was_healed_from_but_not_its_current_one() {
+        let dto = record_binding_to_dto(RouteBindingRecord {
+            stable_id: "win-adapter:{new}".into(),
+            display_name: "Tunnel".into(),
+            user_confirmed: true,
+            known_stable_ids: vec!["WIN-ADAPTER:{NEW}".into(), "win-adapter:{old}".into()],
+        });
+        assert_eq!(dto.known_stable_ids, vec!["win-adapter:{old}".to_string()]);
     }
 
     #[test]
-    fn empty_sid_returns_none() {
-        let (_d, conn) = open_state_db();
-        let probe = ProductionFailClosedProbe::new(conn);
-        assert!(probe.probe("", &[]).is_none());
-    }
-
-    #[test]
-    fn no_secondary_bound_returns_inactive_state() {
-        let (_d, conn) = open_state_db();
-        // Caller has never sent a RoutePolicyUpdate — load_for_sid
-        // returns the empty record (no secondary, PreferPrimary mode).
-        let probe = ProductionFailClosedProbe::new(conn);
-        let state = probe.probe(TEST_SID, &[]).expect("Some");
-        assert!(!state.fail_closed_active);
-    }
-
-    #[test]
-    fn secondary_offline_with_block_policy_on_yields_active() {
-        let (_d, conn) = open_state_db();
-        seed_policy(&conn, BehaviorMode::PreferPrimary, true);
-        let probe = ProductionFailClosedProbe::new(conn);
-        // Secondary adapter listed as Down → offline + block ON.
-        let adapters = vec![adapter("primary-id", "Up"), adapter(SECONDARY_ID, "Down")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(state.fail_closed_active);
-    }
-
-    #[test]
-    fn secondary_up_with_block_policy_on_yields_inactive() {
-        let (_d, conn) = open_state_db();
-        seed_policy(&conn, BehaviorMode::PreferPrimary, true);
-        let probe = ProductionFailClosedProbe::new(conn);
-        let adapters = vec![adapter(SECONDARY_ID, "Up")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(!state.fail_closed_active);
-    }
-
-    #[test]
-    fn secondary_offline_with_block_toggle_off_still_yields_active() {
-        // A bound secondary arms the leak-guard on
-        // its own, so the opt-in `block_secondary_when_unavailable` toggle no
-        // longer disables protection. An offline secondary with the default
-        // fail-closed posture is therefore ACTIVE even with the toggle off.
-        // The user's opt-out is the fail-OPEN posture, below.
-        let (_d, conn) = open_state_db();
-        seed_policy(&conn, BehaviorMode::PreferPrimary, false);
-        let probe = ProductionFailClosedProbe::new(conn);
-        let adapters = vec![adapter(SECONDARY_ID, "Down")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(state.fail_closed_active);
-    }
-
-    #[test]
-    fn secondary_offline_with_fail_open_posture_yields_inactive() {
-        // The way to let traffic ride the primary
-        // when the secondary drops is the fail-OPEN posture
-        // (kill_switch_fail_closed = false), NOT unticking the block toggle.
-        let (_d, conn) = open_state_db();
-        seed_policy_posture(&conn, BehaviorMode::PreferPrimary, false, false);
-        let probe = ProductionFailClosedProbe::new(conn);
-        let adapters = vec![adapter(SECONDARY_ID, "Down")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(!state.fail_closed_active);
-    }
-
-    #[test]
-    fn strict_secondary_fail_closed_mode_triggers_without_explicit_block_flag() {
-        let (_d, conn) = open_state_db();
-        // StrictSecondaryFailClosed mode counts as block-when-unavailable
-        // regardless of the explicit flag.
-        seed_policy(&conn, BehaviorMode::StrictSecondaryFailClosed, false);
-        let probe = ProductionFailClosedProbe::new(conn);
-        let adapters = vec![adapter(SECONDARY_ID, "Down")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(state.fail_closed_active);
-    }
-
-    #[test]
-    fn missing_secondary_adapter_in_snapshot_counts_as_offline() {
-        let (_d, conn) = open_state_db();
-        seed_policy(&conn, BehaviorMode::PreferPrimary, true);
-        let probe = ProductionFailClosedProbe::new(conn);
-        // Secondary stable_id NOT in the adapter list at all (e.g.
-        // device unplugged) — must be treated as offline.
-        let adapters = vec![adapter("primary-id", "Up")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(state.fail_closed_active);
-    }
-
-    // ── Regression: persistent-id scheme mismatch (GUID/MAC bindings) ──────
-
-    const GUID_SECONDARY: &str = "{12AB34CD-0000-0000-0000-000000000001}";
-    const MAC_SECONDARY: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-
-    fn seed_policy_with_secondary_stable_id(
-        conn: &Arc<Mutex<Connection>>,
-        secondary_stable_id: &str,
-    ) {
-        let guard = conn.lock().unwrap();
-        let repo = RouteBindingsRepository::new(&guard);
-        repo.update_for_sid(
-            TEST_SID,
-            &RoutePolicyRecord {
-                primary: Some(RouteBindingRecord {
-                    stable_id: "primary-id".into(),
-                    display_name: "Primary".into(),
-                    user_confirmed: true,
-                    known_stable_ids: vec![],
-                }),
-                secondary: Some(RouteBindingRecord {
-                    stable_id: secondary_stable_id.into(),
-                    display_name: "Secondary VPN".into(),
-                    user_confirmed: true,
-                    known_stable_ids: vec![],
-                }),
-                mode: BehaviorMode::PreferPrimary,
-                block_secondary_when_unavailable: true,
-                kill_switch_fail_closed: true,
-                kill_switch_protocols: 0x7F,
-                kill_switch_block_all: false,
-                kill_switch_enabled: true,
-                allow_dns_over_primary: false,
-                include_subdomains: false,
-                shared_ip_policy: nrr_domain::shared_ip::SharedIpPolicy::default(),
-                mode_a_coverage_strategy:
-                    nrr_domain::mode_a_coverage::ModeACoverageStrategy::default(),
-                resolve_hosts_bypass: true,
-                doh_lockdown_enabled: false,
-                doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
-                browser_history_auto_seed: false,
-                kill_switch_strict_shared_ips: false,
-                auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
-                auto_rules_eager_delivery_names: false,
-                primary_probe_auto: false,
-                primary_probe_timeout_ms: 1500,
-                primary_probe_max_targets: 8,
-                primary_probe_repeat_secs: 300,
-                block_ipv6_when_protected: true,
-                local_networks_auto_accept: false,
-                zone_priority_over_ip: false,
-                binding_source: BindingSource::UserAssigned,
-            },
-            100,
-        )
-        .expect("update_for_sid");
-    }
-
-    /// Wire `AdapterEntry` as `adapter_to_entry` would produce it for a live
-    /// adapter identified only by its GUID (no MAC).
-    fn guid_adapter_entry(oper_status: &str) -> AdapterEntry {
-        AdapterEntry {
-            persistent_id: GUID_SECONDARY.into(),
-            adapter_name: GUID_SECONDARY.into(),
-            ipv6_if_index: 7,
-            physical_address: None,
-            windows_name: "VPN".into(),
-            interface_description: String::new(),
-            interface_type: "Ppp".into(),
-            oper_status: oper_status.into(),
-        }
-    }
-
-    fn mac_hex_colon(mac: [u8; 6]) -> String {
-        mac.iter()
-            .map(|b| format!("{b:02X}"))
-            .collect::<Vec<_>>()
-            .join(":")
-    }
-
-    #[test]
-    fn win_adapter_scheme_binding_matches_live_guid_adapter_up() {
-        // Regression for the persistent-id scheme mismatch: the binding
-        // stores `win-adapter:{lowercased-guid}` (the GUI persistent-id
-        // scheme), while the wire `AdapterEntry` this probe receives carries
-        // `AdapterInfo::stable_id()` (bare GUID here, no MAC). A raw `==`
-        // compare between the two schemes never matched, so a live,
-        // working secondary was permanently reported offline.
-        let (_d, conn) = open_state_db();
-        let bound_id = format!("win-adapter:{}", GUID_SECONDARY.to_ascii_lowercase());
-        seed_policy_with_secondary_stable_id(&conn, &bound_id);
-        let probe = ProductionFailClosedProbe::new(conn);
-
-        let adapters = vec![adapter("primary-id", "Up"), guid_adapter_entry("Up")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(
-            !state.fail_closed_active,
-            "a live win-adapter:-scheme secondary must not trip the Fail-Closed banner"
-        );
-    }
-
-    #[test]
-    fn win_adapter_scheme_binding_down_adapter_yields_active() {
-        let (_d, conn) = open_state_db();
-        let bound_id = format!("win-adapter:{}", GUID_SECONDARY.to_ascii_lowercase());
-        seed_policy_with_secondary_stable_id(&conn, &bound_id);
-        let probe = ProductionFailClosedProbe::new(conn);
-
-        let adapters = vec![adapter("primary-id", "Up"), guid_adapter_entry("Down")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(
-            state.fail_closed_active,
-            "a resolved but Down secondary must still trip the banner"
-        );
-    }
-
-    #[test]
-    fn win_adapter_scheme_binding_absent_adapter_yields_active() {
-        let (_d, conn) = open_state_db();
-        let bound_id = format!("win-adapter:{}", GUID_SECONDARY.to_ascii_lowercase());
-        seed_policy_with_secondary_stable_id(&conn, &bound_id);
-        let probe = ProductionFailClosedProbe::new(conn);
-
-        let adapters = vec![adapter("primary-id", "Up")];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(
-            state.fail_closed_active,
-            "a genuinely absent secondary must trip the banner"
-        );
-    }
-
-    #[test]
-    fn win_ifindex_mac_scheme_binding_matches_live_mac_adapter() {
-        // Same mismatch, MAC-fallback branch: the binding stores
-        // `win-ifindex-mac:{index}:{dash-separated-MAC}` while the wire
-        // `AdapterEntry::physical_address` is colon-separated hex.
-        let (_d, conn) = open_state_db();
-        let mac_dash = mac_hex_colon(MAC_SECONDARY).replace(':', "-");
-        let bound_id = format!("win-ifindex-mac:9:{mac_dash}");
-        seed_policy_with_secondary_stable_id(&conn, &bound_id);
-        let probe = ProductionFailClosedProbe::new(conn);
-
-        let mac_adapter = AdapterEntry {
-            persistent_id: "irrelevant-low-level-id".into(),
-            adapter_name: String::new(),
-            ipv6_if_index: 9,
-            physical_address: Some(mac_hex_colon(MAC_SECONDARY)),
-            windows_name: "VPN".into(),
-            interface_description: String::new(),
-            interface_type: "Ppp".into(),
-            oper_status: "Up".into(),
-        };
-        let adapters = vec![adapter("primary-id", "Up"), mac_adapter];
-        let state = probe.probe(TEST_SID, &adapters).expect("Some");
-        assert!(
-            !state.fail_closed_active,
-            "a live win-ifindex-mac:-scheme secondary must not trip the Fail-Closed banner"
-        );
+    #[allow(clippy::expect_used)]
+    fn a_binding_that_was_never_healed_keeps_the_wire_shape_unchanged() {
+        let dto = record_binding_to_dto(RouteBindingRecord {
+            stable_id: "win-adapter:{a}".into(),
+            display_name: "Tunnel".into(),
+            user_confirmed: true,
+            known_stable_ids: vec!["win-adapter:{a}".into()],
+        });
+        let wire = serde_json::to_value(&dto).expect("serializes");
+        assert_eq!(wire["stable-id"], "win-adapter:{a}");
+        assert!(wire.get("known-stable-ids").is_none());
     }
 }

@@ -171,6 +171,10 @@ pub struct ConnectionTraceRecord {
     /// evidence — `blocked_by_nrr` alone only proves WE own the filter, not
     /// which one.
     pub nrr_drop_spec_id: Option<u64>,
+    /// Which of our filters dropped it, as a
+    /// [`nrr_domain::block_notice::BlockReason`] slug. Set by the consumer;
+    /// `None` for anything that is not our drop.
+    pub nrr_block_reason: Option<&'static str>,
     pub observed_unix_ms: Option<u64>,
 }
 
@@ -239,14 +243,23 @@ impl ConnectionTraceRing {
 }
 
 /// Flatten live adapter infos into the `(unicast address → ifindex)` table the
-/// egress derivation consumes. Adapter enumeration is IPv4-only today, so the
-/// table holds only v4 addresses — an IPv6 source therefore resolves to an
-/// unknown egress (the v6-leak signal; NRR routes no v6 in Free).
+/// egress derivation consumes. Both families: a v6 source used to resolve to an
+/// unknown egress, so every IPv6 connection reached the Diagnostics panel with
+/// no route and no verdict — indistinguishable from noise, and nothing a rule
+/// could be attached to.
+///
+/// The index is the adapter's own, whichever family the address belongs to.
+/// Windows keeps a separate `Ipv6IfIndex`, but nothing here compares against
+/// it: the bindings this table is matched against carry the same
+/// [`AdapterInfo::index`], so both sides move together.
 pub fn build_unicast_table(infos: &[AdapterInfo]) -> Vec<(IpAddr, u32)> {
     let mut out = Vec::new();
     for info in infos {
         for ip in &info.ipv4_addresses {
             out.push((IpAddr::V4(*ip), info.index));
+        }
+        for ip in &info.ipv6_addresses {
+            out.push((IpAddr::V6(*ip), info.index));
         }
     }
     out
@@ -271,6 +284,7 @@ pub fn classify_connection(
         verdict: obs.verdict,
         blocked_by_nrr: obs.blocked_by_nrr,
         nrr_drop_spec_id: obs.nrr_drop_spec_id,
+        nrr_block_reason: None,
         observed_unix_ms: obs.observed_unix_ms,
     }
 }
@@ -423,6 +437,14 @@ pub struct ConnectionObservationConsumer {
     /// Addresses already reported this session. A page reconnects to the same
     /// host constantly; the ledger needs the fact once.
     companion_reported: Mutex<HashSet<std::net::Ipv4Addr>>,
+    /// Main-link resends and closes, folded to one outcome per connection
+    /// before they reach the primary-health sink.
+    primary_stall_evidence: Mutex<stall_evidence::ConnectionStallTracker>,
+    /// The application measure's sink — see [`AppMainLinkFn`].
+    app_main_link: Option<AppMainLinkFn>,
+    /// Which program opened each recent main-link connection (see
+    /// `remember_program`).
+    connection_programs: Mutex<std::collections::HashMap<(SocketAddr, SocketAddr), (String, u64)>>,
     /// Destinations already torn down once (see [`Self::note_torn_down`]).
     torn_down_before: Mutex<HashSet<std::net::Ipv4Addr>>,
     /// Last time traffic left over the SECONDARY link, as a cheap proxy for
@@ -579,6 +601,11 @@ pub type CompanionInUseFn = Arc<dyn Fn(&str) + Send + Sync>;
 /// traffic take the wrong link" but "does this host work over that link".
 pub type CompanionPrimaryHealthFn = Arc<dyn Fn(&str, bool) + Send + Sync>;
 
+/// Reports one main-link connection outcome to the application measure: the
+/// program that opened it, the remote address, whether it stalled (`false` for
+/// an orderly close), and whether the address has a name.
+pub type AppMainLinkFn = Arc<dyn Fn(&str, std::net::IpAddr, bool, bool) + Send + Sync>;
+
 /// Reports one outbound connection attempt to the navigation measurement:
 /// the initiating image path, the destination's name when it has one, and
 /// when the connection happened. Purely observational — see
@@ -605,6 +632,7 @@ mod companion;
 mod connection_facts;
 mod consume;
 mod drop_reporter;
+mod stall_evidence;
 
 use connection_facts::{
     block_reason_for, is_learnable_endpoint, process_basename_lower,

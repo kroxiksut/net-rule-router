@@ -163,7 +163,7 @@ fn exact_ip_rule(id: &str, addr: Ipv4Addr) -> CanonicalRule {
     CanonicalRule {
         id: RuleId(id.into()),
         enabled: true,
-        address_match: Some(CanonicalAddressMatch::ExactIp(addr)),
+        address_match: Some(CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(addr))),
         app_match: None,
         comment: String::new(),
         action: nrr_domain::RuleAction::Route,
@@ -238,7 +238,6 @@ fn seed_route_binding(fx: &PipelineFixture, sid: &str, mode: BehaviorMode) {
         primary_probe_timeout_ms: 1500,
         primary_probe_max_targets: 8,
         primary_probe_repeat_secs: 300,
-        block_ipv6_when_protected: true,
         local_networks_auto_accept: false,
         zone_priority_over_ip: false,
         binding_source: BindingSource::UserAssigned,

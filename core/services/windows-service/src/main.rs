@@ -55,6 +55,32 @@ mod runtime_deps;
 #[cfg(windows)]
 mod stderr_capture;
 
+/// Lock the service data tree down, BEFORE anything in it is opened — every
+/// start, in both the SCM and the console path.
+///
+/// Install applies it too, but `acl_applied: Some(false)` is a non-fatal install
+/// outcome, and under `%ProgramData%` any account may create the tree first and
+/// stay its owner. A reset that fails is worth a line; a link in the tree is an
+/// `Err`, and the caller does not start — the databases and logs would be
+/// opened through it.
+#[cfg(windows)]
+pub(crate) fn lock_down_data_tree() -> Result<(), String> {
+    use nrr_platform_api::service_control::ServiceControlError;
+
+    let Some(root) = nrr_platform_api::paths::production_data_root() else {
+        return Ok(());
+    };
+    let _ = std::fs::create_dir_all(&root);
+    match nrr_platform_windows::service_control::apply_data_dir_acl(&root) {
+        Ok(()) => Ok(()),
+        Err(refused @ ServiceControlError::InvalidState { .. }) => Err(refused.to_string()),
+        Err(e) => {
+            eprintln!("[nrr] data-directory lockdown could not be applied: {e}");
+            Ok(())
+        }
+    }
+}
+
 fn main() -> std::process::ExitCode {
     // Publish this binary's semver to the ContractNegotiate handler so
     // the GUI's compatibility banner can render "Service X.Y.Z" in its
@@ -474,22 +500,13 @@ fn run_console() -> std::process::ExitCode {
     // installations use.
     eprintln!("[dbg] step=4 before-bootstrap-config");
     let cfg = BootstrapConfig::new(StorageProfile::ProductionService);
+    #[cfg(windows)]
+    if let Err(refused) = lock_down_data_tree() {
+        eprintln!("[nrr] not starting: {refused}");
+        return std::process::ExitCode::from(1);
+    }
     eprintln!("[dbg] step=5 before-run-bootstrap");
     let artifacts = run_bootstrap(&cfg);
-    // Re-assert the data-directory lockdown every boot.
-    //
-    // Install applies it, but `acl_applied: Some(false)` is a non-fatal install
-    // outcome, and the service creates the same tree itself when it starts
-    // before one — inheriting `%ProgramData%`, where Users may create files.
-    // Either way the per-SID rule store and the audit trail would sit readable
-    // by every local account. Best-effort and idempotent: a failure here is
-    // worth a line, not a refusal to start.
-    #[cfg(windows)]
-    if let Some(root) = nrr_platform_api::paths::production_data_root() {
-        if let Err(e) = nrr_platform_windows::service_control::apply_data_dir_acl(&root) {
-            eprintln!("[nrr] data-directory lockdown could not be re-applied: {e}");
-        }
-    }
     eprintln!(
         "[dbg] step=6 after-run-bootstrap log_writer_some={}",
         artifacts.log_writer.is_some()

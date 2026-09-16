@@ -127,6 +127,25 @@ impl RecentRuleAddressIndex {
         (entry.seen_at.elapsed() < ENTRY_TTL).then(|| entry.hostname.clone())
     }
 
+    /// Fresh addresses last seen for `name` or any name under it, newest
+    /// first, at most `limit`. Scans the whole map: off the hot path only.
+    pub fn addresses_under(&self, name: &str, limit: usize) -> Vec<Ipv4Addr> {
+        let Ok(map) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let suffix = format!(".{name}");
+        let mut found: Vec<(Ipv4Addr, Instant)> = map
+            .iter()
+            .filter(|(_, e)| {
+                e.seen_at.elapsed() < ENTRY_TTL
+                    && (e.hostname == name || e.hostname.ends_with(&suffix))
+            })
+            .map(|(ip, e)| (*ip, e.seen_at))
+            .collect();
+        found.sort_by(|a, b| b.1.cmp(&a.1));
+        found.into_iter().take(limit).map(|(ip, _)| ip).collect()
+    }
+
     /// Number of remembered addresses (diagnostics / tests).
     pub fn len(&self) -> usize {
         self.inner.lock().map(|m| m.len()).unwrap_or(0)

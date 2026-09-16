@@ -9,7 +9,7 @@
 //! are lowered and applied separately on purpose — they fail differently, and a
 //! single combined report would hide a half-applied policy.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::enforcement::{DstMatch, EgressRef, EnforcementPlan};
 use crate::types::RouteEntry;
@@ -20,6 +20,10 @@ use crate::types::RouteEntry;
 #[derive(Clone, Copy, Debug)]
 pub struct RouteTarget {
     pub gateway: Ipv4Addr,
+    /// The IPv6 next hop out of this egress. `UNSPECIFIED` means on-link —
+    /// the same spelling v4 already uses for a gateway-less tunnel, and the
+    /// only spelling available on a tunnel that carries no v6 address at all.
+    pub gateway_v6: Ipv6Addr,
     pub interface_index: u32,
 }
 
@@ -29,10 +33,11 @@ pub struct RouteTarget {
 /// one). Each intent's [`EgressRef`] is resolved to its [`RouteTarget`]
 /// (`Secondary` → `secondary`, `Primary` → `primary` — skipped if the caller has
 /// no primary target, matching the codegen's `PrimaryExceptionsUnavailable`), and
-/// its [`DstMatch`] to `(destination, prefix_length)` (`HostV4` → `/32`, `SubnetV4`
-/// → the overlay prefix). `is_ours = true` and `metric` come straight from the
-/// intent; only the `Main` table is produced on Windows. Ipv6 route intents (none
-/// today) are skipped.
+/// its [`DstMatch`] to `(destination, prefix_length)` (`HostV4` → `/32`,
+/// `HostV6` → `/128`, the subnet variants → the overlay prefix). `is_ours = true`
+/// and `metric` come straight from the intent; only the `Main` table is produced
+/// on Windows. Each family takes its own next hop from the target, so a v6
+/// destination is never handed a v4 gateway.
 pub fn lower_routes(
     plan: &EnforcementPlan,
     secondary: RouteTarget,
@@ -48,16 +53,22 @@ pub fn lower_routes(
             },
             EgressRef::Adapter(_) => continue,
         };
-        let (destination, prefix_length) = match intent.dst {
-            DstMatch::HostV4(ip) => (ip, 32u8),
-            DstMatch::SubnetV4 { net, prefix } => (net, prefix),
-            // Windows routes are IPv4-only today; skip anything else.
-            _ => continue,
+        let (destination, prefix_length, next_hop) = match intent.dst {
+            DstMatch::HostV4(ip) => (IpAddr::V4(ip), 32u8, IpAddr::V4(target.gateway)),
+            DstMatch::SubnetV4 { net, prefix } => {
+                (IpAddr::V4(net), prefix, IpAddr::V4(target.gateway))
+            }
+            DstMatch::HostV6(ip) => (IpAddr::V6(ip), 128u8, IpAddr::V6(target.gateway_v6)),
+            DstMatch::SubnetV6 { net, prefix } => {
+                (IpAddr::V6(net), prefix, IpAddr::V6(target.gateway_v6))
+            }
+            // `Any` names no destination, so it is a filter, never a route.
+            DstMatch::Any => continue,
         };
         out.push(RouteEntry {
             destination,
             prefix_length,
-            next_hop: target.gateway,
+            next_hop,
             interface_index: target.interface_index,
             metric: intent.metric,
             is_ours: true,

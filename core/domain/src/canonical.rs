@@ -24,7 +24,7 @@
 //! the operational SQLite store.
 
 use core::fmt;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use nrr_shared::RouteRole;
 
@@ -127,9 +127,9 @@ pub enum CanonicalAddressMatch {
     /// (default: ExactIp wins). IP subnet zones are not supported; Free
     /// supports domain-suffix zones only.
     Zone(String),
-    /// Matches exactly one IPv4 address (runtime priority tier 3 by default;
+    /// Matches exactly one address of either family (runtime priority tier 3 by default;
     /// configurable vs [`CanonicalAddressMatch::Zone`]).
-    ExactIp(Ipv4Addr),
+    ExactIp(IpAddr),
 }
 
 impl CanonicalAddressMatch {
@@ -151,7 +151,10 @@ impl CanonicalAddressMatch {
             Self::ExactFqdn(label) => label.clone(),
             Self::SuffixDomain(label) => label.clone(),
             Self::Zone(name) => name.clone(),
-            Self::ExactIp(addr) => format!("{:010}", u32::from(*addr)),
+            // v4 keys keep their historic form, so stored orderings do not
+            // move; a v6 key sorts after every v4 one.
+            Self::ExactIp(IpAddr::V4(addr)) => format!("{:010}", u32::from(*addr)),
+            Self::ExactIp(IpAddr::V6(addr)) => format!("v6:{:032x}", u128::from(*addr)),
         }
     }
 }
@@ -428,7 +431,7 @@ mod tests {
         CanonicalRule {
             id: crate::RuleId(id.to_string()),
             enabled: true,
-            address_match: Some(CanonicalAddressMatch::ExactIp(addr)),
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(addr))),
             app_match: None,
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
@@ -527,6 +530,23 @@ mod tests {
         assert_eq!(addrs, ["10.0.0.1", "172.16.0.1", "192.168.1.1"]);
     }
 
+    /// An IPv6 rule sorts after every IPv4 one, and an IPv4 key keeps the form
+    /// stored orderings were built from.
+    #[test]
+    fn ipv6_rules_sort_after_ipv4_and_the_ipv4_key_does_not_move() {
+        let mut v6 = ip_rule("r-6", Ipv4Addr::new(10, 0, 0, 1));
+        v6.address_match = Some(CanonicalAddressMatch::ExactIp(
+            "2001:db8::1".parse().unwrap(),
+        ));
+        let set = CanonicalRuleSet::from_rules(vec![v6, ip_rule("r-4", Ipv4Addr::BROADCAST)]);
+        let ids: Vec<&str> = set.rules().iter().map(|r| r.id.0.as_str()).collect();
+        assert_eq!(ids, ["r-4", "r-6"]);
+        assert_eq!(
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))).sort_key_str(),
+            "0167772161"
+        );
+    }
+
     #[test]
     fn canonical_rule_set_different_insertion_order_same_result() {
         let rules_a = vec![
@@ -581,7 +601,7 @@ mod tests {
         let suffix = CanonicalAddressMatch::SuffixDomain("example.com".to_string());
         assert_eq!(suffix.to_display_string(), "*.example.com");
 
-        let ip = CanonicalAddressMatch::ExactIp(Ipv4Addr::new(1, 2, 3, 4));
+        let ip = CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
         assert_eq!(ip.to_display_string(), "1.2.3.4");
     }
 

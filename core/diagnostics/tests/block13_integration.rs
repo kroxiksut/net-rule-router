@@ -318,6 +318,7 @@ fn archive_default_export_contains_no_raw_db_files() {
         explain_samples: vec![],
         system_info: Some(nrr_shared::system_info::SystemInfo::from_std()),
         service_stderr: None,
+        broker_logs: Vec::new(),
         request: req,
     };
     let result = ArchiveBuilder::build(input, &dest).expect("build archive");
@@ -355,6 +356,7 @@ fn archive_default_export_no_raw_ips_in_health() {
         explain_samples: vec![],
         system_info: Some(nrr_shared::system_info::SystemInfo::from_std()),
         service_stderr: None,
+        broker_logs: Vec::new(),
         request: req,
     };
     ArchiveBuilder::build(input, &dest).expect("build");

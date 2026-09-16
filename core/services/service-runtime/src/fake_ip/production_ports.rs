@@ -24,6 +24,7 @@ use crate::per_sid_orchestrator::RulesProvider;
 
 use super::dialer::RelayNameResolver;
 use super::relay::{RouteSelector, UpstreamAddressResolver};
+use nrr_platform_api::dns::AddressFamily;
 
 /// [`UpstreamAddressResolver`] over the FQDN cache.
 ///
@@ -47,11 +48,7 @@ impl UpstreamAddressResolver for CacheUpstreamResolver {
     fn addresses_for(&self, hostname: &str) -> Vec<IpAddr> {
         // IPv4 only today, as is the whole resolver path; when the cache begins
         // learning AAAA a v6 arm widens this without touching the relay.
-        self.cache
-            .ips_for_hostname(hostname)
-            .into_iter()
-            .map(IpAddr::V4)
-            .collect()
+        self.cache.ips_for_hostname(hostname)
     }
 }
 
@@ -110,12 +107,12 @@ impl RelayNameResolver for ConfirmedNameResolver {
         if let Some(known) = self.remembered(hostname) {
             return known;
         }
-        let Ok(record) = self.resolver.resolve_a(hostname) else {
+        let Ok(record) = self.resolver.resolve(hostname, AddressFamily::Ipv4) else {
             // Remember nothing on failure: the next connection attempt — often
             // the browser's own retry a second later — should try again.
             return Vec::new();
         };
-        let addresses: Vec<IpAddr> = record.addresses.iter().copied().map(IpAddr::V4).collect();
+        let addresses = record.addresses.clone();
         if addresses.is_empty() {
             return addresses;
         }

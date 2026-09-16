@@ -12,7 +12,7 @@
 //! The listener (increment 1b-ii) constructs these and hands them to
 //! [`crate::dns_resolver::handle_a_query`].
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -24,13 +24,14 @@ use nrr_storage::resolution_source::StorageResolutionSource;
 use crate::dns_address_sanity::{classify_answer, AnswerSanity};
 use crate::dns_observation_consumer::rule_set_matches;
 use crate::dns_resolver::{
-    FactSink, ReconcileOutcome, ResolveError, ResolvedA, RuleHostOracle, SyncReconciler,
+    FactSink, ReconcileOutcome, ResolveError, ResolvedAddresses, RuleHostOracle, SyncReconciler,
     UpstreamResolver,
 };
-use crate::net_filter::is_non_routable_v4;
+use crate::net_filter::is_non_routable;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::recent_rule_addresses::RecentRuleAddressIndex;
 use crate::supervised_runtime::RouteRecomputeHook;
+use nrr_platform_api::dns::AddressFamily;
 
 /// TTL (seconds) applied when the upstream record carries none — short, so a
 /// rotating host re-installs enforcement soon after via TTL-driven re-query.
@@ -87,13 +88,17 @@ impl PortUpstreamResolver {
 }
 
 impl UpstreamResolver for PortUpstreamResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedA, ResolveError> {
-        match self.resolver.resolve_a(hostname) {
+    fn resolve(
+        &self,
+        hostname: &str,
+        _family: AddressFamily,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        match self.resolver.resolve(hostname, AddressFamily::Ipv4) {
             Ok(ResolvedRecord {
                 addresses,
                 ttl_seconds,
                 ..
-            }) => Ok(ResolvedA {
+            }) => Ok(ResolvedAddresses {
                 addresses,
                 ttl_seconds: ttl_seconds.unwrap_or(DEFAULT_TTL_SECS),
             }),
@@ -125,16 +130,21 @@ impl UpstreamResolverPort {
 }
 
 impl DnsResolverPort for UpstreamResolverPort {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
-        match self.upstream.resolve_a(hostname) {
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
+        match self.upstream.resolve(hostname, family) {
             Ok(resolved) if !resolved.addresses.is_empty() => {
                 // The confirmation above already tried to replace a placeholder
                 // with a real answer. One that still looks like a placeholder
                 // was not confirmed by anyone, and writing it to the cache would
                 // point the rule at nowhere — worse than having no address,
                 // because nothing would ever re-query it.
-                let addresses = match classify_answer(&resolved.addresses) {
-                    AnswerSanity::Clean => resolved.addresses,
+                let answered = crate::dns_wire::only_v4(&resolved.addresses);
+                let addresses = match classify_answer(&answered) {
+                    AnswerSanity::Clean => answered,
                     AnswerSanity::Sanitized { keep } => keep,
                     AnswerSanity::Unusable => {
                         tracing::info!(
@@ -153,7 +163,7 @@ impl DnsResolverPort for UpstreamResolverPort {
                 };
                 Ok(ResolvedRecord {
                     canonical_hostname: hostname.to_ascii_lowercase(),
-                    addresses,
+                    addresses: addresses.into_iter().map(IpAddr::V4).collect(),
                     ttl_seconds: Some(resolved.ttl_seconds),
                 })
             }
@@ -324,9 +334,10 @@ impl DirectUdpUpstreamResolver {
         query: &[u8],
         id: u16,
         hostname: &str,
+        qtype: u16,
         egress: &crate::dns_egress::DnsEgress,
-    ) -> Result<ResolvedA, ResolveError> {
-        use crate::dns_wire::{parse_a_response, AResponseOutcome};
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        use crate::dns_wire::{parse_address_response, AddressResponseOutcome};
         let sock = Self::open_socket(egress)?;
         sock.send(query)
             .map_err(|e| ResolveError::Unavailable(format!("send: {e}")))?;
@@ -363,25 +374,25 @@ impl DirectUdpUpstreamResolver {
                 }
                 Err(e) => return Err(ResolveError::Unavailable(format!("recv: {e}"))),
             };
-            match parse_a_response(id, hostname, &buf[..n]) {
-                AResponseOutcome::Answers { addresses, min_ttl } => {
-                    return Ok(ResolvedA {
+            match parse_address_response(id, hostname, qtype, &buf[..n]) {
+                AddressResponseOutcome::Answers { addresses, min_ttl } => {
+                    return Ok(ResolvedAddresses {
                         addresses,
                         // A 0-TTL record still needs a positive cache horizon;
                         // 1 s keeps "do not cache" spirit without a special case.
                         ttl_seconds: min_ttl.max(1),
                     });
                 }
-                AResponseOutcome::NoRecords => return Err(ResolveError::NoRecords),
-                AResponseOutcome::Truncated => {
+                AddressResponseOutcome::NoRecords => return Err(ResolveError::NoRecords),
+                AddressResponseOutcome::Truncated => {
                     // No TCP fallback in phase 1 — surface as transient so the
                     // listener fail-opens (forwards raw) instead of NXDOMAIN-ing.
                     return Err(ResolveError::Unavailable("truncated (TC=1)".into()));
                 }
-                AResponseOutcome::Failed(rcode) => {
+                AddressResponseOutcome::Failed(rcode) => {
                     return Err(ResolveError::Unavailable(format!("rcode {rcode}")));
                 }
-                AResponseOutcome::Mismatch => continue,
+                AddressResponseOutcome::Mismatch => continue,
             }
         }
     }
@@ -469,18 +480,26 @@ impl DirectUdpUpstreamResolver {
 }
 
 impl UpstreamResolver for DirectUdpUpstreamResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedA, ResolveError> {
-        use crate::dns_wire::build_a_query;
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        use crate::dns_wire::{build_address_query, QTYPE_A, QTYPE_AAAA};
+        let qtype = match family {
+            AddressFamily::Ipv4 => QTYPE_A,
+            AddressFamily::Ipv6 => QTYPE_AAAA,
+        };
         let id = next_query_id();
         // An unencodable name (empty/oversized label, non-ASCII — IDN arrives
         // here already punycoded) can never resolve: authoritative no-answer.
-        let Some(query) = build_a_query(id, hostname) else {
+        let Some(query) = build_address_query(id, hostname, qtype) else {
             return Err(ResolveError::NoRecords);
         };
         let mut last = ResolveError::Unavailable("no attempts".into());
         for attempt in 0..self.attempts {
             let egress = self.egress_for(attempt);
-            match self.attempt(&query, id, hostname, &egress) {
+            match self.attempt(&query, id, hostname, qtype, &egress) {
                 Ok(resolved) => {
                     tracing::debug!(
                         target: "nrr::dns-resolver",
@@ -490,7 +509,8 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
                         addresses = resolved.addresses.len(),
                         ttl = resolved.ttl_seconds,
                         attempt,
-                        "direct upstream A query answered",
+                        family = family.as_str(),
+                        "direct upstream address query answered",
                     );
                     self.note_attempt(&egress, true);
                     return Ok(resolved);
@@ -687,11 +707,12 @@ impl PoisonFallbackUpstreamResolver {
     }
 
     /// Why `resolved` needs a second source, or `None` when it stands alone.
-    fn suspicion(&self, hostname: &str, resolved: &ResolvedA) -> Option<Suspicion> {
-        if matches!(classify_answer(&resolved.addresses), AnswerSanity::Unusable) {
+    fn suspicion(&self, hostname: &str, resolved: &ResolvedAddresses) -> Option<Suspicion> {
+        let answered = crate::dns_wire::only_v4(&resolved.addresses);
+        if matches!(classify_answer(&answered), AnswerSanity::Unusable) {
             return Some(Suspicion::NoUsableAddress);
         }
-        self.reused_by_another_host(hostname, &resolved.addresses)
+        self.reused_by_another_host(hostname, &answered)
             .map(Suspicion::AlsoAnsweredFor)
     }
 
@@ -700,15 +721,10 @@ impl PoisonFallbackUpstreamResolver {
         &self,
         hostname: &str,
         suspicion: &Suspicion,
-        primary: Option<&ResolvedA>,
-        candidate: &ResolvedA,
+        primary: Option<&ResolvedAddresses>,
+        candidate: &ResolvedAddresses,
     ) -> Option<Confirmation> {
-        if candidate.addresses.is_empty()
-            || matches!(
-                classify_answer(&candidate.addresses),
-                AnswerSanity::Unusable
-            )
-        {
+        if carries_nothing_to_pin(candidate) {
             return None;
         }
         let agreed = matches!(suspicion, Suspicion::AlsoAnsweredFor(_))
@@ -716,21 +732,39 @@ impl PoisonFallbackUpstreamResolver {
         if agreed {
             return Some(Confirmation::Agreed);
         }
-        self.reused_by_another_host(hostname, &candidate.addresses)
+        self.reused_by_another_host(hostname, &crate::dns_wire::only_v4(&candidate.addresses))
             .is_none()
             .then_some(Confirmation::Replaced)
     }
 }
 
+/// Whether an answer holds no address that could ever be pinned — either it
+/// names none at all, or every one of them is a placeholder.
+///
+/// The two are the same for the caller (there is nothing to enforce on) but
+/// they are NOT the same evidence, which is why the loop below asks who
+/// answered rather than only what they said.
+fn carries_nothing_to_pin(answer: &ResolvedAddresses) -> bool {
+    answer.addresses.is_empty()
+        || matches!(
+            classify_answer(&crate::dns_wire::only_v4(&answer.addresses)),
+            AnswerSanity::Unusable
+        )
+}
+
 /// Do two answers name the same addresses, order aside? Answer sets are a
 /// handful of entries, so the quadratic scan beats allocating a set.
-fn same_address_set(a: &[Ipv4Addr], b: &[Ipv4Addr]) -> bool {
+fn same_address_set(a: &[IpAddr], b: &[IpAddr]) -> bool {
     a.len() == b.len() && a.iter().all(|ip| b.contains(ip))
 }
 
 impl UpstreamResolver for PoisonFallbackUpstreamResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedA, ResolveError> {
-        let primary = self.inner.resolve_a(hostname);
+    fn resolve(
+        &self,
+        hostname: &str,
+        _family: AddressFamily,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        let primary = self.inner.resolve(hostname, AddressFamily::Ipv4);
         let suspicion = match &primary {
             Ok(resolved) => self.suspicion(hostname, resolved),
             Err(ResolveError::NoRecords) => Some(Suspicion::NoUsableAddress),
@@ -751,13 +785,19 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
             );
         }
         let started = std::time::Instant::now();
+        // Did anyone answer at all, and did they see what we saw? A second
+        // source that replies "this name has no address" has CONFIRMED the
+        // doubt, not failed to resolve it — and most rule hosts are zone
+        // suffixes whose apex legitimately carries no A record.
+        let mut second_source_saw_nothing_either = false;
         for fallback in &self.fallbacks {
             if started.elapsed() >= Self::CONFIRM_BUDGET {
                 break;
             }
-            let Ok(candidate) = fallback.resolve_a(hostname) else {
+            let Ok(candidate) = fallback.resolve(hostname, AddressFamily::Ipv4) else {
                 continue;
             };
+            second_source_saw_nothing_either |= carries_nothing_to_pin(&candidate);
             match self.confirmation(hostname, &suspicion, primary.as_ref().ok(), &candidate) {
                 Some(Confirmation::Agreed) => {
                     tracing::info!(
@@ -784,6 +824,16 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
         // Two different outcomes, so two messages: an unusable answer really is
         // dropped by the downstream sanity gate, a reuse collision is not.
         match &suspicion {
+            // Everyone agrees the name has nothing to pin. On a rule book full
+            // of zone suffixes that is the ORDINARY answer for the apex, and
+            // reporting it as a failed confirmation buried the real alarms:
+            // measured at ten a minute on a live machine, every one of them a
+            // CDN zone with no A record of its own.
+            Suspicion::NoUsableAddress if second_source_saw_nothing_either => tracing::debug!(
+                target: "nrr::dns-resolver",
+                host = %hostname,
+                "a second source agrees this host has no address of its own — nothing to pin",
+            ),
             Suspicion::NoUsableAddress => tracing::warn!(
                 target: "nrr::dns-resolver",
                 host = %hostname,
@@ -853,14 +903,18 @@ impl HostsBypassDnsResolver {
 }
 
 impl DnsResolverPort for HostsBypassDnsResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
         if !(self.bypass_enabled)() {
-            return self.system.resolve_a(hostname);
+            return self.system.resolve(hostname, family);
         }
         let Some(server) = (self.upstream)() else {
             // No captured upstream (capture failed / not yet available) —
             // resolve through the system rather than not at all.
-            return self.system.resolve_a(hostname);
+            return self.system.resolve(hostname, family);
         };
         let canonical = nrr_platform_api::dns::canonicalize_hostname(hostname);
         if canonical.is_empty() {
@@ -870,8 +924,8 @@ impl DnsResolverPort for HostsBypassDnsResolver {
         if let Some(policy) = &self.egress {
             direct = direct.with_egress(Arc::clone(policy));
         }
-        match direct.resolve_a(&canonical) {
-            Ok(ResolvedA {
+        match direct.resolve(&canonical, family) {
+            Ok(ResolvedAddresses {
                 addresses,
                 ttl_seconds,
             }) => Ok(ResolvedRecord {
@@ -893,7 +947,7 @@ impl DnsResolverPort for HostsBypassDnsResolver {
                     reason = %reason,
                     "hosts-bypass direct resolve failed — falling back to the system resolver",
                 );
-                self.system.resolve_a(hostname)
+                self.system.resolve(hostname, family)
             }
         }
     }
@@ -906,14 +960,14 @@ impl DnsResolverPort for HostsBypassDnsResolver {
 /// deterministic for tests.
 fn build_resolution_entry(
     hostname: &str,
-    resolved: &ResolvedA,
+    resolved: &ResolvedAddresses,
     now: SystemTime,
 ) -> Option<ResolutionEntry> {
-    let routable: Vec<Ipv4Addr> = resolved
+    let routable: Vec<IpAddr> = resolved
         .addresses
         .iter()
         .copied()
-        .filter(|ip| !is_non_routable_v4(ip))
+        .filter(|ip| !is_non_routable(ip))
         .collect();
     if routable.is_empty() {
         return None;
@@ -950,7 +1004,7 @@ impl CacheFactSink {
 }
 
 impl FactSink for CacheFactSink {
-    fn record(&self, hostname: &str, resolved: &ResolvedA) {
+    fn record(&self, hostname: &str, resolved: &ResolvedAddresses) {
         let Some(entry) = build_resolution_entry(hostname, resolved, SystemTime::now()) else {
             return; // nothing routable to enforce
         };
@@ -966,7 +1020,9 @@ impl FactSink for CacheFactSink {
 
     fn cached_routable_ips(&self, hostname: &str) -> Vec<Ipv4Addr> {
         use crate::fqdn_cache_lookup::FqdnCacheLookup;
-        self.lookup.ips_for_hostname(hostname)
+        // This feeds an `A` answer, so it is the v4 half by construction; the
+        // AAAA answer gets its own selection when the family is enforced.
+        crate::dns_wire::only_v4(&self.lookup.ips_for_hostname(hostname))
     }
 }
 
@@ -1091,7 +1147,12 @@ pub struct HookSyncReconciler {
     /// Duration of the last completed hook run, in milliseconds; `0` until one
     /// has finished. Read by [`SyncReconciler::typical_run`].
     last_run_ms: Arc<std::sync::atomic::AtomicU64>,
+    first_contact: Option<FirstContactFn>,
 }
+
+/// Routes a first contact's addresses ahead of the full run; returns how many
+/// got their route. See [`SyncReconciler::install_first_contact`].
+pub type FirstContactFn = Arc<dyn Fn(&[std::net::Ipv4Addr]) -> usize + Send + Sync>;
 
 #[derive(Default)]
 struct ReconcileWorkerState {
@@ -1113,7 +1174,14 @@ impl HookSyncReconciler {
                 std::sync::Condvar::new(),
             )),
             last_run_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            first_contact: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_first_contact(mut self, route: FirstContactFn) -> Self {
+        self.first_contact = Some(route);
+        self
     }
 
     /// Single worker loop: run the hook once per outstanding batch of requests,
@@ -1223,6 +1291,12 @@ impl SyncReconciler for HookSyncReconciler {
             ms => Some(Duration::from_millis(ms)),
         }
     }
+
+    fn install_first_contact(&self, addresses: &[std::net::Ipv4Addr]) -> usize {
+        self.first_contact
+            .as_ref()
+            .map_or(0, |route| route(addresses))
+    }
 }
 
 /// Production [`crate::dns_resolver::EnforcedAddressView`]: the routing-active
@@ -1291,8 +1365,10 @@ impl ReverseDnsResolver for FcrdnsUpstreamResolver {
         let Some(server) = (self.upstream)() else {
             return Vec::new();
         };
-        match DirectUdpUpstreamResolver::new(server, self.timeout, 2).resolve_a(hostname) {
-            Ok(ResolvedA { addresses, .. }) => addresses,
+        match DirectUdpUpstreamResolver::new(server, self.timeout, 2)
+            .resolve(hostname, AddressFamily::Ipv4)
+        {
+            Ok(ResolvedAddresses { addresses, .. }) => crate::dns_wire::only_v4(&addresses),
             Err(_) => Vec::new(),
         }
     }
@@ -1413,896 +1489,4 @@ impl crate::dns_resolver::DirectAnswerGate for ReconcilingDirectAnswerGate {
 }
 
 #[cfg(test)]
-mod tests {
-
-    /// The id is one of three barriers between a forged answer and the cache
-    /// that routes, pins and kill-switch exemptions are derived from. It used
-    /// to be a counter: one observed query gave away every id after it.
-    #[test]
-    fn query_ids_are_not_a_counter() {
-        let ids: Vec<u16> = (0..32).map(|_| next_query_id()).collect();
-        let consecutive = ids
-            .windows(2)
-            .filter(|w| w[1] == w[0].wrapping_add(1))
-            .count();
-        assert!(
-            consecutive < 4,
-            "{consecutive} of 31 pairs increment by one, which is what a counter does: {ids:?}",
-        );
-        let distinct: std::collections::HashSet<u16> = ids.iter().copied().collect();
-        assert!(distinct.len() > 24, "too many repeats: {ids:?}");
-    }
-
-    /// The query socket must be CONNECTED to the upstream it asks. Unconnected,
-    /// it accepts an answer from anyone who guesses the ephemeral port, and what
-    /// that answer feeds is the host cache the routes, pins and kill-switch
-    /// exemptions are derived from.
-    #[test]
-    fn the_query_socket_only_accepts_the_server_it_asked() {
-        let server: std::net::SocketAddr = "127.0.0.1:5353".parse().expect("addr");
-        let egress = crate::dns_egress::DnsEgress::primary(server);
-        let sock = DirectUdpUpstreamResolver::open_socket(&egress).expect("socket");
-        assert_eq!(
-            sock.peer_addr().expect("connected socket has a peer"),
-            server,
-        );
-    }
-    use super::*;
-    use nrr_domain::canonical::{
-        CanonicalAddressMatch, CanonicalRule, CanonicalRuleBook, CanonicalRuleSet,
-    };
-    use nrr_domain::{RouteBehaviorMode, RuleId};
-    use nrr_platform_api::dns::DnsResolverError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use crate::per_sid_orchestrator::ActiveRulesSnapshot;
-
-    fn ip(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
-        Ipv4Addr::new(a, b, c, d)
-    }
-
-    // ── PortUpstreamResolver ──────────────────────────────────────────────────
-
-    struct FakeResolver {
-        answer: Result<ResolvedRecord, DnsResolverError>,
-    }
-    impl DnsResolverPort for FakeResolver {
-        fn resolve_a(&self, _hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
-            self.answer.clone()
-        }
-    }
-
-    // ── PoisonFallbackUpstreamResolver ────────────────────────────────────────
-
-    struct FixedUpstream {
-        answer: Result<ResolvedA, ResolveError>,
-        calls: AtomicUsize,
-    }
-    impl FixedUpstream {
-        fn new(answer: Result<ResolvedA, ResolveError>) -> Arc<Self> {
-            Arc::new(Self {
-                answer,
-                calls: AtomicUsize::new(0),
-            })
-        }
-        fn ok(addresses: Vec<Ipv4Addr>) -> Arc<Self> {
-            Self::new(Ok(ResolvedA {
-                addresses,
-                ttl_seconds: 60,
-            }))
-        }
-    }
-    impl UpstreamResolver for FixedUpstream {
-        fn resolve_a(&self, _hostname: &str) -> Result<ResolvedA, ResolveError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.answer.clone()
-        }
-    }
-
-    #[test]
-    fn poison_fallback_leaves_clean_answers_alone() {
-        let inner = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
-        let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("video.example").expect("clean").addresses,
-            vec![ip(23, 10, 20, 78)]
-        );
-        assert_eq!(
-            fallback.calls.load(Ordering::SeqCst),
-            0,
-            "no fallback fired"
-        );
-    }
-
-    #[test]
-    fn the_port_adapter_refuses_to_hand_a_placeholder_to_the_cache() {
-        // What the seeder and the DNS refresh write goes straight into the
-        // cache the relay dials from, so an unconfirmed placeholder there is a
-        // rule pointing at nowhere that nothing re-queries.
-        let port =
-            UpstreamResolverPort::new(
-                FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)])
-                    as Arc<dyn UpstreamResolver>,
-            );
-        assert_eq!(
-            port.resolve_a("secure.example"),
-            Err(DnsResolverError::Timeout {
-                hostname: "secure.example".to_string()
-            }),
-            "transient, not NXDOMAIN — the name exists, we were not told where"
-        );
-    }
-
-    #[test]
-    fn the_port_adapter_passes_a_real_answer_through() {
-        let port = UpstreamResolverPort::new(
-            FixedUpstream::ok(vec![ip(23, 10, 20, 157)]) as Arc<dyn UpstreamResolver>
-        );
-        let record = port.resolve_a("WWW.Social.Example").expect("resolved");
-        assert_eq!(record.canonical_hostname, "www.social.example");
-        assert_eq!(record.addresses, vec![ip(23, 10, 20, 157)]);
-    }
-
-    #[test]
-    fn the_confirming_query_follows_the_egress_policy() {
-        // On the primary link the interception that produced the placeholder
-        // answers the confirmation too, so the second source agrees with the
-        // first and nothing is ever pinned. The policy is what moves the query
-        // somewhere the provider is not.
-        let tunnel_resolver = spawn_fake_dns(|query| {
-            vec![build_a_response(query, &[ip(23, 10, 20, 157)], 60).expect("resp")]
-        });
-        struct ViaTunnel(std::net::SocketAddr);
-        impl crate::dns_egress::DnsEgressPolicy for ViaTunnel {
-            fn decide(&self, _attempt: u32) -> Option<crate::dns_egress::DnsEgress> {
-                Some(crate::dns_egress::DnsEgress {
-                    server: self.0,
-                    bind: None,
-                    via_secondary: true,
-                })
-            }
-        }
-
-        // Documentation space standing in for the name.
-        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_egress(Arc::new(ViaTunnel(tunnel_resolver)));
-
-        assert_eq!(
-            r.resolve_a("www.social.example")
-                .expect("confirmed")
-                .addresses,
-            vec![ip(23, 10, 20, 157)]
-        );
-    }
-
-    #[test]
-    fn poison_fallback_rescues_loopback_stub_answers() {
-        // A filtering upstream answers the rule host with 127.0.0.1 — the
-        // fallback's clean answer must win.
-        let inner = FixedUpstream::ok(vec![ip(127, 0, 0, 1)]);
-        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 78)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("www.video.example").expect("rescued").addresses,
-            vec![ip(23, 10, 20, 78)]
-        );
-    }
-
-    #[test]
-    fn poison_fallback_rescues_nxdomain() {
-        // The provider NXDOMAINs a rotating googlevideo node; a public resolver
-        // knows it.
-        let inner = FixedUpstream::new(Err(ResolveError::NoRecords));
-        let fallback = FixedUpstream::ok(vec![ip(172, 217, 132, 74)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("rr5.example").expect("rescued").addresses,
-            vec![ip(172, 217, 132, 74)]
-        );
-    }
-
-    #[test]
-    fn poison_fallback_returns_the_original_when_fallbacks_fail_too() {
-        let inner = FixedUpstream::ok(vec![ip(127, 0, 0, 1)]);
-        let dead = FixedUpstream::new(Err(ResolveError::Unavailable("down".into())));
-        let poisoned_too = FixedUpstream::ok(vec![ip(0, 0, 0, 0)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![
-                    Arc::clone(&dead) as Arc<dyn UpstreamResolver>,
-                    Arc::clone(&poisoned_too) as Arc<dyn UpstreamResolver>,
-                ]);
-        // Original poisoned answer comes back unchanged (downstream
-        // sanitization refuses to cache/route it — behaviour unchanged).
-        assert_eq!(
-            r.resolve_a("app.example").expect("original").addresses,
-            vec![ip(127, 0, 0, 1)]
-        );
-        assert_eq!(dead.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(poisoned_too.calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// The observed provider placeholder — a pair of `.0` addresses. It is not
-    /// loopback, so only the address-sanity screen catches it.
-    #[test]
-    fn poison_fallback_rescues_a_documentation_space_placeholder() {
-        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)]);
-        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 135)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("secure.example").expect("rescued").addresses,
-            vec![ip(23, 10, 20, 135)]
-        );
-    }
-
-    /// A synthetic address travelling with a real one leaves the answer
-    /// usable — no second source, no added latency.
-    #[test]
-    fn poison_fallback_ignores_a_single_suspicious_address() {
-        let inner = FixedUpstream::ok(vec![ip(192, 0, 2, 1), ip(23, 10, 20, 78)]);
-        let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(r.resolve_a("x.example").expect("clean").addresses.len(), 2);
-        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn address_reuse_by_an_unrelated_host_asks_a_second_source() {
-        let recent = Arc::new(RecentRuleAddressIndex::new());
-        let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
-        recent.record("secure.example", &shared);
-
-        let inner = FixedUpstream::ok(shared.clone());
-        let fallback = FixedUpstream::ok(vec![ip(23, 10, 20, 159)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
-                .with_recent_addresses(Arc::clone(&recent));
-        assert_eq!(
-            r.resolve_a("assistant.example").expect("rescued").addresses,
-            vec![ip(23, 10, 20, 159)]
-        );
-    }
-
-    /// Re-resolving a host, and a genuinely shared front end, must not drag the
-    /// public resolvers in — that is the common case.
-    #[test]
-    fn re_resolution_and_shared_front_ends_do_not_ask_a_second_source() {
-        let recent = Arc::new(RecentRuleAddressIndex::new());
-        let shared = vec![ip(203, 0, 55, 7), ip(203, 0, 55, 8)];
-        recent.record("static.chatapp.test", &shared);
-
-        let inner = FixedUpstream::ok(shared.clone());
-        let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
-                .with_recent_addresses(Arc::clone(&recent));
-        // Same origin, two labels deep.
-        assert_eq!(
-            r.resolve_a("crashlogs.chatapp.test")
-                .expect("clean")
-                .addresses,
-            shared
-        );
-        // An address nobody remembers ends the scan on the first lookup.
-        let fresh = FixedUpstream::ok(vec![ip(203, 0, 55, 7), ip(198, 41, 30, 9)]);
-        let r2 = PoisonFallbackUpstreamResolver::new(fresh as Arc<dyn UpstreamResolver>)
-            .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>])
-            .with_recent_addresses(recent);
-        assert_eq!(
-            r2.resolve_a("other.example")
-                .expect("clean")
-                .addresses
-                .len(),
-            2
-        );
-        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// One operator, two registrable domains (`claude.ai` / `api.anthropic.com`,
-    /// `chatapp.example` / `chatapp.test`) legitimately share a front end, and the
-    /// origin check cannot see it. The honest second source then answers with
-    /// the very address set that raised the alarm — testing IT for the same
-    /// suspicion would make confirmation impossible and tax every such query
-    /// with the full budget. Agreement is the proof.
-    #[test]
-    fn a_second_source_that_agrees_settles_the_reuse_alarm() {
-        let recent = Arc::new(RecentRuleAddressIndex::new());
-        let shared = vec![ip(160, 79, 104, 10)];
-        recent.record("claude.ai", &shared);
-
-        let inner = FixedUpstream::ok(shared.clone());
-        // Same set, listed the other way round: agreement is about the set.
-        let agrees = FixedUpstream::ok(shared.clone());
-        let never = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![
-                    Arc::clone(&agrees) as Arc<dyn UpstreamResolver>,
-                    Arc::clone(&never) as Arc<dyn UpstreamResolver>,
-                ])
-                .with_recent_addresses(recent);
-
-        assert_eq!(
-            r.resolve_a("api.anthropic.com")
-                .expect("confirmed")
-                .addresses,
-            shared
-        );
-        // The first agreement ends it — no walking the whole fallback list.
-        assert_eq!(agrees.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(never.calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// Agreement only rescues a set that could carry traffic — a second source
-    /// repeating a loopback placeholder confirms nothing.
-    #[test]
-    fn agreement_on_an_unusable_set_confirms_nothing() {
-        let recent = Arc::new(RecentRuleAddressIndex::new());
-        let shared = vec![ip(127, 0, 0, 1)];
-        recent.record("secure.example", &shared);
-
-        let inner = FixedUpstream::ok(shared.clone());
-        let agrees = FixedUpstream::ok(shared.clone());
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&agrees) as Arc<dyn UpstreamResolver>])
-                .with_recent_addresses(recent);
-
-        assert_eq!(
-            r.resolve_a("app.example").expect("original").addresses,
-            shared
-        );
-        assert_eq!(agrees.calls.load(Ordering::SeqCst), 1);
-    }
-
-    /// Without the memory wired the reuse trigger is simply off — it must never
-    /// fire on a fresh index and never panic.
-    #[test]
-    fn the_reuse_trigger_is_inert_when_the_memory_is_not_wired() {
-        let inner = FixedUpstream::ok(vec![ip(203, 0, 55, 7)]);
-        let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("anything.example").expect("clean").addresses,
-            vec![ip(203, 0, 55, 7)]
-        );
-        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// A second source that repeats the placeholder confirms nothing — the
-    /// upstream answer comes back and the downstream gate refuses to pin it.
-    #[test]
-    fn a_second_source_repeating_the_placeholder_is_not_a_confirmation() {
-        let stub = vec![ip(192, 0, 2, 1), ip(203, 0, 113, 7)];
-        let inner = FixedUpstream::ok(stub.clone());
-        let echo = FixedUpstream::ok(stub.clone());
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&echo) as Arc<dyn UpstreamResolver>]);
-        assert_eq!(
-            r.resolve_a("secure.example").expect("original").addresses,
-            stub
-        );
-        assert_eq!(echo.calls.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn poison_fallback_does_not_fire_on_transport_failure() {
-        // Unavailable = the attempt/egress machinery's job; the fallback must
-        // not add three more timeouts on top.
-        let inner = FixedUpstream::new(Err(ResolveError::Unavailable("timeout".into())));
-        let fallback = FixedUpstream::ok(vec![ip(1, 2, 3, 4)]);
-        let r =
-            PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
-                .with_fallbacks(vec![Arc::clone(&fallback) as Arc<dyn UpstreamResolver>]);
-        assert!(r.resolve_a("x.example").is_err());
-        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn upstream_maps_record_ttl_and_default() {
-        // TTL present → carried through.
-        let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
-            answer: Ok(ResolvedRecord {
-                canonical_hostname: "assistant.example".into(),
-                addresses: vec![ip(23, 10, 20, 159)],
-                ttl_seconds: Some(42),
-            }),
-        }));
-        assert_eq!(
-            r.resolve_a("assistant.example"),
-            Ok(ResolvedA {
-                addresses: vec![ip(23, 10, 20, 159)],
-                ttl_seconds: 42,
-            })
-        );
-        // TTL absent → default.
-        let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
-            answer: Ok(ResolvedRecord {
-                canonical_hostname: "x.com".into(),
-                addresses: vec![ip(1, 2, 3, 4)],
-                ttl_seconds: None,
-            }),
-        }));
-        assert_eq!(r.resolve_a("x.com").unwrap().ttl_seconds, DEFAULT_TTL_SECS);
-    }
-
-    #[test]
-    fn upstream_maps_authoritative_vs_transient_errors() {
-        // NXDOMAIN (authoritative) → NoRecords.
-        let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
-            answer: Err(DnsResolverError::NxDomain {
-                hostname: "nope.example".into(),
-            }),
-        }));
-        assert_eq!(r.resolve_a("nope.example"), Err(ResolveError::NoRecords));
-        // Timeout (transient) → Unavailable.
-        let r = PortUpstreamResolver::new(Arc::new(FakeResolver {
-            answer: Err(DnsResolverError::Timeout {
-                hostname: "slow.example".into(),
-            }),
-        }));
-        assert!(matches!(
-            r.resolve_a("slow.example"),
-            Err(ResolveError::Unavailable(_))
-        ));
-    }
-
-    // ── ActiveRuleHostOracle ──────────────────────────────────────────────────
-
-    struct FakeRules {
-        primary: CanonicalRuleSet,
-        secondary: CanonicalRuleSet,
-    }
-    impl RulesProvider for FakeRules {
-        fn active_rules(&self) -> Option<ActiveRulesSnapshot> {
-            Some(ActiveRulesSnapshot {
-                rule_book: CanonicalRuleBook {
-                    primary: self.primary.clone(),
-                    secondary: self.secondary.clone(),
-                },
-                behavior_mode: RouteBehaviorMode::PreferPrimary,
-            })
-        }
-    }
-
-    fn exact_rule(id: &str, host: &str) -> CanonicalRule {
-        CanonicalRule {
-            id: RuleId(id.into()),
-            enabled: true,
-            address_match: Some(CanonicalAddressMatch::ExactFqdn(host.into())),
-            app_match: None,
-            comment: String::new(),
-            action: nrr_domain::RuleAction::Route,
-            origin: None,
-        }
-    }
-
-    #[test]
-    fn oracle_matches_secondary_rule_only() {
-        let rules = Arc::new(FakeRules {
-            primary: CanonicalRuleSet::from_rules(vec![exact_rule("r-p", "example.com")]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "assistant.example")]),
-        });
-        let oracle = ActiveRuleHostOracle::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())));
-        assert!(
-            oracle.is_rule_host("assistant.example"),
-            "secondary rule host"
-        );
-        assert!(
-            !oracle.is_rule_host("example.com"),
-            "primary-only match is not a secondary rule host"
-        );
-        assert!(!oracle.is_rule_host("random.net"), "unmatched host");
-    }
-
-    #[test]
-    fn oracle_fails_open_when_no_active_user() {
-        let rules = Arc::new(FakeRules {
-            primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule("r-s", "assistant.example")]),
-        });
-        // No routing-active SID → nothing is a rule host (fail-open).
-        let oracle = ActiveRuleHostOracle::new(rules, Arc::new(|| None));
-        assert!(!oracle.is_rule_host("assistant.example"));
-    }
-
-    // ── ActiveSecondaryOwnedIps — direct-answer steering set ─────────────────
-
-    /// The  case: `workspace.search.example` (direct) shares every
-    /// front-end address with `aistudio.search.example` (secondary rule). While the
-    /// secondary cannot carry traffic those addresses are BLOCKED by the
-    /// fail-closed posture, so the steering set must stay armed — an empty set
-    /// here is what handed the direct host a set of addresses that could only
-    /// be dropped.
-    #[test]
-    fn steering_set_stays_armed_so_a_shared_direct_host_is_not_strangled() {
-        use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
-        use std::time::Instant;
-        let shared = ip(23, 10, 20, 164);
-        let fqdn = Arc::new(MockFqdnCacheLookup::new());
-        fqdn.set_ips("aistudio.search.example", vec![shared]);
-        let rules = Arc::new(FakeRules {
-            primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule(
-                "r-s",
-                "aistudio.search.example",
-            )]),
-        });
-        let owned =
-            ActiveSecondaryOwnedIps::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())), fqdn);
-        let t0 = Instant::now();
-        assert!(owned.owned_ips_at(t0).contains(&shared));
-        // The posture the  gate used to blank: still armed, so the
-        // listener strips the shared address from the direct host's answer (and,
-        // when every address is shared, flags the reply for the collateral
-        // rescue) instead of relaying addresses that will be dropped.
-        let t1 = t0 + OWNED_SET_MEMO_TTL + Duration::from_millis(1);
-        assert!(
-            owned.owned_ips_at(t1).contains(&shared),
-            "steering must not stand down while the secondary is unusable"
-        );
-    }
-
-    /// An address the cache holds but no live resolution has confirmed inside
-    /// the enforcement window is not enforced, so it must not be steered away
-    /// from either — the steering set and the pin/block set read the same port
-    /// and therefore narrow together.
-    #[test]
-    fn steering_set_follows_the_enforcement_confirmation_window() {
-        use crate::fqdn_cache_lookup::MockFqdnCacheLookup;
-        use std::time::Instant;
-        let fqdn = Arc::new(MockFqdnCacheLookup::new());
-        // The mock models "the port answered nothing for this host", which is
-        // what the SQLite adapter does once every row falls out of the window.
-        fqdn.set_ips("aistudio.search.example", vec![]);
-        let rules = Arc::new(FakeRules {
-            primary: CanonicalRuleSet::from_rules(vec![]),
-            secondary: CanonicalRuleSet::from_rules(vec![exact_rule(
-                "r-s",
-                "aistudio.search.example",
-            )]),
-        });
-        let owned =
-            ActiveSecondaryOwnedIps::new(rules, Arc::new(|| Some("S-1-5-21-1".to_string())), fqdn);
-        assert!(owned.owned_ips_at(Instant::now()).is_empty());
-    }
-
-    // ── build_resolution_entry ────────────────────────────────────────────────
-
-    #[test]
-    fn entry_drops_non_routable_and_keeps_ttl_and_source() {
-        let now = SystemTime::UNIX_EPOCH;
-        let resolved = ResolvedA {
-            addresses: vec![ip(127, 0, 0, 1), ip(203, 0, 113, 7), ip(0, 0, 0, 0)],
-            ttl_seconds: 77,
-        };
-        let entry =
-            build_resolution_entry("assistant.example", &resolved, now).expect("routable IP");
-        assert_eq!(entry.canonical_hostname, "assistant.example");
-        assert_eq!(entry.resolved_ips, vec![ip(203, 0, 113, 7)]); // loopback + unspecified dropped
-        assert_eq!(entry.ttl_seconds, Some(77));
-        assert_eq!(entry.source, StorageResolutionSource::Dns);
-    }
-
-    #[test]
-    fn entry_is_none_when_all_non_routable() {
-        // An ad-block hosts pin to 127.0.0.1 must NOT become a /32 out the secondary adapter.
-        let resolved = ResolvedA {
-            addresses: vec![ip(127, 0, 0, 1)],
-            ttl_seconds: 60,
-        };
-        assert!(
-            build_resolution_entry("blocked.example", &resolved, SystemTime::UNIX_EPOCH).is_none()
-        );
-    }
-
-    // ── HookSyncReconciler ────────────────────────────────────────────────────
-
-    #[test]
-    fn reconciler_installs_when_hook_completes_within_deadline() {
-        let ran = Arc::new(AtomicUsize::new(0));
-        let r = Arc::clone(&ran);
-        let hook: RouteRecomputeHook = Arc::new(move || {
-            r.fetch_add(1, Ordering::SeqCst);
-        });
-        let out = HookSyncReconciler::new(hook).reconcile_now(Duration::from_secs(2));
-        assert_eq!(out, ReconcileOutcome::Installed);
-        // `Installed` is only returned after the completion signal, which the
-        // worker sends AFTER running the hook — so the reconcile really ran.
-        assert_eq!(ran.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn reconciler_reports_deadline_exceeded_for_a_slow_hook() {
-        // Hook far slower than the deadline → fail open on latency.
-        let hook: RouteRecomputeHook = Arc::new(|| {
-            std::thread::sleep(Duration::from_millis(300));
-        });
-        let out = HookSyncReconciler::new(hook).reconcile_now(Duration::from_millis(30));
-        assert_eq!(out, ReconcileOutcome::DeadlineExceeded);
-    }
-
-    #[test]
-    fn concurrent_reconciles_coalesce_onto_a_shared_run() {
-        // under the armed block-all a burst of direct-host answers
-        // used to spawn a full reconcile EACH, convoying on the orchestrator
-        // lock. Now concurrent callers must share hook runs: with 8 callers and
-        // a 40 ms hook, thread-per-call would take 8 runs; coalescing needs at
-        // most a handful (a run in flight when a caller registers cannot vouch
-        // for it, so up to ~2-3 runs may still start).
-        let ran = Arc::new(AtomicUsize::new(0));
-        let r = Arc::clone(&ran);
-        let hook: RouteRecomputeHook = Arc::new(move || {
-            r.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(40));
-        });
-        let reconciler = Arc::new(HookSyncReconciler::new(hook));
-        let callers: Vec<_> = (0..8)
-            .map(|_| {
-                let rc = Arc::clone(&reconciler);
-                std::thread::spawn(move || rc.reconcile_now(Duration::from_secs(5)))
-            })
-            .collect();
-        for caller in callers {
-            assert_eq!(
-                caller.join().expect("caller thread"),
-                ReconcileOutcome::Installed,
-                "a generous deadline must always confirm install"
-            );
-        }
-        let runs = ran.load(Ordering::SeqCst);
-        assert!(
-            (1..=4).contains(&runs),
-            "8 concurrent callers coalesced into {runs} hook runs (expected ≤4)"
-        );
-    }
-
-    #[test]
-    fn a_caller_is_only_satisfied_by_a_run_that_started_after_its_request() {
-        // The first call's run is already in flight when the second call
-        // registers — the second must NOT be credited by it (its facts landed
-        // mid-run) and instead waits for the next run. Observable effect: both
-        // calls Installed, and the hook ran twice.
-        let ran = Arc::new(AtomicUsize::new(0));
-        let r = Arc::clone(&ran);
-        let hook: RouteRecomputeHook = Arc::new(move || {
-            r.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(60));
-        });
-        let reconciler = Arc::new(HookSyncReconciler::new(hook));
-        let rc = Arc::clone(&reconciler);
-        let first = std::thread::spawn(move || rc.reconcile_now(Duration::from_secs(5)));
-        // Let the first run actually start before registering the second.
-        std::thread::sleep(Duration::from_millis(20));
-        let second = reconciler.reconcile_now(Duration::from_secs(5));
-        assert_eq!(
-            first.join().expect("first caller"),
-            ReconcileOutcome::Installed
-        );
-        assert_eq!(second, ReconcileOutcome::Installed);
-        assert_eq!(
-            ran.load(Ordering::SeqCst),
-            2,
-            "the in-flight run must not satisfy a request registered after it started"
-        );
-    }
-
-    // ── DirectUdpUpstreamResolver (HW-0714) ───────────────────────────────────
-
-    use crate::dns_wire::{build_a_response, build_error_response, RCODE_NXDOMAIN};
-    use std::net::UdpSocket;
-
-    /// One-shot fake DNS server on 127.0.0.1: receives a single query and sends
-    /// back every frame `reply` produces for it.
-    fn spawn_fake_dns(
-        reply: impl Fn(&[u8]) -> Vec<Vec<u8>> + Send + 'static,
-    ) -> std::net::SocketAddr {
-        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake dns");
-        let addr = sock.local_addr().expect("fake dns addr");
-        sock.set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("cfg fake dns");
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 2048];
-            if let Ok((n, src)) = sock.recv_from(&mut buf) {
-                for frame in reply(&buf[..n]) {
-                    let _ = sock.send_to(&frame, src);
-                }
-            }
-        });
-        addr
-    }
-
-    #[test]
-    fn direct_udp_resolves_answers_and_ttl_from_fake_server() {
-        let addr = spawn_fake_dns(|query| {
-            // The response builders echo the query's id + question, so the
-            // client's id/question match passes without knowing the id here.
-            vec![build_a_response(query, &[ip(1, 2, 3, 4), ip(5, 6, 7, 8)], 90).expect("resp")]
-        });
-        let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let resolved = r.resolve_a("assistant.example").expect("resolved");
-        assert_eq!(resolved.addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
-        assert_eq!(resolved.ttl_seconds, 90);
-    }
-
-    #[test]
-    fn direct_udp_resolves_ptr_names_from_fake_server() {
-        // Fake server replies to the PTR query with one PTR RR (owner = pointer
-        // to the question, RDATA = uncompressed target name).
-        let addr = spawn_fake_dns(|query| {
-            let q = crate::dns_wire::parse_question(query).expect("question");
-            let mut resp = query[..q.question_end].to_vec();
-            resp[2] = 0x80; // QR=1
-            resp[3] = 0x80; // RA, RCODE 0
-            resp[6..8].copy_from_slice(&1u16.to_be_bytes()); // ANCOUNT=1
-            resp.extend_from_slice(&[0xC0, 0x0C]); // owner → question
-            resp.extend_from_slice(&crate::dns_wire::QTYPE_PTR.to_be_bytes());
-            resp.extend_from_slice(&[0x00, 0x01]); // CLASS IN
-            resp.extend_from_slice(&3600u32.to_be_bytes());
-            let mut rdata = Vec::new();
-            for label in ["feed", "example"] {
-                rdata.push(label.len() as u8);
-                rdata.extend_from_slice(label.as_bytes());
-            }
-            rdata.push(0);
-            resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-            resp.extend_from_slice(&rdata);
-            vec![resp]
-        });
-        let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let names = r.resolve_ptr(ip(203, 0, 113, 100)).expect("ptr names");
-        assert_eq!(names, vec!["feed.example".to_string()]);
-    }
-
-    #[test]
-    fn direct_udp_nxdomain_is_authoritative_no_records() {
-        let addr =
-            spawn_fake_dns(|query| vec![build_error_response(query, RCODE_NXDOMAIN).expect("nx")]);
-        let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 3);
-        assert_eq!(
-            r.resolve_a("gone.example"),
-            Err(ResolveError::NoRecords),
-            "NXDOMAIN must not be retried as transient"
-        );
-    }
-
-    #[test]
-    fn direct_udp_ignores_mismatched_datagram_then_accepts_answer() {
-        let addr = spawn_fake_dns(|query| {
-            let good = build_a_response(query, &[ip(9, 9, 9, 9)], 60).expect("resp");
-            let mut wrong_id = good.clone();
-            wrong_id[0] ^= 0xFF; // late reply of some other query
-            vec![wrong_id, good]
-        });
-        let r = DirectUdpUpstreamResolver::new(addr, Duration::from_secs(2), 1);
-        let resolved = r.resolve_a("assistant.example").expect("resolved");
-        assert_eq!(resolved.addresses, vec![ip(9, 9, 9, 9)]);
-    }
-
-    #[test]
-    fn direct_udp_reports_unavailable_when_nothing_answers() {
-        // Bind-then-drop reserves a port that is closed by the time we query:
-        // the ICMP port-unreachable surfaces as a transient recv error, the
-        // window drains, and the resolver reports Unavailable (never hangs).
-        let addr = {
-            let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-            sock.local_addr().expect("addr")
-        };
-        let r = DirectUdpUpstreamResolver::new(addr, Duration::from_millis(120), 2);
-        match r.resolve_a("assistant.example") {
-            Err(ResolveError::Unavailable(_)) => {}
-            other => panic!("expected Unavailable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn direct_udp_unencodable_name_is_no_records_without_network() {
-        // Never resolvable → authoritative, and no socket traffic is attempted
-        // (the server address is irrelevant/unroutable here).
-        let r = DirectUdpUpstreamResolver::new(
-            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
-            Duration::from_millis(50),
-            1,
-        );
-        assert_eq!(r.resolve_a("a..b"), Err(ResolveError::NoRecords));
-    }
-
-    // ── HostsBypassDnsResolver (HW-0714) ──────────────────────────────────────
-
-    use nrr_platform_api::dns::MockDnsResolver;
-
-    fn system_with(host: &str, ips: &[Ipv4Addr]) -> Arc<dyn DnsResolverPort> {
-        let mock = MockDnsResolver::new();
-        mock.set_response(
-            host,
-            ResolvedRecord {
-                canonical_hostname: host.to_string(),
-                addresses: ips.to_vec(),
-                ttl_seconds: Some(300),
-            },
-        );
-        Arc::new(mock)
-    }
-
-    #[test]
-    fn hosts_bypass_off_uses_the_system_resolver() {
-        let r = HostsBypassDnsResolver::new(
-            system_with("pinned.example", &[ip(10, 0, 0, 1)]),
-            Arc::new(|| false),
-            Arc::new(|| panic!("upstream must not be consulted when bypass is off")),
-            Duration::from_millis(200),
-        );
-        let rec = r.resolve_a("pinned.example").expect("system answer");
-        assert_eq!(rec.addresses, vec![ip(10, 0, 0, 1)]);
-    }
-
-    #[test]
-    fn hosts_bypass_on_resolves_directly_past_the_system() {
-        let addr = spawn_fake_dns(|query| {
-            vec![build_a_response(query, &[ip(203, 0, 113, 7)], 120).expect("resp")]
-        });
-        let r = HostsBypassDnsResolver::new(
-            // System would answer with the hosts-file pin — must NOT be used.
-            system_with("pinned.example", &[ip(127, 0, 0, 1)]),
-            Arc::new(|| true),
-            Arc::new(move || Some(addr)),
-            Duration::from_secs(2),
-        );
-        let rec = r.resolve_a("pinned.example").expect("direct answer");
-        assert_eq!(
-            rec.addresses,
-            vec![ip(203, 0, 113, 7)],
-            "hosts pin bypassed"
-        );
-        assert_eq!(rec.ttl_seconds, Some(120));
-        assert_eq!(rec.canonical_hostname, "pinned.example");
-    }
-
-    #[test]
-    fn hosts_bypass_falls_back_to_system_when_no_upstream() {
-        let r = HostsBypassDnsResolver::new(
-            system_with("host.example", &[ip(198, 51, 100, 4)]),
-            Arc::new(|| true),
-            Arc::new(|| None),
-            Duration::from_millis(200),
-        );
-        let rec = r.resolve_a("host.example").expect("fallback answer");
-        assert_eq!(rec.addresses, vec![ip(198, 51, 100, 4)]);
-    }
-
-    #[test]
-    fn hosts_bypass_falls_back_to_system_on_direct_timeout() {
-        // Upstream present but nothing answers there (bind-then-drop reserves
-        // a closed port) → transient direct failure → system fallback.
-        let dead = {
-            let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind");
-            sock.local_addr().expect("addr")
-        };
-        let r = HostsBypassDnsResolver::new(
-            system_with("host.example", &[ip(198, 51, 100, 9)]),
-            Arc::new(|| true),
-            Arc::new(move || Some(dead)),
-            Duration::from_millis(120),
-        );
-        let rec = r.resolve_a("host.example").expect("fallback answer");
-        assert_eq!(rec.addresses, vec![ip(198, 51, 100, 9)]);
-    }
-}
+mod tests;

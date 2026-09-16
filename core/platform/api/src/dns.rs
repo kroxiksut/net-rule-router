@@ -29,25 +29,27 @@
 //!   System32\\drivers\\etc\\hosts`, follows the configured DNS
 //!   servers.
 
-use std::net::Ipv4Addr;
+pub use nrr_domain::address_class::AddressFamily;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Mutex;
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
 
-/// Result of a successful `A`-record query.
+/// Result of a successful address-record query.
 ///
-/// All addresses share the queried hostname; `ttl_seconds` is the
-/// **minimum** TTL across the returned record set so callers can use a
-/// single expiry timestamp without surprising the OS resolver cache.
+/// All addresses share the queried hostname and belong to the family that was
+/// asked for; `ttl_seconds` is the **minimum** TTL across the returned record
+/// set so callers can use a single expiry timestamp without surprising the OS
+/// resolver cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedRecord {
     /// Canonical hostname queried. Normalised by the resolver: lower-
     /// cased, no trailing dot.
     pub canonical_hostname: String,
-    /// IPv4 addresses returned by DNS. Always non-empty in `Ok`
-    /// results — empty answers are reported as
+    /// Addresses returned by DNS, all of the requested family. Always
+    /// non-empty in `Ok` results — empty answers are reported as
     /// [`DnsResolverError::NxDomain`] instead.
-    pub addresses: Vec<Ipv4Addr>,
+    pub addresses: Vec<IpAddr>,
     /// Minimum TTL (seconds) across returned records. `None` when the
     /// resolver could not surface a TTL (rare — system stub usually
     /// caps very small TTLs at a few seconds).
@@ -365,20 +367,29 @@ impl SystemDnsServersPort for StaticDnsServers {
 
 // ── Trait ────────────────────────────────────────────────────────────────────
 
-/// Abstraction over a synchronous IPv4 DNS resolver.
+/// Abstraction over a synchronous DNS resolver.
 ///
 /// One implementation per platform; mocks for tests. Methods take
 /// `&self` so the trait is `Sync` and can be shared via `Arc<dyn …>`
 /// across the supervisor tick thread and ad-hoc IPC handler calls.
+///
+/// The family is an argument rather than a second method: a caller asks for
+/// the one it is about to act on, so the intercept path never pays for a round
+/// trip whose answer it would discard.
 pub trait DnsResolverPort: Send + Sync {
-    /// Resolve `hostname` to a set of IPv4 addresses (`A` records).
+    /// Resolve `hostname` to a set of addresses of `family` (`A` or `AAAA`).
     ///
     /// Implementations MUST normalise `hostname` to lower-case, no
     /// trailing dot before issuing the query and before populating
     /// [`ResolvedRecord::canonical_hostname`]. Empty hostnames or
     /// hostnames containing NUL bytes / characters that Win32 rejects
-    /// MUST surface as [`DnsResolverError::InvalidName`].
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError>;
+    /// MUST surface as [`DnsResolverError::InvalidName`]. Every returned
+    /// address MUST belong to `family`.
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError>;
 }
 
 // ── Mock implementation ─────────────────────────────────────────────────────
@@ -428,7 +439,7 @@ impl MockDnsResolver {
     }
 
     /// Returns a snapshot of the hostnames passed to
-    /// [`resolve_a`](DnsResolverPort::resolve_a) since construction.
+    /// [`resolve`](DnsResolverPort::resolve) since construction.
     pub fn observed_queries(&self) -> Vec<String> {
         self.inner.lock().unwrap().queries.clone()
     }
@@ -443,14 +454,40 @@ impl Default for MockDnsResolver {
 // Test-only mock: lock-poisoning `unwrap()` is acceptable scaffolding.
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 impl DnsResolverPort for MockDnsResolver {
-    fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
+    /// Configured responses are keyed by hostname alone; the answer is then
+    /// narrowed to `family`, so a fixture written for one family reads as
+    /// "no records of that type" to the other — which is what a real resolver
+    /// says about a name that has only `A`.
+    fn resolve(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+    ) -> Result<ResolvedRecord, DnsResolverError> {
         let canonical = canonicalize_hostname(hostname);
         let mut s = self.inner.lock().unwrap();
         s.queries.push(canonical.clone());
         for (host, result) in s.responses.iter() {
-            if host == &canonical {
-                return result.clone();
+            if host != &canonical {
+                continue;
             }
+            let Ok(record) = result else {
+                return result.clone();
+            };
+            let addresses: Vec<IpAddr> = record
+                .addresses
+                .iter()
+                .copied()
+                .filter(|ip| family.holds(*ip))
+                .collect();
+            if addresses.is_empty() {
+                return Err(DnsResolverError::NxDomain {
+                    hostname: canonical,
+                });
+            }
+            return Ok(ResolvedRecord {
+                addresses,
+                ..record.clone()
+            });
         }
         Err(DnsResolverError::NxDomain {
             hostname: canonical,
@@ -486,7 +523,7 @@ mod tests {
     fn mock_default_response_is_nxdomain() {
         let r = MockDnsResolver::new();
         let err = r
-            .resolve_a("nope.example")
+            .resolve("nope.example", AddressFamily::Ipv4)
             .expect_err("unconfigured hostname must error");
         match err {
             DnsResolverError::NxDomain { hostname } => assert_eq!(hostname, "nope.example"),
@@ -497,8 +534,8 @@ mod tests {
     #[test]
     fn mock_records_observed_queries() {
         let r = MockDnsResolver::new();
-        let _ = r.resolve_a("a.test");
-        let _ = r.resolve_a("B.test");
+        let _ = r.resolve("a.test", AddressFamily::Ipv4);
+        let _ = r.resolve("B.test", AddressFamily::Ipv4);
         assert_eq!(
             r.observed_queries(),
             vec!["a.test".to_string(), "b.test".to_string()]
@@ -510,17 +547,38 @@ mod tests {
         let r = MockDnsResolver::new();
         let first = ResolvedRecord {
             canonical_hostname: "x.test".into(),
-            addresses: vec![Ipv4Addr::new(1, 1, 1, 1)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
             ttl_seconds: Some(60),
         };
         let second = ResolvedRecord {
             canonical_hostname: "x.test".into(),
-            addresses: vec![Ipv4Addr::new(2, 2, 2, 2)],
+            addresses: vec![IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2))],
             ttl_seconds: Some(120),
         };
         r.set_response("x.test", first);
         r.set_response("x.test", second.clone());
-        assert_eq!(r.resolve_a("x.test").unwrap(), second);
+        assert_eq!(r.resolve("x.test", AddressFamily::Ipv4).unwrap(), second);
+    }
+
+    /// A fixture written for one family must not answer the other: a name with
+    /// only `A` records really does have no `AAAA`, and a mock that pretended
+    /// otherwise would hide exactly the case the AAAA path exists to handle.
+    #[test]
+    fn mock_narrows_the_answer_to_the_asked_family() {
+        let r = MockDnsResolver::new();
+        r.set_response(
+            "x.test",
+            ResolvedRecord {
+                canonical_hostname: "x.test".into(),
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))],
+                ttl_seconds: Some(60),
+            },
+        );
+        assert!(r.resolve("x.test", AddressFamily::Ipv4).is_ok());
+        assert!(matches!(
+            r.resolve("x.test", AddressFamily::Ipv6),
+            Err(DnsResolverError::NxDomain { .. })
+        ));
     }
 
     #[test]
@@ -533,7 +591,7 @@ mod tests {
             },
         );
         assert!(matches!(
-            r.resolve_a("down.test"),
+            r.resolve("down.test", AddressFamily::Ipv4),
             Err(DnsResolverError::Timeout { .. })
         ));
     }

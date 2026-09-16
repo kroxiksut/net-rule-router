@@ -99,7 +99,7 @@ and stops at the first match:
 | 1 | Exact domain (FQDN) | `api.bank.com` |
 | 2 | Subdomain / suffix | `*.bank.com` |
 | 3 | Zone (TLD / internal suffix, domain zones) | `.ru`, `.com`, `.intra` |
-| 4 | Exact IPv4 address | `203.0.113.7` |
+| 4 | Exact IP address (IPv4 or IPv6) | `203.0.113.7`, `2001:db8::7` |
 | 5 | Application (process name) | `chrome.exe` |
 | 6 | Default route | behavior: prefer-primary / prefer-secondary / strict-fail-closed |
 
@@ -107,8 +107,10 @@ Notes:
 
 - The **Exact-IP vs Zone** order is configurable (by default a more specific exact IP wins over a zone).
 - A rule may combine an address match **and** an app match — both must hold (logical **AND**).
-- **IPv6, CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
-  IPv6 is committed for the release after this one — see the roadmap.
+- **CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
+- IPv6 addresses work in rules. They travel the additional connection when it
+  carries IPv6; when it does not, they are held back rather than slipping out
+  over the main one.
 - The decision engine is pure and deterministic: identical inputs always produce identical, fully-traceable outputs.
 
 > A destination that matches no rule takes the default route — so a site
@@ -232,10 +234,9 @@ administrative console, RU/EN.
 interface per capability, so the shared decision logic is already OS-neutral),
 then macOS.
 
-**Committed, once the current version is stable: full IPv6.** Rules will name
-an IPv6 address, or a name that resolves to one, and be routed and protected
-exactly as IPv4 rules are today. Until that lands, rules act on IPv4 and IPv6
-is kept from becoming a way around them, so a rule you wrote still holds.
+**In progress: full IPv6.** Rules already name IPv6 addresses and names that
+resolve to them, and route and protect them as they do IPv4; what remains is
+verifying it on real IPv6 networks before calling it finished.
 
 **Explored for the future:** multiple saved profiles and scenario libraries,
 2+N adapters, richer rule types (CIDR, ports, protocols), per-site / per-app

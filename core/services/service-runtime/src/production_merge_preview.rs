@@ -404,8 +404,8 @@ mod tests {
         CanonicalRule {
             id: RuleId(id.to_string()),
             enabled,
-            address_match: Some(CanonicalAddressMatch::ExactIp(std::net::Ipv4Addr::new(
-                ip[0], ip[1], ip[2], ip[3],
+            address_match: Some(CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(
+                std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
             ))),
             app_match: None,
             comment: String::new(),

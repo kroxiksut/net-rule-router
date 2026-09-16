@@ -20,6 +20,7 @@
 pub mod adapter_history_merge;
 pub mod address_class;
 pub mod alert;
+pub mod app_offer;
 pub mod auto_rule_budget;
 pub mod block8_outputs;
 // Block notices: folds a stream of blocked attempts into readable episodes and
@@ -42,7 +43,6 @@ pub mod enforcement_mode;
 pub mod extension_channel;
 pub mod import;
 pub mod ipv4_network;
-pub mod isp_block_pages;
 pub mod linked_source;
 pub mod merge;
 pub mod mode_a_coverage;

@@ -31,8 +31,13 @@ fn main() {
     // own mtime, which (on Windows) does NOT change when a file *inside* it is
     // edited in place. So edits to the resource template / CMake / C++ source
     // were silently not picked up. Track the load-bearing files explicitly.
-    for rel in ["resources/app.rc.in", "CMakeLists.txt", "src/main.cpp"] {
+    for rel in ["resources/app.rc.in", "CMakeLists.txt"] {
         println!("cargo:rerun-if-changed={}", native_dir.join(rel).display());
+    }
+    if let Ok(entries) = std::fs::read_dir(native_dir.join("src")) {
+        for entry in entries.flatten() {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
     }
     println!("cargo:rerun-if-env-changed=CMAKE_PREFIX_PATH");
     println!("cargo:rerun-if-env-changed=NRR_QT_HOST_GENERATOR");
@@ -116,6 +121,20 @@ fn main() {
     // Single-config generators take the build type at configure time; the
     // multi-config ones ignore it and take `--build --config` instead.
     configure.arg(format!("-DCMAKE_BUILD_TYPE={config}"));
+    // The C++ build type is RelWithDebInfo in both profiles, so NDEBUG cannot
+    // tell a dev host from a shipped one; the cargo profile can. Passed either
+    // way, because CMake would otherwise keep a previous run's cached value.
+    let dev_layout = !profile.eq_ignore_ascii_case("release");
+    configure.arg(format!(
+        "-DNRR_DEV_LAYOUT={}",
+        if dev_layout { "ON" } else { "OFF" }
+    ));
+    let dev_bin_dir = dev_layout
+        .then(|| cargo_profile_dir(&out_dir))
+        .flatten()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_default();
+    configure.arg(format!("-DNRR_DEV_BIN_DIR={dev_bin_dir}"));
     run(&mut configure, "configure native Qt host");
 
     run(
@@ -157,6 +176,13 @@ fn main() {
         "cargo:rustc-env=NRR_QT_NATIVE_HOST_EXE={}",
         executable.display()
     );
+}
+
+/// `target/<profile>`, where cargo puts the launcher binaries: `OUT_DIR` is
+/// `<profile>/build/<crate>-<hash>/out`.
+fn cargo_profile_dir(out_dir: &Path) -> Option<PathBuf> {
+    let build = out_dir.ancestors().nth(2)?;
+    (build.file_name()? == "build").then(|| build.parent().map(Path::to_path_buf))?
 }
 
 fn run(command: &mut Command, step: &str) {

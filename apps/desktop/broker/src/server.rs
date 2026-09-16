@@ -103,10 +103,10 @@ fn broker_log_path() -> Option<std::path::PathBuf> {
             .join(nrr_shared::product_identity::PRODUCT_NAME)
             .join("logs");
         if std::fs::create_dir_all(&dir).is_ok() {
-            return Some(dir.join("nrr-broker.log"));
+            return Some(dir.join(nrr_platform_api::paths::BROKER_LOG_FILE));
         }
     }
-    current_exe_dir().map(|dir| dir.join("nrr-broker.log"))
+    current_exe_dir().map(|dir| dir.join(nrr_platform_api::paths::BROKER_LOG_FILE))
 }
 
 /// Append one lifecycle line to the broker log file and also echo to stderr.
@@ -186,10 +186,9 @@ fn check_service_binary(candidate: &Path, broker_dir: Option<&Path>) -> Result<(
         ));
     }
     let Some(broker_dir) = broker_dir else {
-        // Without a known install directory the name check is all there is;
-        // refusing outright would break the broker on a host whose own path
-        // cannot be read, which is not the caller's fault.
-        return Ok(());
+        // The name alone is free to forge: without the install directory there
+        // is nothing tying the binary to this installation.
+        return Err("the application's own directory is unknown".to_string());
     };
     let parent = candidate.parent().unwrap_or(Path::new(""));
     if !same_directory(parent, broker_dir) {
@@ -235,10 +234,6 @@ fn normalised_dir(path: &Path) -> String {
     }
 }
 
-/// Run a privileged service-control action by executing the service binary
-/// subcommand. The broker is already elevated, so the child inherits the
-/// elevated token with NO new UAC prompt. `CREATE_NO_WINDOW` keeps the
-/// console-subsystem service binary from flashing a window / spawning a
 /// How long a relayed service-control verb may take before the broker gives up
 /// on it. Generous — `reinstall` restarts a service — but finite: this runs in
 /// the broker's ONLY accept loop, so a wedged child used to take the whole
@@ -268,7 +263,9 @@ fn run_with_budget(
     }
 }
 
-/// visible conhost.
+/// Run a privileged service-control action by executing the service binary
+/// subcommand. The broker is already elevated, so the child inherits the
+/// elevated token with no new UAC prompt.
 fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
     if !ALLOWED_SERVICE_ACTIONS.contains(&action) {
         return BrokerResponse::err("malformed-request", format!("unknown action: {action}"));
@@ -625,11 +622,9 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_install_directory_falls_back_to_the_name_check() {
-        // Not the caller's fault, and refusing everything would brick service
-        // control on such a host — but the name rule still applies.
+    fn an_unknown_install_directory_refuses_even_the_right_name() {
         let candidate = Path::new("C:/anywhere").join(service_name());
-        assert!(check_service_binary(&candidate, None).is_ok());
+        assert!(check_service_binary(&candidate, None).is_err());
         assert!(check_service_binary(Path::new("C:/anywhere/other.exe"), None).is_err());
     }
 
@@ -658,13 +653,15 @@ mod tests {
     #[test]
     fn rotate_broker_log_moves_existing_file_to_prev() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("nrr-broker.log");
+        let path = dir.path().join(nrr_platform_api::paths::BROKER_LOG_FILE);
         fs::write(&path, b"session one\n").expect("write log");
 
         rotate_broker_log(&path);
 
         assert!(!path.exists(), "current log must be moved out of the way");
-        let prev = dir.path().join("nrr-broker.prev.log");
+        let prev = dir
+            .path()
+            .join(nrr_platform_api::paths::BROKER_PREVIOUS_LOG_FILE);
         assert_eq!(
             fs::read_to_string(&prev).expect("read prev"),
             "session one\n"
@@ -674,8 +671,10 @@ mod tests {
     #[test]
     fn rotate_broker_log_replaces_an_older_prev() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("nrr-broker.log");
-        let prev = dir.path().join("nrr-broker.prev.log");
+        let path = dir.path().join(nrr_platform_api::paths::BROKER_LOG_FILE);
+        let prev = dir
+            .path()
+            .join(nrr_platform_api::paths::BROKER_PREVIOUS_LOG_FILE);
         fs::write(&prev, b"stale, two sessions ago\n").expect("write stale prev");
         fs::write(&path, b"session two\n").expect("write log");
 
@@ -690,12 +689,15 @@ mod tests {
     #[test]
     fn rotate_broker_log_is_a_noop_when_no_file_exists() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("nrr-broker.log");
+        let path = dir.path().join(nrr_platform_api::paths::BROKER_LOG_FILE);
 
         rotate_broker_log(&path);
 
         assert!(!path.exists());
-        assert!(!dir.path().join("nrr-broker.prev.log").exists());
+        assert!(!dir
+            .path()
+            .join(nrr_platform_api::paths::BROKER_PREVIOUS_LOG_FILE)
+            .exists());
     }
 
     #[test]

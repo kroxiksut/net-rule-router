@@ -61,16 +61,13 @@
 //! | Full resolved IP list               | `ExtendedDiagnostics` |
 //! | DNS server used                     | `ExtendedDiagnostics` |
 //! | Raw TTL values                      | `ExtendedDiagnostics` |
-//! | Reverse DNS hostnames               | `ExtendedDiagnostics` |
 //! | Exact resolution timestamps         | `ExtendedDiagnostics` |
 //!
 //! The split exists because full IP lists and internal hostnames can reveal
 //! network topology and should not be surfaced in a default user-facing panel.
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use std::time::SystemTime;
-
-use crate::revision::RevisionId;
 
 // ── LookupDirection ───────────────────────────────────────────────────────────
 
@@ -92,30 +89,6 @@ pub enum LookupDirection {
 
 // ── LookupRequest ─────────────────────────────────────────────────────────────
 
-/// Input to the lookup stage.
-///
-/// Constructed from [`NormalizedDecisionInput`] by the pipeline orchestrator.
-/// Both fields are optional because a connection may have only a hostname (DNS
-/// layer available) or only an IP (direct connection, DNS bypassed).
-///
-/// At least one of `hostname` or `observed_ip` must be `Some` — the pipeline
-/// must not call the lookup stage with both absent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LookupRequest {
-    /// Normalized hostname (lowercase, no trailing dot, IDNA-encoded).
-    /// `None` for direct-IP connections.
-    pub hostname: Option<String>,
-    /// Observed IPv4 address from the WFP callback (already normalized).
-    /// `None` when the IP was absent or was a non-mappable native IPv6.
-    pub observed_ip: Option<Ipv4Addr>,
-    /// Which lookup directions to attempt.
-    pub direction: LookupDirection,
-    /// Active policy revision this lookup is evaluated against.
-    pub active_revision_id: RevisionId,
-    /// Wall-clock time when the lookup was initiated.
-    pub requested_at: SystemTime,
-}
-
 // ── CacheEntryState ───────────────────────────────────────────────────────────
 
 /// Freshness state of a single cache entry.
@@ -135,13 +108,12 @@ pub enum CacheEntryState {
     /// TTL expired but within the stale-usable window; used for matching while
     /// a background refresh is scheduled.
     StaleUsable,
-    /// Too stale to trust for matching; pipeline falls back to observed IP only.
+    /// Too stale to trust for matching.
     StaleNotUsable,
     /// No entry exists in the cache for this key.
     Missing,
     /// Multiple contradictory mappings exist (e.g. hostname maps to two
     /// different canonical IPs with conflicting rule implications).
-    /// The pipeline uses `observed_ip` if available and emits a conflict signal.
     Conflicting,
     /// A negative DNS result (NXDOMAIN or no-answer) is cached.
     /// The hostname is known not to resolve; `ExactIp` matching via lookup
@@ -173,15 +145,15 @@ pub enum LookupSource {
 
 // ── ResolvedAddressEntry ──────────────────────────────────────────────────────
 
-/// A single resolved IPv4 address with its cache metadata.
+/// A single resolved address with its cache metadata, either family.
 ///
 /// Extended metadata fields (`resolved_at`, `ttl_seconds`) are populated only
 /// when available and are surfaced in explain only at `ExtendedDiagnostics`
 /// tier to avoid exposing resolution timestamps in the standard UI.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedAddressEntry {
-    /// The resolved IPv4 address.
-    pub addr: Ipv4Addr,
+    /// The resolved address.
+    pub addr: IpAddr,
     /// Freshness state of this entry in the cache.
     pub cache_state: CacheEntryState,
     /// Source of this entry.
@@ -190,20 +162,6 @@ pub struct ResolvedAddressEntry {
     pub resolved_at: Option<SystemTime>,
     /// TTL from the DNS response (seconds).  `ExtendedDiagnostics` tier only.
     pub ttl_seconds: Option<u32>,
-}
-
-// ── ResolvedHostnameEntry ─────────────────────────────────────────────────────
-
-/// A single reverse-resolved hostname with its cache metadata.
-///
-/// Used only for diagnostic context — never for rule matching.
-/// Always surfaced at `ExtendedDiagnostics` tier only.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedHostnameEntry {
-    /// The reverse-resolved hostname (normalized: lowercase, no trailing dot).
-    pub hostname: String,
-    /// Freshness state of this reverse entry.
-    pub cache_state: CacheEntryState,
 }
 
 // ── LookupError ───────────────────────────────────────────────────────────────
@@ -242,7 +200,6 @@ pub enum LookupError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DoResolvePolicy {
     /// Use only the local cache.  No live DNS during this decision.
-    /// If the cache is missing, the pipeline uses `observed_ip` only.
     CacheOnly,
     /// Allow a live DNS query with a strict time budget.
     /// Should only be used in non-latency-critical contexts (e.g. test harness).
@@ -371,9 +328,6 @@ pub struct LookupExtendedMetadata {
     /// Full list of resolved IPv4 addresses for the hostname (all entries, not
     /// just the selected one).  Reveals network topology.
     pub all_resolved_ips: Vec<ResolvedAddressEntry>,
-    /// Reverse-resolved hostnames for the observed IP.  May reveal internal
-    /// naming conventions.
-    pub reverse_hostnames: Vec<ResolvedHostnameEntry>,
     /// Raw TTL of the selected cache entry, if known.
     pub selected_entry_ttl_secs: Option<u32>,
     /// When the selected entry was resolved, if known.
@@ -390,10 +344,8 @@ pub struct LookupExtendedMetadata {
 /// # Selected IP for ExactIp matching
 ///
 /// When multiple IPs are available for a hostname, the lookup stage selects
-/// one for `ExactIp` matching and records it in `selected_ip`.  The selection
-/// prefers `Fresh` entries over `StaleUsable` ones, and cache entries over
-/// observed-traffic IPs.  If both are present and consistent, the cache entry
-/// is preferred and `observed_ip` is noted in `extended_metadata`.
+/// one for `ExactIp` matching and records it in `selected_ip`, preferring
+/// `Fresh` entries over `StaleUsable` ones.
 ///
 /// Rule matching must use `selected_ip` as the authoritative IP for `ExactIp`
 /// matching — it must not re-derive it from `explain_data`.
@@ -415,8 +367,6 @@ pub struct LookupResult {
     /// When `true`, the explain output must note the selected IP and its
     /// source so the user can understand which address triggered the match.
     pub is_multi_ip: bool,
-    /// Whether conflicting hostname-to-IP mappings were detected in the cache.
-    pub has_conflict: bool,
     /// Privacy-tiered explain metadata for this lookup.
     pub explain_data: LookupExplainData,
 }
@@ -434,6 +384,7 @@ impl LookupResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     // ── CacheEntryState ───────────────────────────────────────────────────────
 
@@ -509,7 +460,7 @@ mod tests {
 
     fn make_entry(addr: Ipv4Addr, state: CacheEntryState) -> ResolvedAddressEntry {
         ResolvedAddressEntry {
-            addr,
+            addr: IpAddr::V4(addr),
             cache_state: state,
             source: LookupSource::CacheHit,
             resolved_at: None,
@@ -527,7 +478,6 @@ mod tests {
             },
             extended: LookupExtendedMetadata {
                 all_resolved_ips: vec![],
-                reverse_hostnames: vec![],
                 selected_entry_ttl_secs: None,
                 selected_entry_resolved_at: None,
             },
@@ -542,7 +492,6 @@ mod tests {
                 CacheEntryState::Fresh,
             )),
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: empty_explain(),
         };
         assert!(result.has_usable_ip());
@@ -556,7 +505,6 @@ mod tests {
                 CacheEntryState::StaleUsable,
             )),
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: empty_explain(),
         };
         assert!(result.has_usable_ip());
@@ -567,7 +515,6 @@ mod tests {
         let result = LookupResult {
             selected_ip: None,
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: empty_explain(),
         };
         assert!(!result.has_usable_ip());
@@ -581,7 +528,6 @@ mod tests {
                 CacheEntryState::StaleNotUsable,
             )),
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: empty_explain(),
         };
         assert!(!result.has_usable_ip());
@@ -595,7 +541,6 @@ mod tests {
                 CacheEntryState::Missing,
             )),
             is_multi_ip: false,
-            has_conflict: false,
             explain_data: empty_explain(),
         };
         assert!(!result.has_usable_ip());
@@ -630,22 +575,6 @@ mod tests {
             signals.errors[0],
             LookupError::LookupTimeout { elapsed_ms: 52 }
         ));
-    }
-
-    #[test]
-    fn extended_metadata_reverse_hostnames_are_diagnostic_only() {
-        // Reverse hostname entries are in extended, never in standard signals
-        let extended = LookupExtendedMetadata {
-            all_resolved_ips: vec![],
-            reverse_hostnames: vec![ResolvedHostnameEntry {
-                hostname: "internal.corp".to_owned(),
-                cache_state: CacheEntryState::Fresh,
-            }],
-            selected_entry_ttl_secs: Some(300),
-            selected_entry_resolved_at: None,
-        };
-        assert_eq!(extended.reverse_hostnames.len(), 1);
-        assert_eq!(extended.reverse_hostnames[0].hostname, "internal.corp");
     }
 
     // ── DoResolvePolicy ───────────────────────────────────────────────────────

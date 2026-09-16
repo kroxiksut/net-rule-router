@@ -35,7 +35,7 @@
 //! domain types may or may not require a wire schema bump — they
 //! evolve as two separate releases.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_shared::rules_json::{
     AddressMatchDto, AppMatchDto, AppPatternDto, CanonicalRulesJsonV1,
@@ -74,6 +74,8 @@ pub enum RulesJsonCodecError {
         /// The raw string the decoder failed to parse.
         raw: String,
     },
+    /// `AddressMatchDto::ExactIpv6.address` did not parse as an IPv6 address.
+    InvalidIpv6 { rule_id: String, raw: String },
     /// A rule carries neither `address_match` nor `app_match`. The
     /// domain invariant requires at least one.
     EmptyMatch {
@@ -101,6 +103,9 @@ impl core::fmt::Display for RulesJsonCodecError {
             ),
             Self::InvalidIpv4 { rule_id, raw } => {
                 write!(f, "rule {rule_id:?}: invalid IPv4 address {raw:?}")
+            }
+            Self::InvalidIpv6 { rule_id, raw } => {
+                write!(f, "rule {rule_id:?}: invalid IPv6 address {raw:?}")
             }
             Self::EmptyMatch { rule_id } => write!(
                 f,
@@ -182,7 +187,10 @@ fn encode_address_match(m: &CanonicalAddressMatch) -> AddressMatchDto {
             suffix: suffix.clone(),
         },
         CanonicalAddressMatch::Zone(name) => AddressMatchDto::Zone { name: name.clone() },
-        CanonicalAddressMatch::ExactIp(addr) => AddressMatchDto::ExactIpv4 {
+        CanonicalAddressMatch::ExactIp(IpAddr::V4(addr)) => AddressMatchDto::ExactIpv4 {
+            address: addr.to_string(),
+        },
+        CanonicalAddressMatch::ExactIp(IpAddr::V6(addr)) => AddressMatchDto::ExactIpv6 {
             address: addr.to_string(),
         },
     }
@@ -274,7 +282,17 @@ fn decode_address_match(
                         rule_id: rule_id.to_string(),
                         raw: address.clone(),
                     })?;
-            CanonicalAddressMatch::ExactIp(parsed)
+            CanonicalAddressMatch::ExactIp(IpAddr::V4(parsed))
+        }
+        AddressMatchDto::ExactIpv6 { address } => {
+            let parsed =
+                address
+                    .parse::<Ipv6Addr>()
+                    .map_err(|_| RulesJsonCodecError::InvalidIpv6 {
+                        rule_id: rule_id.to_string(),
+                        raw: address.clone(),
+                    })?;
+            CanonicalAddressMatch::ExactIp(crate::address_class::canonical_ip(IpAddr::V6(parsed)))
         }
     })
 }
@@ -365,7 +383,7 @@ mod tests {
         CanonicalRule {
             id: RuleId(id.into()),
             enabled: true,
-            address_match: Some(CanonicalAddressMatch::ExactIp(addr)),
+            address_match: Some(CanonicalAddressMatch::ExactIp(IpAddr::V4(addr))),
             app_match: None,
             comment: String::new(),
             action: crate::canonical::RuleAction::Route,
@@ -509,6 +527,21 @@ mod tests {
         let dto = encode(&content);
         let back = decode(dto).expect("decode");
         assert_eq!(content, back);
+    }
+
+    #[test]
+    fn an_ipv6_rule_round_trips_as_its_own_kind() {
+        let mut v6 = ip("r-v6", Ipv4Addr::new(203, 0, 113, 5));
+        v6.address_match = Some(CanonicalAddressMatch::ExactIp(
+            "2001:db8::7".parse().expect("v6"),
+        ));
+        let content = RulesRevisionContent::new(book(vec![v6], vec![]));
+        let dto = encode(&content);
+        assert!(matches!(
+            dto.primary[0].address_match,
+            Some(AddressMatchDto::ExactIpv6 { .. })
+        ));
+        assert_eq!(decode(dto).expect("decode"), content);
     }
 
     #[test]

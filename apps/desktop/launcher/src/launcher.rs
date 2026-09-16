@@ -82,6 +82,10 @@ pub(crate) fn user_diagnostics_dir() -> PathBuf {
 /// `<user_diagnostics_dir>/launcher-{surface}.log`. Shared by [`diag_log`] and
 /// [`rotate_session_log`] so both agree on the exact location.
 fn diag_log_path(surface_tag: &str) -> PathBuf {
+    // Tests write beside themselves, never into the user's real log directory.
+    #[cfg(test)]
+    let mut path = env::temp_dir().join(format!("nrr-launcher-tests-{}", std::process::id()));
+    #[cfg(not(test))]
     let mut path = user_diagnostics_dir();
     path.push(format!("launcher-{surface_tag}.log"));
     path
@@ -401,18 +405,18 @@ fn run_primary(
         }
     }
 
-    let mut command = Command::new(&native_host);
     // In a cargo tree the Qt host lives deep under `target/<profile>/build/…`,
     // so the service binary is NOT its sibling and the host's own sibling-only
     // lookup finds nothing — leaving every service action in the GUI dead with
-    // "Service binary not found", the broker never spawned. This launcher IS
-    // the service's sibling, so it can say where it is. Debug-only, matching
-    // the host side: a shipped layout has them side by side, and the
-    // sibling-only rule there is a trust boundary that must not soften.
-    #[cfg(debug_assertions)]
+    // "Service binary not found" and the broker never spawned. This launcher IS
+    // the service's sibling, so it can say where it is. Passed on every build:
+    // the host is `RelWithDebInfo` in both profiles, so a debug-only hand-off
+    // would have one end compiled out.
     if let Some(service_exe) = sibling_service_binary() {
-        command.env("NRR_SERVICE_BINARY", service_exe);
+        host_arguments.push(format!("--nrr-service-exe={}", service_exe.display()));
     }
+
+    let mut command = Command::new(&native_host);
     command
         .args(&host_arguments)
         // stdin is piped so the launcher can write `NRR_IPC_RESPONSE:<json>`
@@ -485,17 +489,10 @@ fn run_primary(
     spawn_line_reader(stdout, sender.clone());
     spawn_line_reader(stderr, sender);
 
-    // IPC client used by the RPC dispatcher. Lazy initialised on the first
-    // NRR_IPC_REQUEST line so a session that never invokes a bridge method
-    // does not pay the connect cost (named-pipe open + version negotiation).
-    let mut ipc_client: Option<std::sync::Arc<dyn nrr_ipc_client::IpcClient>> = None;
-
-    // Second connection reserved for long-running reads (diagnostic archive
-    // export). A client serialises its calls on one pipe, so without this the
-    // export blocked the 3 s health poll behind it and the GUI painted a
-    // "Connecting to service" banner for the whole export. Created on first
-    // use — a session that never exports an archive never opens it.
-    let mut ipc_side_client: Option<std::sync::Arc<dyn nrr_ipc_client::IpcClient>> = None;
+    // One service connection per lane (see `RpcLane`), each opened by the first
+    // request that needs it: a session that never exports an archive never
+    // pays for that pipe.
+    let mut lane_clients = crate::rpc_dispatcher::LaneClients::default();
 
     // GUI-only sidecar SQLite handle. The actual SidecarDb is opened lazily
     // inside `handle_sidecar_request` on first `sidecar.*` request, so
@@ -556,32 +553,20 @@ fn run_primary(
         // stall PREFS_JSON or shutdown handling).
         if line.starts_with(nrr_shared::launcher_rpc::RPC_REQUEST_MARKER) {
             if let Some(stdin) = child_stdin.as_ref() {
-                let side = crate::rpc_dispatcher::request_uses_side_channel(&line);
-                if side && ipc_side_client.is_none() {
-                    let client = nrr_ipc_client::ServiceIpcClient::start();
-                    ipc_side_client = Some(std::sync::Arc::new(client)
-                        as std::sync::Arc<dyn nrr_ipc_client::IpcClient>);
-                }
-                if !side && ipc_client.is_none() {
-                    let client = nrr_ipc_client::ServiceIpcClient::start();
-                    ipc_client = Some(std::sync::Arc::new(client)
-                        as std::sync::Arc<dyn nrr_ipc_client::IpcClient>);
-                }
-                let selected = if side {
-                    ipc_side_client.as_ref()
-                } else {
-                    ipc_client.as_ref()
-                };
-                if let Some(client) = selected {
-                    let _ = crate::rpc_dispatcher::spawn_dispatch_worker(
-                        line.clone(),
-                        std::sync::Arc::clone(client),
-                        std::sync::Arc::clone(&sidecar_handle),
-                        std::sync::Arc::clone(&broker_handle),
-                        std::sync::Arc::clone(stdin),
-                        side,
-                    );
-                }
+                let lane = crate::rpc_dispatcher::request_lane(&line);
+                let (client, connect_budget) =
+                    lane_clients.client_for(lane, Instant::now(), || {
+                        std::sync::Arc::new(nrr_ipc_client::ServiceIpcClient::start())
+                            as std::sync::Arc<dyn nrr_ipc_client::IpcClient>
+                    });
+                let _ = crate::rpc_dispatcher::spawn_dispatch_worker(
+                    line.clone(),
+                    client,
+                    std::sync::Arc::clone(&sidecar_handle),
+                    std::sync::Arc::clone(&broker_handle),
+                    std::sync::Arc::clone(stdin),
+                    connect_budget,
+                );
             } else {
                 diag_log(
                     tag,
@@ -1032,21 +1017,19 @@ pub fn resolve_native_host_executable() -> Option<PathBuf> {
     } else {
         "nrr_qt_native_host"
     };
-
-    if let Ok(current_executable) = env::current_exe() {
-        if let Some(parent) = current_executable.parent() {
-            let candidate = parent.join(executable_name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
+    if let Some(beside) = beside_executable(executable_name) {
+        return Some(beside);
     }
 
-    // Dev-tree fallback: the absolute path baked at `nrr-qt-host` build time
-    // (its `build.rs` emits `cargo:rustc-env=NRR_QT_NATIVE_HOST_EXE=...`).
-    let baked = PathBuf::from(nrr_qt_host::NATIVE_HOST_EXE);
-    if baked.exists() {
-        return Some(baked);
+    // The path `nrr-qt-host` baked at build time names the build machine's
+    // target directory; on any other machine that folder may be creatable by
+    // anyone, so only a debug build trusts it.
+    #[cfg(debug_assertions)]
+    {
+        let baked = PathBuf::from(nrr_qt_host::NATIVE_HOST_EXE);
+        if baked.exists() {
+            return Some(baked);
+        }
     }
 
     None
@@ -1055,9 +1038,9 @@ pub fn resolve_native_host_executable() -> Option<PathBuf> {
 // ─── QML / icon resolution ────────────────────────────────────────────────
 
 fn resolve_qml_path(surface: LauncherSurface) -> Option<PathBuf> {
-    let env_var = match surface {
-        LauncherSurface::MainGui => "NRR_QML_MAIN",
-        LauncherSurface::Tray => "NRR_QML_TRAY",
+    let (env_var, relative) = match surface {
+        LauncherSurface::MainGui => ("NRR_QML_MAIN", "apps/desktop/qml/Main.qml"),
+        LauncherSurface::Tray => ("NRR_QML_TRAY", "apps/desktop/qml/Tray.qml"),
     };
     if let Ok(explicit) = env::var(env_var) {
         let path = PathBuf::from(explicit);
@@ -1065,80 +1048,55 @@ fn resolve_qml_path(surface: LauncherSurface) -> Option<PathBuf> {
             return Some(path);
         }
     }
-
-    let relative = match surface {
-        LauncherSurface::MainGui => "Main.qml",
-        LauncherSurface::Tray => "Tray.qml",
-    };
-
-    // Installed / portable layout ships the QML tree beside the binary; the
-    // second stem keeps a repository checkout working. Only then fall back to
-    // CARGO_MANIFEST_DIR, which is baked at build time and therefore names a
-    // directory that exists on the build machine alone.
-    if let Some(found) = find_upward_from_executable(&[
-        Path::new("qml").join(relative),
-        Path::new("apps/desktop/qml").join(relative),
-    ]) {
-        return Some(found);
-    }
-
-    let manifest_candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../qml")
-        .join(relative);
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
-
-    None
+    bundled_resource(relative)
 }
 
 /// The service binary next to THIS executable, if it is there. Only the
 /// sibling counts — the same trust boundary the host and the broker draw.
-#[cfg(debug_assertions)]
 fn sibling_service_binary() -> Option<PathBuf> {
-    let exe = env::current_exe().ok()?;
-    let candidate = exe
-        .parent()?
-        .join(nrr_shared::product_identity::BinaryRole::Service.host_file_name());
-    candidate.is_file().then_some(candidate)
+    beside_executable(BinaryRole::Service.host_file_name()).filter(|path| path.is_file())
 }
 
 fn resolve_native_icon_path() -> Option<PathBuf> {
-    if let Some(found) = find_upward_from_executable(&[PathBuf::from("assets/icons/app/app.ico")]) {
-        return Some(found);
-    }
-    let manifest_candidate =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../assets/icons/app/app.ico");
-    if manifest_candidate.exists() {
-        return Some(manifest_candidate);
-    }
-    None
+    bundled_resource("assets/icons/app/app.ico")
 }
 
-/// Levels walked upward from the executable — deep enough for a redirected
-/// `target-dir` or a nested install tree, shallow enough to stay inside it.
-const UPWARD_SEARCH_LEVELS: usize = 6;
-
-fn find_upward_from_executable(relatives: &[PathBuf]) -> Option<PathBuf> {
-    let executable = env::current_exe().ok()?;
-    find_upward(executable.parent()?, relatives, UPWARD_SEARCH_LEVELS)
+/// A payload path the package ships with the binary, `/`-separated relative to
+/// the package root. Looked up beside the executable and, in a debug build
+/// only, in the checkout it was built from — never in a parent directory,
+/// where on a shared machine any user can create folders.
+fn bundled_resource(relative: &str) -> Option<PathBuf> {
+    // `apps/desktop/launcher` sits three levels below the checkout root.
+    #[cfg(debug_assertions)]
+    let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3);
+    #[cfg(not(debug_assertions))]
+    let checkout = None;
+    find_bundled(executable_dir().as_deref(), checkout, relative)
 }
 
-/// Nearest match wins: every relative path is tried at one level before
-/// climbing, so a payload beside the binary is never shadowed by a copy above.
-fn find_upward(start: &Path, relatives: &[PathBuf], levels: usize) -> Option<PathBuf> {
-    let mut directory = Some(start);
-    for _ in 0..levels {
-        let current = directory?;
-        for relative in relatives {
-            let candidate = current.join(relative);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-        directory = current.parent();
-    }
-    None
+fn beside_executable(relative: &str) -> Option<PathBuf> {
+    find_bundled(executable_dir().as_deref(), None, relative)
+}
+
+fn executable_dir() -> Option<PathBuf> {
+    env::current_exe().ok()?.parent().map(Path::to_path_buf)
+}
+
+/// Exactly these two roots, in order; neither is climbed.
+fn find_bundled(
+    executable_dir: Option<&Path>,
+    checkout: Option<&Path>,
+    relative: &str,
+) -> Option<PathBuf> {
+    executable_dir
+        .into_iter()
+        .chain(checkout)
+        .map(|root| {
+            relative
+                .split('/')
+                .fold(root.to_path_buf(), |path, segment| path.join(segment))
+        })
+        .find(|candidate| candidate.exists())
 }
 
 // ─── Subprocess plumbing ─────────────────────────────────────────────────
@@ -1447,7 +1405,9 @@ fn is_process_alive(pid: u32) -> bool {
     };
 
     let filter = format!("PID eq {pid}");
-    let mut command = Command::new("tasklist");
+    let mut command = Command::new(nrr_platform_windows::system_shell::system32_exe(
+        "tasklist.exe",
+    ));
     command.args(["/FI", &filter, "/FO", "CSV", "/NH"]);
     apply_no_window(&mut command);
 
@@ -1500,6 +1460,41 @@ fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bundled_resource_is_never_taken_from_a_parent_directory() {
+        use super::find_bundled;
+        let root = tempfile::tempdir().expect("tempdir");
+        let binary_dir = root.path().join("package");
+        fs::create_dir_all(&binary_dir).expect("binary dir");
+        let planted = root.path().join("apps").join("desktop").join("qml");
+        fs::create_dir_all(&planted).expect("planted dir");
+        fs::write(planted.join("Main.qml"), "planted").expect("planted file");
+
+        let relative = "apps/desktop/qml/Main.qml";
+        assert_eq!(find_bundled(Some(&binary_dir), None, relative), None);
+
+        let shipped = binary_dir.join("apps").join("desktop").join("qml");
+        fs::create_dir_all(&shipped).expect("shipped dir");
+        fs::write(shipped.join("Main.qml"), "shipped").expect("shipped file");
+        assert_eq!(
+            find_bundled(Some(&binary_dir), Some(root.path()), relative),
+            Some(shipped.join("Main.qml"))
+        );
+    }
+
+    #[test]
+    fn the_checkout_is_consulted_only_after_the_binary_directory() {
+        use super::find_bundled;
+        let binary_dir = tempfile::tempdir().expect("binary dir");
+        let checkout = tempfile::tempdir().expect("checkout");
+        fs::write(checkout.path().join("app.ico"), "dev").expect("dev file");
+
+        assert_eq!(
+            find_bundled(Some(binary_dir.path()), Some(checkout.path()), "app.ico"),
+            Some(checkout.path().join("app.ico"))
+        );
+    }
+
     use super::{parse_pid_from_lock_content, rotate_session_log, LauncherConfig, LauncherSurface};
     use std::fs;
 

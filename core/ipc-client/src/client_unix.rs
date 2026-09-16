@@ -175,14 +175,26 @@ impl UnixIpcClient {
             .and_then(|g| g.clone())
     }
 
-    /// Register a push-frame receiver (server-pushed `StatusUpdate` frames).
-    /// One subscriber per client; calling twice replaces the previous channel.
+    /// Prepare a push-frame receiver (server-pushed `StatusUpdate` frames).
+    /// It carries nothing until [`Self::commit_push`]; the channel currently in
+    /// force keeps delivering until then. See [`crate::push_handover`] for why
+    /// the hand-over has two phases.
     pub fn subscribe_push(&self) -> Receiver<Value> {
         let (tx, rx) = sync_channel::<Value>(64);
-        if let Ok(mut g) = self.inner.push_tx.lock() {
+        if let Ok(mut g) = self.inner.pending_push_tx.lock() {
             *g = Some(tx);
         }
         rx
+    }
+
+    /// Put the prepared channel in force, the subscribe having been answered.
+    pub fn commit_push(&self) {
+        crate::push_handover::commit_pending_push(&self.inner.pending_push_tx, &self.inner.push_tx);
+    }
+
+    /// Discard the prepared channel — the subscribe did not go through.
+    pub fn abandon_push(&self) {
+        crate::push_handover::abandon_pending_push(&self.inner.pending_push_tx);
     }
 
     /// Trigger client shutdown. Idempotent.
@@ -211,6 +223,14 @@ impl crate::connection::IpcClient for UnixIpcClient {
 
     fn subscribe_push(&self) -> Option<Receiver<Value>> {
         Some(Self::subscribe_push(self))
+    }
+
+    fn commit_push(&self) {
+        Self::commit_push(self);
+    }
+
+    fn abandon_push(&self) {
+        Self::abandon_push(self);
     }
 
     fn negotiate_info(&self) -> Option<NegotiateInfo> {
@@ -257,6 +277,8 @@ struct ClientInner {
     force_reconnect: AtomicBool,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     push_tx: Mutex<Option<SyncSender<Value>>>,
+    /// Prepared by a subscribe, in force only once its call has been answered.
+    pending_push_tx: Mutex<Option<SyncSender<Value>>>,
     /// A push frame was dropped because the subscriber's channel was full —
     /// see the Windows twin.
     push_gap: AtomicBool,
@@ -291,6 +313,7 @@ impl ClientInner {
             force_reconnect: AtomicBool::new(false),
             worker_handle: Mutex::new(None),
             push_tx: Mutex::new(None),
+            pending_push_tx: Mutex::new(None),
             push_gap: AtomicBool::new(false),
             subscription_id: Mutex::new(None),
             negotiate_info: RwLock::new(None),
@@ -937,7 +960,10 @@ mod tests {
         let server = spawn_stub_server(listener, Arc::clone(&stop));
 
         let client = UnixIpcClient::start_at(sock.0.clone());
+        // Prepare and put in force, the way the RPC dispatcher does once the
+        // subscribe has been answered.
         let _rx = client.subscribe_push();
+        client.commit_push();
         assert!(
             wait_until(Duration::from_secs(3), || client
                 .connection_status()
@@ -1430,6 +1456,7 @@ mod tests {
             .is_connected()));
 
         let pushes = client.subscribe_push();
+        client.commit_push();
         client
             .call(
                 IpcOperationName::StatusUpdatesSubscribe,

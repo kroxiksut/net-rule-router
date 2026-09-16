@@ -25,14 +25,42 @@ fn repo_file(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 
-/// Field names declared by `struct <name>` in this crate's `lib.rs`.
+/// Every `.rs` file of this crate, so the gate keeps working after the next
+/// split. It used to read `src/lib.rs` alone, and moving the contract one file
+/// sideways turned it into a test that passed by finding nothing.
+fn crate_sources() -> Vec<String> {
+    fn walk(dir: &Path, out: &mut Vec<String>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())),
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    assert!(
+        !out.is_empty(),
+        "no source files found — the walk is broken"
+    );
+    out
+}
+
+/// Field names declared by `struct <name>` anywhere in this crate.
 fn declared_fields(struct_name: &str) -> Vec<String> {
-    let src = repo_file("src/lib.rs");
     let header = format!("pub struct {struct_name} {{");
-    let start = src
-        .find(&header)
-        .unwrap_or_else(|| panic!("{struct_name} is not declared in lib.rs"))
-        + header.len();
+    let src = crate_sources()
+        .into_iter()
+        .find(|s| s.contains(&header))
+        .unwrap_or_else(|| panic!("{struct_name} is not declared in this crate"));
+    let start = src.find(&header).unwrap_or_default() + header.len();
     let body = &src[start..];
     let end = body
         .find("\n}")
@@ -69,9 +97,10 @@ fn every_main_window_shell_field_is_read_by_the_context_emitter() {
 /// this fails until the reader exists on the other side.
 #[test]
 fn the_removed_screen_contracts_stay_removed_until_something_reads_them() {
-    let src = repo_file("src/lib.rs");
+    let sources = crate_sources();
     for name in ["RulesContract", "InterfacesRoutesContract"] {
-        let declared = src.contains(&format!("pub struct {name} {{"));
+        let header = format!("pub struct {name} {{");
+        let declared = sources.iter().any(|s| s.contains(&header));
         if !declared {
             continue;
         }

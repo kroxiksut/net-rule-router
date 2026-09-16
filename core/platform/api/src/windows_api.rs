@@ -401,6 +401,7 @@ impl WfpEnginePort for MockWindowsApi {
             action: spec.action,
             remote_ip: spec.remote_ip,
             remote_ip_set: spec.remote_ip_set.clone(),
+            remote_ip_set_v6: spec.remote_ip_set_v6.clone(),
             remote_port: spec.remote_port,
             weight: spec.weight,
             user_sid: spec.user_sid.clone(),
@@ -437,13 +438,13 @@ impl WfpEnginePort for MockWindowsApi {
 mod tests {
     use super::*;
     use crate::types::{WfpAction, WfpLayerKey};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     fn sample_route() -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::new(10, 0, 0, 0),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
             prefix_length: 24,
-            next_hop: Ipv4Addr::new(192, 168, 1, 1),
+            next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             interface_index: 5,
             metric: 100,
             is_ours: true,
@@ -457,6 +458,7 @@ mod tests {
             action: WfpAction::Block,
             remote_ip: Some(Ipv4Addr::new(1, 2, 3, 4)),
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight: 0x10001,
             id: WfpFilterId { raw: 42 },

@@ -1,8 +1,8 @@
-//! IPv4 forwarding-table FFI (`GetIpForwardTable2`,
-//! `CreateIpForwardEntry2`, `DeleteIpForwardEntry2`).
+//! Forwarding-table FFI (`GetIpForwardTable2`, `CreateIpForwardEntry2`,
+//! `DeleteIpForwardEntry2`), both address families.
 //!
 //! Backs three `WindowsApiPort` methods:
-//! - `get_ip_forward_table` — enumerate all IPv4 routes
+//! - `get_ip_forward_table` — enumerate all routes, IPv4 and IPv6
 //! - `create_ip_forward_entry` — add one route
 //! - `delete_ip_forward_entry` — remove one route
 //!
@@ -34,7 +34,7 @@
 #![allow(unsafe_code)]
 
 use std::mem::MaybeUninit;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::Win32::Foundation::NO_ERROR;
 use windows::Win32::NetworkManagement::IpHelper::{
@@ -43,11 +43,12 @@ use windows::Win32::NetworkManagement::IpHelper::{
 };
 use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows::Win32::Networking::WinSock::{
-    AF_INET, AF_INET6, IN_ADDR, IN_ADDR_0, SOCKADDR_IN, SOCKADDR_INET,
+    AF_INET, AF_INET6, AF_UNSPEC, IN6_ADDR, IN6_ADDR_0, IN_ADDR, IN_ADDR_0, SOCKADDR_IN,
+    SOCKADDR_IN6, SOCKADDR_IN6_0, SOCKADDR_INET,
 };
 
 use crate::error::PlatformError;
-use crate::types::{Ipv6RouteRow, RouteEntry};
+use crate::types::RouteEntry;
 
 const GET_OP: &str = "GetIpForwardTable2";
 const CREATE_OP: &str = "CreateIpForwardEntry2";
@@ -98,10 +99,12 @@ pub fn enumerate_routes() -> Result<Vec<RouteEntry>, PlatformError> {
     let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
 
     // SAFETY: `GetIpForwardTable2` writes a freshly-allocated
-    // `MIB_IPFORWARD_TABLE2*` into `table_ptr`. `AF_INET` (u16) is a
-    // valid `ADDRESS_FAMILY` value. On error the pointer remains null
-    // and we don't free it.
-    let code = unsafe { GetIpForwardTable2(AF_INET, &mut table_ptr).0 };
+    // `MIB_IPFORWARD_TABLE2*` into `table_ptr`. `AF_UNSPEC` (u16) is a
+    // valid `ADDRESS_FAMILY` value and asks for BOTH families — asking for one
+    // means never seeing the routes we install in the other, and a route we
+    // cannot see is a route we can never take back. On error the pointer
+    // remains null and we don't free it.
+    let code = unsafe { GetIpForwardTable2(AF_UNSPEC, &mut table_ptr).0 };
     if code != NO_ERROR.0 {
         return Err(PlatformError::Win32 {
             operation: GET_OP,
@@ -125,64 +128,6 @@ pub fn enumerate_routes() -> Result<Vec<RouteEntry>, PlatformError> {
     unsafe { FreeMibTable(table_ptr.cast()) };
 
     Ok(result)
-}
-
-/// Enumerate the IPv6 forwarding table. Read-only: nothing installs v6 routes,
-/// this exists so "what does the v6 table look like" is answerable from a log
-/// instead of from a screenshot of `route print -6`.
-pub fn enumerate_routes_v6() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
-    let mut table_ptr: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
-    // SAFETY: same contract as the v4 enumeration above, with the AF_INET6
-    // family; on error the pointer stays null and is not freed.
-    let code = unsafe { GetIpForwardTable2(AF_INET6, &mut table_ptr).0 };
-    if code != NO_ERROR.0 {
-        return Err(PlatformError::Win32 {
-            operation: GET_OP,
-            code,
-            message: format!("Win32 error {code}"),
-        });
-    }
-    if table_ptr.is_null() {
-        return Ok(Vec::new());
-    }
-    // SAFETY: filled by Win32 and non-null; released by `FreeMibTable` below.
-    let result = unsafe { read_table_v6(table_ptr) };
-    // SAFETY: allocated by the matching `GetIpForwardTable2`.
-    unsafe { FreeMibTable(table_ptr.cast()) };
-    Ok(result)
-}
-
-/// Walk a Win32-allocated table, keeping only the IPv6 rows.
-///
-/// # Safety
-/// `table` must be a live `MIB_IPFORWARD_TABLE2` from `GetIpForwardTable2`.
-unsafe fn read_table_v6(table: *const MIB_IPFORWARD_TABLE2) -> Vec<Ipv6RouteRow> {
-    // SAFETY: valid Win32 allocation per caller invariant.
-    let header = unsafe { &*table };
-    let count = header.NumEntries as usize;
-    if count == 0 {
-        return Vec::new();
-    }
-    let first = header.Table.as_ptr();
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        // SAFETY: Win32 guarantees `count` consecutive valid rows.
-        let row = unsafe { &*first.add(i) };
-        let (Some(dest), Some(next_hop)) = (
-            read_ipv6_from_inet(&row.DestinationPrefix.Prefix),
-            read_ipv6_from_inet(&row.NextHop),
-        ) else {
-            continue;
-        };
-        out.push(Ipv6RouteRow {
-            destination: dest,
-            prefix_length: row.DestinationPrefix.PrefixLength,
-            next_hop,
-            interface_index: row.InterfaceIndex,
-            metric: row.Metric,
-        });
-    }
-    out
 }
 
 /// Read the IPv6 address out of a `SOCKADDR_INET` union; `None` when the entry
@@ -233,11 +178,16 @@ unsafe fn read_table(table: *const MIB_IPFORWARD_TABLE2) -> Vec<RouteEntry> {
     out
 }
 
-/// Decode one `MIB_IPFORWARD_ROW2`. Returns `None` for IPv6 entries
-/// (we only carry IPv4 in `RouteEntry`).
+/// Decode one `MIB_IPFORWARD_ROW2` into a [`RouteEntry`] of either family.
+/// `None` when the row names a family we cannot read, or when destination and
+/// next hop disagree — the kernel does not produce such a row, so it would mean
+/// we misread the union.
 fn decode_row(row: &MIB_IPFORWARD_ROW2) -> Option<RouteEntry> {
-    let dest = read_ipv4_from_inet(&row.DestinationPrefix.Prefix)?;
-    let next_hop = read_ipv4_from_inet(&row.NextHop)?;
+    let dest = read_ip_from_inet(&row.DestinationPrefix.Prefix)?;
+    let next_hop = read_ip_from_inet(&row.NextHop)?;
+    if std::mem::discriminant(&dest) != std::mem::discriminant(&next_hop) {
+        return None;
+    }
     Some(RouteEntry {
         destination: dest,
         prefix_length: row.DestinationPrefix.PrefixLength,
@@ -252,6 +202,12 @@ fn decode_row(row: &MIB_IPFORWARD_ROW2) -> Option<RouteEntry> {
 /// Read the IPv4 address out of a `SOCKADDR_INET` union, returning
 /// `None` if the entry is not IPv4 (IPv6 routes are out of scope —
 /// see `core/platform/windows/src/types.rs` module doc).
+fn read_ip_from_inet(addr: &SOCKADDR_INET) -> Option<IpAddr> {
+    read_ipv4_from_inet(addr)
+        .map(IpAddr::V4)
+        .or_else(|| read_ipv6_from_inet(addr).map(IpAddr::V6))
+}
+
 fn read_ipv4_from_inet(addr: &SOCKADDR_INET) -> Option<Ipv4Addr> {
     // SAFETY: `si_family` is the discriminator arm of the union and
     // can always be read regardless of the variant currently set —
@@ -336,11 +292,13 @@ fn build_row(entry: &RouteEntry, with_protocol: bool) -> MIB_IPFORWARD_ROW2 {
         unsafe { InitializeIpForwardEntry(&mut row) };
     }
 
-    // Destination prefix — wrap an `Ipv4Addr` into a SOCKADDR_INET / V4 arm.
-    row.DestinationPrefix.Prefix = inet_from_ipv4(entry.destination);
+    // Destination prefix — wrap the address into the SOCKADDR_INET arm its
+    // family selects. Both fields take the same family: `RouteEntry::family`
+    // has already rejected a mismatched pair upstream.
+    row.DestinationPrefix.Prefix = inet_from_ip(entry.destination);
     row.DestinationPrefix.PrefixLength = entry.prefix_length;
 
-    row.NextHop = inet_from_ipv4(entry.next_hop);
+    row.NextHop = inet_from_ip(entry.next_hop);
 
     // Anonymous1 union has `InterfaceLuid: NET_LUID_LH | InterfaceIndex: u32`.
     // We fill `InterfaceIndex` only — Win32 looks up the LUID by index.
@@ -362,6 +320,38 @@ fn build_row(entry: &RouteEntry, with_protocol: bool) -> MIB_IPFORWARD_ROW2 {
 }
 
 /// Build a `SOCKADDR_INET` whose IPv4 arm carries the given address.
+fn inet_from_ip(addr: IpAddr) -> SOCKADDR_INET {
+    match addr {
+        IpAddr::V4(v4) => inet_from_ipv4(v4),
+        IpAddr::V6(v6) => inet_from_ipv6(v6),
+    }
+}
+
+/// Wrap an `Ipv6Addr` into the `Ipv6: SOCKADDR_IN6` arm of a `SOCKADDR_INET`.
+///
+/// `sin6_scope_id` stays zero: a scope only qualifies a link-local address, and
+/// the interface a route leaves by is already named by `InterfaceIndex` — a
+/// second, possibly disagreeing answer in the address itself is how a route
+/// silently lands on the wrong link.
+fn inet_from_ipv6(addr: Ipv6Addr) -> SOCKADDR_INET {
+    let mut inet: SOCKADDR_INET =
+        // SAFETY: zeroed SOCKADDR_INET is a documented "no-address"
+        // sentinel; we immediately overwrite the V6 arm.
+        unsafe { MaybeUninit::zeroed().assume_init() };
+    inet.Ipv6 = SOCKADDR_IN6 {
+        sin6_family: AF_INET6,
+        sin6_port: 0,
+        sin6_flowinfo: 0,
+        sin6_addr: IN6_ADDR {
+            u: IN6_ADDR_0 {
+                Byte: addr.octets(),
+            },
+        },
+        Anonymous: SOCKADDR_IN6_0 { sin6_scope_id: 0 },
+    };
+    inet
+}
+
 fn inet_from_ipv4(addr: Ipv4Addr) -> SOCKADDR_INET {
     let mut inet: SOCKADDR_INET =
         // SAFETY: zeroed SOCKADDR_INET is a documented "no-address"
@@ -404,9 +394,9 @@ mod tests {
     #[test]
     fn build_row_roundtrip_matches_decode() {
         let entry = RouteEntry {
-            destination: Ipv4Addr::new(10, 0, 0, 0),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
             prefix_length: 24,
-            next_hop: Ipv4Addr::new(192, 168, 1, 1),
+            next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             interface_index: 5,
             metric: 100,
             is_ours: true, // ignored by build_row
@@ -425,12 +415,73 @@ mod tests {
         assert_eq!(row.Protocol.0, PROTO_NET_MGMT_RAW);
     }
 
+    /// The v6 arm of `SOCKADDR_INET` is a different union member and a
+    /// different width; a round trip is what proves we write and read the same
+    /// one. Getting this wrong yields a syntactically valid address that is
+    /// simply not the one asked for — a wrong answer, not a failure.
+    #[test]
+    fn build_row_roundtrip_matches_decode_for_v6() {
+        let dest: Ipv6Addr = "2001:db8::1".parse().expect("v6");
+        let gw: Ipv6Addr = "fe80::1".parse().expect("v6");
+        let entry = RouteEntry {
+            destination: IpAddr::V6(dest),
+            prefix_length: 128,
+            next_hop: IpAddr::V6(gw),
+            interface_index: 7,
+            metric: 42,
+            is_ours: true,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        let row = build_row(&entry, true);
+        let decoded = decode_row(&row).expect("IPv6 row must decode");
+        assert_eq!(decoded.destination, entry.destination);
+        assert_eq!(decoded.prefix_length, 128);
+        assert_eq!(decoded.next_hop, entry.next_hop);
+        assert_eq!(decoded.interface_index, entry.interface_index);
+    }
+
+    /// An on-link v6 route — no gateway — is the only shape available out of a
+    /// tunnel that carries no IPv6 address of its own, which is how IPv6 leaves
+    /// most VPN interfaces. It must survive the round trip as v6, not decay
+    /// into an unspecified v4 address.
+    #[test]
+    fn an_on_link_v6_route_keeps_its_family_through_the_row() {
+        let dest: Ipv6Addr = "2001:db8::2".parse().expect("v6");
+        let entry = RouteEntry {
+            destination: IpAddr::V6(dest),
+            prefix_length: 128,
+            next_hop: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            interface_index: 9,
+            metric: 1,
+            is_ours: true,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        let decoded = decode_row(&build_row(&entry, true)).expect("row must decode");
+        assert_eq!(decoded.next_hop, IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert!(decoded.next_hop.is_unspecified());
+    }
+
+    /// `family()` is what the lowering consults before touching the kernel.
+    #[test]
+    fn a_mixed_family_route_has_no_family() {
+        let entry = RouteEntry {
+            destination: IpAddr::V6("2001:db8::3".parse().expect("v6")),
+            prefix_length: 128,
+            next_hop: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            interface_index: 3,
+            metric: 1,
+            is_ours: true,
+            table: nrr_platform_api::RouteTableRef::Main,
+        };
+        assert!(entry.family().is_none());
+    }
+
     #[test]
     fn build_row_for_delete_omits_protocol_stamp() {
         let entry = RouteEntry {
-            destination: Ipv4Addr::new(10, 0, 0, 0),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)),
             prefix_length: 24,
-            next_hop: Ipv4Addr::new(192, 168, 1, 1),
+            next_hop: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
             interface_index: 5,
             metric: 100,
             is_ours: true,

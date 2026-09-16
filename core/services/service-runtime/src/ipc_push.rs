@@ -36,6 +36,46 @@ pub fn extract_subscription_id(env: &IpcResponseEnvelope) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// What one response did to a connection's push subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionChange {
+    Unchanged,
+    Opened(String),
+    Replaced { previous: String, current: String },
+}
+
+/// Serve a connection its NEWEST subscription.
+///
+/// A client that subscribes again on the same connection puts the new channel
+/// in force. Keeping the first id left every later subscription on the bus with
+/// nobody reading it, and a bus that replaces a client's earlier subscription
+/// would have left the connection reading an id that no longer exists.
+pub fn adopt_subscription(
+    current: &mut Option<String>,
+    response: &IpcResponseEnvelope,
+    event_bus: Option<&EventBus>,
+) -> SubscriptionChange {
+    if !response.ok {
+        return SubscriptionChange::Unchanged;
+    }
+    let Some(new_id) = extract_subscription_id(response) else {
+        return SubscriptionChange::Unchanged;
+    };
+    match current.replace(new_id.clone()) {
+        None => SubscriptionChange::Opened(new_id),
+        Some(previous) if previous == new_id => SubscriptionChange::Unchanged,
+        Some(previous) => {
+            if let Some(bus) = event_bus {
+                bus.unsubscribe(&previous);
+            }
+            SubscriptionChange::Replaced {
+                previous,
+                current: new_id,
+            }
+        }
+    }
+}
+
 /// One push pump tick. Returns `true` when a write failed, which the caller
 /// must treat as "close this connection".
 ///
@@ -169,6 +209,72 @@ mod tests {
             bus.peek_pending_for(&s.subscription_id, 32).is_empty(),
             "cursor should have advanced past the last delivered id"
         );
+    }
+
+    fn subscribe_response(subscription_id: &str) -> IpcResponseEnvelope {
+        IpcResponseEnvelope {
+            request_id: "r".into(),
+            correlation_id: "c".into(),
+            operation_id: None,
+            ok: true,
+            stale: false,
+            diagnostics_id: None,
+            user_action_required: false,
+            payload: Some(serde_json::json!({ "subscription-id": subscription_id })),
+            error: None,
+        }
+    }
+
+    /// A tray that re-subscribed every ten seconds on one connection left a
+    /// subscription behind each time; the bus filled to its cap with them.
+    #[test]
+    fn a_second_subscribe_on_a_connection_replaces_the_first_on_the_bus() {
+        let bus = EventBus::new();
+        let first = bus.subscribe("tray-1".into(), None).subscription_id;
+        let mut current = None;
+        assert_eq!(
+            adopt_subscription(&mut current, &subscribe_response(&first), Some(&bus)),
+            SubscriptionChange::Opened(first.clone())
+        );
+
+        let second = bus.subscribe("tray-2".into(), None).subscription_id;
+        assert_eq!(
+            adopt_subscription(&mut current, &subscribe_response(&second), Some(&bus)),
+            SubscriptionChange::Replaced {
+                previous: first,
+                current: second.clone()
+            }
+        );
+        assert_eq!(current.as_deref(), Some(second.as_str()));
+        assert_eq!(bus.subscriber_count(), 1);
+
+        // The connection now reads the subscription that is still there.
+        let id = bus.publish(adapters_event());
+        let mut sent = Vec::new();
+        assert!(!flush_push_frames(&bus, &second, 32, collector(&mut sent)));
+        assert_eq!(sent.len(), 1);
+        let frame: StatusUpdatePushFrame =
+            serde_json::from_value(sent[0].payload.clone().expect("payload")).expect("decode");
+        assert_eq!(frame.event_id, id);
+    }
+
+    #[test]
+    fn responses_that_are_not_a_subscription_leave_it_alone() {
+        let bus = EventBus::new();
+        let mut current = Some("sub-a".to_string());
+        let mut failed = subscribe_response("sub-b");
+        failed.ok = false;
+        assert_eq!(
+            adopt_subscription(&mut current, &failed, Some(&bus)),
+            SubscriptionChange::Unchanged
+        );
+        let mut other = subscribe_response("x");
+        other.payload = Some(serde_json::json!({ "rules": [] }));
+        assert_eq!(
+            adopt_subscription(&mut current, &other, Some(&bus)),
+            SubscriptionChange::Unchanged
+        );
+        assert_eq!(current.as_deref(), Some("sub-a"));
     }
 
     #[test]

@@ -63,14 +63,14 @@ impl ReachabilityProbe for LinuxIcmpProbe {
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 /// Type, code, checksum, identifier, sequence.
-const ICMP_HEADER_LEN: usize = 8;
+pub(crate) const ICMP_HEADER_LEN: usize = 8;
 /// Enough payload to look like a normal ping to anything counting bytes.
 const ECHO_PAYLOAD: &[u8] = b"nrr-reachability";
 
 /// RFC 1071 one's-complement sum. Returns the value to store in the checksum
 /// field, which is the complement of the sum — so running this over a complete
 /// packet, checksum field included, yields zero.
-fn internet_checksum(bytes: &[u8]) -> u16 {
+pub(crate) fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut chunks = bytes.chunks_exact(2);
     for pair in &mut chunks {
@@ -88,7 +88,7 @@ fn internet_checksum(bytes: &[u8]) -> u16 {
 
 /// Build an echo request. `identifier` is written for well-formedness only —
 /// a datagram ICMP socket replaces it (see the module note).
-fn build_echo_request(identifier: u16, sequence: u16, payload: &[u8]) -> Vec<u8> {
+pub(crate) fn build_echo_request(identifier: u16, sequence: u16, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(ICMP_HEADER_LEN + payload.len());
     packet.push(ICMP_ECHO_REQUEST);
     packet.push(0); // code
@@ -173,7 +173,7 @@ fn echo_once(target: Ipv4Addr, timeout: Duration) -> std::io::Result<bool> {
 
 /// Monotonic per-process sequence source.
 #[cfg(target_os = "linux")]
-fn next_sequence() -> u16 {
+pub(crate) fn next_sequence() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     static NEXT: AtomicU16 = AtomicU16::new(1);
     NEXT.fetch_add(1, Ordering::Relaxed)
@@ -182,7 +182,7 @@ fn next_sequence() -> u16 {
 /// Owning wrapper over the ICMP socket descriptor, so every early return closes
 /// it exactly once.
 #[cfg(target_os = "linux")]
-struct IcmpSocket(libc::c_int);
+pub(crate) struct IcmpSocket(libc::c_int);
 
 #[cfg(target_os = "linux")]
 impl IcmpSocket {
@@ -194,7 +194,7 @@ impl IcmpSocket {
         Self::open_kind(libc::SOCK_DGRAM).or_else(|_| Self::open_kind(libc::SOCK_RAW))
     }
 
-    fn open_kind(kind: libc::c_int) -> std::io::Result<Self> {
+    pub(crate) fn open_kind(kind: libc::c_int) -> std::io::Result<Self> {
         // SAFETY: `socket` takes three integers and returns a descriptor.
         let fd = unsafe { libc::socket(libc::AF_INET, kind, libc::IPPROTO_ICMP) };
         if fd < 0 {
@@ -203,7 +203,7 @@ impl IcmpSocket {
         Ok(Self(fd))
     }
 
-    fn set_receive_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+    pub(crate) fn set_receive_timeout(&self, timeout: Duration) -> std::io::Result<()> {
         // A zero timeval means "block forever" — never that. Anything under a
         // microsecond rounds up so a tiny timeout cannot become an eternal one.
         let micros = timeout.as_micros().max(1);
@@ -228,7 +228,7 @@ impl IcmpSocket {
         Ok(())
     }
 
-    fn send_to(&self, packet: &[u8], target: Ipv4Addr) -> std::io::Result<()> {
+    pub(crate) fn send_to(&self, packet: &[u8], target: Ipv4Addr) -> std::io::Result<()> {
         // SAFETY: `sockaddr_in` is plain data; an all-zero value is valid to
         // fill in field by field.
         let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -254,7 +254,48 @@ impl IcmpSocket {
         Ok(())
     }
 
-    fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    /// Hop limit for everything this socket sends.
+    pub(crate) fn set_ttl(&self, ttl: u8) -> std::io::Result<()> {
+        let value = libc::c_int::from(ttl);
+        // SAFETY: `value` is live for the call and sized as the option expects.
+        let rc = unsafe {
+            libc::setsockopt(
+                self.0,
+                libc::IPPROTO_IP,
+                libc::IP_TTL,
+                std::ptr::addr_of!(value).cast::<libc::c_void>(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Send from `source`, the same steering the relay's TCP dials use.
+    pub(crate) fn bind_source(&self, source: Ipv4Addr) -> std::io::Result<()> {
+        // SAFETY: `sockaddr_in` is plain data; all-zero is valid to fill in.
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr = libc::in_addr {
+            s_addr: u32::from(source).to_be(),
+        };
+        // SAFETY: the address is live for the call and its size is the one passed.
+        let rc = unsafe {
+            libc::bind(
+                self.0,
+                std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn receive(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         // SAFETY: `buffer` is live and writable for its own length.
         let read = unsafe {
             libc::recv(

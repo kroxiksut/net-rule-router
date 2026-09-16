@@ -213,6 +213,12 @@ pub enum AddressMatchDto {
         /// IPv4 address as `"a.b.c.d"`.
         address: String,
     },
+    /// Single IPv6 address in its RFC 5952 text form.
+    #[serde(rename = "exact-ipv6")]
+    ExactIpv6 {
+        /// IPv6 address, e.g. `"2001:db8::7"`.
+        address: String,
+    },
 }
 
 /// Application-side match condition.
@@ -392,7 +398,9 @@ fn fold_rule(rule: &mut RuleDto) {
             // An address has one spelling already: the validator rejects
             // leading zeros rather than folding them, so trimming is all a
             // comparison may do without inventing a difference of its own.
-            AddressMatchDto::ExactIpv4 { address } => *address = address.trim().to_string(),
+            AddressMatchDto::ExactIpv4 { address } | AddressMatchDto::ExactIpv6 { address } => {
+                *address = address.trim().to_string()
+            }
         }
     }
     if let Some(app) = rule.app_match.as_mut() {
@@ -436,6 +444,7 @@ fn comparison_key(rule: &RuleDto) -> String {
         Some(AddressMatchDto::SuffixDomain { suffix }) => ("suffix-domain", suffix.as_str()),
         Some(AddressMatchDto::Zone { name }) => ("zone", name.as_str()),
         Some(AddressMatchDto::ExactIpv4 { address }) => ("exact-ipv4", address.as_str()),
+        Some(AddressMatchDto::ExactIpv6 { address }) => ("exact-ipv6", address.as_str()),
         None => ("", ""),
     };
     // The app side keeps its own discriminator: an `Exact` and a `Glob` of the

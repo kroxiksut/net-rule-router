@@ -37,6 +37,19 @@ pub trait RouteSelector: Send + Sync {
     fn route_for(&self, hostname: &str) -> RouteRole;
 }
 
+/// Could `ip` be a single host that owns a flow?
+///
+/// Excludes multicast, the limited broadcast and the unspecified address. The
+/// pool's own network and broadcast addresses are excluded separately, by
+/// [`FakeIpPoolConfig::holds_host`], because only the pool knows its prefix.
+fn is_unicast_host(ip: IpAddr) -> bool {
+    use nrr_domain::address_class::{classify, AddressClass};
+    matches!(
+        classify(ip),
+        AddressClass::Routable | AddressClass::Loopback | AddressClass::LinkLocal
+    )
+}
+
 /// What to do with a packet addressed to the fake range.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayDecision {
@@ -48,6 +61,16 @@ pub enum RelayDecision {
     /// Not addressed to the fake range at all — none of our business. The
     /// packet reached the adapter by accident (or the pool was reconfigured).
     NotFakeAddress,
+    /// Not a flow at all: the destination is multicast, broadcast, or the
+    /// pool's own network/broadcast address, so no endpoint owns it.
+    ///
+    /// Kept apart from every other refusal because it must NOT be answered.
+    /// These are discovery datagrams — mDNS, LLMNR, NetBIOS, SSDP — and they
+    /// are how the host resolves SHORT names when DNS does not. Refusing one
+    /// does not fail a flow closed; it breaks name resolution on the link, and
+    /// the symptom lands far away (a share or an RDP host that "does not
+    /// exist"). The packet is simply not ours: ignore it.
+    NotAFlow,
     /// Inside the pool but no hostname holds that address any more: a stale
     /// binding whose slot was recycled. Dropping is the safe answer — the
     /// alternative would be forwarding a user's bytes to whatever host happens
@@ -71,6 +94,7 @@ impl RelayDecision {
         match self {
             Self::Relay { .. } => "relay",
             Self::NotFakeAddress => "not-fake-address",
+            Self::NotAFlow => "not-a-flow",
             Self::UnmappedFakeAddress => "unmapped-fake-address",
             Self::NoUpstreamAddress { .. } => "no-upstream-address",
             Self::OutOfScope { .. } => "out-of-scope",
@@ -152,12 +176,33 @@ impl RelayCore {
     /// disturbing anything.
     #[must_use]
     pub fn decide(&self, packet: &ParsedPacket) -> RelayDecision {
-        let destination = packet.key.destination;
+        self.decide_endpoints(packet.key.source, packet.key.destination)
+    }
+
+    /// [`Self::decide`] for traffic with no ports — an ICMP echo is keyed on
+    /// its addresses alone (pass port 0), and must leave the way a connection
+    /// to the same name would.
+    #[must_use]
+    pub fn decide_endpoints(&self, source: SocketAddr, destination: SocketAddr) -> RelayDecision {
+        // FIRST, and before any lock: a destination nobody owns can never be a
+        // binding, and answering it is actively harmful (see `NotAFlow`). It is
+        // also the cheapest possible check, which matters on a data path.
+        if !is_unicast_host(destination.ip()) {
+            return RelayDecision::NotAFlow;
+        }
         let hostname = {
             // A poisoned allocator must not take the decision path with it: the
             // panic would be re-raised on every packet, and the poller's own
             // restart loop would re-enter it forever with the block armed.
             let mut allocator = self.allocator.lock().unwrap_or_else(|p| p.into_inner());
+            // Inside the range but not a host — the pool's own network or
+            // broadcast address. Nobody owns it, so it is not a flow and must
+            // not be answered.
+            if allocator.is_fake_address(destination.ip())
+                && !allocator.holds_host(destination.ip())
+            {
+                return RelayDecision::NotAFlow;
+            }
             if !allocator.is_fake_address(destination.ip()) {
                 // In-tunnel rescue: a VPN client that enumerates
                 // TUN adapters can bind its in-tunnel control socket to OUR
@@ -232,7 +277,7 @@ impl RelayCore {
         if route == RouteRole::Secondary
             && self
                 .vpn_bypass
-                .owned_by_confirmed_client(packet.key.source, destination)
+                .owned_by_confirmed_client(source, destination)
         {
             route = RouteRole::Primary;
         }
@@ -347,6 +392,52 @@ mod tests {
             Arc::new(resolver),
             Arc::new(FixedRouteSelector(route)),
         )
+    }
+
+    /// The pool's own broadcast address is where the host sends NetBIOS name
+    /// queries on this link. Treating it as a recycled binding answered a name
+    /// lookup with a refusal, and the symptom surfaces far away — a host that
+    /// «does not exist» when reached by short name.
+    #[test]
+    fn the_pools_broadcast_address_is_not_a_binding() {
+        let (allocator, _) = allocator_with("assistant.example");
+        let relay = core(
+            allocator,
+            StaticUpstreamResolver::new(),
+            RouteRole::Secondary,
+        );
+
+        assert_eq!(
+            relay.decide(&packet("198.19.255.255:137".parse().expect("addr"), false)),
+            RelayDecision::NotAFlow,
+            "the subnet broadcast is not a host in the pool"
+        );
+    }
+
+    /// Discovery runs on multicast, and the answer to a multicast datagram is
+    /// silence, not a refusal.
+    #[test]
+    fn multicast_and_broadcast_destinations_are_not_flows() {
+        let (allocator, _) = allocator_with("assistant.example");
+        let relay = core(
+            allocator,
+            StaticUpstreamResolver::new(),
+            RouteRole::Secondary,
+        );
+
+        for dst in [
+            "224.0.0.251:5353",
+            "224.0.0.252:5355",
+            "239.255.255.250:1900",
+            "255.255.255.255:138",
+            "[ff02::fb]:5353",
+        ] {
+            assert_eq!(
+                relay.decide(&packet(dst.parse().expect("addr"), false)),
+                RelayDecision::NotAFlow,
+                "{dst} names no endpoint"
+            );
+        }
     }
 
     #[test]

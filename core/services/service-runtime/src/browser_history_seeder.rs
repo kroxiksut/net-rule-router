@@ -23,9 +23,10 @@ use nrr_storage::repository::CacheRepository;
 use nrr_storage::resolution_source::StorageResolutionSource;
 
 use crate::dns_observation_consumer::{rule_set_matches, ActiveSidFn};
-use crate::net_filter::is_non_routable_v4;
+use crate::net_filter::is_non_routable;
 use crate::per_sid_orchestrator::RulesProvider;
 use crate::supervised_runtime::RouteRecomputeHook;
+use nrr_platform_api::dns::AddressFamily;
 
 /// Outcome of one seed pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -118,13 +119,14 @@ impl BrowserHistorySeeder {
         summary.rule_matching = matching.len();
 
         for host in &matching {
-            let Ok(record) = self.resolver.resolve_a(host) else {
+            let Ok(record) = self.resolver.resolve(host, AddressFamily::Ipv4) else {
                 continue;
             };
-            let routable: Vec<std::net::Ipv4Addr> = record
+            let routable: Vec<std::net::IpAddr> = record
                 .addresses
-                .into_iter()
-                .filter(|ip| !is_non_routable_v4(ip))
+                .iter()
+                .copied()
+                .filter(|ip| !is_non_routable(ip))
                 .collect();
             if routable.is_empty() {
                 continue;
@@ -169,7 +171,7 @@ mod tests {
     use nrr_domain::{RouteBehaviorMode, RuleId};
     use nrr_platform_api::browser_history::MockBrowserHistoryRead;
     use nrr_platform_api::dns::{DnsResolverError, ResolvedRecord};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use crate::per_sid_orchestrator::ActiveRulesSnapshot;
 
@@ -190,11 +192,15 @@ mod tests {
         map: std::collections::HashMap<String, Vec<Ipv4Addr>>,
     }
     impl DnsResolverPort for FakeResolver {
-        fn resolve_a(&self, hostname: &str) -> Result<ResolvedRecord, DnsResolverError> {
+        fn resolve(
+            &self,
+            hostname: &str,
+            _family: AddressFamily,
+        ) -> Result<ResolvedRecord, DnsResolverError> {
             match self.map.get(hostname) {
                 Some(ips) => Ok(ResolvedRecord {
                     canonical_hostname: hostname.to_string(),
-                    addresses: ips.clone(),
+                    addresses: ips.iter().copied().map(IpAddr::V4).collect(),
                     ttl_seconds: Some(300),
                 }),
                 None => Err(DnsResolverError::NxDomain {

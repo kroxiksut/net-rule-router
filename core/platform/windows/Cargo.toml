@@ -68,11 +68,16 @@ windows = { version = "0.58", features = [
     # adapter enumeration reports identically (as nothing at all).
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_NetworkManagement_IpHelper",
+    # IcmpSendEcho2Ex's APC parameter type.
+    "Win32_System_IO",
     # Block 16.12.A.0: IP_ADAPTER_ADDRESSES_LH transitively pulls in
     # NDIS types (NET_LUID_LH, NET_IF_*) which the windows crate gates
     # behind a separate feature flag.
     "Win32_NetworkManagement_Ndis",
     "Win32_NetworkManagement_WindowsFilteringPlatform",
+    # INetworkListManager: name the network our TUN adapter joins.
+    "Win32_Networking_NetworkListManager",
+    "Win32_System_Com",
     "Win32_Networking_WinSock",
     # Operator-facing records in the Application event log.
     "Win32_System_EventLog",
@@ -136,6 +141,9 @@ windows = { version = "0.58", features = [
     # a sign-out. SendMessageTimeoutW + HWND_BROADCAST + SMTO_ABORTIFHUNG bound
     # the broadcast so one hung window cannot block the caller.
     "Win32_UI_WindowsAndMessaging",
+    # SHGetKnownFolderPath: `%ProgramData%` as the shell registers it, not as an
+    # inherited environment string says (system_shell).
+    "Win32_UI_Shell",
     # SetStdHandle points this process's error stream at its own log file
     # (process_error_stream): a launcher started by another process otherwise
     # writes its diagnostics into the parent's captured stream.

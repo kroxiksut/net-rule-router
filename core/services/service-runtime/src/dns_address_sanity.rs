@@ -32,7 +32,7 @@
 //! Everything here is pure and allocation-free on the clean path — it runs on
 //! every resolver answer.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Why an address cannot be trusted as a destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,39 @@ pub(crate) fn is_unreachable_v4(ip: &Ipv4Addr) -> bool {
         224..=255 => true,
         _ => false,
     }
+}
+
+/// `true` when nothing can ever be reached at `ip`, in any context — the IPv6
+/// half of [`is_unreachable_v4`].
+///
+/// Defers to the domain classifier for the four classes it already names
+/// (unspecified, loopback, multicast, link-local) rather than restating their
+/// prefixes here, and adds the two an address CLASSIFIER has no reason to model
+/// because they are not about how a destination is talked about:
+///
+/// - `::ffff:0:0/96` — an IPv4 address wearing IPv6 clothes. Admitting it would
+///   give one address two spellings, and the rule that matches one would miss
+///   the other. It belongs on the v4 path, canonicalised, or nowhere.
+/// - `100::/64` — the discard prefix (RFC 6666). Traffic to it is dropped by
+///   definition, so a name answering with it answers with nothing.
+///
+/// Unique-local `fc00::/7` is deliberately ALLOWED, mirroring the v4 rule that
+/// lets private space through: on this product's own network it is a perfectly
+/// good destination.
+#[inline]
+#[must_use]
+pub(crate) fn is_unreachable_v6(ip: &Ipv6Addr) -> bool {
+    use nrr_domain::address_class::{classify, AddressClass};
+
+    if !matches!(classify(IpAddr::V6(*ip)), AddressClass::Routable) {
+        return true;
+    }
+    if ip.to_ipv4_mapped().is_some() {
+        return true;
+    }
+    let s = ip.segments();
+    // 100::/64
+    s[0] == 0x0100 && s[1] == 0 && s[2] == 0 && s[3] == 0
 }
 
 /// `true` when `ip` has no business appearing in a public DNS answer:

@@ -107,8 +107,9 @@ pub fn plan_fake_ip_enforcement(
             if !scope.decide(&host, None).is_fake_ip() {
                 continue;
             }
-            for ip in cache
-                .ips_for_hostname(&host)
+            // The fake-IP pool hands out v4 addresses, so its scope is the v4
+            // half; a v6 arm arrives with the v6 relay.
+            for ip in crate::dns_wire::only_v4(&cache.ips_for_hostname(&host))
                 .into_iter()
                 .take(PER_HOSTNAME_IP_CAP)
             {
@@ -419,7 +420,9 @@ mod tests {
         let literal = CanonicalRule {
             id: RuleId("r-ip".into()),
             enabled: true,
-            address_match: Some(CanonicalAddressMatch::ExactIp(ip(198, 51, 100, 7))),
+            address_match: Some(CanonicalAddressMatch::ExactIp(std::net::IpAddr::V4(ip(
+                198, 51, 100, 7,
+            )))),
             app_match: None,
             comment: String::new(),
             action: nrr_domain::RuleAction::Route,

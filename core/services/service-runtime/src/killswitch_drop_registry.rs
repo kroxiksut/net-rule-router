@@ -27,9 +27,11 @@
 //!   while the secondary is usable means the pin outran the route (or the
 //!   scope is genuinely too wide) — actionable.
 //! - **ipv6-cut** — the blanket close of the IPv6 family (see
-//!   `killswitch_codegen::catch_all_v6_filters`). Deliberately NOT part of the
-//!   role-verification set: a v6 drop proves nothing about the tunnel, it only
-//!   needs its own wording in the notice.
+//!   `killswitch_codegen::catch_all_v6_filters`), i.e. a v6 block naming no
+//!   destination. Deliberately NOT part of the role-verification set: it proves
+//!   nothing about the tunnel and only needs its own wording in the notice. A
+//!   v6 block that DOES name a destination is a pin like any other and belongs
+//!   in the destination-scoped set.
 //! - **app-scoped** — the block carries only an `ALE_APP_ID` condition and no
 //!   destination (`killswitch_codegen::app_kill_switch_filters`). It covers
 //!   EVERY destination the process talks to, including the ones the routing

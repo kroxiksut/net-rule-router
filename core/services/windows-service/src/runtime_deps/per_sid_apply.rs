@@ -16,6 +16,8 @@ use super::*;
 /// Owned clones (every field is an `Arc` or a `Copy`) rather than borrows, so
 /// the moved body keeps using `Arc::clone(&x)` exactly as it did inline.
 pub(super) struct PerSidApplyInputs<'a> {
+    /// A background disk walk found an application the last plan lacked.
+    pub app_walk_found: Arc<dyn Fn() + Send + Sync>,
     pub artifacts: &'a BootstrapArtifacts,
     pub cache_refresh_secs: u32,
     pub cache_store: Option<Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>>,
@@ -65,6 +67,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
     // Destructured rather than read through `inputs.x`, so the body below is
     // the same text it was inline and the diff shows a move, not a rewrite.
     let PerSidApplyInputs {
+        app_walk_found,
         artifacts,
         cache_refresh_secs,
         cache_store,
@@ -661,11 +664,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             state_conn,
                         )),
                     ))
-                    // Shares the process singleton with the settings writer
-                    // below, so a Save flips this gate live, no restart.
-                    .with_isp_block_candidates_flag(
-                        nrr_service_runtime::auto_rules::global_isp_block_candidates_enabled(),
-                    )
                     // Suggestions wait for the additional route: with it down
                     // every address already travels the main link, so there is
                     // no half-loaded page to offer a fix for. Same resolve the
@@ -799,6 +797,13 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         let coord = Arc::clone(&route_coord);
                         Arc::new(move |sid: &str| coord.kill_switch_exemptions(sid))
                     };
+                // What policy may do about IPv6 for this SID: the same
+                // coordinator, because the answer is a fact about the links it
+                // already resolves.
+                let ipv6_guard_resolver: nrr_service_runtime::per_sid_orchestrator::Ipv6GuardResolver = {
+                        let coord = Arc::clone(&route_coord);
+                        Arc::new(move |sid: &str| coord.ipv6_guard(sid))
+                    };
                 // Fail-closed exemptions: resolved even
                 // when the secondary is gone, so a fail-closed block-all
                 // (mode B) keeps LAN / manageability and lets the tunnel
@@ -856,6 +861,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         )
                         .with_failure_mode_source(failure_mode_source)
                         .with_kill_switch_resolver(kill_switch_resolver)
+                        .with_ipv6_guard_resolver(ipv6_guard_resolver)
                         .with_fail_closed_exemptions_resolver(fail_closed_exemptions_resolver)
                         // App-routing via observation: read the
                         // process-wide observed app→IP store the conn-observe
@@ -880,7 +886,10 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                             nrr_service_runtime::confirmed_client_app_resolver::ConfirmedClientAppPathResolver::new(
                                 Arc::new(
                                     nrr_service_runtime::persistent_app_resolver::PersistentAppPathResolver::new(
-                                        Arc::new(nrr_platform_windows::WindowsAppPathResolver::new()),
+                                        Arc::new(
+                                            nrr_platform_windows::WindowsAppPathResolver::new()
+                                                .with_walk_listener(app_walk_found),
+                                        ),
                                         Arc::clone(state_conn),
                                     ),
                                 ),

@@ -20,7 +20,7 @@
 //! instead of on someone's machine.
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use nrr_domain::canonical::{
@@ -74,7 +74,10 @@ fn main_link_claims() -> Vec<(&'static str, CanonicalRule)> {
     vec![
         (
             "by literal address",
-            address_rule("r-ip", CanonicalAddressMatch::ExactIp(CONTESTED)),
+            address_rule(
+                "r-ip",
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(CONTESTED)),
+            ),
         ),
         (
             "by exact name",
@@ -106,6 +109,7 @@ fn resolver() -> MockAppPathResolver {
 fn target() -> SecondaryRouteTarget {
     SecondaryRouteTarget {
         gateway: Ipv4Addr::new(10, 88, 0, 1),
+        gateway_v6: None,
         interface_index: 42,
     }
 }
@@ -133,6 +137,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
             app_resolver: &resolver,
             secondary_ip_denylist: &HashSet::new(),
             zone_priority_over_ip: false,
+            families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
         });
         let routes = generate_routes(
             RouteBehaviorMode::PreferPrimary,
@@ -147,7 +152,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
         );
 
         assert!(
-            !filters.secondary_dest_ips.contains(&CONTESTED),
+            !filters.secondary_dest_ips.contains(&IpAddr::V4(CONTESTED)),
             "{how}: the filter side took over an address the main link names — the kill-switch \
              would block it for every process",
         );
@@ -158,7 +163,7 @@ fn an_address_the_main_link_names_is_never_taken_over_by_an_app_rule() {
         // The app rule is not disarmed by the guard: what nobody else named is
         // still its own.
         assert!(
-            filters.secondary_dest_ips.contains(&APP_ONLY),
+            filters.secondary_dest_ips.contains(&IpAddr::V4(APP_ONLY)),
             "{how}: the guard swallowed a destination no other rule claims",
         );
     }
@@ -182,7 +187,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
             app_rule("r-app", APP),
             address_rule(
                 "r-sec",
-                CanonicalAddressMatch::ExactIp(Ipv4Addr::new(198, 51, 100, 4)),
+                CanonicalAddressMatch::ExactIp(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4))),
             ),
         ]),
     };
@@ -196,6 +201,7 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
     });
     let routes = generate_routes(
         RouteBehaviorMode::PreferPrimary,
@@ -209,11 +215,23 @@ fn every_protected_destination_is_one_the_routes_actually_steer() {
         &[],
     );
 
-    let steered: HashSet<Ipv4Addr> = routes.routes.iter().map(|r| r.destination).collect();
+    let steered: HashSet<Ipv4Addr> = routes
+        .routes
+        .iter()
+        .filter_map(|r| match r.destination {
+            IpAddr::V4(d) => Some(d),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
     let orphaned: Vec<Ipv4Addr> = filters
         .secondary_dest_ips
         .iter()
-        .copied()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            // The Windows route producer is v4-only, so a v6 destination has
+            // no route to be orphaned from — see the seam in `route_codegen`.
+            IpAddr::V6(_) => None,
+        })
         .filter(|ip| !steered.contains(ip))
         .collect();
 
@@ -274,18 +292,19 @@ fn an_address_rule_wins_over_an_app_rule_on_either_link() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
     });
 
     assert!(
-        filters.secondary_dest_ips.contains(&CONTESTED),
+        filters.secondary_dest_ips.contains(&IpAddr::V4(CONTESTED)),
         "the address rule that names it must keep the address on its own link",
     );
     assert!(
-        !filters.primary_dest_ips.contains(&CONTESTED),
+        !filters.primary_dest_ips.contains(&IpAddr::V4(CONTESTED)),
         "the app rule on the main link took an address the tunnel's own rule names — that host          would leave over the open link whenever this program touched it",
     );
     // And what only the program knows about is still the program's.
-    assert!(filters.primary_dest_ips.contains(&APP_ONLY));
+    assert!(filters.primary_dest_ips.contains(&IpAddr::V4(APP_ONLY)));
 }
 
 /// The census is the second half of the same question, and it went missing on
@@ -312,6 +331,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
         app_resolver: &resolver,
         secondary_ip_denylist: &HashSet::new(),
         zone_priority_over_ip: false,
+        families: nrr_service_runtime::enforcement_planner::FamilyScope::V4Only,
     });
     let routes = generate_routes(
         RouteBehaviorMode::PreferPrimary,
@@ -326,7 +346,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
     );
 
     assert!(
-        !filters.secondary_dest_ips.contains(&APP_ONLY),
+        !filters.secondary_dest_ips.contains(&IpAddr::V4(APP_ONLY)),
         "the filter side pinned a destination another process is using; the kill-switch would          cut that process off too",
     );
     assert!(
@@ -335,7 +355,7 @@ fn a_destination_another_process_uses_is_pinned_by_neither_mechanism() {
     );
     // Untouched by the census, so still the app rule's own.
     assert!(
-        filters.secondary_dest_ips.contains(&CONTESTED),
+        filters.secondary_dest_ips.contains(&IpAddr::V4(CONTESTED)),
         "the census swallowed a destination nobody else uses",
     );
 }
@@ -362,6 +382,7 @@ fn the_neutral_planner_reads_the_same_arbiter() {
         "S-1-5-21-TEST",
         RouteBehaviorMode::PreferPrimary,
         &PlannerInput {
+            ipv6: nrr_service_runtime::enforcement_planner::Ipv6Guard::Off,
             fqdn_cache: &cache,
             app_resolver: &resolver,
             app_observations: &observations,
@@ -465,9 +486,7 @@ fn only_the_arbiter_reads_the_observation_store() {
     );
     assert!(
         stripped_files > 0,
-        "no `<module>/tests.rs` was recognised: unit tests moved into their own \
-         files, and a strip that only knows `#[cfg(test)]` blocks would read \
-         every one of them as production",
+        "no `<module>/tests.rs` and no `<module>/tests/` file was recognised: \n         unit tests moved into their own files, and a strip that only knows \n         `#[cfg(test)]` blocks would read every one of them as production",
     );
     assert!(
         offenders.is_empty(),

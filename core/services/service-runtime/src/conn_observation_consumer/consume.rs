@@ -12,11 +12,14 @@ use super::*;
 impl ConnectionObservationConsumer {
     /// Consume a batch: derive each connection's egress interface and emit a
     /// per-connection trace line on `nrr::conn-trace`. Returns counts by role.
-    pub fn consume(&self, batch: &[ConnectionObservation], _now: SystemTime) -> ConnConsumeSummary {
+    pub fn consume(&self, batch: &[ConnectionObservation], now: SystemTime) -> ConnConsumeSummary {
         let mut summary = ConnConsumeSummary::default();
         if batch.is_empty() {
             return summary;
         }
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
 
         // Live context, read once per batch. Prefer the full unicast table
         // (IPv4 + IPv6 → ifindex) so v6 egress is labelled; fall back to the
@@ -39,13 +42,16 @@ impl ConnectionObservationConsumer {
         };
         // The "no rule covers this host" catch-all's id is deterministic
         // (same hash the codegen used to mint it) — computed once per batch,
-        // only when a sink is actually wired, so an idle observer never pays
-        // for it.
-        let default_block_id: Option<u64> = self.block_notice_sink.as_ref().and_then(|_| {
+        // only when a notice or the trace will read it, so an idle observer
+        // never pays for it.
+        let default_block_id: Option<u64> = (self.block_notice_sink.is_some()
+            || self.trace_ring.is_some())
+        .then(|| {
             active_sid_now.as_deref().map(|sid| {
                 crate::wfp_codegen::filter_id_for(sid, "default", "", "default", "block-all").raw
             })
-        });
+        })
+        .flatten();
 
         // De-dup learned endpoints within the batch
         // so a burst of drops to one server calls the learner once.
@@ -71,7 +77,7 @@ impl ConnectionObservationConsumer {
             std::collections::BTreeSet::new();
 
         for obs in batch {
-            let rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
+            let mut rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
             // A resend or an orderly close is evidence about a peer, not a
             // connection of its own: it must never become a trace row, an
             // NDJSON line, an app→IP fact or a drop statistic. Only the primary
@@ -79,12 +85,21 @@ impl ConnectionObservationConsumer {
             // and how a host behaves once already inside it answers nothing.
             if obs.progress != ConnectionProgress::Attempt {
                 if rec.egress.role == EgressRole::Primary {
-                    self.note_companion_primary_health(
-                        rec.remote.ip(),
-                        obs.progress == ConnectionProgress::Retransmit,
-                    );
+                    self.note_companion_primary_health(obs, now_ms);
                 }
                 continue;
+            }
+            // Our own filter dropped it, and the stack now resends into that
+            // filter: those resends must not read as the main link not answering.
+            if obs.blocked_by_nrr == Some(true) {
+                self.primary_stall_evidence
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .exclude(
+                        obs.local,
+                        obs.remote,
+                        obs.observed_unix_ms.unwrap_or(now_ms),
+                    );
             }
             summary.total += 1;
             // Role verification, shared by the VPN-endpoint learner and the
@@ -103,6 +118,12 @@ impl ConnectionObservationConsumer {
                 .nrr_drop_spec_id
                 .zip(self.killswitch_app_scope_check.as_ref())
                 .is_some_and(|(spec_id, check)| check(spec_id));
+            if rec.blocked_by_nrr == Some(true) {
+                rec.nrr_block_reason = Some(
+                    self.reason_for_drop(&rec, killswitch_verified, default_block_id)
+                        .slug(),
+                );
+            }
             // Surface every attributed drop in the NDJSON
             // (once per app/destination; see `log_drop_once`) and count it in
             // the tick summary so "N connections were being blocked right
@@ -303,6 +324,7 @@ impl ConnectionObservationConsumer {
             }
             if rec.egress.role == EgressRole::Primary {
                 self.note_companion_in_use(rec.remote.ip());
+                self.remember_program(&rec, rec.observed_unix_ms.unwrap_or(now_ms));
             }
             // Did the user go there, or did a page take them there? Measured
             // on the event's OWN timestamp: the batch is drained on a timer,

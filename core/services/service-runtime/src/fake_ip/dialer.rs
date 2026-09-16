@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nrr_platform_api::icmp_echo::{EchoOutcome, EchoProbe, IcmpEchoPort};
 use nrr_shared::RouteRole;
 
 /// How long to wait for the upstream TCP handshake before giving up. A fake-IP
@@ -187,10 +188,27 @@ pub trait RelayDatagram: Send + Sync {
     fn receive(&self, buffer: &mut [u8]) -> Result<usize, RelayError>;
 }
 
+/// How long a relayed echo waits for an answer. Under the four seconds `ping`
+/// and `tracert` wait by default, so what comes back still reaches them.
+pub const RELAYED_ECHO_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Opens upstream connections on behalf of the relay.
 pub trait RelayDialer: Send + Sync {
     fn connect_tcp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayStream>, RelayError>;
     fn connect_udp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayDatagram>, RelayError>;
+
+    /// Send one echo with hop limit `ttl` to the target's real address, over
+    /// its route. Blocking — call it off the poll loop.
+    fn echo(
+        &self,
+        _target: &UpstreamTarget,
+        _ttl: u8,
+        _payload: &[u8],
+    ) -> Result<EchoOutcome, RelayError> {
+        Err(RelayError::Upstream {
+            detail: "this dialer does not carry ICMP echo".into(),
+        })
+    }
 }
 
 // ── Source-address policy ────────────────────────────────────────────────────
@@ -253,6 +271,8 @@ pub struct SystemRelayDialer {
     /// relay never produces such targets, and one arriving anyway fails the
     /// dial rather than guessing.
     names: Option<Arc<dyn RelayNameResolver>>,
+    /// Sends relayed echoes. Unwired, `ping` to a virtual address stays silent.
+    icmp: Option<Arc<dyn IcmpEchoPort>>,
 }
 
 impl std::fmt::Debug for SystemRelayDialer {
@@ -294,6 +314,13 @@ impl SystemRelayDialer {
     #[must_use]
     pub fn with_name_resolver(mut self, names: Arc<dyn RelayNameResolver>) -> Self {
         self.names = Some(names);
+        self
+    }
+
+    /// Wire the ICMP mechanism relayed `ping` / `traceroute` probes go out on.
+    #[must_use]
+    pub fn with_icmp_echo(mut self, icmp: Arc<dyn IcmpEchoPort>) -> Self {
+        self.icmp = Some(icmp);
         self
     }
 
@@ -382,6 +409,44 @@ fn dial_failed(error: io::Error, address: SocketAddr, elapsed: Duration) -> Rela
 }
 
 impl RelayDialer for SystemRelayDialer {
+    fn echo(
+        &self,
+        target: &UpstreamTarget,
+        ttl: u8,
+        payload: &[u8],
+    ) -> Result<EchoOutcome, RelayError> {
+        let Some(icmp) = self.icmp.as_ref() else {
+            return Err(RelayError::Upstream {
+                detail: "no ICMP mechanism wired".into(),
+            });
+        };
+        let address = self.dial_address(target)?;
+        let IpAddr::V4(destination) = address.ip() else {
+            return Err(RelayError::Upstream {
+                detail: format!("relayed echo to {address} needs IPv4"),
+            });
+        };
+        // The same source steering a connection to this name gets, so the
+        // probe crosses the link the rules picked — or is refused with it.
+        let source = match self.bind_address_for(target.route, &address)? {
+            Some(bind) => match bind.ip() {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            },
+            None => None,
+        };
+        icmp.echo(&EchoProbe {
+            destination,
+            source,
+            ttl,
+            payload: payload.to_vec(),
+            timeout: RELAYED_ECHO_TIMEOUT,
+        })
+        .map_err(|e| RelayError::Upstream {
+            detail: e.to_string(),
+        })
+    }
+
     fn connect_tcp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayStream>, RelayError> {
         let address = self.dial_address(target)?;
         let started = std::time::Instant::now();
@@ -525,6 +590,10 @@ struct MockDialerState {
     /// Bytes the relay wrote upstream, concatenated.
     written: Vec<u8>,
     fail_with: Option<String>,
+    /// What every relayed echo comes back with; `None` refuses it.
+    echo_outcome: Option<EchoOutcome>,
+    /// Hop limit of each relayed echo, in order.
+    echo_ttls: Vec<u8>,
 }
 
 // Test double: lock-poisoning `expect()` is acceptable scaffolding.
@@ -564,6 +633,21 @@ impl MockRelayDialer {
         self.state.lock().expect("mock dialer mutex").fail_with = Some(detail.to_string());
     }
 
+    /// Script what every relayed echo returns.
+    pub fn set_echo_outcome(&self, outcome: EchoOutcome) {
+        self.state.lock().expect("mock dialer mutex").echo_outcome = Some(outcome);
+    }
+
+    /// Hop limit of each relayed echo, in order.
+    #[must_use]
+    pub fn echo_ttls(&self) -> Vec<u8> {
+        self.state
+            .lock()
+            .expect("mock dialer mutex")
+            .echo_ttls
+            .clone()
+    }
+
     fn record(&self, target: &UpstreamTarget) -> Result<Vec<u8>, RelayError> {
         let mut state = self.state.lock().expect("mock dialer mutex");
         state.dials.push(target.clone());
@@ -578,6 +662,21 @@ impl MockRelayDialer {
 
 #[allow(clippy::expect_used)]
 impl RelayDialer for MockRelayDialer {
+    #[allow(clippy::expect_used)]
+    fn echo(
+        &self,
+        target: &UpstreamTarget,
+        ttl: u8,
+        _payload: &[u8],
+    ) -> Result<EchoOutcome, RelayError> {
+        let mut state = self.state.lock().expect("mock dialer mutex");
+        state.dials.push(target.clone());
+        state.echo_ttls.push(ttl);
+        state.echo_outcome.ok_or_else(|| RelayError::Upstream {
+            detail: "no echo scripted".into(),
+        })
+    }
+
     fn connect_tcp(&self, target: &UpstreamTarget) -> Result<Box<dyn RelayStream>, RelayError> {
         let response = self.record(target)?;
         Ok(Box::new(MockStream {

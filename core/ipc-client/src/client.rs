@@ -220,12 +220,26 @@ impl NamedPipeIpcClient {
     /// Bounded channel capacity 64 — the GUI generally drains push
     /// frames within ms; this is just slack for transient bursts. On
     /// overflow the worker drops new frames and logs.
+    /// Prepare a push channel. It carries nothing until [`Self::commit_push`];
+    /// the channel currently in force keeps delivering until then.
     pub fn subscribe_push(&self) -> std::sync::mpsc::Receiver<Value> {
         let (tx, rx) = sync_channel::<Value>(64);
-        if let Ok(mut g) = self.inner.push_tx.lock() {
+        if let Ok(mut g) = self.inner.pending_push_tx.lock() {
             *g = Some(tx);
         }
         rx
+    }
+
+    /// Put the prepared channel in force. Called once the subscribe has been
+    /// answered — the id in that answer is what the frames will be stamped with.
+    pub fn commit_push(&self) {
+        crate::push_handover::commit_pending_push(&self.inner.pending_push_tx, &self.inner.push_tx);
+    }
+
+    /// Throw the prepared channel away: the subscribe did not go through, so
+    /// whatever was delivering before goes on delivering.
+    pub fn abandon_push(&self) {
+        crate::push_handover::abandon_pending_push(&self.inner.pending_push_tx);
     }
 
     /// Trigger client shutdown. Worker thread exits, in-flight requests
@@ -257,6 +271,14 @@ impl crate::connection::IpcClient for NamedPipeIpcClient {
         Some(Self::subscribe_push(self))
     }
 
+    fn commit_push(&self) {
+        Self::commit_push(self);
+    }
+
+    fn abandon_push(&self) {
+        Self::abandon_push(self);
+    }
+
     fn negotiate_info(&self) -> Option<NegotiateInfo> {
         Self::negotiate_info(self)
     }
@@ -286,6 +308,15 @@ struct ClientInner {
     /// [`NamedPipeIpcClient::subscribe_push`]. Push frames seen on the wire
     /// (`request_id == ""`) are forwarded here; if `None`, they are dropped.
     push_tx: Mutex<Option<SyncSender<Value>>>,
+    /// The sender a subscribe has prepared but whose call has not answered yet.
+    ///
+    /// Registering the new channel straight into `push_tx` destroyed the live
+    /// one before anyone knew whether the subscribe would succeed: a call that
+    /// then failed left the client with no channel at all, and events stopped
+    /// arriving until some later subscribe happened to work. Frames that arrive
+    /// while the call is in flight keep going to the CURRENT channel, which is
+    /// exactly where they were going a moment earlier.
+    pending_push_tx: Mutex<Option<SyncSender<Value>>>,
     /// A push frame was dropped because the subscriber's channel was full.
     /// Cleared by emitting one `push-gap` event, which tells the GUI that what
     /// it holds may be behind and a re-read is due.
@@ -325,6 +356,7 @@ impl ClientInner {
             force_reconnect: Arc::new(AtomicBool::new(false)),
             worker_handle: Mutex::new(None),
             push_tx: Mutex::new(None),
+            pending_push_tx: Mutex::new(None),
             push_gap: AtomicBool::new(false),
             negotiate_info: RwLock::new(None),
             last_subscribe: Mutex::new(None),

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use nrr_platform_api::dns::{DnsResolverError, DnsResolverPort};
+use nrr_platform_api::dns::{AddressFamily, DnsResolverError, DnsResolverPort};
 use nrr_platform_linux::dns_resolver::{parse_nameservers, LinuxDnsResolver, RESOLV_CONF};
 
 /// A name that exists for as long as the internet does, and is not a service
@@ -31,7 +31,7 @@ fn a_known_name_resolves_with_a_ttl() {
     }
     let resolver = LinuxDnsResolver::new().with_timeout(Duration::from_secs(3));
 
-    let record = match resolver.resolve_a(KNOWN_NAME) {
+    let record = match resolver.resolve(KNOWN_NAME, AddressFamily::Ipv4) {
         Ok(record) => record,
         Err(DnsResolverError::Timeout { .. }) | Err(DnsResolverError::Network { .. }) => {
             eprintln!("SKIPPED dns_resolver_live: the configured nameserver did not answer");
@@ -67,7 +67,7 @@ fn a_name_that_does_not_exist_comes_back_as_nxdomain() {
     let resolver = LinuxDnsResolver::new().with_timeout(Duration::from_secs(3));
 
     // `.invalid` is reserved by RFC 2606 precisely so it can never resolve.
-    match resolver.resolve_a("nrr-does-not-exist.invalid") {
+    match resolver.resolve("nrr-does-not-exist.invalid", AddressFamily::Ipv4) {
         Err(DnsResolverError::NxDomain { .. }) => {}
         Err(DnsResolverError::Timeout { .. }) | Err(DnsResolverError::Network { .. }) => {
             eprintln!("SKIPPED dns_resolver_live: the configured nameserver did not answer");

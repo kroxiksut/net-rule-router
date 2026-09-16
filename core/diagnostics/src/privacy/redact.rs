@@ -253,9 +253,9 @@ fn extract_filename(path: &str) -> Option<String> {
 /// Replaces the username/home directory segment in a path with `<masked-user>`.
 ///
 /// Matched by the home-directory MARKER segment, not by a whole prefix on one
-/// drive: the two hard-coded `C:` prefixes let `D:\Users\john`, `/home/john` and
-/// `\\server\home\john` through with the name intact — into the archive that gets
-/// sent to support, on the platform this product is going cross to.
+/// drive: the two hard-coded `C:` prefixes let `D:\Users\<name>`, `/home/<name>`
+/// and `\\server\home\<name>` through with the name intact — into the archive
+/// that gets sent to support, on the platform this product is going cross to.
 fn mask_path_username(path: &str) -> String {
     /// Segments after which the NEXT segment is a user name.
     const HOME_MARKERS: &[&str] = &["users", "documents and settings", "home"];

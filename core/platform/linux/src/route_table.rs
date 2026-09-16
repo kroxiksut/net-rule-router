@@ -27,8 +27,9 @@
 // compiles and is still tested there.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use nrr_platform_api::dns::AddressFamily;
 use nrr_platform_api::enforcement::RouteTableRef;
 use nrr_platform_api::error::PlatformError;
 use nrr_platform_api::types::RouteEntry;
@@ -59,6 +60,23 @@ const NLM_F_EXCL: u16 = 0x0200;
 const NLM_F_CREATE: u16 = 0x0400;
 
 const AF_INET_U8: u8 = 2;
+/// `AF_INET6` as the kernel spells it in `rtmsg.rtm_family`.
+const AF_INET6_U8: u8 = 10;
+
+/// Read a route attribute payload as an address of `family`. `None` when the
+/// payload width does not match the family the message declared — a mismatch is
+/// not our address, and guessing from the width alone would let a v4 gateway
+/// attribute be read into a v6 route.
+fn address_from_attr(payload: &[u8], family: AddressFamily) -> Option<IpAddr> {
+    match family {
+        AddressFamily::Ipv4 => <[u8; 4]>::try_from(payload)
+            .ok()
+            .map(|o| IpAddr::V4(Ipv4Addr::from(o))),
+        AddressFamily::Ipv6 => <[u8; 16]>::try_from(payload)
+            .ok()
+            .map(|o| IpAddr::V6(Ipv6Addr::from(o))),
+    }
+}
 
 /// `RT_TABLE_MAIN`. The table every ordinary route lives in.
 const RT_TABLE_MAIN: u8 = 254;
@@ -119,18 +137,47 @@ fn encode_route_mutation(
     sequence: u32,
 ) -> Result<Vec<u8>, PlatformError> {
     let table = table_number(&entry.table)?;
-    if entry.prefix_length > 32 {
+    // A mismatched pair is our own planning bug, and the kernel would answer a
+    // confusing EINVAL; say what is actually wrong instead.
+    if entry.family().is_none() {
         return Err(PlatformError::StateCorrupted {
             detail: format!(
-                "route carries prefix length {}, which is not a v4 prefix",
+                "route destination {} and next hop {} are different address families",
+                entry.destination, entry.next_hop
+            ),
+        });
+    }
+    let (family_byte, dst_octets, gw_octets) = match (entry.destination, entry.next_hop) {
+        (IpAddr::V4(d), nh) => (
+            AF_INET_U8,
+            d.octets().to_vec(),
+            match nh {
+                IpAddr::V4(g) => g.octets().to_vec(),
+                IpAddr::V6(_) => Vec::new(),
+            },
+        ),
+        (IpAddr::V6(d), nh) => (
+            AF_INET6_U8,
+            d.octets().to_vec(),
+            match nh {
+                IpAddr::V6(g) => g.octets().to_vec(),
+                IpAddr::V4(_) => Vec::new(),
+            },
+        ),
+    };
+    let max_prefix = entry.max_prefix_length();
+    if entry.prefix_length > max_prefix {
+        return Err(PlatformError::StateCorrupted {
+            detail: format!(
+                "route carries prefix length {}, wider than /{max_prefix} allows",
                 entry.prefix_length
             ),
         });
     }
 
-    let mut body = Vec::with_capacity(64);
+    let mut body = Vec::with_capacity(96);
     // struct rtmsg
-    body.push(AF_INET_U8); // rtm_family
+    body.push(family_byte); // rtm_family
     body.push(entry.prefix_length); // rtm_dst_len
     body.push(0); // rtm_src_len
     body.push(0); // rtm_tos
@@ -147,11 +194,13 @@ fn encode_route_mutation(
     body.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
     debug_assert_eq!(body.len(), RTMSG_LEN);
 
-    push_attr(&mut body, RTA_DST, &entry.destination.octets());
+    push_attr(&mut body, RTA_DST, &dst_octets);
     // An unspecified next hop is an on-link route: the attribute must be absent
-    // rather than zero, or the kernel routes to 0.0.0.0.
-    if !entry.next_hop.is_unspecified() {
-        push_attr(&mut body, RTA_GATEWAY, &entry.next_hop.octets());
+    // rather than zero, or the kernel routes to the unspecified address. This is
+    // the only form available out of a tunnel that carries no address of the
+    // family at all, which is how IPv6 leaves most VPN interfaces.
+    if !entry.next_hop.is_unspecified() && !gw_octets.is_empty() {
+        push_attr(&mut body, RTA_GATEWAY, &gw_octets);
     }
     push_attr(&mut body, RTA_OIF, &entry.interface_index.to_ne_bytes());
     push_attr(&mut body, RTA_PRIORITY, &entry.metric.to_ne_bytes());
@@ -169,7 +218,10 @@ fn encode_route_mutation(
 /// Encode the `RTM_GETROUTE` dump request.
 fn encode_route_dump(sequence: u32) -> Vec<u8> {
     let mut body = vec![0u8; RTMSG_LEN];
-    body[0] = AF_INET_U8; // rtm_family — v4 routes only
+    // AF_UNSPEC dumps BOTH families. Asking for one means never seeing the
+    // routes we install in the other — and a route we cannot see is a route we
+    // can never take back.
+    body[0] = 0; // rtm_family = AF_UNSPEC
     frame(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, sequence, &body)
 }
 
@@ -252,7 +304,12 @@ fn parse_dump_chunk(datagram: &[u8]) -> DumpChunk {
 /// `None` for anything that is not an ordinary IPv4 unicast route we could act
 /// on — a v6 row, a truncated body, or a route with no output interface.
 fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
-    if body.len() < RTMSG_LEN || body[0] != AF_INET_U8 {
+    let family = match body.first() {
+        Some(&AF_INET_U8) => AddressFamily::Ipv4,
+        Some(&AF_INET6_U8) => AddressFamily::Ipv6,
+        _ => return None,
+    };
+    if body.len() < RTMSG_LEN {
         return None;
     }
     let prefix_length = body[1];
@@ -262,8 +319,16 @@ fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
         return None;
     }
 
-    let mut destination = Ipv4Addr::UNSPECIFIED;
-    let mut next_hop = Ipv4Addr::UNSPECIFIED;
+    let (mut destination, mut next_hop) = match family {
+        AddressFamily::Ipv4 => (
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        ),
+        AddressFamily::Ipv6 => (
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        ),
+    };
     let mut interface_index: Option<u32> = None;
     let mut metric = 0u32;
     let mut table = u32::from(table_byte);
@@ -277,11 +342,17 @@ fn parse_route_message(body: &[u8]) -> Option<RouteEntry> {
         }
         let payload = &body[offset + RTATTR_HEADER_LEN..offset + len];
         match attr_type {
-            RTA_DST if payload.len() == 4 => {
-                destination = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+            // The attribute width is what says which family the address is;
+            // a payload of the wrong width for this message is not our address.
+            RTA_DST => {
+                if let Some(addr) = address_from_attr(payload, family) {
+                    destination = addr;
+                }
             }
-            RTA_GATEWAY if payload.len() == 4 => {
-                next_hop = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
+            RTA_GATEWAY => {
+                if let Some(addr) = address_from_attr(payload, family) {
+                    next_hop = addr;
+                }
             }
             RTA_OIF if payload.len() == 4 => {
                 interface_index = Some(u32::from_ne_bytes([
@@ -511,9 +582,9 @@ mod tests {
 
     fn entry() -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::new(10, 20, 30, 0),
+            destination: IpAddr::V4(Ipv4Addr::new(10, 20, 30, 0)),
             prefix_length: 24,
-            next_hop: Ipv4Addr::new(10, 20, 0, 1),
+            next_hop: IpAddr::V4(Ipv4Addr::new(10, 20, 0, 1)),
             interface_index: 7,
             metric: 42,
             is_ours: true,
@@ -562,7 +633,7 @@ mod tests {
     #[test]
     fn an_on_link_route_carries_no_gateway_attribute() {
         let mut e = entry();
-        e.next_hop = Ipv4Addr::UNSPECIFIED;
+        e.next_hop = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let msg = encode_route_mutation(RTM_NEWROUTE, &e, 1).expect("encode");
         let body = &msg[NLMSG_HEADER_LEN..];
         let mut offset = RTMSG_LEN;
@@ -614,7 +685,7 @@ mod tests {
     fn a_dump_chunk_walks_every_message_it_carries() {
         let mut datagram = encode_route_mutation(RTM_NEWROUTE, &entry(), 1).expect("encode");
         let mut second = entry();
-        second.destination = Ipv4Addr::new(192, 168, 5, 0);
+        second.destination = IpAddr::V4(Ipv4Addr::new(192, 168, 5, 0));
         second.interface_index = 9;
         datagram.extend(encode_route_mutation(RTM_NEWROUTE, &second, 1).expect("encode"));
         let chunk = parse_dump_chunk(&datagram);

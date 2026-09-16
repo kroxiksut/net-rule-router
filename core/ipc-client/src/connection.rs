@@ -170,6 +170,16 @@ pub trait IpcClient: Send + Sync {
         None
     }
 
+    /// Put the channel [`Self::subscribe_push`] prepared in force, now that the
+    /// subscribe has been answered. Two phases rather than one because the
+    /// single-phase version destroyed the live channel before the outcome was
+    /// known: a subscribe that then failed left nothing delivering at all.
+    fn commit_push(&self) {}
+
+    /// Discard the prepared channel — the subscribe failed, and whatever was
+    /// delivering before must go on delivering.
+    fn abandon_push(&self) {}
+
     /// Id the server currently knows this client's status subscription by, or
     /// `None` when it has never subscribed. NOT a constant: a reconnect
     /// re-subscribes and the server allocates a NEW id, so anything that labels

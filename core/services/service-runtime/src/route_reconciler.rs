@@ -29,7 +29,7 @@
 //! pure diff/apply core.
 
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 
 use nrr_platform_api::route_table::RouteTablePort;
@@ -41,7 +41,7 @@ use crate::route_codegen::{OVERLAY_HIGH, OVERLAY_LOW};
 /// Identity of a route for diffing — everything but `metric`/`is_ours`.
 /// Two routes with the same key are "the same route"; a metric-only change
 /// is not a meaningful diff for our `/32` host routes.
-type RouteKey = (Ipv4Addr, u8, Ipv4Addr, u32);
+type RouteKey = (IpAddr, u8, IpAddr, u32);
 
 fn route_key(r: &RouteEntry) -> RouteKey {
     (
@@ -88,7 +88,7 @@ pub enum RouteOwnership {
 pub fn classify_route_ownership(
     route: &RouteEntry,
     secondary_ifindex: u32,
-    primary_gateway: Option<Ipv4Addr>,
+    primary_gateway: Option<IpAddr>,
 ) -> RouteOwnership {
     if route.is_ours {
         return RouteOwnership::Ours;
@@ -96,7 +96,7 @@ pub fn classify_route_ownership(
     // Bootstrap host route FIRST so it can never be mistaken for anything
     // strippable: a /32 reached via the primary gateway. Checked regardless of
     // interface — defence in depth, even if a client installs it unusually.
-    if route.prefix_length == 32 {
+    if route.is_host_route() {
         if let Some(pg) = primary_gateway {
             if route.next_hop == pg {
                 return RouteOwnership::BootstrapHostRoute;
@@ -130,6 +130,41 @@ pub fn bootstrap_server_ips(
     secondary_ifindex: u32,
     primary_gateway: Option<Ipv4Addr>,
 ) -> Vec<Ipv4Addr> {
+    bootstrap_servers(routes, secondary_ifindex, primary_gateway.map(IpAddr::V4))
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(d) => Some(d),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
+/// The IPv6 half of [`bootstrap_server_ips`]: the tunnel's v6 endpoints, read
+/// off the `/128` bootstrap routes taken via the primary's v6 gateway.
+///
+/// The route table is the honest source. The model has no v6 endpoint field,
+/// and learning one from observed drops would grow the exemption set out of
+/// whatever the tunnel happened to try — the table states what the client
+/// itself installed.
+pub fn bootstrap_server_ips_v6(
+    routes: &[RouteEntry],
+    secondary_ifindex: u32,
+    primary_gateway: Option<Ipv6Addr>,
+) -> Vec<Ipv6Addr> {
+    bootstrap_servers(routes, secondary_ifindex, primary_gateway.map(IpAddr::V6))
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V6(d) => Some(d),
+            IpAddr::V4(_) => None,
+        })
+        .collect()
+}
+
+fn bootstrap_servers(
+    routes: &[RouteEntry],
+    secondary_ifindex: u32,
+    primary_gateway: Option<IpAddr>,
+) -> Vec<IpAddr> {
     let mut seen = HashSet::new();
     routes
         .iter()
@@ -142,6 +177,22 @@ pub fn bootstrap_server_ips(
         .map(|r| r.destination)
         .filter(|ip| seen.insert(*ip))
         .collect()
+}
+
+/// The primary link's IPv6 default gateway, from its own `::/0` route.
+///
+/// [`AdapterInfo::gateways`][nrr_platform_api::adapters::AdapterInfo::gateways]
+/// enumerates IPv4 only, so the v6 next hop has exactly one source on both
+/// platforms: the route the OS itself installed.
+#[must_use]
+pub fn primary_gateway_v6(routes: &[RouteEntry], primary_ifindex: u32) -> Option<Ipv6Addr> {
+    routes
+        .iter()
+        .filter(|r| r.interface_index == primary_ifindex && r.prefix_length == 0)
+        .find_map(|r| match (r.destination, r.next_hop) {
+            (IpAddr::V6(_), IpAddr::V6(gw)) if !gw.is_unspecified() => Some(gw),
+            _ => None,
+        })
 }
 
 /// the primary interface's
@@ -166,11 +217,48 @@ pub fn primary_local_subnets(routes: &[RouteEntry], primary_ifindex: u32) -> Vec
             r.interface_index == primary_ifindex
                 && r.next_hop.is_unspecified()
                 && (1..=31).contains(&r.prefix_length)
-                && is_unicast_destination(r.destination)
+                && matches!(r.destination, IpAddr::V4(d) if is_unicast_destination(d))
         })
-        .map(|r| (r.destination, r.prefix_length))
+        .filter_map(|r| match r.destination {
+            IpAddr::V4(d) => Some((d, r.prefix_length)),
+            IpAddr::V6(_) => None,
+        })
         .filter(|s| seen.insert(*s))
         .collect()
+}
+
+/// The IPv6 half of [`primary_local_subnets`]: the prefixes the primary link is
+/// directly attached to over v6.
+///
+/// The on-link form is the same — no next hop — but the scope test differs:
+/// `fe80::/64` and the multicast scopes are already exempt everywhere, so
+/// listing them here would only restate that. A `/128` is the interface's own
+/// address, not a segment.
+pub fn primary_local_subnets_v6(
+    routes: &[RouteEntry],
+    primary_ifindex: u32,
+) -> Vec<(Ipv6Addr, u8)> {
+    let mut seen = HashSet::new();
+    routes
+        .iter()
+        .filter(|r| r.interface_index == primary_ifindex && r.next_hop.is_unspecified())
+        .filter(|r| (1..=127).contains(&r.prefix_length))
+        .filter_map(|r| match r.destination {
+            IpAddr::V6(d) if is_unicast_destination_v6(d) => Some((d, r.prefix_length)),
+            _ => None,
+        })
+        .filter(|s| seen.insert(*s))
+        .collect()
+}
+
+/// `false` for v6 destinations already covered elsewhere or that no host lives
+/// on: multicast, the link-local scope, loopback and the unspecified address.
+fn is_unicast_destination_v6(net: Ipv6Addr) -> bool {
+    let s = net.segments();
+    !net.is_multicast()
+        && (s[0] & 0xffc0) != 0xfe80
+        && net != Ipv6Addr::LOCALHOST
+        && !net.is_unspecified()
 }
 
 /// `false` for the destinations that are routing artefacts rather than
@@ -231,6 +319,10 @@ pub struct SecondaryRouteReconciler {
     /// Routes this reconciler currently owns (last successfully applied
     /// desired set).
     owned: Mutex<Vec<RouteEntry>>,
+    /// "Has the stop teardown begun?" A route added behind it stays in the OS
+    /// table with no service left to reap it. Injected rather than read from
+    /// the static directly so a test can flip it for itself alone.
+    teardown_gate: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 // `owned` is a `Mutex`; `lock().unwrap_or_else(into_inner)` recovers from a
@@ -240,7 +332,16 @@ impl SecondaryRouteReconciler {
         Self {
             api,
             owned: Mutex::new(Vec::new()),
+            teardown_gate: Arc::new(crate::teardown_in_progress),
         }
+    }
+
+    /// Answer "is the service stopping?" from something other than the
+    /// process-wide latch.
+    #[cfg(test)]
+    pub fn with_teardown_gate(mut self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.teardown_gate = gate;
+        self
     }
 
     /// Seed the owned set without touching the route table. Used by the
@@ -308,13 +409,28 @@ impl SecondaryRouteReconciler {
             }
         }
         // Add newly-desired routes (AddRoute is idempotent on conflict, so
-        // a route already in the table is harmless).
+        // a route already in the table is harmless). Never once the stop
+        // teardown has begun: a pass that entered before the latch is still
+        // running, and what it adds behind the teardown outlives the process.
+        // Deletes stay — converging downward is exactly what the stop wants.
         let mut added = 0usize;
+        let mut refused = 0usize;
         for r in desired.iter() {
             if !owned_keys.contains(&route_key(r)) {
+                if (self.teardown_gate)() {
+                    refused += 1;
+                    continue;
+                }
                 actions.push(RoutingAction::AddRoute(r.clone()));
                 added += 1;
             }
+        }
+        if refused > 0 {
+            tracing::info!(
+                target: "nrr::route-reconciler",
+                refused = refused as u64,
+                "teardown in progress — route adds refused (a route added behind the stop outlives the process)",
+            );
         }
 
         if actions.is_empty() {
@@ -365,6 +481,36 @@ impl SecondaryRouteReconciler {
         self.reconcile(&[])
     }
 
+    /// Installs `extra` beside the owned set without touching the rest of it,
+    /// and claims what actually landed — a conflicting add stays whoever's it
+    /// is. For a first contact with a new address: the full reconcile that
+    /// wants the same routes runs seconds later and finds them in place.
+    /// Returns how many were added.
+    pub fn install_additional(&self, extra: &[RouteEntry]) -> Result<usize, PlatformError> {
+        if (self.teardown_gate)() {
+            return Ok(0);
+        }
+        let mut owned = self.owned.lock().unwrap_or_else(|p| p.into_inner());
+        let actions: Vec<RoutingAction> = extra
+            .iter()
+            .filter(|r| !owned.iter().any(|o| route_key(o) == route_key(r)))
+            .map(|r| RoutingAction::AddRoute(r.clone()))
+            .collect();
+        if actions.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = RoutingTransaction::new(Arc::clone(&self.api));
+        if let Err(e) = tx.execute(&actions) {
+            let _ = tx.rollback();
+            return Err(e);
+        }
+        let landed = tx.added_routes();
+        tx.finalize();
+        let added = landed.len();
+        owned.extend(landed);
+        Ok(added)
+    }
+
     /// graceful-stop "keep secondary" teardown: delete NRR's
     /// overlays (the mode-A `/2` counter-overlays and the mode-B `/1`
     /// split-default) but KEEP the secondary `/32` host routes, so rule-matched
@@ -395,9 +541,9 @@ mod tests {
 
     fn route(d: [u8; 4], gw: [u8; 4], ifx: u32) -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::from(d),
+            destination: IpAddr::V4(Ipv4Addr::from(d)),
             prefix_length: 32,
-            next_hop: Ipv4Addr::from(gw),
+            next_hop: IpAddr::V4(Ipv4Addr::from(gw)),
             interface_index: ifx,
             metric: 5,
             is_ours: true,
@@ -409,7 +555,10 @@ mod tests {
         api.get_ip_forward_table()
             .unwrap()
             .iter()
-            .map(|r| r.destination)
+            .filter_map(|r| match r.destination {
+                IpAddr::V4(d) => Some(d),
+                IpAddr::V6(_) => None,
+            })
             .collect()
     }
 
@@ -472,6 +621,80 @@ mod tests {
         // The next pass wants neither. Ours goes; the foreign one is left alone.
         rec.reconcile(&[]).expect("second reconcile");
         assert_eq!(rec.owned_count(), 0);
+    }
+
+    /// A first-contact route goes in beside what is owned and is claimed, so
+    /// the full pass that wants it finds it in place; a route somebody else
+    /// already holds stays theirs.
+    #[test]
+    fn an_additional_route_is_claimed_and_the_full_pass_finds_it_in_place() {
+        let taken = Ipv4Addr::new(1, 1, 1, 1);
+        let api = Arc::new(ForeignRouteApi {
+            inner: MockWindowsApi::new(),
+            taken,
+        });
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>);
+        rec.reconcile(&[route([3, 3, 3, 3], [10, 0, 0, 1], 7)])
+            .expect("first pass");
+
+        let extra = vec![
+            route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            route([1, 1, 1, 1], [10, 0, 0, 1], 7),
+        ];
+        assert_eq!(rec.install_additional(&extra).expect("install"), 1);
+        assert_eq!(
+            rec.owned_count(),
+            2,
+            "the owned route stays, only ours is claimed"
+        );
+
+        let delta = rec
+            .reconcile(&[
+                route([3, 3, 3, 3], [10, 0, 0, 1], 7),
+                route([2, 2, 2, 2], [10, 0, 0, 1], 7),
+            ])
+            .expect("full pass");
+        assert!(delta.is_noop(), "{delta:?}");
+    }
+
+    /// The stop strips the table, and a pass that entered before the latch is
+    /// still running: what it adds afterwards stays behind with no service to
+    /// reap it. Deletes must still land — converging downward is the point.
+    #[test]
+    fn a_reconcile_that_lands_during_teardown_removes_but_never_adds() {
+        let api = Arc::new(MockWindowsApi::new());
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = {
+            let stopping = Arc::clone(&stopping);
+            Arc::new(move || stopping.load(std::sync::atomic::Ordering::SeqCst))
+                as Arc<dyn Fn() -> bool + Send + Sync>
+        };
+        let rec = SecondaryRouteReconciler::new(Arc::clone(&api) as Arc<dyn RouteTablePort>)
+            .with_teardown_gate(gate);
+        rec.reconcile(&[route([1, 1, 1, 1], [10, 0, 0, 1], 7)])
+            .expect("first pass");
+
+        stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        let delta = rec
+            .reconcile(&[route([2, 2, 2, 2], [10, 0, 0, 1], 7)])
+            .expect("teardown pass");
+        assert_eq!(
+            delta,
+            RouteReconcileDelta {
+                added: 0,
+                removed: 1
+            },
+        );
+        assert!(
+            table_dests(&api).is_empty(),
+            "the new route never reached the table",
+        );
+        assert_eq!(
+            rec.install_additional(&[route([3, 3, 3, 3], [10, 0, 0, 1], 7)])
+                .expect("additional"),
+            0
+        );
+        assert!(table_dests(&api).is_empty());
     }
 
     #[test]
@@ -613,9 +836,9 @@ mod tests {
 
     fn raw_route(d: [u8; 4], prefix: u8, gw: [u8; 4], ifx: u32, ours: bool) -> RouteEntry {
         RouteEntry {
-            destination: Ipv4Addr::from(d),
+            destination: IpAddr::V4(Ipv4Addr::from(d)),
             prefix_length: prefix,
-            next_hop: Ipv4Addr::from(gw),
+            next_hop: IpAddr::V4(Ipv4Addr::from(gw)),
             interface_index: ifx,
             metric: 5,
             is_ours: ours,
@@ -701,6 +924,7 @@ mod tests {
             interface_type: InterfaceType::Ethernet,
             oper_status: IfOperStatus::Up,
             ipv4_addresses: vec![Ipv4Addr::new(10, 0, 0, 1)],
+            ipv6_addresses: Vec::new(),
             gateways: Vec::new(),
         }
     }
@@ -744,14 +968,14 @@ mod tests {
         // the same /1 shape as the VPN's redirect pair — so we never strip it.
         let r = raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, true);
         assert_eq!(
-            classify_route_ownership(&r, 78, Some(Ipv4Addr::new(192, 168, 1, 1))),
+            classify_route_ownership(&r, 78, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))),
             RouteOwnership::Ours
         );
     }
 
     #[test]
     fn classify_vpn_redirect_pair_on_secondary() {
-        let pg = Some(Ipv4Addr::new(192, 168, 1, 1));
+        let pg: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
         let lo = raw_route([0, 0, 0, 0], 1, [10, 91, 192, 1], 78, false);
         let hi = raw_route([128, 0, 0, 0], 1, [10, 91, 192, 1], 78, false);
         assert_eq!(
@@ -769,7 +993,7 @@ mod tests {
         // A /1 on some other interface is not our VPN's redirect — don't touch.
         let r = raw_route([0, 0, 0, 0], 1, [10, 0, 0, 1], 12, false);
         assert_eq!(
-            classify_route_ownership(&r, 78, Some(Ipv4Addr::new(192, 168, 1, 1))),
+            classify_route_ownership(&r, 78, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)))),
             RouteOwnership::Untracked
         );
     }
@@ -780,20 +1004,20 @@ mod tests {
         let pg = Ipv4Addr::new(192, 168, 1, 1);
         let boot = raw_route([203, 0, 113, 7], 32, [192, 168, 1, 1], 12, false);
         assert_eq!(
-            classify_route_ownership(&boot, 78, Some(pg)),
+            classify_route_ownership(&boot, 78, Some(IpAddr::V4(pg))),
             RouteOwnership::BootstrapHostRoute
         );
         // Defence in depth: even if it appeared on the secondary ifindex.
         let boot_on_sec = raw_route([203, 0, 113, 7], 32, [192, 168, 1, 1], 78, false);
         assert_eq!(
-            classify_route_ownership(&boot_on_sec, 78, Some(pg)),
+            classify_route_ownership(&boot_on_sec, 78, Some(IpAddr::V4(pg))),
             RouteOwnership::BootstrapHostRoute
         );
     }
 
     #[test]
     fn classify_os_default_and_unrelated_are_untracked() {
-        let pg = Some(Ipv4Addr::new(192, 168, 1, 1));
+        let pg: Option<IpAddr> = Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)));
         // OS default /0 (prefix 0, not 1) — never strippable.
         let def = raw_route([0, 0, 0, 0], 0, [192, 168, 1, 1], 12, false);
         assert_eq!(

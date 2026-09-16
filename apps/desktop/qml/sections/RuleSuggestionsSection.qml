@@ -409,9 +409,13 @@ ColumnLayout {
     /// offer and confirming a guess — a background client's six hosts under a
     /// third-party apex is exactly how a whole domain lands on the tunnel.
     function _reachText(host) {
-        var scope = root.tr("rules.suggestions.inbox.reach",
+        var scope = host.isApp === true
+            ? root.tr("rules.suggestions.inbox.reach-app",
+                "The rule sends every connection of {app} through the additional route.")
+                .replace("{app}", String(host.domain || host.match || ""))
+            : root.tr("rules.suggestions.inbox.reach",
                 "The rule covers every name under {domain}.")
-            .replace("{domain}", String(host.match || ""))
+                .replace("{domain}", String(host.match || ""))
         var members = host.observedMembers || []
         if (members.length === 0) return scope
         var shownCount = Math.min(members.length, section.membersShownInReach)
@@ -443,8 +447,6 @@ ColumnLayout {
         }
         if (slug === "stalls")
             return root.tr("rules.suggestions.inbox.behavior-stalls", "connections to it stall on the main route")
-        if (slug === "cut")
-            return root.tr("rules.suggestions.inbox.behavior-cut", "the main route drops connections to it")
         return root.tr("rules.suggestions.inbox.behavior-unknown", "not checked on the main route")
     }
     /// Whose name the offer is: the site's own, or a third party it pulls in.
@@ -824,7 +826,10 @@ ColumnLayout {
                                     wrapMode: Text.Wrap
                                     font.bold: true
                                     color: root.textColor
-                                    text: modelData.domain
+                                    text: modelData.isApp === true
+                                        ? root.tr("rules.suggestions.inbox.app-group", "Application {name}")
+                                            .replace("{name}", modelData.domain)
+                                        : modelData.domain
                                 }
                                 Label {
                                     Layout.fillWidth: true

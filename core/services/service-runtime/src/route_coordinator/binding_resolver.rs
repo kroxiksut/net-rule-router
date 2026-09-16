@@ -10,7 +10,7 @@
 //! a different scheme, and a direct compare between them silently matched
 //! nothing.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::RouteEntry;
@@ -125,7 +125,7 @@ pub(super) fn is_version_token(token: &str) -> bool {
 
 /// Words that name a category, not a vendor. A family match resting only on
 /// these is not evidence: every tunnel on the machine carries some of them.
-const GENERIC_NAME_TOKENS: &[&str] = &[
+pub(super) const GENERIC_NAME_TOKENS: &[&str] = &[
     "vpn",
     "adapter",
     "tunnel",
@@ -287,6 +287,41 @@ pub(super) fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
 
 /// The name to store for an adapter: the connection name the GUI lists, with
 /// the driver description as the fallback.
+/// Live connections worth offering when the bound one is gone.
+///
+/// Every usable adapter used to be offered, on the reasoning that we cannot
+/// know which one replaced the old one. That is right for a list the user
+/// reads — but it puts their Ethernet beside their VPN as equals, and for the
+/// ADDITIONAL route those are not equals at all: one is the thing the rules
+/// were pointing at, the other is the link those rules exist to route around.
+///
+/// So for that role the tunnel-looking connections come FIRST when there are
+/// any, by the same keyword classification the adapter screen uses. Nothing is
+/// removed — a user whose tunnel is named something we do not recognise still
+/// sees every connection, lower down. Guessing is still refused; only the order
+/// of the offer changes, which is what lets the surface above ever put a button
+/// on the first entry.
+pub(super) fn replacement_candidates(infos: &[AdapterInfo], role: &str) -> Vec<String> {
+    let usable = infos.iter().filter(|i| {
+        crate::route_coordinator::classify_availability(i)
+            == Some(crate::route_coordinator::AdapterAvailability::Available)
+    });
+    if role != "secondary" {
+        return usable
+            .map(|i| preferred_display_name(i).to_string())
+            .collect();
+    }
+    let (tunnels, rest): (Vec<&AdapterInfo>, Vec<&AdapterInfo>) = usable.partition(|i| {
+        nrr_platform_api::vpn_discovery::looks_like_vpn(preferred_display_name(i))
+            || nrr_platform_api::vpn_discovery::looks_like_vpn(&i.description)
+    });
+    tunnels
+        .into_iter()
+        .chain(rest)
+        .map(|i| preferred_display_name(i).to_string())
+        .collect()
+}
+
 pub(super) fn preferred_display_name(info: &AdapterInfo) -> &str {
     let friendly = info.friendly_name.trim();
     if friendly.is_empty() {
@@ -323,6 +358,18 @@ pub(super) fn derive_secondary_next_hop(routes: &[RouteEntry], ifindex: u32) -> 
     nrr_platform_api::interface_rows::derive_forwarding_next_hop(routes, ifindex)
 }
 
+/// The IPv6 twin of [`derive_secondary_next_hop`].
+///
+/// `None` — this link has no IPv6 way out, and policy must not name a `/128`
+/// through it. Read from the route table for the same reason the v4 answer is:
+/// a TUN client installs routes, not an adapter gateway.
+pub(super) fn derive_secondary_next_hop_v6(
+    routes: &[RouteEntry],
+    ifindex: u32,
+) -> Option<std::net::Ipv6Addr> {
+    nrr_platform_api::interface_rows::derive_forwarding_next_hop_v6(routes, ifindex)
+}
+
 /// Derive the **primary** routing target (gateway + interface) from the OS
 /// default route, for when the user bound only a secondary (VPN) adapter.
 ///
@@ -348,7 +395,9 @@ pub(super) fn derive_primary_target(
         if !(r.destination.is_unspecified() && r.prefix_length == 0) {
             continue;
         }
-        let nh = r.next_hop;
+        let IpAddr::V4(nh) = r.next_hop else {
+            continue; // this probe names the IPv4 gateway
+        };
         if nh.is_unspecified() || nh.is_loopback() {
             continue;
         }
@@ -360,6 +409,7 @@ pub(super) fn derive_primary_target(
     }
     best.map(|(_, gateway, interface_index)| SecondaryRouteTarget {
         gateway,
+        gateway_v6: derive_secondary_next_hop_v6(routes, interface_index),
         interface_index,
     })
 }

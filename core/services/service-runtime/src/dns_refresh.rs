@@ -42,7 +42,8 @@ use nrr_storage::dto::{ExpiredHostname, NegativeCacheReason, ResolutionEntry};
 use nrr_storage::repository::CacheRepository;
 use nrr_storage::resolution_source::StorageResolutionSource;
 
-use crate::net_filter::{contains_fake_pool_addr, is_non_routable_v4};
+use crate::net_filter::{contains_fake_pool_addr, is_non_routable};
+use nrr_platform_api::dns::AddressFamily;
 
 /// Outcome of one [`DnsRefreshOrchestrator::run_once`] invocation.
 ///
@@ -377,7 +378,10 @@ impl DnsRefreshOrchestrator {
         now: SystemTime,
         summary: &mut RefreshSummary,
     ) -> TickStep {
-        match self.resolver.resolve_a(&row.canonical_hostname) {
+        match self
+            .resolver
+            .resolve(&row.canonical_hostname, AddressFamily::Ipv4)
+        {
             Ok(mut record) => {
                 // Mode B self-interception: the OS resolver path is redirected
                 // to our own resolver, so a system-level re-resolution hands
@@ -385,12 +389,12 @@ impl DnsRefreshOrchestrator {
                 // about the host — skip it on a FLAT short retry instead of
                 // walking the hosts-file backoff ladder (observed :
                 // a delivery apex banned for minutes by its own fake answers).
-                let fake_intercepted = contains_fake_pool_addr(&record.addresses);
+                let fake_intercepted = contains_fake_pool_addr(record.addresses.iter().copied());
                 // Drop non-routable IPs (loopback/unspecified) before writing
                 // back. A hostname can flip to a hosts-file loopback pin
                 // between refreshes; such a mapping must never re-enter the
                 // cache (it would build a bogus /32 route out the secondary).
-                record.addresses.retain(|ip| !is_non_routable_v4(ip));
+                record.addresses.retain(|ip| !is_non_routable(ip));
                 if record.addresses.is_empty() && fake_intercepted {
                     summary.skipped = summary.skipped.saturating_add(1);
                     summary.fake_intercepted = summary.fake_intercepted.saturating_add(1);
@@ -530,7 +534,7 @@ impl DnsRefreshOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
 
     use nrr_domain::decision_lookup::FreshnessThresholds;
     use nrr_platform_api::dns::{MockDnsResolver, ResolvedRecord};
@@ -573,7 +577,7 @@ mod tests {
             .upsert_resolution(ResolutionEntry {
                 canonical_hostname: hostname.into(),
                 raw_hostname_sample: None,
-                resolved_ips: vec![ip],
+                resolved_ips: vec![IpAddr::V4(ip)],
                 ttl_seconds: Some(ttl),
                 source: StorageResolutionSource::Dns,
                 resolved_at,
@@ -614,7 +618,7 @@ mod tests {
             "ad.test",
             ResolvedRecord {
                 canonical_hostname: "ad.test".into(),
-                addresses: vec![Ipv4Addr::new(127, 0, 0, 1)],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
                 ttl_seconds: Some(120),
             },
         );
@@ -680,7 +684,7 @@ mod tests {
             "chat.example",
             ResolvedRecord {
                 canonical_hostname: "chat.example".into(),
-                addresses: vec![Ipv4Addr::new(203, 0, 113, 9)],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9))],
                 ttl_seconds: Some(300),
             },
         );
@@ -734,7 +738,7 @@ mod tests {
             "expired.test",
             ResolvedRecord {
                 canonical_hostname: "expired.test".into(),
-                addresses: vec![Ipv4Addr::new(203, 0, 113, 5)],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))],
                 ttl_seconds: Some(120),
             },
         );
@@ -826,7 +830,7 @@ mod tests {
             "ad.test",
             ResolvedRecord {
                 canonical_hostname: "ad.test".into(),
-                addresses: vec![Ipv4Addr::new(127, 0, 0, 1)],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
                 ttl_seconds: Some(120),
             },
         );
@@ -875,7 +879,7 @@ mod tests {
             "tube.test",
             ResolvedRecord {
                 canonical_hostname: "tube.test".into(),
-                addresses: vec![Ipv4Addr::new(198, 18, 0, 60)],
+                addresses: vec![IpAddr::V4(Ipv4Addr::new(198, 18, 0, 60))],
                 ttl_seconds: Some(120),
             },
         );
@@ -996,7 +1000,7 @@ mod tests {
         );
         assert_eq!(
             lookup.resolved_ips.first().map(|e| e.addr),
-            Some(Ipv4Addr::new(198, 51, 100, 2)),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))),
             "the previously-resolved address is retained"
         );
     }
@@ -1037,7 +1041,7 @@ mod tests {
                 &host,
                 ResolvedRecord {
                     canonical_hostname: host.clone(),
-                    addresses: vec![Ipv4Addr::new(10, 0, 0, i)],
+                    addresses: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, i))],
                     ttl_seconds: Some(60),
                 },
             );

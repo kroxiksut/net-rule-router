@@ -19,6 +19,9 @@ impl PerSidApplyOrchestrator {
     ) -> Self {
         Self {
             apply_locks: Mutex::new(std::collections::HashMap::new()),
+            // The process-wide stop latch. Tests override it rather than flip a
+            // static every other test in the binary would see.
+            teardown_gate: Arc::new(crate::teardown_in_progress),
             #[cfg(windows)]
             shadow_compare_seen: Mutex::new(std::collections::HashMap::new()),
             standing_volume_last: Mutex::new(std::collections::HashMap::new()),
@@ -34,6 +37,7 @@ impl PerSidApplyOrchestrator {
             // Default: kill-switch off (unresolved). Production overrides
             // via `with_kill_switch_resolver`.
             kill_switch_resolver: Arc::new(|_| None),
+            ipv6_guard_resolver: Arc::new(|_| crate::enforcement_planner::Ipv6Guard::Off),
             // Default: no extra exemptions. Production overrides via
             // `with_fail_closed_exemptions_resolver`.
             fail_closed_exemptions_resolver: Arc::new(|_| FailClosedExemptions::default()),
@@ -136,6 +140,14 @@ impl PerSidApplyOrchestrator {
         reset: Arc<dyn nrr_platform_api::fake_ip::stale_flows::StaleFlowReset>,
     ) -> Self {
         self.stale_flow_reset = Some(reset);
+        self
+    }
+
+    /// Answer "is the service stopping?" from something other than the
+    /// process-wide latch.
+    #[cfg(test)]
+    pub fn with_teardown_gate(mut self, gate: Arc<dyn Fn() -> bool + Send + Sync>) -> Self {
+        self.teardown_gate = gate;
         self
     }
 
@@ -401,6 +413,14 @@ impl PerSidApplyOrchestrator {
     /// active user's secondary binding + exemptions through the route
     /// coordinator; the kill-switch then activates only when the user has
     /// also turned on `block_secondary_when_unavailable`.
+    /// Plug the resolver that says what policy may do about IPv6 this pass.
+    /// Unset, the orchestrator names IPv4 only.
+    #[must_use]
+    pub fn with_ipv6_guard_resolver(mut self, resolver: Ipv6GuardResolver) -> Self {
+        self.ipv6_guard_resolver = resolver;
+        self
+    }
+
     pub fn with_kill_switch_resolver(mut self, resolver: KillSwitchResolver) -> Self {
         self.kill_switch_resolver = resolver;
         self

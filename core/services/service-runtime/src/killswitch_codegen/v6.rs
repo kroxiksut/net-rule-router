@@ -6,7 +6,9 @@
 //! and carries `user_sid = None`. Reading that next to the v4 code invited
 //! copying one into the other.
 //!
-//! Behaviour is unchanged: the same functions, verbatim.
+//! What the block must never cut is the same list as on the v4 side — the
+//! link's own upkeep, the tunnel's endpoints, the LAN — read off the route
+//! table rather than guessed.
 
 use std::net::Ipv6Addr;
 
@@ -30,14 +32,26 @@ const V6_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0);
 /// leaking nothing — link-local multicast cannot cross a router.
 const V6_LINK_LOCAL_MULTICAST: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0);
 
-/// Emit the IPv6 half of a catch-all block: loopback + link-local +
-/// link-local-multicast exemption permits over an unconditional block-all, at
-/// BOTH the V6 ALE-connect and V6
-/// packet layers. ALE-layer filters are scoped to `sid` (the V6 ALE layer
-/// exposes `ALE_USER_ID`); packet-layer filters carry `user_sid = None` (no ALE
-/// id there — the same caveat as the V4 packet layer). Distinct id seeds per
+/// Emit the IPv6 half of a catch-all block: the link-scope exemptions, the
+/// tunnel's own `/128` endpoints and the primary link's attached prefixes, over
+/// an unconditional block-all, at BOTH the V6 ALE-connect and V6 packet layers.
+///
+/// ALE-layer filters are scoped to `sid` (the V6 ALE layer exposes
+/// `ALE_USER_ID`); packet-layer filters carry `user_sid = None` (no ALE id
+/// there — the same caveat as the V4 packet layer). Distinct id seeds per
 /// (layer, target) so every filter gets a unique UUID.
-pub fn catch_all_v6_filters(sid: &str, secondary_luid: u64) -> Vec<WfpFilterSpec> {
+///
+/// `server_ips` and `local_subnets` are the v6 twins of what the v4 half
+/// exempts. Without the servers, a tunnel whose endpoint is reachable only over
+/// IPv6 could never dial out from under its own guard; without the subnets, the
+/// v6 LAN — the printer, the NAS, the router's own management address — dies
+/// with the tunnel it never used.
+pub fn catch_all_v6_filters(
+    sid: &str,
+    secondary_luid: u64,
+    server_ips: &[Ipv6Addr],
+    local_subnets: &[(Ipv6Addr, u8)],
+) -> Vec<WfpFilterSpec> {
     let mut out = Vec::new();
     // Anything leaving through the tunnel survives the cut. Without this the v6
     // block-all was absolute, and a tunnel whose endpoint is a v6 address could
@@ -100,6 +114,29 @@ pub fn catch_all_v6_filters(sid: &str, secondary_luid: u64) -> Vec<WfpFilterSpec
         ),
         block_all_v6(sid, WfpLayerKey::OutboundIpPacketV6),
     ]);
+    // The address-scoped exemptions continue the band after the three
+    // link-scope ones above, at both layers.
+    let scoped = server_ips
+        .iter()
+        .map(|ip| (*ip, 128u8))
+        .chain(local_subnets.iter().copied());
+    for (e, (net, prefix)) in scoped.enumerate() {
+        let e = e as u64;
+        out.push(exempt_subnet_v6(
+            sid,
+            WfpLayerKey::AleAuthConnectV6,
+            net,
+            prefix,
+            CATCHALL_EXEMPT_BASE + 3 + e,
+        ));
+        out.push(exempt_subnet_v6(
+            sid,
+            WfpLayerKey::OutboundIpPacketV6,
+            net,
+            prefix,
+            PACKET_EXEMPT_BASE + 3 + e,
+        ));
+    }
     out
 }
 
@@ -111,6 +148,7 @@ fn egress_permit_v6(sid: &str, layer: WfpLayerKey, secondary_luid: u64) -> WfpFi
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         // Above the exemption band so it outranks every block on this layer.
         weight: CATCHALL_EXEMPT_BASE + 100,
@@ -163,6 +201,7 @@ fn exempt_subnet_v6(
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(
@@ -200,6 +239,7 @@ fn block_all_v6(sid: &str, layer: WfpLayerKey) -> WfpFilterSpec {
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, "block-all"),

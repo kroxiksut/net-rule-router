@@ -15,7 +15,7 @@
 //! outright, so they are always honoured (never denied) regardless of sharing.
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use nrr_domain::canonical::{CanonicalAddressMatch, CanonicalRuleSet};
 use nrr_domain::shared_ip::{commit_shared_ip, SharedIpPolicy};
@@ -63,7 +63,8 @@ pub fn secondary_ip_denylist(
             Some(CanonicalAddressMatch::ExactIp(_)) | None => {}
             Some(CanonicalAddressMatch::ExactFqdn(host)) => {
                 rule_hosts.insert(host.clone());
-                for ip in cache.ips_for_hostname(host) {
+                // The shared-IP census is an IPv4 ledger.
+                for ip in crate::dns_wire::only_v4(&cache.ips_for_hostname(host)) {
                     ip_rule_hosts.entry(ip).or_default().insert(host.clone());
                 }
             }
@@ -109,7 +110,7 @@ fn collect_suffix_hosts(
     rule_hosts: &mut HashSet<String>,
 ) {
     for h in hosts {
-        for ip in cache.ips_for_hostname(h) {
+        for ip in crate::dns_wire::only_v4(&cache.ips_for_hostname(h)) {
             ip_rule_hosts.entry(ip).or_default().insert(h.clone());
         }
         rule_hosts.insert(h.clone());
@@ -133,11 +134,17 @@ impl<'a> DenylistFilteredCache<'a> {
 }
 
 impl FqdnCacheLookup for DenylistFilteredCache<'_> {
-    fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+    fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
         self.inner
             .ips_for_hostname(hostname)
             .into_iter()
-            .filter(|ip| !self.denied.contains(ip))
+            // The declined set is an IPv4 census, so it can only speak about
+            // IPv4. An address of the other family was never offered to it and
+            // must pass — declining by silence would hide the family entirely.
+            .filter(|ip| match ip {
+                IpAddr::V4(v4) => !self.denied.contains(v4),
+                IpAddr::V6(_) => true,
+            })
             .collect()
     }
 
@@ -165,7 +172,7 @@ mod tests {
         direct: HashMap<Ipv4Addr, u32>,
     }
     impl FqdnCacheLookup for CensusMock {
-        fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+        fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
             self.inner.ips_for_hostname(hostname)
         }
         fn hostnames_under_suffix(&self, suffix: &str, limit: usize) -> Vec<String> {

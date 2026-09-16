@@ -21,7 +21,21 @@ find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
 
 qt_standard_project_setup()
 
-set(NRR_HOST_SOURCES src/main.cpp)
+# Headers carrying a `Q_OBJECT` class are listed so AUTOMOC generates their
+# meta-object code; moc reads a source's own text, never what it includes.
+set(NRR_HOST_SOURCES
+    src/main.cpp
+    src/native_bridge.cpp
+    src/native_bridge_channel.cpp
+    src/native_bridge_files.cpp
+    src/native_bridge_rpc.cpp
+    src/native_bridge_rpc_diagnostics.cpp
+    src/host_includes.h
+    src/host_support.h
+    src/native_bridge.h
+    src/rpc_stdin_reader.h
+    src/service_controller.h
+)
 
 # The PE resource script carries the executable's icon. It is a Windows
 # concept — a `.rc` in the source list of a Linux build has no compiler to
@@ -44,25 +58,24 @@ qt_add_executable(nrr_qt_native_host
     ${NRR_HOST_SOURCES}
 )
 
-# Bake absolute QML paths so the host can locate them regardless of where
-# `target-dir` redirects build artefacts (e.g. fast local drive away from a
-# synced source tree). `findUpwardFile` from the binary location is tried
-# first; this is the deterministic dev-mode fallback.
-set(NRR_QML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../qml")
-get_filename_component(NRR_QML_DIR_ABS "${NRR_QML_DIR}" ABSOLUTE)
-# Same fallback story for `presets/` (country packs) and
-# `configs/presets/` (builtin-demo). Walking upward fails when the
-# build target-dir is on a different drive than the source tree.
-set(NRR_PRESETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../presets")
-get_filename_component(NRR_PRESETS_DIR_ABS "${NRR_PRESETS_DIR}" ABSOLUTE)
-set(NRR_CONFIGS_PRESETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../configs/presets")
-get_filename_component(NRR_CONFIGS_PRESETS_DIR_ABS "${NRR_CONFIGS_PRESETS_DIR}" ABSOLUTE)
-target_compile_definitions(nrr_qt_native_host PRIVATE
-    NRR_QML_MAIN_DEFAULT="${NRR_QML_DIR_ABS}/Main.qml"
-    NRR_QML_TRAY_DEFAULT="${NRR_QML_DIR_ABS}/Tray.qml"
-    NRR_PRESETS_ROOT_DEFAULT="${NRR_PRESETS_DIR_ABS}"
-    NRR_CONFIGS_PRESETS_ROOT_DEFAULT="${NRR_CONFIGS_PRESETS_DIR_ABS}"
-)
+# The host looks for its payload (QML, presets, icons, the launcher binaries)
+# beside itself only. A dev build also reads it from the checkout and the cargo
+# profile directory; those paths name the build machine, where on another
+# machine anyone could create them, so they are baked only when build.rs asks.
+option(NRR_DEV_LAYOUT "Resolve payload from the source checkout (dev builds only)" OFF)
+set(NRR_DEV_BIN_DIR "" CACHE PATH "Cargo profile directory holding the launcher binaries")
+if(NRR_DEV_LAYOUT)
+    get_filename_component(NRR_DEV_REPO_ROOT_ABS "${CMAKE_CURRENT_SOURCE_DIR}/../../../.." ABSOLUTE)
+    target_compile_definitions(nrr_qt_native_host PRIVATE
+        NRR_DEV_REPO_ROOT="${NRR_DEV_REPO_ROOT_ABS}"
+    )
+    if(NRR_DEV_BIN_DIR)
+        file(TO_CMAKE_PATH "${NRR_DEV_BIN_DIR}" NRR_DEV_BIN_DIR_CMAKE)
+        target_compile_definitions(nrr_qt_native_host PRIVATE
+            NRR_DEV_BIN_DIR="${NRR_DEV_BIN_DIR_CMAKE}"
+        )
+    endif()
+endif()
 
 target_link_libraries(nrr_qt_native_host PRIVATE
     Qt6::Core
@@ -73,11 +86,8 @@ target_link_libraries(nrr_qt_native_host PRIVATE
     Qt6::Widgets
 )
 
-# Runtime assets (startup-splash logo, window icon) are resolved by walking
-# upward from the binary, which fails when the build target-dir lives on a
-# different drive than the source tree and equally in an installed layout.
-# Copy them next to the binary so the depth-0 lookup always succeeds; this
-# also mirrors how an installer lays assets out relative to the executables.
+# Runtime assets (startup-splash logo, window icon) are looked up beside the
+# binary, the same place the package puts them; copy them there.
 set(NRR_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets")
 get_filename_component(NRR_ASSETS_DIR_ABS "${NRR_ASSETS_DIR}" ABSOLUTE)
 add_custom_command(TARGET nrr_qt_native_host POST_BUILD

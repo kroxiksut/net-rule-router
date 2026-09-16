@@ -8,7 +8,7 @@
 //! interface LUID + address set), the ALE block, and the transport-layer
 //! protocol-narrowed block — through the real `FwpmFilterAdd0` at escalating
 //! set sizes, and REQUIRES the shipped cap
-//! ([`nrr_platform_api::wfp_slotting::V4_SET_MAX_CONDITIONS`]) to materialize.
+//! ([`nrr_platform_api::wfp_slotting::SET_MAX_CONDITIONS`]) to materialize.
 //! Larger sizes are probed informationally to show the actual headroom.
 //!
 //! ## Safety: nothing is ever committed
@@ -30,7 +30,7 @@
 use std::net::Ipv4Addr;
 
 use nrr_platform_api::types::{WfpAction, WfpFilterId, WfpFilterSpec, WfpLayerKey};
-use nrr_platform_api::wfp_slotting::V4_SET_MAX_CONDITIONS;
+use nrr_platform_api::wfp_slotting::SET_MAX_CONDITIONS;
 use nrr_platform_windows::win32_ffi::wfp_engine::engine_open;
 use nrr_platform_windows::win32_ffi::wfp_filter::add_filter;
 use nrr_platform_windows::win32_ffi::wfp_transaction::{transaction_abort, transaction_begin};
@@ -88,6 +88,7 @@ fn set_spec(shape: &Shape, n: usize, id_raw: u64) -> WfpFilterSpec {
         action: shape.action,
         remote_ip: None,
         remote_ip_set: probe_ips(n),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: 0x0040_0000,
         id: WfpFilterId::from_raw(id_raw),
@@ -106,7 +107,7 @@ fn packed_set_cap_materializes_on_this_host() {
     let token = engine_open().expect("FwpmEngineOpen0 — run from an ELEVATED shell");
     transaction_begin(&token).expect("FwpmTransactionBegin0 — run from an ELEVATED shell");
 
-    let sizes = [8usize, 16, 32, V4_SET_MAX_CONDITIONS, 128, 256, 512];
+    let sizes = [8usize, 16, 32, SET_MAX_CONDITIONS, 128, 256, 512];
     let mut id_raw = 0x5E7_C0DE_0000u64;
     let mut cap_failures = Vec::new();
     for shape in &SHAPES {
@@ -120,7 +121,7 @@ fn packed_set_cap_materializes_on_this_host() {
                         "FAIL  [{}] {} OR'd remote-ip conditions: {e}",
                         shape.label, n
                     );
-                    if n <= V4_SET_MAX_CONDITIONS {
+                    if n <= SET_MAX_CONDITIONS {
                         cap_failures.push(format!("{} at {n}: {e}", shape.label));
                     }
                 }
@@ -131,7 +132,7 @@ fn packed_set_cap_materializes_on_this_host() {
     println!("SUMMARY: transaction ABORTED (nothing committed)");
     assert!(
         cap_failures.is_empty(),
-        "the shipped cap V4_SET_MAX_CONDITIONS={V4_SET_MAX_CONDITIONS} does not materialize on \
+        "the shipped cap SET_MAX_CONDITIONS={SET_MAX_CONDITIONS} does not materialize on \
          this host — lower it before trusting the packed codegen:\n{}",
         cap_failures.join("\n")
     );

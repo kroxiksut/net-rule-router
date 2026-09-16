@@ -15,13 +15,14 @@
 //! [`RouteEntry`][nrr_platform_api::types::RouteEntry] — what was missing was a
 //! caller that reads the facts on a platform where the route table is a port.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::adapters::AdapterInfo;
 use nrr_platform_api::types::RouteEntry;
 
 use crate::route_reconciler::{
-    bootstrap_server_ips, primary_local_subnets, virtual_machine_local_subnets,
+    bootstrap_server_ips, bootstrap_server_ips_v6, primary_gateway_v6, primary_local_subnets,
+    primary_local_subnets_v6, virtual_machine_local_subnets,
 };
 
 /// The escapes a blanket block grants, for one principal's bindings.
@@ -32,6 +33,12 @@ pub struct CatchAllExemptions {
     /// Subnets this machine is directly attached to over the primary link, plus
     /// the private segments of its own virtual-machine adapters.
     pub local_subnets: Vec<(Ipv4Addr, u8)>,
+    /// Tunnel-server endpoints reached over IPv6, from the `/128` bootstrap
+    /// routes. Empty on a machine with no v6 — which is not a reason to refuse
+    /// to arm, because the tunnel then bootstraps over v4.
+    pub server_ips_v6: Vec<Ipv6Addr>,
+    /// The prefixes the primary link is directly attached to over IPv6.
+    pub local_subnets_v6: Vec<(Ipv6Addr, u8)>,
 }
 
 impl CatchAllExemptions {
@@ -83,7 +90,23 @@ pub fn collect_exemptions(
     CatchAllExemptions {
         server_ips: bootstrap_server_ips(routes, secondary.index, Some(primary_gateway)),
         local_subnets,
+        server_ips_v6: bootstrap_server_ips_v6(
+            routes,
+            secondary.index,
+            primary_gateway_v6(routes, primary.index),
+        ),
+        local_subnets_v6: primary_local_subnets_v6(routes, primary.index),
     }
+}
+
+/// The adapter a bound display name refers to, matched the way the route
+/// applier matches it: the link name first, the OS-level name second.
+#[must_use]
+pub fn bound_adapter<'a>(
+    adapters: &'a [AdapterInfo],
+    name: Option<&str>,
+) -> Option<&'a AdapterInfo> {
+    name.and_then(|n| adapter_by_name(adapters, n))
 }
 
 /// Match a bound name against what the machine calls its links now — the link
@@ -99,6 +122,7 @@ mod tests {
     use super::*;
     use nrr_platform_api::adapters::{IfOperStatus, InterfaceType};
     use nrr_platform_api::RouteTableRef;
+    use std::net::IpAddr;
 
     fn adapter(index: u32, name: &str, gateways: Vec<Ipv4Addr>) -> AdapterInfo {
         AdapterInfo {
@@ -110,15 +134,16 @@ mod tests {
             interface_type: InterfaceType::Ethernet,
             oper_status: IfOperStatus::Up,
             ipv4_addresses: vec![Ipv4Addr::new(192, 168, 1, 10)],
+            ipv6_addresses: Vec::new(),
             gateways,
         }
     }
 
     fn route(dst: Ipv4Addr, prefix: u8, next_hop: Ipv4Addr, index: u32) -> RouteEntry {
         RouteEntry {
-            destination: dst,
+            destination: IpAddr::V4(dst),
             prefix_length: prefix,
-            next_hop,
+            next_hop: IpAddr::V4(next_hop),
             interface_index: index,
             metric: 0,
             is_ours: false,

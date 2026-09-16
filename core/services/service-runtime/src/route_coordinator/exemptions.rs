@@ -11,6 +11,23 @@
 use super::*;
 
 impl SecondaryRouteCoordinator {
+    /// What policy may do about IPv6 for `sid`'s bindings this pass.
+    ///
+    /// Unreadable links answer [`Ipv6Guard::Off`] — the same posture every
+    /// other resolver here takes when the machine will not say what it has:
+    /// name nothing rather than pin on a guess.
+    pub fn ipv6_guard(&self, sid: &str) -> crate::enforcement_planner::Ipv6Guard {
+        use crate::enforcement_planner::Ipv6Guard;
+        let Ok(adapters) = self.api.get_adapter_infos() else {
+            return Ipv6Guard::Off;
+        };
+        let secondary = self
+            .resolve(sid)
+            .secondary
+            .and_then(|t| adapters.iter().find(|a| a.index == t.interface_index));
+        Ipv6Guard::from_links(&adapters, secondary)
+    }
+
     /// resolve everything the
     /// kill-switch needs about `sid`'s secondary interface: its LUID plus the
     /// system exemptions (VPN server IPs, primary local subnets).
@@ -105,10 +122,17 @@ impl SecondaryRouteCoordinator {
                 }
             }
         }
+        // The v6 halves come straight off the route table: an IPv6 endpoint
+        // has no field in the model, and the `/128` bootstrap route the client
+        // installs is what the machine itself states.
+        let (bootstrap_server_ips_v6, local_subnets_v6) =
+            v6_exemptions(&routes, resolution.primary, Some(secondary.interface_index));
         Some(KillSwitchResolution {
             secondary_luid,
             bootstrap_server_ips: server_ips,
+            bootstrap_server_ips_v6,
             local_subnets,
+            local_subnets_v6,
             foreign_tunnel_luids: self.foreign_tunnel_luids(Some(secondary.interface_index)),
         })
     }
@@ -262,9 +286,16 @@ impl SecondaryRouteCoordinator {
             .into_iter()
             .filter(|ip| !ip.is_unspecified())
             .collect();
+        let (bootstrap_server_ips_v6, local_subnets_v6) = v6_exemptions(
+            &routes,
+            resolution.primary,
+            resolution.secondary.map(|s| s.interface_index),
+        );
         FailClosedExemptions {
             bootstrap_server_ips,
+            bootstrap_server_ips_v6,
             local_subnets,
+            local_subnets_v6,
             foreign_tunnel_luids: self
                 .foreign_tunnel_luids(resolution.secondary.map(|s| s.interface_index)),
             // the resolver has no rule/codegen context;
@@ -282,4 +313,29 @@ impl SecondaryRouteCoordinator {
             probe_target_ips,
         }
     }
+}
+
+/// The IPv6 exemptions both postures share: the tunnel's `/128` endpoints and
+/// the primary link's attached prefixes.
+///
+/// `secondary_ifindex` is only the redirect-overlay hint — a bootstrap host
+/// route is recognised by its next hop, so an unresolved tunnel still yields
+/// its endpoints.
+fn v6_exemptions(
+    routes: &[nrr_platform_api::types::RouteEntry],
+    primary: Option<crate::route_coordinator::SecondaryRouteTarget>,
+    secondary_ifindex: Option<u32>,
+) -> (Vec<std::net::Ipv6Addr>, Vec<(std::net::Ipv6Addr, u8)>) {
+    let Some(primary) = primary else {
+        return (Vec::new(), Vec::new());
+    };
+    let gateway = crate::route_reconciler::primary_gateway_v6(routes, primary.interface_index);
+    (
+        crate::route_reconciler::bootstrap_server_ips_v6(
+            routes,
+            secondary_ifindex.unwrap_or(0),
+            gateway,
+        ),
+        crate::route_reconciler::primary_local_subnets_v6(routes, primary.interface_index),
+    )
 }

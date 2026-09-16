@@ -122,11 +122,14 @@ pub fn run_under_scm() -> Result<(), ScmError> {
 /// because SCM has already disconnected stdin/stdout — there is no
 /// useful place to surface them.
 fn scm_service_main(_args: Vec<OsString>) {
-    // First thing in the process under SCM: without this, a panic during
-    // startup leaves no trace anywhere.
-    #[cfg(windows)]
-    capture_stderr();
-    let _ = run_scm_inner();
+    // Before stderr is pointed into the log directory: that file is the first
+    // thing written into the data tree.
+    let refused = crate::lock_down_data_tree().err();
+    // Without the capture, a panic during startup leaves no trace anywhere.
+    if refused.is_none() {
+        capture_stderr();
+    }
+    let _ = run_scm_inner(refused);
 }
 
 /// Send stderr to a file in the log directory. Resolves the directory
@@ -156,7 +159,7 @@ fn running_controls() -> ServiceControlAccept {
         | ServiceControlAccept::SESSION_CHANGE
 }
 
-fn run_scm_inner() -> Result<(), ScmError> {
+fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     let stop = StopToken::new();
     let stop_for_handler = stop.clone();
     let (tx, rx) = mpsc::channel::<LifecycleEvent>();
@@ -206,6 +209,21 @@ fn run_scm_inner() -> Result<(), ScmError> {
 
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
         .map_err(|e| ScmError::Handler(e.to_string()))?;
+
+    // Stopped with a service-specific code, so SCM records a failed start
+    // rather than a process that vanished.
+    if let Some(reason) = refused {
+        let _ = status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: ServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::ServiceSpecific(1),
+            checkpoint: 0,
+            wait_hint: Duration::from_secs(0),
+            process_id: None,
+        });
+        return Err(ScmError::Handler(reason));
+    }
 
     // Build a controller that reports state to SCM. The runtime body
     // calls `report` synchronously; SCM accepts repeated `Running`

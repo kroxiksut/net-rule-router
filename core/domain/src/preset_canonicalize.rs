@@ -523,11 +523,14 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_address_is_rejected_in_free_edition() {
-        let outcome = canonicalize("--- IP\n::1\n", RouteRole::Primary);
+    fn an_ipv6_address_is_an_exact_ip_rule() {
+        let outcome = canonicalize("--- IP\n2001:db8::7\n", RouteRole::Primary);
+        let rules = outcome.rule_set().unwrap().rules();
         assert!(matches!(
-            outcome,
-            PresetRulesCanonicalizeOutcome::Rejected { .. }
+            rules[0].address_match,
+            Some(crate::canonical::CanonicalAddressMatch::ExactIp(
+                std::net::IpAddr::V6(_)
+            ))
         ));
     }
 

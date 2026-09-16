@@ -307,10 +307,6 @@
       "detailed-mode": {
         "label": "Detailed mode",
         "note": "Shows the fine-grained fake-IP switches (UDP relay, instant reset) under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way."
-      },
-      "isp-block-candidates": {
-        "label": "Suggest a rule when a site is blocked by your provider",
-        "note": "When a site will not open because your internet provider is blocking it, NetRuleRouter offers to move that site to your additional route instead of leaving it unreachable."
       }
     },
     "field": {
@@ -579,12 +575,6 @@
         "max-targets": "Addresses per check",
         "repeat": "Do not re-check the same address for, s",
         "reset": "Reset to defaults"
-      },
-      "block-ipv6": "Switch IPv6 off while leak protection is on",
-      "block-ipv6-description": "Rules cover IPv4 addresses. A site that also has an IPv6 address could otherwise reach it over the main connection while its IPv4 traffic goes through the additional route. Turn this off only if your network needs IPv6.",
-      "isp-block-candidates": {
-        "label": "Suggest sites your provider blocks",
-        "description": "When a site stops opening on the main connection and that looks like a block rather than the site being down, it is offered as a suggestion to move to the additional route. You still decide — nothing is added on its own."
       }
     },
     "logs": {
@@ -1751,9 +1741,6 @@
     "fake-ip-instant-rst-on": "Instant reset for the additional route is on.",
     "fake-ip-instant-rst-off": "Instant reset is off — connections are held briefly instead of resetting.",
     "fake-ip-instant-rst-failed": "Could not change the instant-reset setting: ",
-    "isp-block-candidates-on": "ISP block-page rule suggestions are on.",
-    "isp-block-candidates-off": "ISP block-page rule suggestions are off.",
-    "isp-block-candidates-failed": "Could not change the ISP block-page rule suggestions setting: ",
     "mode-a-coverage-set": "Fallback blocking behavior updated.",
     "mode-a-coverage-failed": "Could not update the fallback blocking behavior: ",
     "hosts-bypass-set": "Rule-domain resolution updated.",
@@ -1798,8 +1785,6 @@
     "primary-probe-failed": "Could not change the main-route check: ",
     "refusing-anchor-on": "{name} is marked as refusing addresses on the main connection.",
     "refusing-anchor-off": "The mark on {name} was removed.",
-    "block-ipv6-on": "IPv6 is switched off while leak protection is on, so rules cover a site completely.",
-    "block-ipv6-off": "IPv6 stays on. Sites with an IPv6 address can bypass your rules over it.",
     "binding-parked-offline": "Saved. The connection assignment will be applied as soon as the background service is running.",
     "binding-delivered-after-offline": "The connections you chose are now applied by the background service.",
     "provisioned-rule-set-missing": "The rule set named in the setup answers was not found: ",
@@ -2055,7 +2040,7 @@
     "hint": {
       "zone": "A single zone label — letters, digits, hyphens; an optional leading dot is allowed. Matches all hosts in the zone. Examples: .ru, ru, com, intra, corp.",
       "domain": "FQDN (example.com) or wildcard suffix (*.example.com). Matches the domain itself and all subdomains. Examples: example.com, *.example.com, mail.example.com.",
-      "exact-ip": "Exact IPv4 address. Each octet 0–255; first octet ≥ 1. Examples: 192.0.2.1, 8.8.8.8, 203.0.113.7.",
+      "exact-ip": "Exact IPv4 or IPv6 address. For IPv4 each octet is 0–255 and the first is ≥ 1. Examples: 192.0.2.1, 203.0.113.7, 2001:db8::7.",
       "application-windows": "Process filename — .exe, .ps1, .bat or any executable script. Exact (browser.exe) or glob (*vpn*.exe).",
       "application-linux": "Process filename, case-sensitive on Linux.",
       "application-macos": "Process filename or app bundle id."
@@ -2141,8 +2126,7 @@
         "domain": "Enter a domain name (example.com) or a subdomain wildcard (*.example.com).",
         "domain-too-long": "Domain is longer than 253 characters.",
         "domain-glob-position": "Wildcard `*` is allowed only as a leading prefix (`*.example.com`).",
-        "exact-ip": "Enter a valid IPv4 address (e.g. 203.0.113.7).",
-        "exact-ip-v6": "Rules work with IPv4 addresses. IPv6 is switched off while leak protection is on, so an IPv6 address needs no rule of its own — enter the site's domain or its IPv4 address.",
+        "exact-ip": "Enter a valid IPv4 or IPv6 address (e.g. 203.0.113.7 or 2001:db8::7).",
         "exact-ip-octet-out-of-range": "Octet {octet} (position {position}) is out of range. Each octet must be 0–255.",
         "exact-ip-first-octet-zero": "First octet must be ≥ 1 (0.x.x.x is reserved).",
         "exact-ip-broadcast": "255.255.255.255 is the limited-broadcast address and cannot be routed.",
@@ -2166,7 +2150,7 @@
       "section-hint": {
         "zones": "Zone-level group routing. Matches all traffic for a named zone (e.g. .ru, corp-internal). Highest priority tier.",
         "domains": "Domain name rules. Exact FQDN (example.com) or subdomain wildcard (*.example.com). Exact match takes priority over wildcard.",
-        "ip": "Exact IPv4 address rules. One address per entry. CIDR and IPv6 are not supported yet.",
+        "ip": "Exact IP address rules, IPv4 or IPv6. One address per entry. CIDR is not supported yet.",
         "windows": "Windows application rules matched by process filename — exact or glob (e.g. *vpn*.exe). Applied on Windows only.",
         "linux": "Linux application rules matched by process name. Stored in the file on all platforms, but applied only on Linux.",
         "macos": "macOS application rules matched by bundle ID or process name. Stored in the file on all platforms, but applied only on macOS."
@@ -2209,6 +2193,8 @@
         "needed-by": "Needed by:",
         "reach": "The rule covers every name under {domain}.",
         "reach-seen": "Seen so far: {hosts}.",
+        "reach-app": "The rule sends every connection of {app} through the additional route.",
+        "app-group": "Application {name}",
         "reach-more": "+{count} more",
         "consumer-on-primary": "on the main route",
         "consumer-on-primary-hint": "This site goes through the main route. If you move the address into the tunnel, this site's traffic to it goes there too.",
@@ -2230,7 +2216,6 @@
         "select-all-tooltip": "Select or clear every address currently shown.",
         "action-forget": "Delete",
         "action-forget-tooltip": "Removes the record entirely, answer and all, so the address is offered again if it turns up next to your sites.",
-        "behavior-cut": "the main route drops connections to it",
         "behavior-unknown": "not checked on the main route",
         "sort-main-route": "What the main route can't reach first",
         "action-check-main-route": "Check the main route",
@@ -2394,8 +2379,8 @@
         "brand-related": "shares a name with the site",
         "delivery-name": "looks like a delivery address of the site",
         "co-activity": "keeps appearing together with the site",
-        "isp-block-page": "your provider answered with a notice page instead of this site",
         "placeholder-answer": "your provider answered with an address nothing can be reached at",
+        "app-main-link-blocked": "none of its connections went through on the main route, and it kept failing on several addresses",
         "main-link-blocked": "connections to it kept failing on the main route and none went through"
       },
       "action": {
@@ -2406,6 +2391,8 @@
       },
       "title-blocked": "Sites the main route will not carry",
       "body-blocked": "Connections to {name} keep failing on the main route.",
+      "title-app-blocked": "Programs the main route will not carry",
+      "body-app-blocked": "No connection of {name} goes through on the main route.",
       "body-blocked-multi": "Connections to {count} sites keep failing on the main route."
     },
     "auto-rules-mode-confirm": {
@@ -2650,7 +2637,9 @@
         "hour": "h",
         "day": "d",
         "expired": "expired"
-      }
+      },
+      "window-title": "Cache",
+      "open-window": "Open cache"
     },
     "conn-trace": {
       "title": "Connection trace",
@@ -2707,8 +2696,14 @@
       "observer-unavailable": "The service is not observing connections right now, so this list stays empty. The service log says why.",
       "rule-for-address": "Rule for this address…",
       "rule-for-app": "Rule for this application…",
+      "why-this-route": "Why this route?",
       "auto-paused": "Paused — scroll to the top or clear the selection to resume",
-      "gui-stream-off": "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running."
+      "gui-stream-off": "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.",
+      "window-title": "Connection trace",
+      "open-window": "Open connection trace",
+      "card-summary": "Which interface each outgoing connection actually left through.",
+      "only-ipv6": "IPv6 only",
+      "only-ipv6-tip": "Show only connections made over IPv6. They are observed, but routing rules do not apply to that family yet — so these are the connections currently travelling outside your policy. Link-local IPv6 counts as local, so tick \"Show local connections\" as well to see it."
     },
     "explain": {
       "title": "Explain sample",
@@ -2751,7 +2746,9 @@
         "collateral-blocked-strict": "Some of this site's addresses are SHARED with sites routed via the additional adapter. Strict kill switch is on: while the additional adapter is unavailable those shared addresses are blocked, so this site may not open.",
         "collateral-smart-exempt": "Some of this site's addresses are shared with sites routed via the additional adapter. Smart kill switch keeps them unblocked, so this site works — but routed traffic to those shared addresses is not leak-protected.",
         "collateral-risk-subdomain-rules": "This name is not cached, but sites under the same domain are routed via the additional adapter. Large services often serve both from the same addresses, so a strict kill switch may block this site while the additional adapter is unavailable."
-      }
+      },
+      "window-title": "Rule diagnostics",
+      "open-window": "Open rule diagnostics"
     },
     "archive": {
       "title": "Diagnostic archive export",
@@ -2849,6 +2846,7 @@
     "service-degraded": "Service is degraded — try again later",
     "recovery-required": "Service requires user recovery action",
     "internal": "Internal service error",
+    "gui-internal": "Internal error in the application — the change was not sent",
     "transport-disconnected": "Service is offline",
     "timeout": "Request timed out",
     "bad-response": "Service returned a malformed response",
@@ -3048,6 +3046,10 @@
     "app-rule-learning": {
       "title": "New application rule is settling in",
       "body": "{apps}: the service is still learning which addresses this program uses, so its first connection attempts may fail. Restart the program if it is already open."
+    },
+    "host-unreachable": {
+      "title": "A site does not answer on either link",
+      "body": "{host} did not answer through the main link or through the additional one, so moving it would not help and nothing was offered. The problem is most likely on the site's side."
     }
   },
   "route": {

@@ -152,7 +152,7 @@ fn collect_from(sysfs: &Path, proc_net_route: &Path) -> Result<Vec<AdapterInfo>,
     let gateways = std::fs::read_to_string(proc_net_route)
         .map(|text| parse_default_gateways(&text))
         .unwrap_or_default();
-    let addresses = crate::adapters_addr::ipv4_addresses_by_interface();
+    let addresses = crate::adapters_addr::unicast_addresses_by_interface();
 
     let entries = std::fs::read_dir(sysfs).map_err(|e| PlatformError::Transient {
         operation: "adapters.enumerate",
@@ -185,7 +185,14 @@ fn collect_from(sysfs: &Path, proc_net_route: &Path) -> Result<Vec<AdapterInfo>,
             mac: read("address").and_then(|v| parse_mac(&v)),
             interface_type,
             oper_status: oper_status_from(facts.operstate.as_deref(), facts.carrier),
-            ipv4_addresses: addresses.get(&name).cloned().unwrap_or_default(),
+            ipv4_addresses: addresses
+                .get(&name)
+                .map(|a| a.v4.clone())
+                .unwrap_or_default(),
+            ipv6_addresses: addresses
+                .get(&name)
+                .map(|a| a.v6.clone())
+                .unwrap_or_default(),
             gateways: gateways
                 .iter()
                 .filter(|g| g.interface == name)

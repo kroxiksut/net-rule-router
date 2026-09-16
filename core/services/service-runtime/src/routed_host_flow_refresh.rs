@@ -133,7 +133,8 @@ impl RoutedHostFlowRefresh {
     }
 
     fn collect_into(&self, addresses: &mut BTreeSet<Ipv4Addr>, hostname: &str) {
-        for address in self.cache.ips_for_hostname(hostname) {
+        // Routed-host flow refresh acts on the v4 flows the relay tracks.
+        for address in crate::dns_wire::only_v4(&self.cache.ips_for_hostname(hostname)) {
             addresses.insert(address);
         }
     }
@@ -146,15 +147,16 @@ mod tests {
     use nrr_platform_api::fake_ip::MockStaleFlowReset;
 
     use super::*;
+    use std::net::IpAddr;
 
     #[derive(Default)]
     struct FakeCache {
-        addresses: HashMap<String, Vec<Ipv4Addr>>,
+        addresses: HashMap<String, Vec<IpAddr>>,
         under_suffix: HashMap<String, Vec<String>>,
     }
 
     impl FqdnCacheLookup for FakeCache {
-        fn ips_for_hostname(&self, hostname: &str) -> Vec<Ipv4Addr> {
+        fn ips_for_hostname(&self, hostname: &str) -> Vec<IpAddr> {
             self.addresses.get(hostname).cloned().unwrap_or_default()
         }
 

@@ -130,10 +130,8 @@ pub fn validate_rule_value(rule_type_slug: &str, match_value: &str) -> RuleValue
 // ── exact-ip ──────────────────────────────────────────────────────────────────
 
 fn validate_exact_ip(value: &str) -> RuleValueValidation {
-    // An IPv6 literal is a deliberate answer, not a typo: say why the rule is
-    // unnecessary rather than making the user check their four octets.
-    if value.parse::<std::net::Ipv6Addr>().is_ok() {
-        return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip-v6");
+    if let Ok(v6) = value.parse::<std::net::Ipv6Addr>() {
+        return validate_exact_ipv6(v6);
     }
     // Reject anything that is not exactly four dot-separated decimal octets.
     let parts: Vec<&str> = value.split('.').collect();
@@ -187,6 +185,25 @@ fn validate_exact_ip(value: &str) -> RuleValueValidation {
         );
     }
     if octets[0] >= 224 && octets[0] <= 239 {
+        return RuleValueValidation::warning(
+            "rules.validation.match-value-warning.exact-ip-multicast",
+        );
+    }
+    RuleValueValidation::Valid
+}
+
+/// The IPv6 half: the parser already settled the syntax, so only the addresses
+/// that make no sense as a routing target remain to be named.
+fn validate_exact_ipv6(ip: std::net::Ipv6Addr) -> RuleValueValidation {
+    if ip.is_unspecified() {
+        return RuleValueValidation::error("rules.validation.match-value-invalid.exact-ip");
+    }
+    if ip.is_loopback() {
+        return RuleValueValidation::warning(
+            "rules.validation.match-value-warning.exact-ip-loopback",
+        );
+    }
+    if ip.is_multicast() {
         return RuleValueValidation::warning(
             "rules.validation.match-value-warning.exact-ip-multicast",
         );
@@ -401,17 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn an_ipv6_literal_says_ipv6_not_bad_octets() {
-        assert!(matches!(
-            validate_rule_value("exact-ip", "2606:4700::1111"),
-            RuleValueValidation::Error { ref message_key, .. }
-                if message_key == "rules.validation.match-value-invalid.exact-ip-v6"
-        ));
-        assert!(matches!(
-            validate_rule_value("exact-ip", "::1"),
-            RuleValueValidation::Error { ref message_key, .. }
-                if message_key == "rules.validation.match-value-invalid.exact-ip-v6"
-        ));
+    fn an_ipv6_literal_is_an_exact_ip() {
+        ok("exact-ip", "2001:db8::7");
+        warn("exact-ip", "::1", "loopback");
+        warn("exact-ip", "ff02::1", "multicast");
+        err("exact-ip", "::", "exact-ip");
     }
 
     #[test]

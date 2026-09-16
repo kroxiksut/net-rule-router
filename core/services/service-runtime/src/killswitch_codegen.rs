@@ -78,11 +78,11 @@
 //! The function is pure: same inputs → identical filters and identical
 //! filter ids.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use nrr_platform_api::fail_closed::is_exempt_from_blocking;
 use nrr_platform_api::types::{WfpAction, WfpFilterSpec, WfpLayerKey};
-use nrr_platform_api::wfp_slotting::{pack_v4, V4SlotChunk};
+use nrr_platform_api::wfp_slotting::{pack_both, pack_v4, FamilyChunk, V4SlotChunk};
 // Weight bands come from `wfp_bands`, which holds the complete order and
 // asserts it. This file emits filters; it does not get to invent a band.
 use crate::wfp_bands::{
@@ -107,8 +107,12 @@ pub struct KillSwitchResolution {
     /// VPN server IPs (bootstrap host-route destinations) to exempt so the
     /// tunnel can (re)establish. Empty → the catch-all must NOT arm.
     pub bootstrap_server_ips: Vec<Ipv4Addr>,
+    /// The same endpoints reached over IPv6. Empty on a machine with no v6.
+    pub bootstrap_server_ips_v6: Vec<Ipv6Addr>,
     /// Primary interface's connected subnets to exempt (LAN/DHCP/local DNS).
     pub local_subnets: Vec<(Ipv4Addr, u8)>,
+    /// The primary link's directly-attached IPv6 prefixes.
+    pub local_subnets_v6: Vec<(Ipv6Addr, u8)>,
     /// Tunnels the user runs beside ours — see
     /// [`FailClosedExemptions::foreign_tunnel_luids`].
     pub foreign_tunnel_luids: Vec<u64>,
@@ -295,6 +299,7 @@ fn doh_port_block(
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: scope.map(|c| c.members.clone()).unwrap_or_default(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: Some(port),
         weight,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-doh", &tag),
@@ -326,7 +331,7 @@ fn doh_port_block(
 /// there is nothing to protect or the LUID is unusable.
 pub fn kill_switch_filters(
     sid: &str,
-    protected_ips: &[Ipv4Addr],
+    protected_ips: &[IpAddr],
     secondary_luid: u64,
     protocols: KillSwitchProtocols,
 ) -> Vec<WfpFilterSpec> {
@@ -336,7 +341,7 @@ pub fn kill_switch_filters(
         return Vec::new();
     }
 
-    let chunks = pack_v4(
+    let chunks = pack_both(
         protected_ips
             .iter()
             .copied()
@@ -356,13 +361,21 @@ pub fn kill_switch_filters(
         // 2a — packet-layer egress-conditional pairs so ICMP and
         // the other selected packet protocols are killed the instant the
         // secondary adapter drops (the ALE pair above only sees TCP/UDP).
-        filters.extend(packet_egress_pairs(
-            sid,
-            DestScope::Chunk(chunk),
-            protocols,
-            secondary_luid,
-            idx,
-        ));
+        //
+        // IPv4 only: the pairs need `FWPM_CONDITION_IP_PROTOCOL`, which lives
+        // at the transport layer, and the v6 transport layer is not modelled.
+        // An accepted gap with the same shape as the per-app one — a rule
+        // host's own traffic is TCP/UDP, which the ALE pair above covers in
+        // both families, and ICMPv6 to it is not what the tunnel carries.
+        if let FamilyChunk::V4(v4) = chunk {
+            filters.extend(packet_egress_pairs(
+                sid,
+                DestScope::Chunk(v4),
+                protocols,
+                secondary_luid,
+                idx,
+            ));
+        }
     }
     filters
 }
@@ -386,52 +399,69 @@ pub(super) fn permit_luid_seg(luid: u64) -> String {
 /// change mints a new id and the reconcile swaps the filter make-before-break.
 fn permit_via_secondary(
     sid: &str,
-    chunk: &V4SlotChunk,
+    chunk: &FamilyChunk,
     secondary_luid: u64,
     idx: u64,
 ) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Permit,
-        remote_ip: None,
-        remote_ip_set: chunk.members.clone(),
-        remote_port: None,
-        weight: KILLSWITCH_PERMIT_BASE + idx,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            &permit_luid_seg(secondary_luid),
-            "ks-permit",
-            &chunk.id_seg(),
-        ),
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: Some(secondary_luid),
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
+    let id = filter_id_for(
+        sid,
+        KILLSWITCH_ROLE,
+        &permit_luid_seg(secondary_luid),
+        "ks-permit",
+        &chunk.id_seg(),
+    );
+    let mut spec = crate::wfp_codegen::chunk_spec(
+        chunk,
+        crate::wfp_codegen::ale_layer(chunk),
+        WfpAction::Permit,
+        KILLSWITCH_PERMIT_BASE + idx,
+        id,
+    );
+    spec.user_sid = Some(sid.to_string());
+    spec.local_interface_luid = Some(secondary_luid);
+    spec
 }
 
 /// `Block` half: drop the chunk's destinations whenever the egress-conditional
 /// permit does not match (i.e. the secondary adapter is down and the route
 /// fell back elsewhere).
-fn block_off_secondary(sid: &str, chunk: &V4SlotChunk, idx: u64) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: chunk.members.clone(),
-        remote_port: None,
-        weight: KILLSWITCH_BLOCK_BASE + idx,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-block", &chunk.id_seg()),
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
+/// The v6 twin of [`ale_block`] over a packed chunk: same band, same protocol
+/// narrowing, the family's own layer.
+fn ale_block_v6(sid: &str, chunk: &FamilyChunk, proto: Option<u8>, weight: u64) -> WfpFilterSpec {
+    let id = filter_id_for(
+        sid,
+        KILLSWITCH_ROLE,
+        "",
+        "ks-ale-block",
+        &format!(
+            "{}-{}",
+            chunk.id_seg(),
+            proto.map_or("any".into(), |p| p.to_string())
+        ),
+    );
+    let mut spec = crate::wfp_codegen::chunk_spec(
+        chunk,
+        crate::wfp_codegen::ale_layer(chunk),
+        WfpAction::Block,
+        weight,
+        id,
+    );
+    spec.user_sid = Some(sid.to_string());
+    spec.ip_protocol = proto;
+    spec
+}
+
+fn block_off_secondary(sid: &str, chunk: &FamilyChunk, idx: u64) -> WfpFilterSpec {
+    let id = filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-block", &chunk.id_seg());
+    let mut spec = crate::wfp_codegen::chunk_spec(
+        chunk,
+        crate::wfp_codegen::ale_layer(chunk),
+        WfpAction::Block,
+        KILLSWITCH_BLOCK_BASE + idx,
+        id,
+    );
+    spec.user_sid = Some(sid.to_string());
+    spec
 }
 
 // ── Per-app kill-switch ────────────────────────────────────────
@@ -493,6 +523,7 @@ fn permit_app_via_secondary(
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: KILLSWITCH_PERMIT_BASE + idx,
         id: filter_id_for(
@@ -526,6 +557,7 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: APP_KILLSWITCH_BLOCK_BASE + idx,
         id: filter_id_for(
@@ -578,13 +610,29 @@ pub const DEFAULT_VPN_EXEMPT_PATTERNS: &[&str] = &[
     "tunnelbear*",
     "windscribe*",
     "hide.me*",
-    "swiftvpn*",
     "amnezia*",
     "outline*",
     "warp-svc",
     "cloudflare warp",
     "tailscale*",
     "zerotier*",
+    // Corporate clients of the project's primary audience. None of them carries
+    // "vpn" in its name — `*vpn*` does not reach "ViPNet" (v-i-p-n-e-t), and a
+    // client that fail-closed cuts is a user who loses the corporate network
+    // and has every reason to blame us.
+    //
+    // Shaped as exe-name globs, which is what the app resolver matches; the
+    // adapter-side [`nrr_platform_api::vpn_discovery::VPN_CORPORATE_KEYWORDS`]
+    // is a substring list over DISPLAY names too, so the two cannot be derived
+    // from one another (several of its entries contain spaces). A client whose
+    // binary is named differently still needs the user's own primary-app rule.
+    "*vipnet*",
+    "*s-terra*",
+    "*sterra*",
+    // Prefix, not substring: as a substring "continent" is an ordinary word,
+    // which is why the adapter-side list leaves it out. An executable that
+    // BEGINS with it is a different matter.
+    "continent*",
 ];
 
 /// Kill-switch EXEMPTION for apps the user routed to the **primary** adapter.
@@ -613,7 +661,7 @@ pub const CLIENT_TREE_EXEMPT_CAP: usize = 24;
 /// The OTHER executables of each recognised tunnel client, so the exemption
 /// covers the process that actually performs the handshake.
 ///
-/// A client is not one binary. `hidemy.name VPN 3.0.exe` is a window: its
+/// A client is not one binary. `swiftvpn 3.0.exe` is a window: its
 /// transports are `OpenVPN\openvpn.exe` and `XRay\ExternalBinaries\xray.exe`,
 /// each a separate process, and one of them — never the window — is what talks
 /// to the server. Exempting only the resolved binary is why one observed outage
@@ -671,6 +719,7 @@ fn exempt_primary_app(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec {
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: APP_EXEMPT_BASE + idx,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-app-exempt", pattern),
@@ -826,12 +875,16 @@ pub fn catch_all_kill_switch_filters(
         filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
     }
 
-    // ── IPv6 (Free's only IPv6 handling) ──
-    // Whenever the catch-all arms, cut ALL outbound IPv6 too (except loopback,
-    // link-local and link-local multicast), independent of the V4 protocol
-    // mask above. Selective per-IP
-    // V6 needs AAAA, which is not done; the catch-all closes the IPv6 leak.
-    filters.extend(catch_all_v6_filters(sid, exemptions.secondary_luid));
+    // ── IPv6 ──
+    // The blanket posture means "nothing leaves except through the tunnel", and
+    // that has to hold for both families or the block is a v4 block wearing a
+    // catch-all's name. Same exemption list as the v4 half, in v6 spelling.
+    filters.extend(catch_all_v6_filters(
+        sid,
+        exemptions.secondary_luid,
+        &exemptions.bootstrap_server_ips_v6,
+        &exemptions.local_subnets_v6,
+    ));
 
     filters
 }
@@ -861,6 +914,7 @@ pub fn fake_ip_pool_permit_filters(
         action: WfpAction::Permit,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: FAKEIP_POOL_PERMIT_BASE,
         id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "v4"),
@@ -877,6 +931,7 @@ pub fn fake_ip_pool_permit_filters(
             action: WfpAction::Permit,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight: FAKEIP_POOL_PERMIT_BASE + 1,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "v6"),
@@ -901,6 +956,7 @@ pub fn fake_ip_pool_permit_filters(
             action: WfpAction::Block,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight: FAKEIP_POOL_PERMIT_BASE + 2,
             id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "udp4"),
@@ -917,6 +973,7 @@ pub fn fake_ip_pool_permit_filters(
                 action: WfpAction::Block,
                 remote_ip: None,
                 remote_ip_set: Vec::new(),
+                remote_ip_set_v6: Vec::new(),
                 remote_port: None,
                 weight: FAKEIP_POOL_PERMIT_BASE + 3,
                 id: filter_id_for(sid, KILLSWITCH_ROLE, "", "ks-fakeip-pool", "udp6"),
@@ -944,6 +1001,7 @@ fn catch_all_block(sid: &str, ip_protocol: Option<u8>) -> WfpFilterSpec {
         action: WfpAction::Block,
         remote_ip: None,
         remote_ip_set: Vec::new(),
+        remote_ip_set_v6: Vec::new(),
         remote_port: None,
         weight: CATCHALL_BLOCK_WEIGHT,
         // The protocol is part of the id: a filter is immutable by key, and the
@@ -995,683 +1053,10 @@ mod v6;
 
 pub use v6::catch_all_v6_filters;
 
-// ── Fail-closed (block 16.18.vpn — failure posture) ─────────────────────────
-
-/// Exemptions for the fail-closed block-all path (mode B) when the secondary
-/// is unresolvable. Loopback / link-local / broadcast are always exempt in the
-/// codegen; these are the host-specific extras that keep the box manageable and
-/// let the tunnel reconnect.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct FailClosedExemptions {
-    /// Known VPN server IPs to exempt so the tunnel can (re)establish even
-    /// while everything else is blocked. May be empty (then reconnection
-    /// requires toggling the emergency block off).
-    pub bootstrap_server_ips: Vec<Ipv4Addr>,
-    /// Primary interface's connected subnets (LAN / DHCP unicast / local
-    /// router / local DNS) to exempt so the machine stays reachable.
-    pub local_subnets: Vec<(Ipv4Addr, u8)>,
-    /// known-primary destination IPs (hosts
-    /// the user's PRIMARY rules resolved to). Under the block-all, TCP/UDP to
-    /// these already escapes at the ALE layer via the rule permit, but the
-    /// packet-layer named blocks (ICMP/…) are unconditional and would cut ping
-    /// to a positively primary-routed host. Each earns a packet-layer
-    /// proto-agnostic permit above the block band so "known-primary" is fully
-    /// reachable while only "unknown" traffic is cut. The caller has already
-    /// subtracted any IP that is also secondary-destined (those stay blocked
-    /// while the secondary is down). Loopback/link-local are skipped here too.
-    pub primary_dest_ips: Vec<Ipv4Addr>,
-    /// OPT-IN "allow name resolution over the primary link
-    /// while the catch-all block-all is engaged". `false` (default) = the strict
-    /// posture blocks DNS too; `true` = add port-scoped permits (remote UDP/TCP
-    /// port 53) so the Mode-B resolver's upstream queries — and plain DNS — keep
-    /// working over the primary link while everything else is blocked. Narrowed to
-    /// port 53 so it is NOT a full-host tunnel; it is still a deliberate
-    /// DNS-over-primary leak, which is why it is opt-in and defaults off.
-    pub allow_dns_over_primary: bool,
-    /// destinations POSITIVELY established as DIRECT
-    /// (non-rule) hosts (see [`crate::known_direct::KnownDirectRegistry`]): a
-    /// Mode-B steered direct answer, or an FCrDNS forward-confirmed name that
-    /// matches no rule. Unlike [`Self::primary_dest_ips`] these have NO rule
-    /// permit at the ALE layer, so under the block-all each earns BOTH an ALE
-    /// exempt and a packet-layer permit — otherwise a plain primary-path site
-    /// (an unruled direct destination) dies with the tunnel it never used. The caller has
-    /// already subtracted anything secondary-destined.
-    pub known_direct_ips: Vec<Ipv4Addr>,
-    /// LUID of the tunnel, so traffic leaving THROUGH it survives a cut. `0`
-    /// when the tunnel is unresolved and there is no egress to permit. Carried
-    /// here rather than passed alongside because it answers the same question
-    /// as every other field: what may still leave.
-    pub secondary_luid: u64,
-    /// LUIDs of tunnels the USER runs that are none of our business — a
-    /// corporate VPN beside our own additional route.
-    ///
-    /// Traffic leaving through one of these is not a leak: it goes into
-    /// somebody else's encrypted tunnel, not out of the provider's door,
-    /// which is the thing this block-all exists to stop. Cutting it makes the
-    /// product the reason a working corporate connection dies, and the user
-    /// cannot tell our block from their VPN failing.
-    ///
-    /// Permitted by EGRESS, never by destination: exempting the tunnel's
-    /// address range instead would open that range on every link, including
-    /// the primary — the hole the kill-switch is for.
-    pub foreign_tunnel_luids: Vec<u64>,
-    /// The secondary tunnel next-hop(s) the liveness probe pings. The probe's
-    /// verdict is what DISARMS this very block-all, and its ICMP echo is
-    /// kernel-originated — it carries no app-id, so no process exemption can
-    /// cover it; only a destination permit can  HW diagnosis: the
-    /// packet-layer ICMP block ate the probe's echo and the kill-switch stayed
-    /// fail-closed until service stop, through every VPN reconnect). Each IP
-    /// earns an ALE exempt plus a proto-agnostic packet-layer permit, both with
-    /// their own id kind so a next-hop equal to a bootstrap server IP keeps
-    /// distinct filter ids.
-    pub probe_target_ips: Vec<Ipv4Addr>,
-}
-
-/// Fail-closed, mode A (selective). The secondary is unresolvable, so there is
-/// no tunnel to permit through — emit a **block** over each protected secondary
-/// destination, narrowed to the selected `protocols`. TCP/UDP are blocked at
-/// the ALE connect layer; ICMP/IGMP/GRE/ESP (and, for "Other", every remaining
-/// protocol) at the packet layer — the only place ICMP/ping is visible.
-/// Loopback / link-local destinations are skipped. Returns empty when there is
-/// nothing to protect or no protocol is selected.
-pub fn fail_closed_block_destinations(
-    sid: &str,
-    protected_ips: &[Ipv4Addr],
-    protocols: KillSwitchProtocols,
-) -> Vec<WfpFilterSpec> {
-    if !protocols.any() {
-        return Vec::new();
-    }
-    let chunks = pack_v4(
-        protected_ips
-            .iter()
-            .copied()
-            .filter(|ip| !is_exempt_from_blocking(*ip))
-            .take(KILLSWITCH_MAX_DESTINATIONS),
-    );
-    let mut out = Vec::new();
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let idx = idx as u64;
-        let scope = DestScope::Chunk(chunk);
-        if protocols.wants_ale_block() {
-            out.push(ale_block(
-                sid,
-                scope,
-                protocols.ale_protocol(),
-                KILLSWITCH_BLOCK_BASE + idx,
-            ));
-        }
-        out.extend(packet_protocol_blocks(sid, scope, protocols, idx));
-    }
-    out
-}
-
-/// Fail-closed, mode A, per-**app**. The secondary is unresolvable, so there is
-/// no tunnel to permit through — block each protected secondary application at
-/// the ALE connect layer (TCP/UDP). ICMP from a specific process is not
-/// matchable at the packet layer (no app context), so it is out of scope here —
-/// the app's observed-destination `/32`s cover it via
-/// [`fail_closed_block_destinations`]. Returns empty when no app is protected or
-/// no ALE protocol is selected.
-pub fn fail_closed_block_apps(
-    sid: &str,
-    app_patterns: &[String],
-    protocols: KillSwitchProtocols,
-) -> Vec<WfpFilterSpec> {
-    if !protocols.wants_ale_block() {
-        return Vec::new();
-    }
-    app_patterns
-        .iter()
-        .take(APP_KILLSWITCH_MAX_APPS)
-        .enumerate()
-        .map(|(idx, pattern)| ale_block_app(sid, pattern, APP_KILLSWITCH_BLOCK_BASE + idx as u64))
-        .collect()
-}
-
-/// ALE-layer block keyed on an app id (mirrors [`ale_block`] for the per-app
-/// fail-closed path). Protocol-agnostic (covers TCP+UDP). Sits below the
-/// primary rule band ([`APP_KILLSWITCH_BLOCK_BASE`]) so main-named addresses
-/// keep working for the app even with the tunnel unresolved; the id folds the
-/// band tag for the same upgrade reason as [`block_app_off_secondary`].
-fn ale_block_app(sid: &str, pattern: &str, weight: u64) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "sub-main-band",
-            "ks-app-fc-block",
-            pattern,
-        ),
-        user_sid: Some(sid.to_string()),
-        app_pattern: Some(pattern.to_string()),
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
-}
-
-/// Fail-closed, mode B (everything-via-secondary). The secondary is gone, so
-/// block **all** egress for this user except the safe exemptions. Unlike
-/// [`catch_all_kill_switch_filters`] this arms WITHOUT a resolvable secondary adapter LUID
-/// (there is none) and WITHOUT requiring server IPs — it is the last-resort
-/// "the secondary adapter is gone, cut everything" path. The filter set, by weight
-/// (high → low):
-/// 1. exemption permits at [`CATCHALL_EXEMPT_BASE`] (loopback, link-local,
-///    broadcast, any known VPN server, each primary local subnet);
-/// 2. (rule-driven primary permits at `0x0020_0000` still escape — mode-B
-///    exceptions routed via the primary link keep working);
-/// 3. the catch-all `Block` at [`CATCHALL_BLOCK_WEIGHT`].
-///
-/// All filters are scoped to `sid` — it never blocks other users / the system.
-pub fn fail_closed_block_all_filters(
-    sid: &str,
-    exemptions: &FailClosedExemptions,
-    protocols: KillSwitchProtocols,
-) -> Vec<WfpFilterSpec> {
-    if !protocols.any() {
-        return Vec::new();
-    }
-    let mut filters: Vec<WfpFilterSpec> = Vec::new();
-    let mut weight = CATCHALL_EXEMPT_BASE;
-
-    // Somebody else's tunnel keeps carrying what it was carrying. See
-    // `FailClosedExemptions::foreign_tunnel_luids` for why this is not a hole:
-    // the permit is on the EGRESS interface, so it covers only packets that
-    // actually leave through that tunnel.
-    for luid in &exemptions.foreign_tunnel_luids {
-        if *luid != 0 && *luid != exemptions.secondary_luid {
-            filters.push(exempt_egress(sid, *luid, weight));
-            weight += 1;
-        }
-    }
-    // ── ALE connect layer exemptions (TCP/UDP) ──
-    filters.extend(base_ale_exemptions(
-        sid,
-        &exemptions.bootstrap_server_ips,
-        &mut weight,
-    ));
-    // Liveness-probe target(s): the tunnel next-hop the probe must keep
-    // reaching, or its DEAD verdict can never flip back and this block-all
-    // never disarms (see `FailClosedExemptions::probe_target_ips`).
-    for ip in &exemptions.probe_target_ips {
-        filters.push(exempt_probe_target(sid, *ip, weight));
-        weight += 1;
-    }
-    // Primary interface's connected subnets (LAN, DHCP unicast, local DNS).
-    for (net, prefix) in &exemptions.local_subnets {
-        filters.push(exempt_subnet(sid, *net, *prefix, weight));
-        weight += 1;
-    }
-    // known-direct destinations. A direct host has no rule
-    // permit at all, so without this the catch-all cuts plain primary-path
-    // sites along with the leak it guards against. Distinct id kind from
-    // `exempt_host`, so an IP that is also a VPN server keeps both filter ids.
-    for ip in exemptions
-        .known_direct_ips
-        .iter()
-        .copied()
-        .filter(|ip| !is_exempt_from_blocking(*ip))
-        .take(KILLSWITCH_MAX_DESTINATIONS)
-    {
-        filters.push(exempt_direct_host(sid, ip, weight));
-        weight += 1;
-    }
-    // opt-in: keep name resolution working over the primary
-    // link while blocked (port-scoped UDP/TCP 53). See `allow_dns_over_primary`.
-    if exemptions.allow_dns_over_primary {
-        filters.extend(exempt_dns_over_primary(sid, weight));
-    }
-    // The catch-all ALE block — TCP/UDP egress this user sends, narrowed to the
-    // TCP/UDP selection. Skipped entirely when neither TCP nor UDP is selected.
-    if protocols.wants_ale_block() {
-        filters.push(ale_block(
-            sid,
-            DestScope::All,
-            protocols.ale_protocol(),
-            CATCHALL_BLOCK_WEIGHT,
-        ));
-    }
-
-    // ── Transport layer (ICMP/IGMP/GRE/ESP — incl. ping) ──
-    // the named-protocol blocks live at OUTBOUND_TRANSPORT_V4 (the
-    // packet layer has no IP_PROTOCOL condition), so the layer needs its OWN
-    // exemptions: the named blocks there would otherwise trap loopback/LAN/
-    // DHCP/the tunnel server for those protocols.
-    if protocols.wants_packet_layer() {
-        const TR: WfpLayerKey = WfpLayerKey::OutboundTransportV4;
-        let mut pw = PACKET_EXEMPT_BASE;
-        filters.extend(base_packet_exemptions(
-            sid,
-            TR,
-            &exemptions.bootstrap_server_ips,
-            &mut pw,
-        ));
-        // Packet-layer twin of the probe-target ALE exempt above — this is the
-        // layer whose named ICMP block would otherwise eat the probe's echo.
-        for ip in &exemptions.probe_target_ips {
-            filters.push(packet_permit_probe_target(sid, TR, *ip, pw));
-            pw += 1;
-        }
-        for (net, prefix) in &exemptions.local_subnets {
-            filters.push(packet_exempt_subnet(sid, TR, *net, *prefix, pw));
-            pw += 1;
-        }
-        // known-primary destinations: a
-        // proto-agnostic packet permit per IP so ping/ICMP to a positively
-        // primary-routed host (e.g. ya.ru) escapes the named packet blocks
-        // below, while genuinely-unknown traffic is still cut. TCP/UDP already
-        // escaped at the ALE layer via the rule permit; this closes the
-        // packet-layer gap that made ping to a whitelisted host fail. Caller
-        // has subtracted secondary-destined IPs (those stay blocked while the
-        // secondary is down). Loopback/link-local are skipped and the set is
-        // capped like every other kill-switch destination list.
-        for ip in exemptions
-            .primary_dest_ips
-            .iter()
-            .copied()
-            .filter(|ip| !is_exempt_from_blocking(*ip))
-            .take(KILLSWITCH_MAX_DESTINATIONS)
-        {
-            filters.push(packet_permit_primary_host(sid, TR, ip, pw));
-            pw += 1;
-        }
-        // packet-layer twin of the known-direct ALE exempt
-        // above, so ICMP/ping to a learned direct host survives too.
-        for ip in exemptions
-            .known_direct_ips
-            .iter()
-            .copied()
-            .filter(|ip| !is_exempt_from_blocking(*ip))
-            .take(KILLSWITCH_MAX_DESTINATIONS)
-        {
-            filters.push(packet_permit_direct_host(sid, TR, ip, pw));
-            pw += 1;
-        }
-        filters.extend(packet_protocol_blocks(sid, DestScope::All, protocols, 0));
-    }
-
-    // ── IPv6 (Free's only IPv6 handling) ──
-    // The secondary is gone, so cut ALL outbound IPv6 too (except loopback,
-    // link-local and link-local multicast), independent of the V4 protocol
-    // mask above.
-    filters.extend(catch_all_v6_filters(sid, exemptions.secondary_luid));
-
-    filters
-}
-
-// ── Protocol-aware filter builders (multi-protocol kill-switch) ──────────────
-
-/// Destination scope of a kill-switch filter: everything (the catch-all
-/// forms) or one packed chunk of destinations. The single-address form is
-/// gone deliberately — per-address filters are what grew the standing set
-/// into the thousands.
-#[derive(Clone, Copy)]
-enum DestScope<'a> {
-    All,
-    Chunk(&'a V4SlotChunk),
-}
-
-impl DestScope<'_> {
-    fn members(self) -> Vec<Ipv4Addr> {
-        match self {
-            DestScope::All => Vec::new(),
-            DestScope::Chunk(c) => c.members.clone(),
-        }
-    }
-
-    fn key(self) -> String {
-        match self {
-            DestScope::All => "all".into(),
-            DestScope::Chunk(c) => c.id_seg(),
-        }
-    }
-}
-
-/// Build a scope/protocol key for a packet- or ALE-layer filter id.
-/// [`DestScope::All`] → "all"; `proto = None` → "any".
-fn proto_scope_key(scope: DestScope<'_>, proto: Option<u8>) -> String {
-    let p = proto.map(|p| p.to_string()).unwrap_or_else(|| "any".into());
-    format!("{}-{p}", scope.key())
-}
-
-/// ALE-layer block, optionally narrowed to one IP protocol (TCP/UDP). Scoped
-/// to `sid` (ALE exposes `ALE_USER_ID`). [`DestScope::All`] blocks all
-/// destinations.
-fn ale_block(sid: &str, scope: DestScope<'_>, proto: Option<u8>, weight: u64) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer: WfpLayerKey::AleAuthConnectV4,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: scope.members(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "",
-            "ks-ale-block",
-            &proto_scope_key(scope, proto),
-        ),
-        user_sid: Some(sid.to_string()),
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: proto,
-    }
-}
-
-/// Below-ALE block at `layer`. ⚠ Neither the packet layer nor the transport
-/// layer exposes `ALE_USER_ID`, so `user_sid` MUST be `None` (system-wide);
-/// the id is still seeded with `sid` for uniqueness + cleanup tracking.
-///
-/// a protocol-narrowed block (`proto = Some`) MUST target
-/// [`WfpLayerKey::OutboundTransportV4`] — the IPPACKET layers have no
-/// `FWPM_CONDITION_IP_PROTOCOL` and `FwpmFilterAdd0` rejects the filter with
-/// `FWP_E_CONDITION_NOT_FOUND` (every named-protocol kill-switch block
-/// silently failed to install from  until this fix). The kind tag
-/// is layer-specific so a transport filter never collides UUIDs with a
-/// historically-installed packet-layer twin.
-fn packet_block(
-    sid: &str,
-    layer: WfpLayerKey,
-    scope: DestScope<'_>,
-    proto: Option<u8>,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-block"
-    } else {
-        "ks-pkt-block"
-    };
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Block,
-        remote_ip: None,
-        remote_ip_set: scope.members(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "",
-            kind,
-            &proto_scope_key(scope, proto),
-        ),
-        user_sid: None,
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: proto,
-    }
-}
-
-/// Below-ALE exemption permit for a remote subnet (loopback / link-local /
-/// LAN) at `layer`. Protocol-agnostic. `user_sid = None` (no ALE ids below
-/// the ALE layers). Layer-specific kind tag — see [`packet_block`].
-fn packet_exempt_subnet(
-    sid: &str,
-    layer: WfpLayerKey,
-    net: Ipv4Addr,
-    prefix_len: u8,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-exempt-net"
-    } else {
-        "ks-pkt-exempt-net"
-    };
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Permit,
-        remote_ip: None,
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            "",
-            kind,
-            &format!("{net}/{prefix_len}"),
-        ),
-        user_sid: None,
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: Some((net, prefix_len)),
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
-}
-
-/// Below-ALE exemption permit for an exact remote host (VPN server /
-/// broadcast) at `layer`. Protocol-agnostic. `user_sid = None` (no ALE ids
-/// below the ALE layers). Layer-specific kind tag — see [`packet_block`].
-fn packet_exempt_host(sid: &str, layer: WfpLayerKey, ip: Ipv4Addr, weight: u64) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-exempt-host"
-    } else {
-        "ks-pkt-exempt-host"
-    };
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Permit,
-        remote_ip: Some(ip),
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, &ip.to_string()),
-        user_sid: None,
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
-}
-
-/// below-ALE proto-agnostic permit for a
-/// known-primary destination host under a fail-closed block-all, at `layer`.
-/// Distinct id kind from [`packet_exempt_host`] so a primary IP that happens
-/// to equal a VPN-server IP does not collide filter ids. `user_sid = None`
-/// (no ALE ids below the ALE layers). Layer-specific kind tag — see
-/// [`packet_block`].
-fn packet_permit_primary_host(
-    sid: &str,
-    layer: WfpLayerKey,
-    ip: Ipv4Addr,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-primary-host"
-    } else {
-        "ks-pkt-primary-host"
-    };
-    packet_permit_host_with_kind(sid, layer, ip, weight, kind)
-}
-
-/// packet-layer permit for a KNOWN-DIRECT destination.
-/// Same shape as [`packet_permit_primary_host`] with its own id kind so a
-/// destination that is both known-primary and known-direct keeps distinct ids.
-fn packet_permit_direct_host(
-    sid: &str,
-    layer: WfpLayerKey,
-    ip: Ipv4Addr,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-direct-host"
-    } else {
-        "ks-pkt-direct-host"
-    };
-    packet_permit_host_with_kind(sid, layer, ip, weight, kind)
-}
-
-/// Packet-layer proto-agnostic permit for a liveness-probe target — the twin
-/// of [`exempt_probe_target`] at the layer where the ICMP echo is actually
-/// classified (the ALE block is TCP/UDP-narrowed; the named packet blocks are
-/// what eat ICMP). Own id kind so overlapping IPs keep distinct ids.
-fn packet_permit_probe_target(
-    sid: &str,
-    layer: WfpLayerKey,
-    ip: Ipv4Addr,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-probe-host"
-    } else {
-        "ks-pkt-probe-host"
-    };
-    packet_permit_host_with_kind(sid, layer, ip, weight, kind)
-}
-
-fn packet_permit_host_with_kind(
-    sid: &str,
-    layer: WfpLayerKey,
-    ip: Ipv4Addr,
-    weight: u64,
-    kind: &str,
-) -> WfpFilterSpec {
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Permit,
-        remote_ip: Some(ip),
-        remote_ip_set: Vec::new(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(sid, KILLSWITCH_ROLE, "", kind, &ip.to_string()),
-        user_sid: None,
-        app_pattern: None,
-        local_interface_luid: None,
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: None,
-    }
-}
-
-/// The named-protocol block set for one scope (`Some(ip)` = a /32 in mode A;
-/// `None` = block-all in mode B), narrowed to `protocols`: one block per
-/// selected named packet protocol (ICMP/IGMP/GRE/ESP). `idx` offsets weights
-/// so per-destination sets in mode A never collide.
-///
-/// these blocks live at `OUTBOUND_TRANSPORT_V4`, NOT the packet
-/// layer: the IPPACKET layers have no `FWPM_CONDITION_IP_PROTOCOL`, so every
-/// protocol-narrowed packet-layer filter failed `FwpmFilterAdd0` with
-/// `FWP_E_CONDITION_NOT_FOUND` since  (3 020 skips per HW run).
-/// Known transport-layer gap (accepted): stack-originated IGMP and
-/// kernel-injected GRE/ESP tunnels bypass the transport stack — user-space
-/// ICMP (ping) and raw-socket sends are classified there.
-///
-/// the protocol-agnostic "Other"
-/// block-all is GONE (see [`KillSwitchProtocols::wants_packet_layer`]): it was
-/// system-wide and cut TCP/UDP above every ALE permit/exemption.
-fn packet_protocol_blocks(
-    sid: &str,
-    scope: DestScope<'_>,
-    protocols: KillSwitchProtocols,
-    idx: u64,
-) -> Vec<WfpFilterSpec> {
-    let mut out = Vec::new();
-    for (k, p) in protocols.packet_named().into_iter().enumerate() {
-        out.push(packet_block(
-            sid,
-            WfpLayerKey::OutboundTransportV4,
-            scope,
-            Some(p),
-            PACKET_BLOCK_BASE + idx * 16 + k as u64,
-        ));
-    }
-    out
-}
-
-/// Below-ALE egress-conditional Permit for the leak-proof pair at `layer`:
-/// allow a flow **while it egresses `luid`** (the secondary adapter).
-/// `user_sid = None` (no ALE ids below the ALE layers). Mirrors
-/// [`permit_via_secondary`], optionally narrowed to one IP protocol —
-/// protocol narrowing REQUIRES the transport layer (HW-0718, see
-/// [`packet_block`]). Layer-specific kind tag.
-fn packet_egress_permit(
-    sid: &str,
-    layer: WfpLayerKey,
-    scope: DestScope<'_>,
-    proto: Option<u8>,
-    luid: u64,
-    weight: u64,
-) -> WfpFilterSpec {
-    let kind = if layer == WfpLayerKey::OutboundTransportV4 {
-        "ks-tr-egress"
-    } else {
-        "ks-pkt-egress"
-    };
-    WfpFilterSpec {
-        layer,
-        action: WfpAction::Permit,
-        remote_ip: None,
-        remote_ip_set: scope.members(),
-        remote_port: None,
-        weight,
-        id: filter_id_for(
-            sid,
-            KILLSWITCH_ROLE,
-            &permit_luid_seg(luid),
-            kind,
-            &proto_scope_key(scope, proto),
-        ),
-        user_sid: None,
-        app_pattern: None,
-        local_interface_luid: Some(luid),
-        remote_subnet: None,
-        remote_subnet_v6: None,
-        ip_protocol: proto,
-    }
-}
-
-/// The below-ALE leak-proof pairs for one scope, narrowed to `protocols`:
-/// an egress-conditional Permit (allow while egressing the secondary adapter)
-/// over a Block (fires the instant the secondary adapter drops), per selected
-/// named packet protocol (ICMP/IGMP/GRE/ESP). Empty when no packet protocol
-/// is selected. HW-0718: the pairs live at `OUTBOUND_TRANSPORT_V4` — see
-/// [`packet_protocol_blocks`] for why the packet layer cannot host them.
-///
-/// the protocol-agnostic "Other" pair
-/// is GONE (see [`KillSwitchProtocols::wants_packet_layer`]).
-fn packet_egress_pairs(
-    sid: &str,
-    scope: DestScope<'_>,
-    protocols: KillSwitchProtocols,
-    luid: u64,
-    idx: u64,
-) -> Vec<WfpFilterSpec> {
-    let mut out = Vec::new();
-    for (k, p) in protocols.packet_named().into_iter().enumerate() {
-        out.push(packet_egress_permit(
-            sid,
-            WfpLayerKey::OutboundTransportV4,
-            scope,
-            Some(p),
-            luid,
-            PACKET_EXEMPT_BASE + idx * 16 + k as u64,
-        ));
-        out.push(packet_block(
-            sid,
-            WfpLayerKey::OutboundTransportV4,
-            scope,
-            Some(p),
-            PACKET_BLOCK_BASE + idx * 16 + k as u64,
-        ));
-    }
-    out
-}
-
+mod fail_closed;
+pub use fail_closed::*;
+mod filters;
+use filters::*;
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

@@ -16,6 +16,7 @@
 //! phase-1 gap — classic UDP DNS fits the vast majority of rule-host `A`
 //! answers, and the passive observer remains a backstop.
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::TrySendError;
@@ -23,15 +24,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::dns_resolver::{
-    handle_a_query, CompanionCandidateLookup, CompanionRescueObserver, DirectAnswerGate,
-    DirectFakeIpAnswerer, FactSink, FakeIpAnswerer, NoopCompanionCandidates, NoopCompanionRescue,
-    NoopDirectAnswerGate, NoopDirectFakeIp, NoopFakeIpAnswerer, NoopSecondaryOwnedIps,
-    QueryOutcome, ResolveError, RuleHostOracle, SecondaryOwnedIps, SyncReconciler,
-    UpstreamResolver,
+    handle_a_query, AaaaOutcome, CompanionCandidateLookup, CompanionRescueObserver,
+    DirectAnswerGate, DirectFakeIpAnswerer, FactSink, FakeIpAnswerer, NoopCompanionCandidates,
+    NoopCompanionRescue, NoopDirectAnswerGate, NoopDirectFakeIp, NoopFakeIpAnswerer,
+    NoopSecondaryOwnedIps, QueryOutcome, ResolveError, RuleHostOracle, SecondaryOwnedIps,
+    SyncReconciler, UpstreamResolver,
 };
 use crate::dns_wire::{
-    build_a_response, build_error_response, parse_a_response, parse_question, AResponseOutcome,
-    QTYPE_A, RCODE_NXDOMAIN, RCODE_SERVFAIL,
+    build_a_response, build_error_response, build_negative_response, only_v4,
+    parse_address_response, parse_question, AddressResponseOutcome, QTYPE_A, QTYPE_AAAA,
+    RCODE_NOERROR, RCODE_NXDOMAIN, RCODE_SERVFAIL,
 };
 
 /// TTL (seconds) stamped on resolver-built `A` responses. Deliberately SHORT so
@@ -96,8 +98,16 @@ pub type ClaimedNamespacesFn =
 /// from turning one failed lookup into a burst.
 const MAX_PRIVATE_RETRIES: usize = 2;
 
+/// What policy may do about IPv6 for the routing principal right now.
+pub type Ipv6DispositionFn = Arc<dyn Fn() -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
+
 pub struct DnsInterceptListener {
     oracle: Arc<dyn RuleHostOracle>,
+    /// Rule hosts whose AAAA we have already reported as leaving policy,
+    /// so a repeated lookup does not repeat the warning. Bounded: a suffix
+    /// rule can match unboundedly many names, and a diagnostic must not be
+    /// the thing that grows without limit.
+    aaaa_outside_policy_reported: Mutex<HashSet<String>>,
     upstream: Arc<dyn UpstreamResolver>,
     sink: Arc<dyn FactSink>,
     reconciler: Arc<dyn SyncReconciler>,
@@ -143,15 +153,14 @@ pub struct DnsInterceptListener {
     /// Reports a rescued host to the suggestion engine under its own name. See
     /// [`CompanionRescueObserver`].
     companion_rescue: Arc<dyn CompanionRescueObserver>,
-    /// Sees every `A` query and whether a rule covers its name, which is what
-    /// the operator-notice-page detector needs. The default no-op observes
-    /// nothing, so the feature is absent until wired.
-    resolution_observer: Arc<dyn ResolutionObserver>,
     /// Whether the leak guard is blocking with the additional link unresolved.
     /// A rule-host answer that missed its reconcile deadline is withheld while
     /// it is — see [`crate::dns_resolver::LeakGuardPosture`]. The default never
     /// blocks, keeping the historic fail-open.
     leak_guard: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
+    /// The default is `Off`, which handles every AAAA exactly as before IPv6
+    /// could be routed.
+    ipv6_disposition: Ipv6DispositionFn,
     /// Live choice of forwarding upstream — rotates itself when the server it
     /// points at stops answering.
     upstream_dns: Arc<crate::dns_upstream::UpstreamDnsPool>,
@@ -159,15 +168,6 @@ pub struct DnsInterceptListener {
     forward_timeout: Duration,
     response_ttl: u32,
 }
-
-/// Watches names as they are resolved. Production feeds
-/// [`crate::isp_block_page_learner`]; nothing here decides anything.
-pub trait ResolutionObserver: Send + Sync {
-    fn note_resolution(&self, hostname: &str, rule_covered: bool);
-}
-
-/// The default: sees nothing.
-pub struct NoopResolutionObserver;
 
 /// Receive buffer for both directions of the DNS path.
 ///
@@ -189,10 +189,6 @@ const DNS_DATAGRAM_BUFFER_BYTES: usize = 4096;
 /// ends the loop; one odd packet no longer does.
 const DNS_RECV_ERROR_TOLERANCE: u32 = 16;
 
-impl ResolutionObserver for NoopResolutionObserver {
-    fn note_resolution(&self, _hostname: &str, _rule_covered: bool) {}
-}
-
 impl DnsInterceptListener {
     pub fn new(
         oracle: Arc<dyn RuleHostOracle>,
@@ -204,6 +200,7 @@ impl DnsInterceptListener {
         forward_timeout: Duration,
     ) -> Self {
         Self {
+            aaaa_outside_policy_reported: Mutex::new(HashSet::new()),
             oracle,
             upstream,
             sink,
@@ -217,8 +214,8 @@ impl DnsInterceptListener {
             collateral_fake: Arc::new(NoopDirectFakeIp),
             companion_candidates: Arc::new(NoopCompanionCandidates),
             companion_rescue: Arc::new(NoopCompanionRescue),
-            resolution_observer: Arc::new(NoopResolutionObserver),
             leak_guard: Arc::new(crate::dns_resolver::OpenLeakGuard),
+            ipv6_disposition: Arc::new(|| crate::enforcement_planner::Ipv6Guard::Off),
             enforced_view: Arc::new(crate::dns_resolver::NoEnforcement),
             upstream_dns: Arc::new(crate::dns_upstream::UpstreamDnsPool::fixed(upstream_dns)),
             deadline,
@@ -232,12 +229,6 @@ impl DnsInterceptListener {
     /// the shape tests use.
     pub fn with_upstream_pool(mut self, pool: Arc<crate::dns_upstream::UpstreamDnsPool>) -> Self {
         self.upstream_dns = pool;
-        self
-    }
-
-    /// Watch resolved names (operator-notice-page detection).
-    pub fn with_resolution_observer(mut self, observer: Arc<dyn ResolutionObserver>) -> Self {
-        self.resolution_observer = observer;
         self
     }
 
@@ -259,6 +250,14 @@ impl DnsInterceptListener {
         posture: Arc<dyn crate::dns_resolver::LeakGuardPosture>,
     ) -> Self {
         self.leak_guard = posture;
+        self
+    }
+
+    /// Read the routing principal's IPv6 disposition: a rule host's AAAA is
+    /// routed when the tunnel carries the family, withheld when only the main
+    /// link does.
+    pub fn with_ipv6_disposition(mut self, disposition: Ipv6DispositionFn) -> Self {
+        self.ipv6_disposition = disposition;
         self
     }
 
@@ -366,7 +365,7 @@ impl DnsInterceptListener {
             }
             let full = format!("{label}.{suffix}");
             let id = crate::dns_resolver_ports::next_query_id();
-            let Some(probe) = crate::dns_wire::build_a_query(id, &full) else {
+            let Some(probe) = crate::dns_wire::build_address_query(id, &full, QTYPE_A) else {
                 continue;
             };
             for server in servers {
@@ -379,8 +378,8 @@ impl DnsInterceptListener {
                 else {
                     continue;
                 };
-                if let crate::dns_wire::AResponseOutcome::Answers { addresses, min_ttl } =
-                    crate::dns_wire::parse_a_response(id, &full, &reply)
+                if let crate::dns_wire::AddressResponseOutcome::Answers { addresses, min_ttl } =
+                    crate::dns_wire::parse_address_response(id, &full, QTYPE_A, &reply)
                 {
                     if addresses.is_empty() {
                         continue;
@@ -392,7 +391,7 @@ impl DnsInterceptListener {
                         server = %server,
                         "completed a short name with the namespace its connection claims",
                     );
-                    return build_a_response(query, &addresses, min_ttl.max(1));
+                    return build_a_response(query, &only_v4(&addresses), min_ttl.max(1));
                 }
             }
         }
@@ -406,6 +405,103 @@ impl DnsInterceptListener {
     /// the enforce-before-answer handler and builds the response from the
     /// resolved IPs. Anything else (including a rule host our own resolver could
     /// not reach) is forwarded raw — general DNS never depends on us succeeding.
+    /// Bound on remembered names. Past it the warning repeats rather than
+    /// the set growing — a noisy log is recoverable, unbounded memory in the
+    /// service is not.
+    const AAAA_REPORT_MEMORY: usize = 256;
+
+    fn report_aaaa_outside_policy(&self, qname: &str) {
+        {
+            let mut seen = self
+                .aaaa_outside_policy_reported
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(qname.to_string()) {
+                return;
+            }
+            if seen.len() > Self::AAAA_REPORT_MEMORY {
+                seen.clear();
+            }
+        }
+        tracing::warn!(
+            target: "nrr::dns",
+            host = %qname,
+            "a rule host was asked for over IPv6 and IPv4 cannot carry it — its \
+             v6 traffic leaves outside the rule",
+        );
+    }
+
+    /// AAAA for a rule host, by what the routing principal's links carry.
+    ///
+    /// The tunnel carries IPv6: the host's v6 is routed like its v4. Only the
+    /// main link does: NODATA, so the client uses the family the tunnel
+    /// carries. Nothing carries it: forwarded untouched — suppressing it would
+    /// make a v6-only destination unreachable for no protection at all.
+    ///
+    /// The fake-IP probe is [`FakeIpAnswerer::carries_on_v4`], never
+    /// `fake_answer`: the latter allocates a lease and records health.
+    fn aaaa_action(&self, query: &[u8], qname: &str) -> ListenerAction {
+        use crate::enforcement_planner::Ipv6Guard;
+        if !self.oracle.is_rule_host(qname) {
+            return ListenerAction::Forward; // not a name any rule claims
+        }
+        let nodata = || {
+            build_negative_response(query, RCODE_NOERROR, self.response_ttl)
+                .map_or(ListenerAction::Forward, ListenerAction::Respond)
+        };
+        // A virtual address carries the host on IPv4 and the relay routes it;
+        // a real v6 answer would go around both.
+        if self.fake_ip.carries_on_v4(qname) {
+            return nodata();
+        }
+        match (self.ipv6_disposition)() {
+            Ipv6Guard::FiltersAndRoutes => self.route_aaaa(query, qname),
+            // The tunnel cannot carry the family, so the host's v6 addresses
+            // are pinned to it and blocked. Handing one out would only make the
+            // client wait on it; its IPv4 rides the tunnel.
+            Ipv6Guard::FiltersOnly => nodata(),
+            Ipv6Guard::Off => {
+                // A hole, not a routine forward: the user wrote a rule for
+                // this host and its IPv6 traffic is about to ignore it. Said
+                // once per name — silence is what makes "the rule did not
+                // work" undiagnosable.
+                self.report_aaaa_outside_policy(qname);
+                ListenerAction::Forward
+            }
+        }
+    }
+
+    /// The tunnel carries IPv6: resolve, enforce, then answer.
+    fn route_aaaa(&self, query: &[u8], qname: &str) -> ListenerAction {
+        let hold = crate::dns_resolver::AnswerHold {
+            deadline: self.deadline,
+            fast_answers: crate::dns_resolver::global_dns_fast_answers()
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
+        match crate::dns_resolver::handle_aaaa_query(
+            qname,
+            hold,
+            self.upstream.as_ref(),
+            self.sink.as_ref(),
+            self.reconciler.as_ref(),
+            self.leak_guard.as_ref(),
+        ) {
+            AaaaOutcome::Answer(ips) if !ips.is_empty() => {
+                crate::dns_wire::build_aaaa_response(query, &ips, self.response_ttl)
+                    .map_or(ListenerAction::Forward, ListenerAction::Respond)
+            }
+            AaaaOutcome::Answer(_) | AaaaOutcome::Upstream(ResolveError::NoRecords) => {
+                build_negative_response(query, RCODE_NOERROR, self.response_ttl)
+                    .map_or(ListenerAction::Forward, ListenerAction::Respond)
+            }
+            // Withheld deliberately, as on the A path: forwarding would hand
+            // over the very addresses the guard is holding back.
+            AaaaOutcome::Withheld => build_error_response(query, RCODE_SERVFAIL)
+                .map_or(ListenerAction::Drop, ListenerAction::Respond),
+            AaaaOutcome::Upstream(ResolveError::Unavailable(_)) => ListenerAction::Forward,
+        }
+    }
+
     pub fn answer_query(&self, query: &[u8]) -> ListenerAction {
         let Some(q) = parse_question(query) else {
             return ListenerAction::Forward; // unparseable → transparent proxy
@@ -419,14 +515,13 @@ impl DnsInterceptListener {
         if crate::dns_resolver::is_doh_canary(&q.qname) {
             return negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond);
         }
+        if q.qtype == QTYPE_AAAA {
+            return self.aaaa_action(query, &q.qname);
+        }
         if q.qtype != QTYPE_A {
             return ListenerAction::Forward; // not an A query
         }
         let rule_covered = self.oracle.is_rule_host(&q.qname);
-        // Both halves of the notice-page signal are ordinary lookups — the site
-        // that was cut and the operator's page that followed it.
-        self.resolution_observer
-            .note_resolution(&q.qname, rule_covered);
         if !rule_covered {
             // П0-D — direct host: forward, but steer the reply so the client
             // never receives a secondary-pinned address (shared-CDN collateral).
@@ -686,23 +781,25 @@ impl DnsInterceptListener {
             return (reply, false);
         };
         let id = u16::from_be_bytes([query[0], query[1]]);
-        let AResponseOutcome::Answers { addresses, .. } = parse_a_response(id, &q.qname, &reply)
+        let AddressResponseOutcome::Answers { addresses, .. } =
+            parse_address_response(id, &q.qname, QTYPE_A, &reply)
         else {
             return (reply, false); // NXDOMAIN / error / truncated / mismatch → relay as-is
         };
-        let clean: Vec<Ipv4Addr> = addresses
+        let answered = only_v4(&addresses);
+        let clean: Vec<Ipv4Addr> = answered
             .iter()
             .copied()
             .filter(|ip| !owned.contains(ip))
             .collect();
-        if clean.len() == addresses.len() {
+        if clean.len() == answered.len() {
             return (reply, false); // nothing shared → untouched upstream answer
         }
         if !clean.is_empty() {
             tracing::debug!(
                 target: "nrr::dns-resolver",
                 host = %q.qname,
-                dropped = addresses.len() - clean.len(),
+                dropped = answered.len() - clean.len(),
                 kept = clean.len(),
                 "Mode B: steered a direct-host answer away from secondary-pinned addresses",
             );
@@ -713,12 +810,11 @@ impl DnsInterceptListener {
         }
         // Whole answer pinned — try ONE fresh upstream answer (pools rotate).
         if let Some(retry) = self.forward_within(query, budget) {
-            if let AResponseOutcome::Answers { addresses, .. } =
-                parse_a_response(id, &q.qname, &retry)
+            if let AddressResponseOutcome::Answers { addresses, .. } =
+                parse_address_response(id, &q.qname, QTYPE_A, &retry)
             {
-                let clean: Vec<Ipv4Addr> = addresses
-                    .iter()
-                    .copied()
+                let clean: Vec<Ipv4Addr> = only_v4(&addresses)
+                    .into_iter()
                     .filter(|ip| !owned.contains(ip))
                     .collect();
                 if !clean.is_empty() {
@@ -756,12 +852,13 @@ impl DnsInterceptListener {
             return;
         };
         let id = u16::from_be_bytes([query[0], query[1]]);
-        let AResponseOutcome::Answers { addresses, .. } = parse_a_response(id, &q.qname, reply)
+        let AddressResponseOutcome::Answers { addresses, .. } =
+            parse_address_response(id, &q.qname, QTYPE_A, reply)
         else {
             return;
         };
         if !addresses.is_empty() {
-            self.direct_gate.gate(&q.qname, &addresses);
+            self.direct_gate.gate(&q.qname, &only_v4(&addresses));
         }
     }
 
@@ -775,14 +872,17 @@ impl DnsInterceptListener {
     fn fake_direct_response(&self, query: &[u8], reply: &[u8]) -> Option<Vec<u8>> {
         let q = parse_question(query)?;
         let id = u16::from_be_bytes([query[0], query[1]]);
-        let AResponseOutcome::Answers { addresses, .. } = parse_a_response(id, &q.qname, reply)
+        let AddressResponseOutcome::Answers { addresses, .. } =
+            parse_address_response(id, &q.qname, QTYPE_A, reply)
         else {
             return None; // NXDOMAIN / error / truncated → not ours to rewrite
         };
         if addresses.is_empty() {
             return None;
         }
-        let fake = self.direct_fake.fake_direct_answer(&q.qname, &addresses)?;
+        let fake = self
+            .direct_fake
+            .fake_direct_answer(&q.qname, &only_v4(&addresses))?;
         let resp = build_a_response(query, &fake, self.response_ttl)?;
         tracing::debug!(
             target: "nrr::dns-resolver",
@@ -836,7 +936,8 @@ impl DnsInterceptListener {
     fn fake_collateral_response(&self, query: &[u8], reply: &[u8]) -> Option<Vec<u8>> {
         let q = parse_question(query)?;
         let id = u16::from_be_bytes([query[0], query[1]]);
-        let AResponseOutcome::Answers { addresses, .. } = parse_a_response(id, &q.qname, reply)
+        let AddressResponseOutcome::Answers { addresses, .. } =
+            parse_address_response(id, &q.qname, QTYPE_A, reply)
         else {
             return None;
         };
@@ -845,7 +946,7 @@ impl DnsInterceptListener {
         }
         let fake = self
             .collateral_fake
-            .fake_direct_answer(&q.qname, &addresses)?;
+            .fake_direct_answer(&q.qname, &only_v4(&addresses))?;
         let resp = build_a_response(query, &fake, self.response_ttl)?;
         tracing::info!(
             target: "nrr::dns-resolver",
@@ -1068,551 +1169,4 @@ fn negative_answer(query: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A name one server calls non-existent is not settled: the machine may
-    /// hold a resolver for a namespace nobody outside has heard of. The field
-    /// case is a corporate host and a machine on the LAN, both of which
-    /// stopped resolving once every name was pointed at us.
-    #[test]
-    fn a_non_existent_reply_is_recognised_and_a_real_answer_is_not() {
-        use crate::dns_wire::{build_a_query, build_error_response, RCODE_SERVFAIL};
-        let query = build_a_query(0x4242, "host.corp.example").expect("query");
-
-        let nx = build_error_response(&query, RCODE_NXDOMAIN).expect("nx");
-        assert!(reply_is_nxdomain(&nx));
-
-        // Every other outcome leaves the answer alone: a server failure is
-        // retried elsewhere, and a real answer is the end of the question.
-        let servfail = build_error_response(&query, RCODE_SERVFAIL).expect("servfail");
-        assert!(!reply_is_nxdomain(&servfail));
-        let answer = build_a_response(&query, &[Ipv4Addr::new(10, 0, 0, 4)], 60).expect("a");
-        assert!(!reply_is_nxdomain(&answer));
-
-        // A truncated buffer is not an answer at all, so it is not a
-        // non-existence either — treating it as one would send every
-        // malformed reply on a second round of queries.
-        assert!(!reply_is_nxdomain(&[]));
-        assert!(!reply_is_nxdomain(&[0u8; 3]));
-    }
-
-    /// The forward path relays bytes straight to the client's stub resolver, so
-    /// what it accepts becomes the OS cache and, downstream, the rule host cache
-    /// the routes and kill-switch exemptions are built from.
-    #[test]
-    fn a_forwarded_reply_is_accepted_only_when_it_answers_our_query() {
-        use crate::dns_wire::build_a_query;
-        let query = build_a_query(0x1234, "example.com").expect("query");
-
-        let mut good = query.clone();
-        good[2] |= 0x80; // QR = response
-        assert!(reply_answers_query(&query, &good));
-
-        // Somebody else's transaction.
-        let mut wrong_id = good.clone();
-        wrong_id[0] = 0xFF;
-        assert!(!reply_answers_query(&query, &wrong_id));
-
-        // Right id, different question - the shape a blind forger produces
-        // when it guesses the id but not what was asked.
-        let mut other = build_a_query(0x1234, "evil.example").expect("query");
-        other[2] |= 0x80;
-        assert!(!reply_answers_query(&query, &other));
-
-        // A query echoed back is not an answer.
-        assert!(!reply_answers_query(&query, &query));
-
-        // Case differences in the echoed name are legal (0x20 encoding).
-        let mut mixed = build_a_query(0x1234, "ExAmPlE.CoM").expect("query");
-        mixed[2] |= 0x80;
-        assert!(reply_answers_query(&query, &mixed));
-    }
-    use crate::dns_resolver::{ReconcileOutcome, ResolvedA};
-    use crate::dns_wire::{parse_question, QTYPE_HTTPS};
-    use std::net::Ipv4Addr;
-
-    // ── Fake ports ────────────────────────────────────────────────────────────
-
-    struct Oracle(Vec<String>);
-    impl RuleHostOracle for Oracle {
-        fn is_rule_host(&self, hostname: &str) -> bool {
-            self.0.iter().any(|h| h.as_str() == hostname)
-        }
-    }
-    struct Upstream(Result<ResolvedA, ResolveError>);
-    impl UpstreamResolver for Upstream {
-        fn resolve_a(&self, _h: &str) -> Result<ResolvedA, ResolveError> {
-            self.0.clone()
-        }
-    }
-    struct NoopSink;
-    impl FactSink for NoopSink {
-        fn record(&self, _h: &str, _r: &ResolvedA) {}
-    }
-    struct OkReconciler;
-    impl SyncReconciler for OkReconciler {
-        fn reconcile_now(&self, _d: Duration) -> ReconcileOutcome {
-            ReconcileOutcome::Installed
-        }
-    }
-
-    fn listener(
-        rule_hosts: &[&str],
-        upstream: Result<ResolvedA, ResolveError>,
-    ) -> DnsInterceptListener {
-        DnsInterceptListener::new(
-            Arc::new(Oracle(rule_hosts.iter().map(|s| s.to_string()).collect())),
-            Arc::new(Upstream(upstream)),
-            Arc::new(NoopSink),
-            Arc::new(OkReconciler),
-            // TEST-NET-1 (RFC 5737): a forwarder that can never answer. Pointing
-            // at 127.0.0.1:53 made these tests consult whatever resolver the
-            // machine runs — our own service, when it is up.
-            "192.0.2.1:53".parse().unwrap(),
-            Duration::from_millis(150),
-            Duration::from_millis(150),
-        )
-    }
-
-    fn query(name: &str, qtype: u16) -> Vec<u8> {
-        let mut p = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        for label in name.split('.') {
-            p.push(label.len() as u8);
-            p.extend_from_slice(label.as_bytes());
-        }
-        p.push(0);
-        p.extend_from_slice(&qtype.to_be_bytes());
-        p.extend_from_slice(&[0x00, 0x01]);
-        p
-    }
-
-    fn resolved(ips: &[Ipv4Addr]) -> ResolvedA {
-        ResolvedA {
-            addresses: ips.to_vec(),
-            ttl_seconds: 300,
-        }
-    }
-
-    #[test]
-    fn intercepts_a_rule_host_and_builds_answer() {
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(23, 10, 20, 159)])),
-        );
-        match l.answer_query(&query("assistant.example", QTYPE_A)) {
-            ListenerAction::Respond(resp) => {
-                let q = parse_question(&resp).expect("response parses");
-                assert_eq!(q.qname, "assistant.example");
-                assert_eq!(resp[2] & 0x80, 0x80, "QR set");
-                assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 1, "one answer");
-                // RDATA is the resolved IP.
-                assert_eq!(&resp[resp.len() - 4..], &[23, 10, 20, 159]);
-            }
-            other => panic!("expected Respond, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn forwards_aaaa_and_steers_non_rule_a() {
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        // AAAA for a rule host → not an A query → plain forward.
-        assert_eq!(
-            l.answer_query(&query("assistant.example", 28)),
-            ListenerAction::Forward
-        );
-        // A for a non-rule host → forward WITH direct-answer steering (П0-D).
-        assert_eq!(
-            l.answer_query(&query("example.com", QTYPE_A)),
-            ListenerAction::ForwardFiltered
-        );
-    }
-
-    #[test]
-    fn https_rr_is_forwarded_raw_for_rule_and_direct_hosts() {
-        // Pins today's behaviour, which is a known hole rather than a decision:
-        // an HTTPS answer's `ipv4hint` carries real addresses past both the
-        // rule-host interception and the direct-answer steering. Cloudflare-fronted
-        // names populate that hint in practice.
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        assert_eq!(
-            l.answer_query(&query("assistant.example", QTYPE_HTTPS)),
-            ListenerAction::Forward,
-            "rule host: not intercepted"
-        );
-        assert_eq!(
-            l.answer_query(&query("example.com", QTYPE_HTTPS)),
-            ListenerAction::Forward,
-            "direct host: not even steered"
-        );
-    }
-
-    // ── П0-D — direct-answer steering ────────────────────────────────────────
-
-    struct OwnedSet(Arc<std::collections::HashSet<Ipv4Addr>>);
-    impl crate::dns_resolver::SecondaryOwnedIps for OwnedSet {
-        fn secondary_owned_ips(&self) -> Arc<std::collections::HashSet<Ipv4Addr>> {
-            Arc::clone(&self.0)
-        }
-    }
-
-    fn steering_listener(owned: &[Ipv4Addr]) -> DnsInterceptListener {
-        listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_direct_answer_steering(Arc::new(OwnedSet(Arc::new(
-            owned.iter().copied().collect(),
-        ))))
-    }
-
-    /// Build an upstream-style reply to `query(name, A)` carrying `ips`.
-    fn reply_for(name: &str, ips: &[Ipv4Addr]) -> Vec<u8> {
-        crate::dns_wire::build_a_response(&query(name, QTYPE_A), ips, 300).expect("reply")
-    }
-
-    #[test]
-    fn steering_passes_clean_answers_through_untouched() {
-        let l = steering_listener(&[Ipv4Addr::new(9, 9, 9, 9)]);
-        let q = query("www.search.example", QTYPE_A);
-        let reply = reply_for("www.search.example", &[Ipv4Addr::new(23, 10, 20, 147)]);
-        assert_eq!(
-            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
-            (reply, false)
-        );
-    }
-
-    #[test]
-    fn steering_drops_secondary_pinned_addresses() {
-        let pinned = Ipv4Addr::new(23, 10, 20, 151);
-        let clean = Ipv4Addr::new(23, 10, 20, 134);
-        let l = steering_listener(&[pinned]);
-        let q = query("www.search.example", QTYPE_A);
-        let reply = reply_for("www.search.example", &[pinned, clean]);
-        let (steered, still_pinned) = l.steer_direct_answer(&q, reply, QUERY_BUDGET);
-        assert!(!still_pinned, "a partially clean answer is not pinned");
-        let out = crate::dns_wire::parse_a_response(0x1234, "www.search.example", &steered);
-        match out {
-            crate::dns_wire::AResponseOutcome::Answers { addresses, .. } => {
-                assert_eq!(addresses, vec![clean], "pinned address filtered out");
-            }
-            other => panic!("expected Answers, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn steering_with_empty_owned_set_is_a_no_op() {
-        let l = steering_listener(&[]);
-        let q = query("www.search.example", QTYPE_A);
-        let pinned = Ipv4Addr::new(23, 10, 20, 151);
-        let reply = reply_for("www.search.example", &[pinned]);
-        assert_eq!(
-            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
-            (reply, false)
-        );
-    }
-
-    #[test]
-    fn steering_relays_error_replies_unchanged() {
-        let l = steering_listener(&[Ipv4Addr::new(1, 1, 1, 1)]);
-        let q = query("www.search.example", QTYPE_A);
-        let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-        assert_eq!(
-            l.steer_direct_answer(&q, nx.clone(), QUERY_BUDGET),
-            (nx, false)
-        );
-    }
-
-    #[test]
-    fn steering_reports_a_fully_pinned_reply() {
-        // Every address is secondary-pinned, and the test forwarder (127.0.0.1
-        // with a 150 ms budget) cannot produce a clean re-query → the terminal
-        // fail-open path must hand the reply back flagged, so the caller can
-        // offer it to the collateral fake-IP rescue.
-        let pinned = Ipv4Addr::new(23, 10, 20, 133);
-        let l = steering_listener(&[pinned]);
-        let q = query("workspace.search.example", QTYPE_A);
-        let reply = reply_for("workspace.search.example", &[pinned]);
-        assert_eq!(
-            l.steer_direct_answer(&q, reply.clone(), QUERY_BUDGET),
-            (reply, true)
-        );
-    }
-
-    #[test]
-    fn doh_canary_gets_nxdomain_before_rule_gate_for_any_qtype() {
-        // the Firefox DoH canary is NOT a rule host, yet must
-        // be answered NXDOMAIN (not forwarded) so Firefox disables DoH. Verify for
-        // both A and HTTPS (type 65) qtypes and a subdomain.
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        for (name, qtype) in [
-            ("use-application-dns.net", QTYPE_A),
-            ("use-application-dns.net", QTYPE_HTTPS),
-            ("x.use-application-dns.net", QTYPE_A),
-        ] {
-            match l.answer_query(&query(name, qtype)) {
-                ListenerAction::Respond(resp) => {
-                    assert_eq!(resp[3] & 0x0F, RCODE_NXDOMAIN, "{name}/{qtype} → NXDOMAIN");
-                    assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
-                }
-                other => panic!("expected NXDOMAIN Respond for {name}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn rule_host_no_records_returns_nxdomain() {
-        let l = listener(&["gone.example"], Err(ResolveError::NoRecords));
-        match l.answer_query(&query("gone.example", QTYPE_A)) {
-            ListenerAction::Respond(resp) => {
-                assert_eq!(resp[3] & 0x0F, RCODE_NXDOMAIN);
-                assert_eq!(u16::from_be_bytes([resp[6], resp[7]]), 0, "no answers");
-            }
-            other => panic!("expected NXDOMAIN Respond, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rule_host_upstream_unavailable_fails_open_to_forward() {
-        let l = listener(
-            &["assistant.example"],
-            Err(ResolveError::Unavailable("timeout".into())),
-        );
-        // Our resolver failed — forward raw so the OS server can still answer.
-        assert_eq!(
-            l.answer_query(&query("assistant.example", QTYPE_A)),
-            ListenerAction::Forward
-        );
-    }
-
-    #[test]
-    fn unparseable_datagram_is_forwarded() {
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        assert_eq!(l.answer_query(&[0u8; 3]), ListenerAction::Forward);
-    }
-
-    // ── S4.8 — direct-host fake-IP under block-all (variant A) ───────────────
-
-    /// Claims every host: returns one fixed fake address and records what the
-    /// listener offered (host + the steered real set).
-    struct ClaimingFake {
-        fake: Ipv4Addr,
-        seen: std::sync::Mutex<Vec<(String, Vec<Ipv4Addr>)>>,
-    }
-    impl DirectFakeIpAnswerer for ClaimingFake {
-        fn fake_direct_answer(&self, hostname: &str, real: &[Ipv4Addr]) -> Option<Vec<Ipv4Addr>> {
-            self.seen
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push((hostname.to_string(), real.to_vec()));
-            Some(vec![self.fake])
-        }
-    }
-
-    #[test]
-    fn direct_fake_rewrites_the_reply_and_sees_the_steered_addresses() {
-        let fake = Ipv4Addr::new(198, 18, 0, 7);
-        let claiming = Arc::new(ClaimingFake {
-            fake,
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_direct_fake_ip(Arc::clone(&claiming) as Arc<dyn DirectFakeIpAnswerer>);
-        let q = query("blog.example", QTYPE_A);
-        let real = Ipv4Addr::new(203, 0, 113, 68);
-        let reply = reply_for("blog.example", &[real]);
-        let out = l.fake_direct_response(&q, &reply).expect("claimed");
-        match crate::dns_wire::parse_a_response(0x1234, "blog.example", &out) {
-            crate::dns_wire::AResponseOutcome::Answers { addresses, .. } => {
-                assert_eq!(
-                    addresses,
-                    vec![fake],
-                    "client is handed the virtual address"
-                );
-            }
-            other => panic!("expected Answers, got {other:?}"),
-        }
-        // The answerer saw the FINAL (steered) real set — what the relay dials.
-        let seen = claiming.seen.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(seen.as_slice(), &[("blog.example".to_string(), vec![real])]);
-    }
-
-    #[test]
-    fn direct_fake_declines_leave_the_gate_path_in_charge() {
-        // Default (Noop) answerer → never claims → caller falls back to the
-        // gate + steered-reply path.
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        let q = query("blog.example", QTYPE_A);
-        let reply = reply_for("blog.example", &[Ipv4Addr::new(203, 0, 113, 68)]);
-        assert_eq!(l.fake_direct_response(&q, &reply), None);
-        // Even a claiming answerer must not rewrite an NXDOMAIN / error reply.
-        let claiming = Arc::new(ClaimingFake {
-            fake: Ipv4Addr::new(198, 18, 0, 7),
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_direct_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
-        let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-        assert_eq!(l.fake_direct_response(&q, &nx), None);
-    }
-
-    // ── Collateral rescue — fully pinned direct host → virtual address ───────
-
-    struct StubCompanions(&'static str);
-    impl CompanionCandidateLookup for StubCompanions {
-        fn is_pending_secondary_companion(&self, hostname: &str) -> bool {
-            hostname == self.0
-        }
-    }
-
-    #[test]
-    fn a_parked_companion_suggestion_vetoes_the_collateral_rescue() {
-        let l = listener(
-            &["insta.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_companion_candidates(Arc::new(StubCompanions("static.cdninsta.test")));
-        // The CDN of a site routed over the additional link: it belongs there,
-        // not on the primary, whatever addresses it shares.
-        assert!(l.companion_is_pending(&query("static.cdninsta.test", QTYPE_A)));
-        // An unrelated direct host stays collateral.
-        assert!(!l.companion_is_pending(&query("blog.example", QTYPE_A)));
-    }
-
-    #[test]
-    fn collateral_fake_rewrites_a_fully_pinned_reply() {
-        let fake = Ipv4Addr::new(198, 18, 0, 9);
-        let claiming = Arc::new(ClaimingFake {
-            fake,
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-        let l = listener(
-            &["aistudio.search.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_collateral_fake_ip(Arc::clone(&claiming) as Arc<dyn DirectFakeIpAnswerer>);
-        let q = query("workspace.search.example", QTYPE_A);
-        let pinned = Ipv4Addr::new(23, 10, 20, 133);
-        let reply = reply_for("workspace.search.example", &[pinned]);
-        let out = l.fake_collateral_response(&q, &reply).expect("claimed");
-        match crate::dns_wire::parse_a_response(0x1234, "workspace.search.example", &out) {
-            crate::dns_wire::AResponseOutcome::Answers { addresses, .. } => {
-                assert_eq!(addresses, vec![fake], "client gets the virtual address");
-            }
-            other => panic!("expected Answers, got {other:?}"),
-        }
-        // The rescue recorded the pinned real set — what the relay must dial
-        // (out the primary; the route selector maps a non-rule host there).
-        let seen = claiming.seen.lock().unwrap_or_else(|p| p.into_inner());
-        assert_eq!(
-            seen.as_slice(),
-            &[("workspace.search.example".to_string(), vec![pinned])]
-        );
-    }
-
-    #[test]
-    fn collateral_fake_defaults_to_noop_and_skips_error_replies() {
-        // Default (Noop) → never claims → the old fail-open path stands.
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        );
-        let q = query("workspace.search.example", QTYPE_A);
-        let reply = reply_for(
-            "workspace.search.example",
-            &[Ipv4Addr::new(23, 10, 20, 133)],
-        );
-        assert_eq!(l.fake_collateral_response(&q, &reply), None);
-        // A claiming answerer must not rewrite an NXDOMAIN / error reply.
-        let claiming = Arc::new(ClaimingFake {
-            fake: Ipv4Addr::new(198, 18, 0, 9),
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-        let l = listener(
-            &["assistant.example"],
-            Ok(resolved(&[Ipv4Addr::new(1, 2, 3, 4)])),
-        )
-        .with_collateral_fake_ip(claiming as Arc<dyn DirectFakeIpAnswerer>);
-        let nx = crate::dns_wire::build_error_response(&q, RCODE_NXDOMAIN).expect("nx");
-        assert_eq!(l.fake_collateral_response(&q, &nx), None);
-    }
-    // ── Per-datagram budget ──────────────────────────────────────────────────
-
-    #[test]
-    fn the_budget_cuts_a_forward_short_of_its_own_timeout() {
-        // The stage timeout is the ceiling, the budget is the floor of the two:
-        // spending two seconds on a client that re-asked a second ago is spent
-        // for nobody.
-        let l = DnsInterceptListener::new(
-            Arc::new(Oracle(Vec::new())),
-            Arc::new(Upstream(Ok(resolved(&[])))),
-            Arc::new(NoopSink),
-            Arc::new(OkReconciler),
-            "192.0.2.1:53".parse().expect("test-net address"),
-            Duration::from_millis(150),
-            Duration::from_secs(2),
-        );
-        let started = Instant::now();
-        assert_eq!(
-            l.forward_within(&query("example.com", QTYPE_A), Duration::from_millis(200)),
-            None
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "the 2 s forward timeout must not outlive a 200 ms budget (took {:?})",
-            started.elapsed()
-        );
-    }
-
-    #[test]
-    fn an_exhausted_budget_forwards_nothing_at_all() {
-        let l = listener(&[], Ok(resolved(&[])));
-        let started = Instant::now();
-        assert_eq!(
-            l.forward_within(&query("example.com", QTYPE_A), Duration::ZERO),
-            None
-        );
-        assert!(started.elapsed() < Duration::from_millis(50));
-    }
-
-    #[test]
-    fn a_failed_forward_answers_servfail_instead_of_saying_nothing() {
-        // Silence makes the client wait out its own timeout on top of ours; the
-        // answer it is waiting for is not coming either way.
-        let l = listener(&[], Ok(resolved(&[])));
-        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("server socket");
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("client socket");
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("client timeout");
-        let q = query("example.com", QTYPE_A);
-        l.handle_datagram(&server, &q, client.local_addr().expect("client addr"));
-        let mut buf = [0u8; 512];
-        let n = client.recv(&mut buf).expect("a reply, not silence");
-        assert!(n >= 12);
-        assert_eq!(buf[0..2], q[0..2], "same transaction id");
-        assert_eq!(buf[2] & 0x80, 0x80, "QR set");
-        assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
-    }
-}
+mod tests;

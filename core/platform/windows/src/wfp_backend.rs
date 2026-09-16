@@ -205,6 +205,7 @@ mod tests {
             action: WfpAction::Block,
             remote_ip: None,
             remote_ip_set: Vec::new(),
+            remote_ip_set_v6: Vec::new(),
             remote_port: None,
             weight: 1,
             user_sid: Some(sid.to_string()),

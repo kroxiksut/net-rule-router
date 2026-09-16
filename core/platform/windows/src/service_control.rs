@@ -89,9 +89,15 @@ impl ServiceControlPort for WindowsServiceControl {
         let manager =
             open_manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
 
-        // Step 2 — data directories. Still before `create_service`, so a
-        // failure here leaves no half-registered service behind.
+        // SCM will start this file as LocalSystem on every boot, and a DLL
+        // beside it loads before the system copy.
+        check_binary_location(&spec.binary_path)?;
+
+        // Step 2 — data directories, locked down before anything is registered.
+        // A tree that already exists is locked down too: `%ProgramData%` lets
+        // any user create it first and stay its owner.
         let mut dirs_created = Vec::new();
+        let mut acl_applied = None;
         if spec.create_data_dirs {
             let root = service_data_root()?;
             for subdir in DATA_SUBDIRS {
@@ -107,6 +113,11 @@ impl ServiceControlPort for WindowsServiceControl {
                     dirs_created.push(path);
                 }
             }
+            acl_applied = Some(match apply_data_dir_acl(&root) {
+                Ok(()) => true,
+                Err(refused @ ServiceControlError::InvalidState { .. }) => return Err(refused),
+                Err(_) => false,
+            });
         }
 
         let info = ServiceInfo {
@@ -143,17 +154,7 @@ impl ServiceControlPort for WindowsServiceControl {
         // the report says which of the two happened.
         let recovery_configured = configure_recovery(&service, &spec.recovery).is_ok();
 
-        // Step 5 — lock down the data directory. Only when this install created
-        // the tree: rewriting the permissions of a tree someone else owns is not
-        // an install's business.
-        let acl_applied = if spec.create_data_dirs {
-            let root = service_data_root()?;
-            Some(apply_data_dir_acl(&root).is_ok())
-        } else {
-            None
-        };
-
-        // Step 6 — event-source registration, so lifecycle records show up under
+        // Step 5 — event-source registration, so lifecycle records show up under
         // our name instead of as "description cannot be found". Best-effort for
         // the same reason as recovery actions: a service that logs plainly is
         // still an installed service.
@@ -419,12 +420,67 @@ fn open_manager(access: ServiceManagerAccess) -> Result<ServiceManager, ServiceC
 }
 
 /// Absolute path of the service-owned data root.
+/// The service data root, refused unless it lies under `%ProgramData%` as the
+/// shell registers it. The path is built from an environment string, and an
+/// install elevated on a user's behalf carries that user's environment.
 fn service_data_root() -> Result<PathBuf, ServiceControlError> {
-    nrr_storage::resolve_storage_topology(&StorageProfile::ProductionService)
+    let root = nrr_storage::resolve_storage_topology(&StorageProfile::ProductionService)
         .map(|topology| topology.data_dir)
         .map_err(|e| ServiceControlError::Mechanism {
             detail: format!("resolve storage topology: {e}"),
-        })
+        })?;
+    ensure_under_program_data(&root)?;
+    Ok(root)
+}
+
+fn ensure_under_program_data(root: &Path) -> Result<(), ServiceControlError> {
+    let program_data = crate::system_shell::program_data_directory().ok_or_else(|| {
+        ServiceControlError::Mechanism {
+            detail: "cannot resolve the ProgramData folder".to_string(),
+        }
+    })?;
+    if !is_within(root, &program_data) {
+        return Err(ServiceControlError::InvalidState {
+            detail: format!(
+                "data directory {} is not under {}; refusing to touch it",
+                root.display(),
+                program_data.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Component-wise and case-insensitive: a folder inside `ProgramData` is
+/// within it, a sibling whose name merely starts the same is not.
+fn is_within(path: &Path, base: &Path) -> bool {
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    lower(path).starts_with(lower(base))
+}
+
+/// Refuse a service binary that accounts other than SYSTEM, Administrators and
+/// TrustedInstaller can change. A development build only warns: its binary
+/// lives in the build directory by design.
+fn check_binary_location(binary: &Path) -> Result<(), ServiceControlError> {
+    let problem = match crate::trusted_location::untrusted_writer(binary) {
+        Ok(None) => return Ok(()),
+        Ok(Some(writer)) => writer,
+        Err(e) => format!("cannot tell who can change {}: {e}", binary.display()),
+    };
+    if cfg!(debug_assertions) {
+        tracing::warn!(
+            target: "nrr::service-control",
+            problem = %problem,
+            "registering a service binary that non-administrators can change — development build only",
+        );
+        return Ok(());
+    }
+    Err(ServiceControlError::InvalidState {
+        detail: format!(
+            "{problem}. The service runs as LocalSystem from this file: move the program to a \
+             folder only administrators can change, such as Program Files, and install again"
+        ),
+    })
 }
 
 /// Translate an SCM failure into the neutral taxonomy. Only two OS codes carry
@@ -485,78 +541,29 @@ fn configure_recovery(
 
 /// Restrict the service-owned data directory to the security baseline.
 ///
-/// SYSTEM and Administrators only — no `Users` entry anywhere under the tree —
-/// with inheritance replaced rather than augmented. The state DB carries every
-/// SID's rule set, their route bindings and their session list; the audit
-/// directory is the tamper-evident record of who changed what; and the
-/// operational log names the hosts each user's rules and traffic touched.
-/// `storage::bootstrap` states the intended shape in so many words — "Users
-/// (none)" — and this is the code that has to make it true.
+/// SYSTEM and Administrators only — no `Users` entry anywhere under the tree.
+/// The state DB carries every SID's rule set, route bindings and session list;
+/// the audit directory is the tamper-evident record of who changed what; the
+/// operational log names the hosts each user's traffic touched. Reads of those
+/// go through the service, scoped to the caller, and a diagnostics archive is
+/// handed over by `file_handoff` — nothing needs the folder itself.
 ///
-/// `logs` used to carry `Users:(OI)(CI)RX` so the GUI could open the folder and
-/// the launcher could attach the raw lines to a diagnostics archive. That made
-/// one machine-wide file, holding every user's hostnames, readable by every
-/// account — and it made the per-caller scoping of the log READS pointless,
-/// because the same lines were a double-click away. Both readers moved: the
-/// service answers `logs.list` scoped to the caller, puts the raw section into
-/// the archive itself, and hands the finished archive to its requester
-/// (`file_handoff`).
-///
-/// `icacls.exe` ships with every supported Windows release and its command line
-/// is human-auditable in an install log, which is worth more here than saving a
-/// process spawn on a once-per-install operation.
-/// Absolute path of a `System32` tool.
-///
-/// `Command::new("icacls")` resolves through the process search path, which on
-/// Windows includes the current directory — and this runs elevated, during an
-/// install. `%SystemRoot%` names the directory Windows means; the bare name is
-/// only a fallback for an environment stripped of it.
-fn system32_tool(exe: &str) -> std::path::PathBuf {
-    match std::env::var_os("SystemRoot") {
-        Some(root) => std::path::PathBuf::from(root).join("System32").join(exe),
-        None => std::path::PathBuf::from(exe),
-    }
-}
-
+/// The owner becomes Administrators and explicit entries below the root are
+/// dropped: under `%ProgramData%` any account may create the tree first, and
+/// an owner can always grant itself access back. A link anywhere in the tree
+/// is refused as [`ServiceControlError::InvalidState`].
 pub fn apply_data_dir_acl(root: &Path) -> Result<(), ServiceControlError> {
-    let root_str = root
-        .to_str()
-        .ok_or_else(|| ServiceControlError::Mechanism {
-            detail: format!("non-UTF8 data dir path: {}", root.display()),
-        })?;
-    run_icacls(&[
-        root_str,
-        "/inheritance:r",
-        "/grant",
-        "NT AUTHORITY\\SYSTEM:(OI)(CI)F",
-        "/grant",
-        "BUILTIN\\Administrators:(OI)(CI)F",
-    ])?;
-
-    Ok(())
-}
-
-/// One `icacls` invocation, with its output folded into an error on failure.
-fn run_icacls(args: &[&str]) -> Result<(), ServiceControlError> {
-    use std::process::Command;
-
-    let output = Command::new(system32_tool("icacls.exe"))
-        .args(args)
-        .output()
-        .map_err(|e| ServiceControlError::Mechanism {
-            detail: format!("invoke icacls: {e}"),
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(ServiceControlError::Mechanism {
-            detail: format!(
-                "icacls failed (exit={:?}): stderr={stderr} stdout={stdout}",
-                output.status.code()
-            ),
-        });
-    }
-    Ok(())
+    // The root comes from an environment string; resetting ownership of a tree
+    // someone else pointed it at is not this function's business.
+    ensure_under_program_data(root)?;
+    crate::trusted_location::lock_down_service_tree(root).map_err(|e| match e {
+        crate::trusted_location::LockdownError::Link(_) => ServiceControlError::InvalidState {
+            detail: format!("refusing the data directory: {e}"),
+        },
+        crate::trusted_location::LockdownError::Failed(detail) => {
+            ServiceControlError::Mechanism { detail }
+        }
+    })
 }
 
 /// Poll SCM until the service reports `Stopped` or the budget expires.
@@ -669,4 +676,18 @@ fn sweep_enforcement_state() -> bool {
         crate::dns_redirect::clear_orphan_redirect(&crate::dns_redirect::TransactedNrptStore)
             .is_ok();
     filters_swept && dns_swept
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_folder_counts_as_within_only_by_whole_components() {
+        let base = PathBuf::from("Base");
+        assert!(is_within(&base.join("Product"), &base));
+        assert!(is_within(&PathBuf::from("base").join("Product"), &base));
+        assert!(!is_within(&PathBuf::from("BaseX").join("Product"), &base));
+        assert!(!is_within(&PathBuf::from("Other").join("Base"), &base));
+    }
 }

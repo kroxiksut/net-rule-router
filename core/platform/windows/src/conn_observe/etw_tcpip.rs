@@ -89,7 +89,9 @@ pub struct EtwKernelNetworkObserver {
     control_handle: CONTROLTRACE_HANDLE,
     process_handle: PROCESSTRACE_HANDLE,
     stop_flag: Arc<AtomicBool>,
-    worker: Option<JoinHandle<()>>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+    /// One stop, whoever asks first — the teardown step or `Drop`.
+    stopped: AtomicBool,
 }
 
 // Handles owned solely by this struct; the callback only touches the buffer.
@@ -259,13 +261,24 @@ impl EtwKernelNetworkObserver {
             control_handle,
             process_handle,
             stop_flag,
-            worker: Some(worker),
+            worker: Mutex::new(Some(worker)),
+            stopped: AtomicBool::new(false),
         })
     }
 }
 
-impl Drop for EtwKernelNetworkObserver {
-    fn drop(&mut self) {
+impl EtwKernelNetworkObserver {
+    /// Stop the trace session and join the pump, without waiting for `Drop`.
+    ///
+    /// An ETW session is a KERNEL object registered by name: a process that
+    /// exits without stopping it leaves `NrrConnObserve` running, and the next
+    /// start finds the name taken. `Drop` cannot be relied on for that — the
+    /// consumer threads hold their own `Arc` to this source, and one that is
+    /// still referenced at exit is never dropped.
+    pub fn shutdown(&self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
         self.stop_flag.store(true, Ordering::SeqCst);
         let mut props_buf = alloc_trace_props(&self.session_name);
         let props = props_buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
@@ -281,9 +294,16 @@ impl Drop for EtwKernelNetworkObserver {
             );
             let _ = CloseTrace(self.process_handle);
         }
-        if let Some(w) = self.worker.take() {
+        let worker = self.worker.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(w) = worker {
             let _ = w.join();
         }
+    }
+}
+
+impl Drop for EtwKernelNetworkObserver {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

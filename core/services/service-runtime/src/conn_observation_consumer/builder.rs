@@ -39,6 +39,9 @@ impl ConnectionObservationConsumer {
             companion_primary_health: None,
             navigation_attempt: None,
             companion_reported: Mutex::new(HashSet::new()),
+            primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
+            app_main_link: None,
+            connection_programs: Mutex::new(std::collections::HashMap::new()),
             torn_down_before: Mutex::new(HashSet::new()),
             last_secondary_at: Mutex::new(None),
             outage_announced: std::sync::atomic::AtomicBool::new(false),
@@ -101,6 +104,14 @@ impl ConnectionObservationConsumer {
     #[must_use]
     pub fn with_companion_primary_health(mut self, sink: CompanionPrimaryHealthFn) -> Self {
         self.companion_primary_health = Some(sink);
+        self
+    }
+
+    /// Wire the application measure: every stalled or closed main-link
+    /// connection, attributed to the program that opened it.
+    #[must_use]
+    pub fn with_app_main_link(mut self, sink: super::AppMainLinkFn) -> Self {
+        self.app_main_link = Some(sink);
         self
     }
 

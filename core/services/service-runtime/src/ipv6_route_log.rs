@@ -1,8 +1,6 @@
 //! The IPv6 route table, in the service log.
 //!
-//! The product routes IPv4 and closes IPv6 while the protection is on, so the
-//! v6 table is never something we write. It is, however, the first thing any
-//! IPv6 report needs: whether the machine has a v6 default route at all, and
+//! The v6 table is the first thing any IPv6 report needs: whether the machine has a v6 default route at all, and
 //! whether the tunnel carries one, decides whether a v6 complaint is a leak, a
 //! misconfiguration, or nothing. Asking the user for a screenshot of
 //! `route print -6` answers that once; a line in the log answers it for every
@@ -11,10 +9,11 @@
 //! Logged on a CHANGE, not on a tick: the table is stable for hours at a time,
 //! and a repeated dump would be pure archive-cap burn.
 
+use std::net::IpAddr;
 use std::sync::Mutex;
 
 use nrr_platform_api::route_table::RouteTablePort;
-use nrr_platform_api::types::Ipv6RouteRow;
+use nrr_platform_api::types::RouteEntry;
 
 /// Cap on rows written in one line. A machine with more v6 routes than this has
 /// a story the count alone tells; the line stays readable.
@@ -36,8 +35,11 @@ impl Ipv6RouteTableLog {
     /// `reason` names what prompted the read ("boot", "network-change").
     /// Returns whether a line was written.
     pub fn log_if_changed(&self, api: &dyn RouteTablePort, reason: &str) -> bool {
-        let rows = match api.get_ipv6_forward_table() {
-            Ok(rows) => rows,
+        let rows: Vec<RouteEntry> = match api.get_ip_forward_table() {
+            Ok(rows) => rows
+                .into_iter()
+                .filter(|r| r.destination.is_ipv6())
+                .collect(),
             Err(err) => {
                 // Not an error worth alarming about: a platform that cannot
                 // enumerate v6 is exactly as informative as an empty table.
@@ -55,7 +57,7 @@ impl Ipv6RouteTableLog {
 
     /// The half that decides and writes, without the port — the same call the
     /// fetch above makes once it has rows.
-    pub fn log_rows_if_changed(&self, rows: &[Ipv6RouteRow], reason: &str) -> bool {
+    pub fn log_rows_if_changed(&self, rows: &[RouteEntry], reason: &str) -> bool {
         let rendered = render(rows);
         {
             let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
@@ -82,19 +84,22 @@ impl Ipv6RouteTableLog {
 /// Does any row carry traffic off the link — a default route or a global
 /// unicast prefix? Link-local, loopback and multicast rows never do.
 #[must_use]
-pub fn has_global_route(rows: &[Ipv6RouteRow]) -> bool {
+pub fn has_global_route(rows: &[RouteEntry]) -> bool {
     rows.iter().any(|r| {
-        let seg = r.destination.segments()[0];
+        let IpAddr::V6(dest) = r.destination else {
+            return false;
+        };
+        let seg = dest.segments()[0];
         let link_local = (seg & 0xffc0) == 0xfe80;
         let multicast = (seg & 0xff00) == 0xff00;
-        let loopback = r.destination.is_loopback();
-        let unspecified_default = r.destination.is_unspecified() && r.prefix_length == 0;
+        let loopback = dest.is_loopback();
+        let unspecified_default = dest.is_unspecified() && r.prefix_length == 0;
         unspecified_default || !(link_local || multicast || loopback)
     })
 }
 
 /// One compact line: `dest/prefix via next-hop if=N metric=M`, comma-separated.
-fn render(rows: &[Ipv6RouteRow]) -> String {
+fn render(rows: &[RouteEntry]) -> String {
     let mut out = String::new();
     for (i, r) in rows.iter().take(MAX_ROWS_LOGGED).enumerate() {
         if i > 0 {
@@ -117,14 +122,28 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
-    fn row(dest: &str, prefix: u8) -> Ipv6RouteRow {
-        Ipv6RouteRow {
-            destination: dest.parse().expect("v6 literal"),
+    fn row(dest: &str, prefix: u8) -> RouteEntry {
+        RouteEntry {
+            destination: IpAddr::V6(dest.parse().expect("v6 literal")),
             prefix_length: prefix,
-            next_hop: Ipv6Addr::UNSPECIFIED,
+            next_hop: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             interface_index: 5,
             metric: 256,
+            is_ours: false,
+            table: Default::default(),
         }
+    }
+
+    /// The shared enumeration returns both families; an IPv4 default route is
+    /// not a way off the link for IPv6.
+    #[test]
+    fn an_ipv4_row_says_nothing_about_ipv6() {
+        let v4_default = RouteEntry {
+            destination: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            next_hop: IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1)),
+            ..row("::", 0)
+        };
+        assert!(!has_global_route(&[v4_default]));
     }
 
     #[test]

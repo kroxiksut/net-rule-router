@@ -26,9 +26,7 @@ pub use nrr_platform_api::windows_api::{
 
 use crate::{
     error::PlatformError,
-    types::{
-        Ipv6RouteRow, RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec,
-    },
+    types::{RouteEntry, WfpEngineToken, WfpFilterId, WfpFilterRecord, WfpFilterSpec},
 };
 
 // ── Production implementation ─────────────────────────────────────────────────
@@ -45,10 +43,6 @@ impl RouteTablePort for ProductionWindowsApi {
         // Real GetIpForwardTable2 on Windows; stubbed elsewhere via
         // `production_get_ip_forward_table`.
         production_get_ip_forward_table()
-    }
-
-    fn get_ipv6_forward_table(&self) -> Result<Vec<Ipv6RouteRow>, PlatformError> {
-        production_get_ipv6_forward_table()
     }
 
     fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError> {
@@ -194,18 +188,6 @@ fn production_get_ip_forward_table() -> Result<Vec<RouteEntry>, PlatformError> {
 
 #[cfg(not(target_os = "windows"))]
 fn production_get_ip_forward_table() -> Result<Vec<RouteEntry>, PlatformError> {
-    Err(PlatformError::NotSupported {
-        reason: "GetIpForwardTable2 requires target_os = \"windows\"",
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn production_get_ipv6_forward_table() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
-    crate::win32_ffi::route_table::enumerate_routes_v6()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn production_get_ipv6_forward_table() -> Result<Vec<Ipv6RouteRow>, PlatformError> {
     Err(PlatformError::NotSupported {
         reason: "GetIpForwardTable2 requires target_os = \"windows\"",
     })

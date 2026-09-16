@@ -289,8 +289,7 @@ var STABILITY_FIELD_DEFAULTS = {
     "dns-via-secondary": false,
     "dns-fast-answers": true,
     "fake-ip-udp-relay": false,
-    "fake-ip-instant-rst": true,
-    "isp-block-candidates-enabled": false
+    "fake-ip-instant-rst": true
 }
 
 // Row fields whose value is not a scalar, so they cannot live in the table
@@ -397,6 +396,18 @@ function mergeStabilityWrite(live, intent, parked, partial) {
     return out
 }
 
+// Wall-clock stamp for a table cell: "YYYY-MM-DD HH:MM", or an em dash when
+// there is no usable time. Shared by the cache and connection-trace tables,
+// which must not disagree about how a timestamp looks.
+function formatTimestamp(ms) {
+    var n = Number(ms || 0)
+    if (!isFinite(n) || n <= 0) return "—"
+    var d = new Date(n)
+    function pad(x) { return (x < 10 ? "0" : "") + String(x) }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+        + " " + pad(d.getHours()) + ":" + pad(d.getMinutes())
+}
+
 // ---- connection-trace remote-address classification ----
 
 // True when a connection-trace remote endpoint is NOT an internet destination:
@@ -410,6 +421,18 @@ function mergeStabilityWrite(live, intent, parked, partial) {
 // including a masked or empty value -- returns false: the caller hides
 // non-internet rows, and hiding a row we could not read would silently drop
 // evidence from the view.
+// True when a connection-trace endpoint is IPv6. The display string is either
+// a bracketed literal ("[fe80::1]:53") or a bare address; a bare IPv6 has more
+// than one colon, while "1.2.3.4:443" has exactly one. A masked or empty value
+// reads as NOT v6 — the caller narrows the view with this, and a row we cannot
+// read must not be presented as evidence about a family.
+function isIpv6Endpoint(endpoint) {
+    var s = String(endpoint || "").trim()
+    if (s === "") return false
+    if (s.charAt(0) === "[") return true
+    return s.split(":").length > 2
+}
+
 function isNonInternetAddress(remote) {
     var host = String(remote || "").trim()
     if (host === "") return false
@@ -455,18 +478,20 @@ function isNonInternetAddress(remote) {
 
 // ---- interface-role secondary-name matching ----
 
-// PARITY with the service matcher (route_coordinator.rs
-// `description_matches_display_name`): reduce BOTH sides to version-stripped
-// lowercase whitespace tokens, then match by SYMMETRIC containment (either token
-// set is a subset of the other). A directional substring test diverged from the
-// service, so the GUI painted the secondary "unresolved / press Apply" even when
-// the service had healed the id and was actively routing (saved "...VPN 3.0..."
-// vs live "...VPN...", or the reverse). The caller's "exactly one available
-// match" ambiguity guard bounds the looser matching, like the service's guard.
+// Mirror of the service's `description_matches_display_name`: tokens split on
+// whitespace, `_` and `-`, version tokens dropped, symmetric containment, and
+// at least one shared token that names a vendor rather than a category. Any
+// drift makes the GUI report "adapter not found" for a binding the service has
+// already re-matched ("x_VPN" vs "x VPN OpenVPN Adapter").
+var ADAPTER_GENERIC_NAME_TOKENS = [
+    "vpn", "adapter", "tunnel", "client", "network", "connection",
+    "ethernet", "wireless", "virtual", "tap", "wintun"
+]
+
 function storedNameMatchesLive(storedName, liveText) {
     function _coreTokens(s) {
         var out = []
-        var parts = String(s || "").toLowerCase().split(/\s+/)
+        var parts = String(s || "").toLowerCase().split(/[\s_-]+/)
         for (var i = 0; i < parts.length; i += 1) {
             var t = parts[i]
             if (t === "") continue
@@ -484,7 +509,13 @@ function storedNameMatchesLive(storedName, liveText) {
             if (b.indexOf(a[i]) === -1) return false
         return true
     }
-    return _subset(saved, live) || _subset(live, saved)
+    if (!_subset(saved, live) && !_subset(live, saved)) return false
+    for (var j = 0; j < saved.length; j += 1) {
+        if (live.indexOf(saved[j]) !== -1
+                && ADAPTER_GENERIC_NAME_TOKENS.indexOf(saved[j]) === -1)
+            return true
+    }
+    return false
 }
 
 // ---- service interface wire-row -> model-row mapping ----
@@ -663,6 +694,27 @@ function unroutableInterfaceReasonSlug(row) {
     return ""
 }
 
+// How one adapter reads to a user, everywhere it is named.
+//
+// The CONNECTION name leads and the driver description follows. Which way round
+// they go is the whole point: the description names the driver ("WireGuard
+// Tunnel", "TAP-Windows Adapter V9") and is shared by every tunnel of that kind,
+// while the connection name is what the user themselves gave it or what their
+// VPN client wrote there. A dialog that said only the description asked people
+// to recognise their VPN by the driver behind it.
+//
+// The description is still worth showing — a laptop with "Wi-Fi", "Wi-Fi 2" and
+// "Ethernet 3" needs it to tell them apart — so it is appended, not dropped, and
+// only when it adds something the name does not already say.
+function adapterDisplayName(row) {
+    if (!row) return ""
+    var name = String(row.name || "").trim()
+    var descr = String(row.description || "").trim()
+    if (name === "") return descr
+    if (descr === "" || descr === name) return name
+    return name + " \u2014 " + descr
+}
+
 // Convenience predicate over `unroutableInterfaceReasonSlug`.
 function interfaceCannotCarryTrafficOut(row) {
     return unroutableInterfaceReasonSlug(row) !== ""
@@ -757,7 +809,6 @@ var ROUTE_POLICY_FIELD_DEFAULTS = {
     "primary-probe-timeout-ms": 1500,
     "primary-probe-max-targets": 8,
     "primary-probe-repeat-secs": 300,
-    "block-ipv6-when-protected": true,
     "local-networks-auto-accept": false,
     "zone-priority-over-ip": false
 }
@@ -846,11 +897,40 @@ function routeBindingFromSnapshot(cur, role) {
     var id = String(b["stable-id"] || "")
     var name = String(b["display-name"] || "")
     if (id === "" && name === "") return null
+    var known = b["known-stable-ids"]
     return {
         id: id !== "" ? id : name,
         name: name !== "" ? name : id,
-        confirmed: b["user-confirmed"] === true
+        confirmed: b["user-confirmed"] === true,
+        knownIds: Array.isArray(known) ? known.map(String) : []
     }
+}
+
+// The service re-matched a reinstalled adapter and still lists the app's id
+// among the binding's earlier ones: the app holds a stale copy of the SAME
+// choice, not a different one, so it follows without asking.
+function routeBindingIsHealOf(myId, theirs) {
+    if (myId === "" || theirs === null) return false
+    var mine = myId.toLowerCase()
+    if (mine === theirs.id.toLowerCase()) return false
+    for (var i = 0; i < theirs.knownIds.length; i++)
+        if (theirs.knownIds[i].toLowerCase() === mine) return true
+    return false
+}
+
+// Prefs patch that adopts every slot the service healed from the app's id;
+// empty when there is nothing to follow.
+function routeBindingHealPatch(prefs, cur) {
+    var p = prefs || {}
+    var patch = {}
+    for (var i = 0; i < ROUTE_BINDING_SLOTS.length; i++) {
+        var slot = ROUTE_BINDING_SLOTS[i]
+        var theirs = routeBindingFromSnapshot(cur, slot.role)
+        if (!routeBindingIsHealOf(String(p[slot.id] || ""), theirs)) continue
+        patch[slot.id] = theirs.id
+        patch[slot.name] = theirs.name
+    }
+    return patch
 }
 
 // What to do with the binding the service reports, given what the app holds.
@@ -866,6 +946,7 @@ function routeBindingSeedPlan(prefs, cur) {
     var p = prefs || {}
     var patch = {}
     var divergence = []
+    var firstSeed = false
     for (var i = 0; i < ROUTE_BINDING_SLOTS.length; i++) {
         var slot = ROUTE_BINDING_SLOTS[i]
         var theirs = routeBindingFromSnapshot(cur, slot.role)
@@ -876,12 +957,18 @@ function routeBindingSeedPlan(prefs, cur) {
             patch[slot.id] = theirs.id
             patch[slot.name] = theirs.name
             patch[slot.confirmed] = theirs.confirmed
+            firstSeed = true
             continue
         }
         if (myId !== "" && myId === theirs.id) {
             // Same adapter, fresher label: the service caches the display name
             // at write time and an adapter can be renamed between runs.
             if (theirs.name !== myName) patch[slot.name] = theirs.name
+            continue
+        }
+        if (routeBindingIsHealOf(myId, theirs)) {
+            patch[slot.id] = theirs.id
+            patch[slot.name] = theirs.name
             continue
         }
         divergence.push({
@@ -893,8 +980,7 @@ function routeBindingSeedPlan(prefs, cur) {
     // The behaviour mode rides along with a FIRST seed only. Prefs always carry
     // a mode, so comparing it would report a disagreement on every start where
     // the user simply never touched the setting.
-    if (patch.hasOwnProperty("selectedPrimaryInterfaceId")
-            || patch.hasOwnProperty("selectedSecondaryInterfaceId")) {
+    if (firstSeed) {
         var mode = String((cur || {})["mode"] || "")
         if (mode !== "") patch.routeBehaviorMode = mode
     }
@@ -1098,10 +1184,12 @@ function groupAutoRuleRows(candidates, dismissed) {
     function addLeaf(row, status) {
         var match = String(row["proposed-match"] || row.proposedMatch || "")
         if (match === "") return
-        var domain = registrableDomain(match)
+        // A program is its own group: a file name has no registrable domain.
+        var isApp = String(row["match-kind"] || row.matchKind || "") === "application"
+        var domain = isApp ? match : registrableDomain(match)
         var group = byDomain[domain]
         if (!group) {
-            group = { domain: domain, hosts: [], pendingIds: [], dismissedIds: [],
+            group = { domain: domain, isApp: isApp, hosts: [], pendingIds: [], dismissedIds: [],
                 consumersByHost: {}, latestMs: 0 }
             byDomain[domain] = group
             order.push(domain)
@@ -1154,6 +1242,7 @@ function groupAutoRuleRows(candidates, dismissed) {
         for (var k = 0; k < keys.length; k += 1) consumerList.push(g.consumersByHost[keys[k]])
         groups.push({
             domain: g.domain,
+            isApp: g.isApp === true,
             hosts: g.hosts,
             pendingIds: g.pendingIds,
             dismissedIds: g.dismissedIds,
@@ -1212,7 +1301,7 @@ function autoRuleGroupMainRouteRank(group) {
     var rank = 2
     for (var i = 0; i < hosts.length; i += 1) {
         var behavior = String(hosts[i].primaryBehavior || "")
-        if (behavior === "stalls" || behavior === "cut") return 0
+        if (behavior === "stalls") return 0
         if (behavior !== "responds") rank = Math.min(rank, 1)
     }
     return rank

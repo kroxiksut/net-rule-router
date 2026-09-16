@@ -37,7 +37,7 @@ function isHostlikeRuleType(ruleType) {
 function canonicalRuleTypeSlug(ruleType) {
     var t = String(ruleType || "").toLowerCase()
     if (t === "suffix-domain") return "domain"
-    if (t === "exact-ipv4") return "exact-ip"
+    if (t === "exact-ipv4" || t === "exact-ipv6") return "exact-ip"
     return t
 }
 
@@ -110,7 +110,7 @@ function ruleTypeToSection(ruleType) {
     var rt = String(ruleType || "")
     if (rt === "zone") return "Zones"
     if (rt === "domain" || rt === "suffix-domain" || rt === "exact-fqdn") return "Domains"
-    if (rt === "exact-ip" || rt === "exact-ipv4") return "IP"
+    if (rt === "exact-ip" || rt === "exact-ipv4" || rt === "exact-ipv6") return "IP"
     if (rt === "application") return "Windows"
     return ""
 }
@@ -309,7 +309,12 @@ function ruleRowToWireDto(row, aceEncodeHost, opts) {
             break
         case "exact-ip":
         case "exact-ipv4":
-            dto["address-match"] = { kind: "exact-ipv4", address: value }
+        case "exact-ipv6":
+            // The address names its own family: only IPv6 text has a colon.
+            dto["address-match"] = {
+                kind: value.indexOf(":") >= 0 ? "exact-ipv6" : "exact-ipv4",
+                address: value
+            }
             break
         case "application":
             // A `*` makes it a pattern, exactly as the preset parser reads it.

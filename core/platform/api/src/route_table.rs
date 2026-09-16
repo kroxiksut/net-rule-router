@@ -16,7 +16,7 @@
 
 use crate::adapters::AdapterInfo;
 use crate::error::PlatformError;
-use crate::types::{Ipv6RouteRow, RouteEntry};
+use crate::types::RouteEntry;
 
 /// The system route table plus the interface facts the routing layer reads.
 ///
@@ -24,23 +24,16 @@ use crate::types::{Ipv6RouteRow, RouteEntry};
 /// `GetIpForwardTable2` / `GetAdaptersAddresses`, Linux with rtnetlink, macOS
 /// with the routing socket.
 pub trait RouteTablePort: Send + Sync {
-    // ── IPv4 route table ─────────────────────────────────────────────────────
+    // ── Route table ──────────────────────────────────────────────────────────
 
-    /// Enumerate all IPv4 routes the apply layer is interested in.
+    /// Enumerate the routes, both families.
     fn get_ip_forward_table(&self) -> Result<Vec<RouteEntry>, PlatformError>;
 
-    /// Add a single IPv4 route entry.
+    /// Add a single route entry.
     fn create_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError>;
 
-    /// Delete a single IPv4 route entry.
+    /// Delete a single route entry.
     fn delete_ip_forward_entry(&self, entry: &RouteEntry) -> Result<(), PlatformError>;
-
-    /// Read the IPv6 forwarding table. Diagnostics only — nothing installs v6
-    /// routes — so the default is "this platform cannot tell", which reads the
-    /// same as an empty table to every caller that just logs it.
-    fn get_ipv6_forward_table(&self) -> Result<Vec<Ipv6RouteRow>, PlatformError> {
-        Ok(Vec::new())
-    }
 
     // ── Adapter enumeration ──────────────────────────────────────────────────
 
