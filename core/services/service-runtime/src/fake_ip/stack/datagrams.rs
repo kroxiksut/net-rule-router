@@ -5,14 +5,13 @@
 //! fanned back, and it is retired by an idle timer rather than by a FIN.
 //! Port-unreachable is the only refusal it can express.
 //!
-//! Same inherent impl, split across files. Behaviour is unchanged.
+//! Same inherent impl, split across files.
 
 use super::*;
 
 impl FakeIpStack {
     /// Bind a UDP socket for a fresh datagram to an in-scope fake endpoint.
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
     pub(super) fn maybe_open_udp(&mut self, packet: &ParsedPacket) {
         let local = packet.key.destination;
         let key = (local.ip(), local.port());
@@ -57,8 +56,7 @@ impl FakeIpStack {
 
     /// Pump every UDP bind: client datagrams out to their upstreams, upstream
     /// replies back to their clients, then reap idle flows.
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
     pub(super) fn service_udp(&mut self, now_ms: u64) {
         let keys: Vec<(std::net::IpAddr, u16)> = self.udp_binds.keys().copied().collect();
         for key in keys {

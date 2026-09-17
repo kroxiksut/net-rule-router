@@ -372,8 +372,8 @@ fn recent_log_entries_caps_to_the_newest_max_entries() {
         .recent_log_entries(&LogEntryFilter::default(), 3, &DiagnosticsAudience::Machine)
         .expect("recent");
     let ids: Vec<&str> = recent.iter().map(|e| e.event_id.as_str()).collect();
-    // Only the 3 NEWEST, newest-first — never the stale head the pre-0719
-    // single-oldest-page fetch would have shipped.
+    // Only the 3 NEWEST, newest-first — never the stale head a
+    // single-oldest-page fetch would ship.
     assert_eq!(ids, vec!["evt-0010", "evt-0009", "evt-0008"]);
 }
 

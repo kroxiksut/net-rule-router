@@ -1,10 +1,9 @@
 // One "Received 1.2 GB" / "Sent 340 MB" figure with its direction arrow.
 //
-// The arrow used to be a literal glyph inside the label text, which renders at
-// the font's own stroke weight and reads as a speck next to the number. Here it
-// is the real icon asset, sized off the theme font so the accessibility text
-// scale carries it, and kept out of the label text so a screen reader gets the
-// direction as a word instead of a character it may skip.
+// The arrow is a real icon asset, not a glyph in the label text: it is sized
+// off the theme font so the accessibility text scale carries it, and kept out
+// of the label text so a screen reader gets the direction as a word instead of
+// a character it may skip.
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15

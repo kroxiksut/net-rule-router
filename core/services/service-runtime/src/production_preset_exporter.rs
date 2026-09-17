@@ -334,13 +334,12 @@ mod tests {
 
     #[test]
     fn export_resolves_caller_sid_revision_with_empty_baseline() {
-        // regression — the console user's edits live under THEIR
-        // SID's revision chain (that's what drives enforcement), while the
-        // shared `__baseline__` partition may be empty. Export MUST resolve the
-        // caller's own active revision via per-SID read-through; before the fix
-        // it read the baseline only (`get_active`) and returned
-        // `NoActiveRevision` even though the service was actively enforcing the
-        // user's rules.
+        // Export must resolve the caller's own active revision via per-SID
+        // read-through: the console user's edits live under THEIR SID's
+        // revision chain (that's what drives enforcement), while the shared
+        // `__baseline__` partition may be empty. Reading the baseline only
+        // would return `NoActiveRevision` even though the service is
+        // actively enforcing the user's rules.
         const CALLER_SID: &str = "S-1-5-21-1111111111-2222222222-3333333333-1001";
         let conn = open_state_db_in_memory();
         let content = RulesRevisionContent::new(CanonicalRuleBook {
@@ -355,8 +354,8 @@ mod tests {
 
         let exporter = ProductionPresetExporter::new(Arc::clone(&conn))
             .with_host_app_section(RulesFileSection::Windows);
-        // Sanity: the baseline partition is empty, so the OLD baseline-only
-        // path still returns NoActiveRevision here.
+        // Sanity: the baseline partition is empty, so resolving via the
+        // baseline alone still returns NoActiveRevision here.
         assert_eq!(
             exporter.export_rules_file(
                 nrr_storage::BASELINE_PRINCIPAL,
@@ -367,7 +366,7 @@ mod tests {
             Err(PresetExportError::NoActiveRevision),
             "baseline partition must be empty for this regression"
         );
-        // The fix: exporting as the caller SID resolves their own revision.
+        // Exporting as the caller SID resolves their own revision.
         let out = exporter
             .export_rules_file(CALLER_SID, RouteRole::Primary, false, &Default::default())
             .expect("caller-SID export must succeed via per-SID read-through");

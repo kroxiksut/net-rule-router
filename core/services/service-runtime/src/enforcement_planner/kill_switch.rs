@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Plan the **per-destination kill-switch** (Sub-slices 4a + 4b) for `sid` — the
+/// Plan the **per-destination kill-switch** for `sid` — the
 /// leak-proof `OnlyVia(Secondary)` pins over each protected IP, across every
 /// selected protocol.
 ///
@@ -11,10 +11,10 @@ use super::*;
 /// plus `packet_egress_pairs`). For each non-exempt, capped protected IP at
 /// post-filter index `idx` it emits:
 ///
-/// - **ALE-connect pair (4a)** — iff any ALE protocol (TCP/UDP) is selected: one
+/// - **ALE-connect pair** — iff any ALE protocol (TCP/UDP) is selected: one
 ///   proto-agnostic [`FlowRule`], [`Coverage::ConnectOnly`], `ordinal = idx`,
 ///   egress [`EgressConstraint::OnlyVia`]`(Secondary)`.
-/// - **Packet-layer flows (4b)** — one 16-slot window per destination
+/// - **Packet-layer flows** — one 16-slot window per destination
 ///   (`ordinal = idx * `[`PACKET_SLOTS_PER_DEST`]` + slot`), reproducing
 ///   `packet_egress_pairs`. When "Other" is selected: a proto-agnostic egress
 ///   pair (`OnlyVia`, [`Coverage::AllPackets`], slot 0) that cuts every protocol,
@@ -44,7 +44,7 @@ pub fn plan_kill_switch_destinations(
         .enumerate()
     {
         let idx = idx as u32;
-        // ALE-connect pair (4a): a proto-agnostic egress-conditional pin at
+        // ALE-connect pair: a proto-agnostic egress-conditional pin at
         // ordinal = idx. Present iff any ALE protocol (TCP or UDP) is selected —
         // the ALE pair is protocol-agnostic, so either one selected covers both.
         if protocols.tcp || protocols.udp {
@@ -57,7 +57,7 @@ pub fn plan_kill_switch_destinations(
                 idx,
             ));
         }
-        // Packet-layer flows (4b): one 16-slot window per destination — one
+        // Packet-layer flows: one 16-slot window per destination — one
         // egress pair per selected NAMED packet protocol. By design the
         // proto-agnostic "Other" pair is GONE (see
         // `killswitch_codegen::KillSwitchProtocols::wants_packet_layer`).
@@ -130,7 +130,7 @@ pub(super) fn selected_packet_protocols(p: KillSwitchProtocols) -> Vec<L4Proto> 
     v
 }
 
-/// Plan the **catch-all (Mode-B) kill-switch** (Sub-slice 4c) for `sid` — the
+/// Plan the **catch-all (Mode-B) kill-switch** for `sid` — the
 /// blanket "block everything not exempted" for everything-via-secondary.
 ///
 /// Neutral equivalent of `killswitch_codegen::catch_all_kill_switch_filters`. For
@@ -384,7 +384,7 @@ pub(super) fn push_ipv6_cut(
     ));
 }
 
-/// Build one catch-all [`FlowRule`] (Sub-slices 4c/4d), `app = Any`.
+/// Build one catch-all [`FlowRule`], `app = Any`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn catch_all_flow(
     principal: &PrincipalScope,

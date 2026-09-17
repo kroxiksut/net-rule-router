@@ -93,9 +93,9 @@ impl SecondaryRouteCoordinator {
                     // Whatever failing run was accumulating no longer measures
                     // this tunnel: drop it, or the stale window declares the
                     // adapter DEAD the instant it comes back Up and the
-                    // kill-switch fail-closes a freshly-reconnected tunnel
-                    //  HW). The interface must re-prove its
-                    // reachability baseline after it returns.
+                    // kill-switch fail-closes a freshly-reconnected tunnel.
+                    // The interface must re-prove its reachability baseline
+                    // after it returns.
                     let forgotten = self
                         .probed_ifindex
                         .lock()

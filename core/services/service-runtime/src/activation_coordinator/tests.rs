@@ -385,7 +385,7 @@ fn activate_with_unknown_token_returns_unknown() {
 }
 
 /// A confirmation is a confirmation OF SOMETHING. A token issued for one
-/// candidate used to activate any other candidate of the same principal —
+/// candidate must not activate any other candidate of the same principal —
 /// including one the user had just rejected.
 #[test]
 fn a_token_issued_for_one_revision_cannot_activate_another() {
@@ -678,8 +678,8 @@ fn activate_apply_failure_all_or_nothing_reverts_successful_sids() {
 }
 
 /// A revert that fails is the state that matters most: the SID keeps rules
-/// from a revision the service has just rejected. It used to be discarded
-/// by an `is_ok()` and left no trace anywhere.
+/// from a revision the service has just rejected, so the failure must leave
+/// a trace rather than being discarded.
 #[test]
 fn a_revert_that_fails_is_recorded_on_the_revision() {
     let fx = build_fixture(ApplyFailurePolicy::AllOrNothing);
@@ -910,30 +910,12 @@ fn rollback_to_lkg_creates_new_revision_and_activates() {
         .expect("act b");
     // Now A is superseded → LKG. B is active.
 
-    // Roll back to LKG (= A's content).
-    // First we need a new token issued against the rollback's new
-    // candidate id. The coordinator creates the candidate, so we
-    // must pre-issue a token under a predictable id. Counter IDs
-    // makes this deterministic: next id is rev-00000005.
-    // We issue a token whose `mutation_payload_json` is unrelated —
-    // the consume just checks the token string itself.
-
-    // Pre-issue token by submitting a stand-in revision and issuing
-    // against it... actually, the coordinator's flow is:
-    //   1. resolve target
-    //   2. insert new candidate (gets id N+1)
-    //   3. activate(N+1, token, ...)
-    // So the token must already exist. The rollback flow as-is
-    // expects callers to pre-issue. Since CounterIds is sequential,
-    // we know the next id. But issue_confirmation_token requires
-    // an EXISTING candidate. So in production, the flow is:
-    //   GUI calls rollback_to which returns `RequiresUserAction` or
-    //   similar with the new candidate id, then GUI requests a
-    //   token, then calls activate(new_id, token).
-    //
-    // For our test we follow that two-step shape: directly insert
-    // the rollback candidate via the same mechanism rollback_to
-    // uses, issue a token, then call activate.
+    // Roll back to LKG (= A's content). Production flow: the GUI calls
+    // `rollback_to`, gets the new candidate id back, requests a token for
+    // it, then calls `activate(new_id, token)` — a token can only be issued
+    // against an EXISTING candidate. The test follows the same two-step
+    // shape below: insert the rollback candidate directly, issue a token
+    // against it, then activate.
     let lkg = fx
         .coordinator
         .last_known_good()

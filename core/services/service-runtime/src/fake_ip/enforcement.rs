@@ -274,9 +274,9 @@ mod tests {
         assert_eq!(plan.suppress_ips, vec![ip(23, 10, 20, 140)]);
     }
 
-    /// The 0719 breakage in one assertion: an address a direct host also uses
-    /// must never keep a secondary `/32` permit, however many fake-routed hosts
-    /// claim it. Pinning it would carry the direct co-tenant into the tunnel.
+    /// Regression guard: an address a direct host also uses must never keep a
+    /// secondary `/32` permit, however many fake-routed hosts claim it —
+    /// pinning it would carry the direct co-tenant into the tunnel.
     #[test]
     fn a_shared_ip_is_never_left_pinnable_to_the_tunnel() {
         let cache = MockFqdnCacheLookup::new();

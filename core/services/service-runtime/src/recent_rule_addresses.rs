@@ -194,7 +194,7 @@ mod tests {
         assert_eq!(idx.lookup(ip(1)).as_deref(), Some("b.example"));
     }
 
-    /// The  shape: one address pair handed to two unrelated names.
+    /// The wholesale-reassignment shape: one address pair handed to two unrelated names.
     #[test]
     fn reports_a_wholesale_owner_change() {
         let idx = RecentRuleAddressIndex::new();

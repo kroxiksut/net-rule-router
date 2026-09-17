@@ -164,7 +164,6 @@ mod tests {
 
     // ── Test source ──────────────────────────────────────────────────────────
 
-    /// Configurable fake [`PresetExportSource`] that records each call's
     /// One recorded `export_rules_file` call: principal, route, metadata flag,
     /// and the passthrough sections the caller handed over.
     type ExportCall = (
@@ -174,7 +173,8 @@ mod tests {
         std::collections::BTreeMap<String, String>,
     );
 
-    /// `(route, include_metadata)` pair and returns a pre-seeded outcome.
+    /// Configurable fake [`PresetExportSource`] that records each call and
+    /// returns a pre-seeded outcome.
     struct FakeSource {
         outcome: Mutex<Result<PresetExportOutput, PresetExportError>>,
         calls: Mutex<Vec<ExportCall>>,

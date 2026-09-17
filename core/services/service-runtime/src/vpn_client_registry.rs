@@ -6,7 +6,7 @@
 //! exempts one server IP per drop — which fails against providers that run
 //! their client's connectivity checks over ROTATING infrastructure IPs: every
 //! rotation is a fresh ~72 s hang-until-drop before the next per-IP exemption
-//! lands  field logs, swiftvpn over Google front-ends). The
+//! lands (observed live in field logs — swiftvpn over Google front-ends). The
 //! client PROCESS, however, is stable across rotations, and its whole egress
 //! is the tunnel's transport — so once its role is verified, the process
 //! itself earns an app-scoped exemption whenever a block-all posture arms,
@@ -278,7 +278,7 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
 /// readers (the app-path resolver decorator and the fake-IP relay bypass) are
 /// built in different composition scopes, and a process singleton keeps them on
 /// one value by construction. Empty until the first compute publishes, so a
-/// service that never sees a confirmed client behaves exactly as before.
+/// service that never sees a confirmed client grants no client exemptions.
 pub fn global_confirmed_vpn_clients() -> Arc<ConfirmedVpnClients> {
     static REGISTRY: OnceLock<Arc<ConfirmedVpnClients>> = OnceLock::new();
     Arc::clone(REGISTRY.get_or_init(|| Arc::new(ConfirmedVpnClients::new())))

@@ -258,9 +258,9 @@ mod tests {
 
     #[test]
     fn an_unreadable_payload_is_refused_instead_of_silently_defaulted() {
-        // `include-rules-history` misspelled (or of the wrong type) used to fall
-        // back to the defaults: the history stayed, and the caller was told the
-        // purge succeeded.
+        // A misspelled (or wrongly typed) `include-rules-history` must be
+        // refused, not silently defaulted — defaulting would leave the
+        // history in place while telling the caller the purge succeeded.
         let purger = Arc::new(RecordingPurger::new(Ok(PrincipalDataPurgeResponse {
             rows_deleted: 0,
             tables_touched: 0,

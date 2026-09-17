@@ -1014,14 +1014,13 @@ impl MigrationCompletionWriter for ProductionMigrationCompletionWriter {
     }
 }
 
-// ── NoopMutationExecutor (placeholder until the real executor lands) ─────────
+// ── NoopMutationExecutor ─────────────────────────────────────────────────────
 
-/// Placeholder. Returns an `OperationError::Internal` for
-/// every execute call; preview returns a benign empty `ReviewSummary`;
-/// rollback / safe_disable similarly fail. The settings-ops IPC flow
-/// does NOT route through MutationExecutor (settings have their own
-/// thin handlers) so this stub does not affect production
-/// settings paths. A future revision-flow executor replaces this stub.
+/// Refusing executor for platforms where the revision flow has no backend
+/// yet: every mutation fails and `preview` returns an empty summary, so a
+/// caller is told nothing happened rather than shown a success it did not
+/// get. Settings operations have their own thin handlers and do not travel
+/// this trait, so they are unaffected.
 pub struct NoopMutationExecutor;
 
 impl MutationExecutor for NoopMutationExecutor {
@@ -1032,7 +1031,8 @@ impl MutationExecutor for NoopMutationExecutor {
         _principal: &str,
     ) -> ReviewSummaryResponse {
         ReviewSummaryResponse {
-            diff_summary: "preview not implemented in phase 4a".into(),
+            diff_summary:
+                "preview is unavailable: the revision flow has no backend on this platform".into(),
             provenance: "service".into(),
             risk_level: ReviewRiskLevel::Low,
             requires_review: true,
@@ -1050,68 +1050,27 @@ impl MutationExecutor for NoopMutationExecutor {
     fn execute(&self, _payload: StoredMutation, _principal: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             code: "not-implemented".into(),
-            message: "MutationExecutor not yet wired in phase 4a".into(),
+            message: "revision mutations are not available on this platform".into(),
         })
     }
 
     fn rollback(&self, _principal: &str, _target_revision_id: Option<&str>) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             code: "not-implemented".into(),
-            message: "rollback not yet wired in phase 4a".into(),
+            message: "rollback is not available on this platform".into(),
         })
     }
 
     fn safe_disable(&self, _reason: &str) -> MutationOutcome {
         MutationOutcome::Failed(OperationError {
             code: "not-implemented".into(),
-            message: "safe_disable not yet wired in phase 4a".into(),
+            message: "safe disable is not available on this platform".into(),
         })
-    }
-}
-
-// ── NoopAdaptersSnapshotProvider ─────────────────────────────────────────────
-
-/// Returns an empty adapters list. A future real adapter
-/// wraps `AdapterMonitor::snapshot()` and maps to
-/// `SnapshotInterfacesResponse`. Until then the GUI's interfaces panel
-/// shows "no adapters detected".
-pub struct NoopAdaptersSnapshotProvider;
-
-impl AdaptersSnapshotProvider for NoopAdaptersSnapshotProvider {
-    fn adapters_snapshot(&self, _force_refresh: bool) -> SnapshotInterfacesResponse {
-        SnapshotInterfacesResponse {
-            data_source: "noop-phase-4a".into(),
-            adapters: Vec::new(),
-            // Secondary route state — this noop has
-            // no policy/adapter visibility, so we report `None`. The
-            // GUI treats `None` as "no banner".
-            secondary: None,
-            // No enriched rows from the noop provider.
-            rows: Vec::new(),
-        }
     }
 }
 
 // ── MonitoredAdaptersSnapshotProvider ─────────────────────────────────────────
 
-/// Production [`AdaptersSnapshotProvider`] backed by
-/// [`RouteTablePort::get_adapter_infos`]. Each call enumerates the
-/// adapter list synchronously and projects every
-/// [`AdapterInfo`](nrr_platform_api::adapters::AdapterInfo) into
-/// the wire-shape [`AdapterEntry`](nrr_shared::ipc_payloads::AdapterEntry).
-///
-/// "Monitored" denotes the lifecycle relationship with the supervisor's
-/// `adapter-monitor-tick`: the monitor keeps the
-/// platform-side view warm via its 1-second debounce poll. The
-/// snapshot path queries fresh on demand — `force_refresh` is honoured
-/// implicitly because the underlying `GetAdaptersAddresses` call always
-/// returns the current kernel state.
-///
-/// This is the one provider that can reach the network, and only through
-/// `adapters_snapshot_probing_external_ip`: that variant additionally asks
-/// each live adapter for the address the outside world sees behind it, which
-/// costs a few seconds and sends packets to a third party. `adapters_snapshot`
-/// itself never does.
 /// Narrow persistence seam for a per-adapter
 /// (local_ip, external_ip) observation. Kept as a trait (rather than a direct
 /// `TrafficSampler` handle) so `MonitoredAdaptersSnapshotProvider` — which

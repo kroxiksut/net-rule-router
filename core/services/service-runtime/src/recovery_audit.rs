@@ -1,22 +1,18 @@
-//! production [`RecoveryAuditEmitter`] backed by
-//! [`nrr_diagnostics::AuditWriter`].
+//! Production [`RecoveryAuditEmitter`] backed by [`nrr_diagnostics::AuditWriter`].
 //!
-//! ## Purpose
+//! ## Contract
 //!
-//! [`crate::policy_loader::PolicyLoader`] consults a `RecoveryAuditEmitter`
-//! when integrity verification fails and the LKG-fallback recovery path
-//! kicks in. The contract (see policy_loader.rs lines 96–99) is hard:
+//! [`crate::policy_loader::PolicyLoader`] consults a `RecoveryAuditEmitter` when
+//! integrity verification fails and the LKG-fallback recovery path kicks in:
 //!
 //! > The emitter must persist the event durably *before* returning `Ok`.
 //! > If persistence fails, returning `Err` causes the loader to fall
 //! > through to `RecoveryRequired` rather than silently mutate the
 //! > active pointer.
 //!
-//! used [`crate::policy_loader::NoopAuditEmitter`] as a
-//! placeholder; this module ships the real adapter that maps the
-//! loader's narrow [`crate::policy_loader::RecoveryAuditEvent`] enum
-//! onto the broader [`nrr_diagnostics::AuditEventInput`] schema and
-//! flushes through the durable NDJSON writer.
+//! This adapter maps the loader's narrow [`crate::policy_loader::RecoveryAuditEvent`]
+//! onto the broader [`nrr_diagnostics::AuditEventInput`] schema and flushes through
+//! the durable NDJSON writer.
 //!
 //! ## Mapping
 //!
@@ -26,26 +22,23 @@
 //! | `LkgFallbackCompleted`          | `RecoveryActionRequested` | `Success`| `integrity.policy_integrity_failure` |
 //! | `RecoveryRequired`              | `IntegrityFailureDetected`| `Blocked`| `integrity.policy_integrity_failure` |
 //!
-//! `actor_kind` is always [`ActorKind::Service`] (recovery is service-driven, never user-initiated).
-//! `revision_id` is set to `broken_active` for the two LKG variants so an
-//! auditor reading the chain can immediately correlate the failure to a
-//! specific revision; `RecoveryRequired` carries no revision because by
-//! definition there is no usable active.
+//! `actor_kind` is always [`ActorKind::Service`] (recovery is service-driven, never
+//! user-initiated). `revision_id` is `broken_active` for the two LKG variants so an
+//! auditor can correlate the failure to a specific revision; `RecoveryRequired`
+//! carries no revision because there is no usable active.
 //!
 //! ## Event ID generation
 //!
-//! Spec calls for `adt-{uuid_v4}`, but the workspace deliberately avoids a
-//! `uuid` dependency (no other crate uses it). We derive a deterministic-
-//! enough id from `epoch_nanos + per-process atomic counter`, formatted as
-//! `adt-{nanos}-{counter}`. Collisions are possible only across processes
-//! within the same nanosecond, which the audit chain's `seq` + `prev_hash`
-//! detect anyway.
+//! Spec calls for `adt-{uuid_v4}`, but the workspace avoids a `uuid` dependency
+//! (no other crate needs it). IDs are `adt-{epoch_nanos}-{atomic_counter}`;
+//! collisions are possible only across processes within the same nanosecond,
+//! which the audit chain's `seq` + `prev_hash` catch anyway.
 //!
 //! ## Failure semantics
 //!
-//! Any [`nrr_diagnostics::error::DiagnosticsError`] from `AuditWriter::append`
-//! is converted to a `String` and returned via `Err(...)`. The loader's
-//! invariant takes care of the rest — it will not mutate state on `Err`.
+//! Any [`nrr_diagnostics::error::DiagnosticsError`] from `AuditWriter::append` is
+//! converted to a `String` and returned via `Err(...)`; the loader does not mutate
+//! state on `Err`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -353,7 +346,6 @@ mod tests {
                 details: "test".into(),
             })
             .expect("persist ok");
-        // Verify a file was created with at least one NDJSON line.
         let entries: Vec<_> = std::fs::read_dir(dir.path())
             .expect("read audit dir")
             .flatten()

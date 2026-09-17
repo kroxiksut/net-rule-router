@@ -213,11 +213,11 @@ fn two_live_adapters_answering_to_the_saved_name_ask_the_user_instead_of_guessin
 /// The vendor replaced its adapter outright: the bound GUID is gone and NO
 /// live name answers for it. The field case is swiftvpn switching from its
 /// OpenVPN adapter to a WireGuard tunnel — a different device with a different
-/// name, while the old one stayed behind as a driver that will not start.
+/// name, while the old one stays behind as a driver that will not start.
 ///
-/// Before this the branch only wrote a log line, so the product went quiet at
-/// the exact moment it stopped routing. The cause cannot be known from here,
-/// but the answer is the same for every cause: hand the choice back.
+/// The cause cannot be known from here, but the answer is the same for every
+/// cause: hand the choice back rather than going quiet at the exact moment
+/// routing stops.
 #[test]
 fn a_bound_adapter_that_no_longer_exists_asks_the_user_instead_of_going_quiet() {
     use crate::ipc_handlers::event_bus::EventBus;

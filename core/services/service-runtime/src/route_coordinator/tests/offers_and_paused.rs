@@ -163,9 +163,9 @@ fn recompute_mode_a_emits_counter_overlay_via_derived_primary() {
 
 #[test]
 fn recompute_active_routes_via_derived_next_hop_for_gatewayless_vpn() {
-    // End-to-end: a gateway-less VPN adapter (the round-6 dead end) must
-    // now route — resolve_target derives the tunnel peer from the route
-    // table and the /32 overlay is installed via it.
+    // End-to-end: a gateway-less VPN adapter must still route —
+    // resolve_target derives the tunnel peer from the route table and the
+    // /32 overlay is installed via it.
     let api = Arc::new(MockWindowsApi::new());
     let vpn = adapter("swiftvpnvpn", 78, true, true, None); // up, IPv4, NO gateway
     let bound_id = vpn.stable_id();
@@ -392,9 +392,9 @@ fn our_own_exception_routes_are_not_mistaken_for_vpn_server_ips() {
     );
 }
 
-/// An empty route table and an unreadable one used to be the same value.
-/// Armed on the empty reading, the kill-switch exempts no LAN, no DHCP and
-/// no printers — and says nothing about why.
+/// An empty route table and an unreadable one must not resolve to the same
+/// value: armed on the empty reading, the kill-switch would exempt no LAN,
+/// no DHCP and no printers — and say nothing about why.
 #[test]
 fn an_unreadable_route_table_keeps_the_kill_switch_off() {
     let api = Arc::new(MockWindowsApi::new());
@@ -703,12 +703,11 @@ fn adopt_orphans_picks_our_signature_then_recompute_purges_unwanted() {
 
 #[test]
 fn adopt_orphans_claims_mode_a_counter_overlay_not_just_slash32() {
-    // Regression (block 16, : a crash/kill (not a graceful stop)
-    // can strand the mode-A `/2` counter-overlay (metric 5, on the primary
-    // NIC) in the OS table. Adoption must claim it alongside the `/32`
-    // host routes — previously only `/32` was adopted, so the `/2` lingered
-    // forever and could keep forcing all non-rule traffic to the primary
-    // after the owning service was gone (the kill-during-rebuild leftover).
+    // Regression: a crash/kill (not a graceful stop) can strand the mode-A
+    // `/2` counter-overlay (metric 5, on the primary NIC) in the OS table.
+    // Adoption must claim it alongside the `/32` host routes, or the `/2`
+    // lingers forever and keeps forcing all non-rule traffic to the primary
+    // after the owning service is gone.
     let api = Arc::new(MockWindowsApi::new());
     // Our /2 counter-overlay half @metric5 (primary NIC ifindex 12).
     let overlay = RouteEntry {

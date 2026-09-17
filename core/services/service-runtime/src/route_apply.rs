@@ -5,7 +5,7 @@
 //! says "this host goes over the tunnel" lowers to a filter that permits the
 //! host on the tunnel and drops it elsewhere, so without the matching route the
 //! traffic follows the default path, meets that drop, and the user sees the site
-//! go dark. That was the state of the Linux path until this landed.
+//! go dark.
 //!
 //! Everything here is OS-neutral: the reconciler works through
 //! [`RouteTablePort`], and an egress target is an interface index plus an

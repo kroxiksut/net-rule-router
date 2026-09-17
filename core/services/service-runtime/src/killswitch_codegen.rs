@@ -6,9 +6,9 @@
 //! adapter (typically a VPN tunnel) and that adapter goes down, the OS
 //! route table fails the traffic over to the primary adapter — so the
 //! packets that were meant to be private leak out under the real IP.
-//! The reactive Fail-Closed path (block 15.6,
-//! [`nrr_platform_api::fail_closed`]) closes this by *detecting*
-//! the adapter is unavailable and then installing block filters — but
+//! The reactive Fail-Closed path ([`nrr_platform_api::fail_closed`]) closes
+//! this by *detecting* the adapter is unavailable and then installing block
+//! filters — but
 //! between "secondary adapter dropped" and "block installed" there is a race window
 //! where packets can still escape.
 //!
@@ -94,7 +94,7 @@ use crate::wfp_bands::{
 use crate::wfp_codegen::filter_id_for;
 
 /// Everything the kill-switch needs to know about the secondary (VPN)
-/// interface for a SID, resolved fresh on every apply (block 16.18.vpn).
+/// interface for a SID, resolved fresh on every apply.
 ///
 /// The per-destination kill-switch (mode A) uses only `secondary_luid`.
 /// The catch-all kill-switch (mode B) additionally needs the system
@@ -198,18 +198,17 @@ impl KillSwitchProtocols {
 
     /// Any non-TCP/UDP protocol selected → emit packet-layer filters.
     ///
-    /// `other` no longer counts — the
-    /// packet layer emits ONLY per-protocol blocks for the named set
-    /// (ICMP/IGMP/GRE/ESP), never a protocol-agnostic block-all. The old
-    /// "Other → block-all" was a SYSTEM-WIDE proto-agnostic block that cut
-    /// TCP/UDP at the packet layer ABOVE every ALE verdict, so primary-route
-    /// rule permits, the DNS exemption, the app exemptions and the service's
-    /// own Mode-B resolver upstream (SYSTEM raw UDP) were all dead letters
-    /// whenever "Other" was in the mask — which is the DEFAULT (127). TCP/UDP
-    /// are enforced exclusively at the ALE connect layer (SID-scoped and
-    /// permit/app/DNS-aware); the packet layer owns only what ALE cannot see.
-    /// Trade-off accepted by the user: an exotic IP protocol outside the
-    /// named set passes. The GUI "Other" checkbox needs re-labeling (P2).
+    /// `other` never triggers a block: the packet layer emits ONLY
+    /// per-protocol blocks for the named set (ICMP/IGMP/GRE/ESP), never a
+    /// protocol-agnostic block-all. A proto-agnostic packet-layer block would
+    /// sit ABOVE every ALE verdict and silently kill primary-route rule
+    /// permits, the DNS exemption, the app exemptions and the service's own
+    /// Mode-B resolver upstream (SYSTEM raw UDP) whenever "Other" is in the
+    /// mask — which is the DEFAULT (127). TCP/UDP are enforced exclusively at
+    /// the ALE connect layer (SID-scoped and permit/app/DNS-aware); the packet
+    /// layer owns only what ALE cannot see. Trade-off accepted by the user: an
+    /// exotic IP protocol outside the named set passes. The GUI "Other"
+    /// checkbox needs re-labeling.
     fn wants_packet_layer(self) -> bool {
         self.icmp || self.igmp || self.gre || self.esp
     }
@@ -576,10 +575,10 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
     }
 }
 
-// ── Primary-app kill-switch exemption (HW-0712 C4) ──────────────────────────
+// ── Primary-app kill-switch exemption ────────────────────────────────────────
 
-/// Built-in default VPN-client exemption patterns, always applied on the primary
-/// adapter (HW-0712 C4, user request). A VPN client must reach its server over
+/// Built-in default VPN-client exemption patterns, always applied on the
+/// primary adapter. A VPN client must reach its server over
 /// the physical/primary link to bring the tunnel up; if the kill-switch blocks
 /// that handshake the tunnel never comes up and the secondary stays down —
 /// a fail-closed deadlock. Exempting common VPN clients out of the box prevents
@@ -591,11 +590,11 @@ fn block_app_off_secondary(sid: &str, pattern: &str, idx: u64) -> WfpFilterSpec 
 /// "vpn" in their executable. This is neutral policy DATA co-located with the
 /// emitter — the OS-specific `.exe` handling lives in the Windows resolver.
 ///
-/// these are GLOBS, and the WFP `ALE_APP_ID` condition
+/// These are GLOBS, and the WFP `ALE_APP_ID` condition
 /// keys on a real on-disk file path (`FwpmGetAppIdFromFileName0`), NOT a glob.
 /// A glob stamped verbatim into a filter's `app_pattern` is therefore silently
-/// dropped by the apply layer and NO permit installs — which used to trap a VPN
-/// under its own kill-switch. They must be RESOLVED to concrete exe paths through
+/// dropped by the apply layer and no permit installs, trapping the VPN under
+/// its own kill-switch. They must be RESOLVED to concrete exe paths through
 /// the injected `AppPathResolver` (`wfp_codegen::generate_filters` →
 /// `CodegenOutput::vpn_default_exempt_paths`) before reaching
 /// [`primary_app_exempt_filters`]. Never pass these raw to the enforcement layer.
@@ -791,10 +790,11 @@ pub fn catch_all_kill_switch_filters(
         filters.push(exempt_subnet(sid, *net, *prefix, weight));
         weight += 1;
     }
-    // Hosts known to be reached directly - in these modes those are the
-    // main-link carve-outs. The fail-closed twin has always spared them; the
-    // catch-all cut them, so a destination the user positively routed over the
-    // main link died the moment the tunnel came UP.
+    // Hosts known to be reached directly — in these modes, the main-link
+    // carve-outs. Without this exemption the catch-all would kill a
+    // destination the user positively routed over the main link the moment
+    // the tunnel came up, even though the fail-closed twin spares the same
+    // hosts.
     for ip in exemptions
         .known_direct_ips
         .iter()
@@ -806,26 +806,23 @@ pub fn catch_all_kill_switch_filters(
         weight += 1;
     }
     // The catch-all block — everything else this user sends off-tunnel.
-    // Gated on the protocol mask exactly like its fail-closed twin: with both
-    // TCP and UDP unticked this block used to install anyway and cut them,
-    // so the checkboxes did nothing in mode B. Narrowed to the single selected
-    // protocol when only one is ticked — the ALE layer carries a protocol
-    // condition (the packet layers do not).
+    // Gated on the protocol mask exactly like its fail-closed twin, so
+    // unticking both TCP and UDP keeps the checkboxes meaningful in mode B.
+    // Narrowed to the single selected protocol when only one is ticked — the
+    // ALE layer carries a protocol condition (the packet layers do not).
     if protocols.wants_ale_block() {
         filters.push(catch_all_block(sid, protocols.ale_protocol()));
     }
 
     // ── Transport layer (ICMP/IGMP/GRE/ESP — incl. ping) ──
-    // The ALE catch-all above only sees TCP/UDP
-    // connects; ICMP/ping is invisible there and would leak out the primary
-    // when the secondary adapter drops. HW-0718: the named-protocol blocks
-    // (and therefore the whole mirrored exemption set that shields them) live
-    // at OUTBOUND_TRANSPORT_V4 — the packet layer has no IP_PROTOCOL
-    // condition, so the previous packet-layer set silently never installed
-    // its blocks. Topped by an egress-conditional permit so anything leaving
-    // the tunnel is allowed while the secondary adapter is up and the block
-    // bites the instant it drops. Skipped when the user's protocol mask
-    // selects no packet-layer protocol.
+    // The ALE catch-all above only sees TCP/UDP connects; ICMP/ping is
+    // invisible there and would leak out the primary when the secondary
+    // adapter drops. The named-protocol blocks (and the mirrored exemption set
+    // that shields them) must live at OUTBOUND_TRANSPORT_V4 — no other layer
+    // exposes an IP_PROTOCOL condition. Topped by an egress-conditional permit
+    // so anything leaving the tunnel is allowed while the secondary adapter is
+    // up and the block bites the instant it drops. Skipped when the user's
+    // protocol mask selects no packet-layer protocol.
     if protocols.wants_packet_layer() {
         const TR: WfpLayerKey = WfpLayerKey::OutboundTransportV4;
         let mut pw = PACKET_EXEMPT_BASE;

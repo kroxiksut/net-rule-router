@@ -9,12 +9,13 @@
 //!
 //! # Why one module rather than a constant beside each emitter
 //!
-//! The bands used to be declared in `wfp_codegen` and `killswitch_codegen`,
-//! each asserting about the other's constants across a module boundary. Two
-//! half-views, and neither could see the whole order: a band added to either
-//! file was checked only against the handful of neighbours its author happened
-//! to name. This module holds the complete ordered list and asserts THAT, so a
-//! new band collides at compile time no matter which emitter introduces it.
+//! Declaring bands beside each emitter (`wfp_codegen`, `killswitch_codegen`)
+//! would need each file asserting about the other's constants across a module
+//! boundary — two half-views, neither able to see the whole order: a band
+//! added to either file would be checked only against the handful of
+//! neighbours its author happened to name. This module holds the complete
+//! ordered list and asserts THAT, so a new band collides at compile time no
+//! matter which emitter introduces it.
 //!
 //! # Two orders, not one
 //!

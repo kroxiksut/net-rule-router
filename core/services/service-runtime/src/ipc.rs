@@ -20,7 +20,7 @@
 //! - Pipe name: `\\.\pipe\NetRuleRouter\service-v1`
 //! - Protocol version: `IPC_PROTOCOL_VERSION = 1`
 //! - Single instance (the service is a single-instance daemon by
-//!   design — block 14.2 enforces the SCM lifetime).
+//!   design; the SCM enforces its lifetime).
 //! - Max message size: 1 MiB (request and response). Enforced at the
 //!   transport boundary; envelopes larger than that are rejected with
 //!   `MalformedRequest`. Bumped from 64 KiB to fit preset bytes ferried
@@ -30,7 +30,7 @@
 //!
 //! ## ACL baseline
 //!
-//! On install (block 14.10) the pipe is ACL'd to:
+//! On install, the pipe is ACL'd to:
 //! - `NT AUTHORITY\LocalSystem` — full (the service runs here)
 //! - The service account — full
 //! - `BUILTIN\Administrators` — Read+Write (for the GUI/tray launched by
@@ -95,10 +95,9 @@ pub use nrr_shared::ipc::IPC_PROTOCOL_VERSION;
 /// `SettingsExportFull`. Larger payloads (diagnostic archives,
 /// paginated logs) still use dedicated handle-based operations.
 ///
-/// moved the canonical definition into `nrr-shared::ipc_transport`
-/// so client and server crates share a single source of truth. This is a
-/// re-export to keep the existing `nrr_service_runtime::IPC_MAX_MESSAGE_BYTES`
-/// import path stable.
+/// The canonical definition lives in `nrr-shared::ipc_transport` so client and
+/// server crates share a single source of truth. This re-export keeps the
+/// existing `nrr_service_runtime::IPC_MAX_MESSAGE_BYTES` import path stable.
 pub use nrr_shared::ipc_transport::IPC_MAX_MESSAGE_BYTES;
 
 // ── Operation class ──────────────────────────────────────────────────────────
@@ -113,12 +112,11 @@ pub use nrr_shared::ipc_transport::{canonical_operation_class, IpcOperationClass
 // ── Error model ──────────────────────────────────────────────────────────────
 
 pub use nrr_shared::diagnostics_dto::DiagnosticsAudience;
-/// Canonical error codes exposed in the response envelope. Block
-/// moved the SSOT to `nrr-shared::ipc_transport` so
-/// `nrr-ipc-client` can preserve the typed code on the inbound
-/// path without breaking the "no dependency on `nrr-service-runtime`"
-/// boundary. This re-export keeps the ~200 existing call sites
-/// (`crate::ipc::IpcErrorCode`, `IpcErrorCode::Forbidden`, etc.)
+/// Canonical error codes exposed in the response envelope. The SSOT lives in
+/// `nrr-shared::ipc_transport` so `nrr-ipc-client` can preserve the typed code
+/// on the inbound path without breaking the "no dependency on
+/// `nrr-service-runtime`" boundary. This re-export keeps the ~200 existing
+/// call sites (`crate::ipc::IpcErrorCode`, `IpcErrorCode::Forbidden`, etc.)
 /// untouched.
 pub use nrr_shared::ipc_transport::IpcErrorCode;
 
@@ -285,10 +283,10 @@ impl IpcResponseEnvelope {
 /// Trait the IPC layer calls before executing a privileged mutation
 /// request. The audit emitter must persist the event durably; failure
 /// should propagate as `IpcErrorCode::Internal` so the mutation does
-/// not run silently. Real `AuditWriter` wiring lives in 14.6/14.11.
+/// not run silently.
 ///
-/// `Send + Sync` is required because the named-pipe IPC server (block
-/// ) shares the audit emitter across worker threads via `Arc`.
+/// `Send + Sync` is required because the named-pipe IPC server shares the
+/// audit emitter across worker threads via `Arc`.
 pub trait IpcAuditEmitter: Send + Sync {
     fn record_request(
         &self,
@@ -320,8 +318,8 @@ pub type HandlerOutcome = Result<serde_json::Value, IpcError>;
 /// Per-operation handler. The router looks one up by `IpcOperationName`
 /// after envelope validation.
 ///
-/// `Send + Sync` is required because the named-pipe IPC server (block
-/// ) dispatches requests from multiple worker threads concurrently.
+/// `Send + Sync` is required because the named-pipe IPC server dispatches
+/// requests from multiple worker threads concurrently.
 pub trait IpcHandler: Send + Sync {
     fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome;
 }
@@ -361,9 +359,8 @@ impl IpcHandlerRegistry {
 pub struct MutationQueue {
     /// Live request ids currently being processed.
     in_flight: Mutex<VecDeque<String>>,
-    /// Soft cap on queue depth (post-14.7 the queue will be wired with
-    /// per-class fairness; today this just protects against runaway
-    /// retries from a stuck GUI).
+    /// Soft cap on queue depth — protects against runaway retries from a
+    /// stuck GUI.
     capacity: usize,
 }
 
@@ -566,13 +563,12 @@ impl IpcRouter {
                 },
             );
         }
-        // Demoted from info → debug. Every IPC request was emitting
-        // two operational-log lines; with the GUI's 5 s health-check
-        // tick that meant 24 lines/min of noise even when nothing
-        // was happening. Failures still produce a warn-level record
-        // in the `else` branch below — those remain visible at
-        // default verbosity. Bump `NRR_LOG=nrr=debug` to recover
-        // the per-request trace when diagnosing.
+        // Debug level, not info: logging two lines per IPC request would be
+        // 24 lines/min of noise even when nothing is happening, given the
+        // GUI's 5 s health-check tick. Failures still produce a warn-level
+        // record in the `else` branch below, visible at default verbosity.
+        // Bump `NRR_LOG=nrr=debug` to recover the per-request trace when
+        // diagnosing.
         tracing::debug!(
             target: "nrr::ipc::dispatch",
             request_id = %request.request_id,
@@ -874,9 +870,6 @@ mod tests {
         // `InterfacesRefreshRequest` (adapter re-enumeration + external-address
         // probe) is a DiagnosticQuery: read-class dispatch, outside the mutation
         // queue, callable by a non-elevated client without a UAC prompt.
-        //
-        // This used to loop over DiagnosticQuery and DiagnosticAction by
-        // stamping each onto the same operation; that envelope is now refused.
         let router = make_router();
         let request = req(
             IpcOperationName::InterfacesRefreshRequest,

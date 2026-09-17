@@ -23,17 +23,17 @@ use nrr_domain::RuleAction;
 
 use crate::fqdn_cache_lookup::FqdnCacheLookup;
 // Cap on suffix/zone fan-out when expanding rules to their cached hostnames,
-// taken from the codegen rather than restated: the two used to say 1024 and
-// 4096 under a comment claiming they mirrored each other, so the census
-// answered "who else uses this address" over a smaller set of hosts than the
-// codegen actually enforces.
+// taken from the codegen rather than restated: a duplicated constant can
+// drift from what the codegen actually enforces, so the census would answer
+// "who else uses this address" over a different set of hosts than the one
+// routed.
 use crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP as SUFFIX_FANOUT_LIMIT;
 
 /// The secondary IPs to EXCLUDE from secondary routing/protection under
 /// `policy`. Empty when the policy is [`SharedIpPolicy::AnyRuleDomain`] (it
 /// never declines) or when no shared IP loses its majority test — so the
-/// default, collateral-free case produces an empty denylist and leaves routing
-/// exactly as before this feature existed.
+/// default, collateral-free case produces an empty denylist and routing is
+/// unaffected.
 pub fn secondary_ip_denylist(
     secondary: &CanonicalRuleSet,
     cache: &dyn FqdnCacheLookup,

@@ -145,9 +145,7 @@ function openExternalUrl(url) {
 }
 
 // The page the compatibility banner offers. A user/administrator override wins
-// when it is set and openable; otherwise the project's own releases page. The
-// override used to be stored, bridged into the QML context and read by nobody,
-// so setting it changed nothing.
+// when it is set and openable; otherwise the project's own releases page.
 function updatesPageUrl(prefs, about) {
     var override = String((prefs || {}).updatePageUrl || "")
     if (isOpenableExternalUrl(override)) return override

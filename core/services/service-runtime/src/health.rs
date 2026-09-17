@@ -106,7 +106,7 @@ pub struct HealthComponentSnapshot {
 
 /// Read-only top-level snapshot returned through the IPC
 /// `service.health.get` operation. Pinned to a flat shape so the wire
-/// DTO stays predictable across blocks.
+/// DTO stays predictable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceSnapshot {
     /// Aggregated runtime state. Honours SCM-lifecycle overrides
@@ -162,8 +162,7 @@ struct HealthAggregatorInner {
 
 impl HealthAggregator {
     /// `stale_after_secs` defaults to 30s, matching the typical GUI
-    /// poll cadence (block 14.5 negotiation defaults). Override via
-    /// `with_stale_threshold` for tests.
+    /// poll cadence. Override via `with_stale_threshold` for tests.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HealthAggregatorInner {
@@ -658,10 +657,8 @@ mod tests {
     #[test]
     fn audit_unavailable_blocks_overall_severity_to_blocking() {
         // Diagnostics Blocking → snapshot reports RecoveryRequired even
-        // when storage and policy are both Ok. This is the
-        // "audit unavailable -> mutation blocked" check from the task
-        // list — the IPC layer (block 14.5) refuses mutating ops when
-        // the snapshot reports Blocking.
+        // when storage and policy are both Ok: the IPC layer refuses
+        // mutating ops when the snapshot reports Blocking.
         let agg = HealthAggregator::new();
         agg.clear_lifecycle_override();
         agg.record(HealthComponent::Storage, ServiceHealthSeverity::Ok, "ok");
@@ -678,7 +675,7 @@ mod tests {
 
     #[test]
     fn snapshot_is_pure_observation_not_mutation() {
-        // Pinning task 14.6 invariant: snapshot() must not mutate state.
+        // snapshot() must not mutate state.
         let agg = HealthAggregator::new();
         agg.record(HealthComponent::Storage, ServiceHealthSeverity::Ok, "ok");
         let s1 = agg.snapshot();

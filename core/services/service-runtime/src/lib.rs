@@ -56,12 +56,11 @@
 
 pub mod activation_coordinator;
 pub mod active_sid_registry;
+pub mod address_ownership;
 pub mod app_destination_memory;
 pub mod app_enforcement_status;
 pub mod app_main_link_reach;
 pub mod app_observation_lookup;
-/// Companion-domain discovery — learns the hosts a routed site
-/// needs and, depending on the user's `auto_rules_mode`, offers or applies them.
 pub mod auto_rules;
 pub mod block_notice_center;
 pub mod block_notice_journal_store;
@@ -69,6 +68,7 @@ pub mod block_notice_mute_store;
 pub mod bootstrap;
 pub mod bounded_set;
 pub mod browser_history_seeder;
+pub mod catch_all_exemptions;
 pub mod confirmed_client_app_resolver;
 pub mod conn_observation_consumer;
 pub mod connection_slot;
@@ -83,17 +83,9 @@ pub mod dns_resolver_ports;
 pub mod dns_resolver_service;
 pub mod dns_upstream;
 pub mod dns_wire;
-// Neutral enforcement planner (CodegenInput/rules → EnforcementPlan).
-// Built incrementally alongside the current `wfp_codegen` path; see the
-// module doc.
 pub mod doh_seed;
-/// What the machine ENFORCES right now, published by the apply and read by the
-/// resolver — the answer the FQDN cache cannot give.
 pub mod enforced_addresses;
 pub mod enforcement_planner;
-// Fake-IP neutral relay: flow parsing, per-flow routing
-// decisions and the upstream dialer port. Policy lives here; the TUN adapter
-// mechanism stays behind `nrr_platform_api::fake_ip::TunAdapterPort`.
 pub mod fake_ip;
 pub mod fcrdns_learner;
 pub mod fqdn_cache_lookup;
@@ -106,22 +98,16 @@ pub mod ipv6_route_log;
 pub mod killswitch_codegen;
 pub mod killswitch_drop_registry;
 pub mod known_direct;
-// What the last main-link check found for a rule's address.
 pub mod lifecycle;
 pub mod lifecycle_journal;
-// Ask the machine's own private resolvers before calling a name
-// non-existent: only they can hold a namespace the public internet has
-// never heard of.
 pub mod local_namespace_fallback;
 pub mod logon_rearm;
 pub mod machine_scoped;
 pub mod main_route_verdicts;
 pub mod managers;
+pub mod navigation_registry;
 mod net_filter;
 pub mod network_rearm;
-// Names for addresses no rule covers, so a failing host can be named
-// before anyone has a theory about it. Diagnostic; never enforcement.
-pub mod navigation_registry;
 pub mod observed_host_names;
 pub mod path_probe;
 pub mod per_sid_orchestrator;
@@ -129,9 +115,6 @@ pub mod persistent_app_resolver;
 pub mod phase_timings;
 pub mod policy_loader;
 pub mod power_resume;
-// Which named destinations stall on the MAIN link. Diagnostic only: the
-// companion ledger keeps this evidence for its own candidates and discards it
-// for every other host, which is precisely the host nobody has a theory about.
 pub mod primary_stall_registry;
 pub mod principal_enforcement;
 pub mod production_auto_rule_probe;
@@ -150,22 +133,13 @@ pub mod production_rules_provider;
 pub mod production_security_alerts;
 pub mod production_settings;
 pub mod production_settings_exporter;
-// Production TrafficStatsProvider/Writer backed by
-// the sampler + the service-critical traffic_stats_settings singleton.
 pub mod production_traffic;
 pub mod recent_rule_addresses;
+pub mod recompute_coalescer;
 pub mod recovery_audit;
+pub mod route_apply;
 pub mod route_codegen;
 pub mod route_coordinator;
-// Cold-boot warm-up window before the kill-switch arms fail-closed.
-/// What a blanket block must never cut — tunnel-server addresses and the
-/// machine's own attached subnets, read off the route table.
-/// Who owns an address — one answer for the route, filter and kill-switch
-/// mechanisms, so they cannot disagree about it.
-pub mod address_ownership;
-pub mod catch_all_exemptions;
-pub mod recompute_coalescer;
-pub mod route_apply;
 pub mod route_reconciler;
 pub mod routed_host_flow_refresh;
 pub mod routing_pause;
@@ -178,25 +152,16 @@ pub mod secondary_subnets;
 pub mod service_lifecycle;
 pub mod service_stability;
 pub mod service_tasks;
+pub mod state;
+pub mod supervised_runtime;
 pub mod tamper_bootstrap;
-// Service-side traffic sampler: reads interface octet
-// counters, buckets by role, folds deltas into the daily ledger + session totals.
 pub mod traffic_sampler;
 pub mod verbosity_control;
 pub mod vpn_client_registry;
 pub mod vpn_endpoint_learning;
-// Every WFP weight band, ordered once. Both codegens read it; neither
-// declares a band of its own any more.
 mod wfp_bands;
 pub mod wfp_codegen;
 pub mod wfp_filter_ledger;
-// `source_watcher.rs` was removed as part of a backdoor-audit cleanup: the
-// file-watcher was a scaffold that never got wired into the production
-// runtime and would have constituted a second mutation channel had it
-// shipped active. The single sanctioned mutation channel is
-// `MutationSubmitHandler` via the named-pipe IPC.
-pub mod state;
-pub mod supervised_runtime;
 
 pub use runtime_loop::{
     CountingFailureSink, OperationPriority, ServiceSupervisor, ServiceTask, ShutdownReport,
@@ -313,8 +278,8 @@ pub use production_coordinator::{
 };
 pub use production_diagnostics::{DiagnosticSessionHandle, ProductionDiagnosticsFacade};
 pub use production_handlers_misc::{
-    AdapterAddressRecorder, MonitoredAdaptersSnapshotProvider, NoopAdaptersSnapshotProvider,
-    NoopMutationExecutor, ProductionFailClosedProbe, ProductionMigrationCompletionWriter,
+    AdapterAddressRecorder, MonitoredAdaptersSnapshotProvider, NoopMutationExecutor,
+    ProductionFailClosedProbe, ProductionMigrationCompletionWriter,
     ProductionMigrationStatusProvider, ProductionRoutePolicyProvider, ProductionRoutePolicySource,
     ProductionRoutePolicyWriter, ProductionRulesSnapshotProvider,
 };
@@ -415,11 +380,10 @@ pub fn process_started_at_ms() -> u64 {
 mod tests {
     use super::service_runtime_orchestration_snapshot;
 
-    /// The previous version of this test asserted `"scaffold"` on all eight
-    /// dimensions, so it pinned the banner to a claim that stopped being true
-    /// subsystem by subsystem. Assert the SHAPE instead: every dimension is one
-    /// of the known slugs, and none of them still says `scaffold` — a
-    /// dimension that regresses to a stub has to say so deliberately.
+    /// Assert the SHAPE, not a fixed value: every dimension must be one of
+    /// the known slugs, and none may say `scaffold` — a dimension that
+    /// regresses to a stub has to say so deliberately, not slip past a
+    /// stale exact-match assertion.
     #[test]
     fn every_runtime_dimension_reports_a_known_non_scaffold_stage() {
         let snapshot = service_runtime_orchestration_snapshot();

@@ -19,8 +19,8 @@
 //!    `behavior_mode = PreferPrimary`. The per-SID
 //!    `PerSidPolicySnapshot.mode` always wins inside
 //!    `behavior_mode_for_codegen`, so the snapshot-level value is
-//!    effectively cosmetic until block 16.12.A.5 introduces
-//!    revision-level default modes as a first-class concept.
+//!    effectively cosmetic — nothing yet gives a revision its own
+//!    default mode.
 //!
 //! ## Error handling
 //!
@@ -216,7 +216,7 @@ mod tests {
     /// hash-chain plumbing we don't need for this test.
     fn insert_active_revision(conn: &Mutex<Connection>, rules_json: &str) {
         let g = conn.lock().unwrap();
-        // `revisions` is now per-principal. This provider
+        // `revisions` is per-principal. This provider
         // reads the baseline principal via the storage back-compat shim, so
         // seed the row under `BASELINE_PRINCIPAL`.
         g.execute(
@@ -292,10 +292,10 @@ mod tests {
         assert!(provider.active_rules().is_none());
     }
 
-    /// the enforcement snapshot expands a bare `ExactFqdn`
+    /// The enforcement snapshot expands a bare `ExactFqdn`
     /// rule with a `SuffixDomain` sibling IFF the per-SID `include_subdomains`
-    /// toggle is on. Since  the toggle is ON by default, so a SID with
-    /// no policy row expands; only an explicit `0` leaves the rule untouched.
+    /// toggle is on. The toggle is ON by default, so a SID with no policy
+    /// row expands; only an explicit `0` leaves the rule untouched.
     #[test]
     fn subdomain_coverage_expands_exact_fqdn_only_when_toggle_on() {
         use nrr_domain::canonical::CanonicalAddressMatch;
@@ -332,7 +332,7 @@ mod tests {
             })
         };
 
-        // No policy row → the  default (ON) → apex + subdomain sibling.
+        // No policy row → the default (ON) → apex + subdomain sibling.
         let default_on = provider.active_rules_for(sid).expect("rules present");
         assert_eq!(
             default_on.rule_book.secondary.rules().len(),

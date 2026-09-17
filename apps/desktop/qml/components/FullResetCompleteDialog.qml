@@ -1,7 +1,6 @@
 // Full-reset completion prompt. After a reset the program + tray must be
 // fully closed for it to take effect on next launch; this offers to do that
-// now. Extracted from Main.qml (thin-shell
-// refactor). Emits `closeAllRequested()`; the caller (Main.qml) runs
+// now. Emits `closeAllRequested()`; the caller (Main.qml) runs
 // `fullResetController.closeAllProcesses()`. Shared state comes in through
 // `ownerRoot`.
 import QtQuick 2.15

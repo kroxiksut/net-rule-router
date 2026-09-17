@@ -1,6 +1,5 @@
 // Confirm dialog: "Load active rules from the service" discards unsaved
-// local edits. Extracted from Main.qml (
-// thin-shell refactor). The dialog is "dumb": it emits `confirmed()` and
+// local edits. The dialog is "dumb": it emits `confirmed()` and
 // the caller (Main.qml) runs the reload. Shared state comes in through
 // `ownerRoot` (the ApplicationWindow) — never via implicit scope.
 import QtQuick 2.15

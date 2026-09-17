@@ -87,7 +87,7 @@ impl ProductionMutationExecutor {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(alert.updated_at);
-        // TODO:: the schema's ack_event_seq /
+        // TODO: the schema's ack_event_seq /
         // ack_file (and resolved_event_seq / resolved_file) are meant
         // to point at the audit NDJSON line that recorded this state
         // change. The current `AuditWriter::append` API does not return

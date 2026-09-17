@@ -460,7 +460,7 @@ mod tests {
 
     #[test]
     fn an_uncached_host_is_refused_by_default_and_carried_with_dial_time_resolution() {
-        // Default: nothing known, nothing dialled � the historical behaviour.
+        // Default: nothing known, nothing dialled — the flow fails closed.
         let (allocator, fake) = allocator_with("late.example");
         let relay = core(
             Arc::clone(&allocator),

@@ -46,10 +46,9 @@ use crate::per_sid_orchestrator::RulesProvider;
 /// How many hostnames the "warn / purge once" memories keep.
 ///
 /// Both are one-line-per-host guards against a tick that re-sees the same
-/// resolutions every few seconds, and both used to grow for the life of the
-/// process. Bounded and least-recently-seen first: an eviction means the host
-/// has not been seen in a long time, and the worst it costs is one repeated log
-/// line or one repeated census purge.
+/// resolutions every few seconds. Bounded and least-recently-seen first: an
+/// eviction means the host has not been seen in a long time, and the worst it
+/// costs is one repeated log line or one repeated census purge.
 const WARNED_HOSTS_CAP: usize = 4096;
 
 /// Returns the routing-active SID (Free single-active-user), or `None`.
@@ -135,8 +134,8 @@ pub struct DnsObservationConsumer {
     /// under a blocked burst re-confirms the same (or rotating) addresses many
     /// times a minute; each acceptance re-writes the same cache row, re-emits
     /// the info line, and re-arms a reconcile for facts the table already
-    /// holds (0725 run 9: one host re-confirmed 120 times in 11 minutes, the
-    /// dominant source of the ~1 Hz recompute churn). Entries expire after
+    /// holds — left unchecked, a single host can dominate the recompute
+    /// cadence with over a hundred re-confirmations in minutes. Entries expire after
     /// [`REVERSE_CONFIRM_MEMO_TTL`], so a still-active address refreshes its
     /// `last_seen` at a bounded cadence instead of per drop.
     reverse_confirm_memo: Mutex<HashMap<(String, Ipv4Addr), SystemTime>>,
@@ -235,8 +234,8 @@ fn claim_hosts(
 }
 
 /// `true` when `hostname` matches an enabled rule in `set` (exact FQDN, or a
-/// suffix/zone match). Reused by the resolver's `RuleHostOracle`
-/// (block 16.HW-0708 Mode B) so name→rule matching has a single source of truth.
+/// suffix/zone match). Reused by the resolver's `RuleHostOracle` (Mode B) so
+/// name→rule matching has a single source of truth.
 pub(crate) fn rule_set_matches(hostname: &str, set: &CanonicalRuleSet) -> bool {
     set.rules()
         .iter()

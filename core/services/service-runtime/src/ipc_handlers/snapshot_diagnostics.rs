@@ -34,7 +34,7 @@ impl IpcHandler for SnapshotDiagnosticsHandler {
         };
 
         let status = self.diagnostics.get_status();
-        // TODO:: when `_req.include_explain_sample` is true,
+        // TODO: when `_req.include_explain_sample` is true,
         // call `diagnostics.get_explain(ExplainQuery::Synthetic { ... })`
         // and embed the response. Today no synthetic input is available
         // from the runtime, so the field stays `None`.

@@ -38,16 +38,16 @@ impl DnsObservationConsumer {
         self
     }
 
-    ///  — inject the companion-domain learner so this consumer's
+    /// Inject the companion-domain learner so this consumer's
     /// observations also feed companion discovery. Builder-style; without it the
-    /// feature is inert and `consume` behaves exactly as before.
+    /// feature is inert.
     #[must_use]
     pub fn with_auto_rules(mut self, engine: Arc<crate::auto_rules::AutoRulesEngine>) -> Self {
         self.auto_rules = Some(engine);
         self
     }
 
-    ///  — inject the "secondary is usable" gate (see the field doc).
+    /// Inject the "secondary is usable" gate (see the field doc).
     /// While it reports `false`, a newly-detected collateral pair is logged as
     /// "pin skipped — secondary unusable" (info) instead of the WARN that
     /// claims the direct host egresses the secondary link. Detection, the
@@ -59,7 +59,7 @@ impl DnsObservationConsumer {
         self
     }
 
-    /// Block D (fake-IP) — inject the "relay stack is live" gate so the
+    /// Inject the "fake-IP relay stack is live" gate so the
     /// collateral WARN is silenced (downgraded to debug) while fake-IP is
     /// actively steering those hosts onto the primary. Builder-style; existing
     /// call sites and tests keep the warn-always default.

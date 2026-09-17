@@ -119,7 +119,7 @@ fn note_derived_next_hop_speaks_only_when_the_answer_changes() {
 fn auto_heal_persists_corrected_binding_once() {
     // The stored secondary id is stale (adapter reinstalled → new GUID) but
     // the saved name still matches exactly one live adapter → auto-heal +
-    // persist the corrected id, ONCE per distinct mapping (HW-0705).
+    // persist the corrected id, ONCE per distinct mapping.
     let api = Arc::new(MockWindowsApi::new());
     // Live adapter: new name/GUID "newguid", description "desc newguid",
     // up + IPv4 + gateway → Available and usable.

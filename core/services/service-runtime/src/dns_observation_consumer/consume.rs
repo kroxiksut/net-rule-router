@@ -27,11 +27,11 @@ impl DnsObservationConsumer {
         // batch — maps every IPv4 a secondary rule currently routes out the
         // secondary link → the rule host that owns it.
         let mut secondary_owners: Option<HashMap<Ipv4Addr, String>> = None;
-        //  — secondary usability, read lazily (the gated resolve
+        // Secondary usability, read lazily (the gated resolve
         // enumerates adapters) and at most once per batch, mirroring how the
         // conn-observe consumer reads its egress context once per batch.
         let mut secondary_usable_memo: Option<bool> = None;
-        //  — open the companion-learning batch ONCE for the whole
+        // Open the companion-learning batch ONCE for the whole
         // drain. The engine's mutex is taken here rather than per observation,
         // and a principal whose `auto_rules_mode` is `off` yields `None` so the
         // loop below does no learning work at all.
@@ -196,7 +196,7 @@ impl DnsObservationConsumer {
                     self.record_direct_tenant(&obs.hostname, *ip, now, primary_ruled);
                     if self.note_collateral_once(&obs.hostname, *ip) {
                         summary.collateral = summary.collateral.saturating_add(1);
-                        //  — while the secondary is UNUSABLE
+                        // While the secondary is UNUSABLE
                         // (unresolved / probe-dead / block-all armed) the
                         // shared IP is NOT pinned to it: the compile side skips
                         // the pin (see `secondary_ip_policy` + the orchestrator

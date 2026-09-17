@@ -329,8 +329,9 @@ fn a_hard_read_error_marks_the_udp_flow_dead() {
 
 #[test]
 fn a_client_whose_reader_died_is_retired_instead_of_kept_forever() {
-    // `send` on this upstream never fails, so the old code refreshed
-    // `last_seen_at` on every datagram and the idle reap never came.
+    // `send` on this upstream never fails, so a dead-reader flow must be
+    // retired on the read failure itself — otherwise every later successful
+    // send keeps refreshing `last_seen_at` and the idle reap never fires.
     let health = Arc::new(health::FakeIpHealth::new());
     let probe = Arc::clone(&health);
     let _ = client_bound_after_udp_datagrams(

@@ -46,11 +46,11 @@ use crate::net_filter::is_non_routable_v4;
 use crate::wfp_codegen::SUFFIX_FANOUT_BACKSTOP;
 
 /// Upper bound on routes emitted for a single rule, so a pathological
-/// suffix fan-out cannot flood the route table.  — raised 256 →
-/// 4096 in step with `wfp_codegen::SUFFIX_FANOUT_BACKSTOP`: a busy zone rule
-/// overflowed 256 in normal use, and a host that keeps its WFP permit but
-/// loses its `/32` would silently ride the wrong link. A runaway guard, not
-/// a product limit.
+/// suffix fan-out cannot flood the route table. Matches
+/// `wfp_codegen::SUFFIX_FANOUT_BACKSTOP`: a busy zone rule can overflow a
+/// smaller cap in normal use, and a host that keeps its WFP permit but loses
+/// its `/32` would silently ride the wrong link. A runaway guard, not a
+/// product limit.
 pub const MAX_ROUTES_PER_RULE: usize = 4096;
 
 /// Prefix length of a host route — the shape every address rule fans out to.
@@ -61,13 +61,13 @@ pub const HOST_PREFIX_V6: u8 = 128;
 
 /// Whether `prefix_length` is a shape THIS codegen emits.
 ///
-/// Startup orphan adoption identifies our leftovers by metric plus shape, and
-/// it used to carry its own list of prefixes. The list went stale the moment a
-/// mode grew a shape it did not know: the split-default `/1` pair survived a
-/// crash unadopted, so every packet kept being steered into a tunnel that was
-/// no longer there, and nothing reclaimed the table. Derived from the overlay
-/// constants rather than restated, and pinned by a test that generates every
-/// mode and asserts each emitted shape is recognised here.
+/// Startup orphan adoption identifies our leftovers by metric plus shape.
+/// Derived from the overlay constants rather than kept as a separate list: a
+/// hardcoded list goes stale the moment a mode grows a shape it does not
+/// know, leaving a crashed-and-recovered pair unadopted so every packet keeps
+/// steering into a tunnel that is no longer there. Pinned by a test that
+/// generates every mode and asserts each emitted shape is recognised here.
+///
 /// The FAMILY is part of the shape. `/32` in IPv6 is a prefix, not a host
 /// route, so a family-blind answer adopts a stranger and hands the reconciler
 /// a route to delete that was never ours. Only host routes are emitted over
@@ -192,8 +192,8 @@ const TUNNEL_CATCH_ALL_MAX_PREFIX: u8 = 12;
 
 /// Where matched traffic is sent: an adapter's gateway + interface index,
 /// resolved by the caller from the active route binding. Used for the
-/// secondary (VPN) target and — in mode B (block 16.18.vpn) — for the primary
-/// NIC too, when pulling exception routes back off the tunnel.
+/// secondary (VPN) target and — in mode B — for the primary NIC too, when
+/// pulling exception routes back off the tunnel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecondaryRouteTarget {
     pub gateway: Ipv4Addr,
@@ -515,7 +515,7 @@ fn note_held(held: &mut Option<(IpAddr, usize)>, ip: IpAddr) {
     }
 }
 
-/// Mode-aware route generation (block 16.18.vpn). The desired route set
+/// Mode-aware route generation. The desired route set
 /// depends on the active [`RouteBehaviorMode`]:
 ///
 /// - **`PreferPrimary`** (mode A): secondary-bound rules → `/32` via the

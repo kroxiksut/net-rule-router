@@ -6,7 +6,7 @@
 //! not drop an exemption — which is the whole reason they are written the
 //! way they are.
 //!
-//! Same inherent impl, split across files. Behaviour is unchanged.
+//! Same inherent impl, split across files.
 
 use super::*;
 
@@ -265,9 +265,9 @@ impl SecondaryRouteCoordinator {
         // resolved WITHOUT the liveness gate. A probe-DEAD verdict empties the
         // gated resolution — which is exactly when the block-all arms — yet the
         // probe must keep reaching the next-hop or its verdict can never flip
-        // back to healthy and the block-all never disarms  HW
-        // diagnosis). The echo is kernel-originated (no app-id), so only this
-        // destination exemption can cover it.
+        // back to healthy and the block-all never disarms. The echo is
+        // kernel-originated (no app-id), so only this destination exemption
+        // can cover it.
         let probe_target_ips = match resolution.secondary {
             Some(t) => vec![t.gateway],
             None => self

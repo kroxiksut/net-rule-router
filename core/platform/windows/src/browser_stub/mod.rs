@@ -217,7 +217,7 @@ impl StubServer {
         if !config.enabled {
             return StubServerStatus::Disabled;
         }
-        // TODO(post-MVP): bind local DNS proxy, start HTTP stub server.
+        // TODO: bind the local DNS proxy and start the HTTP stub server.
         // For now, report that the DNS proxy port is unavailable to signal
         // that stub is not active (plain block will be used as fallback).
         StubServerStatus::PortUnavailable {
@@ -227,7 +227,7 @@ impl StubServer {
 
     /// Stop the stub server. No-op in MVP.
     pub fn stop(&self) {
-        // TODO(post-MVP): shutdown DNS proxy and HTTP server gracefully.
+        // TODO: shut the DNS proxy and HTTP server down gracefully.
     }
 }
 

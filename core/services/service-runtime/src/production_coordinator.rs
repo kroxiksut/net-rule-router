@@ -5,20 +5,20 @@
 //!
 //! - [`ProductionIdGenerator`] — generates revision IDs / confirmation
 //!   tokens / attempt IDs without pulling in the `uuid` crate (workspace
-//!   policy). Format mirrors the audit event-id pattern from 16.5:
+//!   policy). Format mirrors the audit event-id pattern:
 //!   `<prefix>-<nanos:020>-<counter:08x>`.
 //! - [`ProductionActivationAuditEmitter`] — wraps an `Arc<AuditWriter>`
 //!   and maps each `ActivationAuditEvent` variant to the closest
 //!   `AuditEventKind` + `ReasonCode`. The emitter swallows write errors
 //!   via `tracing::error` rather than panic — the coordinator's flow
 //!   does not branch on audit success today, but a future revision may
-//!   tighten this once the audit-before-act invariant from 16.5 is
-//!   extended to activation events.
+//!   tighten this once the audit-before-act invariant is extended to
+//!   activation events.
 //! - [`ProductionApplyMarkerStore`] — file-backed marker persistence
 //!   (`%ProgramData%\NetRuleRouter\apply_marker.json`). Atomic write via
 //!   `.tmp` + rename; matches the `app-shutdown.flag` pattern.
-//!   Deliberately not a SQLite column to avoid a v8 schema migration
-//!   ahead of the integration tests in phase 3.
+//!   Deliberately not a SQLite column to avoid a schema migration ahead
+//!   of the integration tests.
 //! - [`ProductionRulesApplyDispatcher`] — wraps a
 //!   `PerSidApplyOrchestrator` and forwards `apply_for_sid` /
 //!   `revert_for_sid` / `dry_run_for_sid` / `pre_flight_for_sid`. The
@@ -151,8 +151,8 @@ impl IdGenerator for ProductionIdGenerator {
 ///   reason and `result = Success` (the start is a successful event;
 ///   apply outcome lands in `RevisionActivated`/`RevisionRejected`)
 /// - `RevisionSubmitted` / `DryRunRequested` / `TokenIssued` /
-///   `TokenConsumed` → `ReviewApproved` (closest fit; phase 3 may add
-///   dedicated audit kinds if precision is needed)
+///   `TokenConsumed` → `ReviewApproved` (closest fit; a future revision
+///   may add dedicated audit kinds if precision is needed)
 /// - `PreFlight*` → `RevisionActivated` with `apply.verification_failed`
 ///   reason on failure
 /// - `ActiveIntegrityRejected` → `UntrustedRevisionRejected` with
@@ -160,7 +160,7 @@ impl IdGenerator for ProductionIdGenerator {
 pub struct ProductionActivationAuditEmitter {
     writer: Arc<AuditWriter>,
     ids: Arc<ProductionIdGenerator>,
-    /// Phase 2: optional `EventBus` so terminal revision transitions
+    /// Optional `EventBus` so terminal revision transitions
     /// (`RevisionActivated` / `RevisionRejected` / `RolledBack`) publish
     /// a `RevisionStatusChanged` push event alongside writing the audit
     /// NDJSON line. `None` skips the publish.
@@ -608,8 +608,8 @@ impl ApplyMarkerStore for ProductionApplyMarkerStore {
 /// a `WfpSession` + `RoutePolicySource` production adapter, both of
 /// which land later). All trait methods succeed; `dry_run_for_sid`
 /// returns a zeroed `SidActionPlanSummary` so the GUI sees "no
-/// changes". Phase 4 swaps this for [`ProductionRulesApplyDispatcher`]
-/// once the orchestrator's policy source has a production adapter.
+/// changes". [`ProductionRulesApplyDispatcher`] replaces this once the
+/// orchestrator's policy source has a production adapter.
 pub struct NoopRulesApplyDispatcher;
 
 impl RulesApplyDispatcher for NoopRulesApplyDispatcher {
@@ -869,9 +869,9 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
         // apply the revision content we were HANDED.
         // The coordinator dispatches BEFORE committing the active pointer
         // (all-or-nothing: revert must stay possible), so a storage read here
-        // still sees the PREVIOUS revision — the 0716 run recorded
-        // "no-active-rules" at the exact activation moment and the new rules
-        // only reached WFP via the next 30 s safety tick.
+        // still sees the PREVIOUS revision — a read at the exact activation
+        // moment observed "no-active-rules", with the new rules only
+        // reaching WFP via the next 30 s safety tick.
         let snapshot = self
             .snapshot_for_dispatch(sid, rules_json, "activation-apply")
             .ok_or_else(|| DispatchFailure {
@@ -890,8 +890,8 @@ impl RulesApplyDispatcher for ProductionRulesApplyDispatcher {
     fn revert_for_sid(&self, sid: &str, previous_rules_json: &str) -> Result<(), DispatchFailure> {
         // Same pass-through as apply, with the PREVIOUS revision content. A
         // decode failure here (no previous revision / legacy blob) falls back
-        // to the storage read — Phase 3a has already restored the previous
-        // active pointer by revert time, and a revert must stay best-effort.
+        // to the storage read — the active pointer is already restored to the
+        // previous revision by revert time, and a revert must stay best-effort.
         match self.snapshot_for_dispatch(sid, previous_rules_json, "activation-revert") {
             Some(snapshot) => self
                 .orchestrator
@@ -1055,11 +1055,11 @@ pub enum CrashRecoveryOutcome {
     Aborted { reason: String },
     /// Audit writer was unavailable; we deliberately do nothing
     /// (mutating recovery without audit violates the audit-before-act
-    /// invariant from 16.5). Caller logs the gap.
+    /// invariant). Caller logs the gap.
     SkippedNoAudit,
 }
 
-/// Phase 4a — probes `RevisionsRepository::last_known_good` to feed
+/// Probes `RevisionsRepository::last_known_good` to feed
 /// `lkg_available` into [`run_crash_recovery_on_startup`]. Opens a
 /// short-lived connection, queries, drops. Returns `false` on any
 /// failure (file missing, lock contention, schema mismatch) — the
@@ -1095,7 +1095,7 @@ pub fn probe_lkg_available(state_db_path: &std::path::Path) -> bool {
 /// the supervised runtime starts. Called from
 /// `nrr-windows-service` between bootstrap and `run_supervised_runtime`.
 ///
-/// Phase 4a wires `lkg_available` via [`probe_lkg_available`] at the
+/// The caller wires `lkg_available` via [`probe_lkg_available`] at the
 /// call site.
 pub fn run_crash_recovery_on_startup(
     data_dir: &std::path::Path,

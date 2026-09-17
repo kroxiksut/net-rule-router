@@ -91,7 +91,7 @@ impl IpcAcceptFailurePolicy {
 
 /// Aggregated stability settings the service runtime consults at startup.
 ///
-/// Currently only carries the IPC accept policy; future blocks may extend
+/// Currently only carries the IPC accept policy; future work may extend
 /// it (apply-layer restart policy, adapter-monitor jitter, …).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ServiceStabilityConfig {

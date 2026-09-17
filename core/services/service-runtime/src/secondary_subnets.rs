@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use nrr_domain::ipv4_network::Ipv4Network;
 
 /// Last-published set. Empty means "not known yet", which every reader treats
-/// as "no restriction" — the behaviour before this existed.
+/// as "no restriction".
 #[derive(Default)]
 pub struct SecondarySubnetsCell {
     inner: Mutex<Vec<Ipv4Network>>,

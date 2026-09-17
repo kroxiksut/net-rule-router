@@ -367,7 +367,7 @@ fn skips_disabled_and_unresolved_rules() {
     .is_empty());
 }
 
-// ── Slices 1–3 EQUIVALENCE — the Phase-B proof (Windows only) ───────────────
+// ── EQUIVALENCE — route rules (Windows only) ─────────────────────────────────
 // The neutral pipeline `plan_route_rules` → `lower_windows::lower_route_rules`
 // must produce the SAME enforcement as today's `wfp_codegen::generate_filters`
 // for the full rule-driven surface (ExactIp + ExactFqdn/Suffix fan-out + Block
@@ -476,7 +476,7 @@ fn slices123_neutral_pipeline_matches_current_codegen() {
     );
 }
 
-// ── Sub-slice 4a EQUIVALENCE — per-destination kill-switch (Windows only) ───
+// ── EQUIVALENCE — per-destination kill-switch (Windows only) ────────────────
 // `plan_kill_switch_destinations` → `lower_windows::lower_kill_switch` must
 // produce the SAME leak-proof pins as `killswitch_codegen::kill_switch_filters`
 // for the ALE (TCP/UDP) case: each protected IP → a permit(luid) + block pair.
@@ -1128,7 +1128,7 @@ fn doh_lockdown_skips_exempt_resolver_ips() {
             || f.covers_v4(Ipv4Addr::new(169, 254, 1, 1))));
 }
 
-// ── Sub-slice 4b EQUIVALENCE — multi-protocol kill-switch (Windows only) ────
+// ── EQUIVALENCE — multi-protocol kill-switch (Windows only) ─────────────────
 // `plan_kill_switch_destinations` → `lower_windows::lower_kill_switch` must
 // reproduce `killswitch_codegen::kill_switch_filters` for the FULL protocol
 // surface, not just TCP/UDP: the ALL default (proto-agnostic ALE + packet
@@ -1208,7 +1208,7 @@ fn slice4b_multiprotocol_kill_switch_matches_current_codegen() {
     );
 }
 
-// ── Sub-slice 4c EQUIVALENCE — catch-all (Mode-B) kill-switch (Windows only) ─
+// ── EQUIVALENCE — catch-all (Mode-B) kill-switch (Windows only) ─────────────
 // `plan_catch_all_kill_switch` → `lower_windows::lower_catch_all_kill_switch`
 // must reproduce `killswitch_codegen::catch_all_kill_switch_filters` — the
 // blanket block-everything-not-exempted with its loopback/link-local/broadcast/
@@ -1293,7 +1293,7 @@ fn slice4c_catch_all_kill_switch_matches_current_codegen() {
     );
 }
 
-// ── Sub-slice 4d EQUIVALENCE — fail-closed + app kill-switch + app exempt ────
+// ── EQUIVALENCE — fail-closed + app kill-switch + app exempt (Windows only) ─
 // The neutral pipeline must reproduce `killswitch_codegen`'s
 // `app_kill_switch_filters` / `primary_app_exempt_filters` /
 // `fail_closed_block_destinations` / `fail_closed_block_apps` /
@@ -1433,7 +1433,7 @@ fn slice4d_fail_closed_and_app_kill_switch_match_current_codegen() {
     }
 }
 
-// ── Slice 5 EQUIVALENCE — fail-closed default block (Windows only) ──────────
+// ── EQUIVALENCE — fail-closed default block (Windows only) ──────────────────
 // With `StrictSecondaryFailClosed`, `plan_route_rules` → `lower_route_rules`
 // must reproduce the whole `generate_filters` output INCLUDING the trailing
 // `default_block_spec` catch-all block (`wfp_codegen`).
@@ -1509,7 +1509,7 @@ fn slice5_fail_closed_default_block_matches_current_codegen() {
     assert!(arbitration_order_preserved(&current.filters, &lowered));
 }
 
-// ── Slice 5 EQUIVALENCE — system route table (Windows only) ─────────────────
+// ── EQUIVALENCE — system route table (Windows only) ──────────────────────────
 // `plan_routes` → `lower_windows::lower_routes` must produce the SAME route SET
 // as `route_codegen::generate_routes` across both behavior modes, with/without a
 // primary target, and through the shared-IP denylist — covering the /32 host

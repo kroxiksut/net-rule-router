@@ -1,11 +1,9 @@
 //! Storage integrity: the row-MAC signing key and the coordinator that uses it.
 //!
-//! Carved out of [`super::build_supervised_runtime_deps`]. Nothing here touches
-//! Windows: it is the DPAPI-backed key STORE that is OS-specific, and that lives
-//! behind a port. The block moved because its interface turned out to be nine
-//! values in and two out — worth naming, and invisible while it sat inline.
-//!
-//! Behaviour is unchanged: the same statements in the same order.
+//! Carved out of [`super::build_supervised_runtime_deps`] because its
+//! interface is narrow — nine values in, two out — worth naming explicitly.
+//! Nothing here touches Windows: the DPAPI-backed key store is the
+//! OS-specific part, and it lives behind a port.
 
 use super::*;
 

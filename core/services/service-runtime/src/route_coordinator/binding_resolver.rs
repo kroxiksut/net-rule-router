@@ -162,13 +162,11 @@ pub(super) fn core_tokens(name: &str) -> Vec<String> {
 /// Both sides are reduced to their version-stripped core token set (so
 /// "swiftvpn VPN OpenVPN Adapter" and "SwiftVPN 3.0 OpenVPN Adapter"
 /// reduce to the same family), then matched by **symmetric** containment:
-/// either core set is a subset of the other. The earlier implementation
-/// required the saved name to be a subset of the live description — a
-/// directional test that silently failed the "every other day" case (HW-0708)
-/// where the SAVED name carried the version token and the live adapter dropped
-/// it (saved "…VPN 3.0 OpenVPN Adapter" vs live "…VPN OpenVPN Adapter"),
-/// leaving a live, working VPN reported as "not found among live adapters".
-/// Symmetric containment heals both directions. The caller only uses this when
+/// either core set is a subset of the other. A one-directional subset test
+/// misses the case where the SAVED name carries the version token and the
+/// live description dropped it, or vice versa (saved "…VPN 3.0 OpenVPN
+/// Adapter" vs live "…VPN OpenVPN Adapter"), leaving a live, working VPN
+/// reported as "not found among live adapters". The caller only uses this when
 /// EXACTLY ONE usable adapter matches, bounding false positives.
 /// Containment alone is not enough once `_`/`-` split names into short token
 /// sets: an adapter merely called "VPN" is a subset of every VPN name there is.
@@ -289,18 +287,13 @@ pub(super) fn mac_anchor_id(info: &AdapterInfo) -> Option<String> {
 /// the driver description as the fallback.
 /// Live connections worth offering when the bound one is gone.
 ///
-/// Every usable adapter used to be offered, on the reasoning that we cannot
-/// know which one replaced the old one. That is right for a list the user
-/// reads — but it puts their Ethernet beside their VPN as equals, and for the
-/// ADDITIONAL route those are not equals at all: one is the thing the rules
-/// were pointing at, the other is the link those rules exist to route around.
-///
-/// So for that role the tunnel-looking connections come FIRST when there are
-/// any, by the same keyword classification the adapter screen uses. Nothing is
-/// removed — a user whose tunnel is named something we do not recognise still
-/// sees every connection, lower down. Guessing is still refused; only the order
-/// of the offer changes, which is what lets the surface above ever put a button
-/// on the first entry.
+/// Tunnel-looking connections come FIRST when there are any, by the same
+/// keyword classification the adapter screen uses: for the ADDITIONAL route
+/// an Ethernet and a VPN are not interchangeable — one is what the rules
+/// point at, the other is the link the rules exist to route around. Nothing
+/// is removed — an unrecognised tunnel name still appears, lower down.
+/// Guessing is still refused; only the order changes, which is what lets the
+/// surface above put a button on the first entry.
 pub(super) fn replacement_candidates(infos: &[AdapterInfo], role: &str) -> Vec<String> {
     let usable = infos.iter().filter(|i| {
         crate::route_coordinator::classify_availability(i)

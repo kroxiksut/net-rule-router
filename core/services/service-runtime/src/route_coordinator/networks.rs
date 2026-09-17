@@ -353,9 +353,9 @@ impl SecondaryRouteCoordinator {
                     }
                     _ => {
                         // Heal found 0 or >1 usable same-name adapters. Fail closed,
-                        // naming the EXACT reason (HW-0712 C6): a genuinely-absent
-                        // bound id vs a present-but-DOWN bound adapter whose live
-                        // same-name sibling we could not uniquely identify.
+                        // naming the EXACT reason: a genuinely-absent bound id vs
+                        // a present-but-DOWN bound adapter whose live same-name
+                        // sibling we could not uniquely identify.
                         match by_id {
                             Some(down) => {
                                 if self.note_not_usable_once(sid, role, &binding.stable_id) {
@@ -372,11 +372,10 @@ impl SecondaryRouteCoordinator {
                                     );
                                 }
                                 // Steady "still not usable" state is silent by
-                                // design (0725 run 9: the per-reconcile debug
-                                // heartbeat wrote 2500+ identical lines in ten
-                                // minutes of verbose capture). The transition
-                                // into the state warned above; the transition
-                                // out re-arms via `clear_not_usable`.
+                                // design: a per-reconcile heartbeat here would
+                                // flood the log with near-identical lines. The
+                                // transition into the state warned above; the
+                                // transition out re-arms via `clear_not_usable`.
                                 //
                                 // The user, however, must not be left guessing:
                                 // failing closed here is what stops their rule
@@ -395,10 +394,6 @@ impl SecondaryRouteCoordinator {
                                 // adapter is not among the live set and no
                                 // live name answers for it — their rules stop
                                 // and nothing else in the product says why.
-                                // Until now this branch only wrote a log line,
-                                // while its sibling (bound-but-down) published
-                                // a status, so a vendor that replaced its
-                                // adapter outright failed silently.
                                 //
                                 // Every usable adapter is offered as a
                                 // candidate: we cannot know which one replaced
@@ -470,10 +465,9 @@ impl SecondaryRouteCoordinator {
             }
         };
         // `info` is guaranteed Available here: the by-id match only accepted an
-        // Available adapter, and the name-heal only adopts an Available sibling — so
-        // the old post-match usability check was redundant and has been removed
-        // A genuinely-down bound adapter with no live sibling already
-        // returned None (fail-closed) above.
+        // Available adapter, and the name-heal only adopts an Available sibling.
+        // A genuinely-down bound adapter with no live sibling already returned
+        // None (fail-closed) above.
         //
         // The binding resolved to a usable adapter on this call — re-arm the
         // not-usable WARN latch so the next usable→not-usable transition logs
@@ -489,7 +483,7 @@ impl SecondaryRouteCoordinator {
                 // peer instead of setting a gateway on the adapter. Derive that
                 // peer from the OS route table so our routes travel exactly like
                 // the link's own traffic, instead of tearing every route down
-                // (the round-6 "NO gateway" dead end).
+                // when no next-hop can be derived.
                 let derived = self
                     .api
                     .get_ip_forward_table()
@@ -497,14 +491,11 @@ impl SecondaryRouteCoordinator {
                     .and_then(|t| derive_secondary_next_hop(&t, info.index));
                 match derived {
                     Some(nh) => {
-                        // Cache it so we can still route after slice-C2 strips
-                        // the catch-all routes we derived it from. Refreshed on
-                        // every successful derive (e.g. after a VPN reconnect).
-                        // Caching it is what lets routing survive slice-C2
-                        // stripping the catch-all routes we derived it from;
-                        // the same write says whether this answer is news, so
-                        // an unchanged next-hop stops repeating itself into the
-                        // log every cycle.
+                        // Cached so routing survives whatever later strips the
+                        // catch-all routes we derived this from (e.g. after a
+                        // VPN reconnect); the same write says whether this
+                        // answer is news, so an unchanged next-hop stops
+                        // repeating itself into the log every cycle.
                         if self.note_derived_next_hop(info.index, nh) {
                             tracing::debug!(
                                 target: "nrr::route-coordinator",
@@ -545,19 +536,17 @@ impl SecondaryRouteCoordinator {
                                 // id AND the effective adapter we actually
                                 // resolved to (healed-by-name id + ifindex), so
                                 // the operator can see it operated on the LIVE
-                                // adapter, not the stale GUID. The old log
-                                // printed only `binding.stable_id` while working
-                                // on `info.index`, which read like an adapter
-                                // mismatch  HW diagnosis).
+                                // adapter, not the stale GUID — the stale id
+                                // alone reads like an adapter mismatch.
                                 let effective_id = format!(
                                     "win-adapter:{}",
                                     info.adapter_name.trim().to_ascii_lowercase()
                                 );
-                                // Once per spell  HW: this state is
-                                // a short burst while the VPN client is still
-                                // installing its routes after media-up, and
-                                // resolution runs many times per second — 55
-                                // identical WARNs in 2.2 s without the latch).
+                                // Once per spell: this state is a short burst
+                                // while the VPN client is still installing its
+                                // routes after media-up, and resolution runs
+                                // many times per second — without the latch
+                                // this floods the log with near-identical WARNs.
                                 if self.note_no_next_hop_once(sid, role) {
                                     tracing::warn!(
                                         target: "nrr::route-coordinator",

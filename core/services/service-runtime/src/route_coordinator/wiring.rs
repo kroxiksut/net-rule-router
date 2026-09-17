@@ -79,17 +79,16 @@ impl SecondaryRouteCoordinator {
         self
     }
 
-    /// Attaches the auto-heal persist callback (HW-0705). Chain before the
-    /// coordinator is wrapped in `Arc`. Without it, an auto-healed binding is
-    /// applied in-memory each reconcile but the stored id stays stale.
+    /// Attaches the auto-heal persist callback. Chain before the coordinator
+    /// is wrapped in `Arc`. Without it, an auto-healed binding is applied
+    /// in-memory each reconcile but the stored id stays stale.
     pub fn with_binding_heal_persist(mut self, persist: BindingHealPersistFn) -> Self {
         self.binding_heal_persist = Some(persist);
         self
     }
 
     /// Wire the OS question "is this adapter gone, or here and broken?".
-    /// Without it a missing adapter is reported as gone, which is what the
-    /// product said before the port existed.
+    /// Without it a missing adapter is always reported as gone.
     #[must_use]
     pub fn with_device_status(mut self, port: Arc<dyn NetworkDeviceStatusPort>) -> Self {
         self.device_status = Some(port);
@@ -123,7 +122,7 @@ impl SecondaryRouteCoordinator {
     /// write-through `persist` (called whenever the live route table yields a
     /// fresh server-IP set) and a startup `loader` (unioned into the fail-closed
     /// exemptions). Chain before the coordinator is wrapped in `Arc`. Without it
-    /// the server-IP set stays in-memory only and is lost on restart, as before.
+    /// the server-IP set stays in-memory only and is lost on restart.
     pub fn with_bootstrap_server_persistence(
         mut self,
         persist: ServerIpPersistFn,
@@ -144,12 +143,11 @@ impl SecondaryRouteCoordinator {
         self
     }
 
-    /// Attaches the Track-1 active-probe liveness (F7). `tracker` is shared with
+    /// Attaches the active-probe liveness tracker. `tracker` is shared with
     /// the probe tick (writer of verdicts) and the setting (writer of the
     /// window); `probe` runs the ICMP echo. Chain before the coordinator is
     /// wrapped in `Arc`. Without it the tracker stays disabled → `is_dead` is
-    /// always false and the probe tick is a no-op, so behaviour is exactly as
-    /// before.
+    /// always false and the probe tick is a no-op.
     pub fn with_liveness_probe(
         mut self,
         tracker: Arc<SecondaryLivenessTracker>,

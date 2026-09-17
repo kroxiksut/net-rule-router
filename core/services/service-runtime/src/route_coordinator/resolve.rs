@@ -106,8 +106,7 @@ impl SecondaryRouteCoordinator {
 
     /// Resolve `sid`'s routing inputs (mode + primary/secondary targets) from
     /// its per-SID route policy and the live adapters. Logs WHY whenever a
-    /// target can't be resolved — these silent exits once made the route side
-    /// invisible in the log when "no route" was reported.
+    /// target can't be resolved, so "no route" is never a silent exit.
     pub(super) fn resolve(&self, sid: &str) -> RouteResolution {
         let Some(policy) = self.route_source.load_for_sid(sid) else {
             tracing::info!(
@@ -116,9 +115,8 @@ impl SecondaryRouteCoordinator {
                 "no route policy for this user — no secondary routes will be applied",
             );
             // From outside this is indistinguishable from a working product: the
-            // service runs, the tray is green, and nothing is routed. Acceptance
-            // run 19 spent ten minutes in exactly this state (339 log lines, zero
-            // filters) with no way for the user to see it.
+            // service runs, the tray is green, and nothing is routed — without
+            // this push the user has no way to see it.
             self.publish_enforcement_status(sid, "no-policy", "", Vec::new());
             return RouteResolution {
                 mode: RouteBehaviorMode::PreferPrimary,

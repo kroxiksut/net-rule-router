@@ -267,8 +267,7 @@ pub struct ServiceSupervisor {
     handles: Mutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
     sink: Arc<dyn TaskFailureSink>,
-    /// Maximum total wait time during shutdown. Defaults to
-    /// `STOP_TIMEOUT` from block 14.2.
+    /// Maximum total wait time during shutdown. Defaults to `STOP_TIMEOUT`.
     stop_timeout: Duration,
 }
 
@@ -383,8 +382,8 @@ impl ServiceSupervisor {
     /// The wait is fair across tasks: all handles are polled together
     /// until the deadline, so one thread stuck in a blocking OS call
     /// cannot consume the budget before already-finished threads are
-    /// counted (a sequential join used to mark those as detached too,
-    /// overstating the problem and hiding the real straggler).
+    /// counted — a sequential join would mark those as detached too,
+    /// overstating the problem and hiding the real straggler.
     pub fn shutdown(&self) -> ShutdownReport {
         self.stop.request_stop();
         if !self.started.load(Ordering::SeqCst) {
@@ -708,8 +707,8 @@ mod tests {
                 ServiceTask::periodic(
                     "sleepy",
                     TaskClass::Recoverable,
-                    // Long enough that the stop lands during the sleep, which is
-                    // the case the runner used to lose.
+                    // Long enough that the stop lands during the sleep — the
+                    // scenario the supervisor must handle correctly.
                     Duration::from_secs(30),
                     1,
                     move |_stop| {

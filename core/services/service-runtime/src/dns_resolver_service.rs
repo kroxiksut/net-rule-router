@@ -1,7 +1,7 @@
 //! Mode B (local DNS resolver) runtime lifecycle — binds the loopback DNS
 //! listener, points the OS at it, serves until stop, and restores the OS DNS on
 //! the way out. Off by default; wired only when `EnforcementMode::Resolver` is
-//! active and the platform supports system-DNS redirect (HW-0709, phase 1e).
+//! active and the platform supports system-DNS redirect.
 //!
 //! Split out of the boot wiring so the redirect lifecycle — order, fail-safe
 //! teardown, cache flush — is unit-testable with a fake redirect + an ephemeral
@@ -262,10 +262,10 @@ impl DnsResolverService {
         // cancel BEFORE touching system DNS if a disarm
         // already fired during the bind. Arming holds no lock across the
         // (slow) NRPT redirect, so a `set(Reactive)` racing a `set(Resolver)`
-        // used to complete the full install→restore cycle even though the user
-        // had already switched back to mode A — stranding DNS on the loopback
-        // listener for the round-trip. Checking `stop` here makes an arm that
-        // is already superseded a no-op that never redirects.
+        // could otherwise complete the full install→restore cycle even though
+        // the user already switched back to mode A — stranding DNS on the
+        // loopback listener for the round-trip. Checking `stop` here makes an
+        // arm that is already superseded a no-op that never redirects.
         if stop.load(Ordering::SeqCst) {
             tracing::info!(
                 target: "nrr::dns-resolver",
@@ -292,8 +292,8 @@ impl DnsResolverService {
         // back through the table we just wrote.
         let mut applied: Vec<DnsNamespaceExemption> = Vec::new();
         Self::apply_exemptions(&self.redirect, self.exemptions.as_ref(), &mut applied);
-        // A warm OS cache would otherwise bypass us on first contact (HW-0709
-        // review). Best-effort: a flush failure is logged, not fatal.
+        // A warm OS cache would otherwise bypass us on first contact.
+        // Best-effort: a flush failure is logged, not fatal.
         if let Err(error) = self.redirect.flush_cache() {
             tracing::warn!(
                 target: "nrr::dns-resolver",
@@ -372,7 +372,7 @@ impl DnsResolverService {
 pub type DnsResolverFactory = Arc<dyn Fn() -> Option<DnsResolverService> + Send + Sync>;
 
 /// Runtime start/stop controller for the Mode-B resolver, so switching
-/// [`EnforcementMode`] takes effect WITHOUT a service restart (HW-0710). Owns the
+/// [`EnforcementMode`] takes effect WITHOUT a service restart. Owns the
 /// resolver thread + its stop flag behind a `Mutex`; `apply` / `start` / `stop`
 /// are idempotent, so a redundant Save (same mode) never flaps system DNS.
 ///
@@ -444,8 +444,8 @@ impl DnsResolverController {
     /// asynchronous [`Self::apply`] for the IPC write path.
     /// `start` runs NRPT PowerShell (seconds) and `stop` JOINS the serve loop;
     /// doing either inline in the `settings.service-stability.set` handler
-    /// held the reply past the GUI's 30 s RPC deadline («Превышено время
-    /// ожидания» on the 0717 run). Records the desired mode first, then
+    /// would hold the reply past the GUI's 30 s RPC deadline («Превышено время
+    /// ожидания»). Records the desired mode first, then
     /// reconciles on a detached thread; the thread re-reads the LATEST desired
     /// mode at execution time, so two racing writes converge on the final
     /// value regardless of thread scheduling order (each apply is itself
@@ -836,8 +836,7 @@ mod tests {
     /// Without the wake the names inside it resolve through us for up to a
     /// guard interval, and the client then caches that answer for the negative
     /// TTL on top — a corporate host stays unreachable long after its VPN was
-    /// ready. Measured on hardware 10.09: link up 13:30:49, namespace conceded
-    /// 13:31:03.
+    /// ready.
     #[test]
     fn a_link_that_appears_between_ticks_is_honoured_at_once() {
         let stop = Arc::new(AtomicBool::new(false));
@@ -916,9 +915,8 @@ mod tests {
         assert!(!calls.contains(&"exempt"), "{calls:?}");
     }
 
-    /// Without a source wired the product behaves exactly as it did before
-    /// the feature existed — the control that keeps the two tests above
-    /// honest about what the source is doing.
+    /// Without a source wired every name is claimed, unfiltered — the control
+    /// that keeps the two tests above honest about what the source is doing.
     #[test]
     fn an_unwired_source_claims_every_name_as_before() {
         let stop = Arc::new(AtomicBool::new(false));
@@ -998,7 +996,7 @@ mod tests {
             "127.0.0.1:0".parse().unwrap(),
         );
         // `stop` false so `run` reaches the (failing) redirect; a preset stop
-        // would now short-circuit as CancelledBeforeRedirect (HW-0720) and never
+        // would instead short-circuit as CancelledBeforeRedirect and never
         // exercise the redirect-failure path this test covers.
         let stop = AtomicBool::new(false);
         assert_eq!(service.run(&stop), DnsResolverRunOutcome::RedirectFailed);
@@ -1006,7 +1004,7 @@ mod tests {
         assert!(!stop.load(Ordering::SeqCst));
     }
 
-    // ── DnsResolverController (HW-0710 live re-arm) ───────────────────────────
+    // ── DnsResolverController (live re-arm) ───────────────────────────────────
 
     #[test]
     fn controller_apply_is_noop_without_factory() {
@@ -1055,8 +1053,8 @@ mod tests {
         // Wait until the arm has actually installed the redirect before
         // switching back. A real mode switch happens after the resolver is up,
         // not within microseconds of the spawn; a stop that beats the redirect
-        // now legitimately cancels the arm (HW-0720), so racing the stop here
-        // would flakily skip the redirect this test asserts.
+        // legitimately cancels the arm, so racing the stop here would flakily
+        // skip the redirect this test asserts.
         for _ in 0..200 {
             if redirect.calls.lock().unwrap().contains(&"redirect_to") {
                 break;

@@ -21,8 +21,8 @@
 //!
 //! This module is deliberately mechanism-free. The listener (`hickory-server`),
 //! the upstream engine (`hickory-resolver` / `DnsQuery_W`), the cache, and the
-//! awaitable reconcile are injected as traits and wired in later increments
-//! (1b–1d). Everything here is synchronous, neutral, and unit-tested with fakes.
+//! awaitable reconcile are injected as traits and wired in separately.
+//! Everything here is synchronous, neutral, and unit-tested with fakes.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
@@ -51,7 +51,7 @@ pub(crate) fn is_doh_canary(hostname: &str) -> bool {
 }
 
 /// Is a queried hostname a SECONDARY rule host for the active principal? The
-/// production impl (increment 1b) reuses the existing policy match
+/// production impl reuses the existing policy match
 /// (`dns_observation_consumer::rule_set_matches` + `match_zone`); a query that
 /// matches no secondary rule takes the fail-open path.
 pub trait RuleHostOracle: Send + Sync {
@@ -90,7 +90,7 @@ impl LeakGuardPosture for OpenLeakGuard {
     }
 }
 
-/// Block D (fake-IP, slice 4) — decides whether a rule host is answered with a
+/// Fake-IP — decides whether a rule host is answered with a
 /// **virtual** (fake) address instead of its real ones.
 ///
 /// When fake-IP is on and `hostname` is in scope (broadly on, minus the
@@ -138,7 +138,7 @@ impl FakeIpAnswerer for NoopFakeIpAnswerer {
 /// A [`FakeIpAnswerer`] gated by a LIVE predicate: it hands out a fake address
 /// only while `gate()` is true, and takes the real path otherwise.
 ///
-/// The production wiring (S4.4-rest) gates on "is the fake-IP TUN stack actually
+/// The production wiring gates on "is the fake-IP TUN stack actually
 /// running?" (`FakeIpController::is_running`), NOT merely on the persisted
 /// toggle — so a host is answered with a virtual address only when the relay is
 /// up to carry it. If the driver is missing, the stack is still coming up, or
@@ -353,8 +353,8 @@ pub trait FactSink: Send + Sync {
 /// listener steers DIRECT-host answers with it: an upstream answer for a
 /// non-rule host is filtered so the client never gets an address the
 /// kill-switch pins to the secondary — the DNS-level cure for the shared-CDN
-/// collateral (0719: www.search.example handed the same front-end IPs as
-/// gemini/video-site secondary rules). Production memoizes over the rule book ×
+/// collateral (e.g. a search front end handed the same front-end IPs as a
+/// video-site secondary rule). Production memoizes over the rule book ×
 /// FQDN cache; the default empty set disables steering.
 pub trait SecondaryOwnedIps: Send + Sync {
     /// Handed out behind an `Arc`: the production impl memoizes one set and
@@ -397,8 +397,8 @@ impl DirectAnswerGate for NoopDirectAnswerGate {
 ///
 /// The gate-based exemption path ([`DirectAnswerGate`]) has an unavoidable
 /// race: the exemption is a WFP recompile, and when it misses its budget the
-/// first connect dies against the catch-all (92% of gates in the 0722 boot
-/// log). Handing the client a fake address removes the race by construction —
+/// first connect dies against the catch-all. Handing the client a fake
+/// address removes the race by construction —
 /// the static pool permit is already installed, the TUN catches the flow, and
 /// the relay dials the real address out the primary while the client waits
 /// inside its handshake. Slow beats severed.
@@ -438,7 +438,7 @@ pub trait CompanionCandidateLookup: Send + Sync {
 }
 
 /// No-op [`CompanionCandidateLookup`]: nothing is ever a pending companion, so
-/// the collateral rescue behaves exactly as it did before the port existed.
+/// the collateral rescue never defers to it.
 pub struct NoopCompanionCandidates;
 
 impl CompanionCandidateLookup for NoopCompanionCandidates {
@@ -496,8 +496,8 @@ pub fn stable_answer_subset(
 
 /// Trigger the enforcement reconcile and BLOCK until the routes/filters for the
 /// active user are installed, bounded by `deadline`. The production impl is the
-/// awaitable reconcile (increment 1d, the P0-B on-ramp). Returns whether install
-/// was confirmed within the deadline.
+/// awaitable reconcile. Returns whether install was confirmed within the
+/// deadline.
 pub trait SyncReconciler: Send + Sync {
     fn reconcile_now(&self, deadline: Duration) -> ReconcileOutcome;
 

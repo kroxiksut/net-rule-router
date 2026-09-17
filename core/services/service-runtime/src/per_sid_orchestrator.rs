@@ -1,15 +1,14 @@
 //! per-SID apply orchestrator.
 //!
-//! Bridges three subsystems built earlier in 16.8:
-//! - [`crate::active_sid_registry::ActiveSidRegistry`] (16.8.3.1) tells
+//! Bridges three subsystems:
+//! - [`crate::active_sid_registry::ActiveSidRegistry`] tells
 //!   the orchestrator which SIDs currently have a live IPC connection.
 //! - `RouteBindingsRepository` carries the per-SID `route_bindings` /
 //!   `behavior_mode` / `secondary_block_policy` rows.
 //!   The orchestrator reads through a [`RoutePolicySource`] trait so
 //!   tests can inject scripted snapshots.
-//! - [`nrr_platform_api::wfp::WfpSession`] (extended in 16.8.3.2 to
-//!   carry `user_sid` per filter) installs the WFP filters that
-//!   actually shape per-user routing.
+//! - [`nrr_platform_api::wfp::WfpSession`] installs the WFP filters
+//!   that actually shape per-user routing, carrying `user_sid` per filter.
 //!
 //! ## Lifecycle
 //!
@@ -24,21 +23,20 @@
 //!
 //! When a user's policy changes mid-session (`RoutePolicyUpdate` IPC
 //! handler), the orchestrator's [`PerSidApplyOrchestrator::recompile_for_sid`]
-//! does a full
-//! remove-then-install pass for that SID. Diff-based recompile (only
-//! changed filters) is a future optimisation for 16.10+ when the rules
-//! schema settles.
+//! does a full remove-then-install pass for that SID. Diff-based recompile
+//! (only changed filters) is a future optimisation once the rules schema
+//! settles.
 //!
-//! ## M-1: no user logged in, and the baseline (block 16.19)
+//! ## No user logged in, and the admin baseline
 //!
-//! Enforcement follows **tray presence** (the M-1 routing-presence model):
-//! filters exist only for SIDs in the active set. When
-//! **nobody is logged in** the active set is empty, so `reconcile`
-//! installs nothing and routing is **passthrough** (system default).
+//! Enforcement follows **tray presence**: filters exist only for SIDs in
+//! the active set. When **nobody is logged in** the active set is empty,
+//! so `reconcile` installs nothing and routing is **passthrough** (system
+//! default).
 //!
-//! The admin **baseline** (block 16.19) is a per-user *default*, not a
-//! machine-wide floor: it reaches the wire only as a per-user
-//! read-through — a real `S-…` SID whose own revision is absent resolves
+//! The admin **baseline** is a per-user *default*, not a machine-wide
+//! floor: it reaches the wire only as a per-user read-through — a real
+//! `S-…` SID whose own revision is absent resolves
 //! the baseline at install time (`RulesProvider::active_rules_for`). The
 //! baseline principal is therefore **never** a routable per-SID target of
 //! its own; `install_for_sid` refuses the sentinel
@@ -61,11 +59,9 @@
 //! - per-SID isolation via `FWPM_CONDITION_ALE_USER_ID`,
 //! - audit and registry coordination.
 //!
-//! ## What is intentionally NOT in 16.8.3.3
+//! ## Out of scope here
 //!
-//! - Production wiring in `runtime_deps.rs` — comes in 16.8.3.4 along
-//!   with audit and multi-user fixture tests.
-//! - Decision-engine rule iteration — block 16.10.
+//! - Decision-engine rule iteration.
 //! - Diff-based recompile — performance optimisation; current
 //!   implementation is full replace.
 //! - WFP filter weight ordering across SIDs — current impl puts every
@@ -136,16 +132,16 @@ pub struct PerSidPolicySnapshot {
     /// (default, "smart"): IPs the shared-IP census has seen on direct
     /// (non-rule) hosts are EXCLUDED from the kill-switch per-IP pin/block set
     /// — blocking a secondary-routed CDN address must not cut an innocent
-    /// co-tenant site (0719: gemini/video-site share Google front-end IPs with
+    /// co-tenant site (e.g. gemini/video-site share Google front-end IPs with
     /// www.search.example; strict pinning killed search.example in every browser).
-    /// `true` ("strict"): the historic pin-everything behaviour. Routing
+    /// `true` ("strict"): pin every shared IP regardless of co-tenancy. Routing
     /// (`/32` while the secondary is up) stays governed by `shared_ip_policy`.
     pub kill_switch_strict_shared_ips: bool,
     /// Mode-A (`PreferPrimary`) coverage strategy for a routed domain's
-    /// un-seeded edge IP. `FailClosedUnknown` (default since HW-0714) escalates
+    /// un-seeded edge IP. `FailClosedUnknown` (default) escalates
     /// the per-IP fail-closed to the catch-all so the rotating-IP leak
-    ///  chatgpt over primary) cannot happen; `PerIp` keeps the
-    /// historic per-IP pinning. Consulted only in `PreferPrimary` + fail-closed.
+    /// (e.g. chatgpt over primary) cannot happen; `PerIp` keeps
+    /// per-IP-only pinning. Consulted only in `PreferPrimary` + fail-closed.
     pub mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy,
     /// exe paths of the secondary binding's **link-provider
     /// apps** (the VPN client et al. the user confirmed via onboarding —
@@ -223,7 +219,7 @@ pub trait RoutePolicySource: Send + Sync {
     fn load_for_sid(&self, sid: &str) -> Option<PerSidPolicySnapshot>;
 }
 
-// ── Active rules provider (block 16.12.A.3) ─────────────────────────────────
+// ── Active rules provider ────────────────────────────────────────────────────
 
 /// Snapshot of the currently-active rules revision plus its
 /// behaviour mode. Fed into the WFP codegen on every install /
@@ -237,8 +233,8 @@ pub struct ActiveRulesSnapshot {
 /// Trait the orchestrator uses to read the currently-active rules
 /// revision. Production impl wraps `nrr_storage::RevisionsRepository`
 /// and the latest `revisions.content_json` decoded via
-/// `nrr_domain::rules_json_codec::decode` (block 16.12.A.2). Tests
-/// inject a scripted snapshot.
+/// `nrr_domain::rules_json_codec::decode`. Tests inject a scripted
+/// snapshot.
 ///
 /// `None` means "no active revision" — orchestrator installs no
 /// rule-driven filters for that SID and records `Applied` with
@@ -373,12 +369,12 @@ struct ComputedPlan {
     unresolved_apps: Vec<String>,
 }
 
-// ── Audit (block 16.8.3.4) ───────────────────────────────────────────────────
+// ── Audit ─────────────────────────────────────────────────────────────────────
 
-/// One audited transition in the per-SID apply lifecycle. Block
-/// surfaces these to the audit subsystem; the orchestrator
-/// itself does not know about NDJSON or hash chains — it just emits
-/// records into a [`PerSidApplyAudit`] sink.
+/// One audited transition in the per-SID apply lifecycle. The caller
+/// surfaces these to the audit subsystem; the orchestrator itself does
+/// not know about NDJSON or hash chains — it just emits records into a
+/// [`PerSidApplyAudit`] sink.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PerSidApplyAuditRecord {
     pub sid: String,
@@ -669,9 +665,7 @@ pub struct PerSidApplyOrchestrator {
     /// fail-closed block-all arming/disarming EDGE (see
     /// [`Self::note_block_all_state`]). Names resolved before the block armed
     /// sit in the OS resolver cache, so the DNS observer never sees them and
-    /// their suffix/zone permits are never built (0717 HW: `ya.ru` under
-    /// `zone ru → primary` stayed blocked — it was answered from the OS cache
-    /// and therefore absent from the FQDN cache). Defaults to
+    /// their suffix/zone permits are never built. Defaults to
     /// [`nrr_platform_api::NoopDnsCacheControl`]; production wires the real
     /// per-OS mechanism via [`Self::with_dns_cache_control`].
     dns_cache_control: Arc<dyn nrr_platform_api::DnsCacheControlPort>,
@@ -897,8 +891,8 @@ fn is_destination_block(spec: &WfpFilterSpec) -> bool {
 /// app-id condition) and matches no destination — no remote IP, no remote
 /// subnet (v4 or v6), so it is not a catch-all either. Skipping such a block
 /// (e.g. its exe did not resolve) cannot uncover a destination, so it must NOT
-/// arm the reconcile deferral gate (HW-0718 — a persistently-absent exe
-/// otherwise deferred the superseded-permit delete pass forever).
+/// arm the reconcile deferral gate — otherwise a persistently-absent exe
+/// defers the superseded-permit delete pass forever.
 fn is_app_only_block(spec: &WfpFilterSpec) -> bool {
     spec.action == WfpAction::Block
         && spec.app_pattern.is_some()
@@ -1228,14 +1222,13 @@ impl PerSidApplyOrchestrator {
                     // the mode-A per-IP path too: subtract the exempted server IPs
                     // from the per-destination block set so, if a secondary rule
                     // ever resolved to the tunnel's own server IP, the handshake to
-                    // it is never blocked. Mirrors the block-all path, which already
-                    // exempts bootstrap_server_ips. (The per-app primary exemption
-                    // above is the primary deadlock fix; this closes the IP-overlap
-                    // corner case as defence-in-depth.)
-                    // The protected set carries both families now, so a rule
-                    // host's v6 addresses are blocked here by name — where the
-                    // family used to be cut wholesale, taking every unrelated
-                    // v6 destination with it.
+                    // it is never blocked. Mirrors the block-all path's
+                    // bootstrap_server_ips exemption, closing the IP-overlap corner
+                    // case as defence-in-depth alongside the per-app primary
+                    // exemption above.
+                    // The protected set carries both families, so a rule host's
+                    // v6 addresses are blocked here by name instead of cutting the
+                    // whole v6 family.
                     let protected: Vec<std::net::IpAddr> =
                         exempt_tunnel_servers(protected_secondary_ips, exemptions);
                     crate::killswitch_codegen::fail_closed_block_destinations(
@@ -1245,11 +1238,11 @@ impl PerSidApplyOrchestrator {
             }
             RouteBehaviorMode::PreferSecondaryWhenAvailable
             | RouteBehaviorMode::StrictSecondaryFailClosed => {
-                // `block_all` is honoured here too. It used to be ignored, and
-                // the caller that arms the guard while the tunnel is HEALTHY
-                // (empty pin set on a cold FQDN cache) states in its own
-                // comment that it must not escalate — it passed `false` and got
-                // a catch-all anyway, cutting every egress on a live tunnel and
+                // `block_all` must be honoured here: the caller that arms the
+                // guard while the tunnel is HEALTHY (empty pin set on a cold
+                // FQDN cache) states in its own comment that it must not
+                // escalate. Ignoring `block_all` would force a catch-all
+                // anyway, cutting every egress on a live tunnel and
                 // deadlocking the very cache warm-up that would lift it.
                 if block_all {
                     crate::killswitch_codegen::fail_closed_block_all_filters(
@@ -1266,18 +1259,9 @@ impl PerSidApplyOrchestrator {
         }
     }
 
-    /// Derive the full WFP filter set for `sid` from its current policy, rules,
-    /// and the (live) FQDN cache — including the leak-guard kill-switch — WITHOUT
-    /// touching the WFP engine or the in-memory installed-set. Split out of
-    /// [`Self::install_for_sid`] so the incremental
-    /// [`Self::reconcile_secondary_coverage`] shares exactly one filter-
-    /// derivation path. Because the FQDN cache is read live, calling it again
-    /// after the DNS observer warms the cache yields the freshly-resolved
-    /// secondary destinations (block 16.HW-0704 P1), and re-resolving the LUID
-    /// yields the current tunnel after a reconnect (gap #2).
-    /// reset the shared unresolved-app set to
-    /// empty so the GUI banner does not keep listing apps for a SID that no
-    /// longer has any (enforceable) rules. No-op when the status is unwired.
+    /// Reset the shared unresolved-app set to empty so the GUI banner does
+    /// not keep listing apps for a SID that no longer has any (enforceable)
+    /// rules. No-op when the status is unwired.
     fn clear_app_enforcement_status(&self) {
         if let Some(status) = self.app_enforcement_status.as_ref() {
             status.set_unresolved(Vec::new());
@@ -1503,7 +1487,7 @@ fn behavior_mode_for_codegen(
 ///
 /// Errors are dropped — they cannot propagate through the listener
 /// signature. A future version may funnel them into a health-component
-/// `Blocking` record (block 16.8.3.4 audit work).
+/// `Blocking` record.
 pub fn wire_orchestrator_to_registry(
     orchestrator: Arc<PerSidApplyOrchestrator>,
     registry: &ActiveSidRegistry,
@@ -1512,8 +1496,8 @@ pub fn wire_orchestrator_to_registry(
     registry.add_listener(Arc::new(move |snapshot: &[String]| {
         // Errors at this layer are logged via tracing — there's no
         // back-channel to the original `on_connect` caller (which is
-        // the IPC accept thread). The audit subsystem in 16.8.3.4
-        // will surface them through `HealthComponent::Apply`.
+        // the IPC accept thread). The audit subsystem surfaces them
+        // through `HealthComponent::Apply`.
         if let Err(e) = orch.reconcile(snapshot) {
             tracing::error!(
                 target: "nrr::per_sid_orchestrator",
@@ -1529,16 +1513,16 @@ pub fn wire_orchestrator_to_registry(
 /// agree on the enforced user even when no tray/GUI process is running.
 pub type FallbackRoutingSidFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
-/// + , B2) — production [`RoutePolicyApplyTrigger`].
+/// Production [`RoutePolicyApplyTrigger`].
 ///
 /// Fired by `RoutePolicyUpdateHandler` after a successful per-SID policy
 /// write. Recompiles the caller's WFP filters ONLY if the SID is currently
-/// routing-active: tray-connected (`ActiveSidRegistry::active_sids`) or —
-/// block 16.HW-0716 (P0) — the effective routing user under the configured
-/// fallback (console-session user, service-driven scope). Without the
-/// fallback, a policy update pushed from a GUI-only connection while the tray
-/// subscription was dead was silently skipped (0716 run 2: kill-switch
-/// re-enable never recompiled). For any other inactive SID the new policy is
+/// routing-active: tray-connected (`ActiveSidRegistry::active_sids`) or the
+/// effective routing user under the configured fallback (console-session
+/// user, service-driven scope). Without the fallback, a policy update
+/// pushed from a GUI-only connection while the tray subscription was dead
+/// was silently skipped (kill-switch re-enable never recompiled). For any
+/// other inactive SID the new policy is
 /// picked up when it next becomes routing-active via `reconcile`. Errors are
 /// logged, never propagated — the policy is already durably written.
 ///

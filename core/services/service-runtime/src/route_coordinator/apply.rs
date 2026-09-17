@@ -16,7 +16,7 @@ impl SecondaryRouteCoordinator {
     /// layer's job, not ours). The behavior mode decides the shape: mode A
     /// pulls secondary-bound rules into the tunnel as `/32`; mode B owns a
     /// split-default overlay via the secondary and carves primary-bound rules
-    /// back onto the primary NIC (block 16.18.vpn).
+    /// back onto the primary NIC.
     pub fn recompute_for(
         &self,
         sid: &str,
@@ -71,8 +71,8 @@ impl SecondaryRouteCoordinator {
             .as_ref()
             .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
         {
-            // Fast liveness check , acceptance run 9): the dead
-            // verdict above has a whole hysteresis window of lag, and for that
+            // Fast liveness check: the dead verdict above has a whole
+            // hysteresis window of lag, and for that
             // window these `/32`s would blackhole every direct dial to the
             // public resolvers system-wide — including a VPN client's own
             // bootstrap DNS, which is exactly what has to work for the tunnel
@@ -101,9 +101,8 @@ impl SecondaryRouteCoordinator {
             }
         }
         if !out.diagnostics.is_empty() {
-            // Counted by kind, not summed: the old line named all three possible
-            // causes in its text and printed only a total, so a run where the
-            // primary was missing read exactly like one with a cold DNS cache.
+            // Counted by kind, not summed: a bare total can't distinguish a
+            // missing primary from a cold DNS cache.
             let tally = diagnostic_tally(&out.diagnostics);
             tracing::debug!(
                 target: "nrr::route-coordinator",
@@ -223,11 +222,9 @@ impl SecondaryRouteCoordinator {
     /// Two route shapes carry our signature, both at the uncommon
     /// [`SECONDARY_ROUTE_METRIC`]: the `/32` secondary host routes (on the
     /// secondary NIC) AND the mode-A `/2` counter-overlay halves ([`COUNTER_OVERLAY`], on
-    /// the primary NIC). We adopt BOTH. Originally only `/32` was adopted,
-    /// so a `/2` overlay orphaned by a crash was stranded in
-    /// the OS table indefinitely — it could send all non-rule traffic to the
-    /// primary even after the service that wanted it was gone, the kind of
-    /// leftover that broke connectivity after a kill-during-rebuild.)
+    /// the primary NIC). We adopt BOTH: an unadopted `/2` overlay would strand
+    /// all non-rule traffic on the primary indefinitely, even after the
+    /// service that wanted it is gone.
     ///
     /// The signature is a heuristic (the OS never tags routes as ours); a
     /// third-party route at the same metric would be adopted and then deleted

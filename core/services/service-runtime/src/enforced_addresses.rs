@@ -4,13 +4,13 @@
 //!
 //! Before handing a rule host's addresses to a client, the resolver has to know
 //! whether a connection to them will be carried by the policy or dropped by it.
-//! It used to ask the FQDN cache, which answers a different question: "has this
-//! name ever resolved to this address". The two diverge by a whole apply cycle —
-//! the cache learns a fact the instant the answer arrives, while the route and
-//! the kill-switch pin that make the address usable land on the next reconcile.
-//! On the machine that reported this, that reconcile ran 10 s at the median, so
-//! every answer in the window went out ahead of its own enforcement and the
-//! client's first connect was dropped.
+//! The FQDN cache answers a different question: "has this name ever resolved to
+//! this address". The two diverge by a whole apply cycle — the cache learns a
+//! fact the instant the answer arrives, while the route and the kill-switch pin
+//! that make the address usable land on the next reconcile (10 s at the median
+//! on the machine that reported this). Answering from the cache would let every
+//! answer in the window go out ahead of its own enforcement, dropping the
+//! client's first connect.
 //!
 //! The two also diverge in the steady state, in both directions: the pin set is
 //! trimmed every pass (a main-link-claimed address is deliberately not pinned),

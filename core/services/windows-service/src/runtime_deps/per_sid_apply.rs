@@ -1,14 +1,10 @@
-//! The per-SID apply stack, carved out of [`super::build_supervised_runtime_deps`].
-//!
-//! It was 1163 lines in the middle of one 3300-line function, and the reason it
-//! can move at all is that its interface is narrow: eleven values in, fourteen
-//! out, and nothing else crosses. Both of those were invisible while the block
-//! sat inline — that is the whole point of the split, not the line count.
-//!
-//! Behaviour is unchanged: the body is the same statements in the same order.
+//! The per-SID apply stack, carved out of
+//! [`super::build_supervised_runtime_deps`] because its interface is narrow —
+//! eleven values in, fourteen out, nothing else crosses — which stating
+//! explicitly is the point of the split.
 
-// Carved out of the parent, so it reads the parent's imports rather than
-// restating sixty `use` lines that would then drift.
+// Reads the parent's imports rather than restating sixty `use` lines that
+// would then drift.
 use super::*;
 
 /// What the stack needs from the boot bundle.
@@ -89,12 +85,6 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
     // to `NoopRulesApplyDispatcher` so the supervisor can still come
     // up in a degraded mode (settings work, rules-apply is a no-op).
     let api: Arc<dyn WindowsApiPort> = Arc::new(ProductionWindowsApi);
-    // Alongside the per-SID WFP orchestrator we build a
-    // `SecondaryRouteCoordinator` that drives the **system route table**
-    // for the active console user (real interface routing of IP/FQDN/
-    // domain-suffix/zone rules out the secondary adapter). It shares the
-    // same providers as the orchestrator, so the Arcs are cloned before the
-    // orchestrator consumes them.
     // Shared "unenforced application rules" status. The per-SID
     // orchestrator publishes app rules whose exe resolved to no path
     // into it on every filter compute; the SnapshotInitial handler reads the
@@ -452,6 +442,12 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         .unwrap_or_default()
                     })
                 };
+                // Alongside the per-SID WFP orchestrator, the
+                // `SecondaryRouteCoordinator` drives the system route table for the
+                // active console user (real interface routing of IP/FQDN/
+                // domain-suffix/zone rules out the secondary adapter); it shares the
+                // orchestrator's providers, cloned before the orchestrator consumes
+                // them.
                 let route_coord = Arc::new(
                     nrr_service_runtime::route_coordinator::SecondaryRouteCoordinator::new(
                         Arc::clone(&api) as Arc<dyn nrr_platform_api::route_table::RouteTablePort>,

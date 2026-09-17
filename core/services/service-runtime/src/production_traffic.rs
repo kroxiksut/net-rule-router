@@ -1,4 +1,4 @@
-//! Block T (traffic counter) — production `TrafficStatsProvider` /
+//! production `TrafficStatsProvider` /
 //! `TrafficStatsWriter` backed by the service [`TrafficSampler`] and the
 //! service-critical `traffic_stats_settings` singleton.
 //!
@@ -87,7 +87,7 @@ fn settings_dto(s: &TrafficStatsSettings) -> TrafficStatsSettingsDto {
     }
 }
 
-/// Block T Feature 2 — the address fields shared by every `TrafficRowDto`
+/// The address fields shared by every `TrafficRowDto`
 /// builder below, looked up once per response (see `addresses` in
 /// [`ProductionTrafficStats::get`]) rather than re-querying the DB per row.
 fn address_fields(
@@ -254,9 +254,8 @@ impl TrafficStatsProvider for ProductionTrafficStats {
             .unwrap_or_else(|_| settings_dto(&TrafficStatsSettings::DEFAULT));
 
         let sampler = lock_sampler(&self.sampler);
-        // Block T Feature 2 — one bulk read of the observed-address table,
-        // joined in-memory by `adapter_key` into each row below, rather than
-        // a per-row DB query.
+        // One bulk read of the observed-address table, joined in-memory by
+        // `adapter_key` into each row below, rather than a per-row DB query.
         let addresses: std::collections::HashMap<String, nrr_storage::AdapterAddressRow> = sampler
             .adapter_addresses()
             .unwrap_or_default()
@@ -420,7 +419,7 @@ impl TrafficStatsWriter for ProductionTrafficStats {
     }
 }
 
-// ── SamplerAdapterAddressRecorder (Block T Feature 2) ───────────────────────
+// ── SamplerAdapterAddressRecorder ───────────────────────────────────────────
 
 /// Wraps the sampler's `Arc<Mutex<TrafficSampler>>` as an
 /// [`crate::production_handlers_misc::AdapterAddressRecorder`], so

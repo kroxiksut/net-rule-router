@@ -101,12 +101,11 @@ impl SecondaryRouteCoordinator {
     /// installed right now: every routing-active (tray-connected) SID, or —
     /// with no tray at all — the single effective routing user from
     /// [`Self::effective_routing_sid`] (console-session user under
-    /// service-driven scope). Gives the WFP orchestrator the SAME no-tray
-    /// fallback the route half has had since , so enforcement
-    /// self-arms from boot / survives a dead tray subscription instead of
-    /// waiting for a tray connect (0716 run 2: zero WFP applies all run).
-    /// Multi-tray SIDs pass through unchanged (the fallback only fills an
-    /// EMPTY set — it never overrides connected trays).
+    /// service-driven scope). Gives the WFP orchestrator the same no-tray
+    /// fallback the route half already has, so enforcement self-arms from
+    /// boot / survives a dead tray subscription instead of waiting for a
+    /// tray connect. Multi-tray SIDs pass through unchanged (the fallback
+    /// only fills an EMPTY set — it never overrides connected trays).
     pub fn effective_enforcement_sids(&self, tray_active: &[String]) -> Vec<String> {
         if !tray_active.is_empty() {
             return tray_active.to_vec();

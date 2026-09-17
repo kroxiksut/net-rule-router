@@ -4,9 +4,8 @@
 //! copy of "how long a main-link check may take", "how many targets it may
 //! use" and "how often it may repeat". The GUI cannot read Rust constants and
 //! the storage crate must not depend on the contracts crate, so the copies are
-//! real and nothing structural keeps them equal — the comment that claimed a
-//! test compared all three was, until this file existed, the only thing that
-//! did.
+//! real and nothing structural keeps them equal — this file is what actually
+//! compares all three.
 //!
 //! Drift is silent and one-sided: a peer that omits the keys agrees to the
 //! wire's numbers, a fresh row gets storage's, and the settings window shows

@@ -58,20 +58,18 @@ fn strip_orphaned_block_filters_blocking() {
 /// (block AND permit) and any leftover NRR-owned route WITHOUT the service
 /// running. Backs the `cleanup` console subcommand.
 ///
-/// A crashed / hard-killed service leaves its non-dynamic WFP session's filters
-/// behind: they survive `taskkill /F` until an explicit delete or a reboot, and
-/// an orphaned kill-switch / fail-closed block can lock the machine off the
-/// network with no service left to lift it. This opens its OWN short-lived WFP
-/// engine session — the same enumerate-by-provider-GUID sweep
+/// A crashed/hard-killed service leaves its non-dynamic WFP filters behind:
+/// they survive `taskkill /F` until deleted or rebooted, and an orphaned
+/// kill-switch block can lock the machine off the network with nothing left
+/// to lift it. Opens its own short-lived WFP engine session — the same sweep
 /// [`nrr_service_runtime::per_sid_orchestrator::PerSidApplyOrchestrator::cleanup_wfp`]
-/// runs via [`WfpSession::cleanup_all`] — deletes all our filters, then sweeps
-/// the OS route table for routes carrying our signature and removes them. Safe
-/// to run when the service is installed but stopped (nothing else holds the
-/// engine).
+/// runs via [`WfpSession::cleanup_all`] — deletes our filters, then sweeps the
+/// OS route table for routes carrying our signature. Safe when the service is
+/// installed but stopped (nothing else holds the engine).
 ///
 /// Requires elevation: `FwpmEngineOpen0` returns access-denied for a
-/// non-elevated caller, which we detect via [`ErrorClass::PrivilegeRequired`]
-/// and turn into a "re-run elevated" message (no new `unsafe` token probe).
+/// non-elevated caller ([`ErrorClass::PrivilegeRequired`]), turned into a
+/// "re-run elevated" message.
 pub(crate) fn run_offline_reset() -> std::process::ExitCode {
     match sweep_orphaned_machine_state() {
         SweepOutcome::Done => std::process::ExitCode::SUCCESS,

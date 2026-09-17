@@ -115,10 +115,9 @@
 //!
 //! - `cargo test --workspace --lib` ⇒ all crates green.
 //! - `cargo deny check` ⇒ no licence/advisory regressions.
-//! - All actionable `TODO:` markers in production paths
-//!   reclassified or removed. Documentation-level architectural-boundary
-//!   comments stay as docs without the TODO marker; real gaps
-//!   reclassify to `TODO(pro-tier)` or similar.
+//! - All actionable `TODO:` markers in production paths resolved or
+//!   removed. Architectural-boundary notes stay as plain docs without the
+//!   marker; a real gap keeps a plain `TODO:` naming what would close it.
 
 #![cfg(target_os = "windows")]
 

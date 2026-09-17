@@ -60,10 +60,9 @@ fn idle_stack_with_flows(count: u16, health: &Arc<health::FakeIpHealth>) -> Fake
     stack
 }
 
-/// A step must cost the flows it has work for, not the flows that exist. With
-/// 300 parked flows and nothing happening, the pump visits none of them; the
-/// old walk-everything pump visited 300 per step, which is what made a busy
-/// relay pay for every idle connection on the machine.
+/// A step must cost the flows it has work for, not the flows that exist —
+/// walking every parked flow on every step would make a busy relay pay for
+/// every idle connection on the machine.
 #[test]
 fn an_idle_step_visits_no_flows_however_many_are_parked() {
     const FLOWS: u16 = 300;
@@ -129,10 +128,10 @@ fn a_flow_its_worker_woke_is_serviced_before_the_next_sweep() {
     );
 }
 
-/// The bench behind the change, kept runnable rather than quoted: 300 parked
-/// flows, 20 000 steps, once servicing only the flows with work and once
-/// sweeping everything each step (what the pump did before). Ignored by
-/// default — it is a measurement, not an assertion.
+/// Benchmark, kept runnable rather than quoted: 300 parked flows, 20 000
+/// steps, comparing event-driven servicing (only flows with work) against
+/// sweeping every flow each step. Ignored by default — a measurement, not an
+/// assertion.
 ///
 /// `cargo test -p nrr-service-runtime --lib the_pump_cost_at_scale -- --ignored --nocapture`
 #[test]
