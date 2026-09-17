@@ -1,16 +1,11 @@
 //! Assembly of the IPC handler surface, carved out of
-//! [`super::build_supervised_runtime_deps`].
+//! [`super::build_supervised_runtime_deps`] because this is where nearly the
+//! whole dependency graph is finally read — as a parameter list that fact is
+//! stated once instead of spread across the surrounding function.
 //!
-//! Thirty values in and four out, and that ratio is the finding rather than an
-//! accident of the split: the IPC surface is where nearly the whole dependency
-//! graph is finally read. Inline, that fact was spread over eight hundred lines
-//! and could not be seen; as a parameter list it is stated once.
-//!
-//! What deliberately did NOT move: the audit emitter, the router and the named
-//! pipe server. They consume the registry this builds, and pipe-server
+//! What deliberately stays in the caller: the audit emitter, the router, and
+//! the named pipe server. They consume the registry this builds, and pipe
 //! construction is the Windows-specific reason `runtime_deps` exists at all.
-//!
-//! Behaviour is unchanged: the same statements in the same order.
 
 use super::*;
 
@@ -110,17 +105,15 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
     // (`NoopMutationExecutor`, etc.) when their dependency chain (WFP
     // session, settings DB) could not be built at boot.
     //
-    // Connection-trace ring, shared between the observer (writer,
-    // built later in `build_conn_trace_pair`) and the `conn-trace.entries.list`
-    // IPC handler (reader, wired into the deps below). ALWAYS created (a
-    // cheap ~1000-entry in-memory bounded buffer) so the handler is always
-    // registered — the "Show connections" panel works WITHOUT a service
-    // restart. The ring is in-memory only and never persisted; the on-disk NDJSON sink stays
-    // opt-in (`conn_trace_ndjson`), which is the privacy-sensitive output.
-    // Declared at function scope so it reaches BOTH the handler registration
-    // (inside the settings-DB block) and the observer construction (after it).
-    // `_conn_trace_gui` is retained in the row but no longer gates the ring
-    // (the ring is always built now); the on-disk NDJSON sink is gated by
+    // Connection-trace ring: shared between the observer (writer, built
+    // later in `build_conn_trace_pair`) and the `conn-trace.entries.list` IPC
+    // handler (reader, wired below). Always created — a cheap ~1000-entry
+    // in-memory bounded buffer, never persisted — so "Show connections"
+    // works without a service restart; the on-disk NDJSON sink stays opt-in
+    // (`conn_trace_ndjson`), the privacy-sensitive output. Declared at
+    // function scope so it reaches both the handler registration and the
+    // observer construction below. `_conn_trace_gui` is retained in the row
+    // but does not gate the ring; the NDJSON sink is gated by
     // `conn_trace_persisted_ndjson` below.
     let (conn_trace_persisted_ndjson, _conn_trace_gui) =
         read_conn_trace_flags(settings_conn.as_ref());

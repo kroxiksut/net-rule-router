@@ -1,4 +1,4 @@
-//! Block T (traffic counter) — service-side sampler.
+//! Traffic-counter service-side sampler.
 //!
 //! Owns the [`TrafficAccountant`] and the [`SqliteTrafficStore`], and on each
 //! supervisor tick: reads per-interface octet counters, buckets each interface
@@ -156,8 +156,8 @@ impl TrafficSampler {
         let samples: Vec<TrafficSample> = named_samples.iter().map(|(_, s)| s.clone()).collect();
         let mut deltas = self.accountant.ingest(&samples);
 
-        // Block T Feature 1 — eliminate tunnel double-counting: what counts
-        // as VPN traffic must not also count in the primary channel. Only
+        // Eliminate tunnel double-counting: what counts as VPN traffic must
+        // not also count in the primary channel. Only
         // meaningful when BOTH a primary and a (tunnel) secondary delta
         // landed THIS TICK; `tunnel_overlap_adjust` itself no-ops when the
         // secondary is not a tunnel (a genuine second physical adapter is
@@ -283,8 +283,8 @@ impl TrafficSampler {
         self.store.prune_before(cutoff_day)
     }
 
-    /// Block T Feature 2 — records the last observed local + external address
-    /// for an adapter. Write path from a USER-REQUESTED external-IP probe
+    /// Records the last observed local + external address for an adapter.
+    /// Write path from a USER-REQUESTED external-IP probe
     /// only (never from the routine sampling tick above); delegates straight
     /// to the store, sharing this sampler's single connection to
     /// `nrr_traffic_stats.db` rather than opening a second one.
@@ -370,10 +370,10 @@ mod tests {
             display_name: name.to_string(),
             interface_type: itype,
             is_virtual,
-            // Mirrors the OLD (pre-strengthening) derivation these fixtures
-            // were written against: the tests below only ever simulate a
-            // tunnel via `InterfaceType::Tunnel`, never via a name/description
-            // heuristic — that heuristic is unit-tested at the pure
+            // Derived directly from `itype`: the tests below only ever
+            // simulate a tunnel via `InterfaceType::Tunnel`, never via a
+            // name/description heuristic — that heuristic is unit-tested
+            // separately at the pure
             // `nrr_platform_api::adapters::text_indicates_vpn_tunnel` level.
             is_tunnel: matches!(itype, InterfaceType::Tunnel),
             is_up: true,
@@ -428,10 +428,10 @@ mod tests {
         let rows = sampler.today_totals(20000).expect("totals");
         let pri = rows.iter().find(|r| r.role == "primary").expect("pri");
         let sec = rows.iter().find(|r| r.role == "secondary").expect("sec");
-        // Block T Feature 1 — WireGuard is a tunnel secondary, so its 60/30
-        // delta is subtracted out of the primary's raw 600/300 delta before
-        // it lands in the day ledger (its encrypted flow physically
-        // re-appears on the Ethernet counter — see `tunnel_overlap_adjust`).
+        // WireGuard is a tunnel secondary, so its 60/30 delta is subtracted
+        // out of the primary's raw 600/300 delta before it lands in the day
+        // ledger (its encrypted flow physically re-appears on the Ethernet
+        // counter — see `tunnel_overlap_adjust`).
         assert_eq!((pri.in_bytes, pri.out_bytes), (540, 270));
         assert_eq!((sec.in_bytes, sec.out_bytes), (60, 30));
     }
@@ -621,14 +621,12 @@ mod tests {
         sampler
             .tick(Some("Ethernet"), Some("WireGuard"), all_on(), 1, 3)
             .expect("t3");
-        // Block T Feature 1 — WireGuard is a tunnel secondary, so its delta is
-        // subtracted from the primary's delta this tick (its encrypted flow
-        // physically re-appears on the Ethernet counter — see
-        // `tunnel_overlap_adjust`). Raw Ethernet reading is 560/230 above the
-        // t3 cursor; after subtracting WireGuard's 500/200 the net primary
-        // session delta is the small overhead residue, 60/30 — chosen so this
-        // test's pre-existing assertions keep reading the same numbers while
-        // now exercising the subtraction path end-to-end.
+        // WireGuard is a tunnel secondary, so its delta is subtracted from
+        // the primary's delta this tick (its encrypted flow physically
+        // re-appears on the Ethernet counter — see `tunnel_overlap_adjust`).
+        // Raw Ethernet reading is 560/230 above the t3 cursor; after
+        // subtracting WireGuard's 500/200 the net primary session delta is
+        // the small overhead residue, 60/30.
         src.set(vec![
             counters("Ethernet", InterfaceType::Ethernet, false, 660, 270),
             counters("WireGuard", InterfaceType::Tunnel, false, 500, 200),

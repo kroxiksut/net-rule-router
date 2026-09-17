@@ -106,9 +106,7 @@ fn main() -> std::process::ExitCode {
                 // installation must carry the grant from the first boot —
                 // otherwise the only way to start a stopped service is an
                 // elevated console.
-                if let Err(e) = service_config::grant_interactive_service_start() {
-                    eprintln!("warning: could not grant SERVICE_START to INTERACTIVE: {e}");
-                }
+                refresh_interactive_grant();
                 println!("Installed service '{}'.", nrr_service_runtime::SERVICE_NAME);
                 std::process::ExitCode::SUCCESS
             }
@@ -211,7 +209,7 @@ fn main() -> std::process::ExitCode {
             }
         }
         #[cfg(windows)]
-        "start" => match scm::start_service(15) {
+        "start" => match refresh_interactive_grant_then(|| scm::start_service(15)) {
             Ok(()) => {
                 println!(
                     "Service '{}' start requested.",
@@ -240,7 +238,9 @@ fn main() -> std::process::ExitCode {
         // so the user sees a single UAC prompt instead of two (one for stop
         // and one for start).
         #[cfg(windows)]
-        "restart" => match scm::stop_service(15).and_then(|()| scm::start_service(15)) {
+        "restart" => match refresh_interactive_grant_then(|| {
+            scm::stop_service(15).and_then(|()| scm::start_service(15))
+        }) {
             Ok(()) => {
                 println!("Service '{}' restarted.", nrr_service_runtime::SERVICE_NAME);
                 std::process::ExitCode::SUCCESS
@@ -254,17 +254,10 @@ fn main() -> std::process::ExitCode {
             print_status_banner();
             std::process::ExitCode::SUCCESS
         }
-        // Disaster-recovery offline reset. Strips ALL NetRuleRouter WFP
-        // filters (block AND permit), any leftover NRR-owned routes, and any
-        // orphaned Mode-B NRPT/DNS-redirect rule WITHOUT the service running —
-        // the escape hatch for a machine whose service crashed and left
-        // orphaned state behind (a non-dynamic WFP session's block filters
-        // survive `taskkill /F` until an explicit delete or reboot, and a
-        // stranded NRPT redirect points all DNS at a dead listener, either of
-        // which can lock the user off the network). Opens its own short-lived
-        // WFP engine session, so it is safe to run when the service is
-        // installed but stopped. Requires elevation. Backing the
-        // `scripts/reset-network.ps1` wrapper.
+        // Disaster-recovery offline reset without the service running; see
+        // `runtime_deps::offline_reset` for why each piece it strips can
+        // otherwise lock the machine off the network. Requires elevation.
+        // Backs the `scripts/reset-network.ps1` wrapper.
         #[cfg(windows)]
         "cleanup" => runtime_deps::run_offline_reset(),
         // Explicit foreground runtime. ONLY a deliberate `console` verb runs
@@ -310,6 +303,27 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::from(2)
         }
     }
+}
+
+/// Best-effort `INTERACTIVE` start grant; a refusal is reported, never fatal.
+#[cfg(windows)]
+fn refresh_interactive_grant() {
+    if let Err(e) = service_config::grant_interactive_service_start() {
+        eprintln!("warning: could not grant SERVICE_START to INTERACTIVE: {e}");
+    }
+}
+
+/// Runs `action` after refreshing the grant. An elevated hand on the service
+/// is the moment to heal a DACL an earlier version cut down to `SERVICE_START`
+/// alone, which left the unprivileged GUI unable to read the service status.
+/// An unelevated caller lacks `WRITE_DAC`: the refusal is one warning line and
+/// `action` still runs on whatever rights the caller holds.
+#[cfg(windows)]
+fn refresh_interactive_grant_then<T>(
+    action: impl FnOnce() -> Result<T, scm::ScmError>,
+) -> Result<T, scm::ScmError> {
+    refresh_interactive_grant();
+    action()
 }
 
 /// Re-register the service against the binary this process runs from, then
@@ -363,6 +377,9 @@ fn reinstall_from_this_binary() -> std::process::ExitCode {
         );
         return std::process::ExitCode::from(1);
     }
+    // A fresh registration carries SCM's default DACL; the GUI's own start
+    // button needs the same grant `install` makes.
+    refresh_interactive_grant();
 
     if let Err(e) = scm::start_service(30) {
         eprintln!(

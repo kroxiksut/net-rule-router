@@ -2,16 +2,7 @@
 //!
 //! A complete `smoltcp::phy::Device` implementation and its two tokens — the
 //! only place in the fake-IP stack that speaks to the tunnel handle directly.
-//! It moved out whole because it is exactly that: everything above the poll
-//! loop, nothing from it.
-//!
-//! The one-packet lookahead is the part worth keeping in view: the poll loop
-//! reads a packet, classifies it (to open a socket for a new flow BEFORE
-//! `smoltcp` sees the SYN), then hands it back so the very next `poll` consumes
-//! it. `smoltcp` pulls at most that one pending packet per poll, which keeps
-//! "inspect, then deliver" a single step.
-//!
-//! Behaviour is unchanged: the same code, verbatim.
+//! See [`TunPhyDevice`] for the one-packet lookahead this device relies on.
 
 use std::sync::Arc;
 

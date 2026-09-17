@@ -457,9 +457,9 @@ fn foreign_sections_survive_an_export_only_because_the_caller_carries_them() {
 ///
 /// `IMPORT_FILE_SIZE_LIMIT_BYTES` is derived from `IPC_MAX_MESSAGE_BYTES` by
 /// backing out the base64 expansion and an envelope allowance. This measures a
-/// REAL envelope at that size: while the two were both a flat 1 MiB, a preset
-/// the product called valid was refused by the transport as "frame too large",
-/// from the wrong layer and without the domain's message.
+/// REAL envelope at that size: a size cap merely equal to the frame cap lets a
+/// domain-valid preset get refused by the transport as "frame too large"
+/// instead of by the domain with its own error.
 #[test]
 fn a_maximum_size_preset_import_fits_one_ipc_frame() {
     use base64::Engine as _;

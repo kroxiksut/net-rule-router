@@ -33,13 +33,13 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// How recently an app's destination must have been SEEN to keep producing a
-/// route and filters. The same window every other enforcement view uses
-/// ([`crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW`]): the FQDN
-/// side already ages its addresses through it, while an app-observed pin used
-/// to stand until the LRU cap or a restart — a P2P session left its last peers
-/// enforced for the life of the process. An address that ages out loses only
-/// its own `/32`; the app touching it again relearns it within a tick (the
-/// first contact drops on the per-app block, which is what teaches it).
+/// route and filters. Shares the window every other enforcement view uses
+/// ([`crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW`]) rather than
+/// standing until the LRU cap or a restart — without it, a P2P session would
+/// keep its last peers enforced for the life of the process. An address that
+/// ages out loses only its own `/32`; the app touching it again relearns it
+/// within a tick (the first contact drops on the per-app block, which is what
+/// teaches it).
 pub const APP_PIN_FRESHNESS_WINDOW: Duration =
     crate::fqdn_cache_lookup::ENFORCEMENT_CONFIRMATION_WINDOW;
 
@@ -126,13 +126,10 @@ pub struct AppObservationStore {
     /// weighed against before it is emitted.
     census: Mutex<CensusIndex>,
     /// `(app, ip)` pairs withdrawn because the host route they produced was
-    /// carrying somebody else's traffic. Sticky, but bounded: the app will
-    /// touch the address again within seconds, and without this the pair would
-    /// be relearned immediately and the two processes would take the address
-    /// from each other in a loop. Bounded because
-    /// the app will touch the address again within seconds, and without this
-    /// the pair would be relearned immediately and the two processes would take
-    /// the address from each other in a loop.
+    /// carrying somebody else's traffic. Sticky, but bounded: without this,
+    /// the app would touch the address again within seconds, the pair would
+    /// be relearned immediately, and the two processes would take the address
+    /// from each other in a loop.
     retracted: Mutex<BoundedRecentSet<(String, Ipv4Addr)>>,
     /// `(app, ip)` pairs actually seen since the last persistence pass. The
     /// store also holds addresses re-seeded from previous sessions and ones

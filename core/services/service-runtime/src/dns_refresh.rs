@@ -61,9 +61,8 @@ pub struct RefreshSummary {
     /// Number of expired hostnames the task chose not to query or not to
     /// write — backoff suppression, an unsupported-platform abort, or an
     /// answer with nothing usable in it. Every attempted row lands in
-    /// exactly one counter; a bucketless row is an accounting bug (the
-    /// archive had 44% of attempts vanish, which made the tick
-    /// log useless for regression triage).
+    /// exactly one counter; a bucketless row is an accounting bug — attempts
+    /// silently vanishing makes the tick log useless for regression triage.
     pub skipped: u32,
     /// Subset of `skipped`: the OS resolver handed back our own fake-IP
     /// pool (Mode B self-interception) — no signal about the host.
@@ -387,8 +386,8 @@ impl DnsRefreshOrchestrator {
                 // to our own resolver, so a system-level re-resolution hands
                 // our fake-pool address back. That answer carries no signal
                 // about the host — skip it on a FLAT short retry instead of
-                // walking the hosts-file backoff ladder (observed :
-                // a delivery apex banned for minutes by its own fake answers).
+                // walking the hosts-file backoff ladder: a host must not stay
+                // banned for minutes by its own fake answers.
                 let fake_intercepted = contains_fake_pool_addr(record.addresses.iter().copied());
                 // Drop non-routable IPs (loopback/unspecified) before writing
                 // back. A hostname can flip to a hosts-file loopback pin
@@ -553,8 +552,8 @@ mod tests {
         runner.run_pending_migrations().expect("migrate");
         // Small `fallback_ttl_secs` floor so these expiry-mechanism tests can
         // seed short-TTL rows that actually expire. Production floors to a week
-        // for leak-guard stickiness (HW-0705), which would keep every seeded
-        // row unexpired and defeat the refresh tests.
+        // for leak-guard stickiness, which would keep every seeded row
+        // unexpired and defeat the refresh tests.
         let store = SqliteCacheStore::new(
             runner.into_connection(),
             FreshnessThresholds {
@@ -870,9 +869,9 @@ mod tests {
     fn run_once_skips_fake_pool_answer_without_backoff_escalation() {
         // Mode B self-interception: the system resolver hands back OUR OWN
         // fake-pool address. It must not be cached, and — unlike a hosts-file
-        // loopback pin — it must never walk the doubling backoff ladder
-        // : a delivery apex spent minutes banned by its own
-        // virtual answers during a fake-IP datapath outage).
+        // loopback pin — it must never walk the doubling backoff ladder: a
+        // host must not spend minutes banned by its own virtual answers
+        // during a fake-IP datapath outage.
         let now = SystemTime::now();
         let resolver_mock = Arc::new(MockDnsResolver::new());
         resolver_mock.set_response(
@@ -900,8 +899,8 @@ mod tests {
             summary.succeeded, 0,
             "a fake-pool answer is not written back"
         );
-        // the interception must be visible in the tick counters
-        // (44% of a phase's attempts once vanished into this branch).
+        // the interception must be visible in the tick counters —
+        // a bucketless outcome makes the batch unaccountable.
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.fake_intercepted, 1);
         assert_eq!(summary.loopback_pinned, 0);

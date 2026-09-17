@@ -77,18 +77,16 @@ pub use vpn_client_bypass::{
     NoVpnClientBypass, OwnerLookupVpnClientBypass, VpnClientFlowBypass, DEFAULT_MIN_PROBE_INTERVAL,
 };
 
-/// Process-wide live gate for the fake-IP UDP relay toggle:
-/// `true` admits UDP (QUIC/HTTP-3) into the pool permit instead of hard-
-/// blocking it — see [`crate::killswitch_codegen::fake_ip_pool_permit_filters`].
-/// Read fresh on every per-SID codegen compute
-/// ([`crate::per_sid_orchestrator`]) and written by
+/// Process-wide live gate for the fake-IP UDP relay toggle: `true` admits
+/// UDP (QUIC/HTTP-3) into the pool permit instead of hard-blocking it — see
+/// [`crate::killswitch_codegen::fake_ip_pool_permit_filters`]. Read on every
+/// per-SID codegen compute ([`crate::per_sid_orchestrator`]) and written by
 /// `ProductionServiceStability::set` on a settings save, mirroring
-/// [`crate::dns_resolver::global_dns_fast_answers`]. A single process-wide
-/// atomic (not per-SID) because the underlying setting is a global service
-/// setting, and the two call sites (boot seed, live write) are composed in
-/// different scopes — a process singleton keeps them on one value by
-/// construction. Defaults to `false` (hard-block UDP, today's behaviour); the
-/// boot path overwrites it with the persisted setting before the first
+/// [`crate::dns_resolver::global_dns_fast_answers`]. Global rather than
+/// per-SID because the setting itself is global and the boot-seed/live-write
+/// call sites are composed in different scopes; a process singleton keeps
+/// them on one value by construction. Defaults to `false` (hard-block UDP);
+/// the boot path overwrites it with the persisted setting before the first
 /// per-SID compute.
 pub fn global_udp_relay_enabled() -> Arc<std::sync::atomic::AtomicBool> {
     static FLAG: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =

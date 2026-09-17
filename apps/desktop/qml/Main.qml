@@ -60,17 +60,12 @@ ApplicationWindow {
     property int wizardStep: 0
     property int autoCloseMs: 0
     property int uiRevision: 0
-    // Dedicated revision token for the
-    // theme tokens (`uiTheme`). Bumped ONLY when a theme-affecting pref
-    // changes (themeMode / effectiveThemeMode / high-contrast / font
-    // scale / system font). Previously `uiTheme` re-derived all its
-    // tokens on every `uiRevision += 1` — which fires on row selection,
-    // unsaved-flag flips, rules refetch, tab switches, etc. With every
-    // section kept resident (lazy keep-alive Loaders), that re-evaluated
-    // every colour/font binding across the whole tree on each
-    // interaction → the "theme/font/tab switching is slow" regression.
-    // Decoupling theme recompute from generic interactions fixes it
-    // (themeRevision split).
+    // Dedicated revision token for the theme tokens (`uiTheme`). Bumped ONLY
+    // when a theme-affecting pref changes (themeMode / effectiveThemeMode /
+    // high-contrast / font scale / system font) — kept separate from
+    // `uiRevision` (which fires on row selection, unsaved-flag flips, rules
+    // refetch, tab switches, etc.) so a generic interaction never
+    // re-evaluates every colour/font binding across the resident sections.
     property int themeRevision: 0
     // Stable language token for `tr()`. Kept separate
     // from the volatile `prefs` object (which is wholesale-replaced on
@@ -702,12 +697,10 @@ ApplicationWindow {
         var kind = (backendStatus || {}).kind || ""
         return kind === "connecting" ? "#d4a017" : "#c0392b"
     }
-    // Footer "Service: …" indicator. It used to
-    // echo `context.security.serviceStatus`, a COLD-START mock field hardwired
-    // to "alert" (the real health→snapshot mapping is a pending TODO),
-    // so a perfectly healthy, connected service still read "Служба: alert".
-    // Derive the word from the LIVE backend connection state instead, and
-    // localize it (the raw slug must never be shown — HARD RULE).
+    // Footer "Service: …" indicator, derived from the LIVE backend connection
+    // state — not `context.security.serviceStatus`, a cold-start mock field
+    // hardwired to "alert" that would misreport a healthy connected service.
+    // Localizes the word; the raw slug must never be shown.
     function serviceFooterStatusText() {
         var kind = String((backendStatus || {}).kind || "connected")
         var word = tr("connection.service-status." + kind,
@@ -719,18 +712,15 @@ ApplicationWindow {
     // before reading `prefs` — QML's dependency tracker follows the integer
     // change reliably, while `var prefs` reassignment via `Object.assign` is
     // not always picked up by binding recomputation in Qt 6.11. Without this
-    // the theme/font-scale UI applies only after a full window reopen
-    // (verified empirically in 13.R2-GUI.2).
+    // the theme/font-scale UI applies only after a full window reopen.
     ThemeTokens {
         id: uiTheme
-        // Tied to `themeRevision` via direct ternary read so QML's binding
-        // analyzer reliably registers the dependency. The earlier
-        // `(uiRevision, expr)` comma-expression did NOT always register —
-        // we therefore switched
-        // the trigger from `uiRevision` to `themeRevision` so these tokens
-        // recompute ONLY on a real theme/font change, not on every generic
-        // interaction (row selection, unsaved flag, rules refetch, tab
-        // switch) — the perf regression with resident keep-alive sections.
+        // Tied to `themeRevision` via a direct ternary read so QML's binding
+        // analyzer reliably registers the dependency — a `(uiRevision, expr)`
+        // comma-expression does not always register. Recomputes ONLY on a
+        // real theme/font change, not on every generic interaction (row
+        // selection, unsaved flag, rules refetch, tab switch), avoiding a
+        // full re-evaluation across the resident keep-alive sections.
         themeMode: themeRevision >= 0 ? resolveThemeModeForPrefs(prefs) : "system"
         accessibilityHighContrast: themeRevision >= 0
             ? resolveThemeModeForPrefs(prefs) === "high-contrast" : false
@@ -980,10 +970,10 @@ ApplicationWindow {
     // ── Overlapping rules ────────────────────────────────────────────────────
     //
     // A wildcard rule covers the apex and every subdomain under it, so an
-    // exact rule beneath the same wildcard usually does nothing. The service
-    // used to warn about these on every apply, which is noise on a path the
-    // user did not open for that. They belong here instead: a count on the
-    // rules screen, and a dialog that removes the spare ones once.
+    // exact rule beneath the same wildcard usually does nothing. Surfaced
+    // here rather than as an apply-time warning (noise on a path the user
+    // did not open for this): a count on the rules screen, and a dialog
+    // that removes the spare ones once.
     //
     // `rules_overlap::find_overlaps` (Rust) decides which pairs are spare —
     // never QML.
@@ -1708,11 +1698,8 @@ ApplicationWindow {
     }
     /// Is `path` part of the rule sets that ship with the app — i.e. a location
     /// the next update overwrites, so binding a save target there loses the
-    /// user's work? The single source of truth for that question; three
-    /// controllers used to answer it with their own copy of the test and one of
-    /// them (the preset-import path) did not know about the exception below,
-    /// which silently blanked the save binding of every set imported from the
-    /// user's own folder.
+    /// user's work? The single source of truth for that question, so every
+    /// caller shares the exception below rather than keeping its own copy.
     ///
     /// The exception: the folder the user explicitly designated as their own
     /// rule-set folder is NEVER factory, even when it sits inside the shipped
@@ -2275,9 +2262,9 @@ ApplicationWindow {
         return head
     }
     // Correlation-id RPC transport over the C++ bridge: the pending-callback
-    // table, GC timer, and bridge forwarders now live in flows/RpcTransport so
-    // the shell no longer owns the pipe. Every RPC goes through `rpc.<fn>`;
-    // sections/components reach it as `root.rpc`.
+    // table, GC timer, and bridge forwarders live in flows/RpcTransport, not
+    // in the shell. Every RPC goes through `rpc.<fn>`; sections/components
+    // reach it as `root.rpc`.
     property alias rpc: rpcTransport
     RpcTransport {
         id: rpcTransport
@@ -2560,12 +2547,12 @@ ApplicationWindow {
     // re-issue it on every disconnect→reconnect so live pushes resume automatically.
     property bool _statusSubscribed: false
     // Debounce for the health-poll banner: a single `timeout`/`rpc-timed-out`
-    // result no longer flips `backendStatus` straight to "connecting" — that
-    // used to fire whenever a slow-but-healthy main-channel op (rules.list,
-    // snapshot.initial.get, interfaces.refresh) happened to be in flight when
-    // the 1 s-budget probe landed behind it. Reset on any success or any
-    // non-timeout error (those are real, not queue contention, so the red
-    // path below stays immediate for them).
+    // result does not flip `backendStatus` straight to "connecting" — a
+    // slow-but-healthy main-channel op (rules.list, snapshot.initial.get,
+    // interfaces.refresh) can be in flight when the 1 s-budget probe lands
+    // behind it. Reset on any success or any non-timeout error (those are
+    // real, not queue contention, so the red path below stays immediate for
+    // them).
     property int _healthTimeoutStreak: 0
     // One subscribe RPC at a time, and one log line per failing streak: the
     // status poll retries this every few seconds until it sticks, and an
@@ -2768,8 +2755,7 @@ ApplicationWindow {
                 }
                 // Demo-rules seeding is opt-in: the user triggers it
                 // explicitly from RulesSection's "Load demo rules"
-                // button via `loadDemoRules()`. We no longer auto-open
-                // the review dialog on every connect.
+                // button via `loadDemoRules()`.
                 // Cold start reads backendStatus as
                 // "connected" already, so `wasDisconnected` is false above; still
                 // offer any intents parked in a previous session, exactly once.
@@ -4068,12 +4054,12 @@ ApplicationWindow {
     //
     // Service-owned routing settings (the per-SID route-policy toggles + the
     // shared service-stability config) are edited in the GUI. When the service
-    // is STOPPED the controls stay live but the RPC can't land, so the change
-    // used to be silently lost and the service's stale value won on the next
-    // start. Instead we PARK every offline edit as an explicit "pending intent"
-    // in `prefs.routePendingOfflineJson` (a compact single-line JSON object,
-    // "" = none). On the next backend connect we offer a dialog to Apply or
-    // Discard — nothing is ever pushed silently.
+    // is STOPPED the controls stay live but the RPC can't land, so every
+    // offline edit is PARKED as an explicit "pending intent" in
+    // `prefs.routePendingOfflineJson` (a compact single-line JSON object,
+    // "" = none) rather than silently lost to the service's stale value
+    // winning on the next start. On the next backend connect we offer a
+    // dialog to Apply or Discard — nothing is ever pushed silently.
     //
     // Shape: { "route-policy": { <wire-key>: <value>, … },
     //          "stability":    { <wire-key>: <value>, … } }
@@ -4434,10 +4420,11 @@ ApplicationWindow {
         // matters. Non-user origins (read-back re-seeds, the replay itself)
         // must never write intent or they would launder service defaults into
         // "what the user wanted".
-        // Recording the decision must never be able to cost the write. A throw
-        // here used to abort the whole function before the queue below ever saw
-        // the job: no request left the GUI, nothing said so, and every later
-        // save was refused by a loading flag that had no one left to clear it.
+        // Recording the decision must never be able to cost the write: an
+        // unguarded throw here would abort the whole function before the
+        // queue below ever saw the job — no request would leave the GUI,
+        // nothing would say so, and every later save would be refused by a
+        // loading flag with no one left to clear it.
         if (originText.indexOf("user:") === 0 || originText === "offline-pending-apply") {
             try {
                 serviceIntentController._recordServiceIntent(partial)
@@ -4963,11 +4950,10 @@ ApplicationWindow {
     readonly property bool wantDarkTitleBar: uiRevision >= 0 && isDarkTitleBarFromPrefs()
     // Re-apply ONCE per actual change, deferred to the next event-loop tick so
     // every binding keyed off the revision counters has settled first.
-    // This used to also run on every `uiRevision` bump and to fire twice per
-    // change; each pass walks all open windows and forces a non-client frame
-    // redraw, which is what made switching to dark / high-contrast feel
-    // laggy — the counter bumps on unrelated interactions too (row selection,
-    // any preference write), so the frame was being rebuilt constantly.
+    // Running this on every `uiRevision` bump would rebuild the non-client
+    // frame on every open window constantly — the counter also bumps on
+    // unrelated interactions (row selection, any preference write), which is
+    // what makes dark / high-contrast switching feel laggy.
     onWantDarkTitleBarChanged: Qt.callLater(applyAllTitleBars)
 
     Component.onCompleted: {
@@ -5454,10 +5440,9 @@ ApplicationWindow {
                 rulesBulkLoading = false
                 // Refresh the unresolved-app set alongside the rule list so the
                 // "app not enforced" banner tracks the live rules (e.g. after
-                // importing a preset that adds application rules). Hoisted out
-                // of the pre-populate block (was fired before the chunked
-                // append even started) — `snapshot.initial.get` on the main
-                // IPC channel no longer competes with the health probe/other
+                // importing a preset that adds application rules). Runs after
+                // the chunked append finishes so `snapshot.initial.get` on the
+                // main IPC channel does not compete with the health probe/other
                 // reads for the duration of the populate.
                 refreshUnenforcedAppRules()
                 // Same reason: the offer the tray may have shown while this
@@ -5791,8 +5776,7 @@ ApplicationWindow {
                 Pure.menuActionText(exitAction.text, "Ctrl+Q")
             ])
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.load-rule-list", "Load rule list..."); shortcutText: "Ctrl+O"; enabled: window.allowUserRuleEdits; onTriggered: openLoadRuleListWindow() }
-            // Show WHAT is being exported, then ask where to put it — the item
-            // used to only switch sections and save nothing.
+            // Show WHAT is being exported, then ask where to put it.
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-current-rule-list", "Export current list..."); shortcutText: "Ctrl+Shift+S"; onTriggered: { rulesAction.trigger(); boundFilesController.exportCurrentRulesInteractive(null) } }
             ShortcutMenuItem { theme: uiTheme; labelText: tr("action.export-settings", "Export settings..."); shortcutText: "Ctrl+Alt+S"; onTriggered: settingsAction.trigger() }
             MenuSeparator {}
@@ -6142,13 +6126,10 @@ ApplicationWindow {
             padding: uiTheme.spacingMd
             background: PanelSurface { theme: uiTheme; cornerRadius: uiTheme.radiusMd }
 
-            // Lazy section loading. Previously all five
-            // sections were instantiated eagerly, so every theme change /
-            // font-scale step / `uiRevision` bump re-evaluated and
-            // relaid-out ALL of them (the dominant cost of slow theme &
-            // font interactions in debug). Each section is now wrapped in
-            // a Loader that is active ONLY while it is the current page,
-            // so an interaction touches just the visible section.
+            // Lazy section loading: each section is wrapped in a Loader that is
+            // active ONLY while it is the current page, so a theme change /
+            // font-scale step / `uiRevision` bump re-evaluates and relays out
+            // just the visible section, not all five.
             //
             // Safe because: every list/data model (`rulesModel`,
             // `interfacesModel`, `logsModel`, …) lives at window scope
@@ -6331,12 +6312,10 @@ ApplicationWindow {
     /// their own rows doesn't lose them. The merged set is then sent
     /// through the standard review flow for persistence.
     ///
-    /// Sourced from the bundled preset files
-    /// (single source of truth) instead of a hardcoded JS copy. The old
-    /// `_buildDemoRuleRows()` hardcoded set was removed; the bundled files
-    /// are parsed via the launcher's `preset.parse` RPC, the same parser
-    /// used by preset import. Replaces the former duplicate "Apply built-in
-    /// demo rules" button, which only worked on an empty table.
+    /// Sourced from the bundled preset files (single source of truth) instead
+    /// of a hardcoded JS copy, parsed via the launcher's `preset.parse` RPC —
+    /// the same parser used by preset import, so demo rows can never drift
+    /// from real import behavior.
     function loadDemoRules() {
         if (!bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
@@ -6738,8 +6717,8 @@ ApplicationWindow {
     /// order/id/comment-independent signature of the rules as last loaded
     /// from (or applied to) the service. `_recomputeRulesDirty()` re-derives
     /// the live signature after every edit and marks the section dirty ONLY
-    /// when it actually differs — so toggling a rule off and back on (net no
-    /// change) no longer leaves a false "unsaved changes" state. It reuses the
+    /// when it actually differs, so toggling a rule off and back on (net no
+    /// change) does not leave a false "unsaved changes" state. It reuses the
     /// drift canonicalisation (`_buildRulesJsonForRoute` — order-stable, id
     /// zeroed, comments excluded), so "dirty" means exactly "routing content
     /// differs from what the service has". Comments are deliberately excluded:
@@ -6766,13 +6745,14 @@ ApplicationWindow {
             _buildRulesJsonForRoute(rows, "secondary") !== _rulesDirtyBaselineSecondary
         setUnsavedChanges("rules", primaryDirty || secondaryDirty)
         // A rule edited in the GUI makes its .txt stale the moment the edit
-        // lands — the file still holds the pre-edit rules. These flags used to
-        // be raised only by an activation, so the footer "Save to file" chip
-        // appeared a whole apply-cycle late. Raise-only: clearing belongs to
-        // the paths that reconcile against the file on disk (`_writeTargets` /
-        // `_reconcileBoundFileDirty`), which compare content and therefore
-        // self-heal a net-zero edit. Raised with or without a linked file —
-        // the save gesture asks for a path when there is none.
+        // lands — the file still holds the pre-edit rules — so these flags
+        // are raised immediately rather than only by an activation, which
+        // would leave the footer "Save to file" chip a whole apply-cycle
+        // late. Raise-only: clearing belongs to the paths that reconcile
+        // against the file on disk (`_writeTargets` / `_reconcileBoundFileDirty`),
+        // which compare content and therefore self-heal a net-zero edit.
+        // Raised with or without a linked file — the save gesture asks for a
+        // path when there is none.
         if (primaryDirty) _filesSyncDirtyPrimary = true
         if (secondaryDirty) _filesSyncDirtySecondary = true
         // Nothing can be applied while the service is down, so remember the
@@ -6802,10 +6782,9 @@ ApplicationWindow {
 
     /// Let the UnsavedChangesGuard offer
     /// "Apply" for the rules section. The rules Save is a multi-step
-    /// review→confirm→activate chain the user can abort, so it used to be left
-    /// unregistered (the guard showed only Discard/Cancel). We register a
-    /// window-scope save callback (so it works even when RulesSection is
-    /// lazily unloaded) that drives that same pipeline and resumes the pending
+    /// review→confirm→activate chain the user can abort, so a window-scope
+    /// save callback is registered (works even when RulesSection is lazily
+    /// unloaded) that drives that same pipeline and resumes the pending
     /// navigation on a successful activation; any abort/failure releases the
     /// guard WITHOUT navigating. `_guardRulesResume` carries the guard's
     /// onDone(ok) continuation across the async chain (it is also re-enabled
@@ -6813,9 +6792,9 @@ ApplicationWindow {
     property var _guardRulesResume: null
     /// Whether an apply CYCLE is running — from the guard's start to its
     /// resolution, dialog included. Separate from the transport's in-flight
-    /// flag, which only covers the request: the gap between the dry-run
-    /// answering and the user deciding is exactly where a second cycle used to
-    /// slip in and open a second review window.
+    /// flag, which only covers the request: without this, the gap between
+    /// the dry-run answering and the user deciding is exactly where a
+    /// second cycle could slip in and open a second review window.
     property bool _guardRulesInFlight: false
     /// Build canonical rules-json from the current `rulesModel`
     /// state. Same shared serializer `RulesSection._buildRulesJson` uses, so

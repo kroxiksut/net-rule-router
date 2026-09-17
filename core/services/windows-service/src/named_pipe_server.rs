@@ -1,72 +1,49 @@
 //! Windows named-pipe IPC server.
 //!
-//! ## Architecture
+//! Binds `\\.\pipe\NetRuleRouter\service-v1` with the canonical DACL from
+//! `named_pipe_acl` (LocalSystem + Administrators full, Authenticated Users
+//! RW, no-write-up). Each connection gets a dedicated worker thread (no
+//! pool), capped at 32 concurrent.
 //!
-//! The server binds `\\.\pipe\NetRuleRouter\service-v1` with the canonical
-//! DACL from `named_pipe_acl` (LocalSystem + Builtin Administrators full,
-//! Authenticated Users RW with low-IL no-write-up).
+//! ## Tick-model accept loop
 //!
-//! Each accepted connection is handled by a **dedicated worker thread**
-//! (per-connection thread, not a thread pool). Hard cap: 32 concurrent
-//! connections.
-//!
-//! ### Tick-model accept loop
-//!
-//! `WindowsNamedPipeServer::bind()` returns a `WindowsNamedPipeAcceptor`
-//! that exposes a single-tick accept primitive
-//! consumable by `ServiceSupervisor`:
-//!
-//! ```text
-//! let server = WindowsNamedPipeServer::new(router, audit);
-//! let acceptor = server.bind()?;
-//! loop {
-//!     match acceptor.accept_one() {
-//!         AcceptOutcome::Connected | AcceptOutcome::Idle => continue,
-//!         AcceptOutcome::ShutdownRequested => break,
-//!         AcceptOutcome::Err(e) => /* policy decides: rebind or retire */,
-//!     }
-//! }
-//! acceptor.request_shutdown();
-//! acceptor.join_workers();
-//! ```
+//! `bind()` returns a `WindowsNamedPipeAcceptor` with a single-tick accept
+//! primitive the `ServiceSupervisor` drives: each tick connects a client,
+//! stays idle, or reports shutdown/error so the caller's retry policy
+//! decides whether to rebind or retire.
 //!
 //! Wire format (4-byte BE u32 length + UTF-8 JSON, `IPC_MAX_MESSAGE_BYTES`),
-//! DACL, identity whitelist, and busy-close at MAX_CONCURRENT_CONNECTIONS
-//! match `nrr-ipc-client`'s protocol bit-for-bit.
+//! DACL, identity whitelist, and busy-close at the concurrency cap match
+//! `nrr-ipc-client`'s protocol bit-for-bit.
 //!
-//! Request flow per connection (handled inside the worker thread):
-//! 1. Identify caller via `named_pipe_identity::classify_pipe_client`
-//! 2. On reject → audit log + close handle
-//! 3. Loop: `read_frame` → `IpcRouter::dispatch` → `write_frame`
-//! 4. Exit on EOF, transport error, or worker-shutdown signal
+//! Per connection: identify the caller via
+//! `named_pipe_identity::classify_pipe_client`; reject → audit log + close;
+//! otherwise loop `read_frame` → `IpcRouter::dispatch` → `write_frame` until
+//! EOF, a transport error, or the worker-shutdown signal.
 //!
 //! ## Pipe instance lifecycle
 //!
-//! Each `accept_one` tick creates one new pipe instance via
-//! `CreateNamedPipeW`, then blocks on `ConnectNamedPipe`. When a client
-//! connects, the instance is handed off to a worker thread; the next
-//! `accept_one` call creates a fresh instance for the next client. Total
-//! active instances = (1 accepting per concurrent supervisor tick) +
-//! (N workers, ≤ 32). When the cap is hit, the new connection is
-//! busy-closed and the tick returns `Idle` so the supervisor keeps
-//! ticking without charging the policy retry budget.
+//! Each `accept_one` tick creates one pipe instance via `CreateNamedPipeW`
+//! and blocks on `ConnectNamedPipe`; a connecting client hands the instance
+//! to a worker thread and the next tick creates a fresh one. Active
+//! instances = 1 accepting + up to 32 workers. At the cap, a new connection
+//! is busy-closed and the tick returns `Idle` without charging the
+//! supervisor's retry budget.
 //!
 //! ## Shutdown
 //!
-//! `request_shutdown()` sets the shutdown flag and wakes any pending
-//! `ConnectNamedPipe` by self-connecting to the pipe via `CreateFileW`.
-//! After waking, the accept tick re-checks the flag and returns
-//! `ShutdownRequested` instead of handing the (self) connection off.
-//! Workers observe the same shutdown flag (`worker_shutdown`) and break
-//! out of their dispatch loop on the next iteration.
+//! `request_shutdown()` sets a flag and wakes any pending `ConnectNamedPipe`
+//! by self-connecting via `CreateFileW`; the woken tick re-checks the flag
+//! and returns `ShutdownRequested` instead of handing off the self
+//! connection. Workers watch the same flag and exit their dispatch loop.
 //!
 //! ## Testability
 //!
-//! The Windows-specific transport (`#[cfg(target_os = "windows")]`) is the
-//! production path. For cross-platform unit tests we use
-//! `InMemoryNamedPipeTransport` which implements the same accept / read /
-//! write contract over `mpsc` channels. See `named_pipe_inmem.rs`.
-//! Real-pipe smoke tests are in `tests/named_pipe_server_smoke.rs`.
+//! The Windows transport (`cfg(target_os = "windows")`) is production;
+//! cross-platform unit tests use `InMemoryNamedPipeTransport`
+//! (`named_pipe_inmem.rs`), which implements the same accept/read/write
+//! contract over `mpsc` channels. Real-pipe smoke tests live in
+//! `tests/named_pipe_server_smoke.rs`.
 
 #![cfg(target_os = "windows")]
 #![allow(unsafe_code)]

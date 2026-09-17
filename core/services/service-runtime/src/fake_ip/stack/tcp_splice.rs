@@ -5,7 +5,7 @@
 //! its upstream and serviced until both halves close. The capacity check
 //! lives here too — refusing a flow is part of opening one.
 //!
-//! Same inherent impl, split across files. Behaviour is unchanged.
+//! Same inherent impl, split across files.
 
 use super::*;
 
@@ -17,8 +17,7 @@ impl FakeIpStack {
     /// route), and the poll thread is shared by every flow — one doomed dial
     /// must never stall the stack for everyone else. A failed dial surfaces to
     /// the client as an RST right after the handshake instead of a stall.
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
     pub(super) fn maybe_open_flow(&mut self, packet: &ParsedPacket, now_ms: u64) {
         if packet.key.protocol != FlowProtocol::Tcp || !packet.is_connection_open {
             return;
@@ -96,8 +95,7 @@ impl FakeIpStack {
     /// the whole map is visited regardless, which is what makes the marking an
     /// optimisation rather than a correctness dependency: `smoltcp` can close a
     /// flow on its own idle or keep-alive timeout, and nobody marks that.
-    // `pub(super)` because the impl is split across files and the caller
-    // is now another module.
+    // `pub(super)`: this split inherent impl is called from a sibling module.
     pub(super) fn service_flows(&mut self, now_ms: u64) {
         let sweep_due = now_ms.saturating_sub(self.last_flow_sweep_ms) >= FLOW_SWEEP_INTERVAL_MS;
         let keys: Vec<FlowKey> = if sweep_due {

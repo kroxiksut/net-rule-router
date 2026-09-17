@@ -204,10 +204,10 @@ mod tests {
 
     #[test]
     fn spread_out_pokes_coalesce_instead_of_firing_per_poke() {
-        // Regression (F7 Track 2 adversarial review): pokes spread across time
-        // (a VPN reconnect emits interface/route callbacks tens of ms apart)
-        // must still collapse to ~once-per-window, NOT once-per-poke. A per-poke
-        // bug fires ~10× here; correct fixed-window coalescing fires ~2–3×.
+        // Regression guard: pokes spread across time (a VPN reconnect emits
+        // interface/route callbacks tens of ms apart) must still collapse to
+        // ~once-per-window, NOT once-per-poke. A per-poke bug fires ~10× here;
+        // correct fixed-window coalescing fires ~2–3×.
         let fires = Arc::new(AtomicUsize::new(0));
         let f = Arc::clone(&fires);
         let trigger = DebouncedTrigger::new(

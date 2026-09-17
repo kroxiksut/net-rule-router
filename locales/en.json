@@ -1463,8 +1463,7 @@
       "confirm-description": "Temporarily disable enforcement with the provided reason",
       "cancel": "Cancel",
       "cancel-description": "Dismiss the dialog and leave enforcement active",
-      "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again.",
-      "stub-pending": "Safe disable RPC bridge is not yet wired. Intent captured locally (see logs)."
+      "unavailable": "Safe disable requires the NetRuleRouter service to be running. Start the service and try again."
     },
     "network-recovery": {
       "title": "Restore network?",

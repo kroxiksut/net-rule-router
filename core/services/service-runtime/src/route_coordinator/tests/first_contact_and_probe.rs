@@ -70,7 +70,7 @@ fn fail_closed_exemptions_seed_persisted_server_ips_before_reconnect() {
 
 #[test]
 fn fail_closed_exemptions_without_persistence_is_unchanged() {
-    // No persistence wired → empty exemption server set (prior behaviour).
+    // No persistence wired → empty exemption server set.
     let api = Arc::new(MockWindowsApi::new());
     let coord = coordinator(api, Arc::new(FakeRules::new()));
     let ex = coord.fail_closed_exemptions("S-1-5-21-A");
@@ -80,7 +80,7 @@ fn fail_closed_exemptions_without_persistence_is_unchanged() {
 
 #[test]
 fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
-    //  HW — the block-all must keep a hole for the liveness
+    // The block-all must keep a hole for the liveness
     // probe's ICMP target (the tunnel next-hop). A probe-DEAD verdict
     // empties the GATED resolution — which is exactly when the block-all
     // arms — so the exemption must come from the RAW binding resolution,
@@ -135,7 +135,7 @@ fn fail_closed_exemptions_carry_probe_target_even_when_liveness_dead() {
 
 #[test]
 fn probe_tick_forgets_the_failing_run_when_the_binding_stops_resolving() {
-    //  HW — while a VPN reconnects, its adapter enumerates Down
+    // While a VPN reconnects, its adapter enumerates Down
     // (no IPv4) and the probe cannot run. The failing run accumulated just
     // before the outage must be dropped the moment the binding stops
     // resolving, or the stale window declares the tunnel DEAD the instant

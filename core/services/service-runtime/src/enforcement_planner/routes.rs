@@ -3,9 +3,9 @@
 
 use super::*;
 
-// ── Slice 5 — system route table (route_codegen) ───────────────────────────────
+// ── System route table (route_codegen) ──────────────────────────────────────────
 
-/// Plan the **system route table** (Slice 5) for `mode` into neutral
+/// Plan the **system route table** for `mode` into neutral
 /// [`RouteIntent`]s — the neutral equivalent of `route_codegen::generate_routes`
 /// (the routing mechanism; the WFP planners above are the blocking one).
 ///

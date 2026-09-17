@@ -46,7 +46,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
             .diagnostic_session
             .current(now_ms)
             .map(|s| {
-                // #21 — a no-expiry ("until restart") session has no countdown.
+                // A no-expiry ("until restart") session has no countdown.
                 let until_restart = s.is_until_restart();
                 DiagnosticModeStateDto {
                     active: true,
@@ -209,7 +209,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
             .as_deref()
             .map(slug_to_scope)
             .unwrap_or(DiagnosticSessionScope::All);
-        // #21 — the "until restart" radio maps to a no-expiry session; the
+        // The "until restart" radio maps to a no-expiry session; the
         // 1h/4h radios pass a bounded duration.
         let session = if req.until_restart {
             DiagnosticSession::until_restart(now_ms, "gui-user", scope, None)

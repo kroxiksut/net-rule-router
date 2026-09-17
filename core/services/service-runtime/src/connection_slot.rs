@@ -50,9 +50,9 @@ mod tests {
 
     #[test]
     fn a_panicking_worker_still_releases_its_slot() {
-        // The whole point: the decrement used to be the last statement of the
-        // worker closure, and a panic in dispatch skipped it. Thirty-two of
-        // those and the transport is closed for business.
+        // The whole point: a panic anywhere in dispatch must still release the
+        // slot. Thirty-two panics that don't and the transport is closed for
+        // business.
         let count = Arc::new(AtomicUsize::new(0));
         let moved = Arc::clone(&count);
         let outcome = std::panic::catch_unwind(move || {

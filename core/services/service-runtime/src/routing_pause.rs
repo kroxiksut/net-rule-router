@@ -20,8 +20,7 @@
 //!   `remove_for_sid` runs OUTSIDE the connection mutex (we drop the
 //!   guard before calling the dispatcher).
 //! - Concurrent `pause` and `resume` for the same SID serialise via the
-//!   IPC `MutationQueue` (block 14) — this coordinator does not add a
-//!   second lock.
+//!   IPC `MutationQueue` — this coordinator does not add a second lock.
 //!
 //! ## M-1 awareness
 //!
@@ -832,8 +831,8 @@ mod tests {
     fn pause_all_active_includes_effective_console_sid_without_tray() {
         // No tray connections (empty registry) but a console session under
         // service-driven scope → safe-disable must still pause the console user,
-        // remove its filters, and return a truthful non-empty list (the old
-        // `registry.active_sids()`-only path returned an empty "0 suspended").
+        // remove its filters, and return a truthful non-empty list — a SID set
+        // built from `registry.active_sids()` alone would be empty here.
         let fx = build_route_fx(Some("S-CONSOLE"));
         let paused = fx
             .coord
@@ -846,9 +845,9 @@ mod tests {
 
     #[test]
     fn pause_effective_sid_persist_keeps_slash32_drops_overlay() {
-        // routing_stop_policy = Persist (opt-in; the default is teardown, HW-0709)
-        // → keep the /32 rule-route on the additional adapter, remove only NRR's
-        // /2 counter-overlay.
+        // routing_stop_policy = Persist (opt-in; the default is teardown) → keep
+        // the /32 rule-route on the additional adapter, remove only NRR's /2
+        // counter-overlay.
         let fx = build_route_fx(Some("S-CONSOLE"));
         {
             use nrr_domain::enforcement_mode::EnforcementMode;

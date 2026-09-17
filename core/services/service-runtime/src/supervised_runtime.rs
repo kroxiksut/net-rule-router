@@ -152,10 +152,9 @@ pub struct SupervisedRuntimeDeps {
     /// `ServiceHealthGet` handler reads via `Arc<dyn HealthReporter>`.
     /// Owned here so the supervisor can call `record_bootstrap`,
     /// `clear_lifecycle_override`, and per-task `record` against the
-    /// instance the GUI sees. Constructing a second aggregator in this
-    /// module produced a bug where IPC reported `state=starting,
-    /// components=[]` forever because the seeded aggregator was a
-    /// different `Arc` than the IPC's reader.
+    /// instance the GUI sees. A second aggregator constructed in this
+    /// module would desync from the IPC reader's `Arc`, so IPC would
+    /// report `state=starting, components=[]` forever.
     pub health: Arc<HealthAggregator>,
     /// Production IPC server. The supervised runtime calls `bind()`
     /// once eagerly inside the IPC-task bundle build so a bad SDDL or
@@ -207,10 +206,9 @@ pub struct SupervisedRuntimeDeps {
     /// `traffic-sample-tick`. `None` skips the task (traffic DB unavailable /
     /// degraded boot).
     pub traffic_tick: Option<crate::service_tasks::TrafficTickDeps>,
-    /// Promoted from a transient `build_supervised_runtime_deps`
-    /// local to a deps field so the coordinator's lifetime is explicit.
-    /// `None` when the audit writer isn't available (recovery-blocked path).
-    /// Held alive for the full runtime; primary consumers are the
+    /// Held alive for the full runtime so the coordinator's lifetime is
+    /// explicit. `None` when the audit writer isn't available
+    /// (recovery-blocked path). Primary consumers are the
     /// `ApplyFailurePolicyWriter` (forward) and the `CoordinatorPolicyManager`
     /// (read-side queries via `current_active`).
     pub activation_coordinator: Option<Arc<crate::activation_coordinator::ActivationCoordinator>>,
@@ -427,7 +425,7 @@ fn component_for_task(id: &str) -> Option<HealthComponent> {
 /// `Starting → RecoveryRequired → Stopping → Stopped`.
 ///
 /// Returns `ServiceShutdownReason::ScmStop` on stop-token-driven exit.
-/// Future blocks may add `IntegrityFailure` and friends.
+/// Future work may add `IntegrityFailure` and friends.
 pub fn run_supervised_runtime(
     controller: &dyn ServiceController,
     stop: &StopToken,
@@ -838,11 +836,11 @@ fn spawn_production_tasks(
         );
     }
 
-    // 1b. route-reconcile-safety-tick (block 16,  — periodic
-    // idempotent re-drive that catches drift the availability-edge monitor
-    // can't see: a secondary that re-IPs while staying `Available`, or a
-    // baseline change applied with no tray under service-driven scope. Only
-    // when the route path exists (coordinator present → hook is Some).
+    // 1b. route-reconcile-safety-tick — periodic idempotent re-drive that
+    // catches drift the availability-edge monitor can't see: a secondary
+    // that re-IPs while staying `Available`, or a baseline change applied
+    // with no tray under service-driven scope. Only when the route path
+    // exists (coordinator present → hook is Some).
     if let Some(hook) = deps.route_recompute_hook.clone() {
         if let Err(e) = supervisor.spawn(build_route_reconcile_safety_task(hook)) {
             tracing::warn!(
@@ -852,8 +850,8 @@ fn spawn_production_tasks(
         }
     }
 
-    // 1c. secondary-liveness-tick (HW-0710 F7 Track 1) — fast active-probe of the
-    // bound secondary tunnel; a no-op while the feature is disabled (window 0).
+    // 1c. secondary-liveness-tick — fast active-probe of the bound secondary
+    // tunnel; a no-op while the feature is disabled (window 0).
     if let Some(hook) = deps.secondary_liveness_hook.clone() {
         if let Err(e) = supervisor.spawn(build_secondary_liveness_task(hook)) {
             tracing::warn!(
@@ -965,7 +963,7 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         tracing::warn!(target: "nrr::supervisor", "spawn diagnostics-cleanup failed: {e}");
     }
 
-    // 2b. diagnostics-audit-cleanup (#20). Separate task — prunes `nrr_audit_*`
+    // 2b. diagnostics-audit-cleanup. Separate task — prunes `nrr_audit_*`
     // NDJSON by the service-side audit retention policy (never user-triggered).
     if let Err(e) = supervisor.spawn(build_diagnostics_audit_cleanup_task(
         deps.audit_dir.clone(),
@@ -1024,9 +1022,9 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 3b. traffic-sample-tick (Block T). Skipped when the traffic DB / sampler
-    // wasn't built (degraded boot). Reads interface octet counters, buckets by
-    // role, folds deltas into the daily ledger + session totals.
+    // 3b. traffic-sample-tick. Skipped when the traffic DB / sampler wasn't
+    // built (degraded boot). Reads interface octet counters, buckets by role,
+    // folds deltas into the daily ledger + session totals.
     if let Some(tick) = deps.traffic_tick.clone() {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_traffic_sample_task(tick)) {
             tracing::warn!(
@@ -1036,11 +1034,10 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 4. dns-refresh-tick (block 16.12.A.4). Skipped when the cache DB
-    // couldn't be opened. Drives the DNS resolver against expired
-    // hostnames hot-first; the periodic refresh keeps `ExactFqdn` /
-    // `SuffixDomain` / `Zone` rule fan-outs producing filters as TTLs
-    // age out.
+    // 4. dns-refresh-tick. Skipped when the cache DB couldn't be opened.
+    // Drives the DNS resolver against expired hostnames hot-first; the
+    // periodic refresh keeps `ExactFqdn` / `SuffixDomain` / `Zone` rule
+    // fan-outs producing filters as TTLs age out.
     if let Some(orch) = deps.dns_refresh_orchestrator.as_ref() {
         if let Err(e) = supervisor.spawn(crate::service_tasks::build_dns_refresh_task(
             Arc::clone(orch),
@@ -1053,9 +1050,9 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 5. rule-hostname-seed-tick (block 16.18 β). Resolves the active
-    // user's ExactFqdn rule hostnames into the FQDN cache so domain rules
-    // actually route. Skipped when the route path isn't available.
+    // 5. rule-hostname-seed-tick. Resolves the active user's ExactFqdn rule
+    // hostnames into the FQDN cache so domain rules actually route. Skipped
+    // when the route path isn't available.
     if let (Some(seeder), Some(present)) = (
         deps.rule_hostname_seeder.as_ref(),
         present_principals_fn(deps),
@@ -1072,11 +1069,11 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 6. dns-observe-tick (block 16.18 β). Drains passively-observed DNS
-    // resolutions and caches the ones matching an active suffix/zone/exact
-    // rule, then recomputes routes. This is how `*.example.com` / `.ru`
-    // rules become real routes. Skipped when the route path / ETW observer
-    // isn't available.
+    // 6. dns-observe-tick. Drains passively-observed DNS resolutions and
+    // caches the ones matching an active suffix/zone/exact rule, then
+    // recomputes routes. This is how `*.example.com` / `.ru` rules become
+    // real routes. Skipped when the route path / ETW observer isn't
+    // available.
     if let (Some(source), Some(consumer)) = (
         deps.dns_observation_source.as_ref(),
         deps.dns_observation_consumer.as_ref(),
@@ -1093,10 +1090,10 @@ fn spawn_optional_tasks(supervisor: &ServiceSupervisor, deps: &SupervisedRuntime
         }
     }
 
-    // 7. conn-observe-tick (block 16.18.vpn). Opt-in connection-egress trace:
-    // drains observed outbound connections and derives each one's egress
-    // interface for diagnostics. Skipped unless the observer was wired (off by
-    // default; enabled via the conn-trace setting / NRR_CONN_TRACE).
+    // 7. conn-observe-tick. Opt-in connection-egress trace: drains observed
+    // outbound connections and derives each one's egress interface for
+    // diagnostics. Skipped unless the observer was wired (off by default;
+    // enabled via the conn-trace setting / NRR_CONN_TRACE).
     if let (Some(source), Some(consumer)) = (
         deps.conn_observation_source.as_ref(),
         deps.conn_observation_consumer.as_ref(),

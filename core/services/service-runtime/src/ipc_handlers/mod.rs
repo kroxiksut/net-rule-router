@@ -1,5 +1,9 @@
 //! IPC operation handlers for the running service.
 //!
+//! `MutationSubmitHandler` over the named pipe is the ONLY sanctioned
+//! mutation channel. A file watcher would open a second, unaudited one
+//! and must not be added.
+//!
 //! Every operation in [`IpcOperationName::ALL`] has a registered handler:
 //! operations whose real implementation is not yet wired resolve to
 //! [`UnimplementedHandler`], which surfaces `RecoveryRequired` to the
@@ -483,9 +487,6 @@ impl IpcHandlerDeps {
         self
     }
 
-    /// Attach the security alerts repository so the list
-    /// handler honours `state_filter` and the mutation executor can
-    /// route ack/resolve operations through it.
     /// Attach the reader for [`Self::other_principals_hold_revisions`].
     #[must_use]
     pub fn with_other_principals_reader(
@@ -496,6 +497,9 @@ impl IpcHandlerDeps {
         self
     }
 
+    /// Attach the security alerts repository so the list
+    /// handler honours `state_filter` and the mutation executor can
+    /// route ack/resolve operations through it.
     pub fn with_alerts_repo(
         mut self,
         repo: Arc<dyn nrr_diagnostics::audit::alert::SecurityAlertsRepository>,
@@ -724,9 +728,6 @@ impl IpcHandlerDeps {
         self
     }
 
-    /// Attach the caller's local-network exemptions so the settings screen can
-    /// list what the service discovered and record what the user decided.
-    /// Attach the main-link probe runner (see [`Self::auto_rule_probe`]).
     /// Attach the refusing-site writer (see [`Self::refusing_anchors`]).
     pub fn with_refusing_anchors(
         mut self,
@@ -736,6 +737,7 @@ impl IpcHandlerDeps {
         self
     }
 
+    /// Attach the main-link probe runner (see [`Self::auto_rule_probe`]).
     pub fn with_auto_rule_probe(
         mut self,
         runner: Arc<dyn crate::ipc_handlers::providers::AutoRuleProbeRunner>,
@@ -744,6 +746,8 @@ impl IpcHandlerDeps {
         self
     }
 
+    /// Attach the caller's local-network exemptions so the settings screen can
+    /// list what the service discovered and record what the user decided.
     pub fn with_local_networks(
         mut self,
         provider: Arc<dyn crate::ipc_handlers::providers::LocalNetworksProvider>,

@@ -11,14 +11,12 @@
 //   * Required reason TextField (audit trail).
 //   * Confirm button stays disabled until the reason is non-empty.
 //   * Cancel / Esc / close = no-op (the dialog just dismisses).
-//   * On Confirm, the dialog emits `confirmed(reason)` — the host
-//     decides what the next step is (RPC call or — until the bridge
-//     lands — a logged stub).
+//   * On Confirm, the dialog emits `confirmed(reason)`; the host runs the
+//     real two-phase safe-disable RPC (dry-run → confirm via
+//     `rpcProductImpactDisable`) with a toast tracking progress.
 //
-// The host's `confirmed` handler runs the real two-phase safe-disable RPC
-// (dry-run → confirm via `rpcProductImpactDisable`), with
-// a toast tracking progress. This dialog only owns the UX path (reason capture
-// + confirm gating); Cancel/Esc dismisses and reports a cancelled status.
+// This dialog only owns the UX path (reason capture + confirm gating);
+// Cancel/Esc dismisses and reports a cancelled status.
 
 import QtQuick 2.15
 import QtQuick.Controls 2.15
@@ -52,9 +50,9 @@ Dialog {
         return fallback
     }
 
-    // Renamed from `reset()` to avoid colliding with Dialog's built-in
-    // `reset` signal (Qt warning: "Duplicate method name: invalid
-    // override of property change signal or superclass signal").
+    // Named to avoid colliding with Dialog's built-in `reset` signal (Qt
+    // warning: "Duplicate method name: invalid override of property
+    // change signal or superclass signal").
     function resetForOpen(prefilledReason) {
         reasonText = String(prefilledReason || "")
     }

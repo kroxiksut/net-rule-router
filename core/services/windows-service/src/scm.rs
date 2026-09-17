@@ -1,11 +1,10 @@
 //! SCM dispatcher, control handler and status reporter — the parts that run
 //! this process from the inside and therefore cannot live anywhere else.
 //!
-//! The *outside* half (register, remove, start, stop, query) moved to
-//! `nrr_platform_windows::service_control`, behind the neutral
-//! `ServiceControlPort`, so the administrative console drives exactly the code
-//! path these verbs drive. What remains here are the lifecycle FLOWS: the steps
-//! around the OS call that the OS knows nothing about, such as backing up the
+//! The *outside* half (register, remove, start, stop, query) lives in
+//! `nrr_platform_windows::service_control` behind `ServiceControlPort`, so the
+//! console drives the same path those verbs drive. What remains here are the
+//! lifecycle flows the OS call itself doesn't know about, e.g. backing up the
 //! state database before a binary update.
 //!
 //! Uses the `windows-service` crate:
@@ -344,16 +343,15 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
         artifacts.report.blocking = true;
     }
 
-    // Persist-on-stop — defensive standalone strip of any orphaned
-    // block/fail-closed/kill-switch WFP filter a hard-killed prior instance
-    // left behind. Runs before deps are built so a kill-switch is removed even
-    // on a recovery-BLOCKED boot (where the orchestrator — and its own startup
-    // strip — is never constructed). Idempotent on a healthy boot.
-    // Each stage announces itself: a boot that stops answering is otherwise a
-    // silent 280-line gap between "crash recovery probe complete" and the first
-    // line the dependency build emits.
-    // Everything this product enforces goes through the filtering engine, so a
-    // stopped one explains an otherwise baffling boot before it happens.
+    // Defensive standalone strip of any orphaned block/fail-closed/kill-switch
+    // filter a hard-killed prior instance left behind, run before deps are
+    // built so it happens even on a recovery-BLOCKED boot (where the
+    // orchestrator and its own startup strip are never constructed).
+    // Idempotent on a healthy boot; stages announce themselves so a stall
+    // here isn't a silent gap before the dependency build's own logging.
+    //
+    // Everything this product enforces goes through the filtering engine, so
+    // a stopped one explains an otherwise baffling boot before it happens.
     match nrr_platform_windows::service_control::filtering_engine_running() {
         Some(true) => {}
         Some(false) => tracing::error!(

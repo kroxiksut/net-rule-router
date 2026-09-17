@@ -1,4 +1,4 @@
-//! Block D (fake-IP) — VPN self-heal.
+//! Fake-IP VPN self-heal.
 //!
 //! A VPN client resolves its own server's hostname, gets a fake address like
 //! every other in-scope host, and connects to it — so its control channel rides

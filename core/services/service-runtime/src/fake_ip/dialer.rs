@@ -985,8 +985,8 @@ mod tests {
         // Hand the accepted socket back instead of dropping it here: closing
         // it before the connecting side's readiness poll observes the
         // handshake can turn a healthy connect into a spurious hang-up under
-        // scheduling pressure (a real flake this test used to have). Keeping
-        // it open until after the dial already succeeded removes the race.
+        // scheduling pressure. Keeping it open until after the dial already
+        // succeeded removes the race.
         let accepted = std::thread::spawn(move || listener.accept().expect("accept"));
 
         let dialer = SystemRelayDialer::new()

@@ -27,17 +27,17 @@
 //! the poll loop through per-flow buffers; the poll loop never blocks on the
 //! network, and the workers never touch a `smoltcp` socket.
 //!
-//! ## What is finished here and what is not
+//! ## Test vs. production wiring
 //!
-//! TCP and UDP are both complete: the TCP handshake, bidirectional splice,
-//! half-close mirroring and idle teardown; and UDP/QUIC (one bound socket per
-//! fake endpoint, multiplexed per client, idle-reaped). What is left before a
-//! hardware run: the production
-//! [`UpstreamAddressResolver`]/[`RouteSelector`] adapters over the FQDN cache
-//! and rule engine, and giving the Windows [`TunDevice`] a bounded-wait read so
-//! the poll loop can service upstream->client data while no inbound packet is
-//! pending (the mock device already returns promptly, so the neutral logic is
-//! exercised in tests today).
+//! TCP and UDP are both complete here: the TCP handshake, bidirectional
+//! splice, half-close mirroring and idle teardown; and UDP/QUIC (one bound
+//! socket per fake endpoint, multiplexed per client, idle-reaped). The
+//! production [`UpstreamAddressResolver`]/[`RouteSelector`] adapters live
+//! over the FQDN cache and rule engine (see `production_ports`); the Windows
+//! [`TunDevice`] still needs a bounded-wait read so the poll loop can service
+//! upstream->client data while no inbound packet is pending — the mock
+//! device already returns promptly, which is what lets the neutral logic run
+//! under test without it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write as _};
@@ -90,13 +90,10 @@ const TCP_FLOW_KEEP_ALIVE: std::time::Duration = std::time::Duration::from_secs(
 /// Chunk size for moving bytes between a `smoltcp` socket and the flow buffers.
 const PUMP_CHUNK_BYTES: usize = 16 * 1024;
 
-/// High-water mark for each direction's hand-off queue. Both were unbounded:
-/// the poll loop drained the client's socket as fast as smoltcp could deliver,
-/// whatever the upstream writer managed, and the reader thread pushed replies
-/// in whether or not the client's socket was taking them. A stalled peer in
-/// either direction then grew a queue instead of applying backpressure — and
-/// TCP already has the mechanism, so the fix is to stop consuming and let the
-/// window close.
+/// High-water mark for each direction's hand-off queue. Without a cap a
+/// stalled peer in either direction grows its queue without bound instead of
+/// applying TCP backpressure, so past this line the loop stops consuming and
+/// lets the window close.
 const FLOW_QUEUE_HIGH_WATER_BYTES: usize = 256 * 1024;
 
 /// How long the run loop parks when idle (no packet processed and no worker
@@ -647,9 +644,9 @@ impl FakeIpStack {
     }
 
     /// Wire the live `fake_ip_instant_rst` gate (schema v40). Builder-style;
-    /// the default is a private flag defaulting to `true` (today's
-    /// instant-reset behaviour), so a caller that never wires this — every
-    /// existing test — sees unchanged behaviour.
+    /// the default is a private flag defaulting to `true` (instant-reset),
+    /// so a caller that never wires this — every existing test — sees
+    /// unchanged behaviour.
     #[must_use]
     pub fn with_instant_rst(mut self, flag: Arc<AtomicBool>) -> Self {
         self.instant_rst = flag;
@@ -665,7 +662,6 @@ impl FakeIpStack {
         self
     }
 
-    /// Override the per-socket buffer size (tests use a small value).
     #[must_use]
     /// Lower the flow ceiling. Only tests do: production wants the memory
     /// bound the constant states.
@@ -675,6 +671,7 @@ impl FakeIpStack {
         self
     }
 
+    /// Override the per-socket buffer size (tests use a small value).
     pub fn with_socket_buffer_bytes(mut self, bytes: usize) -> Self {
         self.socket_buffer_bytes = bytes.max(1);
         self
@@ -1082,34 +1079,9 @@ const HOLD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// a bounded, predictable stall rather than an open-ended one.
 const HOLD_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Attempts the TCP dial, holding and retrying ONLY a source-policy refusal
-/// when `instant_rst` is off. A genuine network failure (unreachable host,
-/// connection refused, timeout) always fails on the first attempt — holding
-/// those would mask a real outage as a slow connect instead of letting the
-/// application retry or fail over on its own.
-///
-/// Runs on the dial-worker thread spawned by [`spawn_dial_worker`], which is
-/// never joined by the poll loop OR by
-/// [`FakeIpController::stop`](super::lifecycle::FakeIpController::stop) —
-/// `stop` only joins the poll-loop thread (`RunningStack.join`), never a
-/// per-flow dial worker. Holding here for up to `HOLD_RETRY_WINDOW` therefore
-/// cannot delay a clean stack shutdown; the bounded window (rather than an
-/// explicit cancel signal) is what keeps a held dial from outliving the flow
-/// indefinitely. `shared.is_dead()` is also checked every iteration so a
-/// client that resets mid-hold stops the retry immediately instead of running
-/// out the window pointlessly.
-///
-/// Returns the dial result, which mode applied (`"instant"` / `"held"`), and
-/// how many attempts were made — all three feed the Task-2 telemetry in
-/// [`spawn_dial_worker`].
-///
-/// `retry_interval`/`retry_window` are parameters (not the
-/// [`HOLD_RETRY_INTERVAL`]/[`HOLD_RETRY_WINDOW`] constants directly) purely so
-/// tests can exercise the window-exhaustion path in milliseconds instead of
-/// really waiting out 10 s; production always calls with the two constants.
 /// Whether the client's half-close may be forwarded to the upstream yet.
 ///
-/// Two conditions, and both were learned the hard way.
+/// Two conditions gate it.
 ///
 /// The STATE test is by the states that only follow the peer's FIN, never by
 /// `!may_recv()`: that is also true before the handshake completes (Listen /
@@ -1136,6 +1108,31 @@ fn client_fin_may_propagate(dial_is_done: bool, state: tcp::State) -> bool {
         )
 }
 
+/// Attempts the TCP dial, holding and retrying ONLY a source-policy refusal
+/// when `instant_rst` is off. A genuine network failure (unreachable host,
+/// connection refused, timeout) always fails on the first attempt — holding
+/// those would mask a real outage as a slow connect instead of letting the
+/// application retry or fail over on its own.
+///
+/// Runs on the dial-worker thread spawned by [`spawn_dial_worker`], which is
+/// never joined by the poll loop OR by
+/// [`FakeIpController::stop`](super::lifecycle::FakeIpController::stop) —
+/// `stop` only joins the poll-loop thread (`RunningStack.join`), never a
+/// per-flow dial worker. Holding here for up to `HOLD_RETRY_WINDOW` therefore
+/// cannot delay a clean stack shutdown; the bounded window (rather than an
+/// explicit cancel signal) is what keeps a held dial from outliving the flow
+/// indefinitely. `shared.is_dead()` is also checked every iteration so a
+/// client that resets mid-hold stops the retry immediately instead of running
+/// out the window pointlessly.
+///
+/// Returns the dial result, which mode applied (`"instant"` / `"held"`), and
+/// how many attempts were made — all three feed the dial-outcome telemetry in
+/// [`spawn_dial_worker`].
+///
+/// `retry_interval`/`retry_window` are parameters (not the
+/// [`HOLD_RETRY_INTERVAL`]/[`HOLD_RETRY_WINDOW`] constants directly) purely so
+/// tests can exercise the window-exhaustion path in milliseconds instead of
+/// really waiting out 10 s; production always calls with the two constants.
 fn dial_tcp_with_hold(
     shared: &FlowShared,
     dialer: &dyn RelayDialer,

@@ -1,8 +1,7 @@
 //! Unit tests for [`super`] — the fake-IP stack.
 //!
-//! 1792 of the module's lines were this block. Moved out verbatim (one
-//! level of indentation removed and nothing else) so the file one reads to
-//! understand the code is the code.
+//! Kept out of `stack.rs` so the file one reads to understand the datapath
+//! is the datapath, not the datapath plus its tests.
 
 /// The half-close must not overtake the request it follows.
 #[test]
@@ -30,7 +29,8 @@ fn a_half_close_waits_for_the_dial_that_carries_the_request() {
 }
 use super::super::{dialer, health, relay};
 use super::*;
-// The phy adapter moved to `super::phy`; the parent no longer imports its traits.
+// The phy adapter lives in `super::phy`, so its smoltcp trait imports below
+// are not pulled in by `use super::*`.
 use nrr_platform_api::fake_ip::tun::{
     MockTunAdapter, MockTunState, TunAdapterConfig, TunAdapterPort,
 };

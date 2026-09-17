@@ -4,8 +4,6 @@
 //! compiles to) lives in `super::plan`; this is what happens to the kernel once
 //! the plan exists — including the locking that keeps two triggers for one SID
 //! from interleaving.
-//!
-//! Behaviour is unchanged: the same methods, in the same order, verbatim.
 
 use super::*;
 
@@ -30,28 +28,15 @@ impl PerSidApplyOrchestrator {
             .unwrap_or(0)
     }
 
-    /// Install (or reinstall) the SID's filter set from the latest
-    /// policy snapshot. Equivalent to a full
-    /// `remove_for_sid` + `install_for_sid` cycle, modulo idempotent
-    /// `WfpFilterAdd` (FWP_E_DUPLICATE_OBJECT → ignored).
-    ///
-    /// filters now come from the WFP codegen
-    /// ([`crate::wfp_codegen::generate_filters`]) which iterates the
-    /// active rule book × FQDN cache, not from a placeholder permit-
-    /// per-binding shape. The per-SID `PerSidPolicySnapshot` is still
-    /// loaded — its presence/absence governs whether the orchestrator
-    /// processes the SID at all — but the bindings themselves drive
-    /// the Windows routing table (block 16.12.A.4+), not the WFP
-    /// filter list.
-    /// confirm each id in
-    /// `installed_ids` is actually live in WFP after an install. Missing ids
-    /// are PHANTOMS (recorded installed but never materialised). Logs the
-    /// outcome; returns `Some(phantom_count)` on a successful enumeration and
-    /// `None` when the live filters could not be read (verification skipped).
-    /// Best-effort — the production caller ignores the return (the check is a
-    /// safety net, not a gate); the value exists so tests can assert on it.
-    /// `expected` is the count we claimed installed.
-    // `pub(super)` because the impl and its tests are now separate files.
+    /// Confirms every id in `installed_ids` is actually live in WFP after an
+    /// install. Missing ids are PHANTOMS (recorded installed but never
+    /// materialised). Logs the outcome; returns `Some(phantom_count)` on a
+    /// successful enumeration and `None` when the live filters could not be
+    /// read (verification skipped). Best-effort — the production caller
+    /// ignores the return (the check is a safety net, not a gate); the value
+    /// exists so tests can assert on it. `expected` is the count claimed
+    /// installed.
+    // pub(super): the tests for this live in a sibling module and call it directly.
     pub(super) fn verify_installed_filters_live(
         &self,
         sid: &str,
@@ -101,7 +86,7 @@ impl PerSidApplyOrchestrator {
     /// Take this SID's apply lock. Held for the whole compute-and-apply, so two
     /// triggers cannot interleave and leave the engine holding a set neither of
     /// them decided on.
-    // `pub(super)` because the impl and its tests are now separate files.
+    // pub(super): the tests for this live in a sibling module and call it directly.
     pub(super) fn apply_lock_for(&self, sid: &str) -> Arc<Mutex<()>> {
         Arc::clone(
             self.apply_locks
@@ -118,8 +103,6 @@ impl PerSidApplyOrchestrator {
         self.install_for_sid_with(sid, None)
     }
 
-    /// [`Self::install_for_sid`] with an optional caller-supplied rules
-    /// snapshot (block 16.HW-0716 P0.2 — see `compute_filters_for_sid`).
     /// Derive what applying `rules` to `sid` WOULD do, touching nothing.
     ///
     /// The compute is the only thing that knows the real answer — how many
@@ -244,13 +227,11 @@ impl PerSidApplyOrchestrator {
         if self.adds_refused(sid, "install") {
             return Ok(0);
         }
-        // the admin baseline is never enforced as its
-        // own machine-wide filter set. It only ever reaches the wire as a
-        // per-user read-through (a real `S-…` SID resolves the baseline
-        // when it has no revision of its own). When NOBODY is logged in,
-        // the active-SID set is empty, so `reconcile` installs nothing and
-        // routing is passthrough — the baseline never gets a filter set of
-        // its own. This guard makes that invariant explicit.
+        // The admin baseline is never enforced as its own machine-wide
+        // filter set — it only reaches the wire as a per-user read-through
+        // when a real SID has no revision of its own. With nobody logged
+        // in, `reconcile` installs nothing, so the baseline itself never
+        // gets a filter set. This guard makes that invariant explicit.
         if sid == nrr_domain::user_principal::BASELINE_PRINCIPAL {
             return Err(OrchestratorError::BaselineNotRoutable);
         }
@@ -344,19 +325,18 @@ impl PerSidApplyOrchestrator {
         // replacement set is already up, so dropping what it supersedes cannot
         // open a window.
         self.delete_superseded_filters(sid, &previously_installed, &installed_ids);
-        // re-read our LIVE WFP filters
-        // and confirm every id we just recorded as installed is actually
-        // present in the engine. A missing id = a PHANTOM: counted as installed
-        // but never in WFP — the exact 0715 bug class (a mis-classified error
-        // silently swallowed the add while `installed=N` still incremented). A
-        // mismatch is logged LOUD (error) so a future regression is caught in
-        // NDJSON instead of trusting `installed=N`. Best-effort: an enumeration
-        // failure never fails the apply — verification is a safety net, not a
-        // gate, and the filters are already committed by this point. Runs only
-        // on a real install (this path), not on the frequent coverage-reconcile
-        // tick, so the one extra enumeration per policy change is cheap.
+        // Re-read our live WFP filters and confirm every id we just recorded
+        // as installed is actually present in the engine. A missing id is a
+        // PHANTOM: counted as installed but never materialised in WFP — the
+        // failure mode when an add error gets mis-classified and silently
+        // swallowed while `installed=N` still increments. Logged loud
+        // (error) so a regression shows up in NDJSON instead of trusting the
+        // count. Best-effort: an enumeration failure never fails the apply
+        // (the filters are already committed); runs only on a real install,
+        // not the frequent coverage-reconcile tick, so the cost is one
+        // enumeration per policy change.
         self.verify_installed_filters_live(sid, &installed_ids, count);
-        // P3-followup — persist the ids so a hard-kill's orphans reap by id.
+        // Persist the ids so a hard-kill's orphans can be reaped by id.
         if let Some(ledger) = self.ledger.as_ref() {
             ledger.record(&installed_ids);
         }
@@ -372,9 +352,8 @@ impl PerSidApplyOrchestrator {
             PerSidApplyAuditKind::Applied
         };
         if apply_outcome.skipped.is_empty() {
-            // a clean install used to be audit-only; the 0716
-            // run had to be diagnosed from the ABSENCE of log lines. Log success
-            // at info so "did enforcement arm?" is answerable from NDJSON alone.
+            // Log success at info, not just audit, so "did enforcement arm?"
+            // is answerable directly from NDJSON.
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
                 sid,
@@ -401,43 +380,33 @@ impl PerSidApplyOrchestrator {
         Ok(count)
     }
 
-    /// window-free, make-before-break reconcile of
-    /// the per-SID filter set against the freshly-resolved secondary LUID.
+    /// Window-free, make-before-break reconcile of the per-SID filter set
+    /// against the freshly-resolved secondary LUID: grows coverage
+    /// additively (newly observed secondary IPs) and reaps tracked filters
+    /// no longer desired — critically the dead-LUID egress permits left
+    /// after a secondary adapter reconnect. The permit id folds the LUID
+    /// (see `killswitch_codegen::permit_luid_seg`), so a reconnect mints a
+    /// new permit id and the stale one is superseded and deleted here (a WFP
+    /// filter is immutable by key, so an add-only path would swallow the
+    /// collision and the stale permit would stick).
     ///
-    /// This both GROWS coverage additively (freshly-observed secondary IPs, the
-    /// block 16.HW-0704 P1 case) AND reaps the tracked filters no longer desired
-    /// — critically the **dead-LUID egress permits** left after a secondary adapter reconnect.
-    /// (It replaces the earlier add-only `refresh_secondary_coverage`, which
-    /// could grow but never reap.) The permit id
-    /// now folds the LUID (see `killswitch_codegen::permit_luid_seg`), so a new
-    /// LUID mints a new permit id; the stale old-LUID id is superseded and
-    /// deleted here. (A WFP filter is immutable by key, so the new permit MUST
-    /// be a new id — an add-only path would swallow the collision and the stale
-    /// permit would stick, blocking legit secondary-adapter traffic until a policy recompile.)
+    /// Ordering is strictly ADD-then-DELETE so the kill-switch is never
+    /// briefly lifted. A pure LUID flip keeps every BLOCK's id stable, so
+    /// only dead-LUID permits get deleted (fail-safe — deleting a permit
+    /// only tightens). An up/down mode transition can change a block's
+    /// shape (`block_off_secondary` ↔ `ale_block`), putting a superseded
+    /// block in the delete set; safety then rests on add-before-delete plus
+    /// deferring the whole delete pass whenever a replacement block add was
+    /// skipped, so a block is never removed while its replacement is not
+    /// yet up. A skipped permit never defers the delete, since skipping a
+    /// permit only tightens. The delete set is derived purely from the
+    /// desired-vs-tracked id diff, never from stored metadata the untyped
+    /// id set lacks.
     ///
-    /// Ordering is strictly **ADD-then-DELETE** so the kill-switch is never
-    /// briefly lifted. Across a **pure LUID flip** (reconnect) every BLOCK keeps
-    /// a LUID-free stable id and stays in both the desired and tracked sets, so
-    /// only the dead-LUID permits are deleted (deleting a permit only tightens —
-    /// fail-safe). Across an **up↔down mode transition** a block's SHAPE changes
-    /// (`block_off_secondary` ↔ `ale_block`, `catch_all_block` ↔ `ale_block`),
-    /// so a superseded block CAN enter the delete set — there, safety rests on
-    /// (a) add-before-delete installing the replacement block first, and (b) the
-    /// delete pass being **deferred whenever a replacement BLOCK add was skipped**
-    /// (best-effort), so a block is never removed while its replacement is not yet
-    /// up. A skipped PERMIT does not defer the delete (skipping a permit only
-    /// tightens), so a pure LUID flip still reaps the dead-LUID permits (gap #2)
-    /// even if an app-permit is unmaterializable. The delete set is derived purely
-    /// from the desired-vs-tracked id diff — never from stored metadata, which the
-    /// untyped id set lacks.
-    ///
-    /// Correct across every secondary adapter transition (the diff drives it): reconnect
-    /// (swap dead permit → live permit), up→down fail-closed (add block-all,
-    /// then drop the per-dest set), up→down fail-open (drop the guard so traffic
-    /// egresses the primary, the chosen posture), down→up (re-arm). A no-op
-    /// (returns 0) when desired == tracked, so it is safe on every DNS-warmup /
-    /// adapter / 30 s safety tick. Only acts on an already-installed SID (an
-    /// inactive / not-yet-installed SID is owned by [`Self::reconcile`]).
+    /// Correct across every secondary adapter transition (reconnect,
+    /// up→down fail-closed/fail-open, down→up re-arm) because the diff
+    /// drives it. A no-op when desired == tracked. Only acts on an
+    /// already-installed SID — [`Self::reconcile`] owns an inactive one.
     /// Returns the count of filters added.
     pub fn reconcile_secondary_coverage(&self, sid: &str) -> Result<usize, OrchestratorError> {
         if self.adds_refused(sid, "leak-guard-coverage") {
@@ -571,15 +540,14 @@ impl PerSidApplyOrchestrator {
             // leave a destination without a covering block. So the BREAK is
             // unsafe iff a *destination-covering* BLOCK add was skipped this tick.
             //
-            // the gate previously armed on ANY skipped block, including
-            // an app-scoped block (ALE app-id, no remote) whose exe did not
-            // resolve (0x80320002). Such a block covers no destination IP, so
-            // skipping it cannot uncover anything — yet when the exe is
-            // *persistently* absent (e.g. 53 app rules for uninstalled apps on
-            // the 0718 boot run) it re-armed the gate every 2 s tick, so the
-            // superseded-PERMIT delete pass was deferred forever and the
-            // over-coverage backlog grew without bound. Excluding app-only block
-            // skips lets the stale permits reap while still deferring on a real
+            // An app-scoped block (ALE app-id, no remote) whose exe does not
+            // resolve (0x80320002) covers no destination IP, so skipping it
+            // cannot uncover anything. The gate deliberately excludes those
+            // app-only block skips: counting them would re-arm on every tick
+            // for an app that is persistently absent, deferring the
+            // superseded-PERMIT delete pass forever and growing the
+            // over-coverage backlog without bound. Excluding them lets the
+            // stale permits reap while still deferring on a real
             // destination-block replacement miss (the actual leak case).
             block_replacement_skipped = to_add.iter().any(|s| {
                 s.action == WfpAction::Block && skipped.contains(&s.id.raw) && !is_app_only_block(s)
@@ -648,14 +616,15 @@ impl PerSidApplyOrchestrator {
         // reflects what was actually deleted (empty when the delete was deferred),
         // so deferred ids stay tracked and are retried on the next tick.
         //
-        // The coverage fields travel with it. This path used to leave whatever
-        // the last install wrote, so the record described a set this pass had
-        // already changed: the addresses it started enforcing were never swept
-        // (sockets already open to them finished on the old link), and the next
-        // install then saw those same addresses as new and swept connections
-        // that had just been re-established. `secondary_resolved` drifted the
-        // same way, turning a tunnel that had been up all along into one that
-        // "just came up" — a sweep of every pinned destination for nothing.
+        // The coverage fields travel with it: they must reflect what this
+        // pass just changed, not what the last install wrote. Otherwise the
+        // addresses this pass starts enforcing never get swept (sockets
+        // already open to them finish on the old link) and the *next*
+        // install sees those same addresses as new, sweeping connections
+        // that had only just been re-established. Likewise `secondary_
+        // resolved` must track this pass's own result, or a tunnel that has
+        // been up all along reads as one that "just came up" — a needless
+        // sweep of every pinned destination.
         let (destinations, secondary_resolved) = Self::coverage_of(&desired);
         self.tear_down_flows_to_new_destinations(sid, &destinations, secondary_resolved);
         Self::publish_enforced_addresses(sid, &desired);
@@ -800,8 +769,8 @@ impl PerSidApplyOrchestrator {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
-        // P3-followup — filters are gone; drop the on-disk ledger so the next
-        // start has no orphans to reap.
+        // Filters are gone; drop the on-disk ledger so the next start has no
+        // orphans to reap.
         if let Some(ledger) = self.ledger.as_ref() {
             ledger.clear();
         }
@@ -814,7 +783,7 @@ impl PerSidApplyOrchestrator {
         Ok(tracked_deleted + swept)
     }
 
-    /// reap a hard-killed PRIOR instance's
+    /// Reap a hard-killed prior instance's
     /// orphaned filters at startup. Reads the on-disk ledger (ids the dead
     /// process recorded before it was killed) and deletes each **by id** — no
     /// dependence on `wfp_enumerate_our_filters`, so it works even when
@@ -839,11 +808,11 @@ impl PerSidApplyOrchestrator {
                 "cleanup_persisted_orphans: delete-by-id best-effort failed: {e:?}",
             );
         } else {
-            // Deliberately not phrased as "reaped N filters": delete-by-id is a
-            // no-op for an id that is already gone, and after a reboot every id
-            // in the ledger is (WFP drops non-persistent filters on shutdown).
-            // The old wording made a clean boot read like it had just cleared
-            // thousands of live blocks.
+            // Phrased as "cleared", not "reaped N filters": delete-by-id is a
+            // no-op for an id already gone, and after a reboot every id in
+            // the ledger is (WFP drops non-persistent filters on shutdown) —
+            // "reaped N" on a clean boot would read like N live blocks had
+            // just been cleared.
             tracing::info!(
                 target: "nrr::per_sid_orchestrator",
                 ledger_ids = ids.len() as u64,
@@ -888,14 +857,13 @@ impl PerSidApplyOrchestrator {
         self.recompile_for_sid_impl(sid, None)
     }
 
-    /// full recompile with the rules supplied by the
-    /// caller instead of a storage read. The activation coordinator dispatches
-    /// apply BEFORE committing the active-revision pointer (all-or-nothing:
-    /// revert must stay possible), so `recompile_for_sid` at activation time
-    /// still saw the PREVIOUS revision — the 0716 run applied
-    /// "no-active-rules" at the exact activation moment and the new rules only
-    /// reached WFP via the next 30 s safety tick. Window-free like
-    /// [`Self::recompile_for_sid`].
+    /// Full recompile with the rules supplied by the caller instead of a
+    /// storage read. The activation coordinator dispatches apply BEFORE
+    /// committing the active-revision pointer (all-or-nothing: revert must
+    /// stay possible), so a storage read at activation time would still see
+    /// the previous revision — applying "no-active-rules" at the exact
+    /// activation moment and leaving the new rules to reach WFP only via the
+    /// next 30 s safety tick. Window-free like [`Self::recompile_for_sid`].
     pub fn recompile_for_sid_with_rules(
         &self,
         sid: &str,
@@ -998,8 +966,8 @@ impl PerSidApplyOrchestrator {
         Ok(())
     }
 
-    /// Delete the filters this SID used to carry that the new set no longer
-    /// contains. A full-replace install only adds, so without this pass a
+    /// Delete filters from `previous` that `kept` no longer contains. A
+    /// full-replace install only adds, so without this pass a
     /// superseded filter stays live in the engine while dropping out of our
     /// accounting: it keeps dropping traffic that no recompute can explain and
     /// no teardown can reach. Best-effort, and deleting a missing id is
@@ -1043,9 +1011,10 @@ impl PerSidApplyOrchestrator {
 
     /// What a filter set covers: the destinations it scopes to (deduplicated,
     /// in emission order) and whether the leak guard had a resolved tunnel when
-    /// it was built. Both answers are READ OFF the filters, so the install path
-    /// and the reconcile path cannot derive them differently — they used to,
-    /// and the reconcile path simply left them at their defaults.
+    /// it was built. Both answers are READ OFF the filters, so the install
+    /// path and the reconcile path cannot derive them differently — deriving
+    /// them independently is what let the reconcile path leave them at
+    /// their defaults.
     ///
     /// Only host-scoped filters contribute. Every subnet-scoped filter we emit
     /// today is an exemption (loopback / LAN / the fake pool), and there is

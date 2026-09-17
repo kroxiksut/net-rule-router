@@ -151,7 +151,7 @@ impl FakeIpAssembly {
 
     /// Teach this assembly which subnets belong to the additional route, so the
     /// answerer never substitutes an address inside the tunnel's own interior.
-    /// Unwired keeps the previous behaviour.
+    /// Optional — unwired, the answerer applies no secondary-subnet exclusion.
     #[must_use]
     pub fn with_secondary_subnets(mut self, read: crate::dns_resolver::SecondarySubnetsFn) -> Self {
         self.secondary_subnets = Some(read);
@@ -301,26 +301,22 @@ struct ControllerInner {
     health: Option<Arc<super::health::FakeIpHealth>>,
     watchdog: WatchdogState,
     /// Stack threads that ignored the stop grace and were detached — a wedged
-    /// TUN datapath can hold `join()` (and with it this controller's mutex)
-    /// for minutes. They still own the old adapter, so `start`
-    /// defers until they finally exit and are reaped. Each keeps its
-    /// `TunControl` so every reap pass can re-fire the (idempotent) shutdown
-    /// wake-up — a reader that missed the first signal gets another chance
-    /// every tick instead of sleeping out its own timeout (observed taking
-    /// up to 215 s to exit on a single wake-up).
+    /// TUN datapath can hold `join()` (and this controller's mutex) for
+    /// minutes. They still own the old adapter, so `start` defers until they
+    /// exit and are reaped. Each keeps its `TunControl` so every reap pass can
+    /// re-fire the idempotent shutdown wake-up rather than wait out a reader's
+    /// own poll timeout (observed up to 215 s on a single wake-up).
     zombies: Vec<ZombieStack>,
     /// A desired stack went down without a user toggle (detached stop or a
     /// self-exited thread) — the watchdog tick keeps retrying the start until
     /// it succeeds. Gated so a factory that cannot build (driver missing) is
     /// not hammered every tick for a stack that never lived.
     restart_pending: bool,
-    /// The datapath went DOWN outside a clean user toggle (detached stop /
-    /// self-exited thread). The next watchdog tick reports a bring-up-style
-    /// `true` to its caller even when no fresh stack could start, so the
-    /// caller re-runs the enforcement replan and flushes the OS DNS cache —
-    /// otherwise applications keep dialling their CACHED virtual addresses
-    /// into a dead TUN for the whole outage (observed hitting WFP walls on
-    /// stale fake answers for several minutes).
+    /// The datapath went DOWN outside a clean user toggle. The next watchdog
+    /// tick reports a bring-up-style `true` even when no fresh stack could
+    /// start, so the caller replans enforcement and flushes the OS DNS cache —
+    /// otherwise apps keep dialling cached virtual addresses into a dead TUN
+    /// for the whole outage.
     down_flush_pending: bool,
 }
 

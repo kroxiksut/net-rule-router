@@ -995,9 +995,9 @@ mod tests {
         );
         // The plan EXISTS - that is the point. Whether it carries blocks is a
         // separate question (with no rules there is no per-destination set to
-        // guard, and the blanket block is opt-in), but a principal who plans
-        // nothing was previously skipped outright: not enforced, and not
-        // counted as unprotected either, so nothing said so.
+        // guard, and the blanket block is opt-in); a principal who plans
+        // nothing must still be enforced and accounted for, not silently
+        // skipped as neither enforced nor unprotected.
         assert!(
             plan.flows.is_empty() || plan.flows.iter().any(|f| f.verdict == Verdict::Block),
             "fixture guard",

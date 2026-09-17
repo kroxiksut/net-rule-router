@@ -11,19 +11,20 @@
 //! 2. [`grant_interactive_service_start`] adds a single `SERVICE_START` ACE for
 //!    the well-known `INTERACTIVE` group on the service object's DACL, so the
 //!    unprivileged launcher can start the service with no UAC prompt in EITHER
-//!    start mode. The grant is targeted (one right, one trustee) — never a
-//!    blanket SDDL widening, and `SetEntriesInAclW` merges it into the existing
-//!    DACL.
+//!    start mode. The grant is targeted (one trustee, its default rights plus
+//!    `SERVICE_START`) — never a blanket SDDL widening, and `SetEntriesInAclW`
+//!    merges it into the existing DACL.
 //!
-//! The trustee used to be the console user's own SID, which read as tighter
-//! than `INTERACTIVE` and was not: nothing removed it, so every account that
-//! had once been at the console kept the right permanently and the set only
-//! grew. The grant still resolves the console user via WTS
-//! ([`console_session_user_sid`]) to retire that legacy ACE — the LocalSystem-
-//! only `WTSQueryUserToken` path is unusable here because these verbs run
-//! elevated-as-admin, not as SYSTEM, and the session's logged-on user is also
-//! the right principal under over-the-shoulder elevation (the standard user at
-//! the console, not the admin whose credentials approved the prompt).
+//! The trustee is `INTERACTIVE`, not the console user's own SID: a per-SID
+//! grant only ever accumulates — nothing removes it as users come and go — so
+//! every account that has ever sat at the console would keep the right
+//! permanently. The grant still resolves the console user via WTS
+//! ([`console_session_user_sid`]) to retire any such legacy ACE — the
+//! LocalSystem-only `WTSQueryUserToken` path is unusable here because these
+//! verbs run elevated-as-admin, not as SYSTEM, and the session's logged-on
+//! user is also the right principal under over-the-shoulder elevation (the
+//! standard user at the console, not the admin whose credentials approved
+//! the prompt).
 
 #![allow(unsafe_code)]
 
@@ -34,7 +35,7 @@ use nrr_service_runtime::{ServiceStartMode, SERVICE_NAME};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{LocalFree, BOOL, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::{
-    SetEntriesInAclW, EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS, SET_ACCESS,
+    SetEntriesInAclW, EXPLICIT_ACCESS_W, GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
     TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
 use windows::Win32::Security::{
@@ -56,9 +57,14 @@ use windows::Win32::System::Services::{
 /// `SERVICE_NO_CHANGE` — passed to `ChangeServiceConfigW` for every field we
 /// are not modifying (we only touch the start type).
 const SERVICE_NO_CHANGE: u32 = 0xFFFF_FFFF;
-/// `SERVICE_START` access right (start the service). The grant adds exactly
-/// this one right, and nothing else. (Win32 `SERVICE_START = 0x0010`.)
+/// `SERVICE_START` access right (Win32 `SERVICE_START = 0x0010`).
 const SERVICE_START_RIGHT: u32 = 0x0010;
+/// What SCM's default DACL already lets `INTERACTIVE` do: query config and
+/// status, enumerate dependents, interrogate, user-defined control, read the
+/// descriptor. Restated because `SetEntriesInAclW` keys entries by trustee and
+/// `INTERACTIVE` is that very trustee: an entry naming only `SERVICE_START`
+/// would replace these, and the unprivileged GUI could not even read status.
+const INTERACTIVE_DEFAULT_RIGHTS: u32 = 0x0001 | 0x0004 | 0x0008 | 0x0080 | 0x0100 | READ_CONTROL;
 /// Standard rights needed to read + rewrite the service object's DACL.
 const READ_CONTROL: u32 = 0x0002_0000;
 const WRITE_DAC: u32 = 0x0004_0000;
@@ -324,28 +330,17 @@ fn lookup_account_sid(account: &str) -> Result<Vec<u8>, StartModeError> {
     Ok(sid)
 }
 
-/// Add the targeted `SERVICE_START` ACE for `INTERACTIVE` to the service DACL.
-/// Idempotent: `SetEntriesInAclW` with `SET_ACCESS` replaces any existing entry
-/// for the same trustee, so re-running never stacks duplicate ACEs.
+/// Add the targeted `SERVICE_START` ACE for `INTERACTIVE` to the service DACL
+/// (trustee rationale: module docs above). Idempotent: `SetEntriesInAclW`
+/// folds the rights into the trustee's existing entry, so re-running never
+/// stacks duplicate ACEs, and re-running on a DACL an earlier version cut
+/// down restores the default rights.
 ///
-/// The trustee is the well-known `INTERACTIVE` group, not the console user's
-/// own SID. The per-user grant read as tighter and was not: nothing ever took
-/// it away, so every account that had once been at the console kept the right
-/// for good, and the set only grew. "Whoever is working at this machine may
-/// start the service by launching the app" IS the definition of `INTERACTIVE`,
-/// and stated that way it is one ACE that is granted once and removed once.
-///
-/// It also no longer depends on a console session existing: the previous
-/// version resolved the logged-on user through WTS and failed the whole grant
-/// when there was nobody at the console.
-///
-/// The grant is held in BOTH start modes. It once tracked the start type —
-/// added for DemandStart, withdrawn for AutoStart on the reasoning that a
-/// service Windows starts needs no manual start. It does: an operator who
-/// stops the service (or whose service stopped on its own) then finds the
-/// GUI's own start button dead, with no way back short of an elevated console.
-/// Starting a service that is already configured to start with Windows is not
-/// a privilege worth withholding from whoever is sitting at the machine.
+/// Held in BOTH start modes, not only DemandStart: an operator who stops the
+/// service (or whose service stopped on its own) would otherwise find the
+/// GUI's own start button dead, with no way back short of an elevated
+/// console. Starting an already-AutoStart service is not a privilege worth
+/// withholding from whoever is sitting at the machine.
 pub fn grant_interactive_service_start() -> Result<(), StartModeError> {
     let sid = interactive_group_sid()?;
     // Best-effort: an installation that predates the `INTERACTIVE` trustee
@@ -354,6 +349,73 @@ pub fn grant_interactive_service_start() -> Result<(), StartModeError> {
     // exactly what the well-known group replaces.
     let legacy_sid = console_session_user_sid().ok();
     write_service_start_ace(&sid, legacy_sid.as_ref())
+}
+
+/// A DACL from `SetEntriesInAclW`, freed on every exit path.
+struct DaclGuard(*mut ACL);
+
+impl Drop for DaclGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: `self.0` came from SetEntriesInAclW (LocalAlloc).
+            let _ = unsafe { LocalFree(HLOCAL(self.0 as *mut c_void)) };
+        }
+    }
+}
+
+/// `old_dacl` plus `SERVICE_START` and the default rights for `sid`, minus
+/// every entry for `legacy_sid`. Pure over its inputs so the merge is testable
+/// against a synthetic DACL without touching the SCM.
+fn merge_start_ace(
+    old_dacl: Option<*const ACL>,
+    sid: &[u8],
+    legacy_sid: Option<&Vec<u8>>,
+) -> Result<DaclGuard, StartModeError> {
+    // `sid` / `legacy_sid` outlive this function, so the raw pointers stashed
+    // in `Trustee.ptstrName` stay valid through the `SetEntriesInAclW` call.
+    let mut entries = vec![EXPLICIT_ACCESS_W {
+        grfAccessPermissions: SERVICE_START_RIGHT | INTERACTIVE_DEFAULT_RIGHTS,
+        // GRANT, not SET: SET replaces the trustee's entry, and this trustee
+        // is the `IU` of SCM's default DACL.
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+            // SAFETY contract: `ptstrName` for TRUSTEE_IS_SID is a PSID cast to
+            // PWSTR. `sid` outlives the SetEntriesInAclW call below.
+            ptstrName: PWSTR(sid.as_ptr() as *mut u16),
+        },
+    }];
+    if let Some(legacy) = legacy_sid {
+        entries.push(EXPLICIT_ACCESS_W {
+            grfAccessPermissions: SERVICE_START_RIGHT,
+            grfAccessMode: REVOKE_ACCESS,
+            grfInheritance: ACE_FLAGS(0),
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                // SAFETY contract: as above; `legacy_sid` outlives the call.
+                ptstrName: PWSTR(legacy.as_ptr() as *mut u16),
+            },
+        });
+    }
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: `entries` is fully initialised; `old_dacl`, when present, is a
+    // valid ACL for the call; `new_dacl` is a valid out-param.
+    let rc = unsafe { SetEntriesInAclW(Some(&entries), old_dacl, &mut new_dacl) };
+    // `SetEntriesInAclW` returns a WIN32_ERROR (0 == ERROR_SUCCESS).
+    if rc.0 != 0 {
+        return Err(StartModeError::Security(format!(
+            "SetEntriesInAcl failed (win32 {})",
+            rc.0
+        )));
+    }
+    Ok(DaclGuard(new_dacl))
 }
 
 /// Read the service DACL, add the `SERVICE_START` ACE for `sid`, revoke every
@@ -409,67 +471,14 @@ fn write_service_start_ace(sid: &[u8], legacy_sid: Option<&Vec<u8>>) -> Result<(
     }
     .map_err(|e| StartModeError::Security(format!("get DACL: {e}")))?;
 
-    // ── 3. Describe the ACE(s) and merge them into the DACL. ──
-    // `sid` / `legacy_sid` are borrowed from the caller's locals: they outlive
-    // this function, so the raw pointers stashed in `Trustee.ptstrName` stay
-    // valid through the `SetEntriesInAclW` call below.
-    let mut entries = vec![EXPLICIT_ACCESS_W {
-        grfAccessPermissions: SERVICE_START_RIGHT,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: ACE_FLAGS(0), // NO_INHERITANCE
-        Trustee: TRUSTEE_W {
-            pMultipleTrustee: std::ptr::null_mut(),
-            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-            TrusteeForm: TRUSTEE_IS_SID,
-            TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
-            // SAFETY contract: `ptstrName` for TRUSTEE_IS_SID is a PSID cast to
-            // PWSTR. `sid` outlives the SetEntriesInAclW call below.
-            ptstrName: PWSTR(sid.as_ptr() as *mut u16),
-        },
-    }];
-    if let Some(legacy) = legacy_sid {
-        entries.push(EXPLICIT_ACCESS_W {
-            grfAccessPermissions: SERVICE_START_RIGHT,
-            grfAccessMode: REVOKE_ACCESS,
-            grfInheritance: ACE_FLAGS(0),
-            Trustee: TRUSTEE_W {
-                pMultipleTrustee: std::ptr::null_mut(),
-                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
-                TrusteeForm: TRUSTEE_IS_SID,
-                TrusteeType: TRUSTEE_IS_USER,
-                // SAFETY contract: as above; `legacy_sid` outlives the call.
-                ptstrName: PWSTR(legacy.as_ptr() as *mut u16),
-            },
-        });
-    }
     let old_dacl_opt: Option<*const ACL> = if old_dacl.is_null() {
         None
     } else {
         Some(old_dacl as *const ACL)
     };
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    // SAFETY: `ea` describes one entry; `old_dacl_opt` points into the live
-    // `sd_buf`; `new_dacl` is a valid out-param (LocalAlloc'd on success).
-    let rc = unsafe { SetEntriesInAclW(Some(&entries), old_dacl_opt, &mut new_dacl) };
-    // `SetEntriesInAclW` returns a WIN32_ERROR (0 == ERROR_SUCCESS).
-    if rc.0 != 0 {
-        return Err(StartModeError::Security(format!(
-            "SetEntriesInAcl failed (win32 {})",
-            rc.0
-        )));
-    }
-
-    // RAII: free the LocalAlloc'd new DACL on every exit path below.
-    struct DaclGuard(*mut ACL);
-    impl Drop for DaclGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: `self.0` came from SetEntriesInAclW (LocalAlloc).
-                let _ = unsafe { LocalFree(HLOCAL(self.0 as *mut c_void)) };
-            }
-        }
-    }
-    let _new_dacl_guard = DaclGuard(new_dacl);
+    // `old_dacl` points into `sd_buf`, which lives to the end of this function.
+    let new_dacl_guard = merge_start_ace(old_dacl_opt, sid, legacy_sid)?;
+    let new_dacl = new_dacl_guard.0;
 
     // ── 4. Build a fresh absolute SD carrying just the new DACL, write it. ──
     let mut new_sd = SECURITY_DESCRIPTOR::default();
@@ -485,4 +494,96 @@ fn write_service_start_ace(sid: &[u8], legacy_sid: Option<&Vec<u8>>) -> Result<(
     unsafe { SetServiceObjectSecurity(svc.0, DACL_SECURITY_INFORMATION, new_psd) }
         .map_err(|e| StartModeError::Security(format!("set object security: {e}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::OBJECT_SECURITY_INFORMATION;
+
+    /// The DACL of `sddl`, as SCM would hand it back for a service, plus the
+    /// self-relative descriptor that owns it (leaked: test-lifetime).
+    fn dacl_of(sddl: &str) -> (PSECURITY_DESCRIPTOR, *const ACL) {
+        let wide = to_wide(sddl);
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: `wide` is NUL-terminated; `sd` receives a LocalAlloc'd
+        // descriptor.
+        unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_ptr()),
+                SDDL_REVISION_1,
+                &mut sd,
+                None,
+            )
+        }
+        .expect("sddl");
+        let mut present = BOOL(0);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut defaulted = BOOL(0);
+        // SAFETY: `sd` is a valid descriptor; out-params are valid locals.
+        unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) }
+            .expect("dacl");
+        (sd, dacl as *const ACL)
+    }
+
+    fn sddl_of(dacl: *mut ACL) -> String {
+        let mut sd = SECURITY_DESCRIPTOR::default();
+        let psd = PSECURITY_DESCRIPTOR(&mut sd as *mut _ as *mut c_void);
+        // SAFETY: `psd` is a stack descriptor owned here; `dacl` outlives the
+        // conversion below.
+        unsafe {
+            InitializeSecurityDescriptor(psd, SD_REVISION).expect("init");
+            SetSecurityDescriptorDacl(psd, BOOL(1), Some(dacl as *const ACL), BOOL(0))
+                .expect("set dacl");
+        }
+        let mut text = PWSTR::null();
+        let mut len = 0u32;
+        // SAFETY: `psd` is valid; `text` receives a LocalAlloc'd string.
+        unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                OBJECT_SECURITY_INFORMATION(DACL_SECURITY_INFORMATION.0),
+                &mut text,
+                Some(&mut len),
+            )
+        }
+        .expect("to sddl");
+        // SAFETY: `text` is a valid NUL-terminated string from the call above.
+        let out = unsafe { text.to_string() }.expect("utf16");
+        // SAFETY: LocalAlloc'd by the conversion.
+        let _ = unsafe { LocalFree(HLOCAL(text.0 as *mut c_void)) };
+        out
+    }
+
+    /// SCM's default DACL for a new service, as `sc sdshow` prints it.
+    const SCM_DEFAULT: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)";
+
+    #[test]
+    fn the_grant_keeps_interactive_readable_and_adds_start() {
+        let sid = interactive_group_sid().expect("interactive sid");
+        let (_sd, old) = dacl_of(SCM_DEFAULT);
+        let merged = merge_start_ace(Some(old), &sid, None).expect("merge");
+        let text = sddl_of(merged.0);
+        // LC (query status) is what the GUI's badge needs; RP is SERVICE_START.
+        assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
+        assert!(
+            text.contains(";;;SY)") && text.contains(";;;BA)") && text.contains(";;;SU)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn re_running_the_grant_repairs_a_dacl_cut_down_to_start_only() {
+        let sid = interactive_group_sid().expect("interactive sid");
+        let (_sd, old) = dacl_of("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;RP;;;IU)");
+        let merged = merge_start_ace(Some(old), &sid, None).expect("merge");
+        let text = sddl_of(merged.0);
+        assert!(text.contains("CCLCSWRPLOCRRC;;;IU)"), "{text}");
+        assert_eq!(text.matches(";;;IU)").count(), 1, "{text}");
+    }
 }

@@ -309,9 +309,9 @@ mod tests {
         assert!(levels.contains(&Some("high")));
     }
 
-    /// A revision belongs to a principal, and so does the list of them. This
-    /// query used to return every row in the table, so one user's GUI listed
-    /// the pending and superseded edits of everybody else on the machine.
+    /// A revision belongs to a principal, and so does the list of them: the
+    /// pending-list query must filter by caller, or one user's GUI lists the
+    /// pending and superseded edits of everybody else on the machine.
     #[test]
     fn the_pending_list_shows_only_the_callers_own_revisions() {
         use nrr_domain::rules_revision::{RevisionStatus, RulesRevisionSource};

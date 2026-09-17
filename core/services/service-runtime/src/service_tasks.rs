@@ -654,11 +654,11 @@ pub fn build_diagnostics_audit_cleanup_task(
     )
 }
 
-/// Say what a retention pass did. Both passes used to drop their
-/// `CleanupResult` into `let _`, so a sweep that removed every log — or failed
-/// to remove anything — left no trace of itself in the very logs it was
-/// managing. A pass that deletes nothing stays quiet; there is one of these
-/// every hour and silence is the normal case.
+/// Say what a retention pass did. Dropping `CleanupResult` silently would leave
+/// a sweep that removed every log — or failed to remove anything — with no
+/// trace of itself in the very logs it was managing. A pass that deletes
+/// nothing stays quiet; there is one of these every hour and silence is the
+/// normal case.
 fn report_cleanup(what: &str, result: nrr_diagnostics::CleanupResult) {
     if !result.errors.is_empty() {
         tracing::warn!(
@@ -1105,8 +1105,8 @@ fn auto_probe_is_due(cadence: AutoProbeCadence, last: Option<Instant>, now: Inst
 /// Should this tick run the automatic main-link pass?
 ///
 /// Both gates in one place so the caller cannot advance the window on a tick
-/// that did not probe — the defect this replaced. `waiting` is how many
-/// suggestions are actually queued for an answer.
+/// that did not probe. `waiting` is how many suggestions are actually queued
+/// for an answer.
 ///
 /// A candidate we have never probed overrides the repeat window. The window
 /// exists to stop us re-measuring the SAME hosts every ten seconds; a host that

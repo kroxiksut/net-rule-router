@@ -413,7 +413,7 @@ impl nrr_service_runtime::RetentionSettingsWriter for EmptyRetentionWriter {
     }
 }
 
-// #20 — empty log/audit retention config provider/writer for router composition.
+// Empty log/audit retention config provider/writer for router composition.
 struct EmptyLogRetention;
 impl nrr_service_runtime::LogRetentionConfigProvider for EmptyLogRetention {
     fn get(&self) -> nrr_service_runtime::ipc_handlers::payloads::LogRetentionConfigDto {
@@ -757,11 +757,11 @@ fn production_handlers_register_every_operation_in_catalog() {
         IpcOperationName::AutostartGet,
         IpcOperationName::AutostartToggle,
         IpcOperationName::ExplainGet,
-        // #21 — DiagnosticModeSet forwards to DiagnosticsFacade::set_diagnostic_mode
+        // DiagnosticModeSet forwards to DiagnosticsFacade::set_diagnostic_mode
         // (facade always wired in deps_default); a bare `{}` payload is a valid
         // disable request, so it returns ok.
         IpcOperationName::DiagnosticModeSet,
-        // #20 — log/audit retention config get/set (FakeLogRetention wired in
+        // Log/audit retention config get/set (FakeLogRetention wired in
         // deps_default). Set gets a valid payload + UserScopedConfiguration
         // envelope below.
         IpcOperationName::LogRetentionConfigGet,

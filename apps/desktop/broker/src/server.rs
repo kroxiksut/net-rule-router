@@ -240,16 +240,30 @@ fn normalised_dir(path: &Path) -> String {
 /// elevation channel with it, `broker.shutdown` included.
 const SERVICE_CONTROL_BUDGET: Duration = Duration::from_secs(90);
 
-/// Runs `cmd` to completion or kills it when the budget expires.
+/// Runs `cmd` to completion or kills it when the budget expires. Returns the
+/// exit status with whatever the child wrote to stderr: the broker has no
+/// console, so this is the only way the reason for a non-zero exit survives.
 fn run_with_budget(
     mut cmd: Command,
     budget: Duration,
-) -> std::io::Result<std::process::ExitStatus> {
+) -> std::io::Result<(std::process::ExitStatus, String)> {
+    use std::io::Read;
+    cmd.stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn()?;
+    // Drained on its own thread so a chatty child cannot fill the pipe and
+    // block against a parent that only polls its exit.
+    let stderr = child.stderr.take();
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    });
     let deadline = Instant::now() + budget;
-    loop {
+    let status = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -260,7 +274,17 @@ fn run_with_budget(
             ));
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
+    Ok((status, reader.join().unwrap_or_default()))
+}
+
+/// The child's last non-empty stderr line, for an error message.
+fn last_stderr_line(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| !line.is_empty())
 }
 
 /// Run a privileged service-control action by executing the service binary
@@ -293,16 +317,21 @@ fn run_service_control(service_exe: &str, action: &str) -> BrokerResponse {
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
     match run_with_budget(cmd, SERVICE_CONTROL_BUDGET) {
-        Ok(status) if status.success() => {
+        Ok((status, _)) if status.success() => {
             broker_log(&format!("service-control: {action} OK"));
             BrokerResponse::ok(serde_json::json!({ "action": action, "ok": true }))
         }
-        Ok(status) => {
+        Ok((status, stderr)) => {
             let code = status.code().unwrap_or(-1);
-            broker_log(&format!("service-control: {action} FAILED exit={code}"));
+            let reason = last_stderr_line(&stderr)
+                .map(|line| format!(": {line}"))
+                .unwrap_or_default();
+            broker_log(&format!(
+                "service-control: {action} FAILED exit={code}{reason}"
+            ));
             BrokerResponse::err(
                 "service-control-failed",
-                format!("'{action}' exited with code {code}"),
+                format!("'{action}' exited with code {code}{reason}"),
             )
         }
         Err(e) => {
@@ -560,6 +589,26 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_reason_is_the_last_non_empty_stderr_line() {
+        assert_eq!(
+            super::last_stderr_line(
+                "warning: x
+install failed: no PROGRAMDATA
+
+"
+            ),
+            Some("install failed: no PROGRAMDATA")
+        );
+        assert_eq!(
+            super::last_stderr_line(
+                "  
+"
+            ),
+            None
+        );
+    }
+
     use super::{
         broker_log_path, check_service_binary, claim_post_elevation_settle, rotate_broker_log,
         AtomicBool,

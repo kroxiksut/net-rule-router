@@ -18,7 +18,7 @@
 //!     │           (we do NOT silently mutate the active pointer
 //!     │            without an audit record)
 //!     └── active missing + LKG missing ───────────► NoState
-//!         (first-run path; tamper detection lives in 14.6 health
+//!         (first-run path; tamper detection lives in the health
 //!          aggregator that combines this with security_alerts)
 //! ```
 //!
@@ -30,7 +30,7 @@
 //! - `set_active_revision` is only called by the loader itself, and only
 //!   inside `try_lkg_fallback` after the audit emitter signals success.
 //! - The candidate/pending revision flow is **not** in this module —
-//!   block 8/16 owns that controlled flow with its own audit chain.
+//!   a separate controlled flow owns it with its own audit chain.
 
 use std::sync::{Arc, Mutex};
 
@@ -42,14 +42,13 @@ use crate::state::{ActiveRevisionState, ServicePolicyState};
 
 // ── Outcome enum ─────────────────────────────────────────────────────────────
 
-/// What `PolicyLoader::load` produced. Mirrors task 14.4's
-/// `PolicyLoadResult`. Carries enough context for the runtime to
-/// transition into the right `ServicePolicyState` and emit the right
-/// audit/health events.
+/// What `PolicyLoader::load` produced. Carries enough context for the
+/// runtime to transition into the right `ServicePolicyState` and emit the
+/// right audit/health events.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyLoadResult {
     /// Active revision loaded and validated. Carries a summary the
-    /// runtime publishes through `HealthReporter` (block 14.6).
+    /// runtime publishes through `HealthReporter`.
     ActiveLoaded(ActiveRevisionState),
     /// Active loaded after the recovery flow flipped the active
     /// pointer to the LKG revision. The summary's `provenance` is
@@ -96,7 +95,7 @@ impl PolicyLoadResult {
 /// LKG fallback. The emitter must persist the event durably *before*
 /// returning `Ok`. If persistence fails, returning `Err` causes the
 /// loader to fall through to `RecoveryRequired` rather than silently
-/// mutate the active pointer (see 14.4 invariant).
+/// mutate the active pointer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecoveryAuditEvent {
     /// Active revision found corrupt; about to switch to LKG.
@@ -251,9 +250,9 @@ where
                 PolicyLoadResult::StorageError(msg)
             }
             (Some(_), (IntegrityCheckResult::CacheCorruptRebuildable, _)) => {
-                // Cache integrity does not affect policy load — block
-                // already handled the rebuild. Treat as Ok for the
-                // policy state machine.
+                // Cache integrity does not affect policy load —
+                // `check_integrity` already handled the rebuild. Treat as Ok
+                // for the policy state machine.
                 self.try_active_after_cache_only_failure()
             }
         }
@@ -322,8 +321,8 @@ where
 
         // 3. Audit completion. Failure here is non-fatal — the active
         // pointer is already on the LKG, the runtime can proceed in
-        // LkgReady, and block 14.11 will surface the audit drop via
-        // the operational health snapshot.
+        // LkgReady, and the operational health snapshot surfaces the
+        // audit drop.
         let _ = self.audit.emit(RecoveryAuditEvent::LkgFallbackCompleted {
             broken_active: broken_active.as_str().to_string(),
             new_active: lkg_id.as_str().to_string(),
@@ -342,8 +341,8 @@ where
             provenance: provenance.to_string(),
             // This loader's scope is the active-pointer state machine. The
             // canonical-profile load (rule_count, behavior_mode) is wired
-            // in once the rule engine context is constructed
-            // here. Using stable defaults keeps the DTO shape pinned.
+            // in by the caller once the rule engine context is available;
+            // stable defaults here keep the DTO shape pinned meanwhile.
             rule_count: 0,
             behavior_mode: "auto".to_string(),
             content_hash_hex: hash,
@@ -370,8 +369,7 @@ fn default_clock() -> String {
     // intentionally avoid `chrono` to keep the runtime free of an
     // additional crate just for one timestamp. Format:
     // `1970-01-01T00:00:00Z` plus integer seconds since UNIX epoch
-    // appended for tie-breaking — replaced by the real chrono format
-    // when the diagnostics layer is wired in 14.6.
+    // appended for tie-breaking.
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

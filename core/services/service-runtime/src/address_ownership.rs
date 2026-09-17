@@ -97,15 +97,14 @@ impl AddressOwnership {
     /// into the tunnel drags every other host on it along, and those break in a
     /// way no rule of the user's explains.
     ///
-    /// `order` settles the one contest the host stage cannot see. A rule naming
-    /// an address LITERALLY has no host to contest with, and used to be written
-    /// into its side unconditionally — so a zone on the main link silently
-    /// outranked an exact-IP rule on the additional one, which is the opposite
-    /// of what the rule model documents and of what the switch in
-    /// Settings -> Routing says it does. A literal address now beats a main-link
-    /// claim that is a ZONE and nothing more; anything the main link named more
-    /// closely than that still keeps it, so the collateral argument above is
-    /// untouched.
+    /// `order` settles the one contest the host stage cannot see: a rule naming
+    /// an address LITERALLY has no host to contest with, so its side is decided
+    /// directly against the main link's strongest claim rather than through the
+    /// per-host stage above. A literal address beats a main-link claim that is a
+    /// ZONE and nothing more — matching the rule model's default (exact IP
+    /// overrides zone) and the switch in Settings -> Routing; anything the main
+    /// link named more closely than that still keeps it, so the collateral
+    /// argument above is untouched.
     #[must_use]
     pub fn resolve_with_order(
         rule_book: &CanonicalRuleBook,
@@ -455,12 +454,12 @@ pub struct AppDestinations {
 /// The single gate between an application rule's observed destinations and any
 /// mechanism that pins or blocks them.
 ///
-/// Route codegen, filter codegen and the neutral planner each used to reach for
-/// [`AppObservationLookup::ips_for_app`] and then apply whichever subset of the
-/// checks its author remembered. They diverged, and the incident in the module
-/// doc is what that costs. The observations are reachable through this type
-/// only, and `tests/ownership_gate.rs` holds the other end: no production call
-/// site outside this module may query them directly.
+/// Route codegen, filter codegen and the neutral planner must not reach for
+/// [`AppObservationLookup::ips_for_app`] directly and apply their own subset of
+/// checks — that divergence is what the incident in the module doc costs. The
+/// observations are reachable through this type only, and `tests/ownership_gate.rs`
+/// holds the other end: no production call site outside this module may query
+/// them directly.
 pub struct AppDestinationGate<'a> {
     ownership: &'a AddressOwnership,
     observations: &'a dyn AppObservationLookup,
@@ -806,10 +805,8 @@ mod tests {
         );
     }
 
-    /// The rule model says an exact address outranks a zone by default, and the
-    /// arbiter used to say the opposite: a literal address went into its side
-    /// unconditionally, the main link then won every overlap, and the user's
-    /// exact-IP rule on the additional link was dead.
+    /// The rule model's default: an exact address outranks a zone, so a literal
+    /// address rule on one link wins even against a zone claim on the other.
     #[test]
     fn an_exact_address_beats_a_zone_on_the_other_link() {
         let ip = Ipv4Addr::new(203, 0, 113, 7);

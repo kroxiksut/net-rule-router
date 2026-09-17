@@ -140,15 +140,14 @@ impl ProductionLocalNetworks {
 /// The answer this adapter already carries, for a segment number it did not
 /// have when the answer was given — the user's LATEST word on that adapter.
 ///
-/// A refusal used to outrank every confirmation regardless of age, on the
-/// reasoning that the other direction reopens a segment the user closed. It
-/// does not survive the case the feature exists for: the adapter renumbers,
-/// the refused network number is gone, the user explicitly allows the new one,
-/// it renumbers again — and the dead refusal was inherited over the live
-/// approval. Worse, the row doing it is invisible in the UI (`compose` hides
-/// stored rows whose adapter discovery still reports), so only a full reset
-/// cleared it. Ordering by recency keeps both directions honest and forgets
-/// nothing; a tie still favours the refusal, which is the conservative read.
+/// Ordered strictly by recency rather than refusal-always-wins: a hypervisor
+/// switch renumbers, the user refuses one number, later explicitly allows the
+/// new one, and it renumbers again. A refusal that always outranked a
+/// confirmation regardless of age would leave the dead refusal outranking the
+/// live approval forever — invisibly, since `compose` hides stored rows whose
+/// adapter discovery still reports, recoverable only by a full reset.
+/// Ordering by recency keeps both directions honest and forgets nothing; a
+/// tie still favours the refusal, which is the conservative read.
 fn inherited_from_adapter(stored: &[LocalNetworkRule], adapter: &str) -> Option<bool> {
     if adapter.is_empty() {
         return None;
@@ -237,9 +236,9 @@ impl LocalNetworksProvider for ProductionLocalNetworks {
                     );
                     continue;
                 }
-                // This answer now speaks for the adapter, so the numbers it
-                // used to carry have nothing left to say. Without this a
-                // switch that renumbers on every reboot leaves a row per boot.
+                // This answer now speaks for the adapter itself, so any other
+                // stored numbers for it become redundant. Without pruning, a
+                // switch that renumbers every reboot accumulates a row per boot.
                 if let Err(e) = repo.forget_superseded_confirmations(sid, &rule.adapter, &rule.cidr)
                 {
                     tracing::warn!(
@@ -386,8 +385,8 @@ mod tests {
 
     /// The scenario the feature exists for: a hypervisor switch renumbers, the
     /// user refuses one number, later ALLOWS the new one, it renumbers again.
-    /// The dead refusal used to outrank the live approval forever, and the row
-    /// doing it is not even visible in the UI.
+    /// Without recency ordering the dead refusal would outrank the live
+    /// approval forever, invisibly, since the row is not shown in the UI.
     #[test]
     fn a_newer_approval_outranks_an_older_refusal_on_the_same_adapter() {
         let switch = "Ethernet (Default Switch)";

@@ -149,9 +149,10 @@ pub(super) fn open_settings_connection(path: &std::path::Path) -> Option<Arc<Mut
     if !path.exists() {
         return None;
     }
-    // The storage factory applies (and VERIFIES) the same baseline this used to
-    // set by hand and discard the result of: a failed pragma left the
-    // connection with no busy timeout and nobody the wiser.
+    // `open_connection` applies AND verifies the busy-timeout pragma rather
+    // than setting it by hand and discarding the result — a failed pragma
+    // would otherwise leave the connection with no timeout and nobody the
+    // wiser.
     match nrr_storage::migration::open_connection(path) {
         Ok(conn) => Some(Arc::new(Mutex::new(conn))),
         Err(e) => {

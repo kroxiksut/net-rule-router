@@ -158,18 +158,13 @@ const FLOW_NOTICE_QUEUE_DEPTH: usize = 256;
 /// channel nothing can cache away.
 ///
 /// **`on_flow_opened` runs on the stack's poll thread while a TCP connection is
-/// being established.** Its contract there is to be prompt, and it was not:
-/// resolving the active SID walks the session registry, and `note_flow` then
-/// matches the hostname against both rule sets and takes the GLOBAL ledger
-/// mutex — the same mutex the discovery tick holds while it qualifies up to
-/// tens of thousands of candidate pairs. A user's connection waited on that.
-///
-/// So the hot path now only hands over the hostname and the instant. Everything
-/// else happens on this observer's own thread. The queue is bounded and a full
-/// queue DROPS the notice: an observation is optional and a connection is not.
-/// The SID is resolved by the worker rather than at the call, which is a
-/// sub-millisecond difference in attribution and takes a registry walk off the
-/// connection path.
+/// being established, so it must be prompt.** SID resolution and rule-set
+/// matching take the GLOBAL ledger mutex — the same mutex the discovery tick
+/// holds while it qualifies up to tens of thousands of candidate pairs — so
+/// that work runs on this observer's own worker thread instead. The hot path
+/// only hands over the hostname and the instant; the queue is bounded and a
+/// full queue DROPS the notice, because an observation is optional and a
+/// connection is not.
 pub struct FlowActivityObserver {
     notices: std::sync::mpsc::SyncSender<(String, SystemTime)>,
     dropped: Arc<std::sync::atomic::AtomicU64>,
@@ -308,12 +303,11 @@ mod tests {
     use nrr_domain::{RouteBehaviorMode, RuleId};
     use std::net::Ipv4Addr;
 
-    /// `on_flow_opened` runs while a TCP connection is being established. It
-    /// used to resolve the SID and then take the global ledger mutex — the one
-    /// the discovery tick holds through tens of thousands of qualify calls — so
-    /// a user's connection waited on a background computation. The hot path
-    /// must hand the fact over and return, and a backlog must cost observations
-    /// rather than connections.
+    /// `on_flow_opened` runs while a TCP connection is being established, so it
+    /// must hand the fact over and return without waiting on SID resolution or
+    /// the global ledger mutex — the same mutex the discovery tick holds through
+    /// tens of thousands of qualify calls. A backlog must cost observations,
+    /// never connections.
     #[test]
     fn a_flow_notice_never_waits_on_the_worker() {
         use super::super::stack::FlowObserver;

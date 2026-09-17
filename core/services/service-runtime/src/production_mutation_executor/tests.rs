@@ -829,9 +829,9 @@ fn the_strict_mode_of_the_caller_reaches_the_risk_scorer() {
     );
 }
 
-/// A preview is a READ. It used to submit a candidate to get a plan, so
-/// every press of it wrote a revision row — rows the user then found in
-/// their pending list as edits they never made.
+/// A preview is a READ. Submitting a candidate to get a plan would write a
+/// revision row on every press — rows the user would then find in their
+/// pending list as edits they never made.
 #[test]
 fn a_preview_writes_no_revision_row() {
     let (exec, conn) = build_test_executor();

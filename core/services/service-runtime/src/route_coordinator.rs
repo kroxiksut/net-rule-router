@@ -56,8 +56,8 @@ pub use binding_resolver::{adapter_binding_matches, adapter_entry_binding_matche
 #[cfg(test)]
 use binding_resolver::description_matches_display_name;
 
-/// Resolved routing inputs for one principal (block 16.18.vpn): the active
-/// behavior mode plus the usable primary/secondary targets. `secondary ==
+/// Resolved routing inputs for one principal: the active behavior mode plus
+/// the usable primary/secondary targets. `secondary ==
 /// None` means there is nowhere to route the tunnel set → tear everything
 /// down. `primary` is only needed to carve mode-B exceptions back onto the
 /// primary NIC; its absence is not an error in mode A.
@@ -151,7 +151,7 @@ pub type ServerIpLoaderFn = Arc<dyn Fn() -> Vec<Ipv4Addr> + Send + Sync>;
 /// warm-up / 30 s safety tick, apply-trigger, boot).
 ///
 /// the predicate carries the stop-policy so the
-/// 30 s safety tick no longer clobbers a `Persist` opt-in. On pause the route
+/// 30 s safety tick does not clobber a `Persist` opt-in. On pause the route
 /// half must match the WFP half's teardown flavour — a `Persist` user keeps the
 /// `/32` secondary rule-routes (only NRR's overlays come down), a `Teardown` user
 /// gets a full clear — otherwise the recompute gate silently deletes the `/32`
@@ -371,10 +371,9 @@ impl crate::ipc_handlers::providers::RoutePolicyApplyTrigger for RouteAndFilterA
         //    actually enforce for. With a tray that's a connected SID; under
         //    service-driven scope with NO tray it is the active console user, so
         //    a change to THEIR rules — or to the shared baseline they inherit —
-        //    must re-drive even though the registry is empty (block 16,
-        //    ; previously this required the SID to be in the registry,
-        //    so service-driven-from-boot policy edits were ignored until a tray
-        //    connected or the periodic safety recompute caught up).
+        //    must re-drive even though the registry is empty, or
+        //    service-driven-from-boot policy edits go unenforced until a tray
+        //    connects or the periodic safety recompute catches up.
         let active = self.registry.active_sids();
         let relevant = match self.route_coord.effective_routing_sid(&active).as_deref() {
             Some(eff) => {

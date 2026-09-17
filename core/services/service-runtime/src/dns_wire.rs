@@ -227,15 +227,15 @@ pub fn build_negative_response(query: &[u8], rcode: u8, negative_ttl: u32) -> Op
     Some(resp)
 }
 
-// ── Client side (HW-0714 — raw-UDP upstream pin) ─────────────────────────────
+// ── Client side: raw-UDP upstream pin ────────────────────────────────────────
 //
-// The Mode-B intercept resolved rule hosts through the OS resolver, which
-// honours the very NRPT catch-all Mode B installs — a self-reference that
-// timed out every rule-host query (HW-0712 finding C10-a). The direct client
-// below talks RFC 1035 wire format straight to the captured upstream over a
-// raw socket, which NRPT does not touch by construction (NRPT only steers the
-// Windows DNS Client service). It also never consults the hosts file — the
-// `resolve_hosts_bypass` posture for rule hosts rides the same codec.
+// Mode B installs an NRPT catch-all that captures the OS resolver, so resolving
+// rule hosts through the OS resolver would self-reference the same catch-all
+// and time out every rule-host query. The direct client below talks RFC 1035
+// wire format straight to the captured upstream over a raw socket, which NRPT
+// does not touch by construction (NRPT only steers the Windows DNS Client
+// service). It also never consults the hosts file — the `resolve_hosts_bypass`
+// posture for rule hosts rides the same codec.
 
 /// Encode `qname` as an uncompressed QNAME. `None` when a label is empty,
 /// longer than 63 octets, non-ASCII, or the total name exceeds 255 octets —
@@ -445,7 +445,7 @@ pub enum AddressResponseOutcome {
     /// off-answer).
     NoRecords,
     /// TC=1 — the answer did not fit the datagram. The caller treats this as
-    /// transient (no TCP fallback in phase 1; the passive observer backstops).
+    /// transient (no TCP fallback; the passive observer backstops).
     Truncated,
     /// Any other RCODE (SERVFAIL, REFUSED, …) — transient upstream failure.
     Failed(u8),
@@ -829,7 +829,7 @@ mod tests {
         assert_eq!(resp.len(), q.len(), "header + question only");
     }
 
-    // ── Client side (HW-0714) ─────────────────────────────────────────────────
+    // ── Client side ────────────────────────────────────────────────────────────
 
     #[test]
     fn a_query_round_trips_through_own_parser() {
@@ -1156,7 +1156,7 @@ mod tests {
         );
     }
 
-    // ── PTR / FCrDNS (HW-0719, killswitch-B) ──────────────────────────────────
+    // ── PTR / FCrDNS ───────────────────────────────────────────────────────────
 
     /// Append one PTR answer RR (owner = pointer to the question at 0x0C, RDATA =
     /// uncompressed target name) to a response being built.

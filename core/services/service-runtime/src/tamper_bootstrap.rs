@@ -36,10 +36,10 @@
 //! An attacker who can write the DB but lacks the key can zero a row's
 //! `row_hmac` to make a tampered row read as `Unsigned` rather than
 //! `Tampered`, and the lazy backfill would then bless it. Closing this
-//! fully needs persistent "backfill already ran" state; the spec
-//! (TASKS_RU.md §16.QoL+8) accepts it because the same attacker can
-//! reach the key only by impersonating `LocalSystem` (`psexec -s`),
-//! which is already an explicit non-goal of the threat model.
+//! fully needs persistent "backfill already ran" state; accepted because
+//! the same attacker can reach the key only by impersonating `LocalSystem`
+//! (`psexec -s`), which is already an explicit non-goal of the threat
+//! model.
 
 use std::sync::{Arc, Mutex};
 
@@ -476,9 +476,9 @@ mod tests {
     }
 
     /// A truncated key blob (interrupted write, clipped file, substitution)
-    /// used to be accepted verbatim — HMAC takes any length, so every row
-    /// verified against the broken key and no alarm could ever fire. It must
-    /// take the same route as a missing key, alert included.
+    /// must never be accepted verbatim — HMAC takes any length, so every row
+    /// would verify against the broken key and no alarm could ever fire. It
+    /// must take the same route as a missing key, alert included.
     #[test]
     fn a_truncated_signing_key_is_treated_as_missing_not_used() {
         let conn = open_state();

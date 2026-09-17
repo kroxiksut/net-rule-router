@@ -140,7 +140,7 @@ fn consumer_with_primary(
     )
 }
 
-///  — a consumer wired to a live companion-learning engine over
+/// A consumer wired to a live companion-learning engine over
 /// the SAME rule book, so the observation feed can be checked end to end
 /// (what the engine learned is only observable through its proposals).
 fn consumer_with_learning(
@@ -483,7 +483,7 @@ fn ignores_host_matching_no_rule() {
 
 #[test]
 fn apex_matches_suffix_rule() {
-    //  — `*.example.com` covers the apex `example.com`, so the
+    // `*.example.com` covers the apex `example.com`, so the
     // observer must cache it like any other rule host. (A `Zone` rule still
     // excludes its own bare label — see `match_zone`.)
     let (cache, lookup) = in_memory_cache();
@@ -564,7 +564,7 @@ fn detects_collateral_when_direct_host_shares_a_secondary_ip() {
 
 #[test]
 fn collateral_with_unusable_secondary_still_counts_and_records_census() {
-    //  — while the secondary is unusable the collateral event is
+    // While the secondary is unusable the collateral event is
     // logged as "pin skipped" (info) instead of the "egresses the
     // secondary" WARN, but detection, the summary count, the dedup, and
     // the shared-IP census recording are all unchanged — the census is

@@ -217,8 +217,8 @@ impl EventBus {
 
         let mut subs = self.subscribers.lock().expect("subscribers poisoned");
         let now = Instant::now();
-        // One client, one subscription: a GUI that reconnects (or retries the
-        // subscribe) used to leave its previous entry behind forever.
+        // One client, one subscription: drop any existing entry for this
+        // client_id before inserting the new one.
         subs.retain(|_, sub| sub.client_id != client_id);
         subs.retain(|_, sub| now.duration_since(sub.last_activity) < SUBSCRIPTION_IDLE_TTL);
         // Still full: drop the one nobody has touched in the longest time. It is
@@ -570,8 +570,8 @@ mod tests {
 
     #[test]
     fn one_client_keeps_one_subscription() {
-        // A GUI that reconnects (or retries the subscribe) used to leave its
-        // previous entry behind, and nothing ever removed it.
+        // A GUI that reconnects (or retries the subscribe) must not accumulate
+        // a stale entry alongside the new one.
         let bus = EventBus::new();
         let first = bus.subscribe("gui-a".into(), None);
         let second = bus.subscribe("gui-a".into(), None);

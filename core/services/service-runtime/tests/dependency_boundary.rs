@@ -10,18 +10,17 @@
 //! new crate to the deny list takes one line; removing one requires
 //! explicit reasoning in CLAUDE.md plus a SECURITY review.
 //!
-//! There are two checks, because the first one alone was defeated for
-//! months by a single hop.
+//! Two checks, because the manifest scan alone only proves a name is
+//! absent from this page, not that it is absent from the binary:
 //!
 //! 1. A string scan over this manifest: hermetic, instant, catches the
 //!    obvious case.
 //! 2. The real one — the whole dependency GRAPH, read from
 //!    `cargo metadata`. The rule is "a forbidden crate must not end up in
-//!    the service binary", and the scan could only ever say "not named on
-//!    this page". It read as the stronger claim (this header used to say
-//!    the check "cannot be defeated"), while `nrr-ui-support` and
-//!    `nrr-mock-backend` were reaching the LocalSystem service through
-//!    `nrr-application` — declared here and used nowhere.
+//!    the service binary", not "must not appear in the manifest" — a
+//!    crate can reach the binary through an edge declared but unused
+//!    here (e.g. `nrr-ui-support` / `nrr-mock-backend` via
+//!    `nrr-application`), which only the graph check catches.
 
 const MANIFEST: &str = include_str!("../Cargo.toml");
 

@@ -11,7 +11,7 @@
 //!
 //! The Windows route table is **machine-wide** — a route entry has no user
 //! dimension. So the table reflects exactly one user's routing at a time:
-//! the active console-session user (block 16.18 wiring). When the active
+//! the active console-session user. When the active
 //! user changes, the wiring recomputes the desired set for the new user
 //! and calls `reconcile`, which tears down the previous user's routes and
 //! installs the new user's. Per-SID WFP filters (the kill-switch) remain
@@ -53,7 +53,7 @@ fn route_key(r: &RouteEntry) -> RouteKey {
 }
 
 /// What a route currently in the system table represents, from the
-/// route-ownership coordinator's perspective (block 16.18.vpn).
+/// route-ownership coordinator's perspective.
 ///
 /// NetRuleRouter takes ownership of the IPv4 route table over a
 /// redirect-gateway VPN: it may strip the VPN client's self-installed
@@ -79,7 +79,7 @@ pub enum RouteOwnership {
     Untracked,
 }
 
-/// Classify one route for ownership-based stripping (block 16.18.vpn).
+/// Classify one route for ownership-based stripping.
 ///
 /// `secondary_ifindex` is the VPN interface; `primary_gateway` is the real
 /// (Ethernet) next-hop, used to recognise — and protect — the bootstrap host
@@ -832,7 +832,7 @@ mod tests {
         );
     }
 
-    // ── route ownership classification (block 16.18.vpn, slice B) ──
+    // ── route ownership classification ──
 
     fn raw_route(d: [u8; 4], prefix: u8, gw: [u8; 4], ifx: u32, ours: bool) -> RouteEntry {
         RouteEntry {
@@ -846,7 +846,7 @@ mod tests {
         }
     }
 
-    // ── Kill-switch exemptions (block 16.18.vpn D3) ─────────────────────────
+    // ── Kill-switch exemptions ──────────────────────────────────────────────
 
     #[test]
     fn bootstrap_server_ips_collects_host_routes_via_primary_gateway() {

@@ -209,8 +209,8 @@ mod tests {
         assert_eq!(parsed["message"], "err with \"quotes\" and \\backslashes");
     }
 
-    /// The trail is NDJSON — one event per line. A newline inside the message
-    /// used to split one event into two lines, neither of them parseable.
+    /// The trail is NDJSON — one event per line, so a newline inside the
+    /// message must not split one event into two unparseable lines.
     #[test]
     fn payload_summary_survives_control_characters_in_the_message() {
         let newline = char::from(10u8);

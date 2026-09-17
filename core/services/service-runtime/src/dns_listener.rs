@@ -11,10 +11,10 @@
 //!
 //! Blocking + thread-based (no tokio) to match the service supervisor's task
 //! model. Binding the socket is neutral (std UDP); *pointing the OS at* this
-//! listener is a separate, per-OS concern behind `SystemDnsRedirectPort`
-//! (increment 1c). TCP fallback for truncated (`TC=1`) answers is a documented
-//! phase-1 gap — classic UDP DNS fits the vast majority of rule-host `A`
-//! answers, and the passive observer remains a backstop.
+//! listener is a separate, per-OS concern behind `SystemDnsRedirectPort`.
+//! TCP fallback for truncated (`TC=1`) answers is a known gap — classic UDP
+//! DNS fits the vast majority of rule-host `A` answers, and the passive
+//! observer remains a backstop.
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -53,11 +53,11 @@ const SERVE_WORKER_THREADS: usize = 8;
 /// behaviour) rather than dropping it.
 const SERVE_QUEUE_DEPTH: usize = 128;
 
-/// Everything one client datagram may cost, end to end. The stages used to
-/// budget independently — rule-host resolve, then the fail-open forward, then
-/// its rotation retry — and summed past seven seconds, while the client's stub
-/// resolver gives up and re-asks after about one. The stage timeouts stay as
-/// they are; this caps their sum.
+/// Everything one client datagram may cost, end to end. The per-stage timeouts
+/// (rule-host resolve, fail-open forward, rotation retry) are independent and
+/// can sum past seven seconds, while the client's stub resolver gives up and
+/// re-asks after about one. The stage timeouts stay as they are; this caps
+/// their sum.
 const QUERY_BUDGET: Duration = Duration::from_secs(3);
 
 /// What the listener should do with one datagram.
@@ -83,8 +83,8 @@ pub enum ListenerAction {
 }
 
 /// The intercept listener. Holds the resolver ports plus the upstream DNS server
-/// to forward non-intercepted queries to (captured *before* the DNS redirect —
-/// increment 1c — so split-horizon keeps working).
+/// to forward non-intercepted queries to (captured *before* the DNS redirect,
+/// so split-horizon keeps working).
 /// Lists the machine's private resolvers, newest answer each call.
 pub type PrivateResolversFn = Arc<dyn Fn() -> Vec<std::net::Ipv4Addr> + Send + Sync>;
 
@@ -115,7 +115,7 @@ pub struct DnsInterceptListener {
     /// of truth for "is this address enforced". The default reports nothing as
     /// enforced, which is the truth for a listener with no apply behind it.
     enforced_view: Arc<dyn crate::dns_resolver::EnforcedAddressView>,
-    /// П0-D — secondary-owned (pinned) addresses for direct-answer steering.
+    /// Secondary-owned (pinned) addresses for direct-answer steering.
     /// The default no-op (empty set) leaves every direct reply untouched.
     secondary_owned: Arc<dyn SecondaryOwnedIps>,
     /// The machine's private resolvers, re-asked when one server calls a name
@@ -124,7 +124,7 @@ pub struct DnsInterceptListener {
     /// Namespaces connections claim, used to complete a single-label name.
     /// `None` leaves such names exactly as they arrive.
     claimed_namespaces: Option<ClaimedNamespacesFn>,
-    /// Block D (fake-IP, slice 4) — answers scope hosts with virtual addresses.
+    /// Fake-IP — answers scope hosts with virtual addresses.
     /// The default no-op returns the real per-IP path for every host.
     fake_ip: Arc<dyn FakeIpAnswerer>,
     /// gates a steered direct answer on the block-all: the
@@ -183,10 +183,10 @@ const DNS_DATAGRAM_BUFFER_BYTES: usize = 4096;
 /// How many consecutive receive errors of a kind we do not recognise are
 /// tolerated before the serve loop gives up.
 ///
-/// The loop used to return on the first one, so a single unusual datagram
-/// switched DNS interception off machine-wide until the watchdog noticed
-/// (~50 s). A genuinely dead socket fails every time, so a run of them still
-/// ends the loop; one odd packet no longer does.
+/// Returning on the first unrecognised error would switch DNS interception
+/// off machine-wide over a single unusual datagram, until the watchdog
+/// noticed (~50 s). A genuinely dead socket fails every time, so a run of
+/// them still ends the loop; one odd packet does not.
 const DNS_RECV_ERROR_TOLERANCE: u32 = 16;
 
 impl DnsInterceptListener {
@@ -268,7 +268,7 @@ impl DnsInterceptListener {
         self
     }
 
-    /// Block D (fake-IP, slice 4) — answer in-scope rule hosts with virtual
+    /// Fake-IP — answer in-scope rule hosts with virtual
     /// addresses so the flow is caught by the TUN and steered by the relay.
     pub fn with_fake_ip(mut self, fake_ip: Arc<dyn FakeIpAnswerer>) -> Self {
         self.fake_ip = fake_ip;
@@ -523,7 +523,7 @@ impl DnsInterceptListener {
         }
         let rule_covered = self.oracle.is_rule_host(&q.qname);
         if !rule_covered {
-            // П0-D — direct host: forward, but steer the reply so the client
+            // Direct host: forward, but steer the reply so the client
             // never receives a secondary-pinned address (shared-CDN collateral).
             return ListenerAction::ForwardFiltered;
         }
@@ -577,16 +577,15 @@ impl DnsInterceptListener {
     /// are handed to a small worker pool; a per-datagram failure is logged and
     /// skipped — the loop never dies on one bad packet or a slow upstream.
     ///
-    /// the loop itself no longer does per-datagram work. The 0722
-    /// boot log showed the previous inline handling serializing the WHOLE
-    /// system's DNS behind one slow answer: under the armed block-all every
-    /// new direct host held the pipeline for the full direct-answer-gate
-    /// budget (events landed exactly one budget apart), so a page touching
-    /// twenty new hosts stalled name resolution for everything for ~10 s.
-    /// Workers now carry the slow parts (upstream forward, bounded reconcile,
-    /// gate) concurrently; the loop only receives and dispatches. When the
-    /// hand-off queue is full the datagram is handled inline — backpressure
-    /// degrades to the old serial behaviour instead of dropping queries.
+    /// The loop itself does no per-datagram work: handling a datagram inline
+    /// would serialize the WHOLE system's DNS behind one slow answer, since
+    /// under the armed block-all every new direct host holds the pipeline for
+    /// the full direct-answer-gate budget — a page touching twenty new hosts
+    /// would stall name resolution for everything for seconds. Workers instead
+    /// carry the slow parts (upstream forward, bounded reconcile, gate)
+    /// concurrently; the loop only receives and dispatches. When the hand-off
+    /// queue is full the datagram is handled inline — backpressure degrades to
+    /// serial handling instead of dropping queries.
     pub fn serve_udp(&self, socket: &UdpSocket, stop: &AtomicBool) -> std::io::Result<()> {
         // A read timeout lets the loop observe `stop` promptly instead of
         // blocking forever in `recv_from`.
@@ -627,14 +626,14 @@ impl DnsInterceptListener {
                     // On Windows `recv_from` surfaces WSAECONNRESET (os error 10054) as
                     // a PER-DATAGRAM condition: after we `send_to` a DNS client whose
                     // ephemeral port already closed, the loopback ICMP port-unreachable
-                    // arrives on the NEXT `recv_from`. The 0710 build treated this as
-                    // fatal, so the whole Mode-B resolver serve loop terminated (with no
-                    // watchdog to re-arm it) and zone/suffix rules silently stopped
-                    // resolving (HW-0711 finding #3). Skip these transient
-                    // connection-level errors and keep serving; only a genuinely dead
-                    // socket ends the loop. Platform-neutral: correct on every OS (see
-                    // the cross-platform seam — no Win32 here; SIO_UDP_CONNRESET
-                    // suppression, if ever wanted, belongs behind the platform socket port).
+                    // arrives on the NEXT `recv_from`. Treating that as fatal would
+                    // terminate the whole Mode-B resolver serve loop (with no watchdog
+                    // to re-arm it), silently stopping zone/suffix rules from resolving.
+                    // Skip these transient connection-level errors and keep serving;
+                    // only a genuinely dead socket ends the loop. Platform-neutral:
+                    // correct on every OS (see the cross-platform seam — no Win32 here;
+                    // SIO_UDP_CONNRESET suppression, if ever wanted, belongs behind the
+                    // platform socket port).
                     Err(e)
                         if matches!(
                             e.kind(),
@@ -760,7 +759,7 @@ impl DnsInterceptListener {
     /// usually leaves usable addresses; when the whole answer is pinned, ONE
     /// upstream re-query is tried (a fresh answer usually rotates), and if
     /// that is also fully pinned the ORIGINAL reply is returned unchanged —
-    /// fail-open; the smart kill-switch (П0-A) is the safety net that keeps
+    /// fail-open; the smart kill-switch is the safety net that keeps
     /// such a host reachable. Every degraded path returns a valid reply.
     ///
     /// The second element is `true` ONLY on that terminal fail-open path —

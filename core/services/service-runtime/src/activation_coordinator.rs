@@ -524,9 +524,8 @@ pub trait Clock: Send + Sync {
 }
 
 /// Generates new revision IDs, confirmation tokens, and apply attempt
-/// IDs. Production builds them from the clock plus a counter (there is no
-/// CSPRNG in this tree - see the predictable-token task); tests use a deterministic
-/// counter so assertions are stable.
+/// IDs. Production builds them from the clock plus a counter — no CSPRNG in
+/// this tree; tests use a deterministic counter so assertions are stable.
 pub trait IdGenerator: Send + Sync {
     fn new_revision_id(&self) -> RevisionId;
     fn new_token(&self) -> String;
@@ -824,7 +823,7 @@ impl ActivationCoordinator {
             revision_id: None,
             action_plans,
             pre_flight_warnings: warnings,
-            estimated_duration_ms: 0, // populated when 16.10 wires real timing
+            estimated_duration_ms: 0, // TODO: no apply-timing instrumentation exists yet
         }
     }
 

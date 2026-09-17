@@ -38,9 +38,9 @@
 //! ## Degraded modes
 //!
 //! [`DegradedModeStatus`] aggregates which subsystems are unavailable and
-//! derives per-operation allowances. The runtime loop (block 14.7) reads
-//! this before accepting IPC requests so that mutating operations are
-//! rejected when the service is in an unsafe state.
+//! derives per-operation allowances. The runtime loop reads this before
+//! accepting IPC requests so that mutating operations are rejected when
+//! the service is in an unsafe state.
 //!
 //! ## Crash counter
 //!
@@ -555,16 +555,11 @@ pub enum SafeDisableOutcome {
     ConfirmationRequired,
 }
 
-/// Execute a safe-disable request. Validates preconditions and emits an
-/// audit record before returning success.
-///
-/// Preconditions:
-/// 1. `confirm_token` must match `expected_token` (issued by dry-run).
-/// 2. Audit write must succeed before any state change.
-/// 3. Apply layer must be reachable (checked by caller via `apply_available`).
-///
-/// TODO:: call `ApplyLayerPort::safe_disable()` here once block 15
-/// defines the interface for suspending WFP/route changes.
+/// Gate a safe-disable request: check the confirmation token, refuse when the
+/// caller reports no reachable apply layer, and record the intent in the audit
+/// trail. Suspending enforcement itself is the caller's job — `Disabled` means
+/// "cleared to proceed", not "enforcement is down" — so the audit line is
+/// written before anything is torn down and never after a silent failure.
 pub fn execute_safe_disable(
     request: &SafeDisableRequest,
     expected_token: &str,
@@ -584,7 +579,6 @@ pub fn execute_safe_disable(
     }) {
         return SafeDisableOutcome::AuditWriteFailed { detail: e };
     }
-    // TODO:: invoke platform apply layer to restore system routing.
     SafeDisableOutcome::Disabled {
         disabled_at_epoch_secs: now_secs,
     }

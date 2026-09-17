@@ -6,7 +6,7 @@
 
 use super::*;
 
-// ── Sub-slice 4d — fail-closed + per-app kill-switch + primary-app exemption ────
+// ── Fail-closed + per-app kill-switch + primary-app exemption ──────────────────
 
 /// A named-app scope carrying `pattern` as its `ALE_APP_ID` — the kill-switch app
 /// filters put the pattern straight into `app_pattern` (no exe-path resolution),
@@ -29,7 +29,7 @@ fn ale_protocol(p: KillSwitchProtocols) -> Option<L4Proto> {
     }
 }
 
-/// Build one kill-switch / fail-closed [`FlowRule`] (Sub-slice 4d).
+/// Build one kill-switch / fail-closed [`FlowRule`].
 #[allow(clippy::too_many_arguments)]
 fn ks_flow(
     principal: &PrincipalScope,
@@ -57,7 +57,7 @@ fn ks_flow(
     }
 }
 
-/// Plan the **per-app kill-switch** (Sub-slice 4d) — the leak-proof
+/// Plan the **per-app kill-switch** — the leak-proof
 /// `OnlyVia(Secondary)` pin over each protected app, keyed on `ALE_APP_ID` instead
 /// of a remote IP. Neutral equivalent of `killswitch_codegen::app_kill_switch_filters`.
 ///
@@ -101,7 +101,7 @@ pub fn plan_app_kill_switch(
     flows
 }
 
-/// Plan the **primary-app kill-switch exemption** (Sub-slice 4d) — one
+/// Plan the **primary-app kill-switch exemption** — one
 /// unconditional ALE `Permit` per app pattern in the top exempt band, so a user's
 /// deliberately primary-routed app (e.g. a VPN client bootstrapping over the
 /// primary link) is never cut. Neutral equivalent of
@@ -132,7 +132,7 @@ pub fn plan_primary_app_exempt(sid: &str, app_patterns: &[String]) -> Vec<FlowRu
         .collect()
 }
 
-/// Plan the **fail-closed per-destination block** (Sub-slice 4d) — the secondary
+/// Plan the **fail-closed per-destination block** — the secondary
 /// is unresolvable, so block each protected IP outright (no egress permit). Neutral
 /// equivalent of `killswitch_codegen::fail_closed_block_destinations`.
 ///
@@ -205,7 +205,7 @@ pub fn plan_fail_closed_destinations(
     flows
 }
 
-/// Plan the **fail-closed per-app block** (Sub-slice 4d) — block each protected
+/// Plan the **fail-closed per-app block** — block each protected
 /// app at the ALE layer (proto-agnostic, no egress permit). Neutral equivalent of
 /// `killswitch_codegen::fail_closed_block_apps`. Emits nothing unless TCP/UDP is
 /// selected (ALE only).
@@ -289,7 +289,7 @@ pub fn plan_doh_dot_block(sid: &str, resolver_ips: &[Ipv4Addr], block_dot: bool)
     flows
 }
 
-/// Plan the **fail-closed Mode-B block-all** (Sub-slice 4d) — the secondary is
+/// Plan the **fail-closed Mode-B block-all** — the secondary is
 /// gone, so block ALL egress for this user except the safe exemptions. Neutral
 /// equivalent of `killswitch_codegen::fail_closed_block_all_filters`.
 ///

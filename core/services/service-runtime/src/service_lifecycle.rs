@@ -9,9 +9,8 @@
 //!
 //! **Resolved decision: the service must run as `NT AUTHORITY\LocalSystem`.**
 //! See [`required_service_identity`] for the authoritative value with
-//! justification. `PRELIMINARY_IDENTITY` retains its `LocalService` value for
-//! reference; it was the optimistic initial candidate before the privilege
-//! survey.
+//! justification. `PRELIMINARY_IDENTITY` is kept only as a reference point;
+//! it is not the resolved value.
 //!
 //! `LocalSystem` is acceptable here because:
 //! - Both route-table and WFP operations require it on Windows Vista+.
@@ -88,9 +87,8 @@ impl ServiceIdentityDecision {
     }
 }
 
-/// Optimistic preliminary identity considered before the Win32 privilege
-/// survey. Retained for reference. The **actual resolved identity** is
-/// `required_service_identity()`.
+/// Preliminary identity value, kept for reference only. The **actual
+/// resolved identity** is `required_service_identity()`.
 ///
 /// See module doc for the full rationale.
 pub const PRELIMINARY_IDENTITY: ServiceIdentityDecision = ServiceIdentityDecision::LocalService;
@@ -409,9 +407,8 @@ mod tests {
 
     #[test]
     fn preliminary_identity_is_local_service_for_historical_reference() {
-        // PRELIMINARY_IDENTITY is the optimistic value considered before
-        // the privilege survey. The resolved identity is
-        // required_service_identity() = LocalSystem.
+        // PRELIMINARY_IDENTITY is a minimal reference value, not the resolved
+        // identity — required_service_identity() resolves to LocalSystem.
         assert!(PRELIMINARY_IDENTITY.is_minimal());
         assert!(!PRELIMINARY_IDENTITY.is_full_local_privilege());
     }
@@ -468,11 +465,8 @@ mod tests {
 
     #[test]
     fn privilege_matrix_has_no_tbd_entries_after_block_15_2() {
-        // TBDBlock15 variant has been removed from IdentityRequirement.
-        // All entries must have a concrete resolved identity.
+        // Every entry must resolve to a concrete identity — none left as TBD.
         for entry in PRIVILEGE_MATRIX {
-            // If any entry still has a justification referencing TODO:,
-            // it was not properly resolved.
             assert!(
                 !entry.justification.starts_with("TODO(block-15)"),
                 "entry '{}' still has an unresolved TODO(block-15) justification",

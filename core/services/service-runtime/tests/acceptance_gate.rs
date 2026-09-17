@@ -329,8 +329,8 @@ fn ipc_mutation_from_unprivileged_client_is_forbidden() {
     );
 }
 
-/// The catalogue says which surfaces may invoke an operation, and that used to
-/// be a note nobody read: the tray could call every operation marked GUI-only.
+/// A GUI-only operation must be refused to the tray by the per-operation
+/// catalogue check, since the read/mutation class check alone would allow it.
 #[test]
 fn a_gui_only_operation_is_refused_to_the_tray() {
     let router = make_router();
@@ -344,8 +344,8 @@ fn a_gui_only_operation_is_refused_to_the_tray() {
     assert_eq!(resp.error.expect("error").code, IpcErrorCode::Forbidden);
 }
 
-/// …and what the tray genuinely needs stays open to it. Enforcing the field as
-/// written would have silenced push events, which is how the tray shows state.
+/// The push-event subscription must stay open to the tray — it is how the
+/// tray reflects state — even though the per-operation refusal above exists.
 #[test]
 fn the_tray_may_still_subscribe_to_push_events() {
     let router = make_router();

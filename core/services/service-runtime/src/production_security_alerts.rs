@@ -1,12 +1,6 @@
 //! production [`SecurityAlertsRepository`] backed by the
-//! `security_alerts` table in `nrr_service_state.db` (schema v3, defined
-//! in block 13.3).
-//!
-//! Replaces `core/application/src/alert_store.rs` (the file-backed JSON
-//! store) for the service-owned write path. The legacy module is
-//! deleted in this sub-block — there are no remaining production
-//! callers, only the local `mod tests` exercises and a doc reference
-//! in `core/domain/src/block8_outputs.rs`.
+//! `security_alerts` table in `nrr_service_state.db`. The service-owned
+//! write path for security alerts.
 //!
 //! ## Lifecycle invariants
 //!

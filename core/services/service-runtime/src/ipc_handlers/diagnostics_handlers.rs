@@ -1274,10 +1274,10 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
         // not a way around the scoping, and the person exporting it is usually
         // about to send it to somebody else.
         let audience = ctx.diagnostics_audience();
-        // The lines as written, scoped like everything else — which is why the
-        // log directory no longer has to be readable by every account. The
-        // user's cap applies; `0` means UNLIMITED, as the preference promises,
-        // and the real bounds are retention and the export's own window.
+        // The lines are scoped like everything else, so the log directory does
+        // not need to be readable by every account. The user's cap applies;
+        // `0` means UNLIMITED, as the preference promises, and the real bounds
+        // are retention and the export's own window.
         let raw_log_budget = match req.raw_log_budget_bytes {
             Some(bytes) if bytes > 0 => bytes as usize,
             _ => usize::MAX,

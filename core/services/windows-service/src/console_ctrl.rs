@@ -1,33 +1,28 @@
-//! Console control handler — block 16.7.
+//! Console control handler.
 //!
-//! Replaces the `ctrlc_install` placeholder in `main.rs`. Registers a
-//! `SetConsoleCtrlHandler` callback that flips a stored
+//! Registers a `SetConsoleCtrlHandler` callback that flips a stored
 //! [`StopToken`][nrr_service_runtime::StopToken] when the user presses
 //! Ctrl+C, Ctrl+Break, or closes the console window.
 //!
-//! ## Why not `ctrlc` crate?
+//! ## Why not the `ctrlc` crate?
 //!
-//! Same reason the original placeholder gave: dragging in a third-party
-//! crate for a single-line need is overkill. We already pull `windows`
-//! for the named-pipe IPC server (block 16.1), so adding the
+//! A third-party crate for a single-line need is overkill; `windows` is
+//! already a dependency for the named-pipe IPC server, so adding the
 //! `Win32_System_Console` feature is incremental.
 //!
 //! ## Why a static `OnceLock<StopToken>`?
 //!
-//! `SetConsoleCtrlHandler` takes a plain `extern "system" fn` — no
-//! closure, no user pointer. The handler must look up the token through
-//! a process-global. `OnceLock` makes the assignment idempotent and
-//! thread-safe; double-install (e.g. accidental call from both `console`
-//! and SCM paths) is a no-op rather than a panic. Production paths only
-//! call `install()` once.
+//! `SetConsoleCtrlHandler` takes a plain `extern "system" fn` — no closure,
+//! no user pointer — so the handler looks up the token through a
+//! process-global. `OnceLock` makes the assignment idempotent and
+//! thread-safe: a double `install()` call is a no-op, not a panic.
 //!
 //! ## SCM mode
 //!
-//! `windows-service` already drives stop/shutdown through the SCM
-//! control handler in `scm.rs`. Console-control events do not flow under
-//! SCM dispatch. This module is therefore wired from `run_console`
-//! only — calling it under SCM is harmless (the handler is never
-//! invoked) but unnecessary.
+//! `windows-service` already drives stop/shutdown through the SCM control
+//! handler in `scm.rs`; console-control events do not flow under SCM
+//! dispatch. This module is wired from `run_console` only — installing it
+//! under SCM would be harmless but unnecessary.
 
 #![cfg(windows)]
 // SAFETY: This module deliberately uses `unsafe` for one reason — calling
@@ -62,8 +57,8 @@ pub enum InstallOutcome {
     /// registration is in effect, and the supplied token is ignored.
     AlreadyInstalled,
     /// The Win32 `SetConsoleCtrlHandler` call returned an error. The
-    /// caller should fall back to "service runs until killed" mode (the
-    /// pre-block-16.7 behaviour) and surface a warning to stderr.
+    /// caller should fall back to "service runs until killed" mode and
+    /// surface a warning to stderr.
     RegistrationFailed,
 }
 
@@ -120,9 +115,8 @@ mod tests {
         );
     }
 
-    // Note: actually calling `install()` would mutate process-global
-    // state and break other tests run in the same binary. The handler
-    // function and OnceLock are exercised in integration tests under
-    // `tests/console_ctrl_test.rs` (block 16.7), which spawn a child
-    // process so the global registration is isolated.
+    // Actually calling `install()` would mutate process-global state and
+    // break other tests in the same binary. The handler function and
+    // OnceLock are exercised in `tests/console_ctrl_test.rs`, which spawns
+    // a child process so the global registration is isolated.
 }

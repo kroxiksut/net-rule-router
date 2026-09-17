@@ -354,10 +354,18 @@ fn adapter_monitor_task_ticks_during_run() {
     let controller = RecordingController::default();
     let stop = StopToken::new();
     let stop_clone = stop.clone();
-    // Stop on the second tick, with a deadline as the backstop. A fixed
-    // sleep measured the machine instead: it starts before `bootstrap`,
-    // so on a loaded runner storage init ate the budget and the monitor
-    // had only reached its first tick.
+
+    // Everything expensive happens BEFORE the probe starts counting. The
+    // deadline used to cover `bootstrap` too, and under a full `--workspace`
+    // run storage init spent the whole budget: the probe then stopped the
+    // runtime before the monitor had ticked even once (observed as "got 0",
+    // not as one tick short).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
+    let artifacts = bootstrap(&cfg);
+
+    // Stop on the second tick, with a deadline as the backstop; what remains
+    // inside the window is starting the runtime and two 500 ms ticks.
     let calls_probe = Arc::clone(&counting);
     let join = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -367,9 +375,6 @@ fn adapter_monitor_task_ticks_during_run() {
         stop_clone.request_stop();
     });
 
-    let dir = tempfile::tempdir().expect("tempdir");
-    let cfg = BootstrapConfig::new(StorageProfile::TestTemp(dir.path().to_path_buf()));
-    let artifacts = bootstrap(&cfg);
     let _ = run_supervised_runtime(&controller, &stop, artifacts, deps);
     join.join().unwrap();
 

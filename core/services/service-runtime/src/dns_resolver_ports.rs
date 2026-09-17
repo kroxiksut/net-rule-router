@@ -9,7 +9,7 @@
 //! - [`PortUpstreamResolver`] — upstream via the platform [`DnsResolverPort`].
 //! - [`CacheFactSink`] — FQDN-cache upsert via [`CacheRepository`].
 //!
-//! The listener (increment 1b-ii) constructs these and hands them to
+//! The listener constructs these and hands them to
 //! [`crate::dns_resolver::handle_a_query`].
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -76,7 +76,7 @@ impl RuleHostOracle for ActiveRuleHostOracle {
 /// the system-configured resolver (`DnsQuery_W` today; hickory later), which
 /// honours the hosts file + configured servers — so split-horizon / corporate
 /// zones resolve correctly, provided it is the resolver captured *before* any
-/// DNS redirect (increment 1c).
+/// DNS redirect.
 pub struct PortUpstreamResolver {
     resolver: Arc<dyn DnsResolverPort>,
 }
@@ -186,8 +186,8 @@ impl DnsResolverPort for UpstreamResolverPort {
 ///
 /// This is the Mode-B upstream PIN: the OS resolver (`DnsQuery_W`) honours the
 /// very NRPT catch-all Mode B installs, so resolving a rule host through it
-/// loops back into our own loopback listener and times out (HW-0712 C10-a —
-/// "Mode B rubs ALL DNS"). A raw socket is invisible to NRPT by construction
+/// loops back into our own loopback listener and times out. A raw socket is
+/// invisible to NRPT by construction
 /// (NRPT steers only the Windows DNS Client service), and it never consults
 /// the hosts file — which is also the enforcement mechanism behind the
 /// `resolve_hosts_bypass` posture for rule hosts. OS-neutral: std sockets, no
@@ -210,13 +210,13 @@ pub struct DirectUdpUpstreamResolver {
 
 /// A fresh, unguessable id for each query.
 ///
-/// It used to be a counter from a nanosecond seed, which made every id after
-/// the first one predictable from any single observed query. The socket is
-/// connected and the answer is matched on id plus question, so a forger already
-/// has to guess the ephemeral port and spoof the server's source address - but
-/// this was the one of the three barriers that cost nothing to remove, and what
-/// it protects is the cache the routes, the pins and the kill-switch exemptions
-/// are all derived from.
+/// A predictable id (e.g. a counter) would make every id after the first one
+/// guessable from a single observed query. The socket is connected and the
+/// answer is matched on id plus question, so a forger already has to guess the
+/// ephemeral port and spoof the server's source address — but randomizing the
+/// id costs nothing and removes one more barrier a forger would otherwise not
+/// need to clear, protecting the cache the routes, the pins and the
+/// kill-switch exemptions are all derived from.
 ///
 /// A failed draw falls back to the clock rather than to a constant: worse than
 /// random, still not fixed, and it cannot fail the resolution.
@@ -385,7 +385,7 @@ impl DirectUdpUpstreamResolver {
                 }
                 AddressResponseOutcome::NoRecords => return Err(ResolveError::NoRecords),
                 AddressResponseOutcome::Truncated => {
-                    // No TCP fallback in phase 1 — surface as transient so the
+                    // No TCP fallback yet — surface as transient so the
                     // listener fail-opens (forwards raw) instead of NXDOMAIN-ing.
                     return Err(ResolveError::Unavailable("truncated (TC=1)".into()));
                 }
@@ -988,7 +988,7 @@ fn build_resolution_entry(
 /// constraint), mirroring the seeder's proven upsert path.
 pub struct CacheFactSink {
     cache: Arc<Mutex<dyn CacheRepository + Send>>,
-    /// П0-D — read-side view over the same cache for the stable-answer
+    /// Read-side view over the same cache for the stable-answer
     /// preference ([`FactSink::cached_routable_ips`]).
     lookup: crate::fqdn_cache_lookup::SqliteFqdnCacheLookup,
 }
@@ -1035,16 +1035,15 @@ impl FactSink for CacheFactSink {
 ///
 /// ## Why this set is NOT gated on the secondary being usable
 ///
-/// A  change emptied this set whenever the secondary could not carry
-/// traffic, on the premise that "nothing is pinned to a dead link, so there is
-/// nothing to steer away from". The premise is inverted: an unusable secondary
-/// is exactly when the fail-closed posture installs a BLOCK over these
-/// addresses, so they go from "would take a detour" to "will be dropped" — the
-/// moment a direct host most needs to be steered off them. The  run
-/// showed the consequence: with the secondary down, a direct host sharing
-/// front-end addresses with a secondary rule host received those addresses
-/// verbatim and lost connectivity, while the steering that would have handed it
-/// clean ones stood down. Steering is therefore unconditional.
+/// Gating this set on the secondary being usable is tempting: "nothing is
+/// pinned to a dead link, so there is nothing to steer away from." The premise
+/// is inverted: an unusable secondary is exactly when the fail-closed posture
+/// installs a BLOCK over these addresses, so they go from "would take a
+/// detour" to "will be dropped" — the moment a direct host most needs to be
+/// steered off them. Gating on usability would let a direct host that shares
+/// front-end addresses with a secondary rule host receive those addresses
+/// verbatim while the secondary is down, losing connectivity instead of being
+/// steered onto clean ones. Steering is therefore unconditional.
 ///
 /// Steering away can never leak rule-host traffic: it only ever REMOVES
 /// addresses from a NON-rule host's answer (rule hosts are intercepted and
@@ -1133,14 +1132,14 @@ impl crate::dns_resolver::SecondaryOwnedIps for ActiveSecondaryOwnedIps {
 /// in the background and the async safety tick converges). A slow enforcement
 /// beats a stalled browser.
 ///
-/// Coalescing (HW-0722, the §9 refinement, promoted from "future"): the 0722
-/// boot log showed thread-per-call reconciles convoying on the orchestrator
-/// lock under the armed block-all — each new direct host spawned another full
-/// reconcile, every one slower than the last, and 92% of the direct-answer
-/// gates blew their budget. Now a caller registers its generation (its facts
-/// are already recorded/registered by then) and is satisfied by the first hook
-/// run that STARTS after its registration; concurrent callers share that run.
-/// The worker lives for the reconciler's lifetime and exits on drop.
+/// Coalescing: without it, thread-per-call reconciles convoy on the
+/// orchestrator lock under an armed block-all — each new direct host spawns
+/// another full reconcile, each one slower than the last, and the
+/// direct-answer gates blow their budget. A caller instead registers its
+/// generation (its facts are already recorded/registered by then) and is
+/// satisfied by the first hook run that STARTS after its registration;
+/// concurrent callers share that run. The worker lives for the reconciler's
+/// lifetime and exits on drop.
 pub struct HookSyncReconciler {
     hook: RouteRecomputeHook,
     state: Arc<(Mutex<ReconcileWorkerState>, std::sync::Condvar)>,
@@ -1326,7 +1325,7 @@ impl crate::dns_resolver::EnforcedAddressView for ActiveSidEnforcedAddresses {
     }
 }
 
-// ── FCrDNS learner adapters (HW-0719, killswitch-B) ─────────────────────────
+// ── FCrDNS learner adapters ──────────────────────────────────────────────────
 
 use crate::dns_observation_consumer::DnsObservationConsumer;
 use crate::fcrdns_learner::{ConfirmedHostSink, ReverseDnsResolver};
@@ -1431,7 +1430,7 @@ impl ConfirmedHostSink for ConsumerConfirmedHostSink {
     }
 }
 
-// ── Direct-answer gate (HW-0721, block-all direct-host exemptions) ───────────
+// ── Direct-answer gate (block-all direct-host exemptions) ────────────────────
 
 /// Production [`crate::dns_resolver::DirectAnswerGate`]: while the kill-switch
 /// block-all is armed, register a steered direct answer's addresses as

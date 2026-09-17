@@ -257,10 +257,9 @@ function hostAddressMatchDto(value) {
 
 // THE rules-model row -> canonical wire DTO mapper. Single serializer for every
 // caller: the Rules-section "Save and review", the window-level apply payload,
-// and the drift hasher. Three divergent copies used to exist and disagreed on
-// two fields — the review payload dropped `comment` while the apply payload kept
-// it, so every rule carrying an inline preset comment showed up as "modified" in
-// a dry-run that changed nothing.
+// and the drift hasher. Per-caller copies risk diverging on fields like
+// `comment`, which would show every rule carrying an inline preset comment as
+// "modified" in a dry-run that changed nothing.
 //
 // `aceEncodeHost` is a callback because ACE/Punycode encoding goes through the
 // C++ bridge, which a `.pragma library` scope cannot reach (see the file header).

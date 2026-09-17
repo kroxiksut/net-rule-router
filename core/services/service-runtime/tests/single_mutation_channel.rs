@@ -28,7 +28,7 @@
 //! plus everything under a directory of the same name. That is the unit the
 //! invariant is stated in ("only these two types' own code"), and it is what
 //! keeps the gate from breaking every time one of those modules is split into
-//! more files — which happened three times before the granularity was fixed.
+//! more files.
 //!
 //! Two rejected alternatives, both of which keep the test green while removing
 //! its teeth: matching by BASENAME (then `tests.rs` has to be allowed, which

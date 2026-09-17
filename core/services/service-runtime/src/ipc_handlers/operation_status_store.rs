@@ -96,10 +96,9 @@ pub struct OperationStatusStore {
 static OPERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Operation ids name a record that carries the RESULT of somebody's mutation,
-/// so they must not be enumerable. The old suffix was
-/// `Instant::now().elapsed()`, which is a few nanoseconds by construction —
-/// the id was the counter and nothing else. The counter stays as the ordering
-/// aid it always was; the randomness is what makes the id unguessable.
+/// so they must not be enumerable. The counter alone is not enough — it is
+/// sequential by construction — so a random suffix is appended; the counter
+/// stays as the ordering aid, the randomness is what makes the id unguessable.
 ///
 /// A failed draw falls back to the clock: an operation whose status cannot be
 /// reported at all is worse than an id that is merely hard to guess, and the

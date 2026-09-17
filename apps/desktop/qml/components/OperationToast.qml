@@ -221,8 +221,7 @@ Rectangle {
         }
         if (root.errorCode) {
             // Bridge not yet wired (e.g. running in Tray context) —
-            // keep the historical "(code)" form so we don't
-            // regress before the helper is available.
+            // fall back to the raw "(code)" form rather than nothing.
             var template = _tr(
                 "toast.operation.error.with-code",
                 "Operation failed ({code})")

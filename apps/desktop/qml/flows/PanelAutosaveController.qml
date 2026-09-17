@@ -2,12 +2,11 @@ import QtQuick 2.15
 
 // Non-visual autosave driver for a settings panel that owns draft state.
 //
-// A panel used to need its own Save button: the draft only reached the service
-// when the user found and pressed it, so an edit made and forgotten was
-// silently lost (or, worse, carried a stale draft into the next Save). The
-// panel now commits through three paths instead — the global footer Apply, the
+// The panel commits through three paths — the global footer Apply, the
 // navigation guard when leaving the section, and this controller, which fires
 // the same save function once the user has stopped editing for `intervalSecs`.
+// Without it, an edit made and forgotten (or a stale draft carried into the
+// next manual Save) is silently lost.
 //
 // Usage: instantiate inside the panel, feed it the panel's live dirty flag and
 // handle `due()` by calling the panel's own save function. The timer is a

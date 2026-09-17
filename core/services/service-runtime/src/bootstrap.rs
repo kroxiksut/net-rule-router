@@ -629,8 +629,8 @@ pub fn bootstrap(config: &BootstrapConfig) -> BootstrapArtifacts {
         ),
     }
 
-    // Phases 6 / 7 — placeholders for IPC start (14.5) and runtime loop
-    // start (14.7). Surfaced here so the report is shaped correctly for
+    // Phases 6 / 7 — placeholders for IPC start and runtime loop start, not
+    // yet implemented. Surfaced here so the report is shaped correctly for
     // every downstream phase to plug into.
     push(
         &mut report,
@@ -699,9 +699,9 @@ fn open_and_migrate_state(
     let verification = runner
         .verify_schema()
         .map_err(|e| StateOpenFailure::Migrate(format!("verify_schema: {e}")))?;
-    // The verdict is the point of the call. It used to be computed and
-    // dropped, so an interrupted migration — a missing table, a missing index
-    // — reported a clean start and failed on the first query instead.
+    // The verdict must actually be checked: an interrupted migration — a
+    // missing table, a missing index — would otherwise report a clean start
+    // and fail only on the first query.
     if !verification.is_ok() {
         return Err(StateOpenFailure::Migrate(describe_schema_failure(
             "state",
@@ -1111,15 +1111,10 @@ mod tests {
 
     #[test]
     fn topology_failure_skips_subsequent_phases() {
-        // Force topology resolution to fail by selecting
-        // ProductionService and clearing PROGRAMDATA. We can't actually
-        // unset the env var safely from a parallel test; instead we
-        // assert the documented helper status_for behaviour via a
-        // direct call to a guaranteed-failing path. We use a
-        // non-existent absolute path encoded as TestTemp under a
-        // root-only directory; on Windows that's `C:\System Volume Information\…`
-        // — too brittle. Instead, exercise the normal happy path and
-        // then manually corrupt the state DB so MIGRATIONS_STATE fails.
+        // Topology failure itself is impractical to trigger here — no safe way
+        // to clear PROGRAMDATA in a parallel test, and Windows-specific paths
+        // are too brittle — so this corrupts the state DB after a clean
+        // bootstrap instead, to exercise the same downstream-skip behavior.
         let (_dir, cfg) = temp_profile();
         let first = bootstrap(&cfg);
         assert!(first.is_ready_to_run());

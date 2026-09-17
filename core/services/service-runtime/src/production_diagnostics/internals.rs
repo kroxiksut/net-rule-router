@@ -444,8 +444,7 @@ impl ProductionDiagnosticsFacade {
         CacheHealthCard {
             entry_count,
             healthy: true,
-            // Rebuild-in-progress tracking is a future
-            // signal (DnsRefreshOrchestrator could expose it via a
+            // Rebuild-in-progress tracking is not surfaced yet.
         }
     }
 

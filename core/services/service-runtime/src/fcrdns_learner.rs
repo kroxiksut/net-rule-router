@@ -94,12 +94,13 @@ pub struct ReverseDnsLearner<R: ReverseDnsResolver, S: ConfirmedHostSink> {
     sink: S,
     /// IPs already attempted, bounded and least-recently-seen first.
     ///
-    /// This used to be an unbounded set plus a hard per-session ceiling: once
-    /// the ceiling was reached the learner stopped learning until the service
-    /// restarted, and an address attempted once during a blip was never retried
-    /// at all. Bounding the memory does both jobs — it caps what a drop storm
-    /// can cost in memory, and an address that falls out of the window becomes
-    /// learnable again, which is how a transient failure heals.
+    /// Bounded rather than an unbounded set with a hard ceiling: a ceiling caps
+    /// memory but never forgets, so once it is reached the learner stops
+    /// learning until the service restarts, and an address attempted once during
+    /// a blip is never retried at all. The bounded window does both jobs — it
+    /// caps what a drop storm can cost in memory, and an address that falls out
+    /// of the window becomes learnable again, which is how a transient failure
+    /// heals.
     attempted: Mutex<BoundedRecentSet<Ipv4Addr>>,
     /// When a lookup for an address came back with nothing at all. Such an
     /// attempt still dedups a drop storm, but only for
@@ -472,12 +473,9 @@ mod tests {
 
     #[test]
     fn the_window_evicts_instead_of_stopping_the_learner() {
-        // The cap used to stop learning for the rest of the session: after N
-        // distinct destinations nothing new was ever attempted, and an address
-        // tried once during a blip was never retried. Now the memory is a
-        // window - a new destination is always attempted, and one that falls
-        // out of the window can be tried again, which is how a transient
-        // failure heals.
+        // The memory is a window, not a ceiling: a new destination is always
+        // attempted, and one that falls out of the window can be tried again,
+        // which is how a transient failure heals.
         let a = Ipv4Addr::new(1, 1, 1, 1);
         let b = Ipv4Addr::new(2, 2, 2, 2);
         let l = learner(&[], &[], ".example", 1);

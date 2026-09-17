@@ -7,10 +7,9 @@
 //!
 //! Push-event emission for the corresponding `StatusUpdateEvent`
 //! variants is **not** wired here — that requires `EventBus` access
-//! plumbed through these structs and will land in a future phase.
-//! Settings writes are
-//! still durably persisted; the GUI sees them on the next
-//! `SnapshotInitial` round-trip until push events go live.
+//! plumbed through these structs. Settings writes are still durably
+//! persisted; the GUI sees them on the next `SnapshotInitial` round-trip
+//! until push events go live.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -46,7 +45,7 @@ fn now_secs() -> i64 {
 }
 
 /// Production `Clock` impl backed by `SystemTime::now`. Used by
-/// `RoutingPauseCoordinator` (and, in phase 2, `ActivationCoordinator`).
+/// `RoutingPauseCoordinator` and `ActivationCoordinator`.
 pub struct SystemClock;
 
 impl crate::activation_coordinator::Clock for SystemClock {
@@ -56,9 +55,9 @@ impl crate::activation_coordinator::Clock for SystemClock {
 }
 
 /// no-op `PauseDispatcher`. Persists pause state
-/// to SQL but does NOT install/remove platform filters. Phase 2 swaps
-/// this for [`OrchestratorPauseDispatcher`]. Kept around for tests and
-/// the recovery path where the orchestrator may not be available.
+/// to SQL but does NOT install/remove platform filters. Kept for tests and
+/// the recovery path where the orchestrator may not be available; production
+/// wiring uses [`OrchestratorPauseDispatcher`] instead.
 pub struct NoopPauseDispatcher;
 
 impl crate::routing_pause::PauseDispatcher for NoopPauseDispatcher {
@@ -113,7 +112,7 @@ fn lock_conn<'a>(
 
 pub struct ProductionRetentionSettings {
     conn: Arc<Mutex<Connection>>,
-    /// Phase 2: optional `EventBus` so successful writes publish a
+    /// Optional `EventBus` so successful writes publish a
     /// `RetentionSettingsChanged` push event. `None` skips the publish
     /// (e.g. when the bus has not been wired yet during partial bring-up).
     event_bus: Option<Arc<EventBus>>,
@@ -342,10 +341,8 @@ impl ApplyFailurePolicyWriter for ProductionApplyFailurePolicy {
             .get_or_default()
             .map_err(|e| SettingsWriteError::Storage(e.to_string()))?;
         drop(conn);
-        // forward to the live coordinator so the
-        // next activation uses the new mode immediately. Phase 1 had a
-        // gap here (eventual consistency via re-read on next activate);
-        // phase 2 closes it.
+        // Forward to the live coordinator so the next activation uses the
+        // new mode immediately, rather than waiting on a re-read.
         if let Some(coord) = self.coordinator.as_ref() {
             if let Some(parsed) = parse_apply_failure_policy(slug) {
                 coord.set_failure_policy(parsed);
@@ -714,10 +711,9 @@ use nrr_storage::service_stability_config::{
 /// storage `IpcAcceptPolicyRecord` enum and the wire-shaped
 /// `IpcAcceptFailurePolicyDto`.
 ///
-/// carry-over (now delivered in 16.13.S1): the IPC
-/// handler was previously stubbed; setting the config requires admin
-/// elevation per `IpcOperationSpec::requires_service_mutation_privilege`
-/// upstream, so the writer trusts the caller has been gated already.
+/// Setting the config requires admin elevation per
+/// `IpcOperationSpec::requires_service_mutation_privilege` upstream, so
+/// the writer trusts the caller has already been gated.
 pub struct ProductionServiceStability {
     conn: Arc<Mutex<Connection>>,
     /// the shared liveness tracker whose window this
@@ -730,13 +726,13 @@ pub struct ProductionServiceStability {
     /// platform factory isn't wired (the mode still persists; takes effect next
     /// restart).
     resolver_controller: Option<Arc<crate::dns_resolver_service::DnsResolverController>>,
-    /// P3 — the boot-time tracing-reload seam. When `Some`,
+    /// The boot-time tracing-reload seam. When `Some`,
     /// a `set()` flips the running process's `EnvFilter` to match the new
     /// `verbose_logging` value WITHOUT a service restart. `None` in tests /
     /// on a degraded boot (the value still persists; takes effect next
-    /// restart, same as before this change).
+    /// restart).
     verbosity_control: Option<Arc<dyn crate::verbosity_control::VerbosityControl>>,
-    /// Block D (S4.7) — the fake-IP live-apply seam. When `Some`, a `set()`
+    /// The fake-IP live-apply seam. When `Some`, a `set()`
     /// reconciles the fake-IP stack to `fake_ip_enabled && mode == Resolver`
     /// WITHOUT a service restart. The hook must be async/best-effort (driver
     /// load takes seconds; never stall the IPC reply). `None` in tests / when
@@ -843,7 +839,7 @@ impl ProductionServiceStability {
         self
     }
 
-    /// Block D (S4.7) — attaches the fake-IP live-apply hook so a toggle (or a
+    /// Attaches the fake-IP live-apply hook so a toggle (or a
     /// mode flip) reconciles the stack live (no restart). Chain after `new`.
     pub fn with_fake_ip_apply(
         mut self,
@@ -977,17 +973,11 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             EnforcementMode::from_slug(&dto.enforcement_mode).unwrap_or_default();
         let conn = lock_conn(&self.conn)?;
         let repo = ServiceStabilityConfigRepository::new(&conn);
-        // the previous enforcement mode, for the transition log below.
-        // The 0714 HW run showed the GUI displaying Mode B while the service ran
-        // Mode A with ZERO log evidence of why; a one-line write log makes every
-        // future "did my toggle reach the service?" diagnosable from the NDJSON.
-        //
-        // P2 — same rationale for `verbose_logging`: the 0716 run saved
-        // the "Verbose service logging" toggle and the row never left `0`. A
-        // symmetric prior→written log line (below, target `nrr::stability`)
-        // means the next run can tell in one grep whether the write reached
-        // storage at all, instead of only being able to query the DB after
-        // the fact.
+        // The previous enforcement mode, for the transition log below: a
+        // one-line prior→written log makes "did my toggle reach the
+        // service?" diagnosable from the NDJSON in one grep instead of only
+        // answerable by querying the DB after the fact. Same rationale
+        // covers `verbose_logging` below (target `nrr::stability`).
         let prior_record = repo.get_or_default().ok();
         let prior_mode = prior_record
             .as_ref()
@@ -997,10 +987,10 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             .as_ref()
             .map(|r| r.verbose_logging)
             .unwrap_or(false);
-        // Same rationale for the two routing-critical toggles: a  run
-        // ended with the GUI showing fake-IP OFF while the service kept the
-        // stack alive to shutdown — with no way to tell from the NDJSON whether
-        // an OFF write ever arrived. Log prior→written for both, always.
+        // Same rationale for the two routing-critical toggles: log
+        // prior→written for both, always, so the NDJSON can confirm whether
+        // a toggle write ever arrived even when the running stack does not
+        // yet reflect it.
         let prior_fake_ip = prior_record
             .as_ref()
             .map(|r| r.fake_ip_enabled)
@@ -1088,14 +1078,13 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             resolver_live = self.resolver_controller.is_some(),
             "service-stability config written (enforcement mode)",
         );
-        // P3 — same write, logged for the verbose-logging field.
-        // Unlike the P2-era comment this superseded: the EnvFilter is now
-        // ALSO reloaded live below when `self.verbosity_control` is wired
+        // Same write, logged for the verbose-logging field. The EnvFilter is
+        // also reloaded live below when `self.verbosity_control` is wired
         // (`live_reload = true`), so `changed = true` together with
         // `live_reload = true` means the running process's log level just
         // flipped, with no restart required. `live_reload = false` (control
-        // not wired — tests / degraded boot) keeps the old behaviour: the
-        // preference persists and takes effect on the next service start.
+        // not wired — tests / degraded boot) means the preference persists
+        // and takes effect on the next service start.
         tracing::info!(
             target: "nrr::stability",
             prior = prior_verbose,
@@ -1104,7 +1093,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
             live_reload = self.verbosity_control.is_some(),
             "service-stability config written (verbose logging)",
         );
-        // P3 — flip the LIVE tracing filter to match the persisted
+        // Flip the LIVE tracing filter to match the persisted
         // value WITHOUT a service restart. Unconditional (not gated on
         // `changed`) to mirror the resolver-controller call below: applying
         // the current value is idempotent and keeps this call site simple,
@@ -1170,7 +1159,7 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
-        // Block D (S4.7) — reconcile the fake-IP stack to the persisted state
+        // Reconcile the fake-IP stack to the persisted state
         // WITHOUT a service restart, same live-apply contract as the resolver
         // controller above. Desired = toggle ON *and* the resolver mode: the
         // fake answers ride the Mode-B resolver, so a mode flip away from
@@ -1277,17 +1266,13 @@ impl ServiceStabilityConfigWriter for ProductionServiceStability {
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 //
-// P2 — regression coverage for the "verbose service logging"
-// toggle chain. The 0716 HW run saved the toggle and `service_stability_config
-// .verbose_logging` never left `0`. The diagnosed root cause (TASKS_RU §16.
-// P0.4a) was a lost-update race in the GUI: `ServiceStabilityConfigSet`
-// has no sparse-update wire shape (every Set replaces the full row), and two
-// panels each doing their own stale Get→Set could clobber each other's field.
-// The QML-side fix serialises every patch through one queue
-// (`Main.qml::_stabilityPatchQueue`); these tests exercise the storage-boundary
-// contract that fix depends on, against the REAL `ProductionServiceStability`
-// writer/provider (not the fakes in `service_stability_handlers.rs` tests) —
-// there was previously no test in this crate that round-tripped
-// `ProductionServiceStability` through real SQLite at all.
+// Regression coverage for the "verbose service logging" toggle chain:
+// `ServiceStabilityConfigSet` has no sparse-update wire shape (every Set
+// replaces the full row), so two panels each doing their own stale Get→Set
+// can clobber each other's field. The QML-side fix serialises every patch
+// through one queue (`Main.qml::_stabilityPatchQueue`); these tests exercise
+// the storage-boundary contract that fix depends on, against the REAL
+// `ProductionServiceStability` writer/provider (not the fakes in
+// `service_stability_handlers.rs` tests) round-tripped through real SQLite.
 #[cfg(test)]
 mod service_stability_tests;

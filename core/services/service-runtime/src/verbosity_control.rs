@@ -1,20 +1,16 @@
-//! Live tracing-verbosity control seam — block 16.HW-0716 P3.
+//! Live tracing-verbosity control seam.
 //!
-//! # Problem
-//!
-//! The "Verbose service logging" toggle (`service_stability_config
-//! .verbose_logging`) was already boot-correct: `nrr-windows-service` reads
-//! the persisted flag before installing the global tracing subscriber, so a
-//! fresh service start always begins at the right filter
-//! (`DEFAULT_TRACING_FILTER` / `VERBOSE_TRACING_FILTER`, see
-//! `nrr_diagnostics::logs::tracing_layer`). What was missing: a mid-session
-//! `Set` (the GUI Save button) only persisted the new value to SQLite — the
-//! *running* process kept its boot-time `EnvFilter` until the service was
-//! restarted.
+//! `nrr-windows-service` reads the persisted `verbose_logging` flag before
+//! installing the global tracing subscriber, so a fresh service start
+//! always begins at the right filter (`DEFAULT_TRACING_FILTER` /
+//! `VERBOSE_TRACING_FILTER`, see `nrr_diagnostics::logs::tracing_layer`).
+//! A mid-session `Set` (the GUI Save button) must additionally reach the
+//! *running* process's `EnvFilter`, not just SQLite — that live reload is
+//! what this module wires up.
 //!
 //! # Design — policy/mechanism seam
 //!
-//! The actual reload primitive (`tracing_subscriber::reload::Handle`) is a
+//! The reload primitive (`tracing_subscriber::reload::Handle`) is a
 //! concrete `nrr-diagnostics` type (`TracingVerbosityHandle`) constructed
 //! once, at boot, alongside `install_ndjson_tracing_with_verbose` in
 //! `nrr-windows-service`. `nrr-service-runtime` (this crate) must not
@@ -27,8 +23,7 @@
 //!   `resolver_controller` optional-live-apply fields on the same struct.
 //! - Tests inject a fake recorder instead of a real subscriber.
 //! - `None` (tests, non-Windows, degraded boot) is a safe default: the
-//!   value still persists to SQLite and takes effect on the next restart,
-//!   same as before this change.
+//!   value still persists to SQLite and takes effect on the next restart.
 //!
 //! `nrr_diagnostics::TracingVerbosityHandle` implements this trait directly
 //! below, so production wiring (`runtime_deps.rs`) can pass the boot-time

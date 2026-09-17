@@ -12,22 +12,18 @@
 //! Private space (`10/8`, `172.16/12`, `192.168/16`) passes untouched: routing
 //! internal names to an internal address is a product feature, not a defect.
 //!
-//! ## What used to be here, and why it is gone
+//! ## Why a trailing `.0` is not treated as synthetic
 //!
-//! A last octet of `.0` was treated as the base address of a prefix and
-//! therefore as a synthetic placeholder. Measured against live answers the rule
-//! has no true positives: every address it rejected completed a TLS handshake
-//! and presented a valid certificate for the very name that had been queried —
-//! CDN, anti-bot, STUN, telemetry and large-retail front ends alike. A prefix
-//! wider than `/24` has an ordinary host at its base, and anycast front ends
-//! assign exactly that address.
+//! A last octet of `.0` looks like the base address of a subnet and therefore
+//! like a synthetic placeholder, but measured against live answers that rule
+//! has no true positives: every address it would reject completes a TLS
+//! handshake and presents a valid certificate for the queried name — CDN,
+//! anti-bot, STUN, telemetry and large-retail front ends alike assign it to an
+//! ordinary host. Treating it as synthetic would also cost that host both its
+//! enforcement and any suggested route, all on the same false signal.
 //!
-//! It was never only cosmetic: an answer with nothing but such addresses
-//! counted as unusable, so those hosts were answered but never pinned, and the
-//! evidence for suggesting a route was drawn from the same mistake.
-//!
-//! A site the main link will not carry is a real thing to detect. The honest
-//! evidence is the connection failing, not the shape of the address.
+//! A site the main link cannot carry is real to detect from the connection
+//! failing, not from the shape of the address.
 //!
 //! Everything here is pure and allocation-free on the clean path — it runs on
 //! every resolver answer.
@@ -241,10 +237,10 @@ mod tests {
         assert!(!is_provider_placeholder_answer(&[]));
     }
 
-    /// Positive control for the rule that was removed. Every address here was
-    /// measured against the live internet: each completed a TLS handshake and
-    /// presented a certificate for the name that had been queried, so none of
-    /// them may cost its host either enforcement or a suggestion.
+    /// Positive control for addresses a trailing-zero rule would reject. Each
+    /// was measured against the live internet: it completed a TLS handshake
+    /// and presented a certificate for the queried name, so none of them may
+    /// cost its host either enforcement or a suggestion.
     #[test]
     fn a_trailing_zero_is_an_ordinary_address() {
         // Documentation space is out of the question here: this module rejects

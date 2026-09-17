@@ -18,7 +18,7 @@ QtObject {
     id: presetImportController
     property var root
 
-    //  — bundled/shipped presets (repo `presets/` tree,
+    // Bundled/shipped presets (repo `presets/` tree,
     // `configs/presets/builtin-demo/`) are READ-ONLY sources. A save-path
     // binding (`lastSavedPath*`) must never point inside them — that let a
     // country-preset import at first-run, or a Load from the bundled-tree
@@ -37,9 +37,9 @@ QtObject {
     /// Bind `lastSavedPath*` to the file(s) this import came from, for every
     /// route the import covered. Reading a file into the app IS a sync with
     /// it — the direction (load vs save) does not matter — so this runs on
-    /// every terminal branch of an import, INCLUDING "Nothing to apply". That
-    /// branch used to return early and skip the binding entirely, leaving the
-    /// Rules screen showing no source for a set the user had just loaded.
+    /// every terminal branch of an import, INCLUDING "Nothing to apply":
+    /// skipping that branch leaves the Rules screen showing no source for a
+    /// set the user had just loaded.
     ///
     /// Two prefs per route, with deliberately different semantics:
     ///   - `lastSavedPath*` — the SAVE-target binding. A bundled-tree path is
@@ -54,8 +54,8 @@ QtObject {
     /// bound-file dirty flag resets too.
     ///
     /// `emitPrefs()` at the end: `updatePrefs` only mutates the in-memory
-    /// object, and the round-trip to the launcher used to happen on graceful
-    /// close only — a crash or a kill between import and exit lost the
+    /// object; without the explicit round-trip here, a crash or kill between
+    /// import and exit (before the graceful-close round-trip runs) loses the
     /// binding.
     function _bindImportedSourcePaths(state) {
         if (!state) return
@@ -95,11 +95,9 @@ QtObject {
         if (bound) root.emitPrefs()
     }
 
-    // Async canonical-txt parser dispatched
-    // through the launcher's `preset.parse` local RPC. Replaces the
-    // JS-side `_parseCanonicalRulesText` that lived in this file. The parser itself now lives in
-    // `nrr_shared::preset_parser` (Rust), reachable via
-    // `nrrNativeBridge.rpcPresetParse`.
+    // Async canonical-txt parser dispatched through the launcher's
+    // `preset.parse` local RPC, backed by `nrr_shared::preset_parser` (Rust),
+    // reachable via `nrrNativeBridge.rpcPresetParse`.
     //
     // `callback(result)` is called exactly once with:
     //   {
@@ -647,7 +645,7 @@ QtObject {
                     // A file the service would refuse stops here, before the
                     // dialog: choosing sections and resolving duplicates in a
                     // file that is going to be rejected whole is work thrown
-                    // away, and the refusal used to arrive only after it.
+                    // away.
                     if (result.rejected) {
                         if (!refused) {
                             refused = true
@@ -791,11 +789,11 @@ QtObject {
                 // Mark the offline import on disk so it survives BOTH a
                 // mid-session service start (the post-connect backlog dialog
                 // offers to apply it) AND a full GUI restart under admin (the
-                // cold-start collect finds the marker). Mirrors what
-                // offline rule EDITS already do via `startOfflineApplyFlow`;
-                // preset import was the missing case. `sha256Hex` is sync, and
-                // the model is fully populated here (the offline apply path is
-                // synchronous, unlike the chunked service refetch).
+                // cold-start collect finds the marker). Mirrors what offline
+                // rule EDITS do via `startOfflineApplyFlow`. `sha256Hex` is
+                // sync, and the model is fully populated here (the offline
+                // apply path is synchronous, unlike the chunked service
+                // refetch).
                 if (!state.hydration
                         && typeof nrrNativeBridge !== "undefined" && nrrNativeBridge
                         && typeof nrrNativeBridge.sha256Hex === "function"

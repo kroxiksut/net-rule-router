@@ -84,12 +84,25 @@ mod imp {
                 out.insert((*name).to_string(), text);
             }
         }
-        // `ProgramData` and the Windows root are not in the environment key on
-        // every build; both live beside it as fixed system values.
+        // The Windows root, `ProgramData` and the system drive are not in the
+        // environment key: the shell composes them at logon. Without
+        // `ProgramData` the service cannot resolve its data root and `install`
+        // fails outright, so each is asked of the API instead.
         out.entry("SystemRoot".to_string())
             .or_insert_with(system_directory_root);
         out.entry("windir".to_string())
             .or_insert_with(system_directory_root);
+        if let Some(dir) = nrr_platform_windows::system_shell::program_data_directory() {
+            out.entry("ProgramData".to_string())
+                .or_insert_with(|| dir.to_string_lossy().into_owned());
+        }
+        let drive = out
+            .get("SystemRoot")
+            .and_then(|root| root.get(..2))
+            .map(str::to_owned);
+        if let Some(drive) = drive {
+            out.entry("SystemDrive".to_string()).or_insert(drive);
+        }
         out
     }
 
@@ -154,5 +167,17 @@ mod tests {
             carried.iter().all(|k| FORWARDED.contains(&k.as_str())),
             "only the forwarded set may reach the child: {carried:?}"
         );
+    }
+
+    /// The machine hive names neither; a child without `ProgramData` cannot
+    /// resolve the service data root and every `install` fails.
+    #[cfg(windows)]
+    #[test]
+    fn program_data_and_system_drive_reach_the_child_even_when_the_hive_lacks_them() {
+        let env = imp::machine_environment();
+        let program_data = env.get("ProgramData").expect("ProgramData");
+        assert!(std::path::Path::new(program_data).is_absolute());
+        let drive = env.get("SystemDrive").expect("SystemDrive");
+        assert!(drive.len() == 2 && drive.ends_with(':'), "{drive}");
     }
 }

@@ -54,16 +54,14 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// before this fires, enforced by a watchdog.
 ///
 /// Sized to fit INSIDE the SCM / `stop` CLI stop window
-/// (`scm::stop_service(15)` waits 15 s for `STOPPED`). Cooperative
-/// tasks honour the stop token in tens of milliseconds; a task still
-/// running after a few seconds is blocked on a non-cooperative syscall
-/// (e.g. a synchronous named-pipe accept) and will not drain at 30 s
-/// either — waiting that long only delays the inevitable detach past
-/// the client's 15 s budget, which surfaced as "Service binary exited
-/// with code 1" on Stop. Detaching at 5 s lets the runtime report
-/// `Stopped` and exit 0 well within the window; the stragglers are
-/// killed when the process exits (each holds its own `Arc`, so detach
-/// is memory-safe).
+/// (`scm::stop_service(15)` waits 15 s for `STOPPED`). A cooperative task
+/// honours the stop token within tens of milliseconds; one still running
+/// after a few seconds is blocked on a non-cooperative syscall (e.g. a
+/// synchronous named-pipe accept) and will not drain even at 30 s, so
+/// waiting longer only delays the inevitable detach past the client's
+/// budget. Detaching at 5 s lets the runtime report `Stopped` and exit 0
+/// well within the window; detached stragglers die with the process
+/// (each holds its own `Arc`, so detach is memory-safe).
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Autostart policy slug we will install with. `delayed-automatic` is
@@ -217,9 +215,9 @@ pub fn run_runtime_with_bootstrap(
 /// `NdjsonTracingLayer` global subscriber from `nrr-diagnostics`) can
 /// happen *between* `bootstrap()` and the runtime loop.
 ///
-/// `artifacts == None` skips bootstrap entirely (matching the historical
-/// `run_runtime_with_bootstrap(_, _, None)` behaviour) — used by
-/// lifecycle unit tests that only care about the state-transition shape.
+/// `artifacts == None` skips bootstrap entirely, the same as passing `None`
+/// to `run_runtime_with_bootstrap` — used by lifecycle unit tests that only
+/// care about the state-transition shape.
 pub fn run_runtime_with_artifacts(
     controller: &dyn ServiceController,
     stop: &StopToken,
@@ -250,7 +248,7 @@ pub fn run_runtime_with_artifacts(
     }
 
     controller.report(ServiceRuntimeState::Stopping);
-    // TODO:: drain background tasks, flush audit/logs,
+    // TODO: drain background tasks, flush audit/logs,
     // release apply locks before reporting Stopped.
     controller.report(ServiceRuntimeState::Stopped);
     // Keep `artifacts` alive until shutdown so any background ports
@@ -260,16 +258,10 @@ pub fn run_runtime_with_artifacts(
     ServiceShutdownReason::ScmStop
 }
 
-// TODO:: Windows Event Log writer.
-//
-// Source registration: install hook writes
-// `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\NetRuleRouter`
-// (`EventMessageFile` = service binary path, `TypesSupported` =
-// EVENTLOG_INFORMATION_TYPE | EVENTLOG_WARNING_TYPE | EVENTLOG_ERROR_TYPE).
-// Runtime writer: `windows-sys::Win32::System::EventLog::ReportEventW`,
-// called on Start / Stop / Degraded / Critical transitions. Lives in
-// `nrr-windows-service` because it needs `windows-sys`; trait surface
-// stays here so the runtime body remains transport-agnostic.
+// TODO: Windows Event Log writer — Start/Stop/Degraded/Critical transitions
+// need a `windows-sys::ReportEventW` writer in `nrr-windows-service` (install
+// already registers the source); this crate keeps only the trait surface so
+// the runtime body stays transport-agnostic.
 
 #[cfg(test)]
 mod tests {

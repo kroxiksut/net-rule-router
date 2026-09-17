@@ -202,9 +202,9 @@ mod tests {
 
     #[test]
     fn tokens_are_not_derivable_from_each_other() {
-        // The suffix used to be `Instant::now().elapsed()` — nanoseconds from a
-        // freshly taken instant, i.e. a near-constant. Seeing one token then
-        // told you the next.
+        // A suffix built from `Instant::now().elapsed()` would be near-constant
+        // across two calls made moments apart, letting one token predict the
+        // next; the random half must actually vary.
         let store = MutationTokenStore::new();
         let deadline = Instant::now() + Duration::from_secs(60);
         let first = store.issue(payload(), deadline);

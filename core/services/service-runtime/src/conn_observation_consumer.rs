@@ -338,7 +338,7 @@ pub struct ConnectionObservationConsumer {
     active_sid: ActiveSidFn,
     /// Whether to emit the per-connection detail line (process + remote IP +
     /// egress) to the operational NDJSON. Off when the user enabled only the
-    /// GUI-stream output (Slice E pushes to the panel instead). The aggregate
+    /// GUI-stream output (the panel is pushed to directly instead). The aggregate
     /// per-tick summary is logged regardless — it carries counts, no PII.
     log_ndjson: bool,
     /// App-routing via observation — when wired, every observed
@@ -466,7 +466,7 @@ pub struct ConnectionObservationConsumer {
     /// address, which [`BlockAttempt::destination_label`] already handles.
     block_notice_name_for_address: Option<NameForAddressFn>,
     /// Sink for one qualifying `BlockAttempt`. `None` keeps the observer
-    /// from reporting blocks at all — as before this feature existed.
+    /// from reporting blocks at all.
     block_notice_sink: Option<BlockNoticeSinkFn>,
     /// Tears down connections a destination pin caught on the wrong link — a
     /// socket older than the pin keeps its interface until it dies. `None`
