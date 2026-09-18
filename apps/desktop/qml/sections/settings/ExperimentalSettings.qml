@@ -3,8 +3,8 @@ import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import "../../components"
 
-// Experimental settings. Detailed mode and the pre-flight apply-policy
-// opt-in are working toggles and sit above the divider; extended
+// Experimental settings. Detailed mode, the pre-flight apply-policy opt-in and
+// the virtual-machines screen are working toggles and sit above the divider; extended
 // diagnostics and kill-switch mode A are dormant and sit below it,
 // disabled, until their wiring lands.
 GroupBox {
@@ -118,6 +118,64 @@ GroupBox {
                     Layout.fillWidth: true
                     text: root.tr("settings.experimental.detailed-mode.note",
                         "Shows manual switches for individual DNS and address-routing mechanisms under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for those mechanisms and keeps this screen simple.")
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+
+        // Reveals the Rules -> Virtual machines screen. Off by default: routing
+        // a hypervisor's traffic is unverified on real hardware, so the screen
+        // ships hidden until it is.
+        Frame {
+            Layout.fillWidth: true
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingSm
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: root.uiTheme.spacingSm
+                    CheckBox {
+                        id: vmSectionCheck
+                        Layout.fillWidth: true
+                        text: root.tr("settings.experimental.vm-section.label",
+                            "Virtual machines screen")
+                        checked: root.uiRevision >= 0
+                            ? (root.prefs.showVirtualMachinesSection === true) : false
+                        Accessible.role: Accessible.CheckBox
+                        Accessible.name: text
+                        Accessible.description: root.tr("settings.experimental.in-development",
+                            "In development")
+                        contentItem: Label {
+                            text: vmSectionCheck.text
+                            leftPadding: vmSectionCheck.indicator.width + vmSectionCheck.spacing
+                            color: root.textColor
+                            wrapMode: Text.WordWrap
+                            verticalAlignment: Text.AlignVCenter
+                        }
+                        onToggled: {
+                            root.updatePrefs({ showVirtualMachinesSection: checked })
+                            root.emitPrefs()
+                            if (checked) {
+                                root.virtualMachinesController.refresh()
+                            } else if (root.section === "rule-virtual-machines") {
+                                root.requestSectionChange("rules")
+                            }
+                        }
+                    }
+                    Label {
+                        text: root.tr("settings.experimental.in-development", "In development")
+                        color: root.uiTheme.colorAccent
+                        font.bold: true
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.tr("settings.experimental.vm-section.note",
+                        "Adds a Virtual machines screen under Rules that sends a hypervisor's traffic over the route you pick. Not verified on real hardware yet: the screen may be incomplete and the route may not apply to every machine.")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }

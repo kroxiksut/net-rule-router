@@ -31,6 +31,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 pub mod egress;
+pub mod live;
 
 /// Transport protocol of an observed connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

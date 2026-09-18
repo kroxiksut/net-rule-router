@@ -334,6 +334,9 @@ pub struct SupervisedRuntimeDeps {
     /// observation source — application rules then route nothing, which the
     /// lowering already reports as unenforceable.
     pub app_observation: Option<crate::service_tasks::AppObservationWiring>,
+    /// Open connections that keep application destinations from ageing out
+    /// under a live session. `None` where the platform cannot list them.
+    pub live_connection_refresh: Option<crate::service_tasks::LiveConnectionRefreshWiring>,
     /// Observed resolutions feeding the rule-driven cache, applied for every
     /// present principal. `None` where nothing observes DNS.
     pub dns_observation: Option<crate::service_tasks::DnsObservationWiring>,
@@ -889,6 +892,19 @@ fn spawn_production_tasks(
             tracing::warn!(
                 target: "nrr::supervisor",
                 "spawn app-observation failed: {e}",
+            );
+        }
+    }
+
+    // 1e'. live-connection-refresh-tick — destinations a program still holds a
+    // connection to stay routed past the freshness window.
+    if let Some(wiring) = deps.live_connection_refresh.clone() {
+        if let Err(e) = supervisor.spawn(crate::service_tasks::build_live_connection_refresh_task(
+            wiring,
+        )) {
+            tracing::warn!(
+                target: "nrr::supervisor",
+                "spawn live-connection-refresh failed: {e}",
             );
         }
     }

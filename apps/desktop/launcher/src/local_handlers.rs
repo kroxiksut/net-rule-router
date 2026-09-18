@@ -97,6 +97,7 @@ pub fn handle_local_request(
         "local.service-info" => handle_service_info(client),
         "local.vpn.discover" => handle_vpn_discover(),
         "local.app-groups.discover" => handle_app_groups_discover(),
+        "local.vm-inventory.list" => handle_vm_inventory_list(),
         "local.system-theme" => Ok(handle_system_theme()),
         other => Err(LocalHandlerError::UnknownOperation(other.to_string())),
     }
@@ -164,6 +165,24 @@ fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
 
 #[cfg(not(target_os = "windows"))]
 fn discover_app_groups_os() -> Vec<nrr_platform_api::DiscoveredApp> {
+    Vec::new()
+}
+
+/// The hypervisors on this machine with their virtual machines, for the rules
+/// screen that routes them. Local for the same reason as the discoveries above:
+/// the settings files are the user's own and the service is not needed.
+fn handle_vm_inventory_list() -> LocalHandlerResult {
+    Ok(json!({ "hypervisors": vm_inventory_os() }))
+}
+
+#[cfg(target_os = "windows")]
+fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
+    use nrr_platform_api::VmInventoryPort;
+    nrr_platform_windows::WindowsVmInventory::new().inventory()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn vm_inventory_os() -> Vec<nrr_platform_api::HypervisorInventory> {
     Vec::new()
 }
 
@@ -601,5 +620,14 @@ mod tests {
         }
         // With no handshake and no registration the answer is "nothing to do".
         assert_eq!(resp["service-older-than-app"], false);
+    }
+
+    /// The virtual machines screen reads `hypervisors` and hides itself when
+    /// the list is empty, so the key must be there on every answer.
+    #[test]
+    fn vm_inventory_always_answers_with_a_hypervisor_list() {
+        let resp = handle_local_request("local.vm-inventory.list", &json!({}), &empty_client())
+            .expect("ok");
+        assert!(resp["hypervisors"].is_array(), "{resp}");
     }
 }

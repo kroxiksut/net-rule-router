@@ -131,3 +131,9 @@ __pycache__/
 * (2).*
 * (3).*
 * (4).*
+
+# Debugging screenshots dropped in the checkout root. They show whatever was on
+# the screen at the time, which is not something a public repository should keep.
+# Anchored to the root so documentation images under docs/ are unaffected.
+/Screenshot*.png
+/Снимок*.png

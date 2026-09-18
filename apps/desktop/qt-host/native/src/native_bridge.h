@@ -513,6 +513,10 @@ public:
     /// source}]}`. Local + non-elevated + no service needed, so the route-
     /// assignment onboarding works before the service is installed.
     Q_INVOKABLE QString rpcAppGroupsDiscover();
+    /// Async wrapper over the launcher-local `local.vm-inventory.list` RPC: the
+    /// hypervisors on this machine and their virtual machines, answered as
+    /// `{hypervisors:[...]}` on `rpcResponse`. Needs no service.
+    Q_INVOKABLE QString rpcVmInventoryList();
 
     /// Async wrapper over the service `diagnostics.seed-from-browser-history`
     /// RPC. On-demand, explicit-consent import: the service reads the local

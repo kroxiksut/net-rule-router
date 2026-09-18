@@ -11,7 +11,10 @@ file, and the setup window does not appear.
 Name it `first-run.json` and put it in either place:
 
 - next to `NetRuleRouter.exe` (portable copy, or an installer's program folder);
-- in the machine data folder, `%ProgramData%\NetRuleRouter\`.
+- in the machine data folder, `%ProgramData%\NetRuleRouter\`. Once the service
+  has started for the first time this folder belongs to it and only an
+  administrator can write there, so this placement is for an administrator
+  preparing a machine — put the file beside the executable otherwise.
 
 The folder next to the executable wins when both exist.
 

@@ -19,15 +19,16 @@
 use std::ffi::OsString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Read};
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOLEAN, HANDLE};
 use windows::Win32::Storage::FileSystem::{
-    FileDispositionInfo, GetFinalPathNameByHandleW, SetFileInformationByHandle, DELETE,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FileDispositionInfo, GetFinalPathNameByHandleW, GetLongPathNameW, SetFileInformationByHandle,
+    DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_NAME_NORMALIZED,
     FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
@@ -106,7 +107,10 @@ fn pin_directory(trusted_root: &Path, path: &Path) -> io::Result<File> {
     }
     // The root is compared as written, never resolved: resolving it would
     // follow the same planted link as the directory and agree with itself.
-    if !resolves_under(&final_path(&dir)?, trusted_root) {
+    // Only its 8.3 short names are spelled out, since the handle path always
+    // carries long ones (a profile registered as `RUNNER~1` names its temp
+    // that way).
+    if !resolves_under(&final_path(&dir)?, &long_form(trusted_root)?) {
         return Err(refused(
             "directory resolved outside the trusted root",
             dir_path,
@@ -145,6 +149,30 @@ fn check_in_place(file: &File, dir: &File, path: &Path) -> io::Result<()> {
         return Err(refused("file resolved outside its directory", path));
     }
     Ok(())
+}
+
+/// The path with every short component spelled long. A text lookup per
+/// component, not a resolution: a junction keeps its own name.
+fn long_form(path: &Path) -> io::Result<PathBuf> {
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the call
+        // writes at most `buf.len()` units and returns that count, or the
+        // size it needs when the buffer is too small.
+        let len = unsafe { GetLongPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len < buf.len() {
+            return Ok(PathBuf::from(OsString::from_wide(&buf[..len])));
+        }
+        buf.resize(len + 1, 0);
+    }
 }
 
 fn final_path(file: &File) -> io::Result<PathBuf> {
@@ -293,6 +321,34 @@ mod tests {
             resolves_under(Path::new(r"\\?\C:\TEMP\x"), Path::new(r"C:\temp")),
             "the filesystem does not distinguish case here, and neither may we"
         );
+    }
+
+    #[test]
+    fn a_trusted_root_given_in_short_form_still_contains_its_files() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let long = root.path().join("a-directory-with-a-long-name");
+        std::fs::create_dir(&long).expect("root");
+        let short = short_form(&long);
+        if short == long {
+            return; // 8.3 names are disabled on this volume
+        }
+        let path = long.join("t.token");
+        std::fs::write(&path, "nonce").expect("write");
+        assert_eq!(take(&short, &path).expect("take"), "nonce");
+    }
+
+    fn short_form(path: &Path) -> PathBuf {
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide` is NUL-terminated; `buf` bounds the write.
+        let len = unsafe { GetShortPathNameW(PCWSTR(wide.as_ptr()), Some(&mut buf)) } as usize;
+        assert!(len > 0 && len < buf.len(), "short path");
+        PathBuf::from(OsString::from_wide(&buf[..len]))
     }
 
     #[test]

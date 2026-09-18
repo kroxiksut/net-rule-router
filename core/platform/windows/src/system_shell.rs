@@ -15,7 +15,8 @@ use std::path::PathBuf;
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::UI::Shell::{
-    FOLDERID_LocalAppData, FOLDERID_ProgramData, SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
+    FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, SHGetKnownFolderPath,
+    KNOWN_FOLDER_FLAG,
 };
 
 /// Where every supported Windows keeps it; used only if the API itself fails,
@@ -62,6 +63,13 @@ pub fn local_app_data_directory() -> Option<PathBuf> {
     known_folder(&FOLDERID_LocalAppData)
 }
 
+/// The user's profile folder as the shell registers it, or `None` when it
+/// cannot say.
+#[must_use]
+pub fn user_profile_directory() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Profile)
+}
+
 fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     // SAFETY: a documented known-folder query with no token; the returned
     // buffer is read once and released with `CoTaskMemFree`, as the API requires.
@@ -88,6 +96,12 @@ mod tests {
     #[test]
     fn program_data_is_an_existing_absolute_directory() {
         let dir = program_data_directory().expect("known folder");
+        assert!(dir.is_absolute() && dir.is_dir(), "{}", dir.display());
+    }
+
+    #[test]
+    fn the_user_profile_is_an_existing_absolute_directory() {
+        let dir = user_profile_directory().expect("known folder");
         assert!(dir.is_absolute() && dir.is_dir(), "{}", dir.display());
     }
 

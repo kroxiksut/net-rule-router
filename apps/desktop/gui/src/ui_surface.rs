@@ -632,6 +632,9 @@ pub fn write_qt_context_file_at(
             "trayNoticeOpacityPercent": preferences.tray_notice_opacity_percent,
             "hideBlockNoticeAddresses": preferences.hide_block_notice_addresses,
             "routingDetailedMode": preferences.routing_detailed_mode,
+            // Experimental opt-in that reveals the Rules -> Virtual machines
+            // screen (default off). Device-local.
+            "showVirtualMachinesSection": preferences.show_virtual_machines_section,
             "reopenLastSectionOnStartup": preferences.reopen_last_section_on_startup,
             "firstRunCompleted": preferences.first_run_completed,
             "acceptedEulaVersion": preferences.accepted_eula_version,
@@ -1201,6 +1204,10 @@ struct QtPreferencesPayload {
     // the safe default (toggles hidden, built-in defaults apply).
     #[serde(default)]
     routing_detailed_mode: bool,
+    // Virtual-machines screen opt-in. `#[serde(default)]` (→ false) matches the
+    // safe default: the unverified screen stays hidden.
+    #[serde(default)]
+    show_virtual_machines_section: bool,
     // "Remembered but absent" ghost-row display toggle. Default true
     // (via `default_true`) so a QML build that omits the key keeps the ON
     // default rather than silently flipping the toggle off.

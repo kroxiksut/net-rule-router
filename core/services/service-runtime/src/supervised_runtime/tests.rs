@@ -107,6 +107,7 @@ fn fresh_deps() -> SupervisedRuntimeDeps {
         logon_session_observer: None,
         rebind_requests: None,
         app_observation: None,
+        live_connection_refresh: None,
         dns_observation: None,
         present_principals: None,
     }

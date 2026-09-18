@@ -394,6 +394,58 @@ pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
     learnt
 }
 
+// ── Live-connection refresh ──────────────────────────────────────────────────
+
+/// How often destinations still held open are restamped. Far inside the
+/// freshness window, so a held connection is never older than this when the
+/// window is measured, and rare enough that reading the connection table costs
+/// nothing noticeable.
+pub const LIVE_CONNECTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub const TASK_ID_LIVE_CONNECTION_REFRESH: &str = "live-connection-refresh-tick";
+
+/// What the live-connection refresh needs: the open connections, and the store
+/// whose destinations they keep fresh.
+#[derive(Clone)]
+pub struct LiveConnectionRefreshWiring {
+    pub source: Arc<dyn nrr_platform_api::conn_observe::live::LiveConnectionSource>,
+    pub store: Arc<crate::app_observation_lookup::AppObservationStore>,
+}
+
+/// Keep application destinations fresh while a program still holds a
+/// connection to them.
+///
+/// Observation sees a connection when it opens, and the freshness window then
+/// runs from that moment: a program holding one connection for hours had its
+/// route withdrawn at the window's edge, under the live session. This tick
+/// changes no policy by itself: a refreshed destination was already routed, and
+/// staying routed is the point.
+///
+/// `Optional`: without it destinations age out as they did before.
+pub fn build_live_connection_refresh_task(wiring: LiveConnectionRefreshWiring) -> ServiceTask {
+    ServiceTask::periodic(
+        TASK_ID_LIVE_CONNECTION_REFRESH,
+        TaskClass::Optional,
+        LIVE_CONNECTION_REFRESH_INTERVAL,
+        RECOVERABLE_DEFAULT_MAX_RESTARTS,
+        move |_stop| {
+            let refreshed = refresh_live_destinations(&wiring);
+            if refreshed > 0 {
+                tracing::debug!(
+                    target: "nrr::app-observations",
+                    refreshed,
+                    "destinations still held open were kept inside the freshness window",
+                );
+            }
+            TaskOutcome::Continue
+        },
+    )
+}
+
+/// One refresh pass; returns how many destinations were restamped.
+pub fn refresh_live_destinations(wiring: &LiveConnectionRefreshWiring) -> usize {
+    wiring.store.refresh_live(&wiring.source.established())
+}
+
 // ── Traffic sampler ──────────────────────────────────────────────────────────
 
 /// Cadence the traffic sampler reads interface octet counters at. Reading a

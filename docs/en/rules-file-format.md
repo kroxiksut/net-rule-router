@@ -347,9 +347,9 @@ in — `rules_primary.txt` or `rules_secondary.txt`) on subsequent connections.
 > address rides the secondary; other applications contacting the same address do
 > not) requires a kernel driver and is out of scope for now. A destination
 > learned from an application is an ordinary destination route — it applies
-> wherever that address is contacted. The first connection to a not-yet-observed
-> address always egresses normally (it is what reveals the address); routing
-> takes effect from the next connection.
+> wherever that address is contacted. The first connection to an address the
+> router has not seen before goes out over the usual route; routing takes effect
+> from the next connection onwards.
 
 In the file, an application rule is a **process name on its own line** — there
 is no nested syntax for its destinations, and learned destinations are runtime

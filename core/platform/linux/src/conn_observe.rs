@@ -149,6 +149,62 @@ impl ConnectionObservationSource for ProcfsConnectionObserver {
 }
 
 /// The process holding a socket.
+/// [`LiveConnectionSource`] over procfs: the established TCP rows of both
+/// tables, owners resolved the same way the observer resolves them.
+///
+/// [`LiveConnectionSource`]: nrr_platform_api::conn_observe::live::LiveConnectionSource
+#[derive(Debug, Default)]
+pub struct ProcfsLiveConnections;
+
+impl ProcfsLiveConnections {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl nrr_platform_api::conn_observe::live::LiveConnectionSource for ProcfsLiveConnections {
+    fn established(&self) -> Vec<nrr_platform_api::conn_observe::live::LiveConnection> {
+        let mut sockets = Vec::new();
+        for (path, v6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                sockets.extend(parse_socket_table(&text, v6));
+            }
+        }
+        let live = established_ipv4(&sockets);
+        if live.is_empty() {
+            return Vec::new();
+        }
+        let wanted: HashMap<u64, u32> = live.iter().map(|(s, _)| (s.inode, s.uid)).collect();
+        let owners = socket_owners(&wanted);
+        live.into_iter()
+            .filter_map(|(socket, remote)| {
+                let exe = owners.get(&socket.inode)?.exe.clone()?;
+                Some(nrr_platform_api::conn_observe::live::LiveConnection {
+                    process_path: exe,
+                    remote,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Established rows with an IPv4 peer, including a dual-stack socket's
+/// v4-mapped one. Pure, so it is tested on every host.
+fn established_ipv4(sockets: &[ProcSocket]) -> Vec<(&ProcSocket, Ipv4Addr)> {
+    sockets
+        .iter()
+        .filter(|socket| socket.state == TCP_ESTABLISHED)
+        .filter_map(|socket| {
+            let remote = match socket.remote.ip() {
+                IpAddr::V4(v4) => v4,
+                IpAddr::V6(v6) => v6.to_ipv4_mapped()?,
+            };
+            (!remote.is_loopback() && !remote.is_unspecified()).then_some((socket, remote))
+        })
+        .collect()
+}
+
 struct SocketOwner {
     pid: u32,
     exe: Option<String>,
@@ -378,6 +434,35 @@ mod tests {
     /// A truncated or unexpected row is skipped, never guessed at: procfs
     /// formats differ between kernels, and inventing a destination from a
     /// half-read line would put a wrong address in a routing decision.
+    #[test]
+    fn only_established_rows_with_a_real_ipv4_peer_are_live() {
+        let row = |remote: &str, state: u8| ProcSocket {
+            local: addr("192.0.2.10:40000"),
+            remote: addr(remote),
+            uid: 1000,
+            inode: 7,
+            state,
+        };
+        let sockets = vec![
+            row("198.51.100.1:443", TCP_ESTABLISHED),
+            row("198.51.100.2:443", TCP_SYN_SENT),
+            row("127.0.0.1:8080", TCP_ESTABLISHED),
+            row("[::ffff:203.0.113.5]:443", TCP_ESTABLISHED),
+            row("[2001:db8::1]:443", TCP_ESTABLISHED),
+        ];
+        let remotes: Vec<Ipv4Addr> = established_ipv4(&sockets)
+            .into_iter()
+            .map(|(_, ip)| ip)
+            .collect();
+        assert_eq!(
+            remotes,
+            vec![
+                Ipv4Addr::new(198, 51, 100, 1),
+                Ipv4Addr::new(203, 0, 113, 5)
+            ]
+        );
+    }
+
     #[test]
     fn a_malformed_row_is_skipped_rather_than_guessed() {
         let table = "  sl  local_address rem_address   st

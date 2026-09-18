@@ -5,9 +5,10 @@
 //! whole group at once (default: primary):
 //!
 //! - **Virtual machines & emulators** — a hypervisor's or emulator's guest
-//!   traffic egresses as ordinary sockets of the host process (VirtualBox,
-//!   VMware, QEMU, DOSBox, Android/console emulators), so an ordinary
-//!   application rule routes it. Kernel-NAT stacks (WSL2, Hyper-V, Docker
+//!   traffic egresses as ordinary sockets of the host process (VMware, QEMU,
+//!   DOSBox, Android/console emulators), so an ordinary application rule
+//!   routes it. VirtualBox is not listed here: its machines have their own
+//!   screen, fed by [`crate::vm_inventory`]. Kernel-NAT stacks (WSL2, Hyper-V, Docker
 //!   Desktop) have NO owning process — their traffic cannot be routed by an
 //!   application rule — so they are surfaced for DISPLAY only (route fixed to
 //!   primary, not user-assignable in this edition).
@@ -43,7 +44,7 @@ pub enum AppGroupTab {
 #[serde(rename_all = "kebab-case")]
 pub enum AppGroupKind {
     /// Usermode-NAT hypervisor — guest traffic is the host process's sockets,
-    /// so an application rule routes it (VirtualBox, VMware, QEMU, DOSBox).
+    /// so an application rule routes it (VMware, QEMU, DOSBox).
     Hypervisor,
     /// Kernel-NAT virtual network (WSL2, Hyper-V, Docker Desktop). Guest
     /// traffic has no owning user process, so it CANNOT be routed by an
@@ -188,17 +189,12 @@ pub struct AppGroupEntry {
 /// against every entry via [`classify_app`].
 pub const APP_GROUP_DICTIONARY: &[AppGroupEntry] = &[
     // ── Virtualization: usermode-NAT hypervisors (route-assignable) ──────────
+    // No VirtualBox: the names this list could match are the manager and its
+    // COM server, which carry no guest traffic, while the processes that do are
+    // named per machine on the virtual machines screen.
     AppGroupEntry {
         kind: AppGroupKind::Hypervisor,
-        keywords: &[
-            "virtualbox",
-            "vboxheadless",
-            "vboxsvc",
-            "vmware",
-            "vmware-vmx",
-            "qemu",
-            "dosbox",
-        ],
+        keywords: &["vmware", "vmware-vmx", "qemu", "dosbox"],
     },
     // ── Virtualization: kernel-NAT stacks (display-only, primary-pinned) ──────
     AppGroupEntry {
@@ -502,7 +498,7 @@ mod tests {
         );
         assert_eq!(classify_app("btweb.exe"), Some(AppGroupKind::BitTorrent));
         assert_eq!(
-            classify_app("VirtualBox VM"),
+            classify_app("vmware-vmx.exe"),
             Some(AppGroupKind::Hypervisor)
         );
         assert_eq!(
@@ -519,6 +515,22 @@ mod tests {
             Some(AppGroupKind::P2pFileSharing)
         );
         assert_eq!(classify_app("bitcoind"), Some(AppGroupKind::CryptoNode));
+    }
+
+    /// VirtualBox has its own screen; listing it here as well offered a route
+    /// for `VBoxSVC.exe` and for the installer's display name, neither of which
+    /// carries a guest's traffic.
+    #[test]
+    fn virtualbox_is_left_to_the_virtual_machines_screen() {
+        for name in [
+            "VirtualBox.exe",
+            "VBoxSVC.exe",
+            "VBoxHeadless.exe",
+            "VirtualBoxVM.exe",
+            "Oracle VirtualBox 7.2.14",
+        ] {
+            assert_eq!(classify_app(name), None, "{name}");
+        }
     }
 
     #[test]

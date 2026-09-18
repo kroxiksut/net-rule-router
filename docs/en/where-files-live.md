@@ -14,19 +14,29 @@ These are plain text. You can read them, edit them in any editor, copy them to a
 
 ## Shared machine state: `C:\ProgramData\NetRuleRouter\`
 
-Written by the background service, shared by every user of the PC. Ordinary users can read it; changing it requires administrator rights.
+Written by the background service, shared by every user of the PC. The folder belongs to the service: only the system and administrators can open it. That is deliberate — it holds the policy that decides where your traffic goes, and the record of who changed it. You will not be able to browse it from Explorer as an ordinary user, and you do not need to: everything in it is reached through the app or the console.
 
-| What | Why it is there | Safe to delete? |
+| What | Why it is there | How you clear it |
 |---|---|---|
-| `nrr_service_state.db` | The rules currently being enforced, your route assignments and behaviour settings | No. Deleting it resets the service to a clean state — you would have to load your rules again |
-| `nrr_fqdn_ip_cache.db` | Addresses already looked up, so a routed site works from the first click after a restart | Yes. It is rebuilt as you browse; the only cost is a slower first few minutes |
-| `nrr_traffic_stats.db` | The traffic counters shown in the app | Yes. You lose the history, nothing else |
-| `logs\` | Operational logs of the service | Yes. Also cleared from Settings, Diagnostics and logs |
-| `audit\` | The security audit trail | Not recommended. It is deliberately excluded from in-app cleanup: it is the record of what changed your routing and when |
-| `archives\` | Diagnostic archives you exported | Yes, once you no longer need them |
-| `backups\` | Automatic copies taken before risky operations | Yes, at the cost of the safety net they provide |
+| `nrr_service_state.db` | The rules currently being enforced, your route assignments and behaviour settings | You do not. Resetting it would mean loading your rules again from your own files |
+| `nrr_fqdn_ip_cache.db` | Addresses already looked up, so a routed site works from the first click after a restart | **Settings, Diagnostics and logs**. It is rebuilt as you browse; the only cost is a slower first few minutes |
+| `nrr_traffic_stats.db` | The traffic counters shown in the app | **Settings, Diagnostics and logs**. You lose the history, nothing else |
+| `logs\` | Operational logs of the service | **Settings, Diagnostics and logs**. To read them, see below |
+| `audit\` | The security audit trail | Not offered. It is deliberately excluded from in-app cleanup: it is the record of what changed your routing and when |
+| `archives\` | Diagnostic archives you exported | The copy you were handed is yours to delete; the service keeps its own to its retention limit |
+| `backups\` | Automatic copies taken before risky operations | Kept to a retention limit, so the safety net stays |
 
-Both databases keep the retention limits you set in **Settings, Diagnostics and logs** — you do not have to clean up by hand.
+The databases and both log trees keep the retention limits you set in **Settings, Diagnostics and logs** — you do not have to clean up by hand, and with this folder closed to you, you could not do it by hand anyway.
+
+### Getting the logs when you need them
+
+Three ways, none of which require you to open the folder:
+
+- **In the app** — *Settings, Diagnostics and logs*, "Export diagnostic archive". You get the archive in your own folder.
+- **`nrr-cli diag export`** — the same archive from a terminal. No administrator rights needed: the service builds it and hands it to whoever asked.
+- **`nrr-cli diag logs --tail N`** — the tail of the operational log, printed verbatim. This one reads the file directly, so it needs an administrator console; it is the option that still works when the service is not running.
+
+See [the `nrr-cli` console](cli.md) for the full command set.
 
 The two `.db` files above are meant to be managed by the application itself, through its own settings, import, and export flows. Opening and editing them directly with a generic SQLite tool or any other third-party program is not supported: it can leave the app unable to start, make it apply the wrong routing policy, or lose your settings and rules. There are legitimate reasons to touch a database file outside the app — restoring it from a backup, moving it to another machine — so this is not forbidden, but if you do it, the consequences are yours to deal with.
 
@@ -48,8 +58,9 @@ Per-user and deliberately not roaming, because it describes this PC.
 |---|---|
 | `snapshot_cache\` | The last state the app saw, so the window can open and show you something useful when the service is not running yet |
 | `notification-decisions.json` | Which notifications you have already answered, so the app and the tray icon do not ask you the same question twice |
+| `gui_metadata.db` | What the window remembers about your rules — labels, the edits you have not applied yet — none of it routing policy |
 
-Both are safe to delete. The app rebuilds them; the only visible effect is that a notification you dismissed once may be offered again.
+All three are safe to delete. The app rebuilds them; the only visible effect is that a notification you dismissed once may be offered again, and rule labels you had typed are gone.
 
 ## Temporary files: `%TEMP%\NetRuleRouter\`
 
@@ -65,8 +76,9 @@ An uninstall that offers to remove your data removes the `ProgramData` and `AppD
 
 ## If you want a clean start
 
-1. Close the app and stop the service.
-2. Delete `C:\ProgramData\NetRuleRouter\` and `%APPDATA%\NetRuleRouter\`.
-3. Start the app and load your rules files.
+1. Close the app.
+2. From an administrator console, run `nrr-cli uninstall --purge`. That stops the service, deregisters it and deletes the folder it owns — which is the part you cannot delete by hand.
+3. Delete `%APPDATA%\NetRuleRouter\` and `%LOCALAPPDATA%\NetRuleRouter\` if you also want the app to forget your theme, language and window layout.
+4. Install the service again and load your rules files.
 
 You get a factory-fresh install with your rules intact, which is the point of keeping them outside the app in the first place.

@@ -38,6 +38,9 @@ nrr-shared = { path = "../../../shared/contracts" }
 # pure decision layer and is itself OS-neutral (depends only on nrr-shared), so
 # this keeps `platform → domain` — an allowed direction — with no cycle.
 nrr-domain = { path = "../../domain" }
+# `vm_inventory::virtualbox` reads VirtualBox's settings files, the same XML on
+# every OS. Pure Rust, no dependencies, MIT OR Apache-2.0.
+roxmltree = "0.21"
 
 # `PlatformError::Errno` classifies POSIX error codes, whose numeric values
 # differ between Unix targets — naming them through `libc` is what keeps the

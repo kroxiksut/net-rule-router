@@ -125,6 +125,12 @@ QtObject {
             ? bridge.rpcAppGroupsDiscover()
             : ""
     }
+    // Hypervisors and their virtual machines (launcher-local); "" == unavailable.
+    function rpcVmInventoryList() {
+        return (bridgeAvailable && typeof bridge.rpcVmInventoryList === "function")
+            ? bridge.rpcVmInventoryList()
+            : ""
+    }
     // Persists the confirmed VPN/link-provider executables to the service-side
     // SSOT (route.link-provider.set), feeding per-app kill-switch exemptions and
     // triggering a server-side recompile. An empty "link-provider-apps" clears

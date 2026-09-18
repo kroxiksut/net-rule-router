@@ -37,7 +37,7 @@ ApplicationWindow {
         if (!platformProfile || !platformProfile.supports) return true
         return platformProfile.supports[feature] !== false
     }
-    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
+    property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     property string statusLine: ""
     /// Long form of the current status message, shown on hover. The footer is
@@ -961,6 +961,7 @@ ApplicationWindow {
         if (id === "interfaces-routes") return tr("section.interfaces-routes", "Interfaces and routes")
         if (id === "rules") return tr("section.rules", "Rules")
         if (id === "rule-suggestions") return tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
+        if (id === "rule-virtual-machines") return tr("rules.vm.nav-label", "Virtual machines")
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
         if (id === "logs") return tr("section.logs", "Logs")
         if (id === "settings") return tr("section.settings", "Settings")
@@ -1464,6 +1465,9 @@ ApplicationWindow {
         // Experimental opt-in that reveals the legacy kill-switch mode A option
         // in routing settings (default off). Only an explicit true opts in.
         normalized.allowModeAKillswitch = !!normalized.allowModeAKillswitch
+        // Experimental opt-in for the Rules -> Virtual machines screen
+        // (default off). Only an explicit true opts in.
+        normalized.showVirtualMachinesSection = !!normalized.showVirtualMachinesSection
         // "remembered but absent" ghost-row display toggle. Default ON
         // (a missing value coerces to true) so the user can see a remembered
         // binding at a glance; only an explicit false turns it off.
@@ -2425,6 +2429,12 @@ ApplicationWindow {
     property alias autoRuleSuggestionsController: autoRuleSuggestionsController
     AutoRuleSuggestionsController {
         id: autoRuleSuggestionsController
+        root: window
+    }
+    // Hypervisors and their machines: the Rules → Virtual machines screen.
+    property alias virtualMachinesController: virtualMachinesController
+    VirtualMachinesController {
+        id: virtualMachinesController
         root: window
     }
     // Push-driven notices: composing them, retiring them, and running what they
@@ -3797,6 +3807,10 @@ ApplicationWindow {
         themeRevision += 1
         uiRevision += 1
         section = context.entrySection || prefs.lastOpenedSection || "interfaces-routes"
+        // The virtual-machines screen is behind an experimental opt-in; a
+        // remembered section must not reopen it once the opt-in is off.
+        if (section === "rule-virtual-machines" && prefs.showVirtualMachinesSection !== true)
+            section = "rules"
         localeDiagnostics = context.localeDiagnostics || {}
         if (Number(localeDiagnostics.rejected || 0) > 0) {
             statusLine = tr("status.locale-files-rejected", "Some locale files were rejected. See logs for details.")
@@ -4855,6 +4869,7 @@ ApplicationWindow {
             showAuditTab: false,
             settingsAutosaveSecs: 60,
             allowModeAKillswitch: false,
+            showVirtualMachinesSection: false,
             showRememberedAdapters: true,
             autoConfirmAdapterIdChange: true,
             // Show the block-all warning banner (default on).
@@ -4976,6 +4991,9 @@ ApplicationWindow {
         if (bridgeAvailable && typeof nrrNativeBridge.rpcResponse !== "undefined") {
             nrrNativeBridge.rpcResponse.connect(rpcTransport.handleRpcResponse)
         }
+        // The sidebar offers Virtual machines only when there are some, and
+        // needs the answer before the user opens Rules.
+        if (prefs.showVirtualMachinesSection === true) virtualMachinesController.refresh()
 
         // The desktop can switch light/dark while the window is open. The
         // context file was written before the window existed, so without this
@@ -6181,6 +6199,14 @@ ApplicationWindow {
                     asynchronous: true
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { RuleSuggestionsSection { root: window } }
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    active: StackLayout.isCurrentItem
+                    asynchronous: true
+                    visible: StackLayout.isCurrentItem
+                    sourceComponent: Component { VirtualMachinesSection { root: window } }
                 }
                 Loader {
                     Layout.fillWidth: true

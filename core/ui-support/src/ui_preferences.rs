@@ -219,6 +219,10 @@ pub struct UiPreferences {
     /// apply; this flag only controls visibility, never the toggles' own
     /// saved values. Pure device-local UI display preference.
     pub routing_detailed_mode: bool,
+    /// Experimental opt-in: reveal the Rules -> Virtual machines screen.
+    /// `false` (default) hides the screen and its sidebar entry; hypervisor
+    /// routing is unverified. Pure device-local UI display preference.
+    pub show_virtual_machines_section: bool,
     /// Display toggle: show "remembered but currently absent" ghost rows in
     /// the Interfaces section for confirmed primary/secondary bindings whose
     /// adapter is not among the live adapters (e.g. a VPN TAP that removes

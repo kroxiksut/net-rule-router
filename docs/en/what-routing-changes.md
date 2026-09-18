@@ -58,8 +58,8 @@ protection has less to work with.
 
 This is a real trade-off, not a detail: encrypted DNS in the browser and
 name-based routing want the same information. Settings → Routing has a
-**Block browser DoH/DoT** switch for this, off by default, and the recommended
-scope limits it to the times when leak protection is armed. If you leave
+**Block browser DoH/DoT** switch for this, off by default; by default it is in
+force only while leak protection is on. If you leave
 encrypted DNS on in your browser, expect routing for browser traffic to be
 less reliable than for everything else.
 

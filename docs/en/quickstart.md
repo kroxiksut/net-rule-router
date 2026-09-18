@@ -156,11 +156,13 @@ the final truth.
 ## If something is not working
 
 1. Check that the service is running: **Settings → Service management** —
-   the status should be "Running" (from console: `.\scripts\service-status.ps1`).
+   the status should be "Running" (from a terminal: `nrr-cli status`).
 2. Look in the "Diagnostics" section — you can see applied rules and
    errors there.
-3. That did not help — collect a diagnostic archive ("Diagnostics" section
-   → "Diagnostic archive export") and create an
+3. Ask the console for a verdict: `nrr-cli diag doctor` checks the service
+   and its data from outside the app and reports what it found.
+4. That did not help — collect a diagnostic archive ("Diagnostics" section
+   → "Diagnostic archive export", or `nrr-cli diag export`) and create an
    [issue](https://github.com/kroxiksut/net-rule-router/issues) with the
    archive attached and a description: what you did, what you expected,
    what happened.
@@ -194,8 +196,9 @@ To see the current routing table for diagnostics, use
 ## Removal
 
 1. Remove the service: **Settings → Service management → Remove service**
-   (or from console: `.\scripts\uninstall-service.ps1`). When the service
-   is removed, it clears the installed routing rules.
+   (or from an administrator terminal: `nrr-cli uninstall`; add `--purge`
+   to delete the data the service owns as well). When the service is
+   removed, it clears the installed routing rules.
 2. Close the app and delete the program folder.
 
 ---

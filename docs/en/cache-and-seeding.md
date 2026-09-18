@@ -33,20 +33,19 @@ the first two — the other two exist to close specific gaps.
 
 ### 1. Live DNS observation
 
-While the service is running, it observes outgoing DNS traffic (via ETW) for
-the console user session. When a program resolves a hostname that matches one
-of your rules, the resulting IP address(es) are recorded. This is the primary,
-always-on source, and it requires no configuration — it is simply how the
-cache stays current with the sites you actually visit while NetRuleRouter is
-active.
+While the service is running, it watches name resolution in your own session.
+When a program resolves a hostname that matches one of your rules, the
+resulting IP address(es) are recorded. This is the primary, always-on source,
+and it requires no configuration — it is simply how the cache stays current
+with the sites you actually visit while NetRuleRouter is active.
 
 ### 2. Confirming a hostname from its address
 
-Sometimes the service learns an IP address before it learns the hostname
-behind it. When that happens, it can look up a candidate name for that
-address — but it only ever accepts the answer after checking it back the
-other way round first, so a name that does not genuinely belong to the
-address is discarded and never reaches the cache.
+The service can also work the other way round and establish which hostname an
+address belongs to. A name is only accepted once it has been confirmed to
+genuinely belong to that address, so a wrong or spoofed answer is discarded and
+never reaches the cache — an address does not inherit your rules just because
+something claimed a name for it.
 
 These lookups go only to the DNS server configured for your connection —
 nothing is sent to any third-party service.

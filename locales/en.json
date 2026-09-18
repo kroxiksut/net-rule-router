@@ -304,6 +304,10 @@
         "label": "Allow kill-switch mode A (legacy)",
         "note": "Mode A is a legacy enforcement mode kept only for historical reference. It is not maintained, may not work, and can be removed in a future release. Mode B (the local DNS resolver) is the supported mechanism. Turn this on only if you specifically need to pick mode A in the routing settings."
       },
+      "vm-section": {
+        "label": "Virtual machines screen",
+        "note": "Adds a Virtual machines screen under Rules that sends a hypervisor's traffic over the route you pick. Not verified on real hardware yet: the screen may be incomplete and the route may not apply to every machine."
+      },
       "detailed-mode": {
         "label": "Detailed mode",
         "note": "Shows the fine-grained fake-IP switches (UDP relay, instant reset) under Settings → Routing. Off by default: without it, NetRuleRouter uses sensible defaults for them. The main routing switches stay visible either way."
@@ -2252,7 +2256,42 @@
       "nothing-to-check": "There are no address rules to check."
     },
     "invalid-count": "{n} rule(s) will not be applied: the value is not valid.",
-    "invalid-count-show": "Show them"
+    "invalid-count-show": "Show them",
+    "vm": {
+      "nav-label": "Virtual machines",
+      "intro": "A virtual machine's traffic leaves your computer as the traffic of its hypervisor, so the route is chosen for the hypervisor and applies to all of its machines. Changes go to your rules list, where you review and apply them.",
+      "scan-failed": "Could not read the virtual machines. Try Refresh.",
+      "added-note": "The rules are in your rules list. Review and apply them there.",
+      "open-rules": "Open rules list",
+      "hypervisor": {
+        "virtualbox": "VirtualBox"
+      },
+      "route-scope": "{hypervisor} runs every machine as one program ({processes}), so a route applies to all of its machines.",
+      "route-now": "Every {hypervisor} machine goes over {route}.",
+      "route-now-mixed": "The rules send {hypervisor}'s programs over different routes.",
+      "route-now-block": "The rules block the traffic of every {hypervisor} machine.",
+      "route-button": "Send over {route}",
+      "no-machines": "{hypervisor} has no machines yet.",
+      "machine-label": "Machine",
+      "no-adapters": "This machine has no network adapters.",
+      "adapter-title": "Adapter {n}: {mode}",
+      "mode": {
+        "nat": "NAT",
+        "bridged": "Bridged",
+        "host-only": "Host-only",
+        "internal": "Internal network",
+        "nat-network": "NAT Network",
+        "other": "Other"
+      },
+      "nat-dns": "For your site rules to work inside this machine, set its DNS server to {address}.",
+      "nat-enable-first": "For your site rules to work inside this machine, first let this adapter reach your computer: power the machine off and run the command below. Then set the machine's DNS server to {address}.",
+      "nat-enable-first-no-tool": "For your site rules to work inside this machine, first let adapter {n} reach your computer with the VBoxManage option --nat-localhostreachable{n} while the machine is off. Then set the machine's DNS server to {address}.",
+      "bridged": "This adapter is bridged: its traffic goes straight to your network and bypasses your rules. Switch it to NAT for the rules to apply.",
+      "host-only": "Traffic stays between this machine and your computer. Nothing to route.",
+      "internal": "Traffic stays between virtual machines. Nothing to route.",
+      "nat-network": "NAT Network is not supported yet, so this adapter is not covered here.",
+      "other": "This adapter is not attached, or its kind is not supported yet."
+    }
   },
   "connection": {
     "banner": {
