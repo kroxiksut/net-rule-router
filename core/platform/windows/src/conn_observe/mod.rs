@@ -25,4 +25,6 @@ pub mod egress;
 #[cfg(target_os = "windows")]
 pub mod etw_tcpip;
 #[cfg(target_os = "windows")]
+pub mod live;
+#[cfg(target_os = "windows")]
 pub mod wfp_events;

@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::bounded_set::BoundedRecentSet;
+use nrr_platform_api::conn_observe::live::LiveConnection;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -281,6 +282,44 @@ impl AppObservationStore {
             .iter()
             .filter(|(app, ip)| self.record(app, *ip))
             .count()
+    }
+
+    /// Restamp the destinations a program is still connected to.
+    ///
+    /// Observation reports a connection once, when it opens, so a program that
+    /// holds one connection for longer than the freshness window would lose its
+    /// route from under that connection. Only pairs already held are touched: an
+    /// open connection keeps a learnt destination alive but never teaches a new
+    /// one, and a pair withdrawn as collateral is no longer held, so it stays
+    /// withdrawn. Returns how many pairs were refreshed.
+    pub fn refresh_live(&self, live: &[LiveConnection]) -> usize {
+        let now = (self.clock)();
+        let mut refreshed: HashSet<(String, Ipv4Addr)> = HashSet::new();
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let mut stamps = self.last_seen.lock().unwrap_or_else(|p| p.into_inner());
+            for connection in live {
+                let key = app_key(&connection.process_path);
+                if key.is_empty() {
+                    continue;
+                }
+                for (name, set) in g.iter_mut() {
+                    if pattern_matches(name, &key) && set.contains(&connection.remote) {
+                        set.observe(connection.remote);
+                        stamps.insert((name.clone(), connection.remote), now);
+                        refreshed.insert((name.clone(), connection.remote));
+                    }
+                }
+            }
+        }
+        let mut seen = self
+            .seen_since_flush
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for pair in &refreshed {
+            seen.observe(pair.clone());
+        }
+        refreshed.len()
     }
 
     /// Which applications have `ip` in their observed set.
@@ -863,6 +902,80 @@ mod tests {
             vec![ip(203, 0, 113, 1)],
             "a live destination is never aged out"
         );
+    }
+
+    fn live(process_path: &str, remote: Ipv4Addr) -> LiveConnection {
+        LiveConnection {
+            process_path: process_path.to_string(),
+            remote,
+        }
+    }
+
+    /// The messenger shape: one connection opened once and held for longer than
+    /// the window. Observation never sees it again, so without the live refresh
+    /// its route was withdrawn from under the open session.
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_connection_held_open_keeps_its_destination_past_the_window() {
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        store.record(r"C:\Apps\Messenger.exe", ip(203, 0, 113, 7));
+        store.record("messenger.exe", ip(203, 0, 113, 8));
+
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(60);
+        assert_eq!(
+            store.refresh_live(&[live("messenger.exe", ip(203, 0, 113, 7))]),
+            1
+        );
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW + Duration::from_secs(60);
+
+        assert_eq!(
+            store.ips_for_app("messenger.exe"),
+            vec![ip(203, 0, 113, 7)],
+            "the held destination stays; the one nobody holds ages out as before"
+        );
+    }
+
+    #[test]
+    fn a_live_connection_never_teaches_a_destination() {
+        let store = AppObservationStore::new();
+        store.record("messenger.exe", ip(203, 0, 113, 7));
+        assert_eq!(
+            store.refresh_live(&[
+                live("messenger.exe", ip(203, 0, 113, 9)),
+                live("browser.exe", ip(203, 0, 113, 7)),
+            ]),
+            0
+        );
+        assert_eq!(store.ips_for_app("messenger.exe"), vec![ip(203, 0, 113, 7)]);
+        assert!(store.ips_for_app("browser.exe").is_empty());
+    }
+
+    #[test]
+    fn a_withdrawn_destination_stays_withdrawn_while_connected() {
+        let store = AppObservationStore::new();
+        store.record("messenger.exe", ip(203, 0, 113, 7));
+        assert!(store.retract("messenger.exe", ip(203, 0, 113, 7)));
+        assert_eq!(
+            store.refresh_live(&[live("messenger.exe", ip(203, 0, 113, 7))]),
+            0
+        );
+        assert!(store.ips_for_app("messenger.exe").is_empty());
+    }
+
+    #[allow(clippy::unwrap_used)]
+    #[test]
+    fn a_glob_rule_keeps_the_live_destination_of_a_process_it_names() {
+        let (offset, clock) = test_clock();
+        let store = AppObservationStore::new().with_clock(clock);
+        store.seed_many(&[("*vpn*.exe".to_string(), ip(203, 0, 113, 1))]);
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW - Duration::from_secs(60);
+        assert_eq!(
+            store.refresh_live(&[live("myvpnclient.exe", ip(203, 0, 113, 1))]),
+            1
+        );
+        *offset.lock().unwrap() = APP_PIN_FRESHNESS_WINDOW + Duration::from_secs(60);
+        assert_eq!(store.ips_for_app("*vpn*.exe"), vec![ip(203, 0, 113, 1)]);
     }
 
     #[allow(clippy::unwrap_used)]

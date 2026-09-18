@@ -121,7 +121,7 @@ fn correct_windows_11_product(product: &str, build: u32) -> String {
 
 /// Read a `REG_SZ` value. Two-pass (size, then read). `None` on any failure.
 #[cfg(target_os = "windows")]
-fn reg_sz(root: HKEY, subkey: &str, value: &str) -> Option<String> {
+pub(crate) fn reg_sz(root: HKEY, subkey: &str, value: &str) -> Option<String> {
     let subkey_w = wide(subkey);
     let value_w = wide(value);
     let mut size: u32 = 0;

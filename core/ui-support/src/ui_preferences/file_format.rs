@@ -190,6 +190,11 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     preferences.routing_detailed_mode = parsed;
                 }
             }
+            "show_virtual_machines_section" => {
+                if let Some(parsed) = parse_bool(value) {
+                    preferences.show_virtual_machines_section = parsed;
+                }
+            }
             "show_remembered_adapters" => {
                 if let Some(parsed) = parse_bool(value) {
                     preferences.show_remembered_adapters = parsed;
@@ -657,6 +662,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "settings_autosave_secs={}\n",
             "allow_mode_a_killswitch={}\n",
             "routing_detailed_mode={}\n",
+            "show_virtual_machines_section={}\n",
             "show_remembered_adapters={}\n",
             "selected_primary_interface_id={}\n",
             "selected_primary_interface_name={}\n",
@@ -751,6 +757,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.settings_autosave_secs),
         one_line(&preferences.allow_mode_a_killswitch),
         one_line(&preferences.routing_detailed_mode),
+        one_line(&preferences.show_virtual_machines_section),
         one_line(&preferences.show_remembered_adapters),
         one_line(&preferences.selected_primary_interface_id),
         one_line(&preferences.selected_primary_interface_name),

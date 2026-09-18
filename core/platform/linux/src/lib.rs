@@ -191,6 +191,10 @@ pub mod vpn_discovery;
 /// returns an empty list until it can be verified on real Linux.
 pub mod app_group_discovery;
 
+/// Linux VirtualBox machine inventory seam (stub). The settings reader is
+/// neutral; the per-user directory and host adapters are not wired yet.
+pub mod vm_inventory;
+
 /// Linux fake-IP TUN seam. The kernel provides
 /// `/dev/net/tun` natively, so unlike Windows there is no third-party driver to
 /// ship or attribute; the stub fails closed until it can be verified on a real

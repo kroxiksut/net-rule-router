@@ -162,6 +162,7 @@ impl QtPreferencesPayload {
         }
         current.allow_mode_a_killswitch = self.allow_mode_a_killswitch;
         current.routing_detailed_mode = self.routing_detailed_mode;
+        current.show_virtual_machines_section = self.show_virtual_machines_section;
         current.show_remembered_adapters = self.show_remembered_adapters;
         current.auto_confirm_adapter_id_change = self.auto_confirm_adapter_id_change;
         // Block-all banner opt-out (device-local display pref).

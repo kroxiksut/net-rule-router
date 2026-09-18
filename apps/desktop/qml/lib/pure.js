@@ -33,9 +33,10 @@ function idxForSection(value) {
     if (value === "interfaces-routes") return 0
     if (value === "rules") return 1
     if (value === "rule-suggestions") return 2
-    if (value === "diagnostics") return 3
-    if (value === "logs") return 4
-    return 5
+    if (value === "rule-virtual-machines") return 3
+    if (value === "diagnostics") return 4
+    if (value === "logs") return 5
+    return 6
 }
 
 // ---- ListModel / array access helpers ----

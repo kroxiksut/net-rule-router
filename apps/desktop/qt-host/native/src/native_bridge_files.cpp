@@ -66,6 +66,10 @@ QString NrrNativeBridge::rpcAppGroupsDiscover() {
                           QJsonObject());
 }
 
+QString NrrNativeBridge::rpcVmInventoryList() {
+    return emitRpcRequest(QStringLiteral("local.vm-inventory.list"), QJsonObject());
+}
+
 QString NrrNativeBridge::rpcSeedFromBrowserHistory() {
     return emitRpcRequest(QStringLiteral("diagnostics.seed-from-browser-history"),
                           QJsonObject());

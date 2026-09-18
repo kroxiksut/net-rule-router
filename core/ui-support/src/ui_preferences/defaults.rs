@@ -42,6 +42,7 @@ impl Default for UiPreferences {
             admin_auto_revoke_minutes: ADMIN_AUTO_REVOKE_DEFAULT_MINUTES,
             allow_mode_a_killswitch: false,
             routing_detailed_mode: false,
+            show_virtual_machines_section: false,
             show_remembered_adapters: true,
             auto_confirm_adapter_id_change: true,
             warn_kill_switch_block_all: true,

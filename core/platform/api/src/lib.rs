@@ -123,6 +123,8 @@ pub mod system_theme;
 // verdict derivation; the hashing/signature MECHANISM is per-OS.
 pub mod third_party;
 pub mod types;
+// A hypervisor's machines and what their network adapters mean for routing.
+pub mod vm_inventory;
 // VPN-client discovery port (processes + installed programs →
 // user-confirmable candidates), replacing the silent `*vpn*` glob.
 pub mod vpn_discovery;
@@ -212,6 +214,10 @@ pub use third_party::{
 pub use types::{
     ApplyActionPlan, RouteEntry, RoutingAction, WfpAction, WfpFilterAction, WfpFilterId,
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
+};
+pub use vm_inventory::{
+    GuestDnsAdvice, Hypervisor, HypervisorInventory, MockVmInventory, NatAdapter, NoopVmInventory,
+    VirtualMachine, VmAdapter, VmAttachment, VmInventoryPort,
 };
 pub use vpn_discovery::{
     looks_like_vpn, merge_candidates, vpn_client_class, MockVpnDiscovery, NoopVpnDiscovery,

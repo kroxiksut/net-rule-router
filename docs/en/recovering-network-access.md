@@ -22,17 +22,23 @@ networking on its own.
 
 ## Option 2 — Reset without rebooting
 
-Run the reset helper from an elevated PowerShell (it self-elevates via UAC — no
-interactive prompts):
+From an administrator console:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\reset-network.ps1
+```
+nrr-cli reset-network --confirm
 ```
 
 It stops the service if it is still running, then restores networking to its
 default state — removing the app's traffic filters, its routes, and its DNS
 redirect — so the network resolves normally again immediately. A reboot
 afterwards is optional and clears any last remainder.
+
+`--confirm` is required and never implied: open connections can drop when that
+state goes, so the command tells you what it would remove rather than doing it
+on a bare invocation. Without an administrator console, add `--elevate` (or
+answer the question the console asks) to raise it. If the service has applied no
+network state at all, the command says so instead of pretending to have cleaned
+something. See [the `nrr-cli` console](cli.md).
 
 > This is a safety escape hatch, not part of normal operation. Reach for it only
 > after an abnormal termination has left the machine's network or DNS stuck.

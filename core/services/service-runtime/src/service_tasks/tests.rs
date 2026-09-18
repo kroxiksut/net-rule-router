@@ -593,6 +593,40 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
     assert_eq!(fold_observations(&wiring), 0);
 }
 
+/// The refresh pass reads the open connections and restamps only what the
+/// store already holds.
+#[test]
+fn the_live_refresh_pass_restamps_held_destinations_only() {
+    use crate::app_observation_lookup::AppObservationLookup;
+    use nrr_platform_api::conn_observe::live::{LiveConnection, MockLiveConnectionSource};
+    use std::net::Ipv4Addr;
+
+    let store = Arc::new(crate::app_observation_lookup::AppObservationStore::new());
+    store.record("/usr/bin/messenger", Ipv4Addr::new(203, 0, 113, 7));
+    let source = Arc::new(MockLiveConnectionSource::default());
+    source.set(vec![
+        LiveConnection {
+            process_path: "/usr/bin/messenger".to_string(),
+            remote: Ipv4Addr::new(203, 0, 113, 7),
+        },
+        LiveConnection {
+            process_path: "/usr/bin/messenger".to_string(),
+            remote: Ipv4Addr::new(203, 0, 113, 99),
+        },
+    ]);
+    let wiring = LiveConnectionRefreshWiring {
+        source,
+        store: Arc::clone(&store),
+    };
+
+    assert_eq!(refresh_live_destinations(&wiring), 1);
+    assert_eq!(
+        store.ips_for_app("messenger"),
+        vec![Ipv4Addr::new(203, 0, 113, 7)],
+        "an open connection to an unknown address teaches nothing"
+    );
+}
+
 /// A resolution belongs to the machine, not to a user: every present
 /// principal's rules must get a look at it, or one user's domain rule would
 /// learn addresses and another's would not.

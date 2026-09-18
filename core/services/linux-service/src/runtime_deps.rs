@@ -255,6 +255,14 @@ pub(crate) fn build_runtime_deps(
             source: Arc::new(nrr_platform_linux::conn_observe::ProcfsConnectionObserver::new()),
             store: Arc::clone(store),
         }),
+        // The observer reports a socket once; this keeps the destinations of
+        // sockets still open from ageing out under them.
+        live_connection_refresh: app_observations.as_ref().map(|store| {
+            nrr_service_runtime::service_tasks::LiveConnectionRefreshWiring {
+                source: Arc::new(nrr_platform_linux::conn_observe::ProcfsLiveConnections::new()),
+                store: Arc::clone(store),
+            }
+        }),
         // What those applications talked to LAST session. Without it every
         // restart starts cold, and an app rule enforces nothing until the
         // program happens to connect again.

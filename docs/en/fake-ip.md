@@ -40,8 +40,9 @@ adapter:
   adapter. The file is shipped exactly as its author signed it and is used only
   through its published interface. See
   [Third-party components](third-party-components.md).
-- **Linux and macOS** provide an equivalent adapter in the operating system
-  itself, so builds for those systems ship no extra driver.
+- **Linux** provides an equivalent adapter in the operating system itself, so
+  the Linux build ships no extra driver. The same will hold on macOS when a
+  build for it exists.
 
 The Settings screen shows the driver's status next to the checkbox, so you can
 confirm the genuine driver is present before relying on the feature.

@@ -448,6 +448,46 @@ Pane {
                             }
                         }
                     }
+                    // Behind the experimental opt-in, and only where a
+                    // hypervisor's network or machines exist: with none, there
+                    // is nothing on this screen to act on.
+                    Button {
+                        id: rulesVirtualMachinesButton
+                        Layout.fillWidth: true
+                        activeFocusOnTab: true
+                        visible: (root.uiRevision >= 0 ? root.prefs.showVirtualMachinesSection === true : false)
+                            && root.virtualMachinesController.available
+                        highlighted: root.section === "rule-virtual-machines"
+                        Accessible.name: root.tr("rules.vm.nav-label", "Virtual machines")
+                        onClicked: root.requestSectionChange("rule-virtual-machines")
+                        background: PanelSurface {
+                            theme: root.uiTheme
+                            cornerRadius: root.uiTheme.radiusSm
+                            color: rulesVirtualMachinesButton.highlighted ? root.accentColor
+                                : (rulesVirtualMachinesButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
+                            border.color: rulesVirtualMachinesButton.highlighted ? root.uiTheme.stateSelectedBorder
+                                : (rulesVirtualMachinesButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
+                        }
+                        contentItem: RowLayout {
+                            spacing: root.uiTheme.spacingXs
+                            Image {
+                                source: root.uiIconSource("routing")
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: root.uiRevision >= 0 ? root.tr("rules.vm.nav-label", "Virtual machines") : ""
+                                color: rulesVirtualMachinesButton.highlighted ? palette.highlightedText : root.textColor
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                        }
+                    }
                 }
             }
         }

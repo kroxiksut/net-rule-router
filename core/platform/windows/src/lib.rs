@@ -126,6 +126,8 @@ pub mod system_theme;
 #[cfg(windows)]
 pub mod trusted_location;
 pub mod types;
+// VirtualBox machines of this user and whether the host carries its network.
+pub mod vm_inventory;
 // Windows VPN-client discovery (processes + Uninstall registry).
 // `#![cfg(target_os = "windows")]` inside the module file.
 pub mod vpn_discovery;
@@ -207,6 +209,7 @@ pub use types::{
     WfpFilterRecord, WfpFilterSpec, WfpLayerKey,
 };
 #[cfg(target_os = "windows")]
+pub use vm_inventory::WindowsVmInventory;
 pub use vpn_discovery::WindowsVpnDiscovery;
 // NT-device → Win32 path mapping for WFP-sourced process paths: the
 // learned-VPN-client sink re-enters the enforcement layer, whose

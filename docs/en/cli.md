@@ -38,8 +38,8 @@ file is missing even though it is right there. Prefix it with `.\`:
 works. On Linux and macOS the same rule as PowerShell applies to the shell —
 use `./nrr-cli`.
 
-To stop typing a path at all, open **Settings → Command-line console** in the
-application and press **Add console to PATH**. It registers the folder for your
+To stop typing a path at all, open **Settings → Service management →
+Command-line console** in the application and press **Add console to PATH**. It registers the folder for your
 user only. Terminals that are already open keep the `PATH` they started with:
 open a new one, or paste the one-line command the panel shows you.
 

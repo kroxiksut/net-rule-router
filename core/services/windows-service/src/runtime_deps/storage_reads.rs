@@ -493,3 +493,61 @@ pub(super) fn read_fake_ip_instant_rst(conn: &Arc<Mutex<Connection>>) -> bool {
         .map(|record| record.fake_ip_instant_rst)
         .unwrap_or(true)
 }
+
+/// Whether the opt-in connection trace is requested. True if the
+/// `NRR_CONN_TRACE` env var is set OR the sentinel file
+/// `%ProgramData%\NetRuleRouter\conn-trace.enabled` exists. The sentinel file
+/// is the service-friendly knob (SCM caches the env block at boot, so a new env
+/// var needs a reboot; a file just needs a service restart). Slice D replaces
+/// both with the persisted GUI settings toggle.
+pub(super) fn conn_trace_requested() -> bool {
+    if std::env::var_os("NRR_CONN_TRACE").is_some() {
+        return true;
+    }
+    if let Some(program_data) = std::env::var_os("ProgramData") {
+        return PathBuf::from(program_data)
+            .join("NetRuleRouter")
+            .join("conn-trace.enabled")
+            .exists();
+    }
+    false
+}
+
+/// Read the persisted connection-trace toggles (NDJSON sink, GUI stream) from
+/// `service_stability_config`. Returns `(false, false)` on any error — the
+/// trace stays off unless explicitly enabled. Read once at bootstrap; the GUI
+/// Save persists the row, so a toggle change takes effect on the next service
+/// start (consistent with the sibling `verbose_logging` flag).
+pub(super) fn read_conn_trace_flags(conn: Option<&Arc<Mutex<Connection>>>) -> (bool, bool) {
+    use nrr_storage::service_stability_config::ServiceStabilityConfigRepository;
+    let Some(conn) = conn else {
+        return (false, false);
+    };
+    let Ok(guard) = conn.lock() else {
+        return (false, false);
+    };
+    match ServiceStabilityConfigRepository::new(&guard).get_or_default() {
+        Ok(r) => (r.conn_trace_ndjson, r.conn_trace_gui),
+        Err(_) => (false, false),
+    }
+}
+
+/// Persist-on-stop — read the `routing_stop_policy` FRESH from
+/// `service_stability_config`. Returns `true` only for the explicit `persist`
+/// slug; any error, a missing row, or the default row all yield `false`
+/// (teardown). Called from the graceful-stop hook at stop time (not a boot
+/// snapshot) so a mid-session Save takes effect. Failing to `false` is the safe
+/// posture: teardown always cleans up, so a corrupted row can never strand
+/// routes or an orphaned block.
+pub(super) fn read_routing_stop_persist(conn: &Arc<Mutex<Connection>>) -> bool {
+    use nrr_storage::service_stability_config::{
+        RoutingStopPolicy, ServiceStabilityConfigRepository,
+    };
+    let Ok(guard) = conn.lock() else {
+        return false;
+    };
+    match ServiceStabilityConfigRepository::new(&guard).get_or_default() {
+        Ok(r) => matches!(r.routing_stop_policy, RoutingStopPolicy::Persist),
+        Err(_) => false,
+    }
+}
