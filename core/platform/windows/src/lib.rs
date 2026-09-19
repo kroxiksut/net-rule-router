@@ -210,6 +210,7 @@ pub use types::{
 };
 #[cfg(target_os = "windows")]
 pub use vm_inventory::WindowsVmInventory;
+#[cfg(target_os = "windows")]
 pub use vpn_discovery::WindowsVpnDiscovery;
 // NT-device → Win32 path mapping for WFP-sourced process paths: the
 // learned-VPN-client sink re-enters the enforcement layer, whose
