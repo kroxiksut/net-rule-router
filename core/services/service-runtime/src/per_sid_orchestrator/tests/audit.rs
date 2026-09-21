@@ -92,6 +92,29 @@ fn losing_the_policy_takes_down_the_filters_the_sid_was_carrying() {
     assert_eq!(orch.filter_count_for("A"), 0);
 }
 
+/// A fresh install: the SID is tracked, no revision is active yet, and the
+/// first adapter binding recompiles it. That recompile took the SID's apply
+/// lock a second time and never returned, so every later binding and apply
+/// queued behind it for good.
+#[test]
+fn recompiling_a_tracked_sid_with_no_active_rules_returns() {
+    let (api, orch, src, rules, _audit) = fixture();
+    src.set("A", snap_full("Wi-Fi", "TAP"));
+    orch.install_for_sid("A").unwrap();
+    rules.clear();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = Arc::clone(&orch);
+    std::thread::spawn(move || {
+        let _ = tx.send(worker.recompile_for_sid("A").map(|_| ()));
+    });
+    let outcome = rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("recompile never returned: the SID's apply lock was taken twice");
+    outcome.expect("recompile");
+    assert!(api.wfp_filters.lock().unwrap().is_empty());
+}
+
 #[test]
 fn remove_emits_withdrawn_audit_record() {
     let (_api, orch, src, _rules, audit) = fixture();

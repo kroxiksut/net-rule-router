@@ -670,6 +670,13 @@ impl PerSidApplyOrchestrator {
         }
         let lock = self.apply_lock_for(sid);
         let _apply_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+        self.remove_for_sid_locked(sid)
+    }
+
+    /// [`Self::remove_for_sid`] for a caller already holding the SID's apply
+    /// lock. The lock is not reentrant: taking it again from inside a recompile
+    /// wedged the SID for good.
+    fn remove_for_sid_locked(&self, sid: &str) -> Result<usize, OrchestratorError> {
         // READ the tracked ids; do not drop the record yet. A delete that fails
         // leaves those filters installed, and forgetting their ids here left
         // them enforcing with nobody accounting for them — `cleanup_wfp`
@@ -924,7 +931,7 @@ impl PerSidApplyOrchestrator {
             // Policy/rules gone → a real teardown; the full-replace path
             // re-records the empty state and emits the same audits as before.
             ComputedFilterSet::NoPolicy | ComputedFilterSet::NoActiveRules => {
-                let _ = self.remove_for_sid(sid)?;
+                let _ = self.remove_for_sid_locked(sid)?;
                 self.install_for_sid_with(sid, rules_override)
             }
             ComputedFilterSet::Install(desired) => self

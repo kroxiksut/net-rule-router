@@ -414,21 +414,17 @@ fn block16_recovery_never_silently_activates_mid_phase() {
         correlation_id: "corr-mid".into(),
     };
     let state = StartupRecoveryState::PreviousApplyIncomplete { marker: mid_marker };
-    // Audit available, LKG unavailable → must escalate to manual
-    // action rather than silently proceed (audit-before-act invariant).
-    let decision = decide_recovery(
-        &state, /* lkg_available */ false, /* audit_available */ true,
-    );
+    let decision = decide_recovery(&state, /* audit_available */ true);
     match decision {
         RecoveryDecision::ProceedNormal => panic!(
-            "decide_recovery returned ProceedNormal on a mid-Applying marker without LKG — \
+            "decide_recovery returned ProceedNormal on a mid-Applying marker — \
              silent activation regression"
         ),
         _ => { /* any non-Proceed variant is acceptable for the gate */ }
     }
 
-    // Inverse: audit unavailable must always escalate to manual,
-    // regardless of LKG. Pinned here so a future refactor doesn't
+    // Inverse: audit unavailable must always escalate to manual.
+    // Pinned here so a future refactor doesn't
     // sneak through an "audit not yet wired" auto-proceed path.
     let decision_no_audit = decide_recovery(
         &StartupRecoveryState::PreviousApplyIncomplete {
@@ -442,7 +438,6 @@ fn block16_recovery_never_silently_activates_mid_phase() {
                 correlation_id: "corr-no-audit".into(),
             },
         },
-        /* lkg_available */ true,
         /* audit_available */ false,
     );
     assert!(

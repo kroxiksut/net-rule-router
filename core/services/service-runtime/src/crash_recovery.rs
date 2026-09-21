@@ -230,7 +230,8 @@ pub enum RecoveryDecision {
     /// Verify that the actual platform state matches the marker's revision
     /// claim, then clear the marker through an audited flow.
     VerifyAndClearMarker { marker: ApplyAttemptMarker },
-    /// Roll back to `target_revision` (or the LKG) and clear the marker.
+    /// Roll back to `target_revision` (`None`: no revision active) and clear
+    /// the marker.
     RollbackAndClearMarker {
         marker: ApplyAttemptMarker,
         target_revision: Option<String>,
@@ -242,14 +243,16 @@ pub enum RecoveryDecision {
 }
 
 /// Derive the recovery decision from the assessed startup state and the
-/// availability of LKG and the audit sink.
+/// availability of the audit sink.
+///
+/// A last-known-good revision is not needed to recover: the active pointer
+/// moves only in the final commit, so an attempt that died before it left the
+/// previous state standing, even when that state is "no revision at all" — a
+/// first apply. Demanding an LKG there left a fresh install with no way back
+/// but a manual reset.
 ///
 /// This is a pure function — no I/O, fully testable.
-pub fn decide_recovery(
-    state: &StartupRecoveryState,
-    lkg_available: bool,
-    audit_available: bool,
-) -> RecoveryDecision {
+pub fn decide_recovery(state: &StartupRecoveryState, audit_available: bool) -> RecoveryDecision {
     match state {
         StartupRecoveryState::Clean => RecoveryDecision::ProceedNormal,
 
@@ -302,21 +305,10 @@ pub fn decide_recovery(
                 ApplyPhase::Preparing
                 | ApplyPhase::Applying
                 | ApplyPhase::RollbackRequired
-                | ApplyPhase::RollingBack => {
-                    if lkg_available {
-                        RecoveryDecision::RollbackAndClearMarker {
-                            target_revision: marker.intended_rollback_to.clone(),
-                            marker: marker.clone(),
-                        }
-                    } else {
-                        RecoveryDecision::RequireManualAction {
-                            reason: format!(
-                                "apply attempt {} crashed in phase {:?} and no LKG is available",
-                                marker.attempt_id, marker.phase
-                            ),
-                        }
-                    }
-                }
+                | ApplyPhase::RollingBack => RecoveryDecision::RollbackAndClearMarker {
+                    target_revision: marker.intended_rollback_to.clone(),
+                    marker: marker.clone(),
+                },
 
                 // Phases that need verification only.
                 ApplyPhase::Verifying | ApplyPhase::RollbackDone => {
@@ -760,7 +752,7 @@ mod tests {
     fn clean_startup_proceeds_normal() {
         let c = coord(FakeMarkerStore::empty(), RecordingAuditSink::ok());
         assert_eq!(c.assess(), StartupRecoveryState::Clean);
-        let decision = decide_recovery(&StartupRecoveryState::Clean, true, true);
+        let decision = decide_recovery(&StartupRecoveryState::Clean, true);
         assert_eq!(decision, RecoveryDecision::ProceedNormal);
         assert_eq!(c.execute(decision), RecoveryExecutionResult::Recovered);
     }
@@ -776,10 +768,10 @@ mod tests {
             state,
             StartupRecoveryState::PreviousApplyIncomplete { .. }
         ));
-        let decision = decide_recovery(&state, true, true);
+        let decision = decide_recovery(&state, true);
         assert!(
             matches!(decision, RecoveryDecision::RollbackAndClearMarker { .. }),
-            "Applying phase with LKG should trigger rollback"
+            "Applying phase should trigger rollback"
         );
         let result = c.execute(decision);
         assert!(
@@ -799,7 +791,7 @@ mod tests {
             FakeMarkerStore::with(marker(ApplyPhase::Applying)),
             RecordingAuditSink::ok(),
         );
-        let decision = decide_recovery(&c.assess(), true, true);
+        let decision = decide_recovery(&c.assess(), true);
         let _ = c.execute(decision);
 
         let records = c.audit_sink.records();
@@ -835,7 +827,7 @@ mod tests {
             RecordingAuditSink::ok(),
         );
         let state = c.assess();
-        let decision = decide_recovery(&state, true, true);
+        let decision = decide_recovery(&state, true);
         assert!(
             matches!(decision, RecoveryDecision::VerifyAndClearMarker { .. }),
             "Verifying phase should trigger verify+clear: {decision:?}"
@@ -852,7 +844,7 @@ mod tests {
             RecordingAuditSink::ok(),
         );
         let state = c.assess();
-        let decision = decide_recovery(&state, true, true);
+        let decision = decide_recovery(&state, true);
         assert!(matches!(
             decision,
             RecoveryDecision::RollbackAndClearMarker { .. }
@@ -864,23 +856,39 @@ mod tests {
         let state = StartupRecoveryState::PreviousApplyIncomplete {
             marker: marker(ApplyPhase::Applying),
         };
-        let decision = decide_recovery(&state, true, false /* audit unavailable */);
+        let decision = decide_recovery(&state, false /* audit unavailable */);
         assert!(
             matches!(decision, RecoveryDecision::RequireManualAction { .. }),
             "audit unavailable must block any mutating recovery"
         );
     }
 
+    /// A first apply that died leaves nothing to roll back to, and nothing
+    /// needs it: the pointer never moved. Blocking here took a fresh install's
+    /// service off the air until someone deleted the marker by hand.
     #[test]
-    fn no_lkg_during_rollback_requires_manual_action() {
-        let state = StartupRecoveryState::PreviousApplyIncomplete {
-            marker: marker(ApplyPhase::Applying),
-        };
-        let decision = decide_recovery(&state, false /* no LKG */, true);
-        assert!(matches!(
-            decision,
-            RecoveryDecision::RequireManualAction { .. }
-        ));
+    fn a_first_apply_that_crashed_rolls_back_to_no_revision() {
+        let mut first = marker(ApplyPhase::Applying);
+        first.intended_rollback_to = None;
+        let c = coord(FakeMarkerStore::with(first), RecordingAuditSink::ok());
+        let decision = decide_recovery(&c.assess(), true);
+        assert!(
+            matches!(
+                decision,
+                RecoveryDecision::RollbackAndClearMarker {
+                    target_revision: None,
+                    ..
+                }
+            ),
+            "{decision:?}"
+        );
+        assert_eq!(
+            c.execute(decision),
+            RecoveryExecutionResult::RolledBack {
+                revision_active: None
+            }
+        );
+        assert!(c.marker_store.read().is_none(), "marker not cleared");
     }
 
     #[test]
@@ -894,7 +902,7 @@ mod tests {
             state,
             StartupRecoveryState::ManualActionRequired { .. }
         ));
-        let decision = decide_recovery(&state, true, true);
+        let decision = decide_recovery(&state, true);
         assert!(matches!(
             decision,
             RecoveryDecision::RequireManualAction { .. }
@@ -908,7 +916,7 @@ mod tests {
             RecordingAuditSink::failing(),
         );
         let state = c.assess();
-        let decision = decide_recovery(&state, true, true);
+        let decision = decide_recovery(&state, true);
         let result = c.execute(decision);
         assert!(
             matches!(result, RecoveryExecutionResult::AuditWriteFailed { .. }),

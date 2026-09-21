@@ -151,11 +151,6 @@ pub(super) fn audit_entry_position(item: &AuditEntryDto) -> (i64, &str) {
     (item.created_at, item.event_id.as_str())
 }
 
-/// Slice the (already-sorted) `items` list by the optional cursor +
-/// `page_size`. Returns the page and an Option-cursor pointing at the
-/// last returned item — caller treats it as opaque.
-///
-/// Inputs MUST already be sorted ascending by `(created_at, event_id)`.
 /// Number of adjacent items sharing a `(created_at, event_id)` position, or
 /// `None` when every position is distinct.
 pub(super) fn duplicate_positions<T>(items: &[T], position: PositionFn<T>) -> Option<u64> {
@@ -166,6 +161,12 @@ pub(super) fn duplicate_positions<T>(items: &[T], position: PositionFn<T>) -> Op
     (count > 0).then_some(count)
 }
 
+/// Slice `items` by the optional cursor + `page_size`; the cursor points at the
+/// last returned item and is opaque to the caller.
+///
+/// Inputs MUST be sorted newest-first — descending by `(created_at, event_id)` —
+/// so the first page is what a reader opens the log for, and each next page
+/// reaches further back.
 pub(super) fn paginate<T>(
     items: Vec<T>,
     params: &PaginationParams,
@@ -194,7 +195,7 @@ pub(super) fn paginate<T>(
             .iter()
             .position(|item| {
                 let (ts, id) = position(item);
-                (ts, id) > (cts, cid.as_str())
+                (ts, id) < (cts, cid.as_str())
             })
             .unwrap_or(items.len()),
     };

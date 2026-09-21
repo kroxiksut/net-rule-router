@@ -1355,7 +1355,7 @@
     },
     "first-run-wizard": {
       "title": "Welcome to NetRuleRouter",
-      "description": "Choose how to populate your initial rule set. You can always change this later via the Rules toolbar or Settings → Presets.",
+      "description": "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.",
       "view-eula": "View EULA",
       "option-country-preset": "Load country preset ({country})",
       "option-country-preset-description": "Detected from your OS locale. Imports the bundled pack for your region.",
@@ -1814,6 +1814,14 @@
     "traffic-history-merge-failed": "Could not save the answer: "
   },
   "interfaces": {
+    "type": {
+      "ethernet": "Ethernet",
+      "wireless": "Wi-Fi",
+      "loopback": "Loopback",
+      "tunnel": "Tunnel",
+      "ppp": "Dial-up (PPP)",
+      "other": "Other"
+    },
     "role-explanation": "Primary route is the default preferred interface; secondary route is the fallback interface.",
     "fail-closed": {
       "banner-title": "Fail-Closed mode active",
@@ -1950,6 +1958,26 @@
       "tooltip": "NetRuleRouter added this rule for {site} on {date}. You can turn it off or delete it like any rule of your own."
     },
     "bundled-preset": {
+      "name": {
+        "abroad-access-to-ru": "Abroad: access to Russian services",
+        "ae-uae-default-split": "UAE: local and foreign",
+        "bh-bahrain-default-split": "Bahrain: local and foreign",
+        "by-osnovnoy-i-zarubezh": "Belarus: local and foreign",
+        "cn-cn-mainland-split": "China: mainland and foreign",
+        "eg-egypt-default-split": "Egypt: local and foreign",
+        "id-indonesia-default-split": "Indonesia: local and foreign",
+        "in-india-default-split": "India: local and foreign",
+        "ir-iran-default-split": "Iran: local and foreign",
+        "jp-japan-default-split": "Japan: local and foreign",
+        "kw-kuwait-default-split": "Kuwait: local and foreign",
+        "kz-kazakhstan-default-split": "Kazakhstan: local and foreign",
+        "om-oman-default-split": "Oman: local and foreign",
+        "qa-qatar-default-split": "Qatar: local and foreign",
+        "ru-osnovnoy-i-zarubezh": "Russia: local and foreign",
+        "sa-saudi-default-split": "Saudi Arabia: local and foreign",
+        "tr-turkey-default-split": "Turkey: local and foreign",
+        "vn-vietnam-default-split": "Vietnam: local and foreign"
+      },
       "label": "Bundled preset:",
       "user-label": "My rule set:",
       "load": "Load",

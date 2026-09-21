@@ -206,7 +206,7 @@ fn no_silent_policy_activation_with_incomplete_marker() {
         RecordingSink::ok(),
     );
     let state = coord.assess();
-    let decision = decide_recovery(&state, true, true);
+    let decision = decide_recovery(&state, true);
     assert!(
         !matches!(decision, RecoveryDecision::ProceedNormal),
         "ProceedNormal must never be returned when an incomplete marker exists"

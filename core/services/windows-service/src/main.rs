@@ -558,19 +558,13 @@ fn run_console() -> std::process::ExitCode {
     }
 
     // Crash recovery hook. Runs BEFORE supervised runtime so a leftover
-    // apply marker is observed and
-    // acted on. `lkg_available` is probed live from
-    // `RevisionsRepository::last_known_good`; outcomes that require
-    // manual action propagate to `artifacts.report.blocking` so the
-    // supervisor stays in `RecoveryRequired` instead of starting tasks.
-    eprintln!("[dbg] step=9 before-probe-lkg");
-    let lkg_available = nrr_service_runtime::probe_lkg_available(&artifacts.topology.state_db_path);
-    eprintln!("[dbg] step=10 lkg_available={lkg_available}");
+    // apply marker is acted on; outcomes that require manual action propagate
+    // to `artifacts.report.blocking` so the supervisor stays in
+    // `RecoveryRequired` instead of starting tasks.
     let recovery_outcome = nrr_service_runtime::run_crash_recovery_on_startup(
         &artifacts.topology.data_dir,
         artifacts.audit_writer.clone(),
         Arc::new(nrr_service_runtime::ProductionIdGenerator::new()),
-        lkg_available,
     );
     eprintln!("[dbg] step=11 after-crash-recovery");
     eprintln!("[service] crash-recovery outcome: {recovery_outcome:?}");
@@ -579,7 +573,6 @@ fn run_console() -> std::process::ExitCode {
     tracing::info!(
         target: "nrr::recovery",
         outcome = ?recovery_outcome,
-        lkg_available,
         "crash recovery probe complete",
     );
     let mut artifacts = artifacts;

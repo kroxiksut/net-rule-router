@@ -74,7 +74,7 @@ fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
                     adapter.adapter_name().trim(),
                 ),
                 interface_description: adapter.description().to_string(),
-                interface_type: format!("{:?}", adapter.if_type()),
+                interface_type: interface_type_slug(adapter.if_type()).to_string(),
                 oper_status: format!("{:?}", adapter.oper_status()).to_ascii_lowercase(),
             }
         })
@@ -88,6 +88,23 @@ fn collect_windows_adapters() -> Result<Vec<AdapterSnapshotEntry>, String> {
     Ok(adapters)
 }
 
+/// A neutral slug for the adapter type: the GUI localises it, and the OS
+/// enum's own spelling (`EthernetCsmacd`) is no name to show anyone.
+#[cfg(windows)]
+fn interface_type_slug(if_type: ipconfig::IfType) -> &'static str {
+    match if_type {
+        ipconfig::IfType::EthernetCsmacd => "ethernet",
+        ipconfig::IfType::Ieee80211 => "wireless",
+        ipconfig::IfType::SoftwareLoopback => LOOPBACK_INTERFACE_TYPE,
+        ipconfig::IfType::Tunnel => "tunnel",
+        ipconfig::IfType::Ppp => "ppp",
+        _ => "other",
+    }
+}
+
+/// The type slug of the loopback pseudo-interface, which can carry no route.
+pub const LOOPBACK_INTERFACE_TYPE: &str = "loopback";
+
 fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
     vec![
         AdapterSnapshotEntry {
@@ -99,7 +116,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
             },
             windows_name: "Ethernet".to_string(),
             interface_description: "Fallback Ethernet adapter".to_string(),
-            interface_type: "Ethernet".to_string(),
+            interface_type: "ethernet".to_string(),
             oper_status: "ifoperstatusup".to_string(),
         },
         AdapterSnapshotEntry {
@@ -111,7 +128,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
             },
             windows_name: "Wi-Fi".to_string(),
             interface_description: "Fallback Wi-Fi adapter".to_string(),
-            interface_type: "Ieee80211".to_string(),
+            interface_type: "wireless".to_string(),
             oper_status: "ifoperstatusup".to_string(),
         },
         AdapterSnapshotEntry {
@@ -123,7 +140,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
             },
             windows_name: "VPN".to_string(),
             interface_description: "Fallback VPN tunnel".to_string(),
-            interface_type: "Tunnel".to_string(),
+            interface_type: "tunnel".to_string(),
             oper_status: "ifoperstatusdormant".to_string(),
         },
     ]

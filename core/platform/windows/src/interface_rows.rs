@@ -100,6 +100,10 @@ fn collect_windows_rows_from_snapshot(
 
     let mut rows = adapters
         .into_iter()
+        // No route can leave through it, so it is no candidate for either role.
+        .filter(|adapter| {
+            adapter.interface_type != crate::interface_manager::LOOPBACK_INTERFACE_TYPE
+        })
         .map(|adapter| {
             let oper_status = adapter.oper_status.to_ascii_lowercase();
             let availability_status = if oper_status.contains("up") {

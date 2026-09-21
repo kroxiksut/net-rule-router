@@ -132,6 +132,33 @@ fn record_to_summary(rec: nrr_storage::revisions::RevisionRecord) -> RevisionSum
     }
 }
 
+fn record_to_active_state(record: nrr_storage::revisions::RevisionRecord) -> ActiveRevisionState {
+    ActiveRevisionState {
+        revision_id: record.revision_id,
+        // Provenance is currently the source slug; a future revision
+        // may surface a richer label.
+        provenance: match record.source {
+            nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit => "gui-rules-edit",
+            nrr_domain::rules_revision::RulesRevisionSource::PresetImport => "preset-import",
+            nrr_domain::rules_revision::RulesRevisionSource::RecoveryLkg => "recovery-lkg",
+            nrr_domain::rules_revision::RulesRevisionSource::Rollback => "rollback",
+        }
+        .to_string(),
+        // Rule count is opaque to the coordinator (rules_json
+        // stays in storage). A future revision may parse + count when
+        // this field becomes user-visible.
+        rule_count: 0,
+        // Behavior mode is per-SID live config, not per-revision.
+        // Surfaced via SnapshotInitialResponse.route_policy.
+        behavior_mode: String::new(),
+        content_hash_hex: record.content_hash,
+        activated_at_iso: record
+            .activated_at
+            .map(|secs| chrono_like_format(secs).unwrap_or_else(|| "unknown".to_string()))
+            .unwrap_or_default(),
+    }
+}
+
 impl PolicyManager for CoordinatorPolicyManager {
     fn load_active(&self) -> ServicePolicyState {
         match self.coordinator.current_active() {
@@ -142,31 +169,24 @@ impl PolicyManager for CoordinatorPolicyManager {
     }
 
     fn current_revision(&self) -> Option<ActiveRevisionState> {
-        let record = self.coordinator.current_active().ok().flatten()?;
-        Some(ActiveRevisionState {
-            revision_id: record.revision_id,
-            // Provenance is currently the source slug; a future revision
-            // may surface a richer label.
-            provenance: match record.source {
-                nrr_domain::rules_revision::RulesRevisionSource::GuiRulesEdit => "gui-rules-edit",
-                nrr_domain::rules_revision::RulesRevisionSource::PresetImport => "preset-import",
-                nrr_domain::rules_revision::RulesRevisionSource::RecoveryLkg => "recovery-lkg",
-                nrr_domain::rules_revision::RulesRevisionSource::Rollback => "rollback",
-            }
-            .to_string(),
-            // Rule count is opaque to the coordinator (rules_json
-            // stays in storage). A future revision may parse + count when
-            // this field becomes user-visible.
-            rule_count: 0,
-            // Behavior mode is per-SID live config, not per-revision.
-            // Surfaced via SnapshotInitialResponse.route_policy.
-            behavior_mode: String::new(),
-            content_hash_hex: record.content_hash,
-            activated_at_iso: record
-                .activated_at
-                .map(|secs| chrono_like_format(secs).unwrap_or_else(|| "unknown".to_string()))
-                .unwrap_or_default(),
-        })
+        Some(record_to_active_state(
+            self.coordinator.current_active().ok().flatten()?,
+        ))
+    }
+
+    fn current_revision_for(&self, principal: &str) -> Option<ActiveRevisionState> {
+        if principal.is_empty() {
+            return self.current_revision();
+        }
+        // A principal with no revision of its own still runs the baseline
+        // (provider read-through), so falling back is what it actually has.
+        let record = self
+            .coordinator
+            .current_active_for(principal)
+            .ok()
+            .flatten()
+            .or_else(|| self.coordinator.current_active().ok().flatten())?;
+        Some(record_to_active_state(record))
     }
 
     fn pending_revisions(&self, principal: &str) -> Vec<RevisionSummary> {

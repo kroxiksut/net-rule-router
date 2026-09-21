@@ -77,7 +77,9 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
         if self.scenario == MockScenario::EmptyLogs {
             return Ok(PageResult::empty());
         }
-        Ok(PageResult::single_page(mock_log_entries(self.scenario)))
+        let mut entries = mock_log_entries(self.scenario);
+        entries.reverse();
+        Ok(PageResult::single_page(entries))
     }
 
     fn list_audit_entries(
@@ -86,7 +88,9 @@ impl DiagnosticsFacade for MockDiagnosticsFacade {
         _pagination: &PaginationParams,
         _audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<AuditEntryDto>> {
-        Ok(PageResult::single_page(mock_audit_entries(self.scenario)))
+        let mut entries = mock_audit_entries(self.scenario);
+        entries.reverse();
+        Ok(PageResult::single_page(entries))
     }
 
     fn list_active_alerts(&self) -> DiagnosticsResult<Vec<SecurityAlertDto>> {

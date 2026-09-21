@@ -91,7 +91,7 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         audience: &DiagnosticsAudience,
     ) -> DiagnosticsResult<PageResult<LogEntryDto>> {
         let events = self.scan_sorted_log_events_for(filter, audience);
-        let items: Vec<LogEntryDto> = events.iter().map(log_event_to_dto).collect();
+        let items: Vec<LogEntryDto> = events.iter().rev().map(log_event_to_dto).collect();
         Ok(paginate(items, pagination, log_entry_position))
     }
 
@@ -132,9 +132,9 @@ impl DiagnosticsFacade for ProductionDiagnosticsFacade {
         }
 
         events.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
-                .then_with(|| a.event_id.cmp(&b.event_id))
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.event_id.cmp(&a.event_id))
         });
 
         let items: Vec<AuditEntryDto> = events.iter().map(audit_event_to_dto).collect();

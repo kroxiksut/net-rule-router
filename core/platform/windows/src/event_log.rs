@@ -33,7 +33,7 @@ use windows::Win32::System::EventLog::{
     EVENTLOG_INFORMATION_TYPE, EVENTLOG_WARNING_TYPE,
 };
 
-/// When this boot reached the sign-in phase, as Unix milliseconds.
+/// When the host last reached the sign-in phase, as Unix milliseconds.
 ///
 /// The marker is `Microsoft-Windows-Wininit` event 14 — the provider is
 /// registered under its full name, and the short `Wininit` matches nothing.
@@ -42,15 +42,13 @@ use windows::Win32::System::EventLog::{
 /// ready to ask who you are"; it is a phase marker, not the pixel moment the
 /// prompt appeared, and the wording the user sees says so.
 ///
-/// The query runs newest-first and takes the first hit, then keeps it only if
-/// it falls inside the CURRENT boot — the System log holds weeks of them, and
-/// answering with last Tuesday's boot would make the comparison nonsense.
+/// The query runs newest-first and takes the first hit, as stamped. Whether it
+/// belongs to the current boot is decided in `nrr_domain::boot_timing`: the
+/// log holds weeks of them, and a stamp can predate a clock step.
 ///
 /// Every failure path answers `None`. This is a diagnostic that exists to
 /// settle a suspicion honestly; a host that cannot answer must say so rather
 /// than produce a number the code invented.
-#[cfg(target_os = "windows")]
-#[allow(unsafe_code)]
 fn sign_in_prompt_at_ms() -> Option<u64> {
     use windows::core::{h, PCWSTR};
     use windows::Win32::System::EventLog::{
@@ -111,17 +109,8 @@ fn sign_in_prompt_at_ms() -> Option<u64> {
         if !rendered || props == 0 {
             return None;
         }
-        let at_ms = filetime_ticks_to_unix_ms(variant.Anonymous.FileTimeVal)?;
-        current_boot_started_at_ms()
-            .is_some_and(|boot| at_ms >= boot)
-            .then_some(at_ms)
+        filetime_ticks_to_unix_ms(variant.Anonymous.FileTimeVal)
     }
-}
-
-/// Non-Windows builds keep the trait's honest default.
-#[cfg(not(target_os = "windows"))]
-fn sign_in_prompt_at_ms() -> Option<u64> {
-    None
 }
 
 /// Convert raw `FILETIME` ticks (100 ns since 1601-01-01) to Unix
@@ -133,10 +122,7 @@ fn filetime_ticks_to_unix_ms(ticks: u64) -> Option<u64> {
         .map(|since_epoch| since_epoch / 10_000)
 }
 
-/// When the machine last booted, as Unix milliseconds — the fence that keeps a
-/// prompt from a previous boot out of the answer.
-#[cfg(target_os = "windows")]
-#[allow(unsafe_code)]
+/// When the machine last booted, as Unix milliseconds on today's clock.
 fn current_boot_started_at_ms() -> Option<u64> {
     use windows::Win32::System::SystemInformation::GetTickCount64;
     let now_ms = std::time::SystemTime::now()
@@ -146,11 +132,6 @@ fn current_boot_started_at_ms() -> Option<u64> {
     // SAFETY: no arguments, no out-parameters — the call cannot fail.
     let uptime_ms = u128::from(unsafe { GetTickCount64() });
     u64::try_from(now_ms.checked_sub(uptime_ms)?).ok()
-}
-
-#[cfg(not(target_os = "windows"))]
-fn current_boot_started_at_ms() -> Option<u64> {
-    None
 }
 
 /// Registry home of an event source, under `HKEY_LOCAL_MACHINE`.
@@ -217,6 +198,10 @@ impl Drop for WindowsEventLog {
 impl SystemEventLogPort for WindowsEventLog {
     fn sign_in_prompt_at_ms(&self) -> Option<u64> {
         sign_in_prompt_at_ms()
+    }
+
+    fn boot_started_at_ms(&self) -> Option<u64> {
+        current_boot_started_at_ms()
     }
 
     fn write(&self, record: &SystemEventRecord) {
@@ -394,18 +379,12 @@ mod tests {
     /// Windows-only: reads the live System log. The assertion is the contract,
     /// not the value — a machine whose log has rolled over answers `None`, and
     /// that is a legitimate answer, not a failure.
-    #[cfg(target_os = "windows")]
     #[test]
     fn the_sign_in_prompt_is_read_or_admitted_unknown() {
-        match sign_in_prompt_at_ms() {
-            None => {}
-            Some(at) => {
-                let boot = current_boot_started_at_ms().expect("a booted machine knows when");
-                assert!(
-                    at >= boot,
-                    "a prompt from an earlier boot must never be the answer: {at} < {boot}"
-                );
-            }
+        let boot = current_boot_started_at_ms().expect("a booted machine knows when");
+        if let Some(at) = sign_in_prompt_at_ms() {
+            // A rolled-over log answers None; a record is a real post-1970 stamp.
+            assert!(at > 0 && boot > 0, "prompt {at}, boot {boot}");
         }
     }
 }

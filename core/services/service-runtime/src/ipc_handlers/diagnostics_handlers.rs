@@ -1304,9 +1304,7 @@ impl IpcHandler for DiagnosticsExportArchiveHandler {
             Vec::new()
         };
         let audit_entries = if req.include_audit_summary {
-            // Audit summary keeps the oldest-first single page (capped
-            // at `max_audit_entries`); the newest-first ordering is scoped to
-            // logs.ndjson only.
+            // One newest-first page; the builder keeps its first `max_audit_entries`.
             let audit_page = PaginationParams {
                 cursor: None,
                 page_size: MAX_PAGE_SIZE,

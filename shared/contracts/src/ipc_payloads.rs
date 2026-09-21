@@ -329,6 +329,8 @@ pub struct SnapshotDiagnosticsResponse {
 
 // ── LogsList / AuditList ─────────────────────────────────────────────────────
 
+// Both page newest-first; `next-cursor` reaches further back in time.
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct LogsListRequest {

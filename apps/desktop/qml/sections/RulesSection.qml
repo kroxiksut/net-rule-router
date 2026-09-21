@@ -595,7 +595,27 @@ ColumnLayout {
         bundledPresetCombo.currentIndex = pick
         bundledPresetCombo.displayText =
             (section._bundledPresetLabels.length > pick)
-                ? String(section._bundledPresetLabels[pick]) : ""
+                ? section._presetDisplayName(section._bundledPresetLabels[pick]) : ""
+    }
+
+    /// A Menu keeps its style's default width and elides what does not fit;
+    /// sized to its longest item, no action reads as "Reset to baseline ru…".
+    function _fitMenuWidth(menu) {
+        var labels = []
+        for (var i = 0; i < menu.count; i += 1) {
+            var item = menu.itemAt(i)
+            if (item && item.text) labels.push(String(item.text))
+        }
+        menu.width = root.menuPopupWidth(labels)
+    }
+
+    /// What a set reads as in the dropdown. The label stays the remembered key;
+    /// a shipped set's label is a folder slug (`ru_osnovnoy-i-zarubezh`), so it
+    /// is shown through its locale name. The user's own sets show as named.
+    function _presetDisplayName(label) {
+        var raw = String(label || "")
+        if (section._userPresetsActive || raw === "") return raw
+        return root.tr("rules.bundled-preset.name." + raw.replace("_", "-"), raw)
     }
 
     // `<source>:<label>` for the entry at `index` — see `ruleSetSelectionKey`
@@ -942,10 +962,10 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.maximumWidth: 380
                 model: section._bundledPresetLabels
-                labelResolver: function(item) { return String(item) }
+                labelResolver: function(item) { return section._presetDisplayName(item) }
                 currentIndex: 0
                 popup.width: root.comboPopupWidth(bundledPresetCombo, model, "",
-                    function(item) { return String(item) })
+                    function(item) { return section._presetDisplayName(item) })
                 Component.onCompleted: {
                     // Fills the list and restores the user's own pick. Only
                     // when there is none does a default apply: the system
@@ -956,7 +976,7 @@ ColumnLayout {
                     section._refreshBundledPresetSelection()
                 }
                 onActivated: {
-                    bundledPresetCombo.displayText = String(model[currentIndex])
+                    bundledPresetCombo.displayText = section._presetDisplayName(model[currentIndex])
                     section._rememberPresetSelection(currentIndex)
                 }
             }
@@ -1139,6 +1159,7 @@ ColumnLayout {
             // option, and a single route stays available but says so.
             Menu {
                 id: exportRouteMenu
+                onAboutToShow: section._fitMenuWidth(exportRouteMenu)
                 MenuItem {
                     text: root.tr("rules.action.save-as-set",
                         "Save as a set (both routes)...")
@@ -1169,6 +1190,7 @@ ColumnLayout {
             onClicked: rulesMoreMenu.popup()
             Menu {
                 id: rulesMoreMenu
+                onAboutToShow: section._fitMenuWidth(rulesMoreMenu)
                 MenuItem {
                     text: root.tr("action.load-rule-list", "Load rule list...")
                     enabled: !section.rulesLocked
@@ -1273,6 +1295,7 @@ ColumnLayout {
                 onClicked: bulkMoveRouteMenu.popup()
                 Menu {
                     id: bulkMoveRouteMenu
+                    onAboutToShow: section._fitMenuWidth(bulkMoveRouteMenu)
                     MenuItem {
                         text: root.routeLabel("primary")
                         onTriggered: section._bulkMoveSelectedToRoute("primary")

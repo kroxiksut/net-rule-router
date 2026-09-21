@@ -1355,7 +1355,7 @@
     },
     "first-run-wizard": {
       "title": "Добро пожаловать в NetRuleRouter",
-      "description": "Выберите, как заполнить начальный набор правил. Это можно поменять позже через тулбар Rules или Settings → Пресеты.",
+      "description": "Выберите, как заполнить начальный набор правил. Это можно поменять позже — на панели инструментов раздела «Правила» или в «Настройки → Пресеты и настройки».",
       "view-eula": "Просмотреть EULA",
       "option-country-preset": "Загрузить пресет для региона ({country})",
       "option-country-preset-description": "Определено по локали ОС. Импортирует поставляемый пакет для вашего региона.",
@@ -1814,6 +1814,14 @@
     "traffic-history-merge-failed": "Не удалось сохранить ответ: "
   },
   "interfaces": {
+    "type": {
+      "ethernet": "Ethernet",
+      "wireless": "Wi-Fi",
+      "loopback": "Петлевой",
+      "tunnel": "Туннель",
+      "ppp": "Коммутируемое (PPP)",
+      "other": "Другой"
+    },
     "role-explanation": "Основной маршрут использует интерфейс по умолчанию; дополнительный маршрут нужен для альтернативного или резервного сценария.",
     "fail-closed": {
       "banner-title": "Активен режим Fail-Closed",
@@ -1950,6 +1958,26 @@
       "tooltip": "NetRuleRouter добавил это правило для сайта {site} {date}. Его можно отключить или удалить так же, как любое ваше правило."
     },
     "bundled-preset": {
+      "name": {
+        "abroad-access-to-ru": "За рубежом: доступ к российским сервисам",
+        "ae-uae-default-split": "ОАЭ: местное и зарубежное",
+        "bh-bahrain-default-split": "Бахрейн: местное и зарубежное",
+        "by-osnovnoy-i-zarubezh": "Беларусь: местное и зарубежное",
+        "cn-cn-mainland-split": "Китай: материковое и зарубежное",
+        "eg-egypt-default-split": "Египет: местное и зарубежное",
+        "id-indonesia-default-split": "Индонезия: местное и зарубежное",
+        "in-india-default-split": "Индия: местное и зарубежное",
+        "ir-iran-default-split": "Иран: местное и зарубежное",
+        "jp-japan-default-split": "Япония: местное и зарубежное",
+        "kw-kuwait-default-split": "Кувейт: местное и зарубежное",
+        "kz-kazakhstan-default-split": "Казахстан: местное и зарубежное",
+        "om-oman-default-split": "Оман: местное и зарубежное",
+        "qa-qatar-default-split": "Катар: местное и зарубежное",
+        "ru-osnovnoy-i-zarubezh": "Россия: местное и зарубежное",
+        "sa-saudi-default-split": "Саудовская Аравия: местное и зарубежное",
+        "tr-turkey-default-split": "Турция: местное и зарубежное",
+        "vn-vietnam-default-split": "Вьетнам: местное и зарубежное"
+      },
       "label": "Пресет из набора:",
       "user-label": "Мой набор правил:",
       "load": "Загрузить",

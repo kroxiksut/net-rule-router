@@ -52,6 +52,8 @@ RowLayout {
                 // re-visited category isn't rebuilt, and unvisited categories
                 // never cost anything.
 
+                // Synchronous while the window starts, like the sections: an
+                // asynchronous first load could stall with an empty pane.
                 // "Application" — the five basic-application groups stacked.
                 Loader {
                     Layout.fillWidth: true
@@ -59,7 +61,7 @@ RowLayout {
                     active: section.activeCategory === "application" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "application"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: ColumnLayout {
                         width: parent ? parent.width : implicitWidth
                         spacing: root.uiTheme.spacingMd
@@ -77,7 +79,7 @@ RowLayout {
                     active: section.activeCategory === "diagnostics" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "diagnostics"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: ColumnLayout {
                         width: parent ? parent.width : implicitWidth
                         spacing: root.uiTheme.spacingMd
@@ -91,7 +93,7 @@ RowLayout {
                     active: section.activeCategory === "traffic" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "traffic"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: TrafficStatsSettings {
                         root: section.root
                         Layout.fillWidth: true
@@ -104,7 +106,7 @@ RowLayout {
                     active: section.activeCategory === "routing" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "routing"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: RoutingSettings { root: section.root; Layout.fillWidth: true }
                 }
                 Loader {
@@ -113,7 +115,7 @@ RowLayout {
                     active: section.activeCategory === "service" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "service"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: ColumnLayout {
                         width: parent ? parent.width : implicitWidth
                         spacing: root.uiTheme.spacingMd
@@ -127,7 +129,7 @@ RowLayout {
                     active: section.activeCategory === "presets" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "presets"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: PresetSettings { root: section.root; Layout.fillWidth: true }
                 }
                 Loader {
@@ -136,7 +138,7 @@ RowLayout {
                     active: section.activeCategory === "experimental" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "experimental"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: ExperimentalSettings { root: section.root; Layout.fillWidth: true }
                 }
                 Loader {
@@ -145,7 +147,7 @@ RowLayout {
                     active: section.activeCategory === "updates" || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
                     visible: section.activeCategory === "updates"
-                    asynchronous: true
+                    asynchronous: root.sectionLoadsAsync
                     sourceComponent: UpdatesSettings { root: section.root; Layout.fillWidth: true }
                 }
 

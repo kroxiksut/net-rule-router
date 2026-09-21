@@ -1059,49 +1059,14 @@ pub enum CrashRecoveryOutcome {
     SkippedNoAudit,
 }
 
-/// Probes `RevisionsRepository::last_known_good` to feed
-/// `lkg_available` into [`run_crash_recovery_on_startup`]. Opens a
-/// short-lived connection, queries, drops. Returns `false` on any
-/// failure (file missing, lock contention, schema mismatch) — the
-/// conservative default that triggers `RequireManualAction` for
-/// recovery decisions that need an LKG.
-///
-/// The connection comes from `nrr_storage::open_connection`, not a raw
-/// `Connection::open`: without its `busy_timeout` a writer holding the lock
-/// for a moment returns `SQLITE_BUSY` immediately, this probe answers "no
-/// last-known-good", and recovery demands manual action over a database that
-/// is perfectly healthy.
-pub fn probe_lkg_available(state_db_path: &std::path::Path) -> bool {
-    if !state_db_path.exists() {
-        return false;
-    }
-    let conn = match nrr_storage::migration::open_connection(state_db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "nrr::crash-recovery",
-                error = %e,
-                "state DB could not be opened for the last-known-good probe; assuming none",
-            );
-            return false;
-        }
-    };
-    let repo = nrr_storage::revisions::RevisionsRepository::new(&conn);
-    matches!(repo.last_known_good(), Ok(Some(_)))
-}
-
 /// startup hook that reads the persisted apply
 /// marker (if any), runs the recovery decision, and executes it before
 /// the supervised runtime starts. Called from
 /// `nrr-windows-service` between bootstrap and `run_supervised_runtime`.
-///
-/// The caller wires `lkg_available` via [`probe_lkg_available`] at the
-/// call site.
 pub fn run_crash_recovery_on_startup(
     data_dir: &std::path::Path,
     audit_writer: Option<Arc<AuditWriter>>,
     ids: Arc<ProductionIdGenerator>,
-    lkg_available: bool,
 ) -> CrashRecoveryOutcome {
     let marker_store = ProductionApplyMarkerStore::new(data_dir);
 
@@ -1117,7 +1082,7 @@ pub fn run_crash_recovery_on_startup(
     let sink = ProductionRecoveryAuditSink::new(writer, ids);
     let coordinator = StartupRecoveryCoordinator::new(marker_store, sink);
     let state = coordinator.assess();
-    let decision = decide_recovery(&state, lkg_available, true);
+    let decision = decide_recovery(&state, true);
     match coordinator.execute(decision) {
         RecoveryExecutionResult::Recovered => CrashRecoveryOutcome::Clean,
         RecoveryExecutionResult::VerifiedAndCleared => CrashRecoveryOutcome::Recovered {
@@ -1414,7 +1379,6 @@ mod tests {
             dir.path(),
             None, // no audit writer is fine when there is no marker
             Arc::new(ProductionIdGenerator::new()),
-            false,
         );
         assert_eq!(outcome, CrashRecoveryOutcome::Clean);
     }
@@ -1433,12 +1397,8 @@ mod tests {
             correlation_id: "corr".into(),
         };
         store.write(&marker).expect("write");
-        let outcome = run_crash_recovery_on_startup(
-            dir.path(),
-            None,
-            Arc::new(ProductionIdGenerator::new()),
-            false,
-        );
+        let outcome =
+            run_crash_recovery_on_startup(dir.path(), None, Arc::new(ProductionIdGenerator::new()));
         assert_eq!(outcome, CrashRecoveryOutcome::SkippedNoAudit);
         // Marker stays in place — recovery did not run.
         assert!(store.read().is_some());

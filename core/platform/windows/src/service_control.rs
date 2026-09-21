@@ -358,7 +358,10 @@ impl ServiceControlPort for WindowsServiceControl {
                     ServiceStartType::OnDemand => Some(ServiceStartMode::OnAppLaunch),
                     _ => None,
                 },
-                Some(config.executable_path),
+                // SCM hands back the command line, quoted and with any arguments.
+                Some(nrr_platform_api::autostart::executable_of_command_line(
+                    &config.executable_path.to_string_lossy(),
+                )),
             ),
             Err(_) => (None, None),
         };

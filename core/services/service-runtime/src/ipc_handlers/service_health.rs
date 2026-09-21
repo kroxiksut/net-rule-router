@@ -47,12 +47,20 @@ pub fn severity_slug(severity: ServiceHealthSeverity) -> &'static str {
 /// available today. Reused by [`SnapshotInitialHandler`] so the
 /// composer's "health" sub-payload is byte-identical with what
 /// `ServiceHealthGet` would return.
+///
+/// `principal` is the caller's stored SID (empty for a caller the transport
+/// cannot name). The active revision is scoped to it: rules live per-SID, and
+/// the baseline-only answer told every user with their own rules applied that
+/// nothing was being applied at all.
 pub fn build_service_health_response(
     health: &dyn HealthReporter,
     policy: &dyn PolicyManager,
     fake_ip_datapath: Option<&FakeIpDatapathProbe>,
+    principal: &str,
 ) -> ServiceHealthResponse {
-    let active_revision_id = policy.current_revision().map(|r| r.revision_id);
+    let active_revision_id = policy
+        .current_revision_for(principal)
+        .map(|r| r.revision_id);
     ServiceHealthResponse {
         service_state: service_state_slug(health.current_state()).into(),
         worst_severity: severity_slug(health.worst_severity()).into(),
@@ -111,7 +119,7 @@ impl ServiceHealthHandler {
 }
 
 impl IpcHandler for ServiceHealthHandler {
-    fn handle(&self, request: &IpcRequestEnvelope, _ctx: &IpcRequestContext) -> HandlerOutcome {
+    fn handle(&self, request: &IpcRequestEnvelope, ctx: &IpcRequestContext) -> HandlerOutcome {
         // Allow `null` and `{}` interchangeably so very-early clients
         // that ship an empty payload don't get a confusing 400.
         if !request.payload.is_null() {
@@ -127,6 +135,7 @@ impl IpcHandler for ServiceHealthHandler {
             self.health.as_ref(),
             self.policy.as_ref(),
             self.fake_ip_datapath.as_ref(),
+            ctx.caller_stored(),
         );
         serde_json::to_value(resp).map_err(|e| IpcError {
             code: IpcErrorCode::Internal,
@@ -194,6 +203,54 @@ mod tests {
         assert!(parsed.degraded_modes.is_empty());
         // No probe wired -> the field is omitted, not fabricated.
         assert!(parsed.fake_ip_datapath.is_none());
+    }
+
+    /// Rules live per-SID: a user whose own revision is active must not be told
+    /// that nothing is applied just because the shared baseline is empty. That
+    /// wrong answer reached the tray icon and its menu header.
+    #[test]
+    fn active_revision_is_scoped_to_the_calling_principal() {
+        use nrr_domain::user_principal::UserPrincipal;
+
+        struct PerSidPolicy;
+        impl PolicyManager for PerSidPolicy {
+            fn load_active(&self) -> crate::state::ServicePolicyState {
+                crate::state::ServicePolicyState::NoState
+            }
+            // The baseline has nothing active.
+            fn current_revision(&self) -> Option<ActiveRevisionState> {
+                None
+            }
+            fn current_revision_for(&self, principal: &str) -> Option<ActiveRevisionState> {
+                (!principal.is_empty()).then(|| ActiveRevisionState {
+                    revision_id: "rev-own".into(),
+                    provenance: "gui-rules-edit".into(),
+                    rule_count: 0,
+                    behavior_mode: String::new(),
+                    content_hash_hex: "hash".into(),
+                    activated_at_iso: String::new(),
+                })
+            }
+        }
+
+        let handler = ServiceHealthHandler::new(
+            Arc::new(FakeHealth {
+                state: ServiceRuntimeState::Running,
+                severity: ServiceHealthSeverity::Ok,
+            }),
+            Arc::new(PerSidPolicy),
+        );
+
+        let mut named = ctx();
+        named.caller_principal = UserPrincipal::from_windows_sid("S-1-5-21-1-2-3-1001").ok();
+        let resp = handler.handle(&req(serde_json::json!({})), &named).unwrap();
+        let parsed: ServiceHealthResponse = serde_json::from_value(resp).unwrap();
+        assert_eq!(parsed.active_revision_id.as_deref(), Some("rev-own"));
+
+        // A caller the transport cannot name still gets the baseline answer.
+        let resp = handler.handle(&req(serde_json::json!({})), &ctx()).unwrap();
+        let parsed: ServiceHealthResponse = serde_json::from_value(resp).unwrap();
+        assert!(parsed.active_revision_id.is_none());
     }
 
     /// A "degraded" answer that cannot say WHICH component is degraded leaves
