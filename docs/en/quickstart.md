@@ -29,6 +29,9 @@ client, proxy, or anonymity tool.
 3. Run `NetRuleRouter.exe`. At first launch the app will show the
    [end-user license agreement](../legal/eula.en.md) — read and accept
    it to continue.
+
+   ![The licence agreement, shown once at first launch](images/first-run-eula.png)
+
 4. Install the background service. The welcome window offers it right
    away — **"Install and start the service"**; confirm the UAC prompt for
    administrator rights. The same actions live in **Settings → Service
@@ -38,23 +41,39 @@ client, proxy, or anonymity tool.
 Without the service, the app runs in limited mode: you can edit rules, but
 routing does not apply.
 
+![The welcome window offers to install the background service right away](images/service-install.png)
+
 ## First setup
 
 1. **Pick a starting rule set.** Right after the service dialog, the
    first-run wizard offers four options: a country preset, a built-in
    demo set, two `.txt` files of your own, or an empty start. Whatever
    you pick lands in the rules for review before anything is applied.
+
+   ![First-run setup: name your two connections and pick the protection you want](images/first-run-wizard.png)
+
+   ![First-run setup: where your first rules come from](images/first-run-rules.png)
+
 2. **Choose two routes.** On the *Interfaces & routes* screen, specify
    which network adapter is the *main* (primary) one and which is the
    *additional* (secondary, for example VPN). Both can be given custom
    names — they will be visible in the rules.
+
+   ![Interfaces & routes: the main and the additional adapter](images/interfaces-routes.png)
+
 3. **Choose default behavior** — where does traffic that doesn't match any
    rule go: the main or additional route.
+
+   ![Routing behavior: where traffic that no rule covers goes](images/routing-behavior.png)
+
 4. **Save the set as your own.** Settings → *Presets & settings* → *My rule
    sets*: point it at a folder of your own, then *"Save current rules as a
    set"* and give it a name. Rule sets left in the application folder are
    replaced by the next update; a set in your own folder survives it, and
    you can keep several — "home", "work" — and switch between them.
+
+   ![Presets and settings: your own rule sets live in a folder you choose](images/presets-settings.png)
+
 5. **Add your own sites and apply** — see the next section.
 
 ## Rules: how it works
@@ -74,6 +93,8 @@ Rules are applied from specific to general: an exact domain beats
 subdomains, subdomains beat zones. A rule can combine address **and**
 application — then both conditions must match.
 
+![Rules: each rule names what it matches and which route it takes](images/rules.png)
+
 ### Add your own sites — a one-time step
 
 The service routes exactly what the rules say and nothing else. Sites that
@@ -89,9 +110,17 @@ the VPN and add them yourself, either way round:
 - or straight in `rules_secondary.txt` inside your rule-set folder, one
   entry per line, then reload the set in the app.
 
+![Adding a rule: what it matches, which route it takes, and what the match covers](images/rule-add.png)
+
 Then press **Apply**: rules only take effect after applying. You do this
 once — from then on the list travels with your rule set, including across
 reinstalls.
+
+Apply never surprises you: the app first shows what the service is about to
+receive — every rule added, changed or removed — and waits for your
+confirmation.
+
+![Review before applying: the full list of changes, waiting for your confirmation](images/review-changes.png)
 
 ### Application rules need a restart of the program
 
@@ -113,10 +142,14 @@ need, and offers to add them. A host that already answers over your main
 connection is **not** raised in the tray: it works without the additional
 route, and interrupting you about it would be noise.
 
+![A suggestion in the tray: the addresses a site you route actually needs](images/tray-suggestion.png)
+
 It is still in the suggestions list, marked as reachable on the main
 connection. Answering is not the same as serving — some sites answer a
 main-connection address with a refusal — so the decision stays yours: open the
 list and add it if the site is not actually working for you.
+
+![Suggested addresses: the whole list, with the site each address belongs to](images/suggested-addresses.png)
 
 ### If you have no additional connection
 
@@ -132,6 +165,12 @@ main channel**, turn on emergency blocking (kill switch) — but read the
 warning at the beginning of this document: in pre-alpha that mode is
 enabled at your own risk.
 
+If you do use a VPN, tell the app which program it is — its client keeps
+working over your main link while leak protection is on, instead of being cut
+off with everything else.
+
+![Point the app at your VPN client so it keeps working while protection is on](images/vpn-client.png)
+
 ### Ready-made presets
 
 The `presets/` folder contains ready-made rule sets — including
@@ -144,6 +183,38 @@ route*. Either way the app shows what changes before anything is applied.
 Import a set and adapt it to yourself: presets are a starting point, not
 the final truth.
 
+## Settings and appearance
+
+Settings → *Application* holds how the app behaves (the tray icon at sign-in,
+minimizing to the tray, tray notifications), the theme, accessibility options
+and the interface language — Russian or English.
+
+![Settings → Application](images/settings.png)
+
+The theme follows the system or can be set to light or dark; for low vision
+there is a dedicated high-contrast theme.
+
+![Dark theme](images/theme-dark.png)
+
+![High-contrast theme](images/theme-high-contrast.png)
+
+Settings → *Logs and diagnostics* decides how much the service records and how
+long it keeps it — the default keeps enough for a bug report without filling
+your disk.
+
+![Logs and diagnostics: how much is recorded and how long it is kept](images/settings-logs.png)
+
+Settings → *Traffic statistics* answers the question a second connection always
+raises: how much actually went through it, and how much went the usual way.
+
+![Traffic statistics: the additional adapter against the main one](images/settings-traffic.png)
+
+Most of the day you will not have the window open at all. The tray icon says
+whether your rules are being applied, and its menu holds the actions you need
+most — including turning the rules off for a moment.
+
+![The tray menu: the current state and the actions you reach for most](images/tray-menu.png)
+
 ## Check that it works
 
 1. Add a rule for some site to the additional route.
@@ -153,12 +224,20 @@ the final truth.
 4. In the "Diagnostics" section you can ask the app *why* a particular
    host went to a particular route — it will show the rule that fired.
 
+![Diagnostics: service state, diagnostic archive, audit trail](images/diagnostics.png)
+
 ## If something is not working
 
 1. Check that the service is running: **Settings → Service management** —
    the status should be "Running" (from a terminal: `nrr-cli status`).
+
+   ![Service management: state, start-up mode and the install / remove actions](images/service-management.png)
+
 2. Look in the "Diagnostics" section — you can see applied rules and
-   errors there.
+   errors there. "Logs" lists what the service did, newest first.
+
+   ![Logs: the service's own record, filterable by period, level and category](images/logs.png)
+
 3. Ask the console for a verdict: `nrr-cli diag doctor` checks the service
    and its data from outside the app and reports what it found.
 4. That did not help — collect a diagnostic archive ("Diagnostics" section

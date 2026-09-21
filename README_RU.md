@@ -16,6 +16,8 @@ Wi-Fi, Ethernet. Без собственного туннеля, без обла
 ![Platform: Windows, Linux в работе](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
 
+<img src="docs/ru/images/rules.png" alt="«Правила»: у каждого правила — что под него попадает и через какой маршрут" width="900" />
+
 [English version → README.md](README.md)
 
 </div>

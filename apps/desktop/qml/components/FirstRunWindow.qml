@@ -422,7 +422,7 @@ Window {
                 wrapMode: Text.WordWrap
                 color: root.mutedTextColor
                 text: root.tr("dialog.first-run-wizard.description",
-                    "Choose how to populate your initial rule set. You can always change this later via the Rules toolbar or Settings → Presets.")
+                    "Choose how to populate your initial rule set. You can change it later from the Rules toolbar or in Settings → Presets and settings.")
             }
 
             // Re-open the same read-only license agreement the user accepted

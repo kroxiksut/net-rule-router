@@ -25,7 +25,36 @@ Dialog {
     modal: false
     palette: root.palette
     title: root.editingRule >= 0 ? root.tr("dialog.rule.edit", "Edit") : root.tr("dialog.rule.add", "Add")
-    standardButtons: Dialog.Ok | Dialog.Cancel
+    // Own buttons, not Dialog.Ok|Cancel: Qt's standard set carries Qt's own
+    // translations, so a Russian UI showed English "OK" / "Cancel".
+    standardButtons: Dialog.NoButton
+    // The buttons belong to the footer, not to the content column: content
+    // anchored to fill its parent adds nothing to the dialog's implicit
+    // height, so a button row placed there hangs below the dialog's edge.
+    footer: Item {
+        implicitHeight: buttonRow.implicitHeight + 2 * root.uiTheme.spacingMd
+        RowLayout {
+            id: buttonRow
+            anchors.fill: parent
+            anchors.margins: root.uiTheme.spacingMd
+            spacing: root.uiTheme.spacingSm
+            Item { Layout.fillWidth: true }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("action.ok", "OK")
+                // App rules ARE saveable now — they route the app's observed
+                // destinations via the secondary (app-routing via observation).
+                enabled: ruleDialog.isMatchValueValid(ruleDialog.localRuleType,
+                    ruleDialog.localValue)
+                onClicked: ruleDialog.accept()
+            }
+            ThemedButton {
+                theme: root.uiTheme
+                text: root.tr("action.cancel", "Cancel")
+                onClicked: ruleDialog.reject()
+            }
+        }
+    }
     // Local fields are reset imperatively from `resetForEdit()` each time
     // the dialog is opened. We deliberately don't use declarative bindings
     // to `rulesModel.get(editingRule)` because the user's edits assign to
@@ -314,20 +343,6 @@ Dialog {
             return
         }
         root.saveRule()
-    }
-    // Bind the OK button's enabled state to per-type validation. The
-    // standardButton lookup is done once on creation; the binding
-    // itself reacts to localRuleType / localValue changes thereafter.
-    Component.onCompleted: {
-        var okBtn = ruleDialog.standardButton(Dialog.Ok)
-        if (okBtn) {
-            okBtn.enabled = Qt.binding(function() {
-                // App rules ARE saveable now — they route the app's observed
-                // destinations via the secondary (app-routing via observation).
-                return ruleDialog.isMatchValueValid(ruleDialog.localRuleType,
-                    ruleDialog.localValue)
-            })
-        }
     }
     ColumnLayout {
         anchors.fill: parent

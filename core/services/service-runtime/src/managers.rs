@@ -78,8 +78,16 @@ pub trait PolicyManager: Send + Sync {
     /// Load the active revision (or fall back to LKG, or report
     /// `RecoveryRequired`). Pure read — no apply attempt yet.
     fn load_active(&self) -> ServicePolicyState;
-    /// Snapshot of the currently-loaded revision, if any.
+    /// Snapshot of the baseline's currently-loaded revision, if any.
     fn current_revision(&self) -> Option<ActiveRevisionState>;
+
+    /// Snapshot of what ONE principal has active — its own revision, or the
+    /// baseline it still inherits. The unscoped answer names the baseline
+    /// only, so a user whose own rules are applied reads as "nothing applied".
+    /// Default forwards for mocks that keep no per-principal state.
+    fn current_revision_for(&self, _principal: &str) -> Option<ActiveRevisionState> {
+        self.current_revision()
+    }
 
     /// Pending / superseded revision summaries surfaced
     /// in `SnapshotInitialResponse.pending_revisions`, for ONE principal.

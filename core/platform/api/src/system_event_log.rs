@@ -37,7 +37,9 @@ pub struct SystemEventRecord {
 pub trait SystemEventLogPort: Send + Sync {
     fn write(&self, record: &SystemEventRecord);
 
-    /// When THIS boot asked the user to sign in, as Unix milliseconds.
+    /// When the host last asked the user to sign in, as Unix milliseconds — the
+    /// newest record, as stamped; whether it belongs to this boot is the
+    /// caller's call against [`Self::boot_started_at_ms`].
     ///
     /// The product is regularly suspected of slowing down boot, and the honest
     /// answer is a comparison: the service either started before that moment or
@@ -49,6 +51,12 @@ pub trait SystemEventLogPort: Send + Sync {
     /// Defaulted so a backend that has no such record — and every test double —
     /// stays honest without writing a stub that lies.
     fn sign_in_prompt_at_ms(&self) -> Option<u64> {
+        None
+    }
+
+    /// When the current boot began, as Unix milliseconds on the same clock —
+    /// what tells a prompt from this boot apart from an earlier or mis-stamped one.
+    fn boot_started_at_ms(&self) -> Option<u64> {
         None
     }
 }

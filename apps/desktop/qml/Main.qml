@@ -39,6 +39,9 @@ ApplicationWindow {
     }
     property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
+    // The section open at launch loads synchronously: an asynchronous first
+    // load could stall with an empty pane until the user clicked something.
+    property bool sectionLoadsAsync: false
     property string statusLine: ""
     /// Long form of the current status message, shown on hover. The footer is
     /// a single row shared with buttons, so a sentence-long status pushed them
@@ -4973,6 +4976,7 @@ ApplicationWindow {
 
     Component.onCompleted: {
         loadContext()
+        Qt.callLater(function() { sectionLoadsAsync = true })
         logProgress(tr("progress.gui-started", "NetRuleRouter started."), "info")
         // Register the rules-section
         // save callback at window scope so the UnsavedChangesGuard offers an
@@ -6166,7 +6170,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { InterfacesRoutesSection { root: window } }
                 }
@@ -6177,7 +6181,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { RulesSection { root: window } }
                     // Pre-warm: compile RulesSection in
@@ -6196,7 +6200,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { RuleSuggestionsSection { root: window } }
                 }
@@ -6204,7 +6208,7 @@ ApplicationWindow {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     active: StackLayout.isCurrentItem
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { VirtualMachinesSection { root: window } }
                 }
@@ -6214,7 +6218,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { DiagnosticsSection { root: window } }
                 }
@@ -6224,7 +6228,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { LogsSection { root: window } }
                 }
@@ -6234,7 +6238,7 @@ ApplicationWindow {
                     property bool keepLoaded: false
                     active: StackLayout.isCurrentItem || keepLoaded
                     onActiveChanged: if (active) keepLoaded = true
-                    asynchronous: true
+                    asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { SettingsSection { root: window } }
                 }

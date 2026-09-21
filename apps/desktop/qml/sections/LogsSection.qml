@@ -284,6 +284,9 @@ ColumnLayout {
     Component.onCompleted: {
         _seedFromSnapshot()
         _fetchVerboseLogging()
+        // Opened at launch, the section is visible from birth and never sees
+        // a visibility change; next tick, so the window's RPC wiring is in place.
+        if (visible) Qt.callLater(_loadIfEmpty)
     }
 
     // The launch snapshot no longer carries the first page: fetching logs and
@@ -291,10 +294,21 @@ ColumnLayout {
     // slow service and bought nothing, because this screen is opened, not
     // watched. Load on show instead — and only when there is nothing yet, so
     // coming back to the tab does not throw away what the user was reading.
-    onVisibleChanged: {
-        if (!visible) return
+    onVisibleChanged: if (visible) _loadIfEmpty()
+
+    function _loadIfEmpty() {
         if (_logEntries.length === 0) _refreshLogs()
         if (_auditEntries.length === 0) _refreshAudit()
+    }
+
+    // Wide enough for the timestamp as rendered (the zone suffix included) in
+    // the current font; a fixed width let the suffix run into the next column.
+    readonly property real timeColumnWidth:
+        Math.max(170, Math.ceil(timeSample.implicitWidth) + root.uiTheme.spacingSm)
+    Label {
+        id: timeSample
+        visible: false
+        text: section.formatCreatedAt(Date.UTC(2000, 11, 28, 20, 58, 58))
     }
 
     function formatCreatedAt(ms) {
@@ -405,7 +419,9 @@ ColumnLayout {
         }
     }
 
-    // D2: Filter bar (only applies to operational)
+    // D2: Filter bar (only applies to operational). Every field fills and has a
+    // floor: a non-filling item is pinned at its preferred width, and the sum of
+    // those overran the section at 1280 px, pushing the row past its edge.
     RowLayout {
         Layout.fillWidth: true
         visible: activeTab === "operational"
@@ -414,7 +430,10 @@ ColumnLayout {
         ThemedComboBox {
             id: rangeCombo
             theme: root.uiTheme
+            Layout.fillWidth: true
+            Layout.minimumWidth: 110
             Layout.preferredWidth: 180
+            Layout.maximumWidth: 180
             model: [ "current-session", "all" ]
             currentIndex: 0
             function rangeLabel(id) {
@@ -431,7 +450,10 @@ ColumnLayout {
         ThemedComboBox {
             id: levelCombo
             theme: root.uiTheme
+            Layout.fillWidth: true
+            Layout.minimumWidth: 100
             Layout.preferredWidth: 160
+            Layout.maximumWidth: 160
             model: [ "all", "info", "warn", "error" ]
             currentIndex: 0
             function levelLabel(id) {
@@ -447,7 +469,10 @@ ColumnLayout {
         Label { text: root.tr("diag.logs.filter-category", "Category"); color: root.textColor }
         ThemedTextField {
             theme: root.uiTheme
+            Layout.fillWidth: true
+            Layout.minimumWidth: 90
             Layout.preferredWidth: 160
+            Layout.maximumWidth: 160
             placeholderText: root.tr("diag.logs.filter-category", "Category")
             onEditingFinished: section.filterCategory = text.trim()
         }
@@ -455,7 +480,7 @@ ColumnLayout {
         ThemedTextField {
             theme: root.uiTheme
             Layout.fillWidth: true
-            Layout.minimumWidth: 220
+            Layout.minimumWidth: 110
             Layout.preferredWidth: 260
             placeholderText: root.tr("diag.logs.filter-kind", "Event type")
             onEditingFinished: section.filterKind = text.trim()
@@ -660,7 +685,7 @@ ColumnLayout {
             anchors.fill: parent
             spacing: root.uiTheme.spacingSm
             Label {
-                Layout.preferredWidth: 170
+                Layout.preferredWidth: section.timeColumnWidth
                 text: root.tr("logs.column.time", "Time") + section.logSortArrow("by-time")
                 color: section.logSortBy === "by-time" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
@@ -772,7 +797,7 @@ ColumnLayout {
                 anchors.fill: parent
                 spacing: root.uiTheme.spacingSm
                 Label {
-                    Layout.preferredWidth: 170
+                    Layout.preferredWidth: section.timeColumnWidth
                     text: formatCreatedAt(modelData.createdAt)
                     color: root.mutedTextColor
                 }
@@ -862,7 +887,7 @@ ColumnLayout {
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: section.setAuditSort("by-seq") }
             }
             Label {
-                Layout.preferredWidth: 170
+                Layout.preferredWidth: section.timeColumnWidth
                 text: root.tr("logs.column.time", "Time") + section.auditSortArrow("by-time")
                 color: section.auditSortBy === "by-time" ? root.uiTheme.colorAccent : root.textColor
                 font.bold: true
@@ -962,7 +987,7 @@ ColumnLayout {
                     color: root.mutedTextColor
                 }
                 Label {
-                    Layout.preferredWidth: 170
+                    Layout.preferredWidth: section.timeColumnWidth
                     text: formatCreatedAt(modelData.createdAt)
                     color: root.mutedTextColor
                 }

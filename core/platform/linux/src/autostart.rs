@@ -22,7 +22,7 @@
 //! The port is a dumb key/value store over a file: `write_value` embeds the
 //! helper-supplied string verbatim in `Exec=`, `read_value` returns that same
 //! string. All quoting/parsing of the binary path stays in the neutral
-//! `AutostartHelper` (`format_registry_value` / `parse_registry_value`), so
+//! `AutostartHelper` (`format_registry_value` / `executable_of_command_line`), so
 //! this impl never second-guesses the coordinator.
 //!
 //! ## Testability

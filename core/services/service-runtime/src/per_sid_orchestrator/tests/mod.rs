@@ -58,7 +58,6 @@ impl ScriptedRules {
     fn set(&self, snap: ActiveRulesSnapshot) {
         *self.snapshot.lock().unwrap() = Some(snap);
     }
-    #[allow(dead_code)]
     fn clear(&self) {
         *self.snapshot.lock().unwrap() = None;
     }

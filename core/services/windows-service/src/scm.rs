@@ -323,17 +323,14 @@ fn run_scm_inner(refused: Option<String>) -> Result<(), ScmError> {
     }
 
     // Crash recovery hook (mirrors console mode).
-    let lkg_available = nrr_service_runtime::probe_lkg_available(&artifacts.topology.state_db_path);
     let recovery_outcome = nrr_service_runtime::run_crash_recovery_on_startup(
         &artifacts.topology.data_dir,
         artifacts.audit_writer.clone(),
         std::sync::Arc::new(nrr_service_runtime::ProductionIdGenerator::new()),
-        lkg_available,
     );
     tracing::info!(
         target: "nrr::recovery",
         outcome = ?recovery_outcome,
-        lkg_available,
         "crash recovery probe complete",
     );
     let mut artifacts = artifacts;

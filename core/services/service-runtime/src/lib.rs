@@ -272,9 +272,9 @@ pub use verbosity_control::VerbosityControl;
 
 // Production ActivationCoordinator stack.
 pub use production_coordinator::{
-    probe_lkg_available, run_crash_recovery_on_startup, CrashRecoveryOutcome,
-    NoopRulesApplyDispatcher, ProductionActivationAuditEmitter, ProductionApplyMarkerStore,
-    ProductionIdGenerator, ProductionRecoveryAuditSink, ProductionRulesApplyDispatcher,
+    run_crash_recovery_on_startup, CrashRecoveryOutcome, NoopRulesApplyDispatcher,
+    ProductionActivationAuditEmitter, ProductionApplyMarkerStore, ProductionIdGenerator,
+    ProductionRecoveryAuditSink, ProductionRulesApplyDispatcher,
 };
 pub use production_diagnostics::{DiagnosticSessionHandle, ProductionDiagnosticsFacade};
 pub use production_handlers_misc::{

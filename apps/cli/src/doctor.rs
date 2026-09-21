@@ -588,12 +588,19 @@ fn inspect_directory(path: Option<PathBuf>) -> DirectoryFact {
             state: DirectoryState::Undefined,
         };
     };
-    let state = if !path.is_dir() {
-        DirectoryState::Missing
-    } else if std::fs::read_dir(&path).is_ok() {
-        DirectoryState::Listable
-    } else {
-        DirectoryState::Present
+    // `is_dir` answers `false` on a refused stat too, which read as "missing"
+    // for a directory only the service account may open.
+    let state = match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => {
+            if std::fs::read_dir(&path).is_ok() {
+                DirectoryState::Listable
+            } else {
+                DirectoryState::Present
+            }
+        }
+        Ok(_) => DirectoryState::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirectoryState::Missing,
+        Err(_) => DirectoryState::Present,
     };
     DirectoryFact {
         path: Some(path),

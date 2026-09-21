@@ -106,7 +106,7 @@ impl<P: AutostartRegistryPort> AutostartHelper<P> {
             Some(s) if s.trim().is_empty() => return Ok(AutostartCurrentState::Disabled),
             Some(s) => s,
         };
-        let parsed = parse_registry_value(&raw);
+        let parsed = executable_of_command_line(&raw);
         if paths_match(&parsed, our_binary_path) {
             Ok(AutostartCurrentState::Enabled {
                 binary_path: parsed,
@@ -133,9 +133,10 @@ fn format_registry_value(target: &Path) -> Result<String, AutostartError> {
     Ok(format!("\"{s}\""))
 }
 
-/// Strips surrounding quotes and any trailing argument tokens. Returns
-/// the bare path component as a `PathBuf`.
-pub(crate) fn parse_registry_value(raw: &str) -> PathBuf {
+/// The executable a registered command line launches: surrounding quotes and
+/// any trailing arguments stripped. Service managers and launch-at-login stores
+/// both hand back the command line, not the path.
+pub fn executable_of_command_line(raw: &str) -> PathBuf {
     let trimmed = raw.trim();
     // Two cases: quoted (`"path with space" args...`) or bare (`path
     // args...`). For bare, splitting on whitespace is good enough —
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn parse_quoted_value_strips_outer_quotes() {
         assert_eq!(
-            parse_registry_value(r#""C:\path\binary.exe""#),
+            executable_of_command_line(r#""C:\path\binary.exe""#),
             PathBuf::from(r"C:\path\binary.exe"),
         );
     }
@@ -269,7 +270,7 @@ mod tests {
     #[test]
     fn parse_quoted_value_with_args_keeps_only_the_path() {
         assert_eq!(
-            parse_registry_value(r#""C:\path\binary.exe" --arg=value"#),
+            executable_of_command_line(r#""C:\path\binary.exe" --arg=value"#),
             PathBuf::from(r"C:\path\binary.exe"),
         );
     }
@@ -277,7 +278,7 @@ mod tests {
     #[test]
     fn parse_unquoted_value_picks_first_token() {
         assert_eq!(
-            parse_registry_value(r"C:\bin.exe --foo"),
+            executable_of_command_line(r"C:\bin.exe --foo"),
             PathBuf::from(r"C:\bin.exe"),
         );
     }

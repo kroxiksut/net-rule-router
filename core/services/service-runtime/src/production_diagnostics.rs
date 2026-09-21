@@ -226,11 +226,12 @@ impl ProductionDiagnosticsFacade {
 
     /// Where this service's start sits relative to the boot's sign-in phase.
     fn start_relative_to_sign_in(&self) -> nrr_domain::boot_timing::ServiceStartRelativeToSignIn {
-        let prompt = self
-            .system_event_log
-            .as_ref()
-            .and_then(|log| log.sign_in_prompt_at_ms());
-        nrr_domain::boot_timing::service_start_relative_to_sign_in(prompt, self.started_at_ms)
+        let log = self.system_event_log.as_ref();
+        nrr_domain::boot_timing::service_start_relative_to_sign_in(
+            log.and_then(|log| log.boot_started_at_ms()),
+            log.and_then(|log| log.sign_in_prompt_at_ms()),
+            self.started_at_ms,
+        )
     }
 
     /// Attach the installed log writer so the health card can report events

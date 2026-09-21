@@ -205,6 +205,10 @@ fn list_audit_entries_pages_and_emits_cursor() {
     assert_eq!(page1.items.len(), 2);
     assert!(page1.next_cursor.is_some());
     assert_eq!(page1.total_count, Some(5));
+    assert!(
+        page1.items[0].created_at >= page1.items[1].created_at,
+        "audit pages newest-first"
+    );
 
     let p2 = PaginationParams {
         cursor: page1.next_cursor.clone(),
@@ -228,6 +232,41 @@ fn list_audit_entries_pages_and_emits_cursor() {
         page3.next_cursor.is_none(),
         "last page must terminate cursor"
     );
+}
+
+/// The Logs view opens on the first page, so that page is the latest activity
+/// and "load more" walks back in time.
+#[test]
+fn list_log_entries_pages_newest_first_without_gaps() {
+    let dir = TempDir::new().expect("tempdir");
+    let audit_dir = dir.path().join("audit");
+    let logs_dir = dir.path().join("logs");
+    std::fs::create_dir_all(&audit_dir).unwrap();
+    std::fs::create_dir_all(&logs_dir).unwrap();
+    write_log_events(&logs_dir, 7);
+    let facade = make_facade(&audit_dir, &logs_dir);
+
+    let mut ids = Vec::new();
+    let mut cursor = None;
+    for _ in 0..10 {
+        let page = facade
+            .list_log_entries(
+                &LogEntryFilter::default(),
+                &PaginationParams {
+                    cursor: cursor.clone(),
+                    page_size: 3,
+                },
+                &DiagnosticsAudience::Machine,
+            )
+            .unwrap();
+        ids.extend(page.items.into_iter().map(|e| e.event_id));
+        match page.next_cursor {
+            Some(c) => cursor = Some(c),
+            None => break,
+        }
+    }
+    let expected: Vec<String> = (1..=7).rev().map(|i| format!("evt-{i:04}")).collect();
+    assert_eq!(ids, expected);
 }
 
 #[test]
@@ -675,6 +714,7 @@ fn paging_delivers_every_line_when_ids_are_unique() {
     // Same millisecond, distinct ids — exactly what the tracing layer now
     // produces, and what the cursor needs to page without losses.
     let items: Vec<LogEntryDto> = (0..5)
+        .rev()
         .map(|n| log_entry(1_000, &format!("evt-{n}")))
         .collect();
 

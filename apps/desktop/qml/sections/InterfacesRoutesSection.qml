@@ -873,7 +873,8 @@ ColumnLayout {
                         Label {
                             Layout.fillWidth: true
                             text: root.tr("interfaces.row.summary", "Type: %1 | IP: %2 | Gateway: %3")
-                                .arg(model.type).arg(model.ip).arg(model.gateway)
+                                .arg(root.tr("interfaces.type." + String(model.type).toLowerCase(), model.type))
+                                .arg(model.ip).arg(model.gateway)
                             color: root.textColor
                             wrapMode: Text.WordWrap
                         }

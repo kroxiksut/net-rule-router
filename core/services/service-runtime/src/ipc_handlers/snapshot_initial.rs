@@ -111,6 +111,7 @@ impl IpcHandler for SnapshotInitialHandler {
             self.health.as_ref(),
             self.policy.as_ref(),
             self.fake_ip_datapath.as_ref(),
+            ctx.caller_stored(),
         );
         let adapters = self.adapters.adapters_snapshot(false);
         let diag_status = self.diagnostics.get_status();

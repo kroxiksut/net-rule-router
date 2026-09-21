@@ -16,6 +16,8 @@ Windows builds today; Linux is in progress, macOS next.
 ![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
 
+<img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
+
 [Russian version → README_RU.md](README_RU.md)
 
 </div>

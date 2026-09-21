@@ -38,8 +38,10 @@ Dialog {
         : (root.readOnly ? "Preview pending changes" : "Review changes")
 
     modal: true
-    width: 900
-    height: 640
+    // Capped by the window: at 1280x720 the fixed 640 pushed the Apply
+    // button below the window edge, out of reach.
+    width: Math.min(900, parent ? parent.width - 24 : 900)
+    height: Math.min(640, parent ? parent.height - 24 : 640)
     standardButtons: Dialog.NoButton
     closePolicy: Popup.NoAutoClose
     // Render inside the main window's overlay instead of a separate
@@ -210,6 +212,13 @@ Dialog {
     // open so keyboard activation can't fire "Approve and activate"
     // by accidental Enter-press. The user must explicitly tab to
     // the destructive action.
+    // Centred here rather than anchored: the drag header moves `x`/`y`.
+    onAboutToShow: {
+        if (parent) {
+            x = Math.max(0, (parent.width - width) / 2)
+            y = Math.max(0, (parent.height - height) / 2)
+        }
+    }
     onOpened: {
         _understandChecked = false
         if (cancelButton) cancelButton.forceActiveFocus()

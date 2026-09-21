@@ -40,7 +40,8 @@ pub trait DiagnosticsFacade: Send + Sync {
     /// Returns the top-level health and status overview.
     fn get_status(&self) -> DiagnosticsStatusDto;
 
-    /// Returns a paginated list of operational log entries.
+    /// Returns a paginated list of operational log entries, newest-first: the
+    /// first page is the latest activity and each next page reaches further back.
     /// `audience` decides whose lines come back — see
     /// [`Self::list_audit_entries`]. A principal-scoped read returns the
     /// caller's own lines plus the machine-level ones that belong to nobody
@@ -57,12 +58,12 @@ pub trait DiagnosticsFacade: Send + Sync {
     /// diagnostic archive: unlike [`list_log_entries`] it is NOT bound by the
     /// wire [`MAX_PAGE_SIZE`] cap and deliberately selects the freshest
     /// entries (the archive builder then trims them to its byte budget).
-    /// Selecting newest-first matters: a single oldest-first page would ship
-    /// the STALEST lines and waste the byte budget.
+    /// Selecting newest-first matters: the stalest lines would waste the byte
+    /// budget.
     ///
-    /// The default implementation pages through the oldest-first listing and
-    /// keeps the newest `max_entries`; storage-backed impls should override it
-    /// with a single scan for efficiency.
+    /// The default implementation reads newest-first pages until it has
+    /// `max_entries`; storage-backed impls should override it with a single
+    /// scan for efficiency.
     ///
     /// [`list_log_entries`]: Self::list_log_entries
     /// [`MAX_PAGE_SIZE`]: crate::facade::pagination::MAX_PAGE_SIZE
@@ -75,15 +76,11 @@ pub trait DiagnosticsFacade: Send + Sync {
         if max_entries == 0 {
             return Ok(Vec::new());
         }
-        // Page through the ascending (oldest-first) listing to the END, keeping
-        // only the newest `max_entries` seen. Capping the page count bounded the
-        // walk by how many entries were ASKED FOR, so a store holding more than
-        // that returned its oldest window — the exact opposite of what this
-        // method promises. The spin guard is a cursor that stops advancing,
-        // which is the only way a well-behaved store can fail to terminate.
+        // The spin guard is a cursor that stops advancing, the only way a
+        // well-behaved store can fail to terminate.
         let mut acc: Vec<LogEntryDto> = Vec::new();
         let mut cursor: Option<PageCursor> = None;
-        loop {
+        while acc.len() < max_entries {
             let page = self.list_log_entries(
                 filter,
                 &PaginationParams {
@@ -92,22 +89,17 @@ pub trait DiagnosticsFacade: Send + Sync {
                 },
                 audience,
             )?;
-            let next = page.next_cursor;
             acc.extend(page.items);
-            if acc.len() > max_entries {
-                let overflow = acc.len() - max_entries;
-                acc.drain(0..overflow);
-            }
-            match next {
+            match page.next_cursor {
                 Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
                 _ => break,
             }
         }
-        acc.reverse();
+        acc.truncate(max_entries);
         Ok(acc)
     }
 
-    /// Returns a paginated list of audit trail entries.
+    /// Returns a paginated list of audit trail entries, newest-first.
     /// `audience` decides WHOSE events come back and is set by the service from
     /// the connection, never from the request: the audit directory is closed to
     /// ordinary users on disk (`SYSTEM` + `Administrators` on Windows, `0700` on
