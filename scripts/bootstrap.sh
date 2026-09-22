@@ -56,15 +56,23 @@ else
   cyan "[bootstrap] .env already exists; skip"
 fi
 
+# Debian/Ubuntu suffix the Qt6 tools (`qmake6`, `qtpaths6`) so they can sit
+# beside Qt5; other distributions and the Qt installer ship them unsuffixed.
+# What the build actually needs is the Qt6 CMake package, which the tool only
+# stands in for here.
 qt_tool_found=0
-have qmake && qt_tool_found=1
-have qtpaths && qt_tool_found=1
+for qt_tool in qmake6 qtpaths6 qmake qtpaths; do
+  if have "$qt_tool"; then
+    qt_tool_found=1
+    break
+  fi
+done
 cmake_found=0
 have cmake && cmake_found=1
 
 if [ "$strict_qt" -eq 1 ]; then
   if [ "$qt_tool_found" -eq 0 ]; then
-    echo "Qt tool not found (qmake/qtpaths). Install Qt 6.6+ for GUI integration." >&2
+    echo "Qt tool not found (qmake6/qtpaths6/qmake/qtpaths). Install Qt 6.6+ for GUI integration." >&2
     exit 1
   fi
   if [ "$cmake_found" -eq 0 ]; then
@@ -73,7 +81,7 @@ if [ "$strict_qt" -eq 1 ]; then
   fi
 else
   if [ "$qt_tool_found" -eq 0 ]; then
-    yellow "Qt tool not found (qmake/qtpaths). Rust workspace is still bootstrap-able, but Qt GUI wiring will require it."
+    yellow "Qt tool not found (qmake6/qtpaths6/qmake/qtpaths). Rust workspace is still bootstrap-able, but Qt GUI wiring will require it."
   fi
   if [ "$cmake_found" -eq 0 ]; then
     yellow "cmake not found. Rust workspace is still bootstrap-able, but Qt integration will require it."

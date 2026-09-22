@@ -882,7 +882,7 @@ fn reverse_learner_consumer(
     let sink = Arc::clone(&named);
     let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
         .with_dns_lockdown_drop_check(lockdown_check)
-        .with_reverse_dns_learner(Arc::new(move |ip, _allow_direct| {
+        .with_reverse_dns_learner(Arc::new(move |ip, _allow_direct, _origin| {
             sink.lock().unwrap_or_else(|p| p.into_inner()).push(ip);
         }));
     (consumer, named)

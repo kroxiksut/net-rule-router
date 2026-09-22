@@ -93,6 +93,17 @@ pub struct PlatformSupports {
     pub background_service: bool,
     /// Launch-on-login autostart integration.
     pub autostart: bool,
+    /// The service exposes its stability/behaviour config (IPC accept policy,
+    /// verbose logging, enforcement mode, fake-IP, DNS options) for reading and
+    /// writing. Where the supervisor holds the defaults and never reads the
+    /// stored row, the GUI must not offer settings nothing will apply.
+    pub service_stability_config: bool,
+    /// Local network segments can be exempted from leak protection by name.
+    /// Needs the route coordinator that discovers and enforces them.
+    pub local_network_exceptions: bool,
+    /// Blocked-connection notices: the per-SID journal, its mutes, and the
+    /// offer to re-route a blocked destination. Fed by the connection observer.
+    pub block_notices: bool,
 
     // ── Capability INVERSIONS ────────────────────────────────────────────────
     // Unlike the flags above (a Windows superset that other OSes may lack),
@@ -152,6 +163,9 @@ impl PlatformProfile {
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
+                service_stability_config: true,
+                local_network_exceptions: true,
+                block_notices: true,
                 // Inversions: Windows blocks apps leak-proof (ALE_APP_ID) but
                 // cannot route per-user or scope a per-user block to all
                 // protocols (packet layer forces user_sid = None).
@@ -180,6 +194,13 @@ impl PlatformProfile {
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
+                // The daemon keeps `ServiceStabilityConfig::default()` and never
+                // reads the stored row; it has no route coordinator and no
+                // connection observer, so all three answer `false` rather than
+                // let the GUI ask for handlers that are not registered.
+                service_stability_config: false,
+                local_network_exceptions: false,
+                block_notices: false,
                 // Inversions: Linux routes per-user (ip rule uidrange) and
                 // scopes per-user blocks to all protocols (meta skuid), which
                 // Windows cannot — but its per-app block is NOT leak-proof
@@ -209,6 +230,9 @@ impl PlatformProfile {
                 hosts_pin: true,
                 background_service: true,
                 autostart: true,
+                service_stability_config: false,
+                local_network_exceptions: false,
+                block_notices: false,
                 // Conservative until the macOS Network Extension backend is
                 // verified: claim none of the inversions (an unverified
                 // capability flag defaults to `false`, never a false promise).
@@ -242,6 +266,22 @@ mod tests {
         let s = PlatformProfile::windows().supports;
         assert!(s.kill_switch && s.app_routing && s.dns_observe && s.dns_resolver);
         assert!(s.hosts_pin && s.background_service && s.autostart);
+        assert!(s.service_stability_config && s.local_network_exceptions && s.block_notices);
+    }
+
+    /// The three service-backed features whose Linux handlers are not
+    /// registered. A `true` here would put the GUI back to asking for an
+    /// operation the daemon answers "not yet implemented".
+    #[test]
+    fn unimplemented_service_features_are_false_off_windows() {
+        for supports in [
+            PlatformProfile::linux().supports,
+            PlatformProfile::macos().supports,
+        ] {
+            assert!(!supports.service_stability_config);
+            assert!(!supports.local_network_exceptions);
+            assert!(!supports.block_notices);
+        }
     }
 
     #[test]
@@ -260,6 +300,9 @@ mod tests {
         assert_eq!(v["supports"]["killSwitch"], true);
         assert_eq!(v["supports"]["appRouting"], true);
         assert_eq!(v["supports"]["dnsResolver"], true);
+        assert_eq!(v["supports"]["serviceStabilityConfig"], true);
+        assert_eq!(v["supports"]["localNetworkExceptions"], true);
+        assert_eq!(v["supports"]["blockNotices"], true);
         // Inversion flags reach QML under camelCase keys too.
         assert_eq!(v["supports"]["perAppBlockLeakproof"], true);
         assert_eq!(v["supports"]["perUserRouting"], false);

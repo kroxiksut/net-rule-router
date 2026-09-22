@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Linux counterpart of uninstall-service.ps1. Counterpart of install-service.sh.
+# Linux counterpart of uninstall-service.ps1. Counterpart of install-service.sh:
+# removes the unit AND the staged copy under /usr/lib/netrulerouter that
+# install-service.sh put there.
 #
 # Difference from uninstall-service.ps1: `nrr-serviced uninstall` runs
 # `systemctl disable --now`, which stops the unit as part of removing it — no
@@ -18,6 +20,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=lib/service-paths.sh
+. "$script_dir/lib/service-paths.sh"
 
 profile="auto"
 while [ "$#" -gt 0 ]; do
@@ -44,66 +48,28 @@ case "$profile" in
     ;;
 esac
 
-cyan() { printf '\033[36m%s\033[0m\n' "$1"; }
-green() { printf '\033[32m%s\033[0m\n' "$1"; }
-
-exe_name="nrr-serviced"
-
-resolve_target_root() {
-  local cfg="$repo_root/.cargo/config.toml" td
-  if [ -f "$cfg" ]; then
-    td="$(grep -oP '^\s*target-dir\s*=\s*"\K[^"]+' "$cfg" 2>/dev/null | head -n1 || true)"
-    if [ -n "${td:-}" ]; then
-      case "$td" in
-        /*) printf '%s\n' "$td"; return ;;
-        *) printf '%s\n' "$repo_root/$td"; return ;;
-      esac
-    fi
-  fi
-  printf '%s\n' "$repo_root/target"
-}
-
-target_root="$(resolve_target_root)"
-
-resolve_service_binary() {
-  local mode="$1"
-  local debug_path="$target_root/debug/$exe_name"
-  local release_path="$target_root/release/$exe_name"
-  case "$mode" in
-    dev) printf '%s\n' "$debug_path"; return ;;
-    release) printf '%s\n' "$release_path"; return ;;
-  esac
-  if [ -f "$debug_path" ] && [ -f "$release_path" ]; then
-    if [ "$release_path" -nt "$debug_path" ]; then
-      printf '%s\n' "$release_path"
-    else
-      printf '%s\n' "$debug_path"
-    fi
-  elif [ -f "$debug_path" ]; then
-    printf '%s\n' "$debug_path"
-  elif [ -f "$release_path" ]; then
-    printf '%s\n' "$release_path"
-  else
-    printf '%s\n' "$debug_path"
-  fi
-}
-
-exe_path="$(resolve_service_binary "$profile")"
+# The staged copy is the registered daemon, so it answers `uninstall` even when
+# the build tree has been cleaned; the build output is the fallback.
+exe_path="$NRR_STAGED_SERVICE_BINARY"
+if [ ! -f "$exe_path" ]; then
+  target_root="$(nrr_target_root "$repo_root")"
+  exe_path="$(nrr_built_service_binary "$target_root" "$profile")"
+fi
 
 if [ ! -f "$exe_path" ]; then
-  echo "Service binary not found at $exe_path. Cannot uninstall without it (need its \`uninstall\` verb)." >&2
+  echo "Service binary found neither at $NRR_STAGED_SERVICE_BINARY nor in target/. Cannot uninstall without it (need its \`uninstall\` verb)." >&2
   exit 1
 fi
 
-cyan "==> uninstall"
-if [ "$(id -u)" -eq 0 ]; then
-  "$exe_path" uninstall
-else
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo "root is required to remove the systemd unit, and sudo was not found. Re-run as root." >&2
-    exit 1
-  fi
-  sudo "$exe_path" uninstall
+nrr_cyan "==> uninstall"
+nrr_run_privileged "$exe_path" uninstall
+
+# The uninstall plan removes the unit, the drop-ins and the alias symlink; the
+# staged binary is this script's own footprint, so this script clears it.
+if [ -f "$NRR_STAGED_SERVICE_BINARY" ]; then
+  nrr_cyan "==> remove $NRR_STAGED_SERVICE_BINARY"
+  nrr_run_privileged rm -f "$NRR_STAGED_SERVICE_BINARY" "$NRR_SERVICE_INSTALL_DIR/$NRR_SERVICE_ALIAS_NAME"
+  nrr_run_privileged rmdir --ignore-fail-on-non-empty "$NRR_SERVICE_INSTALL_DIR"
 fi
 
-green "Service uninstalled. State DB and audit logs preserved."
+nrr_green "Service uninstalled. State DB and audit logs preserved."

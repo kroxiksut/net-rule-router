@@ -1,0 +1,20 @@
+[Desktop Entry]
+# The file basename must match QGuiApplication::setDesktopFileName in the Qt
+# host: that value is the Wayland app_id a compositor looks this entry up by.
+# NoDisplay: the tray is started by the main window, not picked from a menu.
+# The entry exists so the session can autostart it (copy into ~/.config/autostart)
+# and so its prompt windows carry a name and an icon.
+Type=Application
+Version=1.0
+Name=NetRuleRouter Tray
+Name[ru]=NetRuleRouter — значок в трее
+Comment=Status icon for NetRuleRouter
+Comment[ru]=Значок состояния NetRuleRouter в системном лотке
+Exec=netrulerouter-tray
+Icon=netrulerouter
+Terminal=false
+Categories=Network;System;Utility;
+NoDisplay=true
+StartupNotify=false
+StartupWMClass=NetRuleRouterTray
+X-GNOME-Autostart-enabled=true

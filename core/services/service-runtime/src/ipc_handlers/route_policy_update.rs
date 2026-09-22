@@ -2,9 +2,9 @@
 //!
 //! Atomically writes the caller's per-SID route policy (primary +
 //! secondary bindings + behavior mode + secondary-block flag) to
-//! `nrr_service_state.db`. Validation runs server-side: `stable_id`
-//! against the live `AdapterMonitor`, `mode = strict-...` requires a
-//! bound secondary, primary ≠ secondary.
+//! `nrr_service_state.db`. Validation runs server-side: a `stable_id` from the
+//! placeholder dataset is refused here, and the writer holds the rest
+//! (`mode = strict-...` requires a bound secondary, primary ≠ secondary).
 //!
 //! User-scoped class (`UserScopedConfiguration` in `IpcOperationClass`):
 //! flows through the mutation queue (single-writer invariant) and is
@@ -59,6 +59,16 @@ impl IpcHandler for RoutePolicyUpdateHandler {
                 diagnostics_id: None,
             })?;
 
+        // The placeholder rows a GUI shows when no live enumeration arrived name
+        // no adapter of this machine. Refused here rather than in the GUI: a
+        // stored binding to one produces an apply that silently changes nothing,
+        // and the check belongs where every client passes.
+        if let Some(stable_id) = placeholder_binding(&req) {
+            return Err(map_write_error(RoutePolicyWriteError::PlaceholderAdapter {
+                stable_id,
+            }));
+        }
+
         match self.writer.update_for_sid(ctx.caller_stored(), &req) {
             Ok(dto) => {
                 // The policy is durably written; trigger a mid-session WFP
@@ -80,6 +90,16 @@ impl IpcHandler for RoutePolicyUpdateHandler {
     }
 }
 
+/// The first binding in `req` naming a placeholder adapter, if any.
+fn placeholder_binding(req: &RoutePolicyUpdateRequest) -> Option<String> {
+    [req.primary.as_ref(), req.secondary.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|b| b.stable_id.as_str())
+        .find(|id| nrr_platform_api::interface_rows::is_preview_persistent_id(id))
+        .map(str::to_string)
+}
+
 fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
     match err {
         RoutePolicyWriteError::EmptySid => IpcError {
@@ -88,6 +108,7 @@ fn map_write_error(err: RoutePolicyWriteError) -> IpcError {
             diagnostics_id: None,
         },
         RoutePolicyWriteError::UnknownAdapter { .. }
+        | RoutePolicyWriteError::PlaceholderAdapter { .. }
         | RoutePolicyWriteError::PrimaryEqualsSecondary
         | RoutePolicyWriteError::StrictModeRequiresSecondary => IpcError {
             code: IpcErrorCode::PreconditionFailed,
@@ -238,6 +259,52 @@ mod tests {
             .handle(&req(serde_json::json!({"garbage": 1})), &ctx("S"))
             .unwrap_err();
         assert_eq!(err.code, IpcErrorCode::MalformedRequest);
+    }
+
+    /// The payload a GUI sends to bind `stable_id` as primary. Built from the
+    /// sample policy so a field added to the request cannot quietly go missing
+    /// here.
+    fn bind_primary_payload(stable_id: &str) -> serde_json::Value {
+        let mut payload = serde_json::to_value(sample_dto()).expect("policy serialises");
+        payload["primary"]["stable-id"] = serde_json::Value::String(stable_id.to_string());
+        payload
+    }
+
+    #[test]
+    fn a_placeholder_adapter_is_refused_before_the_writer_is_called() {
+        let writer = Arc::new(ScriptedWriter {
+            outcome: Mutex::new(Ok(sample_dto())),
+            seen_sid: Mutex::new(None),
+        });
+        let h = RoutePolicyUpdateHandler::new(writer.clone() as Arc<dyn RoutePolicyWriter>, None);
+        let placeholder = nrr_platform_api::interface_rows::PREVIEW_WIFI_PERSISTENT_ID;
+        let err = h
+            .handle(&req(bind_primary_payload(placeholder)), &ctx("S-1-5-21-1"))
+            .unwrap_err();
+        assert_eq!(err.code, IpcErrorCode::PreconditionFailed);
+        assert!(err.message.contains(placeholder), "{}", err.message);
+        assert!(
+            writer.seen_sid.lock().unwrap().is_none(),
+            "a binding that names no adapter of this machine must not reach storage"
+        );
+    }
+
+    #[test]
+    fn a_live_adapter_id_still_reaches_the_writer() {
+        let writer = Arc::new(ScriptedWriter {
+            outcome: Mutex::new(Ok(sample_dto())),
+            seen_sid: Mutex::new(None),
+        });
+        let h = RoutePolicyUpdateHandler::new(writer.clone() as Arc<dyn RoutePolicyWriter>, None);
+        h.handle(
+            &req(bind_primary_payload("linux-adapter:wlp3s0")),
+            &ctx("S-1-5-21-1"),
+        )
+        .expect("a live adapter id is accepted");
+        assert_eq!(
+            writer.seen_sid.lock().unwrap().as_deref(),
+            Some("S-1-5-21-1")
+        );
     }
 
     #[test]

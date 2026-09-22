@@ -17,7 +17,11 @@ if(NOT DEFINED QT_SKIP_AUTO_QML_PLUGIN_INCLUSION)
     set(QT_SKIP_AUTO_QML_PLUGIN_INCLUSION ON)
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
+# 6.6 is the floor the sources actually need (`Qt::ColorScheme` and the
+# colour-scheme signal landed in 6.5). Stated here so an older Qt is
+# refused by name at configure time instead of failing later as a
+# compile error about a missing member.
+find_package(Qt6 6.6 REQUIRED COMPONENTS Core Gui Qml Quick QuickControls2 Widgets)
 
 qt_standard_project_setup()
 
@@ -87,9 +91,16 @@ target_link_libraries(nrr_qt_native_host PRIVATE
 )
 
 # Runtime assets (startup-splash logo, window icon) are looked up beside the
-# binary, the same place the package puts them; copy them there.
+# binary, the same place the package puts them; copy them there. The window
+# icon differs per platform — `appIconRelativePath()` in host_support.h picks
+# the same file this copies.
 set(NRR_ASSETS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../assets")
 get_filename_component(NRR_ASSETS_DIR_ABS "${NRR_ASSETS_DIR}" ABSOLUTE)
+if(WIN32)
+    set(NRR_APP_ICON_FILE "app.ico")
+else()
+    set(NRR_APP_ICON_FILE "icon-256.png")
+endif()
 add_custom_command(TARGET nrr_qt_native_host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "$<TARGET_FILE_DIR:nrr_qt_native_host>/assets/images/logo"
@@ -99,8 +110,8 @@ add_custom_command(TARGET nrr_qt_native_host POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "$<TARGET_FILE_DIR:nrr_qt_native_host>/assets/icons/app"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${NRR_ASSETS_DIR_ABS}/icons/app/app.ico"
-        "$<TARGET_FILE_DIR:nrr_qt_native_host>/assets/icons/app/app.ico"
+        "${NRR_ASSETS_DIR_ABS}/icons/app/${NRR_APP_ICON_FILE}"
+        "$<TARGET_FILE_DIR:nrr_qt_native_host>/assets/icons/app/${NRR_APP_ICON_FILE}"
     VERBATIM
 )
 

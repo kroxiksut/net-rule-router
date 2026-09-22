@@ -94,7 +94,13 @@ From console — the same operations via scripts:
 .\scripts\install-service.ps1 -Profile release   # install and start
 .\scripts\service-status.ps1                     # check status
 .\scripts\uninstall-service.ps1                  # remove
+.\scripts\purge-data.ps1                          # show every trace a clean re-test would remove
 ```
+
+`purge-data.ps1` is what a clean re-test starts from: it removes the service
+plus every place the product writes to, so the next install behaves like a
+first one. It only lists those places until you add `-Yes`, and it keeps the
+security audit trail unless you add `-PurgeAudit`.
 
 ### Dev build (for those editing code)
 

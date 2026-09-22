@@ -34,7 +34,9 @@ fn the_checkout_is_consulted_only_after_the_binary_directory() {
 }
 
 use super::diag_log::rotate_session_log;
-use super::single_instance::parse_pid_from_lock_content;
+use super::single_instance::{
+    parse_build_stamp_from_lock_content, parse_pid_from_lock_content, BuildStamp,
+};
 use super::{LauncherConfig, LauncherSurface};
 use std::fs;
 
@@ -43,6 +45,83 @@ fn pid_parser_extracts_value_from_lock_content() {
     assert_eq!(parse_pid_from_lock_content("pid=12345\n"), Some(12345));
     assert_eq!(parse_pid_from_lock_content("pid=abc\n"), None);
     assert_eq!(parse_pid_from_lock_content("key=value\n"), None);
+}
+
+/// A lock left behind by a build that predates the build lines must keep
+/// working: the pid still reads, and there is simply nothing to compare.
+#[test]
+fn a_pid_only_lock_still_parses_and_carries_no_build() {
+    assert_eq!(parse_pid_from_lock_content("pid=4242\n"), Some(4242));
+    assert_eq!(parse_build_stamp_from_lock_content("pid=4242\n"), None);
+}
+
+#[test]
+fn a_build_stamp_needs_every_field_to_count() {
+    let full = "pid=7\nversion=0.4.0\nexe_size=4823040\nexe_mtime=1758500000\n";
+    let stamp = parse_build_stamp_from_lock_content(full).expect("full record");
+    assert_eq!(parse_pid_from_lock_content(full), Some(7));
+    assert_eq!(
+        stamp.to_string(),
+        "version=0.4.0 exe_size=4823040 exe_mtime=1758500000"
+    );
+
+    for partial in [
+        "pid=7\nexe_size=4823040\nexe_mtime=1758500000\n",
+        "pid=7\nversion=0.4.0\nexe_mtime=1758500000\n",
+        "pid=7\nversion=0.4.0\nexe_size=4823040\n",
+        "pid=7\nversion=\nexe_size=4823040\nexe_mtime=1758500000\n",
+        "pid=7\nversion=0.4.0\nexe_size=huge\nexe_mtime=1758500000\n",
+    ] {
+        assert_eq!(parse_build_stamp_from_lock_content(partial), None);
+    }
+}
+
+#[test]
+fn a_rebuilt_executable_reads_as_a_different_build() {
+    let same = "version=0.4.0\nexe_size=4823040\nexe_mtime=1758500000\n";
+    assert_eq!(
+        parse_build_stamp_from_lock_content(same),
+        parse_build_stamp_from_lock_content(same)
+    );
+
+    for other in [
+        "version=0.4.1\nexe_size=4823040\nexe_mtime=1758500000\n",
+        "version=0.4.0\nexe_size=4823041\nexe_mtime=1758500000\n",
+        "version=0.4.0\nexe_size=4823040\nexe_mtime=1758500001\n",
+    ] {
+        assert_ne!(
+            parse_build_stamp_from_lock_content(same),
+            parse_build_stamp_from_lock_content(other)
+        );
+    }
+}
+
+/// The written record and the parser are one format or the comparison is
+/// worthless: a writer that drifts reads back as "no build information".
+#[test]
+fn the_written_lock_record_reads_back_whole() {
+    use super::single_instance::write_lock_record;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("gui-shell-v1.lock");
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&path)
+        .expect("lock file");
+    write_lock_record(&mut file).expect("write record");
+    drop(file);
+
+    let content = fs::read_to_string(&path).expect("read back");
+    assert_eq!(
+        parse_pid_from_lock_content(&content),
+        Some(std::process::id())
+    );
+    assert_eq!(
+        parse_build_stamp_from_lock_content(&content),
+        BuildStamp::current()
+    );
 }
 
 #[test]

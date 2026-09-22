@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// Persistent ids this dataset hands out. Declared next to the rows that carry
+/// them so the two cannot drift, and public because a binding naming one of
+/// them points at no adapter of this machine: the service refuses it instead of
+/// storing a route that can never apply.
+pub const PREVIEW_ETHERNET_PERSISTENT_ID: &str = "win-adapter:ethernet-fallback";
+pub const PREVIEW_WIFI_PERSISTENT_ID: &str = "win-adapter:wifi-fallback";
+pub const PREVIEW_VPN_PERSISTENT_ID: &str = "win-adapter:vpn-fallback";
+pub const PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID: &str = "win-adapter:bluetooth-pan-fallback";
+
+/// Every id [`fallback_rows`] produces.
+pub const PREVIEW_PERSISTENT_IDS: [&str; 4] = [
+    PREVIEW_ETHERNET_PERSISTENT_ID,
+    PREVIEW_WIFI_PERSISTENT_ID,
+    PREVIEW_VPN_PERSISTENT_ID,
+    PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID,
+];
+
+/// Whether `persistent_id` came from the placeholder dataset rather than a live
+/// enumeration.
+#[must_use]
+pub fn is_preview_persistent_id(persistent_id: &str) -> bool {
+    PREVIEW_PERSISTENT_IDS.contains(&persistent_id)
+}
+
 /// Deterministic adapter dataset used when no live Windows enumeration is
 /// available (off-Windows builds, dev/test, empty enumeration).
 pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
@@ -75,7 +99,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
 
     vec![
         InterfaceRouteRow {
-            persistent_id: "win-adapter:ethernet-fallback".to_string(),
+            persistent_id: PREVIEW_ETHERNET_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-ETHERNET-ADAPTER}".to_string(),
             windows_name: "Ethernet".to_string(),
             interface_description: "Fallback Ethernet adapter".to_string(),
@@ -95,7 +119,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             route_state: RouteSelectionState::NotSelected,
         },
         InterfaceRouteRow {
-            persistent_id: "win-adapter:wifi-fallback".to_string(),
+            persistent_id: PREVIEW_WIFI_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-WIFI-ADAPTER}".to_string(),
             windows_name: "Wi-Fi".to_string(),
             interface_description: "Fallback Wi-Fi adapter".to_string(),
@@ -115,7 +139,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             route_state: RouteSelectionState::NotSelected,
         },
         InterfaceRouteRow {
-            persistent_id: "win-adapter:vpn-fallback".to_string(),
+            persistent_id: PREVIEW_VPN_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-VPN-ADAPTER}".to_string(),
             windows_name: "VPN".to_string(),
             interface_description: "Fallback VPN tunnel".to_string(),
@@ -135,7 +159,7 @@ pub fn fallback_rows() -> Vec<InterfaceRouteRow> {
             route_state: RouteSelectionState::RequiresVerification,
         },
         InterfaceRouteRow {
-            persistent_id: "win-adapter:bluetooth-pan-fallback".to_string(),
+            persistent_id: PREVIEW_BLUETOOTH_PAN_PERSISTENT_ID.to_string(),
             adapter_name: "{FAKE-BLUETOOTH-PAN-ADAPTER}".to_string(),
             windows_name: "Bluetooth PAN".to_string(),
             interface_description: "Bluetooth Personal Area Network".to_string(),

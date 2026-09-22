@@ -656,7 +656,9 @@ pub(super) fn build(inputs: IpcSurfaceInputs<'_>) -> IpcSurface {
                 })
             };
             let resolver: Arc<dyn nrr_platform_api::dns::DnsResolverPort> =
-                Arc::new(WindowsDnsResolver::new());
+                Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
+                    Arc::new(WindowsDnsResolver::new()),
+                ));
             let seeder = Arc::new(
                 nrr_service_runtime::browser_history_seeder::BrowserHistorySeeder::new(
                     history,

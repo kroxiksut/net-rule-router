@@ -418,8 +418,12 @@ pub(super) fn build_hosts_bypass_resolver(
     let pool = upstream_dns_pool();
     let upstream: Arc<dyn Fn() -> Option<std::net::SocketAddr> + Send + Sync> =
         Arc::new(move || pool.current().or_else(|| pool.note_network_change()));
+    // `DnsQuery_W` answers when the OS is done with it; on the datapath the
+    // caller cannot wait that long, so the system fallback gets a budget.
     let mut resolver = nrr_service_runtime::dns_resolver_ports::HostsBypassDnsResolver::new(
-        Arc::new(WindowsDnsResolver::new()),
+        Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
+            Arc::new(WindowsDnsResolver::new()),
+        )),
         bypass_enabled,
         upstream,
         Duration::from_millis(1500),

@@ -28,6 +28,7 @@ use nrr_service_runtime::{
     activation_coordinator::{ActivationCoordinator, ApplyFailurePolicy},
     active_sid_registry::ActiveSidRegistry,
     bootstrap::BootstrapArtifacts,
+    conn_observation_consumer::ReverseLearnOrigin,
     dns_refresh::DnsRefreshOrchestrator,
     fqdn_cache_lookup::{FqdnCacheLookup, SqliteFqdnCacheLookup},
     health::{HealthAggregator, HealthComponent},

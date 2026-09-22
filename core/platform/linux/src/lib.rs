@@ -251,6 +251,11 @@ pub mod icmp_echo;
 /// are pure and tested on every host; only the reads are Linux-only.
 pub mod adapters;
 
+/// The rows the "Interfaces & routes" screen renders, enumerated live on this
+/// OS. Mirror of `nrr_platform_windows::interface_rows`: every judgement about
+/// a row is the neutral one, only the facts are read here.
+pub mod interface_rows;
+
 /// Abstract-socket mechanism behind
 /// `nrr_platform_api::single_instance::SingleInstancePort`.
 pub mod single_instance;

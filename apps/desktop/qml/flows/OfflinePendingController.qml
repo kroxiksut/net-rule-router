@@ -247,7 +247,7 @@ QtObject {
                 }
                 finish(rows)
             }
-            if (Object.keys(st).length === 0
+            if (Object.keys(st).length === 0 || !root.serviceStabilitySupported
                     || typeof nrrNativeBridge.rpcServiceStabilityConfigGet !== "function") {
                 finalizeWith({})
                 return

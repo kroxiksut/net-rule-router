@@ -1,0 +1,20 @@
+[Desktop Entry]
+# The file basename must match QGuiApplication::setDesktopFileName in the Qt
+# host: that value is the Wayland app_id a compositor looks this entry up by.
+# Exec names the Unix spelling of the binary; install-desktop.sh rewrites it to
+# an absolute path when installing from a build tree.
+Type=Application
+Version=1.0
+Name=NetRuleRouter
+GenericName=Network policy manager
+GenericName[ru]=Менеджер сетевых правил
+Comment=Route traffic across the network interfaces you already have
+Comment[ru]=Распределяет трафик по уже имеющимся сетевым интерфейсам
+Exec=netrulerouter
+Icon=netrulerouter
+Terminal=false
+Categories=Network;System;Utility;
+Keywords=network;routing;rules;policy;interfaces;
+Keywords[ru]=сеть;маршрутизация;правила;политика;интерфейсы;
+StartupNotify=true
+StartupWMClass=NetRuleRouter

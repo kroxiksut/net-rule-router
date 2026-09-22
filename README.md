@@ -14,7 +14,7 @@ Windows builds today; Linux is in progress, macOS next.
 
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#license)
 ![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
-![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
+![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
 <img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
 
@@ -176,6 +176,15 @@ cargo build -p nrr-launcher -p nrr-qt-host
 
 The background service (applies and enforces policy on startup) is installed with
 `scripts/install-service.ps1` and removed with `scripts/uninstall-service.ps1`.
+
+To leave nothing behind — service, settings, caches and logs in one go —
+`scripts/purge-data.ps1` removes every place the product writes to. It only
+lists what it would delete until you pass `-Yes`, and it keeps the security
+audit trail unless you also pass `-PurgeAudit`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
+```
 
 Quality gate (fmt + clippy + tests + license/dependency audit):
 

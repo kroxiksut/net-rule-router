@@ -117,8 +117,10 @@ if [ "$component" = "gui" ] || [ "$component" = "tray" ]; then
   target_dir="$(cargo_target_dir)"
   if [ "$component" = "gui" ]; then
     bin_name="NetRuleRouter"
+    unix_name="netrulerouter"
   else
     bin_name="NetRuleRouterTray"
+    unix_name="netrulerouter-tray"
   fi
   bin_path="$(resolve_profile_binary "$target_dir" "$bin_name" "$profile")"
 
@@ -127,8 +129,28 @@ if [ "$component" = "gui" ] || [ "$component" = "tray" ]; then
     exit 1
   fi
 
-  cyan "[run] $bin_path"
-  exec "$bin_path"
+  # Run from a copy carrying the Unix spelling of the name (the one
+  # `product_identity::BinaryRole::unix_file_name` declares; Cargo cannot name a
+  # `[[bin]]` per OS). The service recognises its own surfaces by the peer's
+  # executable name, and a GUI started as `NetRuleRouter` is a program it cannot
+  # name: it gets the most restricted profile and every read comes back
+  # "admin-console clients may not ...". A copy, not a symlink — `/proc/<pid>/exe`
+  # resolves links and would report the original name again.
+  #
+  # Both copies are made whichever component was asked for: the GUI starts the
+  # tray itself, and a tray started under the Cargo name is refused the same way.
+  profile_dir="$(dirname "$bin_path")"
+  for pair in "NetRuleRouter:netrulerouter" "NetRuleRouterTray:netrulerouter-tray"; do
+    cargo_name="${pair%%:*}"
+    canonical_name="${pair##*:}"
+    if [ -x "$profile_dir/$cargo_name" ]; then
+      cp -f "$profile_dir/$cargo_name" "$profile_dir/$canonical_name"
+    fi
+  done
+
+  unix_path="$profile_dir/$unix_name"
+  cyan "[run] $unix_path"
+  exec "$unix_path"
 fi
 
 # `run` is the daemon body itself on Linux (systemd's ExecStart passes it too),

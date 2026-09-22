@@ -14,6 +14,12 @@ ColumnLayout {
     property var root
     spacing: root.uiTheme.spacingMd
 
+    // Shorthands for the two service-backed capabilities this panel gates on;
+    // every control below that rides the shared stability config or the
+    // local-networks ops reads one of them instead of asking the profile itself.
+    readonly property bool stabilitySupported: root.serviceStabilitySupported
+    readonly property bool localNetworksSupported: root.localNetworksSupported
+
     // Kill-switch failure posture. `true` = fail-closed
     // (block when the additional adapter can't be resolved); `false` =
     // fail-open (allow + warn). Read from the live per-SID policy on mount;
@@ -199,6 +205,7 @@ ColumnLayout {
     property string localNetworkError: ""
 
     function loadLocalNetworks() {
+        if (!panel.localNetworksSupported) return
         if (!root.bridgeAvailable || typeof root.rpc.rpcLocalNetworksGet !== "function") return
         var corr = root.rpc.rpcLocalNetworksGet()
         if (!corr || corr === "") return
@@ -247,6 +254,7 @@ ColumnLayout {
     }
 
     function _writeLocalNetworks(payload) {
+        if (!panel.localNetworksSupported) return
         if (!root.bridgeAvailable || typeof root.rpc.rpcLocalNetworksSet !== "function") {
             panel.localNetworkError = root.tr("status.bindings-require-service",
                 "Adapter bindings can only be changed while the background service is running.")
@@ -747,7 +755,7 @@ ColumnLayout {
         panel.dnsFastAnswers = _offlineStabilityPick(pendingSt, mirrorSt,
             "dns-fast-answers", panel.dnsFastAnswers)
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!panel.stabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
             return
         }
@@ -807,7 +815,7 @@ ColumnLayout {
     // never keeps displaying a mode the service is not actually running.
     function _refreshEnforcementModeFromService() {
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!panel.stabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
             return
         }
@@ -1220,7 +1228,7 @@ ColumnLayout {
         panel.livenessWindowSecs = _offlineStabilityPick(_parkedStability(), _mirrorStability(),
             "secondary-liveness-window-secs", prefsSecs)
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!panel.stabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
             return
         }
@@ -1295,7 +1303,7 @@ ColumnLayout {
         panel.routingStopPolicy = _offlineStabilityPick(parkedSt, mirrorSt,
             "routing-stop-policy", panel.routingStopPolicy)
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!panel.stabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function")
             return
         var corr = bridge.rpcServiceStabilityConfigGet()
@@ -1845,15 +1853,27 @@ ColumnLayout {
             // Mode A (reactive kill-switch, default) vs Mode B (local DNS
             // resolver, enforce-before-connect). Global service setting; takes
             // effect after the service restarts. Redirecting DNS is invasive.
+            // The whole cluster writes the shared service-stability config;
+            // where that has no handler the controls are hidden and this note
+            // stands in their place.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: panel.killSwitchEnabled && !panel.stabilitySupported
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.platformUnsupportedText
+            }
+
             Item {
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 color: root.textColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.enforcement-mode.label",
@@ -1862,7 +1882,7 @@ ColumnLayout {
             ThemedComboBox {
                 id: enforcementModeCombo
                 theme: root.uiTheme
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 Layout.fillWidth: true
                 Layout.maximumWidth: 460
                 // Mode A (reactive) is a non-maintained legacy fallback, offered
@@ -1933,7 +1953,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -1946,7 +1966,7 @@ ColumnLayout {
             // the checkbox and its rows are hidden in Mode A and appear only
             // when Mode B is selected; the long hint folds behind "Show details".
             Item {
-                visible: panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
@@ -1956,7 +1976,7 @@ ColumnLayout {
                 // service's own lookups leave from, which matters in either
                 // enforcement mode. It still needs leak protection on, because
                 // that is what binds an additional connection at all.
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 CheckBox {
                     id: dnsViaSecondaryCheck
                     Layout.fillWidth: true
@@ -1993,7 +2013,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && root.routingDnsViaSecondaryDetailsExpanded
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
@@ -2005,7 +2025,7 @@ ColumnLayout {
                     + "connection is not available, lookups fall back to the main one. Off by default.")
             }
             Item {
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 Layout.fillWidth: true
                 Layout.preferredHeight: root.uiTheme.spacingSm
             }
@@ -2018,7 +2038,7 @@ ColumnLayout {
                 id: dnsFastAnswersCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 checked: panel.dnsFastAnswers
                 text: root.tr("settings.routing.dns-fast-answers.label",
                     "Fast DNS answers")
@@ -2041,7 +2061,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -2055,7 +2075,7 @@ ColumnLayout {
             }
             RowLayout {
                 Layout.fillWidth: true
-                visible: panel.killSwitchEnabled && panel.enforcementMode === "resolver"
+                visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.enforcementMode === "resolver"
                 CheckBox {
                     id: fakeIpCheck
                     Layout.fillWidth: true
@@ -2090,7 +2110,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && root.routingFakeIpDetailsExpanded
                 color: root.mutedTextColor
@@ -2105,7 +2125,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.fakeIpDriverVerdict !== ""
                     && panel.fakeIpDriverVerdict !== "none"
@@ -2127,7 +2147,7 @@ ColumnLayout {
                 id: fakeIpUdpRelayCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2153,7 +2173,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2171,7 +2191,7 @@ ColumnLayout {
                 id: fakeIpInstantRstCheck
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2197,7 +2217,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
                 Layout.leftMargin: root.uiTheme.spacingSm
-                visible: panel.killSwitchEnabled
+                visible: panel.stabilitySupported && panel.killSwitchEnabled
                     && panel.enforcementMode === "resolver"
                     && panel.detailedModeOn
                     && panel.fakeIpEnabled
@@ -2950,7 +2970,7 @@ ColumnLayout {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 0
                     Layout.topMargin: root.uiTheme.spacingSm
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
+                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
                     color: root.textColor
                     wrapMode: Text.WordWrap
                     text: root.tr("settings.routing.liveness-window.label",
@@ -2959,7 +2979,7 @@ ColumnLayout {
                 ThemedComboBox {
                     id: livenessWindowCombo
                     theme: root.uiTheme
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
+                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
                     Layout.fillWidth: true
                     Layout.maximumWidth: 460
                     model: ListModel {
@@ -3051,7 +3071,7 @@ ColumnLayout {
                     stepSize: 5
                     // Shown only while the "Custom…" option is active (explicit
                     // selection, or a persisted non-preset non-zero value).
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
+                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
                         && (panel.livenessCustomSelected
                             || (panel.livenessWindowSecs !== 0
                                 && !panel._isLivenessPreset(panel.livenessWindowSecs)))
@@ -3076,7 +3096,7 @@ ColumnLayout {
                 Label {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 0
-                    visible: panel.killSwitchEnabled && panel.ksFailClosed
+                    visible: panel.stabilitySupported && panel.killSwitchEnabled && panel.ksFailClosed
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                     font.pixelSize: root.uiTheme.baseFontSizePx - 1
@@ -3113,10 +3133,20 @@ ColumnLayout {
                     "While leak protection is on, only these local networks stay reachable. Traffic to them never leaves this computer.")
             }
 
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: !panel.localNetworksSupported
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.platformUnsupportedText
+            }
+
             // The banner's "Stop asking" lives here too, so it can be undone
             // from the same place the networks are listed.
             CheckBox {
                 Layout.fillWidth: true
+                visible: panel.localNetworksSupported
                 checked: panel.localNetworksAutoAccept
                 text: root.tr("settings.routing.local-networks.auto-accept",
                     "Keep newly found local networks reachable without asking")
@@ -3128,6 +3158,7 @@ ColumnLayout {
                 Layout.preferredWidth: 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
+                visible: panel.localNetworksSupported
                 text: root.tr("settings.routing.local-networks.auto-accept-hint",
                     "A hypervisor, WSL or a second VPN adds a network of its own over time. With this on they stay reachable and no question is shown; every network is still listed below and any of them can be refused.")
             }
@@ -3173,7 +3204,7 @@ ColumnLayout {
             Label {
                 Layout.fillWidth: true
                 Layout.preferredWidth: 0
-                visible: panel.localNetworks.length === 0
+                visible: panel.localNetworksSupported && panel.localNetworks.length === 0
                 color: root.mutedTextColor
                 wrapMode: Text.WordWrap
                 text: root.tr("settings.routing.local-networks.empty",
@@ -3206,6 +3237,7 @@ ColumnLayout {
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: panel.localNetworksSupported
                 spacing: root.uiTheme.spacingSm
                 ThemedTextField {
                     id: localNetworkInput
@@ -3990,9 +4022,21 @@ ColumnLayout {
             anchors.right: parent.right
             spacing: root.uiTheme.spacingMd
 
+            // Every control in this group writes the shared service-stability
+            // config, so the whole group stands down together.
+            Label {
+                Layout.fillWidth: true
+                Layout.preferredWidth: 0
+                visible: !panel.stabilitySupported
+                color: root.mutedTextColor
+                wrapMode: Text.WordWrap
+                text: root.platformUnsupportedText
+            }
+
             // ── Who may change the rules at all (rule-edit lock) ──
             ColumnLayout {
                 Layout.fillWidth: true
+                visible: panel.stabilitySupported
                 spacing: root.uiTheme.spacingXxs
                 RowLayout {
                     Layout.fillWidth: true
@@ -4060,6 +4104,7 @@ ColumnLayout {
             // ── When routing rules are enforced (rule-scope) ──
             ColumnLayout {
                 Layout.fillWidth: true
+                visible: panel.stabilitySupported
                 spacing: root.uiTheme.spacingXxs
                 RowLayout {
                     Layout.fillWidth: true
@@ -4109,6 +4154,7 @@ ColumnLayout {
             // ── When routing is paused or the service stops (stop-policy) ──
             ColumnLayout {
                 Layout.fillWidth: true
+                visible: panel.stabilitySupported
                 spacing: root.uiTheme.spacingXxs
                 RowLayout {
                     Layout.fillWidth: true

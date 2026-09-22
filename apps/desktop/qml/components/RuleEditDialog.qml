@@ -19,9 +19,39 @@ Dialog {
     // ApplicationWindow injected by the caller (`root: window`).
     property var root: null
 
-    x: Math.round((root.width - width) / 2)
-    y: Math.round((root.height - height) / 2)
+    // Placed once per opening instead of bound to the centre: hints appear and
+    // disappear as the user types, and a live centre binding walked the whole
+    // dialog up and down under their pointer on every keystroke.
     width: 560
+    onAboutToShow: {
+        ruleDialog._settled = false
+        ruleDialog._centreInWindow()
+    }
+    onOpened: Qt.callLater(function() {
+        ruleDialog._centreInWindow()
+        ruleDialog._settled = true
+    })
+    // Growth after that is absorbed downward; the dialog moves again only when
+    // it would otherwise hang past the window's bottom edge.
+    onHeightChanged: {
+        if (!visible) return
+        if (ruleDialog._settled) ruleDialog._keepInsideWindow()
+        else ruleDialog._centreInWindow()
+    }
+    /// False until the dialog has been laid out with its real content height.
+    property bool _settled: false
+    /// Clearance kept between the dialog and the window edge.
+    readonly property int _edgeGap: 12
+    function _centreInWindow() {
+        if (!root) return
+        x = Math.round(Math.max(0, (root.width - width) / 2))
+        y = Math.round(Math.max(0, (root.height - height) / 2))
+    }
+    function _keepInsideWindow() {
+        if (!root) return
+        var maxY = Math.max(0, root.height - height - ruleDialog._edgeGap)
+        if (y > maxY) y = Math.round(maxY)
+    }
     modal: false
     palette: root.palette
     title: root.editingRule >= 0 ? root.tr("dialog.rule.edit", "Edit") : root.tr("dialog.rule.add", "Add")
@@ -632,6 +662,11 @@ Dialog {
                         + "route unrelated owners. Use a zone rule if that is what you want.")
                         .replace("{value}", val)
                 }
+                // A plain domain rule already says how far it reaches, in the
+                // coverage line above and in the words of the setting that
+                // decides it. Saying it twice, in two wordings, read as two
+                // different rules being described.
+                if (rt !== "suffix-domain") return ""
                 return root.tr("rules.value.suffix-reach",
                     "Matches every name under {value}, including ones you did not list.")
                     .replace("{value}", val)

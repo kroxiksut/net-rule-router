@@ -256,7 +256,11 @@ impl ConnectionObservationConsumer {
                             // see. Naming it is still useful; calling it DIRECT
                             // would punch that app's destination out of the
                             // block-all.
-                            learner(rip, !(killswitch_verified && killswitch_app_scoped));
+                            learner(
+                                rip,
+                                !(killswitch_verified && killswitch_app_scoped),
+                                crate::conn_observation_consumer::ReverseLearnOrigin::EnforcementDrop,
+                            );
                         }
                     }
                 }

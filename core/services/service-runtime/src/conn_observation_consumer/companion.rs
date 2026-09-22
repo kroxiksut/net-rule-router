@@ -164,7 +164,11 @@ impl ConnectionObservationConsumer {
                         // Not a drop at all — a flow that left over the primary
                         // beside a routed site. Nothing forbids the direct
                         // classification here.
-                        learner(ip, true);
+                        learner(
+                            ip,
+                            true,
+                            crate::conn_observation_consumer::ReverseLearnOrigin::PrimaryEgress,
+                        );
                     }
                 }
             }

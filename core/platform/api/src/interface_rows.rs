@@ -22,11 +22,13 @@ use crate::types::RouteEntry;
 mod assess;
 mod dto;
 mod preview;
+mod probe;
 mod routes;
 mod types;
 
 pub use assess::*;
 pub use preview::*;
+pub use probe::*;
 pub use routes::*;
 pub use types::*;
 

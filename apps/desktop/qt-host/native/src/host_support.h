@@ -20,9 +20,37 @@ struct LaunchOptions {
     int autoCloseMs = 0;
 };
 
+// Both spellings of the tray binary: the Cargo artifact name, identical on
+// every OS, and the Unix one the product identity declares
+// (`BinaryRole::Tray::unix_file_name`). They are two names for one program
+// because Cargo cannot name a `[[bin]]` per OS, and the service tells its own
+// surfaces apart by the peer's executable name — a tray running as
+// `NetRuleRouterTray` on Linux is a program it cannot name, and every read it
+// asks for comes back refused.
+inline QStringList trayExecutableNames() {
+#ifdef Q_OS_WIN
+    return {QStringLiteral("NetRuleRouterTray.exe")};
+#else
+    return {QStringLiteral("netrulerouter-tray"), QStringLiteral("NetRuleRouterTray")};
+#endif
+}
+
+inline QStringList mainGuiExecutableNames() {
+#ifdef Q_OS_WIN
+    return {QStringLiteral("NetRuleRouter.exe")};
+#else
+    return {QStringLiteral("netrulerouter"), QStringLiteral("NetRuleRouter")};
+#endif
+}
+
 inline bool isTrayProductExecutable(const QString &applicationFilePath) {
     const QString baseName = QFileInfo(applicationFilePath).completeBaseName();
-    return baseName.compare(QStringLiteral("NetRuleRouterTray"), Qt::CaseInsensitive) == 0;
+    for (const QString &name : trayExecutableNames()) {
+        if (baseName.compare(QFileInfo(name).completeBaseName(), Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 inline LaunchOptions parseLaunchOptions(const QStringList &arguments) {
@@ -197,6 +225,17 @@ inline QString resolveQmlPath(const LaunchOptions &options,
     return findBundledFile(applicationDir, resolveDefaultQmlRelativePath(applicationFilePath));
 }
 
+// Windows takes the multi-size `.ico` the shell also embeds; X11 and the
+// hicolor theme take a PNG. The launcher's `resolve_native_icon_path` chooses
+// by the same rule — both sides must name the same file.
+inline QString appIconRelativePath() {
+#ifdef Q_OS_WIN
+    return QStringLiteral("assets/icons/app/app.ico");
+#else
+    return QStringLiteral("assets/icons/app/icon-256.png");
+#endif
+}
+
 inline QString resolveAppIconPath(const LaunchOptions &options, const QString &applicationDir) {
     const QString explicitPath = normalizeLocalPath(options.appIconPath);
     if (!explicitPath.isEmpty() && QFileInfo::exists(explicitPath)) {
@@ -205,7 +244,7 @@ inline QString resolveAppIconPath(const LaunchOptions &options, const QString &a
 
     // TODO: elevated and non-elevated runs of the same binary occasionally
     // surface different taskbar icons; suspected AppUserModelID cache under HKCU.
-    return findBundledFile(applicationDir, QStringLiteral("assets/icons/app/app.ico"));
+    return findBundledFile(applicationDir, appIconRelativePath());
 }
 
 // Set once from `--nrr-runtime-dir=` before anything touches a lock or a flag.
@@ -272,22 +311,25 @@ inline void clearTrayShutdownFlag() {
 // `NrrNativeBridge::takePendingGuiRequest` consumes. The C++ host no longer
 // needs its own writer for this file.
 
+// The canonical name first: where both exist, the one the service can name is
+// the one worth starting.
+inline QString findProductExecutableNamed(const QString &applicationDir,
+                                          const QStringList &names) {
+    for (const QString &name : names) {
+        const QString found = findProductExecutable(applicationDir, name);
+        if (!found.isEmpty()) {
+            return found;
+        }
+    }
+    return {};
+}
+
 inline QString resolveMainGuiExecutable(const QString &applicationDir) {
-#ifdef Q_OS_WIN
-    const QString executableName = QStringLiteral("NetRuleRouter.exe");
-#else
-    const QString executableName = QStringLiteral("NetRuleRouter");
-#endif
-    return findProductExecutable(applicationDir, executableName);
+    return findProductExecutableNamed(applicationDir, mainGuiExecutableNames());
 }
 
 inline QString resolveTrayGuiExecutable(const QString &applicationDir) {
-#ifdef Q_OS_WIN
-    const QString executableName = QStringLiteral("NetRuleRouterTray.exe");
-#else
-    const QString executableName = QStringLiteral("NetRuleRouterTray");
-#endif
-    return findProductExecutable(applicationDir, executableName);
+    return findProductExecutableNamed(applicationDir, trayExecutableNames());
 }
 
 inline QString resolveLogsDirectory() {

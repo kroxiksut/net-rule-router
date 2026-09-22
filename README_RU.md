@@ -14,7 +14,7 @@ Wi-Fi, Ethernet. Без собственного туннеля, без обла
 
 [![License: MPL-2.0](https://img.shields.io/badge/license-MPL--2.0-blue.svg)](#лицензия)
 ![Platform: Windows, Linux в работе](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
-![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange.svg)
+![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
 <img src="docs/ru/images/rules.png" alt="«Правила»: у каждого правила — что под него попадает и через какой маршрут" width="900" />
 
@@ -179,6 +179,15 @@ cargo build -p nrr-launcher -p nrr-qt-host
 
 Фоновая служба (применяет и поддерживает политику при старте) ставится через
 `scripts/install-service.ps1` и удаляется через `scripts/uninstall-service.ps1`.
+
+Чтобы не осталось ничего — служба, настройки, кэши и логи за один раз —
+`scripts/purge-data.ps1` убирает все места, куда продукт пишет. Без `-Yes` он
+только показывает, что удалит, и оставляет журнал аудита, если не добавить
+`-PurgeAudit`:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
+```
 
 Проверка качества (fmt + clippy + тесты + аудит зависимостей/лицензий):
 

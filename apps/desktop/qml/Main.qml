@@ -26,7 +26,7 @@ ApplicationWindow {
     // emitted into the QML context by the launcher. Windows-all-supported
     // default so mock/preview (which emits no context) still renders every
     // section; the real profile loads from `context.platformProfile` below.
-    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
+    property var platformProfile: ({ os: "windows", enforcementBackend: "wfp", serviceModel: "scm", elevationModel: "uac", supports: { killSwitch: true, appRouting: true, dnsObserve: true, dnsResolver: true, hostsPin: true, backgroundService: true, autostart: true, serviceStabilityConfig: true, localNetworkExceptions: true, blockNotices: true, perUserRouting: false, perAppBlockLeakproof: true, perUserAllProtocolScoping: false } })
     // Capability query for declarative, OS-agnostic section gating: a
     // feature-keyed section renders only when the running OS supports it.
     // Unknown feature or missing profile → true (show it), which is why the
@@ -37,6 +37,19 @@ ApplicationWindow {
         if (!platformProfile || !platformProfile.supports) return true
         return platformProfile.supports[feature] !== false
     }
+    // Service-backed features whose handlers exist on some platforms only. Read
+    // before every request: an unregistered handler answers "not yet
+    // implemented", and a poll asking anyway filled a day's log with refusals.
+    readonly property bool serviceStabilitySupported: supports("serviceStabilityConfig")
+    readonly property bool localNetworksSupported: supports("localNetworkExceptions")
+    readonly property bool blockNoticesSupported: supports("blockNotices")
+    /// Why a section keyed off one of the flags above renders inert. One
+    /// wording for every such section — the reason is the same in all of them.
+    readonly property string platformUnsupportedText: uiRevision >= 0
+        ? tr("status.platform-unsupported",
+            "This is not available on your operating system yet, so the controls here stay off. "
+            + "Nothing here is sent to the background service.")
+        : ""
     property var prefs: ({ launchWindowOnStartup: true, minimizeToTrayInsteadOfClose: true, showNotifications: true, notifySuggestionChanges: true, notifyBlockNotices: true, notifyRuleDuplicates: true, hideBlockNoticeAddresses: false, trayNoticeOpacityPercent: 100, routingDetailedMode: false, showVirtualMachinesSection: false, reopenLastSectionOnStartup: true, firstRunCompleted: false, acceptedEulaVersion: 0, themeMode: "system", effectiveThemeMode: "light", accessibilityHighContrast: false, fontScalePercent: 100, systemFont: "system-default", enhancedFocus: false, simplifiedLabels: false, tooltipsEnabled: true, language: Qt.locale().name, routePrimaryLabel: "Primary", routeSecondaryLabel: "Secondary", selectedPrimaryInterfaceId: "", selectedPrimaryInterfaceName: "", primaryRoleUserConfirmed: false, selectedSecondaryInterfaceId: "", selectedSecondaryInterfaceName: "", secondaryRoleUserConfirmed: false, routeBehaviorMode: "prefer-primary", routeIncludeSubdomains: true, routeSharedIpPolicy: "majority-of-ip", routeEnforcementMode: "resolver", routeKillSwitchBlockAll: false, showBluetoothAdapters: false, showRememberedAdapters: true, autoConfirmAdapterIdChange: true, warnKillSwitchBlockAll: true, killSwitchBannerAcknowledged: false, missingSecondaryBannerAcknowledged: false, trafficStatsPeriod: "today", trafficExportUnit: "mb", diagnosticsArchiveRedactionLevel: "standard", diagnosticsArchiveSessionOnly: true, archiveLogBudgetMib: 0, userPresetsDir: "", selectedPresetSet: "", serviceBackedMirrorJson: "", serviceIntentJson: "", lastOpenedSection: "interfaces-routes" })
     property string section: "interfaces-routes"
     // The section open at launch loads synchronously: an asynchronous first
@@ -87,12 +100,15 @@ ApplicationWindow {
     property var localeDiagnostics: ({})
     property var availableLanguages: []
     property var interfacesRowsAll: []
-    /// Where the adapter rows came from: `"windows-live"` when the service
-    /// enumerated the machine, anything else (including an unknown spelling)
-    /// when they are placeholders. Starts pessimistic — until a source says
-    /// otherwise, rows must not be presented as this machine's adapters.
+    /// Where the adapter rows came from: one of the per-OS live spellings when
+    /// the service enumerated the machine, anything else (including an unknown
+    /// spelling) when they are placeholders. Starts pessimistic — until a
+    /// source says otherwise, rows must not be presented as this machine's
+    /// adapters, so the check is a known-live list rather than "not the mock".
     property string interfacesDataSource: "fallback-mock"
-    readonly property bool interfacesAreLive: interfacesDataSource === "windows-live"
+    readonly property var interfacesLiveSources: ["windows-live", "linux-live"]
+    readonly property bool interfacesAreLive:
+        interfacesLiveSources.indexOf(interfacesDataSource) >= 0
     // Sidecar-backed cache of the last external IP the service resolved per
     // adapter (key -> {ip, observedAtMs}). Populated once at cold start via
     // `interfacesRolesController.loadExternalIpCache()` and kept current by
@@ -1814,6 +1830,7 @@ ApplicationWindow {
     /// it runs on connect and once a day after that — a hypervisor installed
     /// months into using the app creates its network without telling anyone.
     function refreshPendingLocalNetworks() {
+        if (!localNetworksSupported) return
         if (!bridgeAvailable || ((backendStatus || {}).kind) !== "connected") return
         var corr = rpc.rpcLocalNetworksGet()
         if (!corr || corr === "") return
@@ -1831,6 +1848,7 @@ ApplicationWindow {
     /// service already allows them; what this writes is the ANSWER, which is
     /// what stops the offer coming back.
     function acceptPendingLocalNetworks() {
+        if (!localNetworksSupported) return
         var rows = pendingLocalNetworks
         if (rows.length === 0) return
         var decisions = []
@@ -1857,7 +1875,7 @@ ApplicationWindow {
         id: localNetworkRecheckTimer
         interval: 24 * 60 * 60 * 1000
         repeat: true
-        running: true
+        running: window.localNetworksSupported
         onTriggered: window.refreshPendingLocalNetworks()
     }
 
@@ -3445,6 +3463,7 @@ ApplicationWindow {
     /// Acknowledged by the largest id actually read, so an episode raised
     /// while this call was in flight survives to be shown next time.
     function _drainBlockNoticeJournal() {
+        if (!blockNoticesSupported) return
         if (!bridgeAvailable || !rpcTransport
                 || typeof rpcTransport.rpcBlockNoticeJournalList !== "function") return
         var corr = rpcTransport.rpcBlockNoticeJournalList()
@@ -3664,6 +3683,11 @@ ApplicationWindow {
     // paths get re-resolved by the consumer (e.g. ThemedButton in
     // components/) and point to apps/assets/... which doesn't exist.
     function uiIconSource(name) { return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "ui-hc/" : "ui/") + name + ".svg") }
+    // The same icon for a control painted with the accent fill. The normal
+    // set is a blue/indigo gradient, which on that fill is invisible; the
+    // high-contrast set is the same 42 icons painted white, which is what
+    // `palette.highlightedText` puts next to them.
+    function uiIconSourceOnAccent(name) { return Qt.resolvedUrl("../../../assets/icons/ui-hc/" + name + ".svg") }
     function sectionIconSource(sectionId) {
         if (sectionId === "interfaces-routes") return Qt.resolvedUrl("../../../assets/icons/" + (highContrastIcons ? "status-hc/" : "status/") + "interface-ok.svg")
         if (sectionId === "rules") return uiIconSource("search")
@@ -4313,7 +4337,7 @@ ApplicationWindow {
     /// no elevation, works for an ordinary user.
     function refreshRuleEditPermission() {
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        var corr = (bridgeAvailable && bridge !== null
+        var corr = (serviceStabilitySupported && bridgeAvailable && bridge !== null
                 && typeof bridge.rpcServiceStabilityConfigGet === "function")
             ? bridge.rpcServiceStabilityConfigGet() : ""
         if (!corr) {
@@ -4428,6 +4452,12 @@ ApplicationWindow {
     // ("user:enforcement-mode", "user:verbose-toggle", …) the service logs
     // with the write, so a clobbered toggle is diagnosable from the NDJSON.
     function applyServiceStabilityPatch(partial, onDone, origin) {
+        // Refused before the intent is recorded: a parked decision for a config
+        // this OS never reads would be replayed on every connect edge forever.
+        if (!serviceStabilitySupported) {
+            if (typeof onDone === "function") onDone(false, "unsupported-platform", null)
+            return
+        }
         var originText = String(origin || "")
         // Every user-driven change to a service-owned setting funnels through
         // here, so this is the one place that can record intent without having

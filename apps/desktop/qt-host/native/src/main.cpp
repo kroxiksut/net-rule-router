@@ -236,6 +236,16 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     const bool isMainGui = QFileInfo(qmlPath).fileName() == QStringLiteral("Main.qml");
+
+#if defined(Q_OS_UNIX) && !defined(Q_OS_MACOS)
+    // Wayland takes the window name and icon from the desktop entry matched by
+    // app_id and ignores setWindowIcon, so each surface must name its own
+    // entry. One host binary serves both, so the QML entry point is what tells
+    // them apart here — the executable name cannot.
+    QGuiApplication::setDesktopFileName(isMainGui
+                                            ? QStringLiteral("netrulerouter")
+                                            : QStringLiteral("netrulerouter-tray"));
+#endif
     // Main GUI: window may be hidden by close-to-tray and re-shown via
     // activation handover from the tray; do not quit on last-window-hidden.
     // Tray: its own prompt windows open and close on demand (TrayPromptWindow),

@@ -13,50 +13,33 @@ set -uo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=lib/service-paths.sh
+. "$script_dir/lib/service-paths.sh"
 
-cyan() { printf '\033[36m%s\033[0m\n' "$1"; }
-gray() { printf '\033[90m%s\033[0m\n' "$1"; }
-yellow() { printf '\033[33m%s\033[0m\n' "$1"; }
-
-# Keep in sync with SYSTEMD_UNIT_NAME in shared/contracts/src/product_identity.rs.
-unit_name="netrulerouter.service"
-
-cyan "==> systemctl status $unit_name"
-systemctl status --no-pager "$unit_name"
+nrr_cyan "==> systemctl status $NRR_UNIT_NAME"
+systemctl status --no-pager "$NRR_UNIT_NAME"
 status_exit=$?
 
 if [ "$status_exit" -eq 4 ]; then
-  yellow "Service not registered (systemctl exit=$status_exit)."
+  nrr_yellow "Service not registered (systemctl exit=$status_exit)."
   exit 0
 fi
 
-exe_name="nrr-serviced"
-
-resolve_target_root() {
-  local cfg="$repo_root/.cargo/config.toml" td
-  if [ -f "$cfg" ]; then
-    td="$(grep -oP '^\s*target-dir\s*=\s*"\K[^"]+' "$cfg" 2>/dev/null | head -n1 || true)"
-    if [ -n "${td:-}" ]; then
-      case "$td" in
-        /*) printf '%s\n' "$td"; return ;;
-        *) printf '%s\n' "$repo_root/$td"; return ;;
-      esac
-    fi
-  fi
-  printf '%s\n' "$repo_root/target"
-}
-target_root="$(resolve_target_root)"
-debug_path="$target_root/debug/$exe_name"
-release_path="$target_root/release/$exe_name"
+# The staged copy is the binary the unit actually runs, so its banner describes
+# the installed service; the build output only stands in when nothing is staged.
 exe_path=""
-[ -f "$debug_path" ] && exe_path="$debug_path"
-[ -z "$exe_path" ] && [ -f "$release_path" ] && exe_path="$release_path"
+if [ -f "$NRR_STAGED_SERVICE_BINARY" ]; then
+  exe_path="$NRR_STAGED_SERVICE_BINARY"
+else
+  candidate="$(nrr_built_service_binary "$(nrr_target_root "$repo_root")" auto)"
+  [ -f "$candidate" ] && exe_path="$candidate"
+fi
 
 if [ -n "$exe_path" ]; then
   echo ""
-  cyan "==> $exe_name status"
+  nrr_cyan "==> $NRR_SERVICE_EXE_NAME status"
   "$exe_path" status
 else
   echo ""
-  gray "(Service binary not found in target/. Skipping orchestration banner.)"
+  nrr_gray "(Service binary found neither staged nor in target/. Skipping orchestration banner.)"
 fi

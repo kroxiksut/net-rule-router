@@ -268,7 +268,7 @@ ColumnLayout {
     // elsewhere while the resident section stayed loaded.
     function _fetchVerboseLogging() {
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!root.serviceStabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
             return
         }
@@ -498,6 +498,9 @@ ColumnLayout {
         // apply fails), applied through the same live path used by Settings.
         CheckBox {
             id: verboseLoggingCheck
+            // Rides the service-stability config; where that has no handler the
+            // toggle would flip and change nothing.
+            visible: root.serviceStabilitySupported
             text: root.tr(
                 "settings.diagnostics.service-stability.verbose.label",
                 "Verbose service logging")

@@ -22,7 +22,7 @@
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nrr_platform_api::dns::{
     DnsResolverError, DnsResolverPort, ResolvedRecord, SystemDnsServersPort, UpstreamDnsCandidate,
@@ -36,6 +36,12 @@ use crate::dns_message::{
 /// purpose: this runs on a service tick with several names to refresh, and a
 /// resolver that is not answering must not hold the tick.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ceiling on ONE `resolve` call, servers and the TCP retry together. Without
+/// it a machine listing three dead resolvers costs the caller three times the
+/// per-server wait, which is how a caller on the datapath loses a worker to a
+/// resolver nobody can reach.
+const RESOLVE_BUDGET: Duration = Duration::from_secs(3);
 
 /// A datagram answer larger than this cannot arrive; the server sets TC instead
 /// and we re-ask over TCP.
@@ -85,6 +91,8 @@ pub fn parse_nameservers(text: &str) -> Vec<Ipv4Addr> {
 pub struct LinuxDnsResolver {
     servers: Box<dyn SystemDnsServersPort>,
     timeout: Duration,
+    /// Ceiling on the whole call; the per-server wait is what is left of it.
+    budget: Duration,
     /// Transaction ids are sequential from a per-process starting point rather
     /// than random: the id is a check that a datagram answers OUR question, and
     /// the real defence against a forged answer is that we also compare the
@@ -113,6 +121,7 @@ impl LinuxDnsResolver {
         Self {
             servers,
             timeout: QUERY_TIMEOUT,
+            budget: RESOLVE_BUDGET,
             next_id: AtomicU16::new(seed),
         }
     }
@@ -125,12 +134,34 @@ impl LinuxDnsResolver {
         self
     }
 
+    /// Shorten or lengthen the ceiling on the whole call.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// What one socket operation may wait: the per-server timeout, or what is
+    /// left of the call budget when that is shorter. `None` once the budget is
+    /// spent — a zero read timeout means "block forever" to the kernel, which
+    /// is the opposite of what an exhausted budget asks for.
+    fn wait_left(&self, deadline: Instant) -> Option<Duration> {
+        let left = deadline.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then(|| self.timeout.min(left))
+    }
+
     fn ask(
         &self,
         server: Ipv4Addr,
         canonical: &str,
         family: AddressFamily,
+        deadline: Instant,
     ) -> Result<DnsAnswer, DnsResolverError> {
+        let Some(wait) = self.wait_left(deadline) else {
+            return Err(DnsResolverError::Timeout {
+                hostname: canonical.to_owned(),
+            });
+        };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let query =
             encode_query(id, canonical, family).ok_or_else(|| DnsResolverError::InvalidName {
@@ -138,11 +169,13 @@ impl LinuxDnsResolver {
             })?;
         let target = SocketAddr::new(server.into(), 53);
 
-        match self.ask_udp(target, &query, id, canonical, family) {
+        match self.ask_udp(target, &query, id, canonical, family, wait) {
             // The answer did not fit in a datagram. The protocol's own remedy is
             // to ask again over TCP; treating TC as a failure would make every
             // large record set unresolvable.
-            Err(UdpFailure::Truncated) => self.ask_tcp(target, &query, id, canonical, family),
+            Err(UdpFailure::Truncated) => {
+                self.ask_tcp(target, &query, id, canonical, family, deadline)
+            }
             Err(UdpFailure::Failed(e)) => Err(e),
             Ok(answer) => Ok(answer),
         }
@@ -155,11 +188,12 @@ impl LinuxDnsResolver {
         id: u16,
         canonical: &str,
         family: AddressFamily,
+        wait: Duration,
     ) -> Result<DnsAnswer, UdpFailure> {
         let socket =
             UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).map_err(|e| net_error(e, canonical))?;
         socket
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(Some(wait))
             .map_err(|e| net_error(e, canonical))?;
         // Connected UDP: the kernel then drops datagrams from anyone else, which
         // is the cheapest half of not believing a forged answer.
@@ -182,11 +216,26 @@ impl LinuxDnsResolver {
         id: u16,
         canonical: &str,
         family: AddressFamily,
+        deadline: Instant,
     ) -> Result<DnsAnswer, DnsResolverError> {
-        let mut stream = TcpStream::connect_timeout(&target, self.timeout)
-            .map_err(|e| plain_net(e, canonical))?;
+        // The retry is a second round trip, so it re-reads the budget instead
+        // of inheriting the datagram attempt's share of it.
+        let Some(wait) = self.wait_left(deadline) else {
+            return Err(DnsResolverError::Timeout {
+                hostname: canonical.to_owned(),
+            });
+        };
+        let mut stream =
+            TcpStream::connect_timeout(&target, wait).map_err(|e| plain_net(e, canonical))?;
+        // `None` here would mean "block forever", so an exhausted budget after
+        // the connect ends the attempt instead.
+        let Some(read_wait) = self.wait_left(deadline) else {
+            return Err(DnsResolverError::Timeout {
+                hostname: canonical.to_owned(),
+            });
+        };
         stream
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(Some(read_wait))
             .map_err(|e| plain_net(e, canonical))?;
         // Over TCP a message is length-prefixed; without the prefix the server
         // waits for bytes that never come and the query times out.
@@ -305,8 +354,14 @@ impl DnsResolverPort for LinuxDnsResolver {
         let mut last = DnsResolverError::Timeout {
             hostname: canonical.clone(),
         };
+        let deadline = Instant::now() + self.budget;
         for candidate in servers {
-            match self.ask(candidate.server, &canonical, family) {
+            // The budget covers the list, not each entry: a machine listing
+            // three unreachable servers must not cost the caller three waits.
+            if self.wait_left(deadline).is_none() {
+                break;
+            }
+            match self.ask(candidate.server, &canonical, family, deadline) {
                 Ok(DnsAnswer::Addresses { addresses, min_ttl }) => {
                     return Ok(ResolvedRecord {
                         canonical_hostname: canonical,
@@ -383,6 +438,34 @@ options edns0
             resolver.resolve("example.com", AddressFamily::Ipv4),
             Err(DnsResolverError::UnsupportedPlatform { .. })
         ));
+    }
+
+    /// Documentation-range servers nothing answers for: the wait is the point,
+    /// not the address.
+    #[test]
+    fn unreachable_servers_share_one_budget_instead_of_one_wait_each() {
+        struct TwoDeadServers;
+        impl SystemDnsServersPort for TwoDeadServers {
+            fn upstream_candidates_v4(&self) -> Vec<UpstreamDnsCandidate> {
+                vec![
+                    UpstreamDnsCandidate::new(None, Ipv4Addr::new(192, 0, 2, 1)),
+                    UpstreamDnsCandidate::new(None, Ipv4Addr::new(192, 0, 2, 2)),
+                ]
+            }
+        }
+        let resolver = LinuxDnsResolver::with_servers(Box::new(TwoDeadServers))
+            .with_timeout(Duration::from_millis(300))
+            .with_budget(Duration::from_millis(400));
+
+        let started = Instant::now();
+        let answer = resolver.resolve("example.com", AddressFamily::Ipv4);
+
+        assert!(matches!(answer, Err(DnsResolverError::Timeout { .. })));
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "two dead servers took {:?}, the budget was 400 ms",
+            started.elapsed()
+        );
     }
 
     #[test]

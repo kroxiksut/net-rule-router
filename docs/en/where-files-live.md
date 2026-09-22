@@ -76,9 +76,19 @@ An uninstall that offers to remove your data removes the `ProgramData` and `AppD
 
 ## If you want a clean start
 
+From a repository checkout, one command does all of it:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
+```
+
+It prints every place it would remove and removes nothing until you add `-Yes`. The security audit trail stays behind unless you also add `-PurgeAudit`, because it is the record of what changed your routing. Your rules files are never touched, wherever you keep them.
+
+By hand, if you would rather see each step:
+
 1. Close the app.
 2. From an administrator console, run `nrr-cli uninstall --purge`. That stops the service, deregisters it and deletes the folder it owns — which is the part you cannot delete by hand.
-3. Delete `%APPDATA%\NetRuleRouter\` and `%LOCALAPPDATA%\NetRuleRouter\` if you also want the app to forget your theme, language and window layout.
+3. Delete `%APPDATA%\NetRuleRouter\`, `%LOCALAPPDATA%\NetRuleRouter\` and `%TEMP%\NetRuleRouter\` if you also want the app to forget your theme, language and window layout.
 4. Install the service again and load your rules files.
 
 You get a factory-fresh install with your rules intact, which is the point of keeping them outside the app in the first place.

@@ -95,6 +95,7 @@ pub(crate) fn build_runtime_deps(
         liveness,
         rules_provider,
         auto_rules,
+        traffic_sampler,
     ) = match policy {
         Some(stack) => (
             Some(stack.cycle),
@@ -105,8 +106,9 @@ pub(crate) fn build_runtime_deps(
             Some(stack.liveness),
             Some(stack.rules),
             Some(stack.auto_rules),
+            stack.traffic_sampler,
         ),
-        None => (None, None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None, None),
     };
     // One source, two readers: the monitor that reports link changes and the
     // enforcer that resolves bindings against them. Two enumerations would let
@@ -177,7 +179,7 @@ pub(crate) fn build_runtime_deps(
         // Counting octets per interface: the mechanism has existed since the
         // adapter port landed and was simply never called here, so the traffic
         // page had nothing to show on Linux.
-        traffic_tick: traffic_tick(artifacts, state_conn.as_ref()),
+        traffic_tick: traffic_tick(traffic_sampler, state_conn.as_ref()),
         activation_coordinator: None,
         // Domain rules are only as current as the addresses behind them: without
         // this the cache never refreshes, and a rule naming a domain enforces
@@ -185,7 +187,9 @@ pub(crate) fn build_runtime_deps(
         dns_refresh_orchestrator: cache_store.map(|store| {
             Arc::new(
                 nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
-                    Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+                    Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
+                        Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+                    )),
                     store,
                 ),
             )
@@ -317,6 +321,7 @@ pub(crate) fn build_ipc_server(
                 Arc::clone(&event_bus),
                 gui_binary_path(),
                 Some(Arc::clone(&stack.auto_rules)),
+                stack.traffic_sampler.clone(),
             );
             let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
             nrr_service_runtime::ipc_handlers::register_production_handlers(
@@ -502,13 +507,13 @@ const LIVENESS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mi
 /// and matches the single-user shape the free tier is built around; a
 /// multi-user ledger is a product decision, not a wiring one.
 fn traffic_tick(
-    artifacts: &BootstrapArtifacts,
+    sampler: Option<TrafficSamplerHandle>,
     state_conn: Option<&Arc<std::sync::Mutex<rusqlite::Connection>>>,
 ) -> Option<nrr_service_runtime::TrafficTickDeps> {
     use nrr_platform_api::active_principals::ActivePrincipalSource;
 
     let state_conn = state_conn?;
-    let sampler = open_traffic_sampler(&artifacts.topology.traffic_db_path)?;
+    let sampler = sampler?;
 
     let roles: nrr_service_runtime::TrafficRoleResolver = {
         let conn = Arc::clone(state_conn);
@@ -551,15 +556,19 @@ fn traffic_tick(
     })
 }
 
+/// The one sampler both readers share. A second one would mean a second
+/// connection to the ledger: the tick would count into one and the IPC surface
+/// would report from the other.
+pub(crate) type TrafficSamplerHandle =
+    Arc<std::sync::Mutex<nrr_service_runtime::traffic_sampler::TrafficSampler>>;
+
 /// Open the rebuildable traffic ledger and prime a sampler over the Linux
 /// interface counters.
 ///
 /// `None` disables the counter rather than failing the daemon: a machine with a
 /// broken ledger still routes, and traffic figures are the one thing here that
 /// can be recomputed by simply counting again.
-fn open_traffic_sampler(
-    path: &std::path::Path,
-) -> Option<Arc<std::sync::Mutex<nrr_service_runtime::traffic_sampler::TrafficSampler>>> {
+fn open_traffic_sampler(path: &std::path::Path) -> Option<TrafficSamplerHandle> {
     use nrr_platform_linux::interface_traffic::LinuxInterfaceCounterSource;
     use nrr_service_runtime::traffic_sampler::TrafficSampler;
     use nrr_storage::SqliteTrafficStore;
@@ -648,6 +657,10 @@ pub(crate) struct PolicyStack {
     /// get a look at it.
     pub dns_consumer_subject: Arc<std::sync::Mutex<Option<String>>>,
     pub cycle: Arc<PrincipalEnforcementCycle>,
+    /// The ledger both readers share: the housekeeping tick counts into it and
+    /// the IPC surface reports from it. Two samplers would be two connections,
+    /// one counting and the other answering. `None` leaves the counter off.
+    pub traffic_sampler: Option<TrafficSamplerHandle>,
 }
 
 /// Assemble the policy stack, or explain why the daemon cannot enforce.
@@ -704,7 +717,9 @@ pub(crate) fn build_policy_stack(
     };
     let rule_seeder = Arc::new(
         RuleHostnameSeeder::new(
-            Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+            Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
+                Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+            )),
             Arc::clone(&cache_store),
             Arc::clone(&fqdn_cache),
             Arc::clone(&rules),
@@ -851,5 +866,6 @@ pub(crate) fn build_policy_stack(
                 .with_events(events)
                 .with_fail_closed_posture_status(fail_closed_posture),
         ),
+        traffic_sampler: open_traffic_sampler(&artifacts.topology.traffic_db_path),
     })
 }

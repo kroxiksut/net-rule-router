@@ -292,7 +292,10 @@ Pane {
                                 spacing: modelData.icon ? root.uiTheme.spacingSm : 0
                                 Image {
                                     visible: !!modelData.icon
-                                    source: modelData.icon ? root.uiIconSource(modelData.icon) : ""
+                                    source: !modelData.icon ? ""
+                                        : (settingsCategoryButton.highlighted
+                                            ? root.uiIconSourceOnAccent(modelData.icon)
+                                            : root.uiIconSource(modelData.icon))
                                     sourceSize.width: 16
                                     sourceSize.height: 16
                                     Layout.preferredWidth: visible ? 16 : 0

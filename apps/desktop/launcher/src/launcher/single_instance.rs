@@ -1,13 +1,16 @@
 // Single-instance lock: the OS claim + lock-file fallback, stale-lock
-// reclamation, and the liveness probes (`is_process_alive`, tasklist parsing)
-// that decide whether a recorded owner is still real.
+// reclamation, the liveness probes (`is_process_alive`, tasklist parsing)
+// that decide whether a recorded owner is still real, and the build stamp
+// that tells a duplicate launch WHICH build is holding the lock.
 
 use std::env;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
+use std::time::UNIX_EPOCH;
 
 #[cfg(windows)]
 use super::child_process::apply_no_window;
@@ -66,7 +69,7 @@ impl SingleInstanceGuard {
                         .write(true)
                         .truncate(true)
                         .open(&lock_path)?;
-                    writeln!(lock_file, "pid={}", std::process::id())?;
+                    write_lock_record(&mut lock_file)?;
                     return Ok(Some(Self {
                         lock_path,
                         _lock_file: lock_file,
@@ -91,7 +94,7 @@ impl SingleInstanceGuard {
                 .open(&lock_path)
             {
                 Ok(mut lock_file) => {
-                    writeln!(lock_file, "pid={}", std::process::id())?;
+                    write_lock_record(&mut lock_file)?;
                     return Ok(Some(Self {
                         lock_path,
                         _lock_file: lock_file,
@@ -148,7 +151,7 @@ impl SingleInstanceGuard {
             .write(true)
             .truncate(true)
             .open(&lock_path)?;
-        writeln!(lock_file, "pid={}", std::process::id())?;
+        write_lock_record(&mut lock_file)?;
         Ok(Self {
             lock_path,
             _lock_file: lock_file,
@@ -208,6 +211,99 @@ fn cleanup_stale_lock_file(lock_path: &Path) -> io::Result<Option<u32>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Which build a lock holder is running: the crate version plus a fingerprint
+/// of the executable file behind it.
+///
+/// The fingerprint is size + mtime because that costs one `stat`, while
+/// hashing the image would read megabytes on every single launch to answer a
+/// question any rebuild already changes. It is a build *identity*, not a
+/// tamper check: two different builds of identical size and timestamp would
+/// compare equal, which is exactly the accident this never has to survive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct BuildStamp {
+    version: String,
+    exe_size: u64,
+    exe_mtime_secs: u64,
+}
+
+impl BuildStamp {
+    /// `None` when the running executable cannot be stat'ed — the lock then
+    /// carries no build lines and every reader keeps the pid-only behaviour.
+    pub(super) fn current() -> Option<Self> {
+        let metadata = fs::metadata(env::current_exe().ok()?).ok()?;
+        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        Some(Self {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            exe_size: metadata.len(),
+            exe_mtime_secs: modified.as_secs(),
+        })
+    }
+}
+
+impl fmt::Display for BuildStamp {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "version={} exe_size={} exe_mtime={}",
+            self.version, self.exe_size, self.exe_mtime_secs
+        )
+    }
+}
+
+/// Records the holder of `lock_file`: the pid every reader has always
+/// expected, followed by the build lines an older reader simply ignores.
+pub(super) fn write_lock_record(lock_file: &mut File) -> io::Result<()> {
+    writeln!(lock_file, "pid={}", std::process::id())?;
+    if let Some(stamp) = BuildStamp::current() {
+        writeln!(lock_file, "version={}", stamp.version)?;
+        writeln!(lock_file, "exe_size={}", stamp.exe_size)?;
+        writeln!(lock_file, "exe_mtime={}", stamp.exe_mtime_secs)?;
+    }
+    Ok(())
+}
+
+/// The build recorded in the lock for `instance_key` when it is NOT this
+/// process's own, as `(running, ours)`.
+///
+/// `None` means there is no disagreement to report: no lock file, a lock
+/// written before the build lines existed, an executable we cannot stat, or
+/// the same build — all of which leave the caller's behaviour unchanged.
+pub(super) fn foreign_build_in_lock(instance_key: &str) -> Option<(BuildStamp, BuildStamp)> {
+    let content = fs::read_to_string(lock_file_path(instance_key)).ok()?;
+    let running = parse_build_stamp_from_lock_content(&content)?;
+    let ours = BuildStamp::current()?;
+    (running != ours).then_some((running, ours))
+}
+
+/// Where the lock for `instance_key` lives, for readers. Writers go through
+/// `ensure_user_runtime_dir` instead: they must also create the directory.
+pub(super) fn lock_file_path(instance_key: &str) -> PathBuf {
+    nrr_platform_api::paths::user_runtime_dir().join(format!("{instance_key}.lock"))
+}
+
+/// `None` for a lock written before the build lines existed (pid only), or one
+/// missing any of them — the caller then has nothing to compare against.
+pub(super) fn parse_build_stamp_from_lock_content(content: &str) -> Option<BuildStamp> {
+    let (mut version, mut exe_size, mut exe_mtime_secs) = (None, None, None);
+    for line in content.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "version" if !value.is_empty() => version = Some(value.to_owned()),
+            "exe_size" => exe_size = value.parse().ok(),
+            "exe_mtime" => exe_mtime_secs = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(BuildStamp {
+        version: version?,
+        exe_size: exe_size?,
+        exe_mtime_secs: exe_mtime_secs?,
+    })
 }
 
 pub(super) fn parse_pid_from_lock_content(content: &str) -> Option<u32> {

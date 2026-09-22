@@ -11,10 +11,10 @@ use super::*;
 /// `ReverseDnsLearner` (PTR + forward-confirm against the CURRENT captured
 /// upstream, re-captured on a 5-min TTL like the hosts-bypass resolver) and the
 /// rule-gated cache sink (the DNS-observation consumer's `learn_reverse_confirmed`
-/// keep-logic), draining dropped IPs off the observe-tick hot path. The thread
+/// keep-logic), draining the named IPs off the observe-tick hot path. The thread
 /// ends when the sender (held by the conn-trace consumer) is dropped at shutdown.
 pub(super) fn spawn_fcrdns_learner_worker(
-    rx: std::sync::mpsc::Receiver<(std::net::Ipv4Addr, bool)>,
+    rx: std::sync::mpsc::Receiver<(std::net::Ipv4Addr, bool, ReverseLearnOrigin)>,
     consumer: Arc<nrr_service_runtime::dns_observation_consumer::DnsObservationConsumer>,
     companion: Option<CompanionFromReverseDeps<'_>>,
 ) {
@@ -57,7 +57,16 @@ pub(super) fn spawn_fcrdns_learner_worker(
     let spawned = std::thread::Builder::new()
         .name("nrr-fcrdns".into())
         .spawn(move || {
-            for (ip, allow_direct) in rx {
+            for (ip, allow_direct, origin) in rx {
+                // The two feeds mean different things; only one of them is a
+                // drop. Naming the wrong one costs the next reader a hunt for
+                // a filter that never fired.
+                let what = match origin {
+                    ReverseLearnOrigin::EnforcementDrop => "dropped destination",
+                    ReverseLearnOrigin::PrimaryEgress => {
+                        "destination that left over the main link"
+                    }
+                };
                 // Exact match first: if our own resolver saw this address in a
                 // rule host's answer recently, the address needs no naming — we
                 // already know whose it is. This is the common case for a
@@ -74,7 +83,8 @@ pub(super) fn spawn_fcrdns_learner_worker(
                             target: "nrr::fcrdns",
                             ip = %ip,
                             host = %host,
-                            "dropped destination matched a recent answer for a rule host — permit compiles on the next reconcile",
+                            what,
+                            "matched a recent answer for a rule host — permit compiles on the next reconcile",
                         );
                         continue;
                     }
@@ -83,14 +93,16 @@ pub(super) fn spawn_fcrdns_learner_worker(
                     LearnOutcome::Learned => tracing::info!(
                         target: "nrr::fcrdns",
                         ip = %ip,
-                        "reverse-confirmed a dropped destination into a rule host — permit compiles on the next reconcile",
+                        what,
+                        "reverse-confirmed into a rule host — permit compiles on the next reconcile",
                     ),
                     // Forward-confirmed but matches NO rule: a
                     // positively-direct destination the block-all was cutting.
                     LearnOutcome::LearnedDirect => tracing::info!(
                         target: "nrr::fcrdns",
                         ip = %ip,
-                        "reverse-confirmed a dropped destination into a DIRECT host — block-all exemption compiles on the next reconcile",
+                        what,
+                        "reverse-confirmed into a DIRECT host — block-all exemption compiles on the next reconcile",
                     ),
                     LearnOutcome::NotConfirmed | LearnOutcome::Skipped => {}
                 }
@@ -167,11 +179,12 @@ fn observed_path_to_win32(path: &str) -> Option<std::path::PathBuf> {
 /// Grouped because they arrive together and are wired from the same place —
 /// and because passing them loose put the builder over the argument limit.
 pub(super) struct ObservationSinks {
-    /// When the FCrDNS worker is active, this sender is the drop hook: OUR
-    /// block of a routable V4 enqueues the IP for the worker to name +
+    /// When the FCrDNS worker is active, this sender is the naming hook: a
+    /// routable V4 OUR block dropped, or one that left over the main link
+    /// beside routed traffic, is enqueued for the worker to name +
     /// forward-confirm. `None` disables reverse-learning.
     pub(super) reverse_dns_learner_tx:
-        Option<std::sync::mpsc::SyncSender<(std::net::Ipv4Addr, bool)>>,
+        Option<std::sync::mpsc::SyncSender<(std::net::Ipv4Addr, bool, ReverseLearnOrigin)>>,
     /// Deletes one remembered application destination. Wired when the state DB
     /// is open: a destination withdrawn for moving another process's traffic
     /// must not be re-seeded from disk at the next start.
@@ -364,8 +377,8 @@ pub(super) fn build_conn_trace_pair(
     // observe tick never blocks on DNS I/O.
     if let Some(tx) = reverse_dns_learner_tx {
         consumer_builder = consumer_builder.with_reverse_dns_learner(Arc::new(
-            move |ip: std::net::Ipv4Addr, allow_direct: bool| {
-                let _ = tx.try_send((ip, allow_direct));
+            move |ip: std::net::Ipv4Addr, allow_direct: bool, origin: ReverseLearnOrigin| {
+                let _ = tx.try_send((ip, allow_direct, origin));
             },
         ));
     }
