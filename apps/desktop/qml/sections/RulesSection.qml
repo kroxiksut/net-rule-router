@@ -587,15 +587,20 @@ ColumnLayout {
     // fill and by the folder-change handler so both paths agree.
     function _refreshBundledPresetSelection() {
         section._loadBundledPresetList()
-        // A set the user picked before wins over any default: re-deriving the
-        // choice on every visit is what made a deliberate pick evaporate.
+        // Only a set the user actually picked or loaded is shown. Falling back
+        // to a region default here made the row NAME a set nobody had loaded —
+        // it read as "this is what is applied" while the rules on screen came
+        // from somewhere else entirely.
         var pick = section._rememberedPresetIndex()
-        if (pick < 0) pick = section._preferredBundledPresetIndex()
-        if (pick < 0 || pick >= section._bundledPresetLabels.length) pick = 0
+        if (pick < 0 || pick >= section._bundledPresetLabels.length) {
+            bundledPresetCombo.currentIndex = -1
+            bundledPresetCombo.displayText =
+                root.tr("rules.bundled-preset.choose", "Choose a rule set...")
+            return
+        }
         bundledPresetCombo.currentIndex = pick
         bundledPresetCombo.displayText =
-            (section._bundledPresetLabels.length > pick)
-                ? section._presetDisplayName(section._bundledPresetLabels[pick]) : ""
+            section._presetDisplayName(section._bundledPresetLabels[pick])
     }
 
     /// A Menu keeps its style's default width and elides what does not fit;
@@ -641,13 +646,6 @@ ColumnLayout {
         if (key === "" || key === String(root.prefs.selectedPresetSet || "")) return
         root.updatePrefs({ selectedPresetSet: key })
         root.emitPrefs()
-    }
-
-    // Пресет по языку/региону системы как значение по умолчанию (пользователь
-    // дальше меняет вручную) — эвристика живёт на окне (`ruleSetPreferredIndex`),
-    // потому что тем же выбором пользуется гидратация при холодном старте.
-    function _preferredBundledPresetIndex() {
-        return root.ruleSetCatalog.ruleSetPreferredIndex()
     }
 
     // Read the selected bundled preset's primary+secondary files and route
@@ -984,7 +982,10 @@ ColumnLayout {
                 theme: root.uiTheme
                 text: root.tr("rules.bundled-preset.load", "Load")
                 icon.source: root.uiIconSource("load-list")
-                enabled: section._bundledPresetLabels.length > 0
+                // Nothing picked yet is a real state now, and "Load" with no
+                // set behind it would either do nothing or guess.
+                enabled: bundledPresetCombo.currentIndex >= 0
+                    && section._bundledPresetLabels.length > 0
                     && !section.rulesLocked
                 onClicked: section._loadBundledPreset(bundledPresetCombo.currentIndex)
             }

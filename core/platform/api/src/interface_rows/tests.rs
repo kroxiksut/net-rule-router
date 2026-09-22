@@ -512,3 +512,24 @@ fn the_v6_derivation_ignores_other_interfaces_and_the_other_family() {
     ];
     assert_eq!(derive_forwarding_next_hop_v6(&routes, 7), None);
 }
+
+#[test]
+fn every_placeholder_row_carries_a_declared_preview_id() {
+    for row in fallback_rows() {
+        assert!(
+            is_preview_persistent_id(&row.persistent_id),
+            "{} is handed out by the placeholder dataset but not declared in PREVIEW_PERSISTENT_IDS \
+             — the service would take it for a real adapter",
+            row.persistent_id
+        );
+    }
+}
+
+#[test]
+fn a_live_adapter_id_is_not_mistaken_for_a_placeholder() {
+    assert!(!is_preview_persistent_id(
+        "win-adapter:{00000000-1111-2222-3333-444444444444}"
+    ));
+    assert!(!is_preview_persistent_id("linux-adapter:wlp3s0"));
+    assert!(!is_preview_persistent_id(""));
+}

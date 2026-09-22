@@ -24,6 +24,7 @@ impl BasicAvailabilityStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterfacesDataSource {
     WindowsLive,
+    LinuxLive,
     FallbackMock,
 }
 
@@ -31,6 +32,7 @@ impl InterfacesDataSource {
     pub const fn title(self) -> &'static str {
         match self {
             Self::WindowsLive => "windows-live",
+            Self::LinuxLive => "linux-live",
             Self::FallbackMock => "fallback-mock",
         }
     }
@@ -44,13 +46,14 @@ impl InterfacesDataSource {
     pub fn from_title(title: &str) -> Self {
         match title {
             "windows-live" => Self::WindowsLive,
+            "linux-live" => Self::LinuxLive,
             _ => Self::FallbackMock,
         }
     }
 
     /// Whether these rows describe the machine as it actually is.
     pub const fn is_live(self) -> bool {
-        matches!(self, Self::WindowsLive)
+        matches!(self, Self::WindowsLive | Self::LinuxLive)
     }
 }
 

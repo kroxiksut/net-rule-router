@@ -161,8 +161,10 @@ pub struct SnapshotInterfacesRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct SnapshotInterfacesResponse {
-    /// `"windows-live"` in production, `"fallback-mock"` when the
-    /// adapter monitor is in fallback mode.
+    /// The live spelling of the OS that enumerated the rows (`"windows-live"`,
+    /// `"linux-live"`), or `"fallback-mock"` when they are the deterministic
+    /// placeholder set. A reader must treat an unknown spelling as placeholder:
+    /// rows presented as this machine's adapters have to be this machine's.
     pub data_source: String,
     pub adapters: Vec<AdapterEntry>,
     /// Runtime routing state for the secondary route role.

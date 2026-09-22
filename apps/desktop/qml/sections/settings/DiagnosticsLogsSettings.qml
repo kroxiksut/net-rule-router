@@ -368,6 +368,7 @@ GroupBox {
     }
 
     function _fetchStabilityConfig() {
+        if (!root.serviceStabilitySupported) return
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
         if (!root.bridgeAvailable
                 || bridge === null
@@ -1049,8 +1050,35 @@ GroupBox {
         // { "ipc-accept-policy": { "kind": "recoverable",
         //   "max-restarts": N, "backoff-base-ms": N, "backoff-cap-ms": N } }
         // or { "ipc-accept-policy": { "kind": "critical" } }.
+        // Same card, same title, nothing to operate: the group is named so the
+        // user can tell it apart from a screen that simply failed to load.
         Frame {
             Layout.fillWidth: true
+            visible: !root.serviceStabilitySupported
+            padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
+            background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: root.uiTheme.spacingSm
+                Label {
+                    Layout.fillWidth: true
+                    text: root.tr("settings.diagnostics.service-stability.title",
+                        "Service stability")
+                    color: root.textColor
+                    font.bold: true
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.platformUnsupportedText
+                    color: root.mutedTextColor
+                    wrapMode: Text.WordWrap
+                }
+            }
+        }
+
+        Frame {
+            Layout.fillWidth: true
+            visible: root.serviceStabilitySupported
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
             background: CardSurface { theme: root.uiTheme; cornerRadius: root.uiTheme.radiusSm }
             ColumnLayout {

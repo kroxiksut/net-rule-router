@@ -447,6 +447,19 @@ impl ServiceControlPort for LinuxServiceControl {
                 operation: "installing the service under a specific account",
             });
         }
+        // Refused before anything is written: the unit hides the home trees
+        // from the service, so registering a binary that lives in one produces
+        // an install that reports success and a service that can never start.
+        // The message names the way out, because the journal will only say 203.
+        if !crate::systemd::unit_can_execute(&spec.binary_path) {
+            return Err(ServiceControlError::Mechanism {
+                detail: format!(
+                    "the service cannot run from {}: its unit hides the home directories (ProtectHome=yes). Copy the binary somewhere system-wide, e.g. /usr/lib/{}/, and install it from there — scripts/install-service.sh does this.",
+                    spec.binary_path.display(),
+                    nrr_shared::product_identity::PRODUCT_NAME_UNIX,
+                ),
+            });
+        }
         let plan = plan_install(&unit_config(spec), activation_for(spec.start_mode));
         self.execute_install_plan(&plan)?;
         Ok(ServiceInstallReport {

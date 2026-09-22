@@ -20,6 +20,17 @@ SystemTrayIcon {
     property string routeSecondaryLabel: "Secondary"
     property string iconFileUrl: ""
     property var theme: ({ selectedMode: "system", effectiveMode: "light", systemMode: "light", systemModeDetected: false })
+    // OS capability descriptor, mirrored from the main GUI context. The tray
+    // polls the service on its own timers, so it has to answer "does this
+    // platform have that operation" before it asks — an unregistered handler
+    // refuses, and a timer asking anyway fills the service log with refusals.
+    property var platformProfile: ({})
+    function supports(feature) {
+        if (!platformProfile || !platformProfile.supports) return true
+        return platformProfile.supports[feature] !== false
+    }
+    readonly property bool localNetworksSupported: supports("localNetworkExceptions")
+    readonly property bool blockNoticesSupported: supports("blockNotices")
     property var primaryActions: []
     property var quickActions: []
     // User preference "show notifications". The tray is the surface that raises
@@ -715,11 +726,12 @@ SystemTrayIcon {
     // link has settled after connecting. This is a NOTICE, not a question: it
     // carries no decision, so it closes itself.
 
-    /// How long the external-address notice stays on screen. Long enough to
-    /// read and copy an address, short enough that a user who walked away does
-    /// not come back to a stale window sitting over their work. It now fires on
-    /// every reconnect, so it has to be the shorter of the two.
-    readonly property int _externalAddressNoticeMs: 15000
+    /// How long a notice that asks NOTHING stays on screen — the external
+    /// address, "routing is back". Long enough to read and copy an address,
+    /// short enough that a user who walked away comes back to their own work
+    /// rather than to a stale window sitting over it. Notices that carry a
+    /// decision keep `_promptAutoRetireMs`: those wait for an answer.
+    readonly property int _infoNoticeMs: 10000
 
     /// One notice per PUSH, not per address. The service publishes this on
     /// every (re)connect, and a user who reconnects wants the address again —
@@ -802,16 +814,16 @@ SystemTrayIcon {
             // The address is the whole point of this notice — it has to be
             // takeable, not just readable.
             copyPayload: address,
-            primaryAction: {
-                label: tr("action.close", "Close"),
-                actionId: "external-address-dismiss",
-                accent: true
-            },
+            // No footer button of its own. This notice asks nothing, the
+            // corner close box already closes it, and an accent "Close" here
+            // lands in the screen corner right on top of the main window's own
+            // "Close" — one notice retiring a moment early took the app down
+            // with it.
             // Timing out is not an answer: a user who was away never saw it,
             // so the notice stays undecided and the main window still offers
             // it. The window owns the countdown — one mechanism, and it fires
             // for whatever is on screen rather than for a hand-wired case.
-            autoRetireMs: _externalAddressNoticeMs
+            autoRetireMs: _infoNoticeMs
         })
     }
 
@@ -923,11 +935,45 @@ SystemTrayIcon {
 
     /// Destination and app the notice currently on screen is about — the
     /// sub-screens (route confirm, snooze choice, mute choice) act on these.
+    /// Empty when the notice lists several blocks; then `_blockNoticeShown` is
+    /// what the sub-screens read.
     property string _blockNoticeDestination: ""
     property string _blockNoticeApp: ""
     /// Reason slug of the notice on screen — the mute chooser offers to
     /// silence this whole class ("stop telling me the tunnel is down").
     property string _blockNoticeReason: ""
+
+    /// Blocks that have arrived and not been shown yet.
+    ///
+    /// Two failures made one window per block the wrong shape. A page that
+    /// cannot reach five hosts produced five windows, each waiting for its own
+    /// answer; and the queue keeps only the NEWEST entry of a kind, so the
+    /// second of three was dropped without ever being seen. Collecting for a
+    /// moment and presenting once fixes both: nothing is lost, and a burst
+    /// costs one decision.
+    property var _blockNoticeBatch: []
+    /// The rows the notice on screen is about. Snooze and mute act on all of
+    /// them — "stop telling me about this" is rarely meant for one address out
+    /// of five — while the route action acts on the checked rows only.
+    property var _blockNoticeShown: []
+    /// What the route action was pressed for, captured WITH the checkboxes at
+    /// that moment: the confirm screen replaces the list, and the answer has to
+    /// still be about what was checked when it was asked for.
+    property var _blockNoticeRouteTargets: []
+    /// Long enough for a page's burst of requests to land in one notice, short
+    /// enough that the notice still reads as a reaction to what just happened.
+    readonly property int _blockNoticeCollectMs: 3000
+    /// Rows a merged notice lists before it falls back to "and N more". The
+    /// rest are still covered by snooze and mute, which act on the whole batch.
+    readonly property int _blockNoticeListCap: 5
+    /// Bound on the batch itself: past this the machine is having an outage,
+    /// not a moment, and the oldest rows are the least useful to show.
+    readonly property int _blockNoticeBatchCap: 50
+    property Timer _blockNoticeCollectTimer: Timer {
+        interval: tray._blockNoticeCollectMs
+        repeat: false
+        onTriggered: tray._presentBlockNoticeBatch()
+    }
 
     function _onBlockNoticeRaised(event) {
         if (!showNotifications || !notifyBlockNotices) {
@@ -946,13 +992,109 @@ SystemTrayIcon {
             console.log("tray block-notice: suppressed — main window is active")
             return
         }
-        console.log("tray block-notice: showing notice for", destination)
-        var app = String(event.app || "")
-        var reason = String(event.reason || "")
-        var attempts = Number(event.attempts || 0)
-        _presentOrQueue("block-notice", function() {
-            tray._showBlockNotice(destination, app, reason, attempts)
+        console.log("tray block-notice: collecting notice for", destination)
+        _rememberBlockNotice({
+            destination: destination,
+            app: String(event.app || ""),
+            reason: String(event.reason || ""),
+            attempts: Number(event.attempts || 0)
         })
+        // The timer is NOT restarted by later arrivals: a steady stream would
+        // otherwise push the notice away for as long as it lasts, which is
+        // exactly when the user wants to hear about it.
+        if (!_blockNoticeCollectTimer.running) _blockNoticeCollectTimer.start()
+    }
+
+    /// Add one block to the batch, folding a repeat of the same block into the
+    /// row already there. The service folds retries of one episode already;
+    /// this catches the second episode of the same thing inside one burst.
+    function _rememberBlockNotice(entry) {
+        var batch = _blockNoticeBatch.slice()
+        for (var i = 0; i < batch.length; i += 1) {
+            if (batch[i].destination === entry.destination
+                    && batch[i].app === entry.app
+                    && batch[i].reason === entry.reason) {
+                batch[i] = {
+                    destination: entry.destination,
+                    app: entry.app,
+                    reason: entry.reason,
+                    attempts: Math.max(Number(batch[i].attempts || 0), entry.attempts)
+                }
+                _blockNoticeBatch = batch
+                return
+            }
+        }
+        batch.push(entry)
+        while (batch.length > _blockNoticeBatchCap) batch.shift()
+        _blockNoticeBatch = batch
+    }
+
+    /// Hand the batch to the surface. Presenting goes through the same queue as
+    /// every other notice, and the closure reads the batch when it RUNS — so
+    /// blocks that arrive while another notice is still up join the same
+    /// window instead of queueing behind it.
+    function _presentBlockNoticeBatch() {
+        if (_blockNoticeBatch.length === 0) return
+        _presentOrQueue("block-notice", function() {
+            tray._showBlockNoticeBatch()
+        })
+    }
+
+    /// Present what has collected: one block reads as it always did, several
+    /// become one list.
+    function _showBlockNoticeBatch() {
+        var batch = _blockNoticeBatch
+        _blockNoticeBatch = []
+        if (batch.length === 0) return
+        _blockNoticeShown = batch
+        if (batch.length === 1) {
+            _showBlockNotice(batch[0].destination, batch[0].app,
+                batch[0].reason, batch[0].attempts)
+            return
+        }
+        _showMergedBlockNotice(batch)
+    }
+
+    /// Blocks that arrived while a notice was being answered get their turn as
+    /// soon as it is over, without waiting for the next one to push the timer.
+    function _scheduleBlockNoticeBatch() {
+        if (_blockNoticeBatch.length === 0) return
+        if (!_blockNoticeCollectTimer.running) _blockNoticeCollectTimer.start()
+    }
+
+    /// The notice is over, whichever way it ended. Frees the surface and lets
+    /// anything that collected meanwhile take its turn.
+    function _blockNoticeAnswered() {
+        _blockNoticeShown = []
+        _scheduleDrain()
+        _scheduleBlockNoticeBatch()
+    }
+
+    /// The destinations behind the rows the user left checked. An index past
+    /// the listed rows cannot be checked, so it is ignored rather than mapped
+    /// onto a row the user never saw.
+    function _blockNoticeCheckedHosts(selectedIndexes) {
+        var shown = _blockNoticeShown
+        if (shown.length === 0) {
+            return _blockNoticeDestination === "" ? [] : [_blockNoticeDestination]
+        }
+        // A single-row notice carries no checkboxes: its one destination is
+        // what the button is about.
+        if (shown.length === 1 || !selectedIndexes) {
+            return [String(shown[0].destination || "")].filter(function(h) { return h !== "" })
+        }
+        var hosts = []
+        for (var i = 0; i < selectedIndexes.length; i += 1) {
+            var index = Number(selectedIndexes[i])
+            if (index < 0 || index >= shown.length) continue
+            var host = String(shown[index].destination || "")
+            // Only what a rule can act on: a route that is down already has one.
+            if (host !== "" && hosts.indexOf(host) < 0
+                    && _blockNoticeIsRouteable(shown[index].reason)) {
+                hosts.push(host)
+            }
+        }
+        return hosts
     }
 
     function _blockNoticeReasonLine(reason) {
@@ -1068,6 +1210,129 @@ SystemTrayIcon {
         })
     }
 
+    /// Whether adding a rule could do anything about this block. A route that
+    /// is down already HAS a rule pointing at it, and the IPv6 / encrypted-DNS
+    /// cuts are governed by a switch — routing those writes a rule that cannot
+    /// answer the cause.
+    function _blockNoticeIsRouteable(reason) {
+        return reason !== "route-unavailable"
+            && reason !== "ipv6-blocked"
+            && reason !== "dns-lockdown"
+    }
+
+    /// The one reason behind every row, or "" when they differ. The mute
+    /// chooser offers to silence a class, and a class only exists when the
+    /// whole list belongs to it.
+    function _sharedBlockNoticeReason(batch) {
+        var reason = batch.length > 0 ? String(batch[0].reason || "") : ""
+        for (var i = 1; i < batch.length; i += 1) {
+            if (String(batch[i].reason || "") !== reason) return ""
+        }
+        return reason
+    }
+
+    /// Every destination the notice on screen covers, including rows past the
+    /// list cap: snooze and mute are about the whole batch.
+    function _blockNoticeHosts() {
+        var hosts = []
+        for (var i = 0; i < _blockNoticeShown.length; i += 1) {
+            var host = String(_blockNoticeShown[i].destination || "")
+            if (host !== "" && hosts.indexOf(host) < 0) hosts.push(host)
+        }
+        if (hosts.length === 0 && _blockNoticeDestination !== "") {
+            hosts.push(_blockNoticeDestination)
+        }
+        return hosts
+    }
+
+    /// One window for a burst of blocks.
+    ///
+    /// Rows are checkable because the route action is the one answer that is
+    /// per address; snooze and mute stay about the whole list. Rows past the
+    /// cap are counted rather than listed — a notice that fills the screen
+    /// stops being read at all — and they are still covered by both.
+    function _showMergedBlockNotice(batch) {
+        _blockNoticeDestination = ""
+        _blockNoticeApp = ""
+        _blockNoticeReason = _sharedBlockNoticeReason(batch)
+        _activeNoticeId = ""
+
+        var listed = Math.min(batch.length, _blockNoticeListCap)
+        var items = []
+        for (var i = 0; i < listed; i += 1) {
+            var entry = batch[i]
+            var line = _blockNoticeReasonLine(entry.reason)
+            if (String(entry.app || "") !== "") line = line + " · " + entry.app
+            items.push({
+                primaryText: hideBlockNoticeAddresses
+                    ? tr("notifications.block-notice.destination-hidden",
+                        "a hidden destination")
+                    : entry.destination,
+                secondaryText: line
+            })
+        }
+        var body = tr("tray.block-notice.merged.body",
+            "Check the addresses to send over the additional route.")
+        if (batch.length > listed) {
+            body = body + "<br>" + tr("notifications.block-notice.backlog.more",
+                "and {count} more").replace("{count}", String(batch.length - listed))
+        }
+
+        var routeable = false
+        var switchGoverned = true
+        for (var r = 0; r < batch.length; r += 1) {
+            if (_blockNoticeIsRouteable(batch[r].reason)) routeable = true
+            if (batch[r].reason !== "ipv6-blocked" && batch[r].reason !== "dns-lockdown") {
+                switchGoverned = false
+            }
+        }
+        var primary = routeable
+            ? {
+                label: tr("tray.block-notice.action.route-to-secondary",
+                    "To additional route"),
+                actionId: "block-notice-route",
+                accent: true,
+                // Changes routing — the next screen asks for a real yes/no
+                // before anything is written.
+                keepsOpen: true
+            }
+            : switchGoverned
+            ? {
+                label: tr("notifications.strict-killswitch.action", "Open settings"),
+                actionId: "block-notice-open-settings",
+                accent: true
+            }
+            : {
+                label: tr("tray.block-notice.action.open-routes", "Open routes"),
+                actionId: "block-notice-open-routes",
+                accent: true
+            }
+
+        promptWindow.present({
+            titleText: tr("tray.block-notice.merged.title",
+                "{count} connections blocked").replace("{count}", String(batch.length)),
+            bodyText: body,
+            bodyRichText: true,
+            items: items,
+            selectable: routeable,
+            listAccessibleName: tr("tray.block-notice.merged.list-accessible-name",
+                "Blocked connections"),
+            primaryAction: primary,
+            secondaryAction: {
+                label: tr("tray.block-notice.action.snooze", "Snooze"),
+                actionId: "block-notice-snooze",
+                keepsOpen: true
+            },
+            tertiaryAction: {
+                label: tr("tray.block-notice.action.mute", "Don't show"),
+                actionId: "block-notice-mute",
+                keepsOpen: true
+            },
+            dismissActionId: "block-notice-dismiss",
+            autoRetireMs: _promptAutoRetireMs
+        })
+    }
+
     /// Queue kind of the enforcement notice on screen; "" when none. Keyed by
     /// role because the service reports each role independently — an `ok` for
     /// one must not take down the other's question — and carried as the whole
@@ -1078,9 +1343,6 @@ SystemTrayIcon {
     /// on screen: the question may have been suppressed (window in front,
     /// notifications off) and coming back out of this set is still news.
     property var _enforcementDownRoles: []
-
-    /// How long the "routing is back" line stays up. It asks nothing.
-    readonly property int _enforcementRestoredNoticeMs: 15000
 
     /// How long the "a link is down" notice stays up. It used to wait for the
     /// user or for the service to report the role enforced again, which meant a
@@ -1121,7 +1383,7 @@ SystemTrayIcon {
                 bodyText: tray.tr("notifications.enforcement.restored.body",
                     "Your rules are being applied again. Pages that were refused while the connection was down keep showing the error until you reload them — press F5 on those tabs."),
                 dismissActionId: "enforcement-restored-dismiss",
-                autoRetireMs: tray._enforcementRestoredNoticeMs
+                autoRetireMs: tray._infoNoticeMs
             })
         })
     }
@@ -1147,6 +1409,7 @@ SystemTrayIcon {
     readonly property real _localNetworkAskIntervalMs: 24 * 60 * 60 * 1000
 
     function _checkPendingLocalNetworks() {
+        if (!localNetworksSupported) return
         if (!showNotifications) return
         if (typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcLocalNetworksGet !== "function") return
@@ -1339,10 +1602,21 @@ SystemTrayIcon {
     /// gets its own yes/no instead of firing straight off the first click —
     /// same two-step shape as `_confirmAutoRulesAlways`.
     function _confirmBlockNoticeRoute() {
+        var targets = _blockNoticeRouteTargets
+        // Nothing checked is an answer too: the list stays open rather than
+        // asking to confirm a change that would write nothing.
+        if (targets.length === 0) {
+            console.log("tray block-notice: route pressed with nothing checked")
+            return
+        }
         promptWindow.present({
-            titleText: tr("tray.block-notice.route-confirm.title",
-                "Route {name} via the additional link?")
-                .replace("{name}", _blockNoticeDestination),
+            titleText: targets.length === 1
+                ? tr("tray.block-notice.route-confirm.title",
+                    "Route {name} via the additional link?")
+                    .replace("{name}", targets[0])
+                : tr("tray.block-notice.route-confirm.title-many",
+                    "Route {count} addresses via the additional link?")
+                    .replace("{count}", String(targets.length)),
             bodyText: tr("tray.block-notice.route-confirm.body",
                 "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules."),
             primaryAction: {
@@ -1360,6 +1634,7 @@ SystemTrayIcon {
     }
 
     function _sendBlockNoticeRouteToSecondary(destination) {
+        if (!blockNoticesSupported) return
         if (!bridgeAvailable || !rpc
                 || typeof rpc.rpcBlockNoticeRouteToSecondary !== "function") return
         var corr = rpc.rpcBlockNoticeRouteToSecondary({ "destination": destination })
@@ -1377,9 +1652,13 @@ SystemTrayIcon {
     function _showBlockNoticeSnoozeChoice() {
         promptWindow.present({
             titleText: tr("tray.block-notice.snooze.title", "Snooze this notice"),
-            bodyText: tr("tray.block-notice.snooze.body",
-                "Stop asking about {name} for a while.")
-                .replace("{name}", _blockNoticeDestinationText()),
+            bodyText: _blockNoticeHosts().length > 1
+                ? tr("tray.block-notice.snooze.body-many",
+                    "Stop asking about these {count} addresses for a while.")
+                    .replace("{count}", String(_blockNoticeHosts().length))
+                : tr("tray.block-notice.snooze.body",
+                    "Stop asking about {name} for a while.")
+                    .replace("{name}", _blockNoticeDestinationText()),
             primaryAction: {
                 label: tr("tray.block-notice.snooze.for-15-minutes", "15 minutes"),
                 actionId: "block-notice-snooze-15m"
@@ -1412,8 +1691,11 @@ SystemTrayIcon {
             case "block-notice-snooze-day": ms = _blockNoticeSnoozeLongestMs; break
             default: return
         }
-        _setBlockNoticeMute(
-            { "kind": "host", "host": _blockNoticeDestination }, Date.now() + ms)
+        var until = Date.now() + ms
+        var hosts = _blockNoticeHosts()
+        for (var i = 0; i < hosts.length; i += 1) {
+            _setBlockNoticeMute({ "kind": "host", "host": hosts[i] }, until)
+        }
     }
 
     /// A button label carries the real name so "this app" is never a question
@@ -1425,9 +1707,13 @@ SystemTrayIcon {
     }
 
     function _showBlockNoticeMuteChoice() {
+        var hosts = _blockNoticeHosts()
         var slots = [{
-            label: tr("tray.block-notice.mute.this-host", "Only {name}")
-                .replace("{name}", _blockNoticeMuteName(_blockNoticeDestinationText())),
+            label: hosts.length > 1
+                ? tr("tray.block-notice.mute.these-hosts", "Only these {count} addresses")
+                    .replace("{count}", String(hosts.length))
+                : tr("tray.block-notice.mute.this-host", "Only {name}")
+                    .replace("{name}", _blockNoticeMuteName(_blockNoticeDestinationText())),
             actionId: "block-notice-mute-host",
             accent: true
         }]
@@ -1491,8 +1777,10 @@ SystemTrayIcon {
     function _applyBlockNoticeMute(action) {
         switch (action) {
             case "block-notice-mute-host":
-                _setBlockNoticeMute(
-                    { "kind": "host", "host": _blockNoticeDestination }, undefined)
+                var hosts = _blockNoticeHosts()
+                for (var h = 0; h < hosts.length; h += 1) {
+                    _setBlockNoticeMute({ "kind": "host", "host": hosts[h] }, undefined)
+                }
                 break
             case "block-notice-mute-app":
                 if (_blockNoticeApp === "") return
@@ -1515,6 +1803,7 @@ SystemTrayIcon {
     /// the field is `Option<u64>` and `skip_serializing_if` on the Rust side,
     /// so leaving it off the request is how an indefinite mute is spelled.
     function _setBlockNoticeMute(scope, untilUnixMs) {
+        if (!blockNoticesSupported) return
         if (!bridgeAvailable || !rpc
                 || typeof rpc.rpcBlockNoticeMutesSet !== "function") return
         var req = { "scope": scope }
@@ -1560,6 +1849,9 @@ SystemTrayIcon {
         // reusing the auto-rule id machinery below, which answers a different
         // question (a list of candidates) entirely.
         if (action === "block-notice-route") {
+            // The checkboxes exist only while the list is on screen, and the
+            // confirm screen replaces it — so what was checked is taken now.
+            _blockNoticeRouteTargets = _blockNoticeCheckedHosts(selectedIndexes)
             _confirmBlockNoticeRoute()
             return
         }
@@ -1585,12 +1877,17 @@ SystemTrayIcon {
             return
         }
         if (action === "block-notice-route-confirm") {
-            _sendBlockNoticeRouteToSecondary(_blockNoticeDestination)
-            _scheduleDrain()
+            var targets = _blockNoticeRouteTargets
+            _blockNoticeRouteTargets = []
+            for (var t = 0; t < targets.length; t += 1) {
+                _sendBlockNoticeRouteToSecondary(targets[t])
+            }
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-route-cancel") {
-            _scheduleDrain()
+            _blockNoticeRouteTargets = []
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-snooze") {
@@ -1599,13 +1896,13 @@ SystemTrayIcon {
         }
         if (action === "block-notice-snooze-15m" || action === "block-notice-snooze-1h"
                 || action === "block-notice-snooze-8h"
-                || action === "block-notice-snooze-restart") {
+                || action === "block-notice-snooze-day") {
             _applyBlockNoticeSnooze(action)
-            _scheduleDrain()
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-snooze-cancel") {
-            _scheduleDrain()
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-mute") {
@@ -1616,17 +1913,17 @@ SystemTrayIcon {
                 || action === "block-notice-mute-reason"
                 || action === "block-notice-mute-all") {
             _applyBlockNoticeMute(action)
-            _scheduleDrain()
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-mute-cancel") {
-            _scheduleDrain()
+            _blockNoticeAnswered()
             return
         }
         if (action === "block-notice-dismiss") {
             // The toast's own close box — no mute, nothing recorded, same
             // semantics as every other tray notice's X.
-            _scheduleDrain()
+            _blockNoticeAnswered()
             return
         }
         // Switching to automatic mode needs its own confirmation: swap the
@@ -2184,6 +2481,7 @@ SystemTrayIcon {
         routeSecondaryLabel = context.routeSecondaryLabel || routeSecondaryLabel
         iconFileUrl = context.iconFileUrl || ""
         theme = context.theme || theme
+        platformProfile = context.platformProfile || platformProfile
         primaryActions = context.primaryActions || []
         quickActions = context.quickActions || []
         showNotifications = context.showNotifications !== false
@@ -2441,6 +2739,7 @@ SystemTrayIcon {
     }
 
     function _drainBlockNoticeJournal() {
+        if (!blockNoticesSupported) return
         if (!showNotifications || !notifyBlockNotices) return
         if (!bridgeAvailable || !rpc
                 || typeof rpc.rpcBlockNoticeJournalList !== "function") return

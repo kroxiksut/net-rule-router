@@ -918,7 +918,11 @@ pub(crate) fn build_supervised_runtime_deps(
     // DNS-observation consumer exists (it owns the rule-gated cache sink). The
     // conn-trace consumer's drop hook feeds this channel; the worker (below) drains
     // it and does the PTR + forward-confirm off the hot path.
-    let (fcrdns_tx, fcrdns_rx) = std::sync::mpsc::sync_channel::<(std::net::Ipv4Addr, bool)>(256);
+    let (fcrdns_tx, fcrdns_rx) = std::sync::mpsc::sync_channel::<(
+        std::net::Ipv4Addr,
+        bool,
+        nrr_service_runtime::conn_observation_consumer::ReverseLearnOrigin,
+    )>(256);
     let fcrdns_hook = dns_observation_consumer.as_ref().map(|_| fcrdns_tx.clone());
     // Proactive VPN-client learning: best-effort write-through
     // of a newly-learned client path so the app-scoped exemption survives a

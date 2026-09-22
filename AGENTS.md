@@ -26,6 +26,10 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build.ps1 -Profile dev
 .\scripts\run.ps1 -Component gui
 .\scripts\run.ps1 -Component tray
 .\scripts\run.ps1 -Component service
+
+# Start a clean run: show (then, with -Yes, remove) every trace on the machine.
+# Keeps the audit trail unless -PurgeAudit. `purge-data.sh` is the Linux twin.
+powershell -ExecutionPolicy Bypass -File .\scripts\purge-data.ps1
 ```
 
 ## Quality Checks

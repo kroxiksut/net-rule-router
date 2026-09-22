@@ -106,10 +106,16 @@ fn interface_type_slug(if_type: ipconfig::IfType) -> &'static str {
 pub const LOOPBACK_INTERFACE_TYPE: &str = "loopback";
 
 fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
+    // Ids come from the placeholder dataset's own declaration: a binding to one
+    // of them is refused service-side, and a second spelling here would slip
+    // past that refusal.
+    use nrr_platform_api::interface_rows::{
+        PREVIEW_ETHERNET_PERSISTENT_ID, PREVIEW_VPN_PERSISTENT_ID, PREVIEW_WIFI_PERSISTENT_ID,
+    };
     vec![
         AdapterSnapshotEntry {
             identity: AdapterIdentity {
-                persistent_id: "win-adapter:ethernet-fallback".to_string(),
+                persistent_id: PREVIEW_ETHERNET_PERSISTENT_ID.to_string(),
                 adapter_name: "{FAKE-ETHERNET-ADAPTER}".to_string(),
                 ipv6_if_index: 10,
                 physical_address: Some("00-11-22-33-44-55".to_string()),
@@ -121,7 +127,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
         },
         AdapterSnapshotEntry {
             identity: AdapterIdentity {
-                persistent_id: "win-adapter:wifi-fallback".to_string(),
+                persistent_id: PREVIEW_WIFI_PERSISTENT_ID.to_string(),
                 adapter_name: "{FAKE-WIFI-ADAPTER}".to_string(),
                 ipv6_if_index: 20,
                 physical_address: Some("AA-BB-CC-DD-EE-FF".to_string()),
@@ -133,7 +139,7 @@ fn fallback_adapters() -> Vec<AdapterSnapshotEntry> {
         },
         AdapterSnapshotEntry {
             identity: AdapterIdentity {
-                persistent_id: "win-adapter:vpn-fallback".to_string(),
+                persistent_id: PREVIEW_VPN_PERSISTENT_ID.to_string(),
                 adapter_name: "{FAKE-VPN-ADAPTER}".to_string(),
                 ipv6_if_index: 30,
                 physical_address: None,

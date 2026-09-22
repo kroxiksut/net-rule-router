@@ -1242,12 +1242,16 @@ impl MonitoredAdaptersSnapshotProvider {
         // snapshot path stays network-silent and returns immediately. The
         // enrichment is the same builder the GUI cold-start path uses, so
         // a refreshed row renders identically to a cold-start one.
-        // The live adapter enumeration is Windows-only; off
-        // Windows the service returns the neutral deterministic fallback rows.
+        // Each OS enumerates its own links; the rows and every judgement on
+        // them are the neutral ones. An OS with no enumeration of its own says
+        // so with the placeholder set rather than inventing adapters.
         #[cfg(windows)]
         let (source, mut rich_rows) =
             nrr_platform_windows::interface_rows::collect_interfaces_rows(probe_external_ip);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let (source, mut rich_rows) =
+            nrr_platform_linux::interface_rows::collect_interfaces_rows(probe_external_ip);
+        #[cfg(not(any(windows, target_os = "linux")))]
         let (source, mut rich_rows) = {
             let _ = probe_external_ip;
             (

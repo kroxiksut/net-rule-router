@@ -90,7 +90,15 @@ fn print_usage() {
 fn print_status() {
     println!("{DAEMON_NAME} {}", env!("CARGO_PKG_VERSION"));
     #[cfg(target_os = "linux")]
-    println!("platform: linux (systemd); enforcement backend: nftables (not applying rules yet)");
+    {
+        println!("platform: linux (systemd); enforcement backend: nftables");
+        // Asked, not asserted: this banner is the first thing an operator runs,
+        // and "nftables" alone says nothing about whether this host can use it.
+        match nrr_platform_linux::nft_backend::NftablesEnforcement::default().probe() {
+            Ok(()) => println!("nftables: available"),
+            Err(e) => println!("nftables: NOT available — {e}"),
+        }
+    }
     #[cfg(not(target_os = "linux"))]
     println!("platform: non-linux dev build — OS verbs are disabled");
 }

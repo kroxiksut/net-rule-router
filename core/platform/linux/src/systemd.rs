@@ -184,6 +184,27 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     s
 }
 
+/// Directory trees the unit written above cannot execute from.
+///
+/// `ProtectHome=yes` replaces them with empty mounts for the service, so an
+/// `ExecStart` that points there fails at exec with 203 — after `enable`
+/// reported success. The two halves are written a screen apart, which is how a
+/// build installed from a checkout under `/home` came to register a service
+/// that could never start.
+const HIDDEN_BY_PROTECT_HOME: [&str; 3] = ["/home/", "/root/", "/run/user/"];
+
+/// Whether the unit this module renders can execute `binary_path`.
+///
+/// The question is asked before the unit is written, because afterwards the
+/// evidence is a bare exec failure in the journal and the unit file looks fine.
+#[must_use]
+pub fn unit_can_execute(binary_path: &Path) -> bool {
+    let path = binary_path.to_string_lossy();
+    !HIDDEN_BY_PROTECT_HOME
+        .iter()
+        .any(|hidden| path.starts_with(hidden))
+}
+
 // ── install / uninstall plan ─────────────────────────────────────────────────
 
 /// The unit file name systemd looks for under [`SYSTEMD_UNIT_DIR`]. The Linux
@@ -578,6 +599,25 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const SAMPLE_BINARY: &str = "/usr/lib/netrulerouter/nrr-serviced";
+
+    /// The unit hides these trees from the service, so a binary living in one
+    /// can be registered but never started. Both facts are declared in this
+    /// module; the test is what keeps them agreeing.
+    #[test]
+    fn a_binary_under_a_home_tree_cannot_be_executed_by_the_unit() {
+        let cfg = SystemdServiceConfig::for_binary(PathBuf::from(SAMPLE_BINARY));
+        assert!(render_service_unit(&cfg).contains("ProtectHome=yes"));
+
+        assert!(!unit_can_execute(Path::new(
+            "/home/user/nrr/target/debug/nrr-serviced"
+        )));
+        assert!(!unit_can_execute(Path::new("/root/nrr-serviced")));
+        assert!(!unit_can_execute(Path::new("/run/user/1000/nrr-serviced")));
+        assert!(unit_can_execute(Path::new(SAMPLE_BINARY)));
+        assert!(unit_can_execute(Path::new(
+            "/opt/netrulerouter/nrr-serviced"
+        )));
+    }
 
     fn sample_config() -> SystemdServiceConfig {
         SystemdServiceConfig::for_binary(PathBuf::from(SAMPLE_BINARY))

@@ -47,7 +47,7 @@ pub struct LiveUser {
     pub lingering: bool,
 }
 
-/// One row of `loginctl list-users --output=json`.
+/// One row of `loginctl list-users --json=short`.
 #[derive(Debug, Deserialize)]
 struct LoginctlUser {
     uid: u32,
@@ -59,6 +59,19 @@ struct LoginctlUser {
     state: String,
 }
 
+/// How the user list is asked for, newest spelling first.
+///
+/// Neither flag works everywhere, and each is silent about the other's job:
+/// systemd 259 takes `--json=` and ACCEPTS-AND-IGNORES `--output=json`, then
+/// prints its plain table; systemd 255 does not know `--json=` at all and
+/// answers JSON to `--output=json`. Asking with one spelling only left every
+/// tick at "could not determine who is logged in" — on a machine with a user
+/// sitting at it — so both are tried in turn.
+const LIST_USERS_SPELLINGS: [&[&str]; 2] = [
+    &["list-users", "--json=short", "--no-legend"],
+    &["list-users", "--output=json", "--no-legend"],
+];
+
 /// Everyone logind currently considers logged in.
 ///
 /// An empty vector is a legitimate answer (nobody is logged in). `Err` means
@@ -67,11 +80,24 @@ struct LoginctlUser {
 /// enforcing nothing because the question failed would silently drop every
 /// user's protection.
 pub fn live_users() -> Result<Vec<LiveUser>, LogindError> {
+    let first = match live_users_via(LIST_USERS_SPELLINGS[0]) {
+        Ok(users) => return Ok(users),
+        // Nothing to ask with: a second spelling of a missing program is still
+        // missing, and the error already says so.
+        Err(e @ LogindError::Unavailable(_)) => return Err(e),
+        Err(e) => e,
+    };
+    // The older spelling. Its own failure is not the one worth reporting: the
+    // machine is far likelier to be current, so the first error is kept.
+    live_users_via(LIST_USERS_SPELLINGS[1]).map_err(|_| first)
+}
+
+fn live_users_via(args: &[&str]) -> Result<Vec<LiveUser>, LogindError> {
     // Budgeted: this runs on EVERY enforcement tick, and a `loginctl` blocked on
     // an unreachable D-Bus used to stop the apply loop for good.
     let out = crate::command::output_with_timeout(
         "loginctl",
-        &["list-users", "--output=json", "--no-legend"],
+        args,
         crate::command::DEFAULT_COMMAND_TIMEOUT,
     )
     .map_err(|e| LogindError::Unavailable(e.to_string()))?;
@@ -93,7 +119,7 @@ pub enum LogindError {
     /// It ran and failed. Carries the exit status and whatever it said.
     Failed { status: String, stderr: String },
     /// It answered in a shape this build cannot read. The usual cause is a
-    /// systemd too old for `--output=json` on `list-users`, which prints the
+    /// systemd that does not take `--json=` on `list-users` and prints the
     /// table instead. Deliberately NOT falling back to parsing that table: its
     /// column count changed between versions and its footer line
     /// ("2 users listed.") reads as a uid to any parser naive enough to take
@@ -112,7 +138,7 @@ impl std::fmt::Display for LogindError {
             Self::Unreadable(e) => write!(
                 f,
                 "loginctl answered in an unreadable shape (systemd too old for \
-                 `list-users --output=json`?): {e}"
+                 `list-users --json=short`?): {e}"
             ),
         }
     }
@@ -246,6 +272,18 @@ mod tests {
         assert_eq!(users.len(), 2, "the closing one is dropped");
         assert_eq!(users[0].uid, 1000);
         assert_eq!(users[1].uid, 1001);
+    }
+
+    /// The flag IS the bug, and a parser test cannot see it: each spelling is
+    /// the one the other systemd ignores, so dropping either leaves a whole
+    /// range of releases answering a table nobody can read.
+    #[test]
+    fn both_json_spellings_are_asked_for() {
+        assert!(LIST_USERS_SPELLINGS[0].contains(&"--json=short"));
+        assert!(LIST_USERS_SPELLINGS[1].contains(&"--output=json"));
+        for spelling in LIST_USERS_SPELLINGS {
+            assert_eq!(spelling[0], "list-users");
+        }
     }
 
     #[test]

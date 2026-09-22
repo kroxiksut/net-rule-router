@@ -61,7 +61,15 @@ pub(super) fn sibling_service_binary() -> Option<PathBuf> {
 }
 
 pub(super) fn resolve_native_icon_path() -> Option<PathBuf> {
-    bundled_resource("assets/icons/app/app.ico")
+    // Windows takes the multi-size `.ico` the shell also embeds; X11 and the
+    // hicolor theme take a PNG. `appIconRelativePath()` in the Qt host chooses
+    // by the same rule — both sides must name the same file.
+    let relative = if cfg!(windows) {
+        "assets/icons/app/app.ico"
+    } else {
+        "assets/icons/app/icon-256.png"
+    };
+    bundled_resource(relative)
 }
 
 /// A payload path the package ships with the binary, `/`-separated relative to

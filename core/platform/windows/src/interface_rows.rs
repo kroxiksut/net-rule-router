@@ -173,68 +173,6 @@ fn collect_windows_rows_from_snapshot(
     rows
 }
 
-/// Ask every probe-worthy adapter for its external address, in parallel, and
-/// record the answer on its row.
-///
-/// Adapters that are not worth probing are marked as skipped rather than left
-/// at their default: when the user asked for the check, every row should say
-/// what happened to it — including "nothing, and here is why".
-#[cfg(windows)]
-fn apply_external_ip_probes(rows: &mut [InterfaceRouteRow]) {
-    use nrr_platform_api::external_ip::{probe_external_ipv4_batch, ExternalIpProbeOutcome};
-
-    let targets = rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| {
-            external_probe_target(row.availability_status, &row.local_ip)
-                .map(|source| (index, source))
-        })
-        .collect::<Vec<_>>();
-
-    for row in rows.iter_mut() {
-        apply_external_probe(&mut row.observed_facts, ExternalIpProbeOutcome::Skipped);
-    }
-    if targets.is_empty() {
-        return;
-    }
-
-    let sources = targets
-        .iter()
-        .map(|(_, source)| *source)
-        .collect::<Vec<_>>();
-    let outcomes = probe_external_ipv4_batch(&sources);
-
-    for ((index, _), outcome) in targets.iter().zip(outcomes) {
-        let Some(row) = rows.get_mut(*index) else {
-            continue;
-        };
-        apply_external_probe(&mut row.observed_facts, outcome);
-        // The observed address itself is deliberately absent from the log: it
-        // identifies the user's connection and the status is what diagnostics
-        // need to see.
-        tracing::debug!(
-            target: "nrr::interfaces",
-            adapter = %row.windows_name,
-            status = row.observed_facts.external_ip_status.title(),
-            "external-address probe finished",
-        );
-    }
-}
-
-/// Adapter-name keys (lowercased GUID, as `runtime_by_adapter` is keyed) whose
-/// interface carries a default-style route with a real next-hop.
-///
-/// The gateway-less tunnel case: `GetAdaptersAddresses` reports no gateway for
-/// an OpenVPN / WireGuard link, but its split-default routes name a real peer,
-/// so traffic leaves through it perfectly well. Bridging adapter name to the
-/// route table's `IfIndex` needs `get_adapter_infos` (the enumeration the
-/// routing layer itself uses); `ipconfig` only exposes the IPv6 index.
-///
-/// `None` when the route table or the adapter enumeration could not be read:
-/// the answer is then unknown for every adapter, and a row must say so rather
-/// than claim "cannot forward" — the same fail-safe direction as an unrunnable
-/// reachability probe.
 #[cfg(windows)]
 fn forwarding_capable_adapter_names() -> Option<std::collections::HashSet<String>> {
     use nrr_platform_api::interface_rows::derive_forwarding_next_hop;

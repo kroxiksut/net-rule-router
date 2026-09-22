@@ -194,11 +194,14 @@ pub(crate) fn build_ipc_surface(
     event_bus: Arc<EventBus>,
     gui_binary: PathBuf,
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
+    traffic_sampler: Option<crate::runtime_deps::TrafficSamplerHandle>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
     // outside the data root.
     let usage_logs_dir = logs_dir.clone();
+    // Held back from the deps builder below, which consumes the connection.
+    let stats_state_conn = Arc::clone(&state_conn);
     let ids = Arc::new(ProductionIdGenerator::new());
     // Bound here rather than inline at the call below, so the caller can hand it
     // to the housekeeping tick — the same wiring the Windows surface has.
@@ -327,6 +330,30 @@ pub(crate) fn build_ipc_surface(
     // the GUI's suggestions page has nothing to read.
     let deps = match auto_rules {
         Some(engine) => deps.with_auto_rules(engine),
+        None => deps,
+    };
+    // The SAME sampler the housekeeping tick counts into, so the traffic page
+    // reports the ledger that is actually being written. Without it the
+    // `traffic-stats.*` operations stay unimplemented and the GUI polls a
+    // refusal every minute.
+    let deps = match traffic_sampler {
+        Some(sampler) => {
+            let settings = Arc::new(
+                nrr_service_runtime::production_traffic::ProductionTrafficSettings::new(
+                    Arc::clone(&stats_state_conn),
+                ),
+            )
+                as Arc<dyn nrr_service_runtime::production_traffic::TrafficSettingsAccess>;
+            let stats = Arc::new(
+                nrr_service_runtime::production_traffic::ProductionTrafficStats::new(
+                    sampler, settings,
+                ),
+            );
+            deps.with_traffic_stats(
+                Arc::clone(&stats) as Arc<dyn nrr_service_runtime::TrafficStatsProvider>,
+                stats as Arc<dyn nrr_service_runtime::TrafficStatsWriter>,
+            )
+        }
         None => deps,
     };
 

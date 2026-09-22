@@ -275,10 +275,15 @@ Window {
     /// Self-retirement: the notice has been up its whole allowance with nobody
     /// answering. Nothing is recorded — the user never saw it, or chose not to
     /// deal with it — so it can be offered again later.
+    ///
+    /// Paused while the pointer is over it: a notice that retires under the
+    /// hand reaching for it hands that click to whatever sits beneath, and in
+    /// this corner that is the main window's own footer.
     Timer {
         id: autoRetireTimer
         interval: promptWindow.autoRetireMs > 0 ? promptWindow.autoRetireMs : 1
         running: promptWindow.visible && promptWindow.autoRetireMs > 0
+            && !pointerOver.hovered
         repeat: false
         onTriggered: {
             console.log("tray prompt: retired itself after",
@@ -425,6 +430,11 @@ Window {
         anchors.fill: parent
         anchors.margins: promptWindow._pad
         spacing: promptWindow._gapSm
+
+        // Read by the retirement countdown above. On the layout rather than on
+        // the window's border rectangle: only an ancestor of the buttons sees
+        // the pointer while it rests on one of them.
+        HoverHandler { id: pointerOver }
 
         // Header: title on the left, close box hard right. A row rather than an
         // overlay so a long, wrapping title reflows AROUND the button instead of

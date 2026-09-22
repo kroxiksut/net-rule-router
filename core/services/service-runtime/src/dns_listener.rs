@@ -60,6 +60,24 @@ const SERVE_QUEUE_DEPTH: usize = 128;
 /// their sum.
 const QUERY_BUDGET: Duration = Duration::from_secs(3);
 
+/// How many workers may sit in the enforce-before-answer path at once.
+///
+/// That path is the only wait here with no budget of its own — it blocks in the
+/// OS resolver, which spends its own multi-second timeout before it gives up.
+/// Uncapped it takes the whole pool: while the additional link was down, the
+/// machine's resolver censored exactly the names the secondary rules cover,
+/// every worker sat in one of them, and names with no rule at all stopped
+/// resolving machine-wide (the client gave up first, which is what the
+/// `client port closed` storm in the service log counts). The three workers
+/// this leaves are what keeps the rest of the system's DNS moving.
+const MAX_CONCURRENT_RULE_HOST_RESOLVES: usize = 5;
+
+/// How long a worker waits for a rule-host slot before answering without one.
+/// A page-load burst frees slots in tens of milliseconds, so a healthy burst
+/// never reaches the fallback; a stuck upstream does, and then the worker is
+/// back in the pool well inside the second the client's stub resolver waits.
+const RULE_HOST_LANE_WAIT: Duration = Duration::from_millis(400);
+
 /// What the listener should do with one datagram.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerAction {
@@ -101,8 +119,59 @@ const MAX_PRIVATE_RETRIES: usize = 2;
 /// What policy may do about IPv6 for the routing principal right now.
 pub type Ipv6DispositionFn = Arc<dyn Fn() -> crate::enforcement_planner::Ipv6Guard + Send + Sync>;
 
+/// Admission control for the enforce-before-answer path — see
+/// [`MAX_CONCURRENT_RULE_HOST_RESOLVES`]. A worker that cannot get in within
+/// [`RULE_HOST_LANE_WAIT`] answers the query without the upstream instead of
+/// queueing behind a resolver that may never come back.
+#[derive(Default)]
+struct RuleHostLane {
+    in_flight: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+impl RuleHostLane {
+    fn enter(&self, wait: Duration) -> Option<RuleHostLanePermit<'_>> {
+        let started = Instant::now();
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        while *in_flight >= MAX_CONCURRENT_RULE_HOST_RESOLVES {
+            let left = wait.checked_sub(started.elapsed())?;
+            let (guard, wait_result) = self
+                .freed
+                .wait_timeout(in_flight, left)
+                .unwrap_or_else(|p| p.into_inner());
+            in_flight = guard;
+            if wait_result.timed_out() && *in_flight >= MAX_CONCURRENT_RULE_HOST_RESOLVES {
+                return None;
+            }
+        }
+        *in_flight += 1;
+        Some(RuleHostLanePermit { lane: self })
+    }
+}
+
+struct RuleHostLanePermit<'a> {
+    lane: &'a RuleHostLane,
+}
+
+impl Drop for RuleHostLanePermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .lane
+            .in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *in_flight = in_flight.saturating_sub(1);
+        self.lane.freed.notify_one();
+    }
+}
+
 pub struct DnsInterceptListener {
     oracle: Arc<dyn RuleHostOracle>,
+    /// Keeps a slow upstream from holding every worker — see [`RuleHostLane`].
+    rule_host_lane: RuleHostLane,
+    /// Latches the saturated state so entering and leaving it are each said
+    /// once, instead of one line per query while it lasts.
+    rule_lane_saturated: AtomicBool,
     /// Rule hosts whose AAAA we have already reported as leaving policy,
     /// so a repeated lookup does not repeat the warning. Bounded: a suffix
     /// rule can match unboundedly many names, and a diagnostic must not be
@@ -201,6 +270,8 @@ impl DnsInterceptListener {
     ) -> Self {
         Self {
             aaaa_outside_policy_reported: Mutex::new(HashSet::new()),
+            rule_host_lane: RuleHostLane::default(),
+            rule_lane_saturated: AtomicBool::new(false),
             oracle,
             upstream,
             sink,
@@ -440,7 +511,7 @@ impl DnsInterceptListener {
     ///
     /// The fake-IP probe is [`FakeIpAnswerer::carries_on_v4`], never
     /// `fake_answer`: the latter allocates a lease and records health.
-    fn aaaa_action(&self, query: &[u8], qname: &str) -> ListenerAction {
+    fn aaaa_action(&self, query: &[u8], qname: &str, lane_wait: Duration) -> ListenerAction {
         use crate::enforcement_planner::Ipv6Guard;
         if !self.oracle.is_rule_host(qname) {
             return ListenerAction::Forward; // not a name any rule claims
@@ -455,7 +526,7 @@ impl DnsInterceptListener {
             return nodata();
         }
         match (self.ipv6_disposition)() {
-            Ipv6Guard::FiltersAndRoutes => self.route_aaaa(query, qname),
+            Ipv6Guard::FiltersAndRoutes => self.route_aaaa(query, qname, lane_wait),
             // The tunnel cannot carry the family, so the host's v6 addresses
             // are pinned to it and blocked. Handing one out would only make the
             // client wait on it; its IPv4 rides the tunnel.
@@ -472,7 +543,65 @@ impl DnsInterceptListener {
     }
 
     /// The tunnel carries IPv6: resolve, enforce, then answer.
-    fn route_aaaa(&self, query: &[u8], qname: &str) -> ListenerAction {
+    /// A slot in the enforce-before-answer path, or `None` when the wait ran
+    /// out. Saturation is worth a line — it means name resolution is degraded
+    /// for everything this listener serves, not just for the host that asked.
+    fn enter_rule_host_lane(&self, wait: Duration) -> Option<RuleHostLanePermit<'_>> {
+        match self.rule_host_lane.enter(wait) {
+            Some(permit) => {
+                if self.rule_lane_saturated.swap(false, Ordering::Relaxed) {
+                    tracing::info!(
+                        target: "nrr::dns-resolver",
+                        "Mode B: rule-host resolves are keeping up again — answering from the upstream as usual",
+                    );
+                }
+                Some(permit)
+            }
+            None => {
+                if !self.rule_lane_saturated.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        target: "nrr::dns-resolver",
+                        concurrent = MAX_CONCURRENT_RULE_HOST_RESOLVES,
+                        "Mode B: every rule-host resolve slot is taken by an upstream that is not answering — serving rule hosts from the cache so the rest of the machine's DNS keeps working",
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    /// Answer a rule host without going upstream. The addresses the cache holds
+    /// are the ones enforcement was built from, so handing them back is the
+    /// same answer the slow path would most likely produce — and the
+    /// kill-switch still decides what may leave. Nothing cached: SERVFAIL, so
+    /// the client re-asks in a moment rather than waiting out its own timeout.
+    fn rule_host_answer_without_upstream(&self, query: &[u8], qname: &str) -> ListenerAction {
+        let cached = self.sink.cached_routable_ips(qname);
+        if cached.is_empty() {
+            return build_error_response(query, RCODE_SERVFAIL)
+                .map_or(ListenerAction::Drop, ListenerAction::Respond);
+        }
+        let answered: Vec<Ipv4Addr> = cached
+            .into_iter()
+            .take(crate::dns_resolver::MAX_RULE_ANSWER_IPS)
+            .collect();
+        tracing::debug!(
+            target: "nrr::dns-resolver",
+            host = %qname,
+            addresses = ?answered,
+            "Mode B: rule-host lane saturated — answered from the cache, no upstream and no reconcile this round",
+        );
+        build_a_response(query, &answered, self.response_ttl)
+            .map_or(ListenerAction::Forward, ListenerAction::Respond)
+    }
+
+    fn route_aaaa(&self, query: &[u8], qname: &str, lane_wait: Duration) -> ListenerAction {
+        let Some(_lane) = self.enter_rule_host_lane(lane_wait) else {
+            // NODATA costs nothing and sends the client to the family our rules
+            // route anyway, which beats holding a worker for a AAAA.
+            return build_negative_response(query, RCODE_NOERROR, self.response_ttl)
+                .map_or(ListenerAction::Forward, ListenerAction::Respond);
+        };
         let hold = crate::dns_resolver::AnswerHold {
             deadline: self.deadline,
             fast_answers: crate::dns_resolver::global_dns_fast_answers()
@@ -503,6 +632,14 @@ impl DnsInterceptListener {
     }
 
     pub fn answer_query(&self, query: &[u8]) -> ListenerAction {
+        self.answer_query_within(query, RULE_HOST_LANE_WAIT)
+    }
+
+    /// `lane_wait` is how long this caller may block for a rule-host slot. A
+    /// pool worker can afford the wait; the receive loop, which handles a
+    /// datagram itself when the hand-off queue is full, cannot — waiting there
+    /// stops the loop from receiving anything at all.
+    fn answer_query_within(&self, query: &[u8], lane_wait: Duration) -> ListenerAction {
         let Some(q) = parse_question(query) else {
             return ListenerAction::Forward; // unparseable → transparent proxy
         };
@@ -516,7 +653,7 @@ impl DnsInterceptListener {
             return negative_answer(query).map_or(ListenerAction::Forward, ListenerAction::Respond);
         }
         if q.qtype == QTYPE_AAAA {
-            return self.aaaa_action(query, &q.qname);
+            return self.aaaa_action(query, &q.qname, lane_wait);
         }
         if q.qtype != QTYPE_A {
             return ListenerAction::Forward; // not an A query
@@ -527,6 +664,13 @@ impl DnsInterceptListener {
             // never receives a secondary-pinned address (shared-CDN collateral).
             return ListenerAction::ForwardFiltered;
         }
+        // Admission control before the only unbudgeted wait in this listener:
+        // a rule host that cannot get a slot is answered from what we already
+        // know, so a resolver that stopped answering cannot take name
+        // resolution down for every other name on the machine.
+        let Some(_lane) = self.enter_rule_host_lane(lane_wait) else {
+            return self.rule_host_answer_without_upstream(query, &q.qname);
+        };
         match handle_a_query(
             &q.qname,
             crate::dns_resolver::AnswerHold {
@@ -603,7 +747,9 @@ impl DnsInterceptListener {
                         guard.recv()
                     };
                     match msg {
-                        Ok((query, src)) => self.handle_datagram(socket, &query, src),
+                        Ok((query, src)) => {
+                            self.handle_datagram(socket, &query, src, RULE_HOST_LANE_WAIT)
+                        }
                         // Sender dropped — the serve loop exited; drain is done.
                         Err(_) => return,
                     }
@@ -670,7 +816,10 @@ impl DnsInterceptListener {
                 match tx.try_send((buf[..n].to_vec(), src)) {
                     Ok(()) => {}
                     Err(TrySendError::Full((query, src))) => {
-                        self.handle_datagram(socket, &query, src);
+                        // Inline, so no waiting for a rule-host slot: this is
+                        // the thread that receives, and a wait here is a wait
+                        // for every client at once.
+                        self.handle_datagram(socket, &query, src, Duration::ZERO);
                     }
                     // Unreachable while workers live inside this scope; treat
                     // as shutdown just in case.
@@ -686,10 +835,16 @@ impl DnsInterceptListener {
     /// `src` over the shared listener socket. Runs on a pool worker (or inline
     /// under backpressure) — everything here may block for its own bounded
     /// budgets without stalling other queries.
-    fn handle_datagram(&self, socket: &UdpSocket, query: &[u8], src: SocketAddr) {
+    fn handle_datagram(
+        &self,
+        socket: &UdpSocket,
+        query: &[u8],
+        src: SocketAddr,
+        lane_wait: Duration,
+    ) {
         let started = Instant::now();
         let left = || QUERY_BUDGET.saturating_sub(started.elapsed());
-        match self.answer_query(query) {
+        match self.answer_query_within(query, lane_wait) {
             ListenerAction::Respond(resp) => {
                 let _ = socket.send_to(&resp, src);
             }

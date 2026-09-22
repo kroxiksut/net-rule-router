@@ -101,6 +101,9 @@ QtObject {
             return
         }
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
+        // No retry when the platform has no such config: a retry loop exists to
+        // outlive an outage, and this is not one.
+        if (!root.serviceStabilitySupported) return
         if (!root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function") {
             _scheduleServiceIntentRetry("bridge-unavailable")

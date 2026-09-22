@@ -93,7 +93,7 @@ Window {
                 cacheWindow._fakeIpEnabled = stability["fake-ip-enabled"] === true
         }
         var bridge = (typeof nrrNativeBridge !== "undefined") ? nrrNativeBridge : null
-        if (!root.bridgeAvailable || bridge === null
+        if (!root.serviceStabilitySupported || !root.bridgeAvailable || bridge === null
                 || typeof bridge.rpcServiceStabilityConfigGet !== "function")
             return
         var corr = bridge.rpcServiceStabilityConfigGet()

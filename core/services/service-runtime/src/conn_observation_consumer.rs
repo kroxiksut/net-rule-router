@@ -578,13 +578,25 @@ pub type KillswitchDropCheckFn = Arc<dyn Fn(u64) -> bool + Send + Sync>;
 /// `BlockAllPostureStatus` the GUI banner reads).
 pub type FailClosedArmedFn = Arc<dyn Fn() -> bool + Send + Sync>;
 
-/// Sink for an NRR-dropped destination IP the
-/// FCrDNS learner should try to name. The production impl wraps
-/// [`crate::fcrdns_learner::ReverseDnsLearner`] (PTR + forward-confirm + rule-gated
-/// cache). `Send + Sync` so the consumer can live behind an `Arc`.
-/// The `bool` is `allow_direct` — see
+/// Sink for a destination IP the FCrDNS learner should try to name. The
+/// production impl wraps [`crate::fcrdns_learner::ReverseDnsLearner`] (PTR +
+/// forward-confirm + rule-gated cache). `Send + Sync` so the consumer can live
+/// behind an `Arc`. The `bool` is `allow_direct` — see
 /// [`crate::fcrdns_learner::ReverseDnsLearner::learn_scoped`].
-pub type ReverseDnsLearnFn = Arc<dyn Fn(std::net::Ipv4Addr, bool) + Send + Sync>;
+pub type ReverseDnsLearnFn =
+    Arc<dyn Fn(std::net::Ipv4Addr, bool, ReverseLearnOrigin) + Send + Sync>;
+
+/// Why an address reached the reverse learner. Both feeds name an address the
+/// resolver never saw, but only one of them is a drop, and a log line that
+/// calls the other one a drop sends the next diagnosis looking for a filter
+/// that was never involved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReverseLearnOrigin {
+    /// Our own enforcement blocked this flow.
+    EnforcementDrop,
+    /// The flow left over the primary link beside routed traffic.
+    PrimaryEgress,
+}
 
 /// Names a destination IP the service has seen resolved, or `None` when it
 /// knows of none. Production reads the recent-resolution memory the resolver

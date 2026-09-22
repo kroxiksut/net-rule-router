@@ -32,6 +32,9 @@ GroupBox {
     // limited to four fixed presets.
     property var _blockNoticeMutes: []
     property bool _blockNoticeMutesLoading: false
+    // Blocked-connection notices are raised by the connection observer; where
+    // there is none, nothing ever arrives and no mute has anything to silence.
+    readonly property bool _blockNoticesSupported: root.blockNoticesSupported
 
     function _blockNoticeMuteScopeLabel(mute) {
         var scope = (mute && mute.scope) || {}
@@ -77,6 +80,7 @@ GroupBox {
         && root.backendStatus.kind === "connected"
 
     function _loadBlockNoticeMutes() {
+        if (!group._blockNoticesSupported) return
         if (group._blockNoticeMutesLoading || !group._serviceReachable) return
         var corr = root.rpc.rpcBlockNoticeMutesList()
         if (!corr) return
@@ -95,7 +99,7 @@ GroupBox {
         })
     }
     function _removeBlockNoticeMute(mute) {
-        if (!root.bridgeAvailable) return
+        if (!group._blockNoticesSupported || !root.bridgeAvailable) return
         var corr = root.rpc.rpcBlockNoticeMutesRemove({ "scope": mute.scope })
         if (!corr) return
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
@@ -108,7 +112,7 @@ GroupBox {
         })
     }
     function _clearBlockNoticeMutes() {
-        if (!root.bridgeAvailable) return
+        if (!group._blockNoticesSupported || !root.bridgeAvailable) return
         var corr = root.rpc.rpcBlockNoticeMutesClear()
         if (!corr) return
         root.rpc.registerRpcCallback(corr, function(ok, p, code, msg) {
@@ -121,7 +125,7 @@ GroupBox {
         })
     }
     function _addBlockNoticeMute(scopeDto, untilUnixMs) {
-        if (!root.bridgeAvailable) return
+        if (!group._blockNoticesSupported || !root.bridgeAvailable) return
         var payload = { "scope": scopeDto }
         if (untilUnixMs > 0) payload["until-unix-ms"] = untilUnixMs
         var corr = root.rpc.rpcBlockNoticeMutesSet(payload)
@@ -214,6 +218,7 @@ GroupBox {
             Layout.fillWidth: true
             Layout.leftMargin: root.uiTheme.spacingLg
             enabled: root.prefs.showNotifications !== false
+            visible: group._blockNoticesSupported
             text: root.tr("settings.field.notify-block-notices",
                 "Tell me when a connection gets blocked")
             checked: root.prefs.notifyBlockNotices !== false
@@ -495,8 +500,16 @@ GroupBox {
             color: root.textColor
             font.bold: true
         }
+        Label {
+            Layout.fillWidth: true
+            visible: !group._blockNoticesSupported
+            color: root.mutedTextColor
+            wrapMode: Text.WordWrap
+            text: root.platformUnsupportedText
+        }
         CheckBox {
             Layout.fillWidth: true
+            visible: group._blockNoticesSupported
             enabled: root.prefs.notifyBlockNotices !== false
             text: root.tr("settings.field.hide-block-notice-addresses",
                 "Hide addresses in these notifications")
@@ -509,6 +522,7 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            visible: group._blockNoticesSupported
             text: root.tr("settings.field.hide-block-notice-addresses-tooltip",
                 "Replaces the destination with a generic label instead of the real hostname — useful when your screen is being shared or recorded.")
         }
@@ -516,6 +530,7 @@ GroupBox {
         Label {
             Layout.fillWidth: true
             Layout.topMargin: root.uiTheme.spacingSm
+            visible: group._blockNoticesSupported
             text: root.tr("settings.block-notices.mutes.heading", "Active mutes")
             color: root.textColor
             font.bold: true
@@ -524,7 +539,7 @@ GroupBox {
             id: blockNoticeMuteList
             Layout.fillWidth: true
             Layout.preferredHeight: Math.min(220, Math.max(1, group._blockNoticeMutes.length) * 44)
-            visible: group._blockNoticeMutes.length > 0
+            visible: group._blockNoticesSupported && group._blockNoticeMutes.length > 0
             clip: true
             boundsBehavior: Flickable.StopAtBounds
             ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
@@ -563,7 +578,7 @@ GroupBox {
         }
         Label {
             Layout.fillWidth: true
-            visible: group._blockNoticeMutes.length === 0
+            visible: group._blockNoticesSupported && group._blockNoticeMutes.length === 0
             color: root.mutedTextColor
             text: group._blockNoticeMutesLoading
                 ? root.tr("settings.block-notices.mutes.loading", "Loading…")
@@ -571,6 +586,7 @@ GroupBox {
         }
         RowLayout {
             Layout.fillWidth: true
+            visible: group._blockNoticesSupported
             spacing: root.uiTheme.spacingSm
             Item { Layout.fillWidth: true }
             ThemedButton {
@@ -586,6 +602,7 @@ GroupBox {
         Label {
             Layout.fillWidth: true
             Layout.topMargin: root.uiTheme.spacingSm
+            visible: group._blockNoticesSupported
             text: root.tr("settings.block-notices.add.heading", "Add a mute")
             color: root.textColor
             font.bold: true
@@ -595,11 +612,13 @@ GroupBox {
             color: root.mutedTextColor
             wrapMode: Text.WordWrap
             font.pixelSize: root.uiTheme.baseFontSizePx - 1
+            visible: group._blockNoticesSupported
             text: root.tr("settings.block-notices.add.description",
                 "The notification's quick-mute options only offer a few fixed lengths. Use this form for a duration of your own, or to mute indefinitely.")
         }
         RowLayout {
             Layout.fillWidth: true
+            visible: group._blockNoticesSupported
             spacing: root.uiTheme.spacingSm
             ThemedComboBox {
                 id: blockNoticeAddScope
@@ -629,6 +648,7 @@ GroupBox {
         }
         RowLayout {
             Layout.fillWidth: true
+            visible: group._blockNoticesSupported
             spacing: root.uiTheme.spacingSm
             Label {
                 text: root.tr("settings.block-notices.add.duration-label", "For how long")
@@ -668,6 +688,7 @@ GroupBox {
         }
         RowLayout {
             Layout.fillWidth: true
+            visible: group._blockNoticesSupported
             spacing: root.uiTheme.spacingSm
             Item { Layout.fillWidth: true }
             ThemedButton {

@@ -2,6 +2,10 @@
 
 #include "native_bridge.h"
 
+#ifndef Q_OS_WIN
+#include <unistd.h>
+#endif
+
 // ── NrrServiceController ─────────────────────────────────────────────────
 //
 // Q_OBJECT bridge for the Windows Service Control Manager. Wraps the
@@ -35,6 +39,7 @@
 // raises UAC). Used by the service worker so "Run as administrator" users
 // don't get re-prompted on every service operation.
 inline bool nrrProcessIsElevated() {
+#ifdef Q_OS_WIN
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         return false;
@@ -45,6 +50,11 @@ inline bool nrrProcessIsElevated() {
                                         &elevation, sizeof(elevation), &bytes);
     CloseHandle(token);
     return ok && elevation.TokenIsElevated != 0;
+#else
+    // The POSIX counterpart of an elevated token: root is what may write a
+    // unit file, reshape nftables and read the service's own data tree.
+    return ::geteuid() == 0;
+#endif
 }
 
 class NrrServiceWorker : public QObject {
@@ -60,6 +70,17 @@ public slots:
     void runElevated(const QString &operation,
                      const QString &servicePath,
                      const QString &command) {
+#ifndef Q_OS_WIN
+        // Elsewhere the service is the platform's own (systemd today), and
+        // registering or starting it is a Rust port's job, not this glue's.
+        // Saying so is the whole non-Windows behaviour: a GUI that silently
+        // did nothing would read as a service that refuses to start.
+        (void) servicePath;
+        (void) command;
+        emit result(operation, false,
+                    QStringLiteral("Service control from the app is Windows-only for now; "
+                                   "install and start the service from the command line."));
+#else
         SHELLEXECUTEINFOW sei{};
         sei.cbSize = sizeof(sei);
         sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
@@ -101,6 +122,7 @@ public slots:
             emit result(operation, false,
                         QStringLiteral("Service binary exited with code %1").arg(exitCode));
         }
+#endif
     }
 
 signals:
@@ -230,16 +252,7 @@ public:
     }
 
     Q_INVOKABLE bool isCurrentProcessElevated() const {
-        HANDLE token = nullptr;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
-            return false;
-        }
-        TOKEN_ELEVATION elevation{};
-        DWORD bytes = 0;
-        const BOOL ok = GetTokenInformation(token, TokenElevation,
-                                            &elevation, sizeof(elevation), &bytes);
-        CloseHandle(token);
-        return ok && elevation.TokenIsElevated != 0;
+        return nrrProcessIsElevated();
     }
 
     /// Wire the RPC bridge so a non-elevated
@@ -399,6 +412,13 @@ private:
     static constexpr const wchar_t *SERVICE_NAME = L"NetRuleRouter";
 
     Status queryStatus(QString *reason) const {
+#ifndef Q_OS_WIN
+        // No SCM here. The state of a systemd unit is read by the platform
+        // port in Rust; reimplementing it in this glue would be a second
+        // answer to the same question, free to drift from the first.
+        *reason = QStringLiteral("Service state is not read by the app on this platform.");
+        return Unknown;
+#else
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
         if (!scm) {
             *reason = QStringLiteral("OpenSCManager failed: %1").arg(GetLastError());
@@ -434,6 +454,7 @@ private:
             case SERVICE_STOP_PENDING:   return StopPending;
             default:                     return Unknown;
         }
+#endif
     }
 
     void dispatch(const QString &operation, const QString &command) {

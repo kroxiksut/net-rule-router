@@ -36,7 +36,9 @@ use child_process::{apply_no_window, spawn_line_reader};
 use context::{cleanup_temp_leftovers, emit_context};
 use diag_log::{diag_log_path, rotate_session_log, surface_tag};
 use resolve::{resolve_native_icon_path, resolve_qml_path, sibling_service_binary};
-use single_instance::{is_process_alive, parse_pid_from_lock_content};
+use single_instance::{
+    foreign_build_in_lock, is_process_alive, lock_file_path, parse_pid_from_lock_content,
+};
 
 /// stdout/stderr line marker emitted by Main.qml / Tray.qml on every
 /// preference mutation. Each payload is a complete snapshot and is written
@@ -522,6 +524,11 @@ const ACTIVATION_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 const ACTIVATION_ACK_TIMEOUT_OWNER_ALIVE: Duration = Duration::from_secs(30);
 const ACTIVATION_ACK_POLL: Duration = Duration::from_millis(100);
 
+/// Exit code for "a different build of this surface is already running".
+/// Distinct from `FAILURE` so a script — or a developer reading `$?` after a
+/// rebuild — can tell it apart from a launch that actually went wrong.
+const EXIT_BUILD_MISMATCH: u8 = 4;
+
 fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryOutcome {
     let tag = surface_tag(config.surface);
     // Same reasoning as the primary path, minus the rotation: this run appends
@@ -536,6 +543,23 @@ fn run_secondary(config: &LauncherConfig, request: &LaunchRequest) -> SecondaryO
             config.surface
         ),
     );
+    // A different build holding the lock is never a duplicate launch: it is the
+    // previous build still running. Handing it the activation would raise ITS
+    // window, which looks exactly like a rebuild that changed nothing — the
+    // trap that cost a developer six hours. Say which build answered instead.
+    if let Some((running, ours)) = foreign_build_in_lock(config.single_instance_key) {
+        diag_log(
+            tag,
+            &format!(
+                "NRR_LAUNCHER[secondary] ANOTHER BUILD of {} holds the single-instance lock; \
+                 not activating it. running: [{running}] this: [{ours}]. \
+                 Close the running instance before starting this one.",
+                config.app_name
+            ),
+        );
+        return SecondaryOutcome::Handled(ExitCode::from(EXIT_BUILD_MISMATCH));
+    }
+
     // For Tray surface a duplicate launch is a no-op — we cannot meaningfully
     // "activate" a tray icon and the running tray process already owns it.
     if matches!(config.surface, LauncherSurface::Tray) {
@@ -612,9 +636,7 @@ fn install_system_theme_port() {
 /// How long to wait for the primary to answer, decided by whether it is still
 /// there to answer at all.
 fn activation_ack_budget(instance_key: &str) -> Duration {
-    let lock_path =
-        nrr_platform_api::paths::user_runtime_dir().join(format!("{instance_key}.lock"));
-    let owner_alive = fs::read_to_string(&lock_path)
+    let owner_alive = fs::read_to_string(lock_file_path(instance_key))
         .ok()
         .and_then(|content| parse_pid_from_lock_content(&content))
         .is_some_and(is_process_alive);

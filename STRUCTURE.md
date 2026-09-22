@@ -73,8 +73,12 @@ Bundled baseline locale files (`en.json`, `ru.json`) — the source of truth for
 ### third_party/
 Vendored third-party components redistributed with the product, with their licences
 
+### packaging/
+Files a platform's delivery installs but the build does not produce:
+- **`packaging/linux`** — the two XDG desktop entries (`netrulerouter.desktop`, `netrulerouter-tray.desktop`). Their basenames are the Wayland `app_id` the Qt host declares via `setDesktopFileName`, which is how a compositor finds the window's name and icon.
+
 ### scripts/
-Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, network reset, smoke and speed probes, packaging, WSL gate. `scripts/dev/` holds one-off maintenance utilities.
+Developer automation, PowerShell and shell side by side: bootstrap, build, run, check, service install/uninstall/status, desktop-entry install/uninstall, full data purge, network reset, smoke and speed probes, packaging, WSL gate. `scripts/lib/` holds path constants the shell scripts source (never execute); `scripts/dev/` holds one-off maintenance utilities.
 
 ### .github/
 CI/CD workflow definitions (Windows and Linux quality gates)
@@ -145,6 +149,8 @@ The root `Cargo.toml` `members` list is the authority; add a crate there and her
 - `check` — Canonical quality gate (fmt, clippy, test, cargo-deny)
 - `clean-sync-duplicates` — Remove file-sync conflict copies
 - `install-service` / `uninstall-service` / `service-status` / `service-smoke` — Service lifecycle for development
+- `install-desktop` / `uninstall-desktop` — Linux only: desktop entries and hicolor icons, per user or machine-wide
+- `purge-data` — Remove every trace the product leaves on a machine, so the next install starts clean. Shows what it would delete unless `--yes` / `-Yes` is given; keeps the audit trail unless `--purge-audit` / `-PurgeAudit` is given
 - `reset-network` — Drop network state an abnormally stopped service left behind
 - `wsl-gate` — Run the Linux gate from WSL2
 - `package-windows` — Portable Windows package: binaries, the Qt and Visual C++

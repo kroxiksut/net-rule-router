@@ -473,6 +473,10 @@ Window {
                         id: firstRunPrimaryCombo
                         theme: root.uiTheme
                         Layout.fillWidth: true
+                        // Same gate the Interfaces screen puts on its role
+                        // buttons: placeholder rows name no adapter of this
+                        // machine, and the service refuses a binding to one.
+                        enabled: root.interfacesAreLive
                         model: root.interfacesModel
                         textRole: "name"
                         currentIndex: -1
@@ -491,7 +495,7 @@ Window {
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("dialog.first-run-wizard.primary-adapter-assign", "Set as main")
-                        enabled: firstRunPrimaryCombo.currentIndex >= 0
+                        enabled: root.interfacesAreLive && firstRunPrimaryCombo.currentIndex >= 0
                         onClicked: {
                             if (root.interfacesRolesController
                                     && typeof root.interfacesRolesController.assignRole === "function") {
@@ -505,7 +509,8 @@ Window {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
                     color: root.mutedTextColor
-                    visible: !firstRunWindow.primaryAssigned && root.interfacesModel.count === 0
+                    visible: !firstRunWindow.primaryAssigned
+                        && (root.interfacesModel.count === 0 || !root.interfacesAreLive)
                     text: root.tr("dialog.first-run-wizard.primary-adapter-unavailable",
                         "No connections to choose from yet — the background service reports them once it is running. You can set this later in Interfaces and routes.")
                 }
@@ -546,6 +551,7 @@ Window {
                         id: firstRunSecondaryCombo
                         theme: root.uiTheme
                         Layout.fillWidth: true
+                        enabled: root.interfacesAreLive
                         model: root.interfacesModel
                         textRole: "name"
                         currentIndex: -1
@@ -565,7 +571,7 @@ Window {
                         theme: root.uiTheme
                         text: root.tr("dialog.first-run-wizard.secondary-adapter-assign",
                             "Set as additional")
-                        enabled: firstRunSecondaryCombo.currentIndex >= 0
+                        enabled: root.interfacesAreLive && firstRunSecondaryCombo.currentIndex >= 0
                         onClicked: {
                             if (root.interfacesRolesController
                                     && typeof root.interfacesRolesController.assignRole === "function") {
@@ -671,6 +677,7 @@ Window {
                 CheckBox {
                     id: firstRunFakeIpCheck
                     Layout.fillWidth: true
+                    visible: root.serviceStabilitySupported
                     checked: firstRunWindow.wantFakeIp
                     text: root.tr("dialog.first-run-wizard.protection-fake-ip",
                         "Route sites by name, so an address shared with another site is not dragged along")
@@ -686,6 +693,7 @@ Window {
                 CheckBox {
                     id: firstRunDiagLogsCheck
                     Layout.fillWidth: true
+                    visible: root.serviceStabilitySupported
                     checked: firstRunWindow.wantDiagnosticLogs
                     text: root.tr("dialog.first-run-wizard.protection-diagnostic-logs",
                         "Write detailed diagnostic logs (only needed to report a problem)")
@@ -702,6 +710,7 @@ Window {
                     id: firstRunMuteBlockNoticesCheck
                     Layout.fillWidth: true
                     Layout.preferredWidth: 0
+                    visible: root.blockNoticesSupported
                     checked: firstRunWindow.wantBlockNoticesMuted
                     text: root.tr("dialog.first-run-wizard.protection-mute-block-notices",
                         "Do not show notifications about blocked traffic (rule suggestions still arrive)")

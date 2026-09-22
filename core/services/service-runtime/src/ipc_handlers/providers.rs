@@ -231,6 +231,10 @@ pub enum RoutePolicyWriteError {
     /// `stable_id` does not match any adapter the live `AdapterMonitor`
     /// knows about. Handler maps to `IpcErrorCode::PreconditionFailed`.
     UnknownAdapter { stable_id: String },
+    /// `stable_id` belongs to the placeholder dataset shown when no live
+    /// enumeration was available, so it names no adapter of this machine.
+    /// Handler maps to `IpcErrorCode::PreconditionFailed`.
+    PlaceholderAdapter { stable_id: String },
     /// Primary and secondary point at the same `stable_id`. Handler
     /// maps to `IpcErrorCode::PreconditionFailed`.
     PrimaryEqualsSecondary,
@@ -249,6 +253,11 @@ impl std::fmt::Display for RoutePolicyWriteError {
             Self::UnknownAdapter { stable_id } => {
                 write!(f, "unknown adapter id: {stable_id}")
             }
+            Self::PlaceholderAdapter { stable_id } => write!(
+                f,
+                "{stable_id} is a placeholder adapter, not one of this machine: \
+                 bind a role only to an adapter a live enumeration reported"
+            ),
             Self::PrimaryEqualsSecondary => {
                 write!(f, "primary and secondary cannot reference the same adapter")
             }

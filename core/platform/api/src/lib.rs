@@ -35,6 +35,9 @@ pub mod conn_observe;
 // enumeration cannot tell the two apart, and they need opposite advice.
 pub mod device_status;
 pub mod dns;
+// A caller-side deadline over any resolver: the platform ones answer
+// synchronously and cannot be cancelled.
+pub mod dns_budget;
 pub mod dns_observe;
 pub mod dns_redirect;
 // Which connection claims which DNS namespace. A corporate VPN says this

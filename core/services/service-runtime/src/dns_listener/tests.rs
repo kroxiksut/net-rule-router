@@ -692,11 +692,124 @@ fn a_failed_forward_answers_servfail_instead_of_saying_nothing() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("client timeout");
     let q = query("example.com", QTYPE_A);
-    l.handle_datagram(&server, &q, client.local_addr().expect("client addr"));
+    l.handle_datagram(
+        &server,
+        &q,
+        client.local_addr().expect("client addr"),
+        RULE_HOST_LANE_WAIT,
+    );
     let mut buf = [0u8; 512];
     let n = client.recv(&mut buf).expect("a reply, not silence");
     assert!(n >= 12);
     assert_eq!(buf[0..2], q[0..2], "same transaction id");
     assert_eq!(buf[2] & 0x80, 0x80, "QR set");
     assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
+}
+
+// ── Rule-host admission control ───────────────────────────────────────────
+
+/// Stands in for the FQDN cache: the addresses enforcement was built from.
+struct CachedSink(Vec<Ipv4Addr>);
+impl FactSink for CachedSink {
+    fn record(&self, _h: &str, _r: &ResolvedAddresses) {}
+    fn cached_routable_ips(&self, _hostname: &str) -> Vec<Ipv4Addr> {
+        self.0.clone()
+    }
+}
+
+/// The upstream that made this necessary: one that never comes back.
+struct NeverAnswers;
+impl UpstreamResolver for NeverAnswers {
+    fn resolve(&self, _h: &str, _f: AddressFamily) -> Result<ResolvedAddresses, ResolveError> {
+        panic!("a saturated rule-host lane must not reach the upstream")
+    }
+}
+
+fn saturated_listener(cached: &[Ipv4Addr]) -> DnsInterceptListener {
+    DnsInterceptListener::new(
+        Arc::new(Oracle(vec!["routed.example".to_string()])),
+        Arc::new(NeverAnswers),
+        Arc::new(CachedSink(cached.to_vec())),
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().unwrap(),
+        Duration::from_millis(150),
+        Duration::from_millis(150),
+    )
+}
+
+/// Every slot taken: the name still resolves, from what enforcement already
+/// holds, and the worker is free again immediately.
+#[test]
+fn a_saturated_rule_host_lane_answers_from_the_cache() {
+    let cached = Ipv4Addr::new(203, 0, 113, 7);
+    let l = saturated_listener(&[cached]);
+    let _held: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+        .map(|_| l.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+        .collect();
+
+    match l.answer_query(&query("routed.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => {
+            match crate::dns_wire::parse_address_response(0x1234, "routed.example", QTYPE_A, &bytes)
+            {
+                crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
+                    assert_eq!(addresses, vec![cached]);
+                }
+                other => panic!("expected Answers, got {other:?}"),
+            }
+        }
+        other => panic!("expected a response built from the cache, got {other:?}"),
+    }
+}
+
+/// Nothing cached and no slot: SERVFAIL, so the client re-asks in a moment
+/// instead of waiting out its own timeout on an answer that is not coming.
+#[test]
+fn a_saturated_rule_host_lane_without_a_cache_entry_fails_fast() {
+    let l = saturated_listener(&[]);
+    let _held: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+        .map(|_| l.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+        .collect();
+
+    match l.answer_query(&query("routed.example", QTYPE_A)) {
+        ListenerAction::Respond(bytes) => {
+            assert_eq!(bytes[3] & 0x0F, RCODE_SERVFAIL, "SERVFAIL rcode");
+        }
+        other => panic!("expected SERVFAIL, got {other:?}"),
+    }
+}
+
+/// The point of the cap: a name no rule claims is unaffected by rule hosts
+/// queueing on a resolver that stopped answering.
+#[test]
+fn a_name_no_rule_claims_is_unaffected_by_a_saturated_lane() {
+    let l = saturated_listener(&[]);
+    let _held: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+        .map(|_| l.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+        .collect();
+
+    let started = Instant::now();
+    assert_eq!(
+        l.answer_query(&query("vk.example", QTYPE_A)),
+        ListenerAction::ForwardFiltered
+    );
+    assert!(
+        started.elapsed() < RULE_HOST_LANE_WAIT,
+        "a direct name must not wait for a rule-host slot"
+    );
+}
+
+/// The slot is released when the answer is done, not held for the process.
+#[test]
+fn a_rule_host_slot_is_returned_after_the_query() {
+    let l = saturated_listener(&[Ipv4Addr::new(203, 0, 113, 7)]);
+    {
+        let _held: Vec<_> = (0..MAX_CONCURRENT_RULE_HOST_RESOLVES)
+            .map(|_| l.rule_host_lane.enter(Duration::ZERO).expect("slot"))
+            .collect();
+        assert!(l.rule_host_lane.enter(Duration::ZERO).is_none());
+    }
+    assert!(
+        l.rule_host_lane.enter(Duration::ZERO).is_some(),
+        "slots are free again once the permits drop"
+    );
 }

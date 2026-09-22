@@ -1689,6 +1689,7 @@
     "local-network-offer-decide": "Decide for each…",
     "local-network-offer-accepted": "These local networks stay reachable while routed traffic is blocked.",
     "local-network-offer-failed": "Could not save the answer; it will be asked again.",
+    "platform-unsupported": "This is not available on your operating system yet, so the controls here stay off. Nothing here is sent to the background service.",
     "drift-loaded-from-file": "Loaded {count} rule(s) from file into the app. Review and apply when ready.",
     "drift-clear-all-running": "Clearing all rules…",
     "drift-cleared-all": "All rules cleared from the app and the service.",
@@ -1980,6 +1981,7 @@
       },
       "label": "Bundled preset:",
       "user-label": "My rule set:",
+      "choose": "Choose a rule set...",
       "load": "Load",
       "hide": "Hide",
       "hide-tooltip": "Hide the bundled-preset quick-load row. Re-enable it in Settings.",
@@ -2483,6 +2485,11 @@
     "block-notice": {
       "title": "Connection blocked",
       "title-route-down": "Additional route is unavailable",
+      "merged": {
+        "title": "{count} connections blocked",
+        "body": "Check the addresses to send over the additional route.",
+        "list-accessible-name": "Blocked connections"
+      },
       "attempts": "{count} attempts",
       "reason": {
         "route-unavailable": "The route these addresses are bound to is down right now, so none of them open. This is one notice for the whole route.",
@@ -2501,11 +2508,13 @@
       },
       "route-confirm": {
         "title": "Route {name} via the additional link?",
+        "title-many": "Route {count} addresses via the additional link?",
         "body": "Adds a rule that sends this address over the additional route from now on. You can undo it later in Rules."
       },
       "snooze": {
         "title": "Snooze this notice",
         "body": "Stop asking about {name} for a while.",
+        "body-many": "Stop asking about these {count} addresses for a while.",
         "for-15-minutes": "15 minutes",
         "for-1-hour": "1 hour",
         "for-8-hours": "8 hours",
@@ -2515,6 +2524,7 @@
         "title": "What should stop appearing?",
         "body": "Mutes can be lifted later in Settings, General, under \"Active mutes\".",
         "this-host": "Only {name}",
+        "these-hosts": "Only these {count} addresses",
         "this-app": "Only {name}",
         "this-reason": "All \"{name}\"",
         "all": "All blocks: any host, any app"
