@@ -217,33 +217,7 @@ pub(super) fn build(inputs: PerSidApplyInputs<'_>) -> PerSidApplyStack {
                         ..FreshnessThresholds::default_production()
                     },
                 ));
-                // Seed the shared DoH-resolver baseline on first run
-                // (no-op once the list is non-empty, so user edits
-                // are never overwritten). Best-effort — a seed failure must not
-                // block service start.
-                {
-                    use nrr_storage::doh_lockdown::DohResolverEntriesRepository;
-                    let seed = nrr_service_runtime::doh_seed::builtin_seed();
-                    if let Ok(guard) = state_conn.lock() {
-                        let now = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        match DohResolverEntriesRepository::new(&guard).seed_if_empty(&seed, now) {
-                            Ok(n) if n > 0 => tracing::info!(
-                                target: "nrr::doh",
-                                seeded = n,
-                                "seeded the DoH/DoT resolver baseline on first run",
-                            ),
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                target: "nrr::doh",
-                                error = %e,
-                                "DoH resolver seed failed (non-fatal)",
-                            ),
-                        }
-                    }
-                }
+                nrr_service_runtime::doh_seed::seed_shared_baseline(state_conn);
                 // The policy source resolves DoH-resolver HOST entries
                 // through the FQDN cache (IP entries need no cache).
                 let route_source: Arc<dyn RoutePolicySource> = Arc::new(

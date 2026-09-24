@@ -20,7 +20,6 @@ outlook.exe                # corporate mail client
 # powershell.exe           # disabled: only enable for corporate managed devices
 
 --- Linux
-# (reserved — not applied on Windows)
 
 --- MacOS
 # (reserved — not applied on Windows)

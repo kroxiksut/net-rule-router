@@ -2,6 +2,9 @@
 # Shared path resolution and privileged helpers for the Linux service scripts
 # (install / uninstall / status). Sourced, never executed.
 
+# The checkout these scripts ship in: lib -> scripts -> repository root.
+NRR_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 # Keep in sync with product_identity.rs: PRODUCT_NAME, PRODUCT_NAME_UNIX,
 # SYSTEMD_UNIT_NAME and BinaryRole::Service. Both spellings are in play: our own
 # directories use the unix one, the Qt organization/application pair the
@@ -46,16 +49,36 @@ nrr_user_footprint_paths() {
   local state="${XDG_STATE_HOME:-$home/.local/state}"
   local config="${XDG_CONFIG_HOME:-$home/.config}"
   printf '%s\n' \
+    "$config/$NRR_PRODUCT_NAME_UNIX" \
     "$cache/$NRR_PRODUCT_NAME_UNIX" \
     "$cache/$NRR_PRODUCT_NAME/$NRR_PRODUCT_NAME" \
     "$cache/$NRR_PRODUCT_NAME/$NRR_TRAY_APP_NAME" \
     "$data/$NRR_PRODUCT_NAME/$NRR_PRODUCT_NAME" \
     "$data/$NRR_PRODUCT_NAME/$NRR_TRAY_APP_NAME" \
+    "$data/$NRR_PRODUCT_NAME/gui_metadata.db" \
+    "$data/$NRR_PRODUCT_NAME/gui_metadata.db-wal" \
+    "$data/$NRR_PRODUCT_NAME/gui_metadata.db-shm" \
     "$state/$NRR_PRODUCT_NAME_UNIX" \
     "$config/autostart/$NRR_TRAY_AUTOSTART_FILE" \
     "${TMPDIR:-/tmp}/$NRR_PRODUCT_NAME/managed"
   if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     printf '%s\n' "$XDG_RUNTIME_DIR/$NRR_PRODUCT_NAME_UNIX"
+  fi
+  # A development build keeps its per-user files in the checkout, next to the
+  # scripts themselves.
+  if [ -d "$NRR_REPO_ROOT/.devdata" ]; then
+    printf '%s\n' "$NRR_REPO_ROOT/.devdata"
+  fi
+}
+
+# Under sudo HOME is root's, so a per-user path set resolves for the wrong
+# profile and the script reports success having touched nothing. $1 names the
+# way to the privileged scope, which differs per script.
+nrr_refuse_sudo() {
+  if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+    echo "Run $(basename "$0") as your own user, not through sudo: the per-user" >&2
+    echo "paths would resolve for root. $1" >&2
+    exit 2
   fi
 }
 

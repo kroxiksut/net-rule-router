@@ -33,15 +33,17 @@ use nrr_service_runtime::production_coordinator::{
 };
 use nrr_service_runtime::production_diagnostics::ProductionDiagnosticsFacade;
 use nrr_service_runtime::production_handlers_misc::{
-    MonitoredAdaptersSnapshotProvider, NoopMutationExecutor, ProductionMigrationCompletionWriter,
+    MonitoredAdaptersSnapshotProvider, ProductionMigrationCompletionWriter,
     ProductionMigrationStatusProvider, ProductionRoutePolicyProvider, ProductionRoutePolicyWriter,
     ProductionRulesSnapshotProvider,
 };
+use nrr_service_runtime::production_mutation_executor::ProductionMutationExecutor;
 use nrr_service_runtime::production_policy_manager::CoordinatorPolicyManager;
 use nrr_service_runtime::production_security_alerts::ProductionSecurityAlertsRepository;
 use nrr_service_runtime::production_settings::{
     ProductionApplyFailurePolicy, ProductionAutostart, ProductionLogRetentionConfig,
-    ProductionRetentionSettings, ProductionRoutingPause, ProductionStorageUsage,
+    ProductionRetentionSettings, ProductionRoutingPause, ProductionServiceStability,
+    ProductionStorageUsage,
 };
 use nrr_service_runtime::routing_pause::{
     NoopRoutingPauseAudit, PauseDispatcher, RoutingPauseCoordinator,
@@ -195,6 +197,7 @@ pub(crate) fn build_ipc_surface(
     gui_binary: PathBuf,
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
     traffic_sampler: Option<crate::runtime_deps::TrafficSamplerHandle>,
+    cache_store: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -246,6 +249,18 @@ pub(crate) fn build_ipc_surface(
         Arc::new(nrr_service_runtime::production_settings::SystemClock),
     ));
 
+    // Every rule change the GUI makes — preset import, table edits, rollback —
+    // lands here; without it a preview came back empty and read as "nothing to
+    // apply". The coordinator's dispatcher is what makes an approval take effect.
+    let mutation_executor = ProductionMutationExecutor::new(Arc::clone(&coordinator))
+        .with_alerts_repo(Arc::clone(&alerts_repo) as _)
+        .with_state_conn(Arc::clone(&state_conn))
+        .with_event_bus(Arc::clone(&event_bus))
+        .with_pause_coordinator(Arc::clone(&pause_coordinator))
+        .with_stability_provider(Arc::new(ProductionServiceStability::new(Arc::clone(
+            &state_conn,
+        ))));
+
     // Wired but shadowed: the launcher answers `autostart.*` before the socket
     // hop because autostart is per-user and this daemon runs as root, where
     // `$HOME` is `/root` — an entry written here is one no session ever reads.
@@ -281,10 +296,7 @@ pub(crate) fn build_ipc_surface(
             )
             .with_log_writer(log_writer),
         ),
-        // Rule mutations travel the coordinator, which the policy manager owns;
-        // the executor covers the other mutation kinds and none of them are
-        // wired here yet, so it refuses rather than reports success.
-        Arc::new(NoopMutationExecutor),
+        Arc::new(mutation_executor),
         Arc::clone(&mutation_tokens),
         Arc::default(),
         Arc::clone(&event_bus),
@@ -325,6 +337,21 @@ pub(crate) fn build_ipc_surface(
                 .with_event_bus(event_bus),
         ),
     );
+    // Archives go under the runtime directory: the state tree is `0700`, and a
+    // user cannot open a file below a directory they cannot traverse.
+    let deps = deps
+        .with_cache_repository(cache_store)
+        .with_archives_config(
+            nrr_platform_linux::systemd::runtime_dir().join("archives"),
+            env!("CARGO_PKG_VERSION").to_string(),
+        )
+        .with_system_info(nrr_platform_linux::system_info::collect())
+        .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
+        // No connection observer feeds it yet: the trace viewer answers
+        // "observer inactive" instead of an unimplemented operation.
+        .with_conn_trace_ring(Arc::new(
+            nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
+        ));
     // The SAME engine the observation consumer feeds. Without it the
     // `autorules.candidates.*` operations stay registered as unimplemented and
     // the GUI's suggestions page has nothing to read.

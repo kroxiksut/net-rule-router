@@ -623,6 +623,7 @@ fn handle_connection(
                     SubscriptionChange::Unchanged => {}
                     SubscriptionChange::Opened(sub_id) => tracing::info!(
                         target: "nrr::ipc-push",
+                        msg_key = "push-subscription-opened",
                         subscription_id = %sub_id,
                         profile = ?identity.profile,
                         subscribers = event_bus.as_ref().map(|b| b.subscriber_count()).unwrap_or(0),
@@ -686,6 +687,7 @@ fn handle_connection(
         bus.unsubscribe(sub_id);
         tracing::info!(
             target: "nrr::ipc-push",
+            msg_key = "push-subscription-closed",
             subscription_id = %sub_id,
             subscribers = bus.subscriber_count(),
             "push subscription closed"

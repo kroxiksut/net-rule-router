@@ -598,6 +598,7 @@ impl IpcRouter {
                 .unwrap_or_else(|| ("Unknown".into(), String::new()));
             tracing::warn!(
                 target: "nrr::ipc::dispatch",
+                msg_key = "ipc-request-failed",
                 request_id = %response.request_id,
                 op = op_slug,
                 class = ?class,

@@ -215,6 +215,9 @@ impl SidLedger {
     fn config(eager_delivery_names: bool) -> CompanionAffinityConfig {
         CompanionAffinityConfig {
             propose_delivery_names_without_co_activity: eager_delivery_names,
+            // The service watches connections, so a resolution before the
+            // window that nothing followed is a prefetch, not a companion.
+            lookback_requires_traffic: true,
             ..CompanionAffinityConfig::default()
         }
     }

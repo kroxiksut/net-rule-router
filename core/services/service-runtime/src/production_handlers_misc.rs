@@ -410,6 +410,8 @@ pub struct ProductionRoutePolicySource {
     /// seed list carries an IP for every resolver, so the lockdown is fully
     /// functional by IP even without host resolution.
     fqdn_cache: Option<Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>>,
+    /// Set where the platform has no other way to turn browser DoH off.
+    doh_lockdown_forced: bool,
 }
 
 impl ProductionRoutePolicySource {
@@ -417,7 +419,17 @@ impl ProductionRoutePolicySource {
         Self {
             conn,
             fqdn_cache: None,
+            doh_lockdown_forced: false,
         }
+    }
+
+    /// Blocks DoH for every principal regardless of their toggle. For a
+    /// platform whose service does not answer DNS itself: there the canary that
+    /// switches browser DoH off is never served, and a browser resolving over
+    /// HTTPS hides every subdomain a wildcard rule has to learn.
+    pub fn with_doh_lockdown_forced(mut self) -> Self {
+        self.doh_lockdown_forced = true;
+        self
     }
 
     /// Wires the FQDN cache so DoH-resolver HOST entries resolve.
@@ -475,9 +487,15 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             .into_iter()
             .map(|a| a.exe_path)
             .collect();
+        let doh_lockdown_enabled = record.doh_lockdown_enabled || self.doh_lockdown_forced;
+        let doh_lockdown_scope = if self.doh_lockdown_forced {
+            nrr_storage::doh_lockdown::DohLockdownScope::Always
+        } else {
+            record.doh_lockdown_scope
+        };
         // Resolve the DoH-resolver list only when the lockdown is
         // on (avoid the list read + cache lookups otherwise).
-        let doh_resolver_ips = if record.doh_lockdown_enabled {
+        let doh_resolver_ips = if doh_lockdown_enabled {
             self.resolve_doh_resolver_ips(&conn)
         } else {
             Vec::new()
@@ -496,8 +514,8 @@ impl RoutePolicySource for ProductionRoutePolicySource {
             kill_switch_strict_shared_ips: record.kill_switch_strict_shared_ips,
             mode_a_coverage_strategy: record.mode_a_coverage_strategy,
             link_provider_exe_paths,
-            doh_lockdown_enabled: record.doh_lockdown_enabled,
-            doh_lockdown_scope: record.doh_lockdown_scope,
+            doh_lockdown_enabled,
+            doh_lockdown_scope,
             doh_resolver_ips,
             auto_rules_mode: record.auto_rules_mode,
             primary_probe_auto: record.primary_probe_auto,

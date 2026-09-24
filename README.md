@@ -80,13 +80,13 @@ The full walkthrough, including what to do if you lose network access, is in
 ## Highlights
 
 - **Two-route model** — a `primary` and a `secondary` route, one active config at a time.
-- **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (Windows process name).
+- **Four ways to match traffic** — by domain (label + all subdomains), by domain zone (a TLD or internal suffix such as `.ru` or `.intra`), by exact IPv4, or by application (the process name).
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
-- **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a Windows service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
+- **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
 - **Accessibility as a baseline** — screen-reader support, keyboard navigation, scalable fonts, a dedicated high-contrast theme.
 - **RU / EN out of the box**, with drop-in community locales (no rebuild needed).
 - **Local-first & private** — no mandatory login, telemetry off by default, no hidden background network calls.

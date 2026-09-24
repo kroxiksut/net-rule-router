@@ -22,7 +22,6 @@ vn              # Socialist Republic of Vietnam (.vn)
 # Local/region-oriented desktop apps (examples)
 
 --- Linux
-# (reserved - not applied on Windows)
 
 --- MacOS
 # (reserved - not applied on Windows)

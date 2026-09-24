@@ -56,7 +56,7 @@ tamtam.exe
 2gis.exe
 
 --- Linux
-# (reserved - not applied on Windows)
+yandex-disk
 
 --- MacOS
 # (reserved - not applied on Windows)

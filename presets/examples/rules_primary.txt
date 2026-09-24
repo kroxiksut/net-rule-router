@@ -18,7 +18,6 @@ updates.example.org      # vendor update endpoint
 # (no application rules in this example)
 
 --- Linux
-# (reserved — not applied on Windows)
 
 --- MacOS
 # (reserved — not applied on Windows)

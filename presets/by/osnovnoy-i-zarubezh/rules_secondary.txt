@@ -190,7 +190,30 @@ mps.exe  # JetBrains IDE and tooling apps
 MaintenanceTool.exe  # Qt installer and updater (Qt account and downloads are refused from this country)
 
 --- Linux
-# (reserved - not applied on Windows)
+clion
+codex
+codex*
+cursor
+datagrip
+dataspell
+discord
+goland
+idea
+jetbrains-toolbox
+maintenancetool  # Qt installer and updater (Qt account and downloads are refused from this country)
+phpstorm
+pycharm
+rider
+rubymine
+signal-desktop
+slack
+telegram
+telegram-desktop
+viber
+webstorm
+wechat
+windsurf
+zoom
 
 --- MacOS
 # (reserved - not applied on Windows)

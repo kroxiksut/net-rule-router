@@ -313,6 +313,7 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
     // mode actually decides.
     let mut post_write_commands = vec![vec!["systemctl".to_string(), "daemon-reload".to_string()]];
     if activation == UnitActivation::EnableNow {
+        post_write_commands.push(reset_start_limit());
         post_write_commands.push(vec![
             "systemctl".to_string(),
             "enable".to_string(),
@@ -344,11 +345,31 @@ pub fn plan_install(cfg: &SystemdServiceConfig, activation: UnitActivation) -> S
     }
 }
 
+/// `systemctl reset-failed` for the unit. `StartLimitBurst=` counts EVERY start,
+/// not only crash restarts, so a third reinstall or restart in a day would be
+/// refused as a crash loop. An operator's start is not one: clear the counter
+/// first, and leave the limit to bound `Restart=` alone.
+pub fn reset_start_limit() -> Vec<String> {
+    vec![
+        "systemctl".to_string(),
+        "reset-failed".to_string(),
+        SYSTEMD_UNIT_NAME.to_string(),
+    ]
+}
+
 /// The service-owned state directory systemd provisions via `StateDirectory=`
 /// (`/var/lib/netrulerouter`). Declared here, next to the directive that
 /// creates it, so a purge cannot delete a directory the unit never made.
 pub fn state_dir() -> PathBuf {
     PathBuf::from("/var/lib").join(RUNTIME_STATE_DIR)
+}
+
+/// The runtime directory systemd provisions via `RuntimeDirectory=`
+/// (`/run/netrulerouter`, `0755`). The one service-owned tree an ordinary user
+/// can traverse, so files handed to a user live under it; it is emptied when
+/// the service stops.
+pub fn runtime_dir() -> PathBuf {
+    PathBuf::from("/run").join(RUNTIME_STATE_DIR)
 }
 
 /// The operational-log directory systemd provisions via `LogsDirectory=`
@@ -889,6 +910,7 @@ mod tests {
             plan.post_write_commands,
             vec![
                 vec!["systemctl".to_string(), "daemon-reload".to_string()],
+                reset_start_limit(),
                 vec![
                     "systemctl".to_string(),
                     "enable".to_string(),

@@ -520,6 +520,7 @@ impl ServiceControlPort for LinuxServiceControl {
         if self.query()?.is_none() {
             return Err(ServiceControlError::NotInstalled);
         }
+        self.run_checked(&crate::systemd::reset_start_limit())?;
         // `--no-block` returns as soon as the job is queued, so the wait below
         // is ours to bound rather than systemd's.
         self.run_checked(&systemctl(&["start", "--no-block", SYSTEMD_UNIT_NAME]))?;
@@ -815,6 +816,7 @@ mod tests {
                 "link /usr/lib/netrulerouter/nrr-service -> /usr/lib/netrulerouter/nrr-serviced"
                     .to_string(),
                 "run systemctl daemon-reload".to_string(),
+                "run systemctl reset-failed netrulerouter.service".to_string(),
                 "run systemctl enable --now netrulerouter.service".to_string(),
             ]
         );
@@ -977,9 +979,16 @@ mod tests {
         let (port, journal) = port_over(vec![("show", ok(&show_running())), ("is-active", ok(""))]);
         port.start(Duration::from_secs(5)).expect("start");
         let ops = recorded(&journal);
-        assert!(ops
+        let reset = ops
             .iter()
-            .any(|o| o == "run systemctl start --no-block netrulerouter.service"));
+            .position(|o| o == "run systemctl reset-failed netrulerouter.service");
+        let start = ops
+            .iter()
+            .position(|o| o == "run systemctl start --no-block netrulerouter.service");
+        assert!(
+            matches!((reset, start), (Some(r), Some(s)) if r < s),
+            "the start-limit counter must be cleared before the start: {ops:?}"
+        );
         assert!(ops.iter().any(|o| o.contains("is-active")));
     }
 

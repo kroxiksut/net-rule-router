@@ -45,3 +45,6 @@ tamtam.exe
 vk.exe
 vkplay.exe
 vkteams.exe
+
+--- Linux
+yandex-disk

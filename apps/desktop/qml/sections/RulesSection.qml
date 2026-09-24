@@ -1067,7 +1067,7 @@ ColumnLayout {
             theme: root.uiTheme
             Layout.fillWidth: true
             // The question "why did this go out the wrong way" is asked over
-            // the rule table; the answer lives in Diagnostics.
+            // the rule table; the answer lives in the connection trace.
             text: root.tr("rules.action.where-traffic-goes", "Where traffic is going")
             icon.source: root.uiIconSource("diagnostics")
             ToolTip.visible: hovered && root.prefs.tooltipsEnabled
@@ -1078,9 +1078,7 @@ ColumnLayout {
             Accessible.description: ToolTip.text
             // Through the unsaved-changes guard: the rule table is often
             // dirty, and assigning the section directly would skip the ask.
-            onClicked: root.requestSectionChange("diagnostics", function() {
-                root.diagOpenConnTrace = true
-            })
+            onClicked: root.requestSectionChange("conn-trace")
         }
         ThemedButton {
             theme: root.uiTheme

@@ -1152,10 +1152,10 @@ pub const STATE_DB_V49_DDL: &[&str] = &[
 ];
 
 /// ISP block-page rule candidates — `isp_block_candidates_enabled` on
-/// `service_stability_config`, sibling of `fake_ip_enabled`: an opt-in
-/// mechanism gate with no owning administrator flag until now, so the
-/// feature could not be turned on to test it. `0` (the default) keeps it
-/// off. Purely additive ALTER. DEV schema; wiped freely.
+/// `service_stability_config`. Added as an opt-in gate and never given a
+/// reader; dropped again in v63, which is why this DDL stays: a database still
+/// on an older version walks through it on the way up. DEV schema; wiped
+/// freely.
 pub const STATE_DB_V50_DDL: &[&str] = &["ALTER TABLE service_stability_config \
 ADD COLUMN isp_block_candidates_enabled INTEGER NOT NULL DEFAULT 0 \
 CHECK(isp_block_candidates_enabled IN (0, 1))"];
@@ -1340,3 +1340,76 @@ pub const STATE_DB_V61_DDL: &[&str] = &[
 /// covers both and no second alarm mechanism is introduced.
 pub const STATE_DB_V62_DDL: &[&str] =
     &["ALTER TABLE active_revision_pointer ADD COLUMN row_hmac BLOB NOT NULL DEFAULT x''"];
+
+/// Drops `isp_block_candidates_enabled` from `service_stability_config`.
+///
+/// It was added as an opt-in gate for the provider-block offers and never
+/// acquired a reader: the offers are already gated twice, by the principal's
+/// auto-rules mode and by a confirmed connection to the censored host. A third
+/// switch nothing consults is a setting that cannot be wrong, only misleading —
+/// a run spent time asking whether it was what kept the offers away.
+///
+/// The column carries a CHECK, which SQLite cannot drop with `ALTER`, so the
+/// table is rebuilt. Settings are carried over: unlike a wiped mute list, these
+/// are the service's own knobs and losing them changes how it runs.
+pub const STATE_DB_V63_DDL: &[&str] = &[
+    "CREATE TABLE service_stability_config_v63 (
+    id                   INTEGER PRIMARY KEY CHECK(id = 1),
+    ipc_accept_kind      TEXT    NOT NULL CHECK(ipc_accept_kind IN
+                              ('recoverable', 'critical')),
+    ipc_max_restarts     INTEGER CHECK(ipc_max_restarts IS NULL
+                              OR ipc_max_restarts BETWEEN 1 AND 100),
+    ipc_backoff_base_ms  INTEGER CHECK(ipc_backoff_base_ms IS NULL
+                              OR ipc_backoff_base_ms BETWEEN 50 AND 5000),
+    ipc_backoff_cap_ms   INTEGER CHECK(ipc_backoff_cap_ms IS NULL
+                              OR ipc_backoff_cap_ms BETWEEN 1000 AND 60000),
+    set_by_sid           TEXT,
+    updated_at           INTEGER NOT NULL,
+    verbose_logging      INTEGER NOT NULL DEFAULT 0 CHECK(verbose_logging IN (0, 1)),
+    conn_trace_ndjson    INTEGER NOT NULL DEFAULT 0 CHECK(conn_trace_ndjson IN (0, 1)),
+    conn_trace_gui       INTEGER NOT NULL DEFAULT 0 CHECK(conn_trace_gui IN (0, 1)),
+    rule_scope_service_driven INTEGER NOT NULL DEFAULT 1
+                              CHECK(rule_scope_service_driven IN (0, 1)),
+    routing_stop_policy  TEXT NOT NULL DEFAULT 'teardown'
+                              CHECK(routing_stop_policy IN ('teardown', 'persist')),
+    cache_refresh_interval_secs INTEGER NOT NULL DEFAULT 300
+                              CHECK(cache_refresh_interval_secs BETWEEN 60 AND 86400),
+    enforcement_mode     INTEGER NOT NULL DEFAULT 0 CHECK(enforcement_mode IN (0, 1)),
+    secondary_liveness_window_secs INTEGER NOT NULL DEFAULT 0
+                              CHECK(secondary_liveness_window_secs BETWEEN 0 AND 3600),
+    fake_ip_enabled      INTEGER NOT NULL DEFAULT 0 CHECK(fake_ip_enabled IN (0, 1)),
+    dns_via_secondary    INTEGER NOT NULL DEFAULT 0 CHECK(dns_via_secondary IN (0, 1)),
+    dns_fast_answers     INTEGER NOT NULL DEFAULT 1 CHECK(dns_fast_answers IN (0, 1)),
+    fake_ip_udp_relay    INTEGER NOT NULL DEFAULT 0 CHECK(fake_ip_udp_relay IN (0, 1)),
+    fake_ip_instant_rst  INTEGER NOT NULL DEFAULT 1 CHECK(fake_ip_instant_rst IN (0, 1)),
+    allow_user_rule_edits INTEGER NOT NULL DEFAULT 1
+                              CHECK(allow_user_rule_edits IN (0, 1)),
+    CHECK (
+        (ipc_accept_kind = 'recoverable'
+            AND ipc_max_restarts    IS NOT NULL
+            AND ipc_backoff_base_ms IS NOT NULL
+            AND ipc_backoff_cap_ms  IS NOT NULL)
+        OR
+        (ipc_accept_kind = 'critical'
+            AND ipc_max_restarts    IS NULL
+            AND ipc_backoff_base_ms IS NULL
+            AND ipc_backoff_cap_ms  IS NULL)
+    )
+)",
+    "INSERT INTO service_stability_config_v63 (
+    id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms,
+    set_by_sid, updated_at, verbose_logging, conn_trace_ndjson, conn_trace_gui,
+    rule_scope_service_driven, routing_stop_policy, cache_refresh_interval_secs,
+    enforcement_mode, secondary_liveness_window_secs, fake_ip_enabled,
+    dns_via_secondary, dns_fast_answers, fake_ip_udp_relay, fake_ip_instant_rst,
+    allow_user_rule_edits)
+SELECT id, ipc_accept_kind, ipc_max_restarts, ipc_backoff_base_ms, ipc_backoff_cap_ms,
+    set_by_sid, updated_at, verbose_logging, conn_trace_ndjson, conn_trace_gui,
+    rule_scope_service_driven, routing_stop_policy, cache_refresh_interval_secs,
+    enforcement_mode, secondary_liveness_window_secs, fake_ip_enabled,
+    dns_via_secondary, dns_fast_answers, fake_ip_udp_relay, fake_ip_instant_rst,
+    allow_user_rule_edits
+FROM service_stability_config",
+    "DROP TABLE service_stability_config",
+    "ALTER TABLE service_stability_config_v63 RENAME TO service_stability_config",
+];

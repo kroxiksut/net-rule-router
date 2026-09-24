@@ -1,4 +1,8 @@
 use super::*;
+// Private to the archive module; its naming and pruning tests live here.
+use super::archive::{
+    format_timestamp_for_filename, prune_old_archives, sanitize_for_filename, unique_archive_path,
+};
 use crate::ipc_handlers::test_fakes::{FakeAdapters, FakeRoutePolicy};
 use nrr_diagnostics::audit::alert::InMemorySecurityAlertsRepository;
 use nrr_shared::ipc::{IpcClientProfile, IpcOperationName};

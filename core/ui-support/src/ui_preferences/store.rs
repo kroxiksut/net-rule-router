@@ -196,24 +196,18 @@ struct StorageLocation {
     is_profile_persistent: bool,
 }
 
+/// Where the OS wants a per-user file kept is not this crate's business — it
+/// asks [`nrr_shared::user_paths`], which is also what the localization layer
+/// reads, so the override directory and the settings file cannot drift apart.
 fn resolve_storage_location() -> io::Result<StorageLocation> {
-    let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
-    if let Some(app_data) = env::var_os("APPDATA") {
-        candidates.push((PathBuf::from(app_data), true));
-    }
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        candidates.push((PathBuf::from(local_app_data), true));
-    }
-    candidates.push((env::temp_dir(), false));
-
     let mut last_error = None;
-    for (base, is_profile_persistent) in candidates {
-        let managed_path = base.join(MANAGED_ROOT_FOLDER).join(MANAGED_SUBFOLDER);
+    for root in nrr_shared::user_paths::user_app_roots() {
+        let managed_path = root.path.join(MANAGED_SUBFOLDER);
         match fs::create_dir_all(&managed_path) {
             Ok(_) => {
                 return Ok(StorageLocation {
                     root: managed_path,
-                    is_profile_persistent,
+                    is_profile_persistent: root.is_profile_persistent,
                 });
             }
             Err(error) => {

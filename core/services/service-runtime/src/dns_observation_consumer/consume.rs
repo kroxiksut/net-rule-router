@@ -119,8 +119,42 @@ impl DnsObservationConsumer {
             // hand. The engine applies its own exclusions, and the main-link
             // probe still gets to disagree before the user is asked.
             if crate::dns_address_sanity::is_provider_placeholder_answer(&obs.ipv4s) {
-                if let Some(engine) = self.auto_rules.as_ref() {
-                    engine.note_placeholder_answer_host(&sid, &obs.hostname, now);
+                // Parked, not offered: the same answer goes to a name a page
+                // prefetched and to one the user opened, and only the second
+                // one is followed by a connection. See
+                // [`crate::placeholder_waitlist`].
+                tracing::debug!(
+                    target: "nrr::auto-rules",
+                    host = %obs.hostname,
+                    addresses = ?obs.ipv4s,
+                    "the answer for this host is a provider placeholder",
+                );
+                let parked = crate::placeholder_waitlist::global_placeholder_waitlist().note(
+                    &obs.hostname,
+                    &obs.ipv4s,
+                    crate::conn_observation_consumer::now_unix_ms(),
+                );
+                tracing::debug!(
+                    target: "nrr::auto-rules",
+                    host = %obs.hostname,
+                    outcome = ?parked,
+                    "placeholder answer parked",
+                );
+                match parked {
+                    // Nothing observes connections here, so the answer stands
+                    // on its own, as it did before this gate existed.
+                    crate::placeholder_waitlist::Parked::ConfirmationUnavailable => {
+                        if let Some(engine) = self.auto_rules.as_ref() {
+                            engine.note_placeholder_answer_host(&sid, &obs.hostname, now);
+                        }
+                    }
+                    // The connection was seen first: confirmed already.
+                    crate::placeholder_waitlist::Parked::AlreadyInUse(host) => {
+                        if let Some(engine) = self.auto_rules.as_ref() {
+                            engine.note_placeholder_answer_host(&sid, &host, now);
+                        }
+                    }
+                    crate::placeholder_waitlist::Parked::Waiting => {}
                 }
             }
             let secondary = rule_set_match_origin(&obs.hostname, &snapshot.rule_book.secondary);
@@ -231,6 +265,7 @@ impl DnsObservationConsumer {
                         } else {
                             tracing::warn!(
                                 target: "nrr::dns-observe",
+                                msg_key = "direct-host-shares-secondary-ip",
                                 direct_host = %obs.hostname,
                                 shared_ip = %ip,
                                 secondary_rule_host = %owner,

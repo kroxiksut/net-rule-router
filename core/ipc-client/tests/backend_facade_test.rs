@@ -332,6 +332,7 @@ fn list_log_entries_returns_server_payload_when_connected() {
         message: String::new(),
         has_payload: false,
         correlation_summary: Vec::new(),
+        args: Default::default(),
     };
     fake.set_response(
         IpcOperationName::LogsList,

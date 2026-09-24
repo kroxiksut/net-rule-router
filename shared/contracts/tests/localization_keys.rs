@@ -180,6 +180,67 @@ fn runtime_uses_known_localization_keys() {
     );
 }
 
+/// A service line tagged `msg_key = "<id>"` is shown in the Logs view as
+/// `diag.event.<id>`; a tag with no translation would show English in RU.
+#[test]
+fn every_service_message_key_is_translated() {
+    let mut sources = Vec::new();
+    collect_files_with_extension(&workspace_root().join("core"), "rs", &mut sources);
+    let mut tags = BTreeSet::new();
+    for content in &sources {
+        for line in content.lines() {
+            let line = line.trim_start();
+            if line.starts_with("//") {
+                continue;
+            }
+            let mut rest = line;
+            while let Some(at) = rest.find("msg_key = \"") {
+                rest = &rest[at + "msg_key = \"".len()..];
+                let Some(end) = rest.find('"') else { break };
+                tags.insert(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+    }
+    assert!(
+        tags.len() >= 10,
+        "found only {} msg_key tags under core/ — the scan is not seeing the call sites",
+        tags.len()
+    );
+
+    for locale in ["en", "ru"] {
+        let map = load_locale_map(locale);
+        let missing: Vec<_> = tags
+            .iter()
+            .filter(|tag| {
+                !is_valid_key_segment(tag) || !map.contains_key(&format!("diag.event.{tag}"))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "locale '{locale}' lacks diag.event.* for msg_key tags (or a tag is not kebab-case): {missing:?}"
+        );
+    }
+}
+
+fn collect_files_with_extension(dir: &Path, extension: &str, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().and_then(|n| n.to_str()) != Some("target") {
+                collect_files_with_extension(&path, extension, out);
+            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some(extension) {
+            if let Ok(contents) = fs::read_to_string(&path) {
+                out.push(contents);
+            }
+        }
+    }
+}
+
 fn is_allowed_runtime_dynamic_key(key: &str) -> bool {
     key.starts_with("action.") && key.ends_with(".description")
 }

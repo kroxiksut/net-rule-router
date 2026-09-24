@@ -35,6 +35,6 @@ pub use tracing_layer::{
     install_ndjson_tracing, install_ndjson_tracing_with_console,
     install_ndjson_tracing_with_console_and_verbose, install_ndjson_tracing_with_verbose,
     NdjsonTracingLayer, TracingInstallOutcome, TracingVerbosityHandle, DEFAULT_TRACING_FILTER,
-    VERBOSE_TRACING_FILTER,
+    EVENT_MESSAGE_KEY_PREFIX, MESSAGE_KEY_FIELD, VERBOSE_TRACING_FILTER,
 };
 pub use writer::{LogWriter, LogWriterConfig, DEFAULT_LOG_MAX_FILE_SIZE_BYTES};

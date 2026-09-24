@@ -50,7 +50,8 @@ AliWangWang.exe  # Common domestic apps (best-effort process names)
 DingTalk.exe  # Common domestic apps (best-effort process names)
 
 --- Linux
-# (reserved - not applied on Windows)
+qq
+wechat
 
 --- MacOS
 # (reserved - not applied on Windows)

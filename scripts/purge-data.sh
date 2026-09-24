@@ -8,6 +8,9 @@
 # --yes deletes, and only the paths declared in lib/service-paths.sh — no
 # pattern is ever expanded against the home directory.
 #
+# The desktop entries and icons go through uninstall-desktop.sh, which owns
+# those paths.
+#
 # The audit trail is not part of a user cleanup, so /var/lib/netrulerouter/audit
 # survives unless --purge-audit says otherwise.
 #
@@ -58,14 +61,9 @@ case "$profile" in
     ;;
 esac
 
-# The per-user half is resolved from the caller's own XDG variables, so running
-# this through sudo would clean root's profile and leave the human's intact.
-# Privileged steps elevate one at a time on their own.
-if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-  echo "Run purge-data.sh as your own user, not through sudo: the profile half" >&2
-  echo "would otherwise be resolved for root. Privileged steps elevate themselves." >&2
-  exit 2
-fi
+# The per-user half comes from the caller's own XDG variables; the privileged
+# steps elevate one at a time on their own.
+nrr_refuse_sudo "Privileged steps elevate themselves."
 
 removed_list=""
 absent_list=""
@@ -189,6 +187,17 @@ run_uninstall() {
   nrr_run_privileged systemctl disable --now "$NRR_UNIT_NAME" || true
 }
 
+# The desktop entries and hicolor icons are the desktop script's footprint, in
+# this same profile; it owns their paths, so purge delegates rather than
+# restating them.
+run_uninstall_desktop() {
+  if [ "$apply" -eq 0 ]; then
+    nrr_yellow "  would run    $script_dir/uninstall-desktop.sh"
+    return
+  fi
+  "$script_dir/uninstall-desktop.sh" >/dev/null || nrr_yellow "uninstall-desktop.sh failed"
+}
+
 if [ "$apply" -eq 0 ]; then
   nrr_cyan "==> dry run: nothing will be deleted (pass --yes to act)"
 fi
@@ -210,6 +219,7 @@ purge_path "$NRR_RUNTIME_DIR" system
 purge_nft_table
 
 nrr_cyan "==> profile of $(id -un)"
+run_uninstall_desktop
 user_paths="$(nrr_user_footprint_paths)"
 while IFS= read -r user_path; do
   [ -n "$user_path" ] || continue

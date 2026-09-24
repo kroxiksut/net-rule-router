@@ -80,10 +80,11 @@ impl FixedUpstream {
     }
 }
 impl UpstreamResolver for FixedUpstream {
-    fn resolve(
+    fn resolve_within(
         &self,
         _hostname: &str,
         _family: AddressFamily,
+        _budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.answer.clone()
@@ -779,6 +780,60 @@ fn direct_udp_resolves_answers_and_ttl_from_fake_server() {
         .expect("resolved");
     assert_eq!(resolved.addresses, vec![ip(1, 2, 3, 4), ip(5, 6, 7, 8)]);
     assert_eq!(resolved.ttl_seconds, 90);
+}
+
+/// A server that never answers used to cost `attempts x timeout` no matter
+/// what the caller could afford: two attempts of 1.5 s each, while the client's
+/// stub resolver gives up after about one second and re-asks. The budget is the
+/// whole call, retry included.
+#[test]
+fn direct_udp_gives_the_whole_call_back_inside_the_budget() {
+    // Bound but never read from: the query is sent, nothing ever replies.
+    let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind silent");
+    let addr = silent.local_addr().expect("silent addr");
+    let r = DirectUdpUpstreamResolver::new(addr, Duration::from_millis(1500), 2);
+    let started = std::time::Instant::now();
+    let outcome = r.resolve_within(
+        "assistant.example",
+        AddressFamily::Ipv4,
+        Duration::from_millis(300),
+    );
+    let spent = started.elapsed();
+    assert!(
+        matches!(outcome, Err(ResolveError::Unavailable(_))),
+        "a silent server cannot resolve: {outcome:?}",
+    );
+    assert!(
+        spent < Duration::from_millis(900),
+        "the call spent {spent:?} of a 300ms budget — the stages are not sharing it",
+    );
+}
+
+/// The confirmation round is a second opinion, not a second budget: once the
+/// caller's deadline is gone there is nobody left to answer.
+#[test]
+fn the_second_opinion_does_not_outlive_the_caller_deadline() {
+    let inner = FixedUpstream::new(Err(ResolveError::NoRecords));
+    let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind silent");
+    let addr = silent.local_addr().expect("silent addr");
+    let slow: Arc<dyn UpstreamResolver> = Arc::new(DirectUdpUpstreamResolver::new(
+        addr,
+        Duration::from_millis(1500),
+        2,
+    ));
+    let r = PoisonFallbackUpstreamResolver::new(Arc::clone(&inner) as Arc<dyn UpstreamResolver>)
+        .with_fallbacks(vec![slow]);
+    let started = std::time::Instant::now();
+    let _ = r.resolve_within(
+        "assistant.example",
+        AddressFamily::Ipv4,
+        Duration::from_millis(250),
+    );
+    let spent = started.elapsed();
+    assert!(
+        spent < Duration::from_millis(900),
+        "the confirmation round spent {spent:?} past a 250ms budget",
+    );
 }
 
 #[test]

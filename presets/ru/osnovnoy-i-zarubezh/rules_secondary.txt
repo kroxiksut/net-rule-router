@@ -166,3 +166,29 @@ webstorm.exe
 webstorm64.exe
 wechat.exe
 zoom.exe
+
+--- Linux
+clion
+codex
+codex*
+cursor
+datagrip
+dataspell
+discord
+goland
+idea
+jetbrains-toolbox
+maintenancetool  # Qt installer and updater (Qt account and downloads are refused from this country)
+phpstorm
+pycharm
+rider
+rubymine
+signal-desktop
+slack
+telegram
+telegram-desktop
+viber
+webstorm
+wechat
+windsurf
+zoom

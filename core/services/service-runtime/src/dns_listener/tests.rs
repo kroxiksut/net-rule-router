@@ -72,7 +72,12 @@ impl RuleHostOracle for Oracle {
 }
 struct Upstream(Result<ResolvedAddresses, ResolveError>);
 impl UpstreamResolver for Upstream {
-    fn resolve(&self, _h: &str, _family: AddressFamily) -> Result<ResolvedAddresses, ResolveError> {
+    fn resolve_within(
+        &self,
+        _h: &str,
+        _family: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
         self.0.clone()
     }
 }
@@ -720,9 +725,59 @@ impl FactSink for CachedSink {
 /// The upstream that made this necessary: one that never comes back.
 struct NeverAnswers;
 impl UpstreamResolver for NeverAnswers {
-    fn resolve(&self, _h: &str, _f: AddressFamily) -> Result<ResolvedAddresses, ResolveError> {
+    fn resolve_within(
+        &self,
+        _h: &str,
+        _f: AddressFamily,
+        _budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
         panic!("a saturated rule-host lane must not reach the upstream")
     }
+}
+
+/// An upstream that takes everything it is allowed to, as a resolver waiting
+/// on a server that has stopped answering does.
+struct SpendsTheBudget;
+impl UpstreamResolver for SpendsTheBudget {
+    fn resolve_within(
+        &self,
+        _h: &str,
+        _f: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        std::thread::sleep(budget.min(Duration::from_secs(5)));
+        Err(ResolveError::Unavailable("nothing answered".into()))
+    }
+}
+
+/// The datagram's remaining budget reaches the enforce-before-answer branch.
+/// It used to stop at the forward path: the branch ran on the sum of its own
+/// stage timeouts (about five seconds) while the client's stub resolver gave up
+/// after one and re-asked, which is what the `client port closed` storm counted.
+#[test]
+fn the_rule_host_branch_answers_inside_the_budget_it_was_given() {
+    let l = DnsInterceptListener::new(
+        Arc::new(Oracle(vec!["routed.example".to_string()])),
+        Arc::new(SpendsTheBudget),
+        Arc::new(CachedSink(Vec::new())),
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().unwrap(),
+        Duration::from_millis(150),
+        Duration::from_millis(150),
+    );
+    let started = Instant::now();
+    let action = l.answer_query_within(
+        &query("routed.example", QTYPE_A),
+        Duration::ZERO,
+        Duration::from_millis(200),
+    );
+    let spent = started.elapsed();
+    // Upstream unavailable is the fail-open forward; what is asserted is when.
+    assert_eq!(action, ListenerAction::Forward);
+    assert!(
+        spent < Duration::from_millis(600),
+        "the branch spent {spent:?} of a 200ms budget",
+    );
 }
 
 fn saturated_listener(cached: &[Ipv4Addr]) -> DnsInterceptListener {

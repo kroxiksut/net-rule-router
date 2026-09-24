@@ -77,6 +77,12 @@ impl ConnectionObservationConsumer {
             std::collections::BTreeSet::new();
 
         for obs in batch {
+            // Asked of EVERY observation, before the filter below keeps only
+            // established connections. A host a provider censors is one whose
+            // connection never comes up, so waiting for an establishment to
+            // confirm that somebody went there waits forever — the whole point
+            // is that they went and it did not work.
+            self.confirm_placeholder_use(obs.remote.ip(), obs.observed_unix_ms.unwrap_or(now_ms));
             let mut rec = classify_connection(obs, &unicast, primary_ifindex, secondary_ifindex);
             // A resend or an orderly close is evidence about a peer, not a
             // connection of its own: it must never become a trace row, an

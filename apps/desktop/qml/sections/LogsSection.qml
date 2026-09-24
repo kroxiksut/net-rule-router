@@ -130,7 +130,8 @@ ColumnLayout {
             messageKey: String(w.message_key || ""),
             message: String(w.message || ""),
             hasPayload: !!w.has_payload,
-            correlationSummary: w.correlation_summary || []
+            correlationSummary: w.correlation_summary || [],
+            args: w.args || {}
         }
     }
     function _auditEntryFromWire(w) {
@@ -331,11 +332,15 @@ ColumnLayout {
         return date + " " + time + " " + off
     }
     function formatMessage(entry) {
-        // Fallback order: a real locale key, then the event's own text, then
-        // the area it came from. A tracing event never has a key that exists,
-        // so before the text was carried the reader saw only the area.
+        // A tagged event translates by its `diag.event.*` key and fills named
+        // `{field}` placeholders from its fields; the English text is the
+        // fallback, then the area it came from.
         var fallback = String(entry.message || "") || String(entry.kind || "")
         var text = root.tr(String(entry.messageKey || ""), fallback)
+        var args = entry.args || {}
+        for (var name in args) {
+            text = text.split("{" + name + "}").join(String(args[name]))
+        }
         var corr = entry.correlationSummary || []
         for (var i = 0; i < corr.length; i += 1) {
             text = text.replace("{" + i + "}", String(corr[i]))

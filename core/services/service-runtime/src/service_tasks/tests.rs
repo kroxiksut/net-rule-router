@@ -1,4 +1,6 @@
 use super::*;
+// Private to the cadence module; the tests for it live here.
+use super::auto_rules::{auto_probe_is_due, auto_probe_should_run};
 use crate::ipc_handlers::operation_status_store::OperationStatusStore;
 use crate::managers::{AcceptError, AcceptErrorCategory};
 use std::sync::atomic::{AtomicUsize, Ordering};

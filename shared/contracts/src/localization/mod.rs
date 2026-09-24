@@ -13,7 +13,6 @@ const RESERVED_ROOT_NAMESPACES: &[&str] = &["_system", "_service", "_internal"];
 const ALLOWED_METADATA_FIELDS: &[&str] =
     &["language", "label", "nativeLabel", "version", "fallbacks"];
 const MAX_RECOMMENDED_LOCALE_VALUE_LEN: usize = 2000;
-const MANAGED_ROOT_FOLDER: &str = crate::product_identity::PRODUCT_NAME;
 const MANAGED_SUBFOLDER: &str = "managed";
 const USER_LOCALES_SUBFOLDER: &str = "locales";
 

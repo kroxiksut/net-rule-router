@@ -41,7 +41,8 @@ use nrr_shared::RouteRole;
 
 use crate::catch_all_exemptions::{collect_exemptions, CatchAllExemptions};
 use crate::enforcement_planner::{
-    plan_catch_all_kill_switch, plan_fail_closed_block_all, plan_fail_closed_destinations,
+    plan_catch_all_kill_switch, plan_doh_dot_block, plan_fail_closed_block_all,
+    plan_fail_closed_destinations,
 };
 use crate::killswitch_codegen::KillSwitchProtocols;
 use crate::per_sid_orchestrator::PerSidPolicySnapshot;
@@ -281,6 +282,12 @@ impl ProductionPrincipalPlanSource {
         };
         let fail_closed_blocks = fail_closed.len();
         flows.extend(fail_closed);
+
+        // Browser DoH hides the names wildcard rules learn from, so blocking it
+        // sends the browser back to plaintext DNS. Same gate as the codegen.
+        if doh_lockdown_active(&policy) {
+            flows.extend(plan_doh_dot_block(stored, &policy.doh_resolver_ips, true));
+        }
 
         // Routes are planned even while the secondary is down: the applier
         // resolves the link at apply time and reports the ones it cannot steer,
@@ -579,6 +586,12 @@ impl PrincipalPlanSource for ProductionPrincipalPlanSource {
 /// block-all explicitly. Reported, never acted on: arming a blanket block
 /// without the tunnel-server and local-subnet exemptions cuts the reconnect that
 /// would end the outage, and the LAN with it.
+fn doh_lockdown_active(policy: &PerSidPolicySnapshot) -> bool {
+    policy.doh_lockdown_enabled
+        && (policy.doh_lockdown_scope == nrr_storage::doh_lockdown::DohLockdownScope::Always
+            || policy.kill_switch_enabled)
+}
+
 fn wants_block_all(policy: &PerSidPolicySnapshot, mode: RouteBehaviorMode) -> bool {
     if !policy.kill_switch_enabled || !policy.block_secondary_when_unavailable {
         return false;
@@ -763,6 +776,8 @@ mod tests {
         block_when_unavailable: bool,
         fail_closed: bool,
         block_all: bool,
+        /// `Some` = DoH lockdown on with scope `Always`, over these resolvers.
+        doh_always: Option<Vec<Ipv4Addr>>,
     }
 
     impl Policy {
@@ -772,6 +787,7 @@ mod tests {
                 block_when_unavailable: true,
                 fail_closed: true,
                 block_all: false,
+                doh_always: None,
             }
         }
 
@@ -806,9 +822,13 @@ mod tests {
                 kill_switch_strict_shared_ips: false,
                 mode_a_coverage_strategy: nrr_domain::mode_a_coverage::ModeACoverageStrategy::PerIp,
                 link_provider_exe_paths: Vec::new(),
-                doh_lockdown_enabled: false,
-                doh_lockdown_scope: nrr_storage::doh_lockdown::DohLockdownScope::default(),
-                doh_resolver_ips: Vec::new(),
+                doh_lockdown_enabled: self.doh_always.is_some(),
+                doh_lockdown_scope: if self.doh_always.is_some() {
+                    nrr_storage::doh_lockdown::DohLockdownScope::Always
+                } else {
+                    nrr_storage::doh_lockdown::DohLockdownScope::default()
+                },
+                doh_resolver_ips: self.doh_always.clone().unwrap_or_default(),
                 auto_rules_mode: nrr_storage::auto_rules::AutoRulesMode::default(),
                 primary_probe_auto: false,
                 primary_probe_timeout_ms: 1500,
@@ -1021,6 +1041,52 @@ mod tests {
 
     /// A user who never bound their adapters has nothing to enforce, and that is
     /// an answer — not an empty plan that would look like a policy.
+    fn doh_blocks(plan: &EnforcementPlan) -> Vec<(DstMatch, Option<u16>)> {
+        plan.flows
+            .iter()
+            .filter(|f| {
+                f.verdict == Verdict::Block && f.precedence.class == PrecedenceClass::DohBlock
+            })
+            .map(|f| (f.flow.dst, f.flow.dst_port))
+            .collect()
+    }
+
+    /// Without the block a DoH browser hides every subdomain a wildcard rule
+    /// learns from, and those subdomains leave over the primary.
+    #[test]
+    fn an_always_on_doh_lockdown_blocks_the_resolvers_without_leak_protection() {
+        let resolver = Ipv4Addr::new(198, 51, 100, 53);
+        let policy = Policy {
+            doh_always: Some(vec![resolver]),
+            ..Policy::disarmed()
+        };
+        let (plan, _) = plan(
+            OneSecondaryRule(RouteBehaviorMode::PreferPrimary),
+            policy,
+            true,
+        );
+        let blocks = doh_blocks(&plan);
+        let https = blocks
+            .iter()
+            .filter(|(dst, port)| *dst == DstMatch::HostV4(resolver) && *port == Some(443))
+            .count();
+        assert_eq!(https, 2, "TCP and UDP (HTTP/3) on 443: {blocks:?}");
+        assert!(
+            blocks.iter().any(|(_, port)| *port == Some(853)),
+            "DoT: {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn with_the_lockdown_off_no_resolver_is_blocked() {
+        let (plan, _) = plan(
+            OneSecondaryRule(RouteBehaviorMode::PreferPrimary),
+            Policy::armed(),
+            true,
+        );
+        assert!(doh_blocks(&plan).is_empty());
+    }
+
     #[test]
     fn a_principal_without_stored_policy_plans_nothing() {
         assert!(source(Arc::new(NoRules), Arc::new(NoPolicy))

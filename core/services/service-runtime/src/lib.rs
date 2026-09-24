@@ -113,6 +113,7 @@ pub mod path_probe;
 pub mod per_sid_orchestrator;
 pub mod persistent_app_resolver;
 pub mod phase_timings;
+pub mod placeholder_waitlist;
 pub mod policy_loader;
 pub mod power_resume;
 pub mod primary_stall_registry;

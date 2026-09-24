@@ -38,6 +38,7 @@ impl ConnectionObservationConsumer {
             companion_in_use: None,
             companion_primary_health: None,
             navigation_attempt: None,
+            placeholder_confirmed: None,
             companion_reported: Mutex::new(HashSet::new()),
             primary_stall_evidence: Mutex::new(stall_evidence::ConnectionStallTracker::default()),
             app_main_link: None,
@@ -117,6 +118,16 @@ impl ConnectionObservationConsumer {
 
     /// Wire the navigation measurement. Observational only: the consumer
     /// reports every attempt and nothing downstream reads the result yet.
+    #[must_use]
+    /// Wire the censored-host confirmation. Declaring it also tells the
+    /// waitlist that answers may now wait for a connection: without an observer
+    /// on this platform they are decided on the spot, as before.
+    pub fn with_placeholder_confirmed(mut self, sink: super::PlaceholderConfirmedFn) -> Self {
+        crate::placeholder_waitlist::global_placeholder_waitlist().confirmation_is_wired();
+        self.placeholder_confirmed = Some(sink);
+        self
+    }
+
     #[must_use]
     pub fn with_navigation_attempt(mut self, sink: NavigationAttemptFn) -> Self {
         self.navigation_attempt = Some(sink);

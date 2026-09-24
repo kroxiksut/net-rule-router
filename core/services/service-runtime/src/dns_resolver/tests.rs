@@ -32,10 +32,11 @@ struct FakeUpstream {
     answer: Result<ResolvedAddresses, ResolveError>,
 }
 impl UpstreamResolver for FakeUpstream {
-    fn resolve(
+    fn resolve_within(
         &self,
         _hostname: &str,
         _family: AddressFamily,
+        _budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         self.answer.clone()
     }
@@ -79,6 +80,7 @@ fn resolved6(ips: &[std::net::Ipv6Addr]) -> ResolvedAddresses {
 
 fn aaaa_hold() -> AnswerHold {
     AnswerHold {
+        budget: Duration::from_secs(3),
         deadline: Duration::from_millis(150),
         fast_answers: true,
     }
@@ -213,12 +215,122 @@ fn describe_resolve_failure_labels_each_variant() {
     );
 }
 
+/// An upstream that spends the budget it is handed, like a resolver waiting on
+/// a server that will not answer.
+struct SlowUpstream {
+    spends: Duration,
+    answer: Result<ResolvedAddresses, ResolveError>,
+}
+impl UpstreamResolver for SlowUpstream {
+    fn resolve_within(
+        &self,
+        _hostname: &str,
+        _family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        std::thread::sleep(self.spends.min(budget));
+        self.answer.clone()
+    }
+}
+
+/// Remembers every deadline a reconcile was given. The first-contact install
+/// asks for zero by default, so a test asserting "nothing was waited for" reads
+/// the whole list rather than the last entry.
+#[derive(Default)]
+struct DeadlineSpy(Mutex<Vec<Duration>>);
+impl DeadlineSpy {
+    fn waits(&self) -> Vec<Duration> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .copied()
+            .filter(|d| !d.is_zero())
+            .collect()
+    }
+}
+impl SyncReconciler for DeadlineSpy {
+    fn reconcile_now(&self, deadline: Duration) -> ReconcileOutcome {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(deadline);
+        ReconcileOutcome::Installed
+    }
+}
+
+/// The two stages share one budget. A resolve that ate most of it leaves the
+/// reconcile the remainder, not its own full deadline on top — the client stops
+/// waiting at a moment the listener declared, whichever stage spent the time.
+#[test]
+fn a_slow_resolve_shortens_the_reconcile_it_precedes() {
+    let spy = DeadlineSpy::default();
+    let out = handle_a_query(
+        "assistant.example",
+        AnswerHold {
+            budget: Duration::from_millis(400),
+            deadline: Duration::from_millis(300),
+            fast_answers: false,
+        },
+        &oracle(&["assistant.example"]),
+        &SlowUpstream {
+            spends: Duration::from_millis(250),
+            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+        },
+        &FakeSink(&CallLog::default()),
+        &spy,
+        &NoopFakeIpAnswerer,
+        &OpenLeakGuard,
+        &NoEnforcement,
+    );
+    assert!(matches!(out, QueryOutcome::Answer { .. }), "{out:?}");
+    let waits = spy.waits();
+    let given = *waits.first().expect("the reconcile was waited for");
+    assert!(
+        given < Duration::from_millis(200),
+        "the reconcile was given {given:?} after a 250ms resolve out of a 400ms budget",
+    );
+}
+
+/// A resolve that spent the whole budget leaves nothing to wait in: the
+/// reconcile is requested for the background instead of held for, which is the
+/// same call the futile-wait gate makes.
+#[test]
+fn an_exhausted_budget_does_not_hold_the_answer_for_a_reconcile() {
+    let spy = DeadlineSpy::default();
+    let out = handle_a_query(
+        "assistant.example",
+        AnswerHold {
+            budget: Duration::from_millis(120),
+            deadline: Duration::from_millis(300),
+            fast_answers: false,
+        },
+        &oracle(&["assistant.example"]),
+        &SlowUpstream {
+            spends: Duration::from_millis(200),
+            answer: Ok(resolved(&[ip(23, 10, 20, 138)])),
+        },
+        &FakeSink(&CallLog::default()),
+        &spy,
+        &NoopFakeIpAnswerer,
+        &OpenLeakGuard,
+        &NoEnforcement,
+    );
+    assert!(matches!(out, QueryOutcome::Answer { .. }), "{out:?}");
+    assert!(
+        spy.waits().is_empty(),
+        "the answer was held {:?} for a reconcile that had no time to install anything",
+        spy.waits(),
+    );
+}
+
 #[test]
 fn non_rule_host_fails_open_without_touching_enforcement() {
     let log = CallLog::default();
     let out = handle_a_query(
         "example.com",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -270,6 +382,7 @@ fn a_host_inside_the_tunnels_own_subnet_is_never_given_a_virtual_address() {
     let out = handle_a_query(
         "auth.tunnel.internal",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -309,6 +422,7 @@ fn a_placeholder_only_answer_is_never_pinned() {
     let out = handle_a_query(
         "secure.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -353,6 +467,7 @@ fn an_unusable_address_beside_a_real_one_is_dropped_and_the_host_stays_enforced(
     let out = handle_a_query(
         "rule.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -436,6 +551,7 @@ fn fast_answers_skips_the_hold_when_every_answered_address_is_enforced() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: true,
         },
@@ -475,6 +591,7 @@ fn a_cached_address_the_policy_does_not_carry_is_not_the_fast_path() {
     let out = handle_a_query(
         "static.proflcdn.test",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: true,
         },
@@ -516,6 +633,7 @@ fn a_wait_that_cannot_finish_is_not_attempted() {
     let out = handle_a_query(
         "static.proflcdn.test",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(900),
             fast_answers: true,
         },
@@ -581,6 +699,7 @@ fn a_first_contact_gets_its_route_before_the_answer_goes_out() {
         let out = handle_a_query(
             "assistant.example",
             AnswerHold {
+                budget: Duration::from_secs(3),
                 deadline: Duration::from_millis(900),
                 fast_answers: true,
             },
@@ -612,6 +731,7 @@ fn fast_answers_still_holds_on_first_contact_with_a_new_address() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: true,
         },
@@ -647,6 +767,7 @@ fn fast_answers_off_awaits_the_reconcile_even_for_cached_addresses() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -682,6 +803,7 @@ fn rule_host_records_then_reconciles_before_answering() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -717,6 +839,7 @@ fn rule_host_answers_but_unenforced_when_deadline_exceeded() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -755,6 +878,7 @@ fn rule_host_answer_is_withheld_when_the_guard_is_blocking_and_install_missed_th
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -787,6 +911,7 @@ fn deferred_answer_is_not_withheld_while_the_guard_is_blocking() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: true,
         },
@@ -859,6 +984,7 @@ fn rule_host_answer_is_capped_to_stable_subset() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -892,6 +1018,7 @@ fn fake_ip_scope_host_is_answered_with_the_virtual_address_and_skips_reconcile()
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -932,6 +1059,7 @@ fn a_rule_host_outside_fake_ip_scope_keeps_the_real_per_ip_path() {
     let out = handle_a_query(
         "bank.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },
@@ -1042,6 +1170,7 @@ fn upstream_failure_propagates_without_enforcement() {
     let out = handle_a_query(
         "assistant.example",
         AnswerHold {
+            budget: Duration::from_secs(3),
             deadline: Duration::from_millis(150),
             fast_answers: false,
         },

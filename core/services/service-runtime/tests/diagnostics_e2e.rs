@@ -226,6 +226,7 @@ fn make_log_entry(id: u32) -> LogEntryDto {
         message: String::new(),
         has_payload: false,
         correlation_summary: Vec::new(),
+        args: Default::default(),
     }
 }
 
