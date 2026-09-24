@@ -31,6 +31,9 @@ struct Resends {
     stalled: bool,
     /// Our own filter dropped it; its resends go into that filter.
     ours: bool,
+    /// The stack reported this connection as established. Only then does its
+    /// close say anything about the peer.
+    established: bool,
 }
 
 impl Resends {
@@ -40,6 +43,7 @@ impl Resends {
             last_ms: at_ms,
             stalled: false,
             ours: false,
+            established: false,
         }
     }
 }
@@ -61,8 +65,16 @@ impl Default for ConnectionStallTracker {
 
 impl ConnectionStallTracker {
     /// `Some(true)` once per connection, when it is confirmed stalled;
-    /// `Some(false)` for an orderly close; `None` while a resend is not yet
-    /// evidence, and for attempts.
+    /// `Some(false)` for the close of a connection that was ESTABLISHED;
+    /// `None` while a resend is not yet evidence, for an attempt, and for the
+    /// close of a connection that never came up.
+    ///
+    /// That last case is why the attempt is recorded at all. A client that
+    /// gives up on a destination which never answered closes its socket, and
+    /// the stack reports that close like any other — read as an orderly close,
+    /// it said "this host answers on the main link" about a host that had not
+    /// answered at all, and silenced the offer to route it. Measured on the
+    /// stand: `curl` exit 28 against a dead address produced one "completion".
     pub(super) fn note(
         &mut self,
         local: SocketAddr,
@@ -72,10 +84,26 @@ impl ConnectionStallTracker {
     ) -> Option<bool> {
         let key = (local, remote);
         match progress {
-            ConnectionProgress::Attempt => None,
+            ConnectionProgress::Attempt => {
+                if !self.connections.contains_key(&key) {
+                    self.make_room(at_ms);
+                }
+                let entry = self
+                    .connections
+                    .entry(key)
+                    .or_insert_with(|| Resends::started(at_ms));
+                if at_ms.saturating_sub(entry.last_ms) >= IDLE_TTL_MS {
+                    *entry = Resends::started(at_ms);
+                }
+                entry.established = true;
+                entry.last_ms = entry.last_ms.max(at_ms);
+                None
+            }
             ConnectionProgress::ClosedInOrder => {
-                let ours = self.connections.remove(&key).is_some_and(|r| r.ours);
-                (!ours).then_some(false)
+                let entry = self.connections.remove(&key);
+                let ours = entry.is_some_and(|r| r.ours);
+                let established = entry.is_some_and(|r| r.established);
+                (!ours && established).then_some(false)
             }
             ConnectionProgress::Retransmit => {
                 if !self.connections.contains_key(&key) {
@@ -165,6 +193,11 @@ mod tests {
         t.note(local, remote, ConnectionProgress::Retransmit, at_ms)
     }
 
+    fn attempt(t: &mut ConnectionStallTracker, port: u16, at_ms: u64) -> Option<bool> {
+        let (local, remote) = conn(port);
+        t.note(local, remote, ConnectionProgress::Attempt, at_ms)
+    }
+
     fn close(t: &mut ConnectionStallTracker, port: u16, at_ms: u64) -> Option<bool> {
         let (local, remote) = conn(port);
         t.note(local, remote, ConnectionProgress::ClosedInOrder, at_ms)
@@ -185,9 +218,10 @@ mod tests {
 
     #[test]
     fn a_loss_burst_on_a_working_connection_is_not_a_stall() {
-        // The field shape: three resends in one millisecond, then the transfer
-        // finishes.
+        // The field shape: the connection comes up, three resends land in one
+        // millisecond, then the transfer finishes.
         let mut t = ConnectionStallTracker::default();
+        assert_eq!(attempt(&mut t, 50000, 999), None);
         for _ in 0..3 {
             assert_eq!(resend(&mut t, 50000, 1_000), None);
         }
@@ -219,6 +253,7 @@ mod tests {
     #[test]
     fn an_orderly_close_is_a_completion_and_frees_the_tuple() {
         let mut t = ConnectionStallTracker::default();
+        assert_eq!(attempt(&mut t, 50000, 0), None);
         assert_eq!(resend(&mut t, 50000, 0), None);
         assert_eq!(close(&mut t, 50000, 500), Some(false));
         // A new connection on the same tuple: its clock starts over.
@@ -229,7 +264,21 @@ mod tests {
     #[test]
     fn a_close_without_resends_is_still_a_completion() {
         let mut t = ConnectionStallTracker::default();
+        assert_eq!(attempt(&mut t, 50000, 0), None);
         assert_eq!(close(&mut t, 50000, 0), Some(false));
+    }
+
+    /// The case that made the establishment matter: a client gives up on a
+    /// destination that never answered and closes its socket. Counted as a
+    /// completion, that close said "this host answers on the main link" about a
+    /// host that had answered nothing, and silenced the offer to route it.
+    #[test]
+    fn closing_a_connection_that_never_came_up_says_nothing() {
+        let mut t = ConnectionStallTracker::default();
+        assert_eq!(close(&mut t, 50000, 5_000), None);
+        // Nor does one that only ever resent its handshake.
+        assert_eq!(resend(&mut t, 50001, 0), None);
+        assert_eq!(close(&mut t, 50001, 400), None);
     }
 
     #[test]
@@ -247,12 +296,14 @@ mod tests {
         assert_eq!(resend(&mut t, 50000, 1_000), None);
     }
 
+    /// An attempt is not a verdict — but it IS remembered, because the close
+    /// that follows means opposite things depending on whether it happened.
     #[test]
-    fn attempts_are_not_evidence() {
+    fn attempts_are_not_evidence_but_are_remembered() {
         let mut t = ConnectionStallTracker::default();
         let (local, remote) = conn(50000);
         assert_eq!(t.note(local, remote, ConnectionProgress::Attempt, 0), None);
-        assert!(t.connections.is_empty());
+        assert_eq!(t.connections.len(), 1);
     }
 
     #[test]

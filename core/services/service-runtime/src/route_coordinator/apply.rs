@@ -146,6 +146,7 @@ impl SecondaryRouteCoordinator {
             // quiet once routing has converged.
             tracing::debug!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-table-unchanged",
                 sid = %sid,
                 secondary_ifindex = secondary.interface_index,
                 desired_routes = out.routes.len(),
@@ -154,6 +155,7 @@ impl SecondaryRouteCoordinator {
         } else {
             tracing::info!(
                 target: "nrr::route-coordinator",
+                msg_key = "route-table-reconciled",
                 sid = %sid,
                 mode = ?resolution.mode,
                 primary = primary_present,

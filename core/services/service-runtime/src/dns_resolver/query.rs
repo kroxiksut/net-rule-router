@@ -19,8 +19,9 @@ pub fn handle_a_query(
     leak_guard: &dyn LeakGuardPosture,
     enforced_view: &dyn EnforcedAddressView,
 ) -> QueryOutcome {
+    let started = std::time::Instant::now();
     // Upstream resolve is needed for BOTH paths — do it first.
-    let resolved = match upstream.resolve(hostname, AddressFamily::Ipv4) {
+    let resolved = match upstream.resolve_within(hostname, AddressFamily::Ipv4, hold.budget) {
         // Asked for v4, so nothing is dropped here; the narrowing marks the
         // whole handler as still speaking one family.
         Ok(r) => ResolvedAddressesV4 {
@@ -184,11 +185,19 @@ pub fn handle_a_query(
     } else {
         reconciler.install_first_contact(&unenforced)
     };
+    // The hold is what the resolve left of the branch budget, never more than
+    // its own deadline: the client stops waiting at a fixed moment, whichever
+    // stage spent the time.
+    let hold_deadline = hold
+        .deadline
+        .min(hold.budget.saturating_sub(started.elapsed()));
     // A reconcile that runs past the deadline cannot install anything inside
-    // it, so waiting spends the budget on every query and installs nothing.
-    let futile_wait = reconciler
-        .typical_run()
-        .is_some_and(|typical| typical > hold.deadline);
+    // it, so waiting spends the budget on every query and installs nothing —
+    // which is also the case once the resolve has eaten the branch budget.
+    let futile_wait = hold_deadline.is_zero()
+        || reconciler
+            .typical_run()
+            .is_some_and(|typical| typical > hold_deadline);
     let reconcile = if hold.fast_answers && all_enforced {
         reconciler.request_reconcile();
         ReconcileOutcome::Deferred
@@ -196,7 +205,7 @@ pub fn handle_a_query(
         reconciler.request_reconcile();
         ReconcileOutcome::AheadOfEnforcement
     } else {
-        reconciler.reconcile_now(hold.deadline)
+        reconciler.reconcile_now(hold_deadline)
     };
     let enforced = all_enforced || matches!(reconcile, ReconcileOutcome::Installed);
     tracing::debug!(
@@ -274,7 +283,8 @@ pub fn handle_aaaa_query(
     reconciler: &dyn SyncReconciler,
     leak_guard: &dyn LeakGuardPosture,
 ) -> AaaaOutcome {
-    let resolved = match upstream.resolve(hostname, AddressFamily::Ipv6) {
+    let started = std::time::Instant::now();
+    let resolved = match upstream.resolve_within(hostname, AddressFamily::Ipv6, hold.budget) {
         Ok(r) => r,
         Err(e) => return AaaaOutcome::Upstream(e),
     };
@@ -306,14 +316,18 @@ pub fn handle_aaaa_query(
     );
     // No "already enforced" shortcut: the installed-address view is IPv4. The
     // wait is skipped only when it is known to be futile, as on the A path.
-    let reconcile = if reconciler
-        .typical_run()
-        .is_some_and(|typical| typical > hold.deadline)
+    let hold_deadline = hold
+        .deadline
+        .min(hold.budget.saturating_sub(started.elapsed()));
+    let reconcile = if hold_deadline.is_zero()
+        || reconciler
+            .typical_run()
+            .is_some_and(|typical| typical > hold_deadline)
     {
         reconciler.request_reconcile();
         ReconcileOutcome::AheadOfEnforcement
     } else {
-        reconciler.reconcile_now(hold.deadline)
+        reconciler.reconcile_now(hold_deadline)
     };
     if matches!(reconcile, ReconcileOutcome::DeadlineExceeded) && leak_guard.blocking() {
         tracing::warn!(

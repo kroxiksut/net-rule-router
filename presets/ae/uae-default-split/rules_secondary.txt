@@ -175,7 +175,29 @@ fleet.exe  # JetBrains IDE and tooling apps
 mps.exe  # JetBrains IDE and tooling apps
 
 --- Linux
-# (reserved - not applied on Windows)
+clion
+codex
+codex*
+cursor
+datagrip
+dataspell
+discord
+goland
+idea
+jetbrains-toolbox
+phpstorm
+pycharm
+rider
+rubymine
+signal-desktop
+slack
+telegram
+telegram-desktop
+viber
+webstorm
+wechat
+windsurf
+zoom
 
 --- MacOS
 # (reserved - not applied on Windows)

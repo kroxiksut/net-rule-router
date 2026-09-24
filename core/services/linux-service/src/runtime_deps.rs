@@ -322,6 +322,7 @@ pub(crate) fn build_ipc_server(
                 gui_binary_path(),
                 Some(Arc::clone(&stack.auto_rules)),
                 stack.traffic_sampler.clone(),
+                Arc::clone(&stack.cache_store),
             );
             let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
             nrr_service_runtime::ipc_handlers::register_production_handlers(
@@ -680,9 +681,7 @@ pub(crate) fn build_policy_stack(
     let state_conn = Arc::clone(&conn);
     let conn_for_stability = Arc::clone(&conn);
 
-    let policy: Arc<dyn RoutePolicySource> =
-        Arc::new(ProductionRoutePolicySource::new(Arc::clone(&conn)));
-    let rules: Arc<dyn RulesProvider> = Arc::new(ProductionRulesProvider::new(conn));
+    let rules: Arc<dyn RulesProvider> = Arc::new(ProductionRulesProvider::new(Arc::clone(&conn)));
     let rules_for_stack = Arc::clone(&rules);
 
     // No cache means domain rules resolve to nothing. Said out loud here,
@@ -702,6 +701,15 @@ pub(crate) fn build_policy_stack(
         }
     };
     let fqdn_cache = cache_lookup_over(Arc::clone(&cache_store));
+
+    // This daemon answers no DNS itself, so the canary that turns browser DoH
+    // off is never served: the lockdown is the only way to see those names.
+    nrr_service_runtime::doh_seed::seed_shared_baseline(&conn);
+    let policy: Arc<dyn RoutePolicySource> = Arc::new(
+        ProductionRoutePolicySource::new(conn)
+            .with_fqdn_cache(Arc::clone(&fqdn_cache))
+            .with_doh_lockdown_forced(),
+    );
 
     // The same resolver the refresh task uses, pointed at the rule book instead
     // of at expiring cache rows: one asks "what is this name now", the other

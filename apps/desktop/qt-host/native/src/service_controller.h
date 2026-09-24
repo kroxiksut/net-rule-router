@@ -410,13 +410,49 @@ private slots:
 
 private:
     static constexpr const wchar_t *SERVICE_NAME = L"NetRuleRouter";
+    // `product_identity::SYSTEMD_UNIT_NAME`; the host cannot link the Rust SSOT.
+    static constexpr const char *SYSTEMD_UNIT = "netrulerouter.service";
+    static constexpr int kSystemctlTimeoutMs = 2000;
 
     Status queryStatus(QString *reason) const {
 #ifndef Q_OS_WIN
-        // No SCM here. The state of a systemd unit is read by the platform
-        // port in Rust; reimplementing it in this glue would be a second
-        // answer to the same question, free to drift from the first.
-        *reason = QStringLiteral("Service state is not read by the app on this platform.");
+        // The same two properties the Rust systemd port reads. The GUI polls
+        // this, so it stays one short read-only call rather than an IPC hop
+        // that would itself fail whenever the service is down.
+        QProcess systemctl;
+        systemctl.start(QStringLiteral("systemctl"),
+                        {QStringLiteral("show"), QStringLiteral("--property=LoadState,ActiveState"),
+                         QStringLiteral("--"), QString::fromLatin1(SYSTEMD_UNIT)});
+        if (!systemctl.waitForFinished(kSystemctlTimeoutMs)) {
+            systemctl.kill();
+            *reason = QStringLiteral("systemctl show did not answer");
+            return Unknown;
+        }
+        QString loadState;
+        QString activeState;
+        const QStringList lines = QString::fromUtf8(systemctl.readAllStandardOutput())
+                                      .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+        for (const QString &line : lines) {
+            if (line.startsWith(QLatin1String("LoadState=")))
+                loadState = line.mid(10).trimmed();
+            else if (line.startsWith(QLatin1String("ActiveState=")))
+                activeState = line.mid(12).trimmed();
+        }
+        if (loadState == QLatin1String("not-found")) {
+            *reason = QStringLiteral("Service not registered");
+            return NotInstalled;
+        }
+        reason->clear();
+        if (activeState == QLatin1String("active") || activeState == QLatin1String("reloading"))
+            return Running;
+        if (activeState == QLatin1String("activating"))
+            return StartPending;
+        if (activeState == QLatin1String("deactivating"))
+            return StopPending;
+        if (activeState == QLatin1String("inactive") || activeState == QLatin1String("failed"))
+            return Stopped;
+        *reason = QStringLiteral("systemctl reported LoadState=%1 ActiveState=%2")
+                      .arg(loadState, activeState);
         return Unknown;
 #else
         SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);

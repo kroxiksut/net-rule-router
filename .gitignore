@@ -137,3 +137,8 @@ __pycache__/
 # Anchored to the root so documentation images under docs/ are unaffected.
 /Screenshot*.png
 /Снимок*.png
+
+# Per-user files of a DEVELOPMENT build (settings, locale overrides): kept in
+# the checkout so a test run is wiped with one delete instead of hunting
+# through the profile. A release build never writes here.
+/.devdata/

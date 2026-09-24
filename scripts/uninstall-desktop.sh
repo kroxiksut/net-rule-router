@@ -35,6 +35,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+if [ "$scope" = "user" ]; then
+  nrr_refuse_sudo "Pass --system to act on the machine-wide scope."
+fi
+
 data_root="$(nrr_desktop_data_root "$scope")"
 applications_dir="$data_root/applications"
 icons_root="$data_root/icons/hicolor"

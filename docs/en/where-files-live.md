@@ -66,6 +66,19 @@ All three are safe to delete. The app rebuilds them; the only visible effect is 
 
 Short-lived working files the app windows and the tray icon use to talk to each other, plus the launcher logs that go into a diagnostic archive. Cleared by Windows disk cleanup, and NetRuleRouter sweeps its own leftovers on startup. Safe to delete at any time while the app is closed.
 
+## The same places on Linux
+
+The layout follows the XDG conventions your other applications use, so nothing lands in a surprising folder:
+
+| Windows | Linux | What it holds |
+|---|---|---|
+| `C:\ProgramData\NetRuleRouter\` | `/var/lib/netrulerouter/` (logs in `/var/log/netrulerouter/`) | Shared machine state written by the service |
+| `%APPDATA%\NetRuleRouter\` | `~/.config/netrulerouter/` | Your own settings |
+| `%LOCALAPPDATA%\NetRuleRouter\` | `~/.cache/netrulerouter/` | Caches that are rebuilt when missing |
+| `%TEMP%\NetRuleRouter\` | `/run/user/<your id>/netrulerouter/` and `~/.local/state/netrulerouter/` | Coordination files for the current session, and the launcher logs |
+
+For a clean start there is the same script with a shell spelling: `./scripts/purge-data.sh`, dry-run until you add `--yes`, and the audit trail stays unless you add `--purge-audit`.
+
 ## What survives a reinstall
 
 - **Your rules files** — untouched, they are not in any app folder.

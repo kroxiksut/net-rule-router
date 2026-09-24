@@ -602,12 +602,10 @@ QtObject {
                 for (var bi = 0; bi < blocks.length; bi += 1) {
                     var b = blocks[bi] || {}
                     var bn = String(b["section-name"] || "")
-                    // Linux / MacOS are well-known foreign-OS sections
-                    // with established passthrough semantics — don't
-                    // pester the user about them. Surface every other
-                    // unknown for reclassification (Cidr, Ports,
-                    // user-named custom sections, etc.).
-                    if (bn === "" || bn === "Linux" || bn === "MacOS") continue
+                    // An OS section is passthrough only because it belongs to
+                    // another OS — never a question for the user. Surface every
+                    // other unknown for reclassification (Cidr, Ports, custom).
+                    if (bn === "" || bn === "Windows" || bn === "Linux" || bn === "MacOS") continue
                     if (seenUnk[bn]) continue
                     seenUnk[bn] = true
                     aggregatedUnknowns.push(b)

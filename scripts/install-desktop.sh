@@ -59,20 +59,17 @@ case "$profile" in
     ;;
 esac
 
+if [ "$scope" = "user" ]; then
+  nrr_refuse_sudo "Pass --system to act on the machine-wide scope."
+fi
+
 target_root="$(nrr_target_root "$repo_root")"
 profile_dir="$(nrr_desktop_profile_dir "$target_root" "$profile")"
 
-# The service tells its surfaces apart by the peer's executable name, so the
-# entry must launch the Unix spelling; run.sh makes the same copy before it
-# runs a surface. A copy, not a symlink: /proc/<pid>/exe resolves links and
-# would report the Cargo name again.
+# The entry must launch the Unix spelling — see nrr_sync_unix_binaries.
+nrr_sync_unix_binaries "$profile_dir"
 nrr_desktop_unix_binary() {
-  local cargo_name="$1" unix_name="$2"
-  # `-ef` keeps a case-insensitive filesystem from copying a file onto itself.
-  if [ -x "$profile_dir/$cargo_name" ] &&
-    ! [ "$profile_dir/$cargo_name" -ef "$profile_dir/$unix_name" ]; then
-    cp -f "$profile_dir/$cargo_name" "$profile_dir/$unix_name"
-  fi
+  local unix_name="$1"
   if [ ! -x "$profile_dir/$unix_name" ]; then
     echo "executable was not found: $profile_dir/$unix_name" >&2
     echo "build it first: cargo build -p nrr-launcher -p nrr-qt-host" >&2
@@ -81,8 +78,8 @@ nrr_desktop_unix_binary() {
   printf '%s\n' "$profile_dir/$unix_name"
 }
 
-gui_exec="$(nrr_desktop_unix_binary "$NRR_DESKTOP_GUI_CARGO_NAME" "$NRR_DESKTOP_GUI_ID")"
-tray_exec="$(nrr_desktop_unix_binary "$NRR_DESKTOP_TRAY_CARGO_NAME" "$NRR_DESKTOP_TRAY_ID")"
+gui_exec="$(nrr_desktop_unix_binary "$NRR_DESKTOP_GUI_ID")"
+tray_exec="$(nrr_desktop_unix_binary "$NRR_DESKTOP_TRAY_ID")"
 
 data_root="$(nrr_desktop_data_root "$scope")"
 applications_dir="$data_root/applications"

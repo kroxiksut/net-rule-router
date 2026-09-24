@@ -2,50 +2,43 @@ import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
 import QtQuick.Window 2.15
-import "../theme"
+import "../components"
 import "../lib/pure.js" as Pure
 
-// Live connection trace, moved out of DiagnosticsSection into its own window.
-// People read it WHILE editing rules — a section in a StackLayout cannot be open
-// beside the rules table, a window can. The window owns its state rather than
-// borrowing the section's: the section lives in a lazy Loader and does not exist
-// until Diagnostics has been opened once.
-Window {
-    id: traceWindow
+// Live connection trace. Its state lives here, so the Loader keeps the section
+// resident once opened: the list survives a trip to Rules and back, while the
+// poll stops whenever the section is not on screen.
+ScrollView {
+    id: section
+    property var root
+    clip: true
+    Layout.fillWidth: true
+    Layout.fillHeight: true
+    contentWidth: availableWidth
 
-    property var root: null
+    Component.onCompleted: section._loadConnTraceEntries(true)
+    // Coming back catches up on what arrived while the poll was paused.
+    onVisibleChanged: if (visible) section._refreshConnTraceHead()
 
-    width: 1100
-    height: 720
-    visible: false
-    modality: Qt.NonModal
-    color: root ? root.panelColor : "transparent"
-    title: root ? root.tr("diag.conn-trace.window-title", "Connection trace") : ""
-    transientParent: root
-    flags: Qt.Dialog
-    onVisibleChanged: if (visible) { root.centerChildWindow(traceWindow); root.applyTitleBarTo(traceWindow) }
-
-    // Table geometry: the window owns its own, so a change here cannot silently
-    // resize the cache table in the other window.
+    // Own table geometry, so a change here cannot resize the cache table.
     readonly property int _renderCap: 400
     readonly property int _listMaxHeight: 460
     readonly property int _listLineHeight:
         Math.max(20, Math.round(root.uiTheme.baseFontSizePx * 1.7))
-    // Sort for THIS table only. The old shared helper switched on a "table"
-    // string; each window sorting its own columns removes the switch.
+    // Sort for this table's columns only.
     function _sortKey(col, e) {
         if (col === "process") return String((e && e.process) || "")
         if (col === "remote") return String((e && e.remote) || "")
-        if (col === "egress") return traceWindow._connEgressLabel(e && e.egress_role)
-        if (col === "verdict") return traceWindow._connVerdictLabel(e && e.verdict)
+        if (col === "egress") return section._connEgressLabel(e && e.egress_role)
+        if (col === "verdict") return section._connVerdictLabel(e && e.verdict)
         return ""
     }
     function _sortRows(list, table, col, dir) {
         if (!col || !dir) return list
         var arr = list.slice()
         arr.sort(function(a, b) {
-            var va = String(traceWindow._sortKey(col, a)).toLowerCase()
-            var vb = String(traceWindow._sortKey(col, b)).toLowerCase()
+            var va = String(section._sortKey(col, a)).toLowerCase()
+            var vb = String(section._sortKey(col, b)).toLowerCase()
             return (va < vb ? -1 : (va > vb ? 1 : 0)) * dir
         })
         return arr
@@ -57,16 +50,16 @@ Window {
     // Numeric/chronological columns compare as numbers; every other column
     // compares the displayed (localized) label case-insensitively.
     function _toggleConnSort(col) {
-        if (traceWindow._connSortCol === col)
-            traceWindow._connSortDir = -traceWindow._connSortDir
-        else { traceWindow._connSortCol = col; traceWindow._connSortDir = 1 }
+        if (section._connSortCol === col)
+            section._connSortDir = -section._connSortDir
+        else { section._connSortCol = col; section._connSortDir = 1 }
     }
     // " ▲" (ascending) / " ▼" (descending) suffix appended to the active sort
     // column header, "" otherwise. Glyphs are plain UTF-8 (file already holds
     // em-dashes); no locale keys needed for the sort indicator.
     function _connSortArrow(col) {
-        if (traceWindow._connSortCol !== col) return ""
-        return traceWindow._connSortDir < 0 ? " ▼" : " ▲"
+        if (section._connSortCol !== col) return ""
+        return section._connSortDir < 0 ? " ▼" : " ▲"
     }
 
     // Per-row lowercase search blob, computed ONCE and cached on
@@ -75,10 +68,10 @@ Window {
     // (2× new Date + 2× tr + join) → O(pages × rows) heavy work that froze the form
     // on a cache-miss search. With the cache each recompute is a cheap indexOf.
     function _connRowsTsv() {
-        var list = traceWindow._connFiltered
+        var list = section._connFiltered
         var lines = []
         for (var i = 0; i < list.length; i++)
-            lines.push(traceWindow._connRowTsv(list[i] || {}))
+            lines.push(section._connRowTsv(list[i] || {}))
         return lines.join("\n")
     }
 
@@ -103,8 +96,7 @@ Window {
     property bool _connGuiStreamEnabled: true
     // Client-side retention of the merged list, matching the service ring.
     readonly property int _connTraceRingCap: 1000
-    // TASK A — direct row selection for the connection-trace table (mirror of the
-    // cache twin). Selection holds the row objects by reference; synthetic group
+    // Direct row selection for the table (mirror of the cache twin). Selection holds the row objects by reference; synthetic group
     // headers (`_isGroupHeader`) are never selectable. Copy/count/highlight filter
     // against the live `_connGroupedModel`, so a stale reference clears itself when
     // the model rebuilds. `_connSelAnchor` indexes into `_connGroupedModel`.
@@ -112,48 +104,48 @@ Window {
     property int _connSelAnchor: -1
     property int _connSelRev: 0
     function _connRowSelected(e) {
-        return traceWindow._connSelRev >= 0 && e !== undefined
-            && traceWindow._connSel.indexOf(e) !== -1
+        return section._connSelRev >= 0 && e !== undefined
+            && section._connSel.indexOf(e) !== -1
     }
     function _connSelectedCount() {
-        var model = traceWindow._connGroupedModel
+        var model = section._connGroupedModel
         var n = 0
-        for (var i = 0; traceWindow._connSelRev >= 0 && i < model.length; i++) {
+        for (var i = 0; section._connSelRev >= 0 && i < model.length; i++) {
             var e = model[i]
             if (e !== undefined && !e._isGroupHeader
-                    && traceWindow._connSel.indexOf(e) !== -1) n++
+                    && section._connSel.indexOf(e) !== -1) n++
         }
         return n
     }
     function _selectConnRow(index, e, ctrl, shift) {
-        var model = traceWindow._connGroupedModel
-        if (shift && traceWindow._connSelAnchor >= 0
-                && traceWindow._connSelAnchor < model.length) {
-            var lo = Math.min(traceWindow._connSelAnchor, index)
-            var hi = Math.max(traceWindow._connSelAnchor, index)
-            var next = ctrl ? traceWindow._connSel.slice() : []
+        var model = section._connGroupedModel
+        if (shift && section._connSelAnchor >= 0
+                && section._connSelAnchor < model.length) {
+            var lo = Math.min(section._connSelAnchor, index)
+            var hi = Math.max(section._connSelAnchor, index)
+            var next = ctrl ? section._connSel.slice() : []
             for (var i = lo; i <= hi; i++) {
                 var it = model[i]
                 if (it !== undefined && !it._isGroupHeader
                         && next.indexOf(it) === -1) next.push(it)
             }
-            traceWindow._connSel = next
+            section._connSel = next
         } else if (ctrl) {
-            var arr = traceWindow._connSel.slice()
+            var arr = section._connSel.slice()
             var at = arr.indexOf(e)
             if (at === -1) arr.push(e); else arr.splice(at, 1)
-            traceWindow._connSel = arr
-            traceWindow._connSelAnchor = index
+            section._connSel = arr
+            section._connSelAnchor = index
         } else {
-            traceWindow._connSel = [e]
-            traceWindow._connSelAnchor = index
+            section._connSel = [e]
+            section._connSelAnchor = index
         }
-        traceWindow._connSelRev++
+        section._connSelRev++
     }
     function _clearConnSelection() {
-        traceWindow._connSel = []
-        traceWindow._connSelAnchor = -1
-        traceWindow._connSelRev++
+        section._connSel = []
+        section._connSelAnchor = -1
+        section._connSelRev++
     }
     // TSV for one connection row — the SAME column layout as `_connRowsTsv` and
     // the per-row right-click copy. Shared so the delegate, "Copy row" and
@@ -162,20 +154,20 @@ Window {
         return String((e && e.process) || "") + "\t"
             + String((e && e.process_path) || "") + "\t"
             + String((e && e.remote) || "") + "\t"
-            + traceWindow._connEgressLabel(e && e.egress_role) + "\t"
-            + traceWindow._connVerdictLabel(e && e.verdict) + "\t"
-            + traceWindow._connProtoLabel(e && e.proto) + "\t"
+            + section._connEgressLabel(e && e.egress_role) + "\t"
+            + section._connVerdictLabel(e && e.verdict) + "\t"
+            + section._connProtoLabel(e && e.proto) + "\t"
             + String((e && e.local) || "") + "\t"
             + Pure.formatTimestamp(e && e.observed_at_ms)
     }
     function _copyConnSelected() {
-        var model = traceWindow._connGroupedModel
+        var model = section._connGroupedModel
         var lines = []
         for (var i = 0; i < model.length; i++) {
             var e = model[i]
             if (e !== undefined && !e._isGroupHeader
-                    && traceWindow._connSel.indexOf(e) !== -1)
-                lines.push(traceWindow._connRowTsv(e))
+                    && section._connSel.indexOf(e) !== -1)
+                lines.push(section._connRowTsv(e))
         }
         if (lines.length > 0)
             root.copyToClipboard(lines.join("\n"))
@@ -239,7 +231,7 @@ Window {
         root.diagConnGroupExpandRev++
         // A collapsed group's rows leave the model; drop the selection so
         // "Copy selected" can never emit rows the user cannot see.
-        traceWindow._clearConnSelection()
+        section._clearConnSelection()
     }
     function _isConnGroupExpanded(key) {
         return root.diagConnGroupExpandRev >= 0
@@ -250,7 +242,7 @@ Window {
     // reach, and the viewport-height estimate. Kept in a SINGLE binding so the
     // three can never disagree and the grouping runs once per change.
     property var _connGroupedBuild: {
-        var lineH = traceWindow._listLineHeight
+        var lineH = section._listLineHeight
         if (!_connGroupByProcess) {
             return {
                 "rows": _connRendered,
@@ -288,7 +280,7 @@ Window {
             }
             out.push({ "_isGroupHeader": true, "process": k, "_count": rows.length })
             height += lineH + root.uiTheme.spacingXs
-            if (!traceWindow._isConnGroupExpanded(k)) continue
+            if (!section._isConnGroupExpanded(k)) continue
             var r = 0
             for (; r < rows.length && out.length < _renderCap; r++) {
                 out.push(rows[r])
@@ -319,11 +311,11 @@ Window {
         if (e && e._blob !== undefined) return e._blob
         var b = [
             String((e && e.process) || ""),
-            traceWindow._connProtoLabel(e && e.proto),
+            section._connProtoLabel(e && e.proto),
             String((e && e.local) || ""),
             String((e && e.remote) || ""),
-            traceWindow._connEgressLabel(e && e.egress_role),
-            traceWindow._connVerdictLabel(e && e.verdict),
+            section._connEgressLabel(e && e.egress_role),
+            section._connVerdictLabel(e && e.verdict),
             Pure.formatTimestamp(e && e.observed_at_ms)
         ].join(" ").toLowerCase()
         if (e) e._blob = b
@@ -345,7 +337,7 @@ Window {
         var out = []
         for (var i = 0; i < entries.length; i++) {
             var e = entries[i] || {}
-            if (!showBlocked && traceWindow._connVerdictIsBlock(e.verdict)) continue
+            if (!showBlocked && section._connVerdictIsBlock(e.verdict)) continue
             if (!showLocal && Pure.isNonInternetAddress(e.remote)) continue
             if (onlyIpv6 && !Pure.isIpv6Endpoint(e.remote)) continue
             out.push(e)
@@ -361,7 +353,7 @@ Window {
         var out = []
         for (var i = 0; i < entries.length; i++) {
             var e = entries[i] || {}
-            if (traceWindow._connRowBlob(e).indexOf(q) !== -1) out.push(e)
+            if (section._connRowBlob(e).indexOf(q) !== -1) out.push(e)
         }
         return out
     }
@@ -371,27 +363,27 @@ Window {
                 || typeof nrrNativeBridge === "undefined"
                 || nrrNativeBridge === null
                 || typeof nrrNativeBridge.rpcConnTraceEntriesList !== "function") {
-            traceWindow._connTraceError = root.tr("diag.conn-trace.entries-bridge-unavailable",
+            section._connTraceError = root.tr("diag.conn-trace.entries-bridge-unavailable",
                 "Service bridge not connected — connection trace unavailable")
-            traceWindow._connTraceShown = true
+            section._connTraceShown = true
             return
         }
         if (reset) {
-            traceWindow._connTraceEntries = []
-            traceWindow._connTraceCursor = ""
+            section._connTraceEntries = []
+            section._connTraceCursor = ""
         }
-        traceWindow._connTraceShown = true
-        traceWindow._connTraceLoading = true
-        traceWindow._connTraceError = ""
-        var cursor = reset ? "" : traceWindow._connTraceCursor
+        section._connTraceShown = true
+        section._connTraceLoading = true
+        section._connTraceError = ""
+        var cursor = reset ? "" : section._connTraceCursor
         // Request the max page (200) so the ≤1000-entry ring loads in
         // ≤5 pages via a one-time OPEN drain (below), not the old per-keystroke drain
         // that rebuilt the render model on every append and froze the view.
         var corr = nrrNativeBridge.rpcConnTraceEntriesList(cursor, 200)
         root.rpc.registerRpcCallback(corr, function(ok, payload, errorCode, errorMessage) {
-            traceWindow._connTraceLoading = false
+            section._connTraceLoading = false
             if (!ok) {
-                traceWindow._connTraceError = root.tr("diag.conn-trace.entries-failed",
+                section._connTraceError = root.tr("diag.conn-trace.entries-failed",
                     "Failed to load connection trace: ")
                     + ((typeof root.ipcErrorLabel === "function")
                         ? root.ipcErrorLabel(String(errorCode || "unknown"))
@@ -400,31 +392,31 @@ Window {
             }
             var page = (payload && payload.page) || {}
             var items = page.items || []
-            traceWindow._connObserverActive =
+            section._connObserverActive =
                 (payload && payload["observer-active"]) !== false
-            traceWindow._connGuiStreamEnabled =
+            section._connGuiStreamEnabled =
                 (payload && payload["gui-stream-enabled"]) !== false
-            traceWindow._connLastRefreshMs = Date.now()
-            var merged = traceWindow._connTraceEntries.slice()
+            section._connLastRefreshMs = Date.now()
+            var merged = section._connTraceEntries.slice()
             for (var i = 0; i < items.length; i++)
                 merged.push(items[i])
-            traceWindow._connTraceEntries = merged
+            section._connTraceEntries = merged
             var nc = page.next_cursor
-            traceWindow._connTraceCursor =
+            section._connTraceCursor =
                 (nc === undefined || nc === null) ? "" : String(nc)
             // ONE-TIME open drain: load the rest of the ≤1000-entry
             // ring (≤5 pages of 200) so the client filter covers the whole ring.
             // Unlike the old code this is NOT gated on the filter, so it runs once on
             // open and does NOT re-drain per keystroke (the debounce no longer drains).
             // TSV is gated (select-mode only) so these few appends don't churn.
-            if (traceWindow._connTraceCursor !== ""
-                    && traceWindow._connTraceEntries.length < traceWindow._connTraceDrainCap)
-                traceWindow._loadConnTraceEntries(false)
+            if (section._connTraceCursor !== ""
+                    && section._connTraceEntries.length < section._connTraceDrainCap)
+                section._loadConnTraceEntries(false)
         })
     }
 
     // Set while an Add-rule dialog opened from this panel is on screen, so the
-    // window can follow the user to Rules once the rule is in — a rule added
+    // section can follow the user to Rules once the rule is in — a rule added
     // from Diagnostics is not applied yet, and leaving the user here reads as
     // nothing having happened.
     property bool _connRulePending: false
@@ -446,20 +438,20 @@ Window {
     function _ruleFromConnRow(ruleType, value) {
         if (!root.ruleDialog || String(value || "") === "")
             return
-        traceWindow._connRulePending = true
+        section._connRulePending = true
         root.ruleDialog.resetForNew(ruleType, value)
         root.ruleDialog.open()
     }
     Connections {
         target: root.ruleDialog
         function onAccepted() {
-            if (!traceWindow._connRulePending)
+            if (!section._connRulePending)
                 return
-            traceWindow._connRulePending = false
+            section._connRulePending = false
             root.section = "rules"
         }
         function onRejected() {
-            traceWindow._connRulePending = false
+            section._connRulePending = false
         }
     }
 
@@ -480,7 +472,7 @@ Window {
     // real money on a diagnostic view. Existing row objects are kept by
     // reference so an active selection survives the merge.
     function _refreshConnTraceHead() {
-        if (!traceWindow._connTraceShown || traceWindow._connTraceLoading)
+        if (!section._connTraceShown || section._connTraceLoading)
             return
         if (!root.bridgeAvailable
                 || typeof nrrNativeBridge === "undefined"
@@ -495,46 +487,46 @@ Window {
                 return
             var page = (payload && payload.page) || {}
             var items = page.items || []
-            traceWindow._connObserverActive =
+            section._connObserverActive =
                 (payload && payload["observer-active"]) !== false
-            traceWindow._connGuiStreamEnabled =
+            section._connGuiStreamEnabled =
                 (payload && payload["gui-stream-enabled"]) !== false
-            traceWindow._connLastRefreshMs = Date.now()
+            section._connLastRefreshMs = Date.now()
             var seen = {}
-            var current = traceWindow._connTraceEntries
+            var current = section._connTraceEntries
             for (var i = 0; i < current.length; i++)
-                seen[traceWindow._connRowKey(current[i])] = true
+                seen[section._connRowKey(current[i])] = true
             var fresh = []
             for (var j = 0; j < items.length; j++) {
-                if (seen[traceWindow._connRowKey(items[j])] !== true)
+                if (seen[section._connRowKey(items[j])] !== true)
                     fresh.push(items[j])
             }
             if (fresh.length === 0)
                 return
             var merged = fresh.concat(current)
-            if (merged.length > traceWindow._connTraceRingCap)
-                merged = merged.slice(0, traceWindow._connTraceRingCap)
-            traceWindow._connTraceEntries = merged
+            if (merged.length > section._connTraceRingCap)
+                merged = merged.slice(0, section._connTraceRingCap)
+            section._connTraceEntries = merged
         })
     }
     // Age of the snapshot on screen, or the reason the poll is standing still.
     function _connRefreshStatusLabel() {
-        if (traceWindow._connClockRev < 0 || traceWindow._connLastRefreshMs <= 0)
+        if (section._connClockRev < 0 || section._connLastRefreshMs <= 0)
             return ""
         // Nothing is being served, so an age would only describe an empty page;
         // the empty state below already explains itself.
-        if (!traceWindow._connGuiStreamEnabled)
+        if (!section._connGuiStreamEnabled)
             return ""
-        if (traceWindow._connAutoRefresh
-                && (traceWindow._connSel.length > 0 || connTraceList.contentY > 1))
+        if (section._connAutoRefresh
+                && (section._connSel.length > 0 || connTraceList.contentY > 1))
             return root.tr("diag.conn-trace.auto-paused",
                 "Paused — scroll to the top or clear the selection to resume")
         var secs = Math.max(0,
-            Math.round((Date.now() - traceWindow._connLastRefreshMs) / 1000))
+            Math.round((Date.now() - section._connLastRefreshMs) / 1000))
         return root.tr("diag.conn-trace.updated-ago", "updated %1 s ago").arg(secs)
     }
 
-    // Snapshot poll. Stops when the panel is hidden, the section is off-screen,
+    // Snapshot poll. Stops when the list is hidden, the section is off-screen,
     // the window is minimized, the user has rows selected, or the list is
     // scrolled away from the top: new rows arrive at the HEAD, so refreshing
     // under a reader who has scrolled down moves the text they are reading.
@@ -542,31 +534,27 @@ Window {
         id: connAutoRefreshTimer
         interval: 2000
         repeat: true
-        running: traceWindow._connTraceShown && traceWindow._connAutoRefresh
-            && traceWindow._connGuiStreamEnabled
-            && traceWindow._connSel.length === 0
+        running: section._connTraceShown && section._connAutoRefresh
+            && section._connGuiStreamEnabled
+            && section._connSel.length === 0
             && connTraceList.contentY <= 1
-            && traceWindow.visible
-            && traceWindow.visibility !== Window.Minimized
-        onTriggered: traceWindow._refreshConnTraceHead()
+            && section.visible
+            && root.visibility !== Window.Minimized
+        onTriggered: section._refreshConnTraceHead()
     }
     // Drives the age label only.
     Timer {
         id: connAgeTicker
         interval: 1000
         repeat: true
-        running: traceWindow._connTraceShown && traceWindow.visible
-        onTriggered: traceWindow._connClockRev++
+        running: section._connTraceShown && section.visible
+        onTriggered: section._connClockRev++
     }
 
-    ScrollView {
-        anchors.fill: parent
-        anchors.margins: root.uiTheme.spacingLg
-        clip: true
-        ColumnLayout {
-            width: traceWindow.width - 2 * root.uiTheme.spacingLg
-            spacing: root.uiTheme.spacingMd
-        // C4c: Connection trace viewer (Q3) — read-only, populated on demand.
+    ColumnLayout {
+        width: section.availableWidth
+        spacing: root.uiTheme.spacingMd
+        // Read-only connection trace viewer.
         Frame {
             Layout.fillWidth: true
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
@@ -595,18 +583,18 @@ Window {
                     spacing: root.uiTheme.spacingSm
                     ThemedButton {
                         theme: root.uiTheme
-                        visible: !traceWindow._connTraceShown
-                        enabled: !traceWindow._connTraceLoading
+                        visible: !section._connTraceShown
+                        enabled: !section._connTraceLoading
                         text: root.tr("diag.conn-trace.entries-button", "Show recent connections")
-                        onClicked: traceWindow._loadConnTraceEntries(true)
+                        onClicked: section._loadConnTraceEntries(true)
                     }
                     ThemedTextField {
                         id: connTraceSearchField
                         theme: root.uiTheme
                         Layout.fillWidth: true
-                        visible: traceWindow._connTraceShown
-                            && (traceWindow._connTraceEntries.length > 0
-                                || traceWindow._connTraceFilter !== "")
+                        visible: section._connTraceShown
+                            && (section._connTraceEntries.length > 0
+                                || section._connTraceFilter !== "")
                         placeholderText: root.tr("diag.conn-trace.entries-search-placeholder",
                             "Search all fields…")
                         // Debounce (see cache search).
@@ -616,8 +604,8 @@ Window {
                     // wedged between two buttons reads as a third button.
                     CheckBox {
                         id: connAutoRefreshCheck
-                        visible: traceWindow._connTraceShown
-                        checked: traceWindow._connAutoRefresh
+                        visible: section._connTraceShown
+                        checked: section._connAutoRefresh
                         text: root.tr("diag.conn-trace.auto-refresh", "Refresh automatically")
                         contentItem: Label {
                             text: connAutoRefreshCheck.text
@@ -628,32 +616,32 @@ Window {
                         }
                         Accessible.name: connAutoRefreshCheck.text
                         onToggled: {
-                            traceWindow._connAutoRefresh = checked
+                            section._connAutoRefresh = checked
                             if (checked)
-                                traceWindow._refreshConnTraceHead()
+                                section._refreshConnTraceHead()
                         }
                     }
                     Label {
-                        visible: traceWindow._connTraceShown
-                            && traceWindow._connRefreshStatusLabel() !== ""
-                        text: traceWindow._connRefreshStatusLabel()
+                        visible: section._connTraceShown
+                            && section._connRefreshStatusLabel() !== ""
+                        text: section._connRefreshStatusLabel()
                         color: root.mutedTextColor
                         font.pixelSize: root.uiTheme.baseFontSizePx - 1
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        visible: traceWindow._connTraceShown
-                        enabled: !traceWindow._connTraceLoading
+                        visible: section._connTraceShown
+                        enabled: !section._connTraceLoading
                         text: root.tr("diag.conn-trace.entries-refresh", "Refresh")
-                        onClicked: traceWindow._loadConnTraceEntries(true)
+                        onClicked: section._loadConnTraceEntries(true)
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        visible: traceWindow._connTraceShown
+                        visible: section._connTraceShown
                         text: root.tr("diag.conn-trace.entries-hide", "Hide connection trace")
                         onClicked: {
                             // Hide FIRST (see cache-entries hide, E).
-                            traceWindow._connTraceShown = false
+                            section._connTraceShown = false
                             connTraceSearchField.text = ""
                         }
                     }
@@ -667,12 +655,12 @@ Window {
                 // themed already, only the label colour needs the theme applied.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown
-                        && traceWindow._connTraceEntries.length > 0
+                    visible: section._connTraceShown
+                        && section._connTraceEntries.length > 0
                     spacing: root.uiTheme.spacingMd
                     CheckBox {
                         id: connShowBlockedCheck
-                        checked: traceWindow._connShowBlocked
+                        checked: section._connShowBlocked
                         text: root.tr("diag.conn-trace.show-blocked", "Show blocked")
                         contentItem: Label {
                             text: connShowBlockedCheck.text
@@ -683,13 +671,13 @@ Window {
                         }
                         Accessible.name: connShowBlockedCheck.text
                         onToggled: {
-                            traceWindow._connShowBlocked = checked
-                            traceWindow._clearConnSelection()
+                            section._connShowBlocked = checked
+                            section._clearConnSelection()
                         }
                     }
                     CheckBox {
                         id: connShowLocalCheck
-                        checked: traceWindow._connShowLocal
+                        checked: section._connShowLocal
                         text: root.tr("diag.conn-trace.show-local",
                             "Show local connections")
                         contentItem: Label {
@@ -704,13 +692,13 @@ Window {
                         ToolTip.text: root.tr("diag.conn-trace.show-local-tip",
                             "Connections to your own machine or your local network (loopback, link-local, private LAN addresses). They never leave your network, so they say nothing about routing.")
                         onToggled: {
-                            traceWindow._connShowLocal = checked
-                            traceWindow._clearConnSelection()
+                            section._connShowLocal = checked
+                            section._clearConnSelection()
                         }
                     }
                     CheckBox {
                         id: connOnlyIpv6Check
-                        checked: traceWindow._connOnlyIpv6
+                        checked: section._connOnlyIpv6
                         text: root.tr("diag.conn-trace.only-ipv6", "IPv6 only")
                         contentItem: Label {
                             text: connOnlyIpv6Check.text
@@ -724,14 +712,14 @@ Window {
                         ToolTip.text: root.tr("diag.conn-trace.only-ipv6-tip",
                             "Show only connections made over IPv6. They are observed, but routing rules do not apply to that family yet — so these are the connections currently travelling outside your policy. Link-local IPv6 counts as local, so tick \"Show local connections\" as well to see it.")
                         onToggled: {
-                            traceWindow._connOnlyIpv6 = checked
-                            traceWindow._clearConnSelection()
+                            section._connOnlyIpv6 = checked
+                            section._clearConnSelection()
                         }
                     }
                     // Group the trace rows by process.
                     CheckBox {
                         id: connGroupByProcessCheck
-                        checked: traceWindow._connGroupByProcess
+                        checked: section._connGroupByProcess
                         text: root.tr("diag.conn-trace.group-by-process", "Group by process")
                         contentItem: Label {
                             text: connGroupByProcessCheck.text
@@ -742,8 +730,8 @@ Window {
                         }
                         Accessible.name: connGroupByProcessCheck.text
                         onToggled: {
-                            traceWindow._connGroupByProcess = checked
-                            traceWindow._clearConnSelection()
+                            section._connGroupByProcess = checked
+                            section._clearConnSelection()
                         }
                     }
                     Item { Layout.fillWidth: true }
@@ -760,35 +748,35 @@ Window {
                         // _loadConnTraceEntries), so the client filter already sees the
                         // whole ring without the per-keystroke page-drain that froze
                         // the view (each append rebuilt the render model).
-                        traceWindow._connTraceFilter = connTraceSearchField.text
+                        section._connTraceFilter = connTraceSearchField.text
                     }
                 }
 
                 // Error state.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceError !== ""
-                    text: traceWindow._connTraceError
+                    visible: section._connTraceError !== ""
+                    text: section._connTraceError
                     color: root.uiTheme.colorAccent
                     wrapMode: Text.WordWrap
                 }
                 // First-load spinner surrogate.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceLoading && traceWindow._connTraceEntries.length === 0
+                    visible: section._connTraceLoading && section._connTraceEntries.length === 0
                     text: root.tr("diag.conn-trace.entries-loading", "Loading connections...")
                     color: root.mutedTextColor
                 }
                 // Empty state.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && !traceWindow._connTraceLoading
-                        && traceWindow._connTraceError === ""
-                        && traceWindow._connTraceEntries.length === 0
-                    text: !traceWindow._connGuiStreamEnabled
+                    visible: section._connTraceShown && !section._connTraceLoading
+                        && section._connTraceError === ""
+                        && section._connTraceEntries.length === 0
+                    text: !section._connGuiStreamEnabled
                         ? root.tr("diag.conn-trace.gui-stream-off",
                             "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.")
-                        : traceWindow._connObserverActive
+                        : section._connObserverActive
                             ? root.tr("diag.conn-trace.entries-empty",
                                 "No connections observed yet")
                             : root.tr("diag.conn-trace.observer-unavailable",
@@ -801,35 +789,35 @@ Window {
                 // otherwise render as a silent empty table.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceEntries.length > 0
-                        && traceWindow._connFiltered.length === 0
+                    visible: section._connTraceEntries.length > 0
+                        && section._connFiltered.length === 0
                     text: root.tr("diag.conn-trace.entries-no-match",
                         "No connections match the current filters")
                     color: root.mutedTextColor
                     wrapMode: Text.WordWrap
                 }
 
-                // Copy toolbar (TASK A) — see the cache table twin.
+                // Copy toolbar — see the cache table twin.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && traceWindow._connTraceEntries.length > 0
+                    visible: section._connTraceShown && section._connTraceEntries.length > 0
                     spacing: root.uiTheme.spacingSm
                     ThemedButton {
                         theme: root.uiTheme
                         text: root.tr("diag.copy-all-shown", "Copy all shown")
-                        onClicked: root.copyToClipboard(traceWindow._connRowsTsv())
+                        onClicked: root.copyToClipboard(section._connRowsTsv())
                     }
                     ThemedButton {
                         theme: root.uiTheme
-                        visible: traceWindow._connSelectedCount() > 0
+                        visible: section._connSelectedCount() > 0
                         text: root.tr("diag.copy-selected", "Copy selected")
-                            + " (" + traceWindow._connSelectedCount() + ")"
-                        onClicked: traceWindow._copyConnSelected()
+                            + " (" + section._connSelectedCount() + ")"
+                        onClicked: section._copyConnSelected()
                     }
                 }
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && traceWindow._connTraceEntries.length > 0
+                    visible: section._connTraceShown && section._connTraceEntries.length > 0
                     text: root.tr("diag.table.select-hint",
                         "Click a row to select it (Ctrl+click to toggle, Shift+click to extend), then press Ctrl+C to copy. Right-click for more options.")
                     color: root.mutedTextColor
@@ -842,7 +830,7 @@ Window {
                 // and states the trace is observation-only (never changes routing).
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && traceWindow._connTraceEntries.length > 0
+                    visible: section._connTraceShown && section._connTraceEntries.length > 0
                     spacing: root.uiTheme.spacingSm
                     // Every header is clickable to sort (a `_connSortArrow` suffix
                     // marks the active column) and keeps its explanatory tooltip.
@@ -853,14 +841,14 @@ Window {
                         id: connHdrProcess
                         Layout.fillWidth: true
                         text: root.tr("diag.conn-trace.col-process", "Process")
-                            + traceWindow._connSortArrow("process")
+                            + section._connSortArrow("process")
                         color: root.mutedTextColor
                         font.bold: true
                         elide: Text.ElideRight
                         HoverHandler { id: connHdrProcessHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: traceWindow._toggleConnSort("process")
+                            onTapped: section._toggleConnSort("process")
                         }
                         ToolTip.visible: connHdrProcessHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-process-tip",
@@ -870,14 +858,14 @@ Window {
                         id: connHdrRemote
                         Layout.preferredWidth: 150
                         text: root.tr("diag.conn-trace.col-remote", "Remote")
-                            + traceWindow._connSortArrow("remote")
+                            + section._connSortArrow("remote")
                         color: root.mutedTextColor
                         font.bold: true
                         elide: Text.ElideRight
                         HoverHandler { id: connHdrRemoteHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: traceWindow._toggleConnSort("remote")
+                            onTapped: section._toggleConnSort("remote")
                         }
                         ToolTip.visible: connHdrRemoteHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-remote-tip",
@@ -887,14 +875,14 @@ Window {
                         id: connHdrEgress
                         Layout.preferredWidth: 110
                         text: root.tr("diag.conn-trace.col-egress", "Egress")
-                            + traceWindow._connSortArrow("egress")
+                            + section._connSortArrow("egress")
                         color: root.mutedTextColor
                         font.bold: true
                         elide: Text.ElideRight
                         HoverHandler { id: connHdrEgressHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: traceWindow._toggleConnSort("egress")
+                            onTapped: section._toggleConnSort("egress")
                         }
                         ToolTip.visible: connHdrEgressHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-egress-tip",
@@ -904,14 +892,14 @@ Window {
                         id: connHdrVerdict
                         Layout.preferredWidth: 180
                         text: root.tr("diag.conn-trace.col-verdict", "Verdict")
-                            + traceWindow._connSortArrow("verdict")
+                            + section._connSortArrow("verdict")
                         color: root.mutedTextColor
                         font.bold: true
                         elide: Text.ElideRight
                         HoverHandler { id: connHdrVerdictHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler {
                             acceptedButtons: Qt.LeftButton
-                            onTapped: traceWindow._toggleConnSort("verdict")
+                            onTapped: section._toggleConnSort("verdict")
                         }
                         ToolTip.visible: connHdrVerdictHover.hovered
                         ToolTip.text: root.tr("diag.conn-trace.col-verdict-tip",
@@ -919,14 +907,11 @@ Window {
                     }
                 }
 
-                // The verdict comes from an engine-wide
-                // WFP feed with no owner attribution, so a "Blocked" row may be a
-                // drop by Windows Firewall or the antivirus, NOT NetRuleRouter.
-                // The user saw avp.exe "blocked on primary" and thought NRR broke
-                // the AV (HW #4); make the ambiguity explicit.
+                // The verdict feed has no owner attribution, so a "Blocked" row
+                // may be a firewall or antivirus drop; say so explicitly.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && traceWindow._connTraceEntries.length > 0
+                    visible: section._connTraceShown && section._connTraceEntries.length > 0
                     text: root.tr("diag.conn-trace.verdict-note",
                         "\"Blocked\" means the connection was dropped by a Windows filter — this can be Windows Firewall or your antivirus, not necessarily NetRuleRouter. NetRuleRouter never blocks traffic on your primary route.")
                     color: root.mutedTextColor
@@ -943,45 +928,41 @@ Window {
                 ListView {
                     id: connTraceList
                     Layout.fillWidth: true
-                    Layout.preferredHeight: Math.min(traceWindow._listMaxHeight,
-                        Math.max(traceWindow._listLineHeight,
-                            Number(traceWindow._connGroupedBuild.height || 0)))
-                    visible: traceWindow._connTraceShown
-                        && traceWindow._connGroupedModel.length > 0
+                    Layout.preferredHeight: Math.min(section._listMaxHeight,
+                        Math.max(section._listLineHeight,
+                            Number(section._connGroupedBuild.height || 0)))
+                    visible: section._connTraceShown
+                        && section._connGroupedModel.length > 0
                     clip: true
                     interactive: contentHeight > height
                     ScrollBar.vertical: ScrollBar {
                         policy: connTraceList.contentHeight > connTraceList.height
                             ? ScrollBar.AlwaysOn : ScrollBar.AsNeeded
                     }
-                    // TASK A — Ctrl+C copies the selected rows / Escape clears (see
+                    // Ctrl+C copies the selected rows / Escape clears (see
                     // the cache twin). Focus arrives via the row MouseArea.
                     Keys.onPressed: function(event) {
                         if (event.matches(StandardKey.Copy)) {
-                            traceWindow._copyConnSelected()
+                            section._copyConnSelected()
                             event.accepted = true
                         } else if (event.key === Qt.Key_Escape) {
-                            traceWindow._clearConnSelection()
+                            section._clearConnSelection()
                             event.accepted = true
                         }
                     }
                     // Reuse the cached `_connFiltered` (render-capped
                     // to `_renderCap`); `_connGroupedModel` is `_connRendered` when
                     // grouping is off, else the header-interleaved grouped list.
-                    model: traceWindow._connTraceShown
-                        ? traceWindow._connGroupedModel
+                    model: section._connTraceShown
+                        ? section._connGroupedModel
                         : []
                     delegate: Item {
                         id: connRowItem
                         width: connTraceList.width
                         // A synthetic group header row vs a real row.
                         readonly property bool _isHeader: !!(modelData && modelData._isGroupHeader)
-                        // Decision-vs-actual mismatch: policy expected
-                        // this remote to egress the SECONDARY link (its IP belongs
-                        // to a secondary rule), yet the flow was PERMITTED out the
-                        // primary — i.e. it leaked. Rendered as a red row tint +
-                        // red egress cell so a leak is visible at a glance instead
-                        // of needing three tools cross-checked by hand (0714 run).
+                        // Leak: a secondary-rule address permitted out the primary
+                        // link. Tinted red so it is visible at a glance.
                         readonly property bool _isLeakMismatch: !_isHeader
                             && !!modelData
                             && modelData.expected_route === "secondary"
@@ -1002,7 +983,7 @@ Window {
                         // Reads `root.diagConnGroupExpandRev` through the helper so a
                         // toggle re-evaluates this binding (mirrors the cache table).
                         readonly property bool _groupExpanded: connRowItem._isHeader
-                            && traceWindow._isConnGroupExpanded(connRowItem._groupKey)
+                            && section._isConnGroupExpanded(connRowItem._groupKey)
                         // Group header (shown only for synthetic header items).
                         // Collapsed by default; the whole header row is the click
                         // target, and the leading chevron states which way it goes.
@@ -1029,14 +1010,14 @@ Window {
                             enabled: connRowItem._isHeader
                             acceptedButtons: Qt.LeftButton
                             cursorShape: Qt.PointingHandCursor
-                            onClicked: traceWindow._toggleConnGroupExpand(connRowItem._groupKey)
+                            onClicked: section._toggleConnGroupExpand(connRowItem._groupKey)
                         }
-                        // TASK A — selection state (never for synthetic headers).
+                        // Selection state (never for synthetic headers).
                         readonly property bool _selected:
-                            !connRowItem._isHeader && traceWindow._connRowSelected(modelData)
+                            !connRowItem._isHeader && section._connRowSelected(modelData)
                         // Whole-row right-click → copy. TSV so paste keeps columns.
-                        readonly property string _rowTsv: traceWindow._connRowTsv(modelData)
-                        // TASK A — accent-tinted selection highlight, behind content
+                        readonly property string _rowTsv: section._connRowTsv(modelData)
+                        // Accent-tinted selection highlight, behind content
                         // (coexists with the leak-mismatch red tint above).
                         Rectangle {
                             visible: connRowItem._selected
@@ -1045,7 +1026,7 @@ Window {
                             opacity: 0.14
                             z: -1
                         }
-                        // TASK A — left-click row selection (plain / Ctrl / Shift),
+                        // Left-click row selection (plain / Ctrl / Shift),
                         // disabled on group headers. Under the row content so hover
                         // tooltips still work; grabs focus for the list-level Ctrl+C.
                         MouseArea {
@@ -1053,7 +1034,7 @@ Window {
                             enabled: !connRowItem._isHeader
                             acceptedButtons: Qt.LeftButton
                             onPressed: function(mouse) {
-                                traceWindow._selectConnRow(
+                                section._selectConnRow(
                                     index, modelData,
                                     (mouse.modifiers & Qt.ControlModifier) !== 0,
                                     (mouse.modifiers & Qt.ShiftModifier) !== 0)
@@ -1066,7 +1047,7 @@ Window {
                             acceptedButtons: Qt.RightButton
                             onTapped: {
                                 if (!connRowItem._selected)
-                                    traceWindow._selectConnRow(index, modelData, false, false)
+                                    section._selectConnRow(index, modelData, false, false)
                                 connTraceList.forceActiveFocus()
                                 connRowMenu.popup()
                             }
@@ -1093,11 +1074,11 @@ Window {
                                 : root.tr("notifications.block-notice.reason." + reason, "")
                         }
                         readonly property string _vEgress:
-                            traceWindow._connEgressLabel(modelData && modelData.egress_role)
+                            section._connEgressLabel(modelData && modelData.egress_role)
                         readonly property string _vVerdict:
-                            traceWindow._connVerdictLabel(modelData && modelData.verdict)
+                            section._connVerdictLabel(modelData && modelData.verdict)
                         readonly property string _vProto:
-                            traceWindow._connProtoLabel(modelData && modelData.proto)
+                            section._connProtoLabel(modelData && modelData.proto)
                         readonly property string _vLocal:
                             String((modelData && modelData.local) || "")
                         readonly property string _vObserved:
@@ -1108,7 +1089,7 @@ Window {
                                 visible: connRowItem._vRemoteIp !== ""
                                 text: root.tr("diag.conn-trace.rule-for-address",
                                     "Rule for this address…")
-                                onTriggered: traceWindow._ruleFromConnRow(
+                                onTriggered: section._ruleFromConnRow(
                                     "exact-ip", connRowItem._vRemoteIp)
                             }
                             MenuItem {
@@ -1119,14 +1100,14 @@ Window {
                                     && connRowItem._vProcess !== "?"
                                 text: root.tr("diag.conn-trace.rule-for-app",
                                     "Rule for this application…")
-                                onTriggered: traceWindow._ruleFromConnRow(
+                                onTriggered: section._ruleFromConnRow(
                                     "application", connRowItem._vProcess)
                             }
                             MenuItem {
                                 visible: connRowItem._vRuleHost !== ""
                                     || connRowItem._vRemoteIp !== ""
                                 text: root.tr("diag.conn-trace.why-this-route", "Why this route?")
-                                onTriggered: traceWindow._explainConnRow(
+                                onTriggered: section._explainConnRow(
                                     connRowItem._vRuleHost, connRowItem._vRemoteIp,
                                     connRowItem._vProcess)
                             }
@@ -1137,12 +1118,12 @@ Window {
                             }
                             MenuItem {
                                 text: root.tr("diag.copy-selected", "Copy selected")
-                                visible: traceWindow._connSelectedCount() > 0
-                                onTriggered: traceWindow._copyConnSelected()
+                                visible: section._connSelectedCount() > 0
+                                onTriggered: section._copyConnSelected()
                             }
                             MenuItem {
                                 text: root.tr("diag.copy-all-shown", "Copy all shown")
-                                onTriggered: root.copyToClipboard(traceWindow._connRowsTsv())
+                                onTriggered: root.copyToClipboard(section._connRowsTsv())
                             }
                             MenuSeparator { }
                             // Single-column copies — the executable path and the
@@ -1223,7 +1204,7 @@ Window {
                                 // A leak-mismatch row marks its egress
                                 // cell red with a ⚠ and explains itself on hover.
                                 text: (connRowItem._isLeakMismatch ? "⚠ " : "")
-                                    + traceWindow._connEgressLabel(modelData && modelData.egress_role)
+                                    + section._connEgressLabel(modelData && modelData.egress_role)
                                 color: connRowItem._isLeakMismatch
                                     ? root.uiTheme.colorDanger
                                     : ((modelData && modelData.egress_role === "secondary")
@@ -1253,7 +1234,7 @@ Window {
                                         if (by === "other")
                                             return root.tr("diag.conn-trace.verdict.block-by-other", "Blocked (another program)")
                                     }
-                                    return traceWindow._connVerdictLabel(modelData && modelData.verdict)
+                                    return section._connVerdictLabel(modelData && modelData.verdict)
                                 }
                                 color: {
                                     if (!(modelData && modelData.verdict === "block"))
@@ -1277,7 +1258,7 @@ Window {
                             Layout.fillWidth: true
                             // The relay note is what keeps a fake-IP flow from
                             // reading as the service going out on its own account.
-                            text: traceWindow._connProtoLabel(modelData && modelData.proto)
+                            text: section._connProtoLabel(modelData && modelData.proto)
                                 + "  ·  " + root.tr("diag.conn-trace.entries-from", "from") + " "
                                 + String((modelData && modelData.local) || "—")
                                 + "  ·  "
@@ -1300,11 +1281,11 @@ Window {
                 // fully collapsed trace that fits never raises the notice.
                 Label {
                     Layout.fillWidth: true
-                    visible: traceWindow._connTraceShown && traceWindow._connDroppedByCap > 0
+                    visible: section._connTraceShown && section._connDroppedByCap > 0
                     text: root.tr("diag.cache.render-truncated",
                         "Showing the first %1 of %2 matches — refine your search to narrow it.")
-                        .arg(traceWindow._connFiltered.length - traceWindow._connDroppedByCap)
-                        .arg(traceWindow._connFiltered.length)
+                        .arg(section._connFiltered.length - section._connDroppedByCap)
+                        .arg(section._connFiltered.length)
                     color: root.uiTheme.colorWarning
                     font.pixelSize: Math.max(11, root.uiTheme.baseFontSizePx - 1)
                     wrapMode: Text.WordWrap
@@ -1313,15 +1294,12 @@ Window {
                 // Load-more affordance — present only while a further page exists.
                 ThemedButton {
                     theme: root.uiTheme
-                    visible: traceWindow._connTraceCursor !== ""
-                    enabled: !traceWindow._connTraceLoading
+                    visible: section._connTraceCursor !== ""
+                    enabled: !section._connTraceLoading
                     text: root.tr("diag.conn-trace.entries-load-more", "Load more")
-                    onClicked: traceWindow._loadConnTraceEntries(false)
+                    onClicked: section._loadConnTraceEntries(false)
                 }
             }
-        }
-
-            Item { Layout.fillHeight: true }
         }
     }
 }

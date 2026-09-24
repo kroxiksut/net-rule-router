@@ -142,13 +142,13 @@ fn refreshing_a_parked_sighting_moves_it_to_the_back() {
         ledger.observe(
             1_000 + i as u64,
             &format!("host{i}.delivery.test"),
-            CoActivityKind::Candidate,
+            CoActivityKind::CandidateInUse,
         );
     }
     // The oldest is seen again — it is now the newest evidence there is.
-    ledger.observe(9_000, "host0.delivery.test", CoActivityKind::Candidate);
+    ledger.observe(9_000, "host0.delivery.test", CoActivityKind::CandidateInUse);
     // One more host overflows the buffer by one.
-    ledger.observe(9_100, "extra.delivery.test", CoActivityKind::Candidate);
+    ledger.observe(9_100, "extra.delivery.test", CoActivityKind::CandidateInUse);
 
     // A window opens and claims everything the look-back still holds.
     ledger.observe(
@@ -226,7 +226,7 @@ fn a_companion_seen_just_before_the_page_is_still_attributed_to_it() {
     // The order a browser actually uses often enough: the CDN connection
     // opens a second ahead of the one to the page.
     let mut ledger = CompanionAffinityLedger::with_defaults();
-    ledger.observe(1_000, "static.cdn.example", CoActivityKind::Candidate);
+    ledger.observe(1_000, "static.cdn.example", CoActivityKind::CandidateInUse);
     ledger.observe(
         2_000,
         "site.example",
@@ -237,6 +237,34 @@ fn a_companion_seen_just_before_the_page_is_still_attributed_to_it() {
         ledger.is_tracking_candidate("static.cdn.example"),
         "a sighting one second before the anchor must not be thrown away"
     );
+}
+
+/// The other thing that looks exactly like a companion opening ahead of its
+/// page: a page prefetching the links on it. The name resolves and nothing
+/// follows — nobody went there — and an offer built on it names a site the
+/// user never opened.
+#[test]
+fn a_name_resolved_before_the_window_with_no_traffic_is_not_claimed_by_it() {
+    let mut ledger = CompanionAffinityLedger::new(CompanionAffinityConfig {
+        // As the service configures it: connections are observed there.
+        lookback_requires_traffic: true,
+        ..CompanionAffinityConfig::default()
+    });
+    ledger.observe(1_000, "prefetched.cdn.example", CoActivityKind::Candidate);
+    ledger.observe(
+        2_000,
+        "site.example",
+        CoActivityKind::Anchor { route: SECONDARY },
+    );
+
+    assert!(
+        !ledger.is_tracking_candidate("prefetched.cdn.example"),
+        "a speculative resolution before the window is not evidence of a visit",
+    );
+
+    // Seen again INSIDE the window, it is an ordinary candidate as before.
+    ledger.observe(2_500, "prefetched.cdn.example", CoActivityKind::Candidate);
+    assert!(ledger.is_tracking_candidate("prefetched.cdn.example"));
 }
 
 #[test]
@@ -275,7 +303,7 @@ fn the_look_back_can_be_switched_off() {
 fn a_replayed_companion_counts_once_however_many_times_it_was_seen() {
     let mut ledger = CompanionAffinityLedger::with_defaults();
     for at in [500_u64, 700, 900, 1_100] {
-        ledger.observe(at, "static.cdn.example", CoActivityKind::Candidate);
+        ledger.observe(at, "static.cdn.example", CoActivityKind::CandidateInUse);
     }
     ledger.observe(
         2_000,

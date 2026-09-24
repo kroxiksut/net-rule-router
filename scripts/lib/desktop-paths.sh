@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Shared paths and helpers for the Linux desktop-integration scripts
-# (install-desktop / uninstall-desktop). Sourced, never executed; both scripts
-# source lib/service-paths.sh first for the colours and nrr_run_privileged.
+# (install-desktop / uninstall-desktop), plus nrr_sync_unix_binaries for
+# build.sh and run.sh. Sourced, never executed; the desktop scripts source
+# lib/service-paths.sh first for the colours and nrr_run_privileged.
 
 # Desktop-entry basenames. A compositor matches a window's app_id against
 # these, so they must equal the setDesktopFileName values in the Qt host and
@@ -60,6 +61,24 @@ nrr_desktop_profile_dir() {
   else
     printf '%s\n' "$debug_dir"
   fi
+}
+
+# Refresh the Unix-named copies the desktop entries launch. The service tells
+# its surfaces apart by the peer's executable name, and Cargo only produces the
+# Cargo spelling. A copy, not a symlink: /proc/<pid>/exe resolves links and
+# would report the Cargo name again. Staged and renamed so a running GUI keeps
+# its own inode instead of failing with "text file busy".
+nrr_sync_unix_binaries() {
+  local profile_dir="$1" pair cargo_path unix_path
+  for pair in "$NRR_DESKTOP_GUI_CARGO_NAME:$NRR_DESKTOP_GUI_ID"     "$NRR_DESKTOP_TRAY_CARGO_NAME:$NRR_DESKTOP_TRAY_ID"; do
+    cargo_path="$profile_dir/${pair%%:*}"
+    unix_path="$profile_dir/${pair##*:}"
+    # `-ef` keeps a case-insensitive filesystem from copying a file onto itself.
+    if [ -x "$cargo_path" ] && ! [ "$cargo_path" -ef "$unix_path" ]; then
+      cp -f "$cargo_path" "$unix_path.tmp.$$"
+      mv -f "$unix_path.tmp.$$" "$unix_path"
+    fi
+  done
 }
 
 # Refresh the caches a desktop environment reads. Both tools are optional —

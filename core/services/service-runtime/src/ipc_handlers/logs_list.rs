@@ -89,6 +89,7 @@ mod tests {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         }
     }
 

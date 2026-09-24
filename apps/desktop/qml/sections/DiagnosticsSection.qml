@@ -212,23 +212,11 @@ ScrollView {
         _refreshServiceHealth()
         _consumePendingExplainHost()
     }
-    // Deep links into this section, both consumed once: a block notice carries
-    // the host to probe, and Rules carries a request to open the connection
-    // trace. Coming back later must not re-run what the user already saw.
+    // A block notice deep-links the host to probe, consumed once: coming back
+    // later must not re-run what the user already saw.
     onVisibleChanged: {
-        if (!visible)
-            return
-        section._consumePendingExplainHost()
-        section._consumePendingConnTrace()
-    }
-    // Rules → "Where traffic is going" sets the flag; whichever happens last —
-    // the flag or this section becoming visible — opens the panel.
-    Connections {
-        target: root
-        function onDiagOpenConnTraceChanged() {
-            if (section.visible)
-                section._consumePendingConnTrace()
-        }
+        if (visible)
+            section._consumePendingExplainHost()
     }
     function serviceStateLabel(state) {
         if (state === "running") return root.tr("diag.status.service-running", "Service running")
@@ -244,18 +232,6 @@ ScrollView {
             return root.tr("diag.status.cache-stale", "Cache entries stale")
         return root.tr("diag.status.cache-healthy", "Cache healthy")
     }
-    function _consumePendingConnTrace() {
-        if (!root.diagOpenConnTrace)
-            return
-        root.diagOpenConnTrace = false
-        // The trace lives in its own window now — the request from Rules
-        // opens it instead of scrolling this section.
-        var trace = root.connTraceWindow
-        if (!trace) return
-        root.openChildWindow(trace)
-        trace._loadConnTraceEntries(true)
-    }
-
     function _consumePendingExplainHost() {
         var host = String(root.notificationsController.pendingExplainHost || "").trim()
         if (host === "") return
@@ -1022,8 +998,7 @@ ScrollView {
             }
         }
 
-        // The connection trace moved to its own window: it is a live list read
-        // beside the rules table, which a section in a StackLayout forbids.
+        // The connection trace has its own section; this card links to it.
         Frame {
             Layout.fillWidth: true
             padding: root.uiTheme.spacingMd - root.uiTheme.spacingXxs
@@ -1050,7 +1025,7 @@ ScrollView {
                 ThemedButton {
                     theme: root.uiTheme
                     text: root.tr("diag.conn-trace.open-window", "Open connection trace")
-                    onClicked: root.openChildWindow(root.connTraceWindow)
+                    onClicked: root.requestSectionChange("conn-trace")
                 }
             }
         }

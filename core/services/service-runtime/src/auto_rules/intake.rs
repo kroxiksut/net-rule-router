@@ -188,6 +188,12 @@ impl AutoRulesEngine {
             return false;
         }
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                program = %program,
+                sid = %sid,
+                "not offered: this principal has no active rules to compare against",
+            );
             return false;
         };
         if snapshot.behavior_mode.default_route_role() == RouteRole::Secondary
@@ -203,6 +209,11 @@ impl AutoRulesEngine {
         let now_ms = unix_ms(now);
         let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_APPLICATION, &program);
         if self.suppressed_ids(sid).contains(&id) {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                program = %program,
+                "not offered: the user has refused this one before",
+            );
             return false;
         }
         tracing::info!(
@@ -422,6 +433,12 @@ impl AutoRulesEngine {
     fn park_self_signed(&self, sid: &str, hostname: &str, signal: &str, now: SystemTime) -> bool {
         let host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
         if host.is_empty() || self.mode(sid) == AutoRulesMode::Off {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                mode = ?self.mode(sid),
+                "not offered: no name, or this principal collects nothing",
+            );
             return false;
         }
         // A host the main link carries has nothing to move. Checked BEFORE
@@ -429,9 +446,21 @@ impl AutoRulesEngine {
         // a site that works is the same false statement, made quietly.
         let behavior = self.main_link_behavior(&host);
         if behavior == PrimaryBehavior::Responds {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                signal = %signal,
+                "not offered: the main link carries this host, so there is nothing to move",
+            );
             return false;
         }
         let Some(snapshot) = self.rules.active_rules_for(sid) else {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                sid = %sid,
+                "not offered: this principal has no active rules to compare against",
+            );
             return false;
         };
         let exclusions = RuleBookExclusions {
@@ -450,6 +479,16 @@ impl AutoRulesEngine {
             || exclusions.is_platform_infrastructure(&host)
             || snapshot.behavior_mode.default_route_role() == RouteRole::Secondary
         {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                rule_host = exclusions.is_rule_host(&host),
+                covered = exclusions.is_matched_by_existing_rule(&host),
+                infrastructure = exclusions.is_platform_infrastructure(&host),
+                default_is_secondary =
+                    snapshot.behavior_mode.default_route_role() == RouteRole::Secondary,
+                "not offered: a rule already covers this host, or moving it would change nothing",
+            );
             return false;
         }
         // One site, one question. A provider that cuts two different names
@@ -459,6 +498,11 @@ impl AutoRulesEngine {
         let now_ms = unix_ms(now);
         let id = candidate_id(sid, AUTO_RULE_MATCH_KIND_SUFFIX, &host);
         if self.suppressed_ids(sid).contains(&id) {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                "not offered: the user has refused this one before",
+            );
             return false;
         }
         let candidate = PendingCandidate {

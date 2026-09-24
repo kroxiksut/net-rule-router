@@ -781,7 +781,6 @@ ApplicationWindow {
     // and the About-on-launch path opens nothing.
     property alias aboutWindow: aboutWindow
     property alias ruleDiagnosticsWindow: ruleDiagnosticsWindow
-    property alias connTraceWindow: connTraceWindow
     property alias cacheWindow: cacheWindow
     // Cache row count, shown both on the Diagnostics summary card and in the
     // cache window. One number with one writer per refresh, so the two
@@ -982,6 +981,7 @@ ApplicationWindow {
         if (id === "rule-suggestions") return tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
         if (id === "rule-virtual-machines") return tr("rules.vm.nav-label", "Virtual machines")
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
+        if (id === "conn-trace") return tr("diag.conn-trace.title", "Connection trace")
         if (id === "logs") return tr("section.logs", "Logs")
         if (id === "settings") return tr("section.settings", "Settings")
         return id
@@ -1373,9 +1373,6 @@ ApplicationWindow {
     property int diagCacheExpandRev: 0
     property var diagConnGroupExpanded: ({})
     property int diagConnGroupExpandRev: 0
-    /// Set by another section navigating INTO Diagnostics to open the
-    /// connection trace straight away; the section clears it once it has.
-    property bool diagOpenConnTrace: false
     property var suggestionsExpandedDomains: ({})
     property bool routingDohLockdownDetailsExpanded: false
     property bool routingKsDetailsExpanded: false
@@ -3763,7 +3760,6 @@ ApplicationWindow {
             { win: licenseWindow,            overlay: true,  titleBar: true },
             { win: aboutWindow,              overlay: true,  titleBar: true },
             { win: ruleDiagnosticsWindow,    overlay: true,  titleBar: true },
-            { win: connTraceWindow,         overlay: true,  titleBar: true },
             { win: cacheWindow,             overlay: true,  titleBar: true },
             { win: firstRunWindow,           overlay: true,  titleBar: true },
             { win: eulaAgreementWindow,      overlay: false, titleBar: true },
@@ -6252,6 +6248,18 @@ ApplicationWindow {
                     visible: StackLayout.isCurrentItem
                     sourceComponent: Component { DiagnosticsSection { root: window } }
                 }
+                // Stays resident once opened so the trace survives a trip to
+                // Rules; the section stops its own poll while hidden.
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    property bool keepLoaded: false
+                    active: StackLayout.isCurrentItem || keepLoaded
+                    onActiveChanged: if (active) keepLoaded = true
+                    asynchronous: window.sectionLoadsAsync
+                    visible: StackLayout.isCurrentItem
+                    sourceComponent: Component { ConnTraceSection { root: window } }
+                }
                 Loader {
                     Layout.fillWidth: true
                     Layout.fillHeight: true
@@ -7653,10 +7661,6 @@ ApplicationWindow {
     // Rule diagnostics: the explain probe, moved out of the Diagnostics
     // section so it can stay open beside the rules table.
     RuleDiagnosticsWindow { id: ruleDiagnosticsWindow; root: window }
-
-    // Live connection trace, in its own window for the same reason: it is read
-    // while rules are being edited.
-    ConnTraceWindow { id: connTraceWindow; root: window }
 
     // FQDN/IP cache viewer, same reasoning.
     CacheWindow { id: cacheWindow; root: window }

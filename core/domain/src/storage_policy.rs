@@ -33,7 +33,9 @@
 //!
 //! See [`StorageTopology`] for details. Short form:
 //!
-//! - **UI preferences**: `%APPDATA%\NetRuleRouter\managed\ui-preferences.conf`
+//! - **UI preferences**: `managed\ui-preferences.conf` under the per-user
+//!   configuration root — `%APPDATA%\NetRuleRouter` on Windows,
+//!   `$XDG_CONFIG_HOME/netrulerouter` (`~/.config/netrulerouter`) elsewhere
 //!   (key=value text, schema_version field, managed by `nrr-ui-support`).
 //! - **Rules files**: user-chosen paths; two files per configuration (primary
 //!   + secondary). Text format with version header and section markers.
@@ -105,8 +107,12 @@ pub struct CompatibilityPolicy;
 ///
 /// # UI preferences store
 ///
-/// - **Path**: `%APPDATA%\NetRuleRouter\managed\ui-preferences.conf`
-///   (falls back to `%LOCALAPPDATA%`, then `%TEMP%` on write failure).
+/// - **Path**: `managed\ui-preferences.conf` under the per-user configuration
+///   root the OS declares (`nrr_shared::user_paths`): `%APPDATA%\NetRuleRouter`
+///   on Windows, `$XDG_CONFIG_HOME/netrulerouter` elsewhere. Falls to the next
+///   candidate when one cannot be created, ending at the temp directory, which
+///   the store reports as non-persistent. A development build keeps its copy in
+///   the checkout (`.devdata/`).
 /// - **Format**: line-oriented `key=value` text with a `# comment` header and
 ///   a `schema_version=N` field on the first non-comment line.
 /// - **Owner**: `nrr-ui-support` crate (`UiPreferencesStore`).

@@ -28,9 +28,9 @@
 //!
 //! # Localization
 //!
-//! The layer does NOT translate message text into locale keys — it is the
-//! developer-facing tracing system.  User-visible event descriptions are
-//! derived from `reason_code` fields, not from `tracing` message strings.
+//! The layer never translates. A call site that carries `msg_key = "<id>"`
+//! gets `message_key = "diag.event.<id>"`, which the GUI translates with its
+//! fields as named placeholders; every other line keeps its English text.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -150,15 +150,31 @@ fn category_of_area(area: &str) -> EventCategory {
 /// call site to change.
 const OWNER_FIELD: &str = "sid";
 
+/// A call site's stable message id. It names the line's locale key and is not
+/// payload: the GUI translates by it, the English text stays the fallback.
+pub const MESSAGE_KEY_FIELD: &str = "msg_key";
+
+/// Prefix of the locale key a [`MESSAGE_KEY_FIELD`] resolves to.
+pub const EVENT_MESSAGE_KEY_PREFIX: &str = "diag.event.";
+
 /// Collects fields from a `tracing::Event` for inclusion in the log payload.
 struct EventFieldVisitor {
     fields: serde_json::Map<String, serde_json::Value>,
+    msg_key: Option<String>,
 }
 
 impl EventFieldVisitor {
     fn new() -> Self {
         Self {
             fields: serde_json::Map::new(),
+            msg_key: None,
+        }
+    }
+
+    fn message_key(&self, target: &str, kind: &str) -> String {
+        match self.msg_key.as_deref() {
+            Some(key) if !key.is_empty() => format!("{EVENT_MESSAGE_KEY_PREFIX}{key}"),
+            _ => format!("tracing.{target}.{kind}"),
         }
     }
 
@@ -183,6 +199,10 @@ impl EventFieldVisitor {
 
 impl Visit for EventFieldVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == MESSAGE_KEY_FIELD {
+            self.msg_key = Some(value.to_string());
+            return;
+        }
         self.fields.insert(
             field.name().to_string(),
             serde_json::Value::String(value.to_string()),
@@ -281,6 +301,14 @@ where
         let mut visitor = EventFieldVisitor::new();
         event.record(&mut visitor);
         let owner = visitor.owner();
+        // The target's leaf, never tracing's event name: that name is a source
+        // path, and the Logs section shows `kind` when nothing else resolves.
+        let kind = meta
+            .target()
+            .strip_prefix("nrr::")
+            .unwrap_or(meta.target())
+            .replace("::", ".");
+        let message_key = visitor.message_key(meta.target(), &kind);
         let mut payload = visitor.into_payload();
 
         // What this event actually discloses, read off the names of the fields
@@ -313,19 +341,6 @@ where
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-
-        // `kind` is the target's leaf (`nrr::conn-trace` → `conn-trace`), not
-        // tracing's event name. That name is the CALL SITE — `event
-        // core\services\…:1223` — and the Logs section falls back to `kind`
-        // when no locale key resolves, so the user was shown a source path
-        // where a message belongs. The leaf is also what the section's "kind"
-        // filter is useful against.
-        let kind = meta
-            .target()
-            .strip_prefix("nrr::")
-            .unwrap_or(meta.target())
-            .replace("::", ".");
-        let message_key = format!("tracing.{}.{kind}", meta.target());
 
         let log_event = LogEvent {
             schema_version: LOG_EVENT_SCHEMA_VERSION,
@@ -994,5 +1009,37 @@ mod tests {
         // The Logs section shows `kind` when no locale key resolves, which is
         // always the case for a tracing event.
         assert_eq!(kinds, ["conn-trace"]);
+    }
+
+    #[test]
+    fn a_msg_key_names_the_locale_key_and_stays_out_of_the_payload() {
+        use tracing_subscriber::prelude::*;
+
+        let dir = tempfile::tempdir().expect("temp");
+        let writer = Arc::new(LogWriter::open(LogWriterConfig::new(dir.path())));
+        let subscriber =
+            tracing_subscriber::registry().with(NdjsonTracingLayer::new(Arc::clone(&writer)));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "nrr::routing", msg_key = "policy-applied", applied = 3, "policy applied");
+            tracing::info!(target: "nrr::routing", "untagged");
+        });
+        drop(writer);
+
+        let lines: Vec<serde_json::Value> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .flat_map(|text| {
+                text.lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+
+        assert_eq!(lines[0]["message_key"], "diag.event.policy-applied");
+        assert!(lines[0]["payload"].get(MESSAGE_KEY_FIELD).is_none());
+        assert_eq!(lines[0]["payload"]["applied"], 3);
+        assert_eq!(lines[1]["message_key"], "tracing.nrr::routing.routing");
     }
 }

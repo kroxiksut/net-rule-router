@@ -90,18 +90,28 @@ impl LocalNamespaceFallbackResolver {
 }
 
 impl UpstreamResolver for LocalNamespaceFallbackResolver {
-    fn resolve(
+    fn resolve_within(
         &self,
         hostname: &str,
         _family: AddressFamily,
+        budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
-        let first = self.inner.resolve(hostname, AddressFamily::Ipv4);
+        let started = std::time::Instant::now();
+        let first = self
+            .inner
+            .resolve_within(hostname, AddressFamily::Ipv4, budget);
         // Only a clean non-existence is worth a second opinion. Everything else
         // either succeeded or is being retried below us.
         if !matches!(first, Err(ResolveError::NoRecords)) {
             return first;
         }
         for server in self.fallback_servers() {
+            // Whatever the upstream left. A private resolver asked after the
+            // client has already given up answers into nothing.
+            let left = budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                break;
+            }
             let direct = DirectUdpUpstreamResolver::new(
                 SocketAddr::from((server, 53)),
                 self.timeout,
@@ -109,7 +119,7 @@ impl UpstreamResolver for LocalNamespaceFallbackResolver {
                 // resolver that does not answer promptly has nothing to add.
                 1,
             );
-            if let Ok(resolved) = direct.resolve(hostname, AddressFamily::Ipv4) {
+            if let Ok(resolved) = direct.resolve_within(hostname, AddressFamily::Ipv4, left) {
                 if !resolved.addresses.is_empty() {
                     tracing::info!(
                         target: "nrr::dns-resolver",
@@ -153,10 +163,11 @@ mod tests {
 
     struct Fixed(Result<ResolvedAddresses, ResolveError>, Mutex<u32>);
     impl UpstreamResolver for Fixed {
-        fn resolve(
+        fn resolve_within(
             &self,
             _hostname: &str,
             _family: AddressFamily,
+            _budget: Duration,
         ) -> Result<ResolvedAddresses, ResolveError> {
             *self.1.lock().unwrap() += 1;
             self.0.clone()

@@ -706,6 +706,7 @@ fn log_entry(created_at: i64, event_id: &str) -> LogEntryDto {
         message: String::new(),
         has_payload: false,
         correlation_summary: Vec::new(),
+        args: Default::default(),
     }
 }
 
@@ -809,4 +810,50 @@ fn a_tracing_events_text_reaches_the_log_view() {
     let mut bare = event.clone();
     bare.payload = None;
     assert!(log_event_to_dto(&bare).message.is_empty());
+}
+
+#[test]
+fn a_tagged_events_key_and_scalar_fields_reach_the_log_view() {
+    use nrr_diagnostics::event::LogEvent;
+    use nrr_diagnostics::taxonomy::EventLevel;
+
+    let mut event = LogEvent::new(
+        "evt-2".to_string(),
+        1_745_000_000_000,
+        EventLevel::Info,
+        nrr_diagnostics::reason::service::STARTED,
+    );
+    event.message_key = "diag.event.policy-applied".to_string();
+    event.payload = Some(serde_json::json!({
+        "message": "policy applied",
+        "applied": 3,
+        "guarded": true,
+        "host": nrr_diagnostics::logs::privacy::REDACTED,
+        "principals": ["S-1-5-21-7"],
+    }));
+
+    let dto = log_event_to_dto(&event);
+    assert_eq!(dto.message_key, "diag.event.policy-applied");
+    assert_eq!(dto.args.get("applied").map(String::as_str), Some("3"));
+    assert_eq!(dto.args.get("guarded").map(String::as_str), Some("true"));
+    assert_eq!(
+        dto.args.get("host").map(String::as_str),
+        Some(nrr_diagnostics::logs::privacy::REDACTED),
+        "a redacted value stays redacted"
+    );
+    assert!(!dto.args.contains_key("message"));
+    assert!(
+        !dto.args.contains_key("principals"),
+        "only scalars are placeholders"
+    );
+
+    // An untagged event keeps the convention key and carries no args.
+    event.message_key = "tracing.nrr::service.service".to_string();
+    event.payload = None;
+    let dto = log_event_to_dto(&event);
+    assert_eq!(
+        dto.message_key,
+        format!("diag.{}.{}.summary", event.category.as_str(), event.kind)
+    );
+    assert!(dto.args.is_empty());
 }

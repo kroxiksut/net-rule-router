@@ -43,11 +43,15 @@ $settingsHive = "HKCU:\Software\$productName"
 
 # %APPDATA% is first in the UI-preferences candidate list, so it is where the
 # preferences file actually lands; the other two hold logs, caches and the
-# desktop surfaces' runtime coordination files.
+# desktop surfaces' runtime coordination files. A development build keeps its
+# own copy in the checkout instead.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$devDataRoot = Join-Path $repoRoot '.devdata'
 $userRoots = @(
     $(if ($env:APPDATA) { Join-Path $env:APPDATA $productName }),
     $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA $productName }),
-    $(if ($env:TEMP) { Join-Path $env:TEMP $productName })
+    $(if ($env:TEMP) { Join-Path $env:TEMP $productName }),
+    $(if (Test-Path $devDataRoot) { $devDataRoot })
 ) | Where-Object { $_ }
 
 $removed = New-Object System.Collections.Generic.List[string]

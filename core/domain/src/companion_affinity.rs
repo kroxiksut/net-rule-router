@@ -284,6 +284,15 @@ pub struct CompanionAffinityConfig {
     /// How far back an opening window reaches for already-seen companions
     /// (see [`DEFAULT_RETRO_WINDOW_MS`]). Zero disables the look-back.
     pub retro_window_ms: u64,
+    /// Whether the look-back claims only sightings that CARRIED TRAFFIC.
+    ///
+    /// A companion's connection often opens a moment before the page's own,
+    /// and so does a page prefetching links nobody clicked; the two are told
+    /// apart by whether anything followed the resolution. `true` wherever
+    /// connections are observed, so a prefetch cannot sign an offer; `false`
+    /// where nothing observes them, because a gate nothing can open is the
+    /// look-back removed.
+    pub lookback_requires_traffic: bool,
     /// Minimum affinity for a proposal (see [`DEFAULT_MIN_AFFINITY`]).
     pub min_affinity: f64,
     /// Minimum affinity for a brand-related proposal
@@ -326,6 +335,7 @@ impl Default for CompanionAffinityConfig {
             window_ms: DEFAULT_WINDOW_MS,
             max_window_ms: DEFAULT_MAX_WINDOW_MS,
             retro_window_ms: DEFAULT_RETRO_WINDOW_MS,
+            lookback_requires_traffic: false,
             min_affinity: DEFAULT_MIN_AFFINITY,
             brand_min_affinity: DEFAULT_BRAND_MIN_AFFINITY,
             min_distinct_windows: DEFAULT_MIN_DISTINCT_WINDOWS,

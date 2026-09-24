@@ -413,6 +413,17 @@ impl CompanionAffinityLedger {
             if self.candidates.contains_key(&hostname) {
                 continue;
             }
+            // Only a sighting that CARRIED TRAFFIC is replayed. The look-back
+            // exists because the browser often opens the companion's connection
+            // before the page's own, and a name resolved before the window with
+            // nothing following it is the other thing that looks like that: a
+            // page's prefetch of links nobody clicked. Counting those signed
+            // offers for hosts the user had never opened. A prefetched name the
+            // user does go to is seen again inside the window, through the
+            // ordinary path.
+            if self.config.lookback_requires_traffic && !in_use {
+                continue;
+            }
             self.observe_candidate(at_ms, &hostname, in_use, Sighting::ReplayedIntoWindow);
         }
     }

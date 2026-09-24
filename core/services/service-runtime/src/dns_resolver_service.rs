@@ -660,10 +660,11 @@ mod tests {
     }
     struct DeadUpstream;
     impl UpstreamResolver for DeadUpstream {
-        fn resolve(
+        fn resolve_within(
             &self,
             _hostname: &str,
             _family: AddressFamily,
+            _budget: Duration,
         ) -> Result<ResolvedAddresses, ResolveError> {
             Err(ResolveError::NoRecords)
         }

@@ -15,12 +15,22 @@ use std::path::PathBuf;
 /// macOS included, since it follows the FHS layout until its own port lands.
 /// Every product-named directory — production root, per-user dev and cache
 /// dirs — takes its leaf from here.
+///
+/// Declared one layer down, in `nrr-shared`, because the localization bundles
+/// live below this crate and name the same directory.
 pub fn product_dir_leaf() -> &'static str {
-    if cfg!(windows) {
-        nrr_shared::product_identity::PRODUCT_NAME
-    } else {
-        nrr_shared::product_identity::PRODUCT_NAME_UNIX
-    }
+    nrr_shared::user_paths::product_dir_leaf()
+}
+
+/// Root of the per-user configuration directory: `%APPDATA%\<product>` on
+/// Windows, `$XDG_CONFIG_HOME/<product>` (or `~/.config/<product>`) elsewhere.
+///
+/// This is the READ answer. A caller about to write walks
+/// [`nrr_shared::user_paths::user_app_roots`] instead, which offers the next
+/// candidate when one cannot be created and says which of them survive a
+/// reboot.
+pub fn user_config_root() -> Option<PathBuf> {
+    nrr_shared::user_paths::user_config_root()
 }
 
 /// Root of the production service's state directory: `%ProgramData%\<product>`

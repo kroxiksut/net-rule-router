@@ -952,6 +952,8 @@ pub fn write_qt_context_file_at(
                 "category": entry.category,
                 "kind": entry.kind,
                 "messageKey": entry.message_key,
+                "message": entry.message,
+                "args": entry.args,
                 "hasPayload": entry.has_payload,
                 "correlationSummary": entry.correlation_summary,
             })).collect::<Vec<_>>(),

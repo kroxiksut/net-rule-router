@@ -54,6 +54,7 @@ fn sample_input(request: DiagnosticArchiveRequest) -> ArchiveInput {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         }],
         audit_entries: vec![AuditEntryDto {
             event_id: "adt-001".into(),
@@ -231,6 +232,7 @@ fn logs_ndjson_drops_entries_before_logs_from_ms() {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         })
         .collect();
     ArchiveBuilder::build(input, &dest).expect("build");
@@ -269,6 +271,7 @@ fn logs_ndjson_respects_the_byte_budget() {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         })
         .collect();
     ArchiveBuilder::build(input, &dest).expect("build");

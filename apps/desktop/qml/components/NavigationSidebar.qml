@@ -19,9 +19,9 @@ Pane {
     // the submenu regardless of this flag.
     property bool rulesNavExpanded: false
 
-    // Same, for the Settings categories. They used to be a second rail inside
-    // the Settings section; one column of navigation is enough.
+    // Same, for the Settings categories and the Diagnostics pages.
     property bool settingsNavExpanded: false
+    property bool diagnosticsNavExpanded: false
 
     // Both submenus stay open until the user collapses them with the arrow.
     // Auto-collapsing on navigation meant opening one closed the other, and a
@@ -113,10 +113,14 @@ Pane {
                 spacing: 0
                 readonly property bool isRulesEntry: modelData === "rules"
                 readonly property bool isSettingsEntry: modelData === "settings"
+                readonly property bool isDiagnosticsEntry: modelData === "diagnostics"
                 readonly property bool hasSubmenu: navEntry.isRulesEntry || navEntry.isSettingsEntry
+                    || navEntry.isDiagnosticsEntry
                 readonly property bool submenuExpanded: navEntry.isRulesEntry
                     ? navigationSidebar.rulesNavExpanded
-                    : navigationSidebar.settingsNavExpanded
+                    : navEntry.isDiagnosticsEntry
+                        ? navigationSidebar.diagnosticsNavExpanded
+                        : navigationSidebar.settingsNavExpanded
 
                 RowLayout {
                     Layout.fillWidth: true
@@ -137,6 +141,7 @@ Pane {
                             root.requestSectionChange(modelData)
                             if (navEntry.isRulesEntry) navigationSidebar.rulesNavExpanded = true
                             if (navEntry.isSettingsEntry) navigationSidebar.settingsNavExpanded = true
+                            if (navEntry.isDiagnosticsEntry) navigationSidebar.diagnosticsNavExpanded = true
                         }
                         Accessible.name: root.sectionTitle(modelData)
                         ToolTip.visible: root.sidebarCollapsed && hovered
@@ -235,6 +240,8 @@ Pane {
                         onClicked: {
                             if (navEntry.isRulesEntry) {
                                 navigationSidebar.rulesNavExpanded = !navigationSidebar.rulesNavExpanded
+                            } else if (navEntry.isDiagnosticsEntry) {
+                                navigationSidebar.diagnosticsNavExpanded = !navigationSidebar.diagnosticsNavExpanded
                             } else {
                                 navigationSidebar.settingsNavExpanded = !navigationSidebar.settingsNavExpanded
                             }
@@ -311,6 +318,55 @@ Pane {
                                     elide: Text.ElideRight
                                     verticalAlignment: Text.AlignVCenter
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // Diagnostics submenu: the live connection trace.
+                ColumnLayout {
+                    visible: navEntry.isDiagnosticsEntry && navigationSidebar.diagnosticsNavExpanded
+                        && !root.sidebarCollapsed
+                    Layout.fillWidth: true
+                    Layout.fillHeight: false
+                    Layout.leftMargin: root.uiTheme.spacingMd + 20
+                    Layout.topMargin: root.uiTheme.spacingXxs
+                    spacing: root.uiTheme.spacingXxs
+
+                    Button {
+                        id: connTraceNavButton
+                        Layout.fillWidth: true
+                        activeFocusOnTab: true
+                        highlighted: root.section === "conn-trace"
+                        Accessible.name: root.sectionTitle("conn-trace")
+                        onClicked: root.requestSectionChange("conn-trace")
+                        background: PanelSurface {
+                            theme: root.uiTheme
+                            cornerRadius: root.uiTheme.radiusSm
+                            color: connTraceNavButton.highlighted ? root.accentColor
+                                : (connTraceNavButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
+                            border.color: connTraceNavButton.highlighted ? root.uiTheme.stateSelectedBorder
+                                : (connTraceNavButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
+                        }
+                        contentItem: RowLayout {
+                            spacing: root.uiTheme.spacingXs
+                            Image {
+                                source: connTraceNavButton.highlighted
+                                    ? root.uiIconSourceOnAccent("routing")
+                                    : root.uiIconSource("routing")
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: root.sectionTitle("conn-trace")
+                                color: connTraceNavButton.highlighted ? palette.highlightedText : root.textColor
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
                             }
                         }
                     }

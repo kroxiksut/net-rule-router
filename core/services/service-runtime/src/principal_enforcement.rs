@@ -413,6 +413,7 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
                 if routes.added > 0 || routes.removed > 0 {
                     tracing::info!(
                         target: "nrr::routes",
+                        msg_key = "system-routes-reconciled",
                         trigger,
                         added = routes.added,
                         removed = routes.removed,
@@ -447,8 +448,10 @@ pub fn log_outcome(outcome: &CycleOutcome, trigger: &'static str, authority: &'s
             if *changed {
                 tracing::info!(
                     target: "nrr::enforcement",
+                    msg_key = "policy-applied",
                     trigger,
                     principals = ?principals,
+                    principal_count = principals.len(),
                     applied = report.applied,
                     skipped = report.skipped,
                     guarded,

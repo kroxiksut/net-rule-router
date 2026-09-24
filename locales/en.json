@@ -2775,7 +2775,6 @@
       "why-this-route": "Why this route?",
       "auto-paused": "Paused — scroll to the top or clear the selection to resume",
       "gui-stream-off": "Showing the connection trace is switched off in Settings → Diagnostics and logs. Observation itself keeps running.",
-      "window-title": "Connection trace",
       "open-window": "Open connection trace",
       "card-summary": "Which interface each outgoing connection actually left through.",
       "only-ipv6": "IPv6 only",
@@ -2853,6 +2852,19 @@
         "diagnostics": "Full diagnostics",
         "caption": "Full diagnostics adds extra cache, storage and decision detail and is less redacted. Only share it with support."
       }
+    },
+    "event": {
+      "conn-observation-tick": "Connections observed: {total} (Main {primary}, Additional {secondary}, blocked {blocked_nrr})",
+      "dns-refresh-tick": "DNS refresh: {succeeded} of {attempted} names resolved",
+      "system-routes-reconciled": "System routes updated: {added} added, {removed} removed",
+      "policy-applied": "Policy applied: {applied} rules for {principal_count} users",
+      "route-table-unchanged": "Route table checked, no changes ({desired_routes} routes)",
+      "route-table-reconciled": "Route table updated: {added} added, {removed} removed, {desired_routes} in total",
+      "adapters-changed-recompute": "Network adapter state changed ({adapter_changes}), recomputing routes",
+      "ipc-request-failed": "Request {op} failed: {error_code}",
+      "direct-host-shares-secondary-ip": "{direct_host} shares address {shared_ip} with the Additional-route rule {secondary_rule_host}, so its traffic goes over the Additional connection. Narrow that rule or route the host separately.",
+      "push-subscription-opened": "An app subscribed to service notifications",
+      "push-subscription-closed": "An app unsubscribed from service notifications ({subscribers} still subscribed)"
     }
   },
   "logs": {

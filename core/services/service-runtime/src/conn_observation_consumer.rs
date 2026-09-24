@@ -431,6 +431,11 @@ pub struct ConnectionObservationConsumer {
     companion_primary_health: Option<CompanionPrimaryHealthFn>,
     /// Where each attempt is reported for the "did the user go there" measure.
     navigation_attempt: Option<NavigationAttemptFn>,
+    /// When wired, a host whose provider-placeholder answer was followed by a
+    /// connection to one of its addresses — see
+    /// [`crate::placeholder_waitlist`]. `None` keeps such an answer from ever
+    /// becoming an offer, which is the safe direction.
+    placeholder_confirmed: Option<PlaceholderConfirmedFn>,
     /// Fallback name source for the health path only — see
     /// `ConnectionObservationConsumerBuilder::with_health_name_fallback`.
     health_name_fallback: Option<NameForAddressFn>,
@@ -623,6 +628,9 @@ pub type AppMainLinkFn = Arc<dyn Fn(&str, std::net::IpAddr, bool, bool) + Send +
 /// when the connection happened. Purely observational — see
 /// [`crate::navigation_registry`].
 pub type NavigationAttemptFn = Arc<dyn Fn(Option<&str>, Option<&str>, u64) + Send + Sync>;
+
+/// Sink for a censored host somebody actually went to.
+pub type PlaceholderConfirmedFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Sink for one blocked-connection attempt worth reporting. The production
 /// impl hands it to `block_notice_center::BlockNoticeCenter::record`, which

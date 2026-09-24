@@ -125,6 +125,32 @@ impl ConnectionObservationConsumer {
         sink(process, hostname.as_deref(), at_ms);
     }
 
+    /// Somebody went to a censored host: this connection is to an address a
+    /// provider placeholder just handed out. Until now that answer alone was
+    /// enough to offer the host, which turned a page's prefetch into a
+    /// suggestion for a site nobody had opened.
+    ///
+    /// Called for every observation, established or not — see the caller.
+    pub(super) fn confirm_placeholder_use(&self, remote: IpAddr, at_ms: u64) {
+        let Some(sink) = self.placeholder_confirmed.as_ref() else {
+            return;
+        };
+        let IpAddr::V4(ip) = remote else {
+            return;
+        };
+        if let Some(host) =
+            crate::placeholder_waitlist::global_placeholder_waitlist().confirm(ip, at_ms)
+        {
+            tracing::debug!(
+                target: "nrr::auto-rules",
+                host = %host,
+                address = %ip,
+                "a censored host was actually connected to - its offer may be parked now",
+            );
+            sink(&host);
+        }
+    }
+
     /// One connection that left over the primary link: if we can name its
     /// destination, that name is a companion the user's traffic reached the
     /// wrong way.

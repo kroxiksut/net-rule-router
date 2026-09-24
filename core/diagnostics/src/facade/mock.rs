@@ -249,6 +249,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         },
         LogEntryDto {
             event_id: "evt-preview-002".into(),
@@ -260,6 +261,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             message: String::new(),
             has_payload: false,
             correlation_summary: vec!["rev-preview-001".into()],
+            args: Default::default(),
         },
     ];
     if scenario == MockScenario::FailClosedBlock {
@@ -273,6 +275,7 @@ fn mock_log_entries(scenario: MockScenario) -> Vec<LogEntryDto> {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: Default::default(),
         });
     }
     entries

@@ -3,6 +3,8 @@
 //! The position functions are the load-bearing part: a page cursor is a
 //! position, not an index, so a record arriving mid-scroll cannot shift a page.
 
+use std::collections::BTreeMap;
+
 use super::*;
 
 // ── Filter mapping ───────────────────────────────────────────────────────────
@@ -52,13 +54,16 @@ pub(super) fn audit_filter_to_query(filter: &AuditEntryFilter) -> AuditQueryFilt
 // ── DTO mapping ──────────────────────────────────────────────────────────────
 
 pub(super) fn log_event_to_dto(event: &LogEvent) -> LogEntryDto {
-    // The localised message key follows the `diag.<category>.<kind>.summary`
-    // convention from `nrr_diagnostics::reason::ReasonCodeMeta::ui_key`.
-    // We compute it inline rather than looking up the meta table so
-    // the projection is total even for kinds without an explicit meta
-    // entry (the GUI's `tr(...)` falls back gracefully on missing
-    // keys).
-    let message_key = format!("diag.{}.{}.summary", event.category.as_str(), event.kind);
+    // A call site's own `diag.event.*` key is the only one a locale can hold;
+    // anything else falls back to the category/kind convention.
+    let message_key = if event
+        .message_key
+        .starts_with(nrr_diagnostics::logs::EVENT_MESSAGE_KEY_PREFIX)
+    {
+        event.message_key.clone()
+    } else {
+        format!("diag.{}.{}.summary", event.category.as_str(), event.kind)
+    };
     let mut correlation_summary = Vec::new();
     if let Some(id) = event.correlation.decision_id.as_deref() {
         correlation_summary.push(format!("decision:{id}"));
@@ -66,6 +71,9 @@ pub(super) fn log_event_to_dto(event: &LogEvent) -> LogEntryDto {
     if let Some(id) = event.correlation.revision_id.as_deref() {
         correlation_summary.push(format!("revision:{id}"));
     }
+    // The writer already redacted the payload down to the active mode's
+    // ceiling, so whatever is left here is safe to show as written.
+    let payload = event.payload.as_ref().and_then(|p| p.as_object());
     LogEntryDto {
         event_id: event.event_id.clone(),
         created_at: event.created_at,
@@ -73,22 +81,35 @@ pub(super) fn log_event_to_dto(event: &LogEvent) -> LogEntryDto {
         category: event.category.as_str().to_string(),
         kind: event.kind.clone(),
         message_key,
-        // The writer already redacted the payload down to the active mode's
-        // ceiling, so whatever is left here is safe to show as written.
-        message: event
-            .payload
-            .as_ref()
+        message: payload
             .and_then(|payload| payload.get("message"))
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string(),
-        // Payload-detail surfacing requires diagnostic
-        // mode plus a structured payload column on `LogEvent` that
-        // doesn't exist on the wire today. Leave `false` until that
-        // schema bump lands.
+        // Payload detail needs a structured payload column on the wire, which
+        // does not exist yet.
         has_payload: false,
         correlation_summary,
+        args: payload.map(scalar_args).unwrap_or_default(),
     }
+}
+
+/// The payload's scalar fields as placeholder values. Nested values and the
+/// message text itself are not placeholders.
+fn scalar_args(payload: &serde_json::Map<String, serde_json::Value>) -> BTreeMap<String, String> {
+    payload
+        .iter()
+        .filter(|(name, _)| name.as_str() != "message")
+        .filter_map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            Some((name.clone(), text))
+        })
+        .collect()
 }
 
 /// Whether a principal-scoped reader may see `event`.

@@ -88,10 +88,15 @@ impl PortUpstreamResolver {
 }
 
 impl UpstreamResolver for PortUpstreamResolver {
-    fn resolve(
+    // The budget is not ours to divide: the port behind this is already wrapped
+    // in `BudgetedDnsResolver`, which caps one call and hands the caller back a
+    // `Timeout`. Narrowing it further would mean a second timer over a call we
+    // cannot cancel.
+    fn resolve_within(
         &self,
         hostname: &str,
         _family: AddressFamily,
+        _budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         match self.resolver.resolve(hostname, AddressFamily::Ipv4) {
             Ok(ResolvedRecord {
@@ -327,8 +332,10 @@ impl DirectUdpUpstreamResolver {
         Ok(sock)
     }
 
-    /// One send + receive window. Loops on non-matching datagrams (late replies
-    /// of a previous query, off-path noise) until the window elapses.
+    /// One send + receive window, `window` long. Loops on non-matching
+    /// datagrams (late replies of a previous query, off-path noise) until it
+    /// elapses. The caller narrows the window when a shared budget leaves less
+    /// than the configured per-attempt timeout.
     fn attempt(
         &self,
         query: &[u8],
@@ -336,6 +343,7 @@ impl DirectUdpUpstreamResolver {
         hostname: &str,
         qtype: u16,
         egress: &crate::dns_egress::DnsEgress,
+        window: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         use crate::dns_wire::{parse_address_response, AddressResponseOutcome};
         let sock = Self::open_socket(egress)?;
@@ -344,7 +352,7 @@ impl DirectUdpUpstreamResolver {
         let started = std::time::Instant::now();
         let mut buf = [0u8; 2048];
         loop {
-            let remaining = self.timeout.saturating_sub(started.elapsed());
+            let remaining = window.saturating_sub(started.elapsed());
             if remaining.is_zero() {
                 return Err(ResolveError::Unavailable("timeout".into()));
             }
@@ -480,10 +488,11 @@ impl DirectUdpUpstreamResolver {
 }
 
 impl UpstreamResolver for DirectUdpUpstreamResolver {
-    fn resolve(
+    fn resolve_within(
         &self,
         hostname: &str,
         family: AddressFamily,
+        budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
         use crate::dns_wire::{build_address_query, QTYPE_A, QTYPE_AAAA};
         let qtype = match family {
@@ -497,9 +506,16 @@ impl UpstreamResolver for DirectUdpUpstreamResolver {
             return Err(ResolveError::NoRecords);
         };
         let mut last = ResolveError::Unavailable("no attempts".into());
+        let started = std::time::Instant::now();
         for attempt in 0..self.attempts {
+            // The retry exists to survive one lost datagram, not to spend a
+            // budget the caller has already promised to its own client.
+            let window = budget.saturating_sub(started.elapsed()).min(self.timeout);
+            if window.is_zero() {
+                return Err(ResolveError::Unavailable("budget exhausted".into()));
+            }
             let egress = self.egress_for(attempt);
-            match self.attempt(&query, id, hostname, qtype, &egress) {
+            match self.attempt(&query, id, hostname, qtype, &egress, window) {
                 Ok(resolved) => {
                     tracing::debug!(
                         target: "nrr::dns-resolver",
@@ -759,12 +775,16 @@ fn same_address_set(a: &[IpAddr], b: &[IpAddr]) -> bool {
 }
 
 impl UpstreamResolver for PoisonFallbackUpstreamResolver {
-    fn resolve(
+    fn resolve_within(
         &self,
         hostname: &str,
         _family: AddressFamily,
+        budget: Duration,
     ) -> Result<ResolvedAddresses, ResolveError> {
-        let primary = self.inner.resolve(hostname, AddressFamily::Ipv4);
+        let call_started = std::time::Instant::now();
+        let primary = self
+            .inner
+            .resolve_within(hostname, AddressFamily::Ipv4, budget);
         let suspicion = match &primary {
             Ok(resolved) => self.suspicion(hostname, resolved),
             Err(ResolveError::NoRecords) => Some(Suspicion::NoUsableAddress),
@@ -785,16 +805,23 @@ impl UpstreamResolver for PoisonFallbackUpstreamResolver {
             );
         }
         let started = std::time::Instant::now();
+        // The confirmation round gets what the primary resolve left, capped at
+        // its own budget: a doubt worth a second opinion is not worth the
+        // client's whole wait.
+        let confirm_budget = budget
+            .saturating_sub(call_started.elapsed())
+            .min(Self::CONFIRM_BUDGET);
         // Did anyone answer at all, and did they see what we saw? A second
         // source that replies "this name has no address" has CONFIRMED the
         // doubt, not failed to resolve it — and most rule hosts are zone
         // suffixes whose apex legitimately carries no A record.
         let mut second_source_saw_nothing_either = false;
         for fallback in &self.fallbacks {
-            if started.elapsed() >= Self::CONFIRM_BUDGET {
+            let left = confirm_budget.saturating_sub(started.elapsed());
+            if left.is_zero() {
                 break;
             }
-            let Ok(candidate) = fallback.resolve(hostname, AddressFamily::Ipv4) else {
+            let Ok(candidate) = fallback.resolve_within(hostname, AddressFamily::Ipv4, left) else {
                 continue;
             };
             second_source_saw_nothing_either |= carries_nothing_to_pin(&candidate);

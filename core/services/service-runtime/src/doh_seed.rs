@@ -8,11 +8,59 @@
 //! with the comment `"<provider> (<country>)"`. Malformed rows are skipped — the
 //! seed is best-effort and must never block service start.
 
-use nrr_storage::doh_lockdown::{DohResolverEntry, DohTarget};
+use std::sync::Mutex;
+
+use nrr_storage::doh_lockdown::{DohResolverEntriesRepository, DohResolverEntry, DohTarget};
+use rusqlite::Connection;
 
 /// The checked-in seed, embedded at build time (single source of truth with the
 /// research-collected list). Path is relative to this source file.
 const SEED_JSON: &str = include_str!("../../../../configs/doh-dot-resolvers.seed.json");
+
+/// Pre-fill the shared resolver baseline on first run. A no-op once the list
+/// has entries, so user edits survive; best-effort, because a failed seed must
+/// not stop the service.
+pub fn seed_shared_baseline(conn: &Mutex<Connection>) {
+    let Ok(guard) = conn.lock() else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    match DohResolverEntriesRepository::new(&guard).seed_if_empty(&builtin_seed(), now) {
+        Ok(n) if n > 0 => tracing::info!(
+            target: "nrr::doh",
+            seeded = n,
+            "seeded the DoH/DoT resolver baseline on first run",
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            target: "nrr::doh",
+            error = %e,
+            "DoH resolver seed failed (non-fatal)",
+        ),
+    }
+}
+
+/// The enabled HOST entries of the baseline. The lockdown blocks by address and
+/// reads host entries through the FQDN cache, so a platform whose DNS observer
+/// never sees these names must resolve them itself.
+pub fn enabled_resolver_hosts(conn: &Mutex<Connection>) -> Vec<String> {
+    let Ok(guard) = conn.lock() else {
+        return Vec::new();
+    };
+    DohResolverEntriesRepository::new(&guard)
+        .load_all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.enabled)
+        .filter_map(|e| match e.target {
+            DohTarget::Host(host) => Some(host),
+            DohTarget::Ip(_) => None,
+        })
+        .collect()
+}
 
 /// Parse the embedded seed into resolver entries (all enabled). De-duplicates by
 /// `(kind, value)` so a shared IP across providers yields one entry. Returns an
@@ -93,14 +141,34 @@ mod tests {
 
     #[test]
     fn parse_seed_dedupes_shared_ips() {
-        // Cloudflare 1.1.1.1 appears in several rows (base + Mozilla TRR); the
-        // (kind, value) dedup must collapse it to one entry.
-        let seed = builtin_seed();
+        let seed = parse_seed(
+            r#"{"resolvers": [
+                {"provider": "A", "ipv4": "192.0.2.1,192.0.2.2"},
+                {"provider": "B", "ipv4": "192.0.2.1", "hostname": "dns.example"}
+            ]}"#,
+        );
         let count = seed
             .iter()
-            .filter(|e| e.target == DohTarget::Ip(Ipv4Addr::new(1, 1, 1, 1)))
+            .filter(|e| e.target == DohTarget::Ip(Ipv4Addr::new(192, 0, 2, 1)))
             .count();
         assert_eq!(count, 1, "shared IP must be deduped");
+        assert_eq!(seed.len(), 3);
+    }
+
+    /// Firefox's default resolver is not on 1.1.1.1; blocking only that pair
+    /// leaves the browser on DoH.
+    #[test]
+    fn builtin_seed_blocks_firefox_default_resolver_by_address() {
+        let seed = builtin_seed();
+        for ip in [
+            Ipv4Addr::new(172, 64, 41, 4),
+            Ipv4Addr::new(162, 159, 61, 4),
+        ] {
+            assert!(
+                seed.iter().any(|e| e.target == DohTarget::Ip(ip)),
+                "{ip} missing"
+            );
+        }
     }
 
     #[test]

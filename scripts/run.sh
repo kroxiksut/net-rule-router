@@ -16,6 +16,8 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
+# shellcheck source=lib/desktop-paths.sh
+. "$script_dir/lib/desktop-paths.sh"
 
 component=""
 # Same name/values/default as run.ps1's -Profile: default stays 'dev' so
@@ -129,24 +131,12 @@ if [ "$component" = "gui" ] || [ "$component" = "tray" ]; then
     exit 1
   fi
 
-  # Run from a copy carrying the Unix spelling of the name (the one
-  # `product_identity::BinaryRole::unix_file_name` declares; Cargo cannot name a
-  # `[[bin]]` per OS). The service recognises its own surfaces by the peer's
-  # executable name, and a GUI started as `NetRuleRouter` is a program it cannot
-  # name: it gets the most restricted profile and every read comes back
-  # "admin-console clients may not ...". A copy, not a symlink — `/proc/<pid>/exe`
-  # resolves links and would report the original name again.
-  #
-  # Both copies are made whichever component was asked for: the GUI starts the
-  # tray itself, and a tray started under the Cargo name is refused the same way.
+  # Run from the Unix-named copy: a GUI started as `NetRuleRouter` is a program
+  # the service cannot name, and every read comes back "admin-console clients
+  # may not ...". Both copies, whichever component was asked for: the GUI
+  # starts the tray itself.
   profile_dir="$(dirname "$bin_path")"
-  for pair in "NetRuleRouter:netrulerouter" "NetRuleRouterTray:netrulerouter-tray"; do
-    cargo_name="${pair%%:*}"
-    canonical_name="${pair##*:}"
-    if [ -x "$profile_dir/$cargo_name" ]; then
-      cp -f "$profile_dir/$cargo_name" "$profile_dir/$canonical_name"
-    fi
-  done
+  nrr_sync_unix_binaries "$profile_dir"
 
   unix_path="$profile_dir/$unix_name"
   cyan "[run] $unix_path"

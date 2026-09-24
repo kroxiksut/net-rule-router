@@ -389,6 +389,7 @@ pub(super) fn build_conn_trace_pair(
     if let Some(engine) = vpn_learning.auto_rules_engine {
         let recent = nrr_service_runtime::recent_rule_addresses::global_recent_rule_addresses();
         let engine_health = Arc::clone(engine);
+        let engine_placeholder = Arc::clone(engine);
         let engine_app = Arc::clone(engine);
         let engine = Arc::clone(engine);
         let sid_for_companion = Arc::clone(active_sid);
@@ -476,6 +477,23 @@ pub(super) fn build_conn_trace_pair(
                     }
                 },
             ));
+        }
+        // A censored host somebody actually went to. The placeholder answer
+        // alone says only that the provider cuts the name — for everyone, ad
+        // exchange and opened site alike; the connection says who went.
+        {
+            let sid_for_placeholder = Arc::clone(active_sid);
+            consumer_builder =
+                consumer_builder.with_placeholder_confirmed(Arc::new(move |hostname: &str| {
+                    let Some(sid) = sid_for_placeholder() else {
+                        return;
+                    };
+                    engine_placeholder.note_placeholder_answer_host(
+                        &sid,
+                        hostname,
+                        std::time::SystemTime::now(),
+                    );
+                }));
         }
         // Did the user go to this host, or did a page take them there? The
         // counts gate the main-link offer above; the distribution is logged so

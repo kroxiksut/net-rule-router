@@ -4,7 +4,7 @@
   "resolvers": [
     {"provider": "Google Public DNS", "country": "global", "ipv4": "8.8.8.8,8.8.4.4", "hostname": "dns.google", "comment": "Largest public resolver; native DoH/DoT on same anycast IPs"},
     {"provider": "Cloudflare", "country": "global", "ipv4": "1.1.1.1,1.0.0.1", "hostname": "cloudflare-dns.com,one.one.one.one", "comment": "1.1.1.1 also serves an HTTPS debug page (1.1.1.1/help) on the same IP"},
-    {"provider": "Cloudflare (Mozilla/Firefox TRR)", "country": "global", "ipv4": "1.1.1.1,1.0.0.1", "hostname": "mozilla.cloudflare-dns.com", "comment": "Firefox's default built-in DoH provider; same Cloudflare anycast IPs"},
+    {"provider": "Cloudflare (Mozilla/Firefox TRR)", "country": "global", "ipv4": "172.64.41.4,162.159.61.4", "hostname": "mozilla.cloudflare-dns.com", "comment": "Firefox's default built-in DoH provider; its own anycast pair, not 1.1.1.1"},
     {"provider": "Cloudflare Family", "country": "global", "ipv4": "1.1.1.3,1.0.0.3", "hostname": "family.cloudflare-dns.com", "comment": "Malware + adult content filtering variant"},
     {"provider": "Cloudflare Security", "country": "global", "ipv4": "1.1.1.2,1.0.0.2", "hostname": "security.cloudflare-dns.com", "comment": "Malware-only filtering variant"},
     {"provider": "Quad9 Secure", "country": "global", "ipv4": "9.9.9.9,149.112.112.112", "hostname": "dns.quad9.net", "comment": "9.9.9.9 also serves an informational HTTPS webpage on the same IP"},

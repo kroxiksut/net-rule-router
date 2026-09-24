@@ -6,9 +6,8 @@ This guide is for those who want to build NetRuleRouter themselves. If you
 just want to use the app — download the ready archive from the releases
 page and follow the [quick start](quickstart.md).
 
-This page is about building for **Windows 10/11 (64-bit)**. The Linux
-guide will be a separate document (`building-linux.md`) once Linux builds
-are supported; macOS is later in the plan.
+This page is about building for **Windows 10/11 (64-bit)**. Linux has its
+own guide ([building-linux.md](building-linux.md)); macOS is later in the plan.
 
 ## What to install
 

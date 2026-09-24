@@ -112,26 +112,17 @@ pub(super) fn resolve_user_locales_dir() -> Option<PathBuf> {
 }
 
 pub(super) fn resolve_managed_locales_dir() -> Option<PathBuf> {
-    let mut candidates = Vec::<PathBuf>::new();
-    if let Some(app_data) = env::var_os("APPDATA") {
-        candidates.push(PathBuf::from(app_data));
-    }
-    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(local_app_data));
-    }
-    candidates.push(env::temp_dir());
-
-    for base in candidates {
-        let candidate = base
-            .join(MANAGED_ROOT_FOLDER)
-            .join(MANAGED_SUBFOLDER)
-            .join(USER_LOCALES_SUBFOLDER);
-        if fs::create_dir_all(&candidate).is_ok() {
-            return Some(candidate);
-        }
-    }
-
-    None
+    // Same roots the preference store walks — the override directory a user is
+    // told to drop a locale into must be the one beside their settings, not a
+    // second location that happens to be writable.
+    crate::user_paths::user_app_roots()
+        .into_iter()
+        .map(|root| {
+            root.path
+                .join(MANAGED_SUBFOLDER)
+                .join(USER_LOCALES_SUBFOLDER)
+        })
+        .find(|candidate| fs::create_dir_all(candidate).is_ok())
 }
 
 pub(super) fn canonical_eq(left: &Path, right: &Path) -> bool {

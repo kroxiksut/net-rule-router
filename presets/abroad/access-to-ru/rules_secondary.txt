@@ -54,3 +54,5 @@ vkteams.exe
 # avp.exe    # Kaspersky
 # kavfs.exe    # Kaspersky
 # mail.ru_cloud*.exe    # Облако Mail.ru
+
+--- Linux

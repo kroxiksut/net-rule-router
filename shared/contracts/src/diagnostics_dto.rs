@@ -16,6 +16,8 @@
 //! access to service-owned files. All sensitive fields are pre-redacted
 //! by the service before being placed into a DTO.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::ipc_payloads::SnapshotInterfacesResponse;
@@ -303,6 +305,10 @@ pub struct LogEntryDto {
     pub has_payload: bool,
     /// Brief correlation summary (decision id, revision id).
     pub correlation_summary: Vec<String>,
+    /// The event's scalar fields as stored (already redacted), for the named
+    /// `{field}` placeholders of a `diag.event.*` translation.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, String>,
 }
 
 // ── AuditEntryDto ─────────────────────────────────────────────────────────────
@@ -549,6 +555,7 @@ mod tests {
             message: String::new(),
             has_payload: false,
             correlation_summary: Vec::new(),
+            args: BTreeMap::new(),
         };
         let json = serde_json::to_string(&dto).expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");

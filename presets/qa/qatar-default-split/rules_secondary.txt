@@ -68,7 +68,24 @@ goland64.exe
 fleet.exe
 
 --- Linux
-# (reserved - not applied on Windows)
+clion
+codex
+codex*
+cursor
+discord
+goland
+idea
+jetbrains-toolbox
+pycharm
+rider
+signal-desktop
+slack
+telegram
+telegram-desktop
+viber
+webstorm
+windsurf
+zoom
 
 --- MacOS
 # (reserved - not applied on Windows)

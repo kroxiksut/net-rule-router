@@ -323,11 +323,25 @@ pub struct ResolvedAddresses {
 /// the one the client asked about, so it never pays for a round trip it would
 /// throw away.
 pub trait UpstreamResolver: Send + Sync {
+    /// `budget` is the deadline for the WHOLE call, stages included. The answer
+    /// path shares one budget across resolve and reconcile, so an implementation
+    /// that waits on the network divides it rather than adding its own timeouts
+    /// on top; one that cannot wait ignores it.
+    fn resolve_within(
+        &self,
+        hostname: &str,
+        family: AddressFamily,
+        budget: Duration,
+    ) -> Result<ResolvedAddresses, ResolveError>;
+
+    /// For callers with no deadline to share — seeders, refresh ticks, tests.
     fn resolve(
         &self,
         hostname: &str,
-        _family: AddressFamily,
-    ) -> Result<ResolvedAddresses, ResolveError>;
+        family: AddressFamily,
+    ) -> Result<ResolvedAddresses, ResolveError> {
+        self.resolve_within(hostname, family, Duration::MAX)
+    }
 }
 
 /// Record a freshly-resolved `hostname → IPs` fact into the FQDN cache (union
@@ -623,12 +637,18 @@ fn describe_resolve_failure(err: &ResolveError) -> String {
     }
 }
 
-/// How long a rule-host answer may be held for the enforcement reconcile, and
+/// What one rule-host answer may spend: a budget for the whole branch, an
+/// upper bound on the part of it the enforcement reconcile may take, and
 /// whether the fast-answers path may skip the hold entirely when every
 /// answered address is already enforced.
 #[derive(Clone, Copy, Debug)]
 pub struct AnswerHold {
-    /// Upper bound on the synchronous reconcile wait.
+    /// Everything this branch may cost, resolve and reconcile together. The
+    /// stages divide it; the client's stub resolver re-asks after about a
+    /// second, so a stage that outlives the budget answers into nothing.
+    pub budget: Duration,
+    /// Upper bound on the synchronous reconcile wait, narrowed to what the
+    /// budget has left when the resolve took most of it.
     pub deadline: Duration,
     /// When `true`, an answer whose addresses are all enforced is returned
     /// immediately (reconcile requested, not awaited).
