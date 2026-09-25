@@ -2,15 +2,16 @@
 //!
 //! A `SuffixDomain` rule covers the apex itself and every subdomain of it
 //! (see `nrr_domain::decision_rules_matching`), so an `ExactFqdn` rule under
-//! the same apex is usually a leftover the user forgot about. It is not always
-//! redundant, though: the engine evaluates `ExactFqdn` first, so an exact rule
-//! in the OTHER route set — or with a different action — is the user
-//! deliberately carving one host out of a wildcard.
+//! the same apex on the same route is usually a leftover the user forgot
+//! about. It is not always redundant, though: one with a different action or
+//! an app filter is a deliberate exception.
 //!
 //! [`find_overlaps`] reports both, split by [`OverlapPair::redundant`]: the
 //! cleanup UI offers the redundant ones for removal and leaves the deliberate
 //! ones alone. The decision lives here rather than in QML so the rule that
 //! decides "safe to delete" is one testable function, shared by every surface.
+//! Pairs across the two routes are [`find_route_overlaps`]'s: the Overlaps
+//! screen owns them.
 //!
 //! The risk-scoring counterpart in `nrr_domain::review` answers a different
 //! question — "does THIS change create an overlap" — and is scoped to a diff.
@@ -18,6 +19,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::rules_json::{AddressMatchDto, CanonicalRulesJsonV1, RuleAction, RuleDto};
+
+mod across_routes;
+
+pub use across_routes::{find_route_overlaps, OverlapRule, RouteOverlap, RouteOverlapKind};
 
 /// One exact rule covered by a suffix rule.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,12 +45,8 @@ pub struct OverlapPair {
     pub redundant: bool,
 }
 
-/// Every exact rule covered by a suffix rule, in a deterministic order
-/// (by apex, then by covered host).
-///
-/// Both routes are scanned as one set: a wildcard in one route covering an
-/// exact rule in the other is exactly the case the user must SEE, because it
-/// is the one that changes where traffic goes.
+/// Every exact rule covered by a suffix rule of the same route, in a
+/// deterministic order (by apex, then by covered host).
 pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
     let suffixes: Vec<(&RuleDto, &str, &str)> = collect(dto, |m| match m {
         AddressMatchDto::SuffixDomain { suffix } => Some(suffix.as_str()),
@@ -60,7 +61,7 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
     for (apex_rule, apex_route, apex) in &suffixes {
         let dotted = format!(".{apex}");
         for (covered_rule, covered_route, host) in &exacts {
-            if host != apex && !host.ends_with(&dotted) {
+            if apex_route != covered_route || (host != apex && !host.ends_with(&dotted)) {
                 continue;
             }
             // An app filter narrows a rule to one process, so the two never
@@ -74,7 +75,6 @@ pub fn find_overlaps(dto: &CanonicalRulesJsonV1) -> Vec<OverlapPair> {
                 covered_route: (*covered_route).to_string(),
                 covered_rule_id: covered_rule.id.clone(),
                 redundant: same_app
-                    && apex_route == covered_route
                     && action_of(apex_rule) == action_of(covered_rule)
                     && apex_rule.enabled
                     && covered_rule.enabled,
@@ -186,16 +186,13 @@ mod tests {
     }
 
     #[test]
-    fn an_exact_rule_in_the_other_route_is_a_deliberate_carve_out() {
+    fn a_pair_across_the_routes_belongs_to_the_overlaps_screen() {
         let dto = book(
             vec![exact("r-2", "api.example.com")],
             vec![suffix("r-1", "example.com")],
         );
-        let found = find_overlaps(&dto);
-        assert_eq!(found.len(), 1);
-        assert!(!found[0].redundant, "a cross-route pair changes routing");
-        assert_eq!(found[0].apex_route, "secondary");
-        assert_eq!(found[0].covered_route, "primary");
+        assert!(find_overlaps(&dto).is_empty());
+        assert_eq!(find_route_overlaps(&dto, false).len(), 1);
     }
 
     #[test]

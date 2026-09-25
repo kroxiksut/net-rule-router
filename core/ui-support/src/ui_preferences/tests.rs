@@ -407,6 +407,8 @@ fn save_then_load_roundtrip_is_stable() {
         // Non-empty so the round-trip proves a kept overlap pair survives
         // a GUI restart.
         rules_overlap_keep_signature: "secondary:example.com>primary:api.example.com".to_string(),
+        route_overlaps_confirmed_signature:
+            "secondary:exact-fqdn:www.site.example>primary:zone:example".to_string(),
         // Non-empty path (with spaces + backslashes) so the round-trip
         // proves the confirmed VPN executable persists.
         confirmed_vpn_exe_path: "C:\\Program Files\\Example VPN\\vpn.exe".to_string(),

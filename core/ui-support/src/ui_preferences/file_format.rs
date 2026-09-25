@@ -286,6 +286,13 @@ pub(super) fn parse_preferences(content: &str) -> UiPreferences {
                     std::mem::take(&mut preferences.rules_overlap_keep_signature),
                 );
             }
+            "route_overlaps_confirmed_signature" => {
+                preferences.route_overlaps_confirmed_signature = storable_line_or(
+                    key,
+                    value.to_string(),
+                    std::mem::take(&mut preferences.route_overlaps_confirmed_signature),
+                );
+            }
             // Confirmed VPN executable path. Free-form single-line value;
             // empty is the valid "not set" state, so no non-empty gate.
             "confirmed_vpn_exe_path" => {
@@ -723,6 +730,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
             "service_intent_json={}\n",
             "unenforced_apps_ack_signature={}\n",
             "rules_overlap_keep_signature={}\n",
+            "route_overlaps_confirmed_signature={}\n",
             "confirmed_vpn_exe_path={}\n",
             "confirmed_vpn_exe_paths={}\n",
             "last_loaded_path_primary={}\n",
@@ -818,6 +826,7 @@ pub(super) fn format_preferences(preferences: &UiPreferences) -> String {
         one_line(&preferences.service_intent_json),
         one_line(&preferences.unenforced_apps_ack_signature),
         one_line(&preferences.rules_overlap_keep_signature),
+        one_line(&preferences.route_overlaps_confirmed_signature),
         one_line(&preferences.confirmed_vpn_exe_path),
         one_line(&preferences.confirmed_vpn_exe_paths),
         optional_string_field(&preferences.last_loaded_path_primary),

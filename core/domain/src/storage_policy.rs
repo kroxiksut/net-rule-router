@@ -111,8 +111,7 @@ pub struct CompatibilityPolicy;
 ///   root the OS declares (`nrr_shared::user_paths`): `%APPDATA%\NetRuleRouter`
 ///   on Windows, `$XDG_CONFIG_HOME/netrulerouter` elsewhere. Falls to the next
 ///   candidate when one cannot be created, ending at the temp directory, which
-///   the store reports as non-persistent. A development build keeps its copy in
-///   the checkout (`.devdata/`).
+///   the store reports as non-persistent. Debug and release builds share it.
 /// - **Format**: line-oriented `key=value` text with a `# comment` header and
 ///   a `schema_version=N` field on the first non-comment line.
 /// - **Owner**: `nrr-ui-support` crate (`UiPreferencesStore`).

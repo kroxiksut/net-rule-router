@@ -89,10 +89,17 @@ impl ConnectionObservationConsumer {
             // NDJSON line, an app→IP fact or a drop statistic. Only the primary
             // link is asked about — the offer is "move this into the tunnel",
             // and how a host behaves once already inside it answers nothing.
+            // The stack's own connect event marks the connection established,
+            // and only an established connection's close counts as "it works".
+            // A filter classify is not one: it fires before the handshake.
+            let establishes = obs.progress == ConnectionProgress::Attempt
+                && obs.verdict == ConnectionVerdict::Unknown;
+            if rec.egress.role == EgressRole::Primary
+                && (establishes || obs.progress != ConnectionProgress::Attempt)
+            {
+                self.note_companion_primary_health(obs, now_ms);
+            }
             if obs.progress != ConnectionProgress::Attempt {
-                if rec.egress.role == EgressRole::Primary {
-                    self.note_companion_primary_health(obs, now_ms);
-                }
                 continue;
             }
             // Our own filter dropped it, and the stack now resends into that

@@ -11,16 +11,33 @@ use super::*;
 pub enum AppSection {
     InterfacesAndRoutes,
     Rules,
+    RuleSuggestions,
+    RuleOverlaps,
+    VirtualMachines,
     Diagnostics,
+    ConnectionTrace,
     Logs,
     Settings,
 }
 
 impl AppSection {
-    pub const ALL: [Self; 5] = [
+    /// Sidebar top level; the other sections are sub-items of Rules and Diagnostics.
+    pub const TOP_LEVEL: [Self; 5] = [
         Self::InterfacesAndRoutes,
         Self::Rules,
         Self::Diagnostics,
+        Self::Logs,
+        Self::Settings,
+    ];
+
+    pub const ALL: [Self; 9] = [
+        Self::InterfacesAndRoutes,
+        Self::Rules,
+        Self::RuleSuggestions,
+        Self::RuleOverlaps,
+        Self::VirtualMachines,
+        Self::Diagnostics,
+        Self::ConnectionTrace,
         Self::Logs,
         Self::Settings,
     ];
@@ -29,7 +46,11 @@ impl AppSection {
         match self {
             Self::InterfacesAndRoutes => "interfaces-routes",
             Self::Rules => "rules",
+            Self::RuleSuggestions => "rule-suggestions",
+            Self::RuleOverlaps => "rule-overlaps",
+            Self::VirtualMachines => "rule-virtual-machines",
             Self::Diagnostics => "diagnostics",
+            Self::ConnectionTrace => "conn-trace",
             Self::Logs => "logs",
             Self::Settings => "settings",
         }
@@ -39,7 +60,11 @@ impl AppSection {
         match self {
             Self::InterfacesAndRoutes => "Interfaces and routes",
             Self::Rules => "Rules",
+            Self::RuleSuggestions => "Suggested addresses",
+            Self::RuleOverlaps => "Overlaps",
+            Self::VirtualMachines => "Virtual machines",
             Self::Diagnostics => "Diagnostics",
+            Self::ConnectionTrace => "Connection trace",
             Self::Logs => "Logs",
             Self::Settings => "Settings",
         }
@@ -59,7 +84,11 @@ impl FromStr for AppSection {
         match value {
             "interfaces-routes" | "routes" | "interfaces" => Ok(Self::InterfacesAndRoutes),
             "rules" => Ok(Self::Rules),
+            "rule-suggestions" => Ok(Self::RuleSuggestions),
+            "rule-overlaps" => Ok(Self::RuleOverlaps),
+            "rule-virtual-machines" => Ok(Self::VirtualMachines),
             "diagnostics" => Ok(Self::Diagnostics),
+            "conn-trace" => Ok(Self::ConnectionTrace),
             "logs" => Ok(Self::Logs),
             "settings" => Ok(Self::Settings),
             _ => Err("unknown section id"),
@@ -110,11 +139,7 @@ impl AppAction {
     pub const fn label(self) -> &'static str {
         match self {
             Self::OpenMainWindow => "Open NetRuleRouter",
-            Self::OpenSection(AppSection::InterfacesAndRoutes) => "Interfaces and routes",
-            Self::OpenSection(AppSection::Rules) => "Rules",
-            Self::OpenSection(AppSection::Diagnostics) => "Diagnostics",
-            Self::OpenSection(AppSection::Logs) => "Logs",
-            Self::OpenSection(AppSection::Settings) => "Settings",
+            Self::OpenSection(section) => section.title(),
             Self::LoadRuleList => "Load rule list...",
             Self::UpdateRulesFromFile => "Update rules from file",
             Self::ImportPreset => "Import preset...",

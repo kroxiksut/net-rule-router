@@ -82,7 +82,8 @@ bitflags! {
         const NEGATIVE_CACHED      = 0b0000_1000;
         /// The lookup that produced this entry failed or timed out.
         const LOOKUP_FAILED        = 0b0001_0000;
-        /// The address family is not supported in Free edition (native IPv6).
+        /// Reserved bit: nothing sets it since IPv6 became a rule family. Kept
+        /// so stored flag values keep their meaning.
         const UNSUPPORTED_ADDR_FAM = 0b0010_0000;
     }
 }

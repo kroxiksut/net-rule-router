@@ -106,9 +106,9 @@ pub enum ListenerAction {
 pub type PrivateResolversFn = Arc<dyn Fn() -> Vec<std::net::Ipv4Addr> + Send + Sync>;
 
 /// Lists the namespaces connections claim, with the servers that answer for
-/// them. Read fresh: a VPN that connects brings its namespace with it.
-pub type ClaimedNamespacesFn =
-    Arc<dyn Fn() -> Vec<(String, Vec<std::net::Ipv4Addr>)> + Send + Sync>;
+/// them. The same source the redirect steps aside for, so the two cannot
+/// disagree about which namespaces exist.
+pub type ClaimedNamespacesFn = crate::dns_resolver_service::DnsNamespaceExemptionsFn;
 
 /// How many private resolvers are re-asked before a "no such name" stands.
 /// A machine has one or two; the bound only stops a strange configuration
@@ -192,6 +192,9 @@ pub struct DnsInterceptListener {
     /// Namespaces connections claim, used to complete a single-label name.
     /// `None` leaves such names exactly as they arrive.
     claimed_namespaces: Option<ClaimedNamespacesFn>,
+    /// Port the resolvers named by a connection listen on. Always 53 outside
+    /// tests, which cannot bind it.
+    resolver_port: u16,
     /// Fake-IP — answers scope hosts with virtual addresses.
     /// The default no-op returns the real per-IP path for every host.
     fake_ip: Arc<dyn FakeIpAnswerer>,
@@ -278,6 +281,7 @@ impl DnsInterceptListener {
             secondary_owned: Arc::new(NoopSecondaryOwnedIps),
             private_resolvers: None,
             claimed_namespaces: None,
+            resolver_port: 53,
             fake_ip: Arc::new(NoopFakeIpAnswerer),
             direct_gate: Arc::new(NoopDirectAnswerGate),
             direct_fake: Arc::new(NoopDirectFakeIp),
@@ -400,11 +404,24 @@ impl DnsInterceptListener {
     }
 
     /// Wire the namespaces connections claim, so a single-label name can be
-    /// completed the way the OS would have completed it.
+    /// completed the way the OS would have completed it. Crate-private: the
+    /// resolver service hands its own exemption source down, so no factory
+    /// can wire one and forget the other.
     #[must_use]
-    pub fn with_claimed_namespaces(mut self, namespaces: ClaimedNamespacesFn) -> Self {
+    pub(crate) fn with_claimed_namespaces(mut self, namespaces: ClaimedNamespacesFn) -> Self {
         self.claimed_namespaces = Some(namespaces);
         self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_resolver_port(mut self, port: u16) -> Self {
+        self.resolver_port = port;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completes_short_names(&self) -> bool {
+        self.claimed_namespaces.is_some()
     }
 
     /// Answer a single-label name by completing it with a claimed namespace.
@@ -428,12 +445,13 @@ impl DnsInterceptListener {
     ) -> Option<Vec<u8>> {
         let namespaces = self.claimed_namespaces.as_ref()?();
         let started = Instant::now();
-        for (suffix, servers) in namespaces {
+        for claim in namespaces {
             let left = budget.saturating_sub(started.elapsed());
             if left.is_zero() {
                 break;
             }
-            let full = format!("{label}.{suffix}");
+            let full = format!("{label}.{}", claim.suffix);
+            let servers = claim.servers;
             let id = crate::dns_resolver_ports::next_query_id();
             let Some(probe) = crate::dns_wire::build_address_query(id, &full, QTYPE_A) else {
                 continue;
@@ -443,7 +461,7 @@ impl DnsInterceptListener {
                 if left.is_zero() {
                     break;
                 }
-                let target = SocketAddr::from((server, 53));
+                let target = SocketAddr::from((server, self.resolver_port));
                 let Some(reply) = self.forward_to(&probe, target, self.forward_timeout.min(left))
                 else {
                     continue;
@@ -1230,7 +1248,7 @@ impl DnsInterceptListener {
             if budget.is_zero() || tried >= MAX_PRIVATE_RETRIES {
                 break;
             }
-            let target = SocketAddr::from((server, 53));
+            let target = SocketAddr::from((server, self.resolver_port));
             if target == already_asked {
                 continue;
             }

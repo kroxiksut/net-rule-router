@@ -20,9 +20,10 @@
 //! at the next ten-second tick. Graceful stop tears the policy back out through
 //! the same object.
 //!
-//! Absent, with `None` rather than a stub: DNS refresh (no Linux resolver
-//! mechanism yet), the observation consumers, and the power observer (the
-//! neutral resume watchdog covers a wake a few seconds later). What that costs
+//! Absent, with `None` rather than a stub: the observation consumers and the
+//! power observer (the neutral resume watchdog covers a wake a few seconds
+//! later). The local DNS resolver arms only where systemd-resolved carries the
+//! machine's lookups (`dns_stack`). What that costs
 //! is concrete rather than abstract: rules naming a domain are enforced only for
 //! addresses already in the FQDN cache, and the catch-all kill-switch is NOT
 //! part of the plan yet — the daemon states both on every apply instead of
@@ -34,7 +35,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nrr_diagnostics::{AuditRetentionPolicy, LogRetentionPolicy, ManualCleanupScope};
-use nrr_domain::enforcement_mode::EnforcementMode;
 use nrr_platform_api::adapters::AdapterMonitor;
 use nrr_platform_api::network_change::NetworkChangeObserver;
 use nrr_platform_linux::network_change::LinuxNetworkChangeObserver;
@@ -96,6 +96,8 @@ pub(crate) fn build_runtime_deps(
         rules_provider,
         auto_rules,
         traffic_sampler,
+        conn_trace,
+        dns_capture,
     ) = match policy {
         Some(stack) => (
             Some(stack.cycle),
@@ -107,8 +109,22 @@ pub(crate) fn build_runtime_deps(
             Some(stack.rules),
             Some(stack.auto_rules),
             stack.traffic_sampler,
+            Some(stack.conn_trace),
+            stack.dns_capture,
         ),
-        None => (None, None, None, None, None, None, None, None, None),
+        None => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::dns_stack::DnsCapture::Unavailable,
+        ),
     };
     // One source, two readers: the monitor that reports link changes and the
     // enforcer that resolves bindings against them. Two enumerations would let
@@ -125,6 +141,10 @@ pub(crate) fn build_runtime_deps(
         let cycle = Arc::clone(cycle);
         Arc::new(move || {
             cycle.tick_logged("recompute");
+            // A VPN coming up takes every name back from our DNS link; the
+            // guard re-checks now instead of on its next tick.
+            nrr_service_runtime::dns_stack::namespace_recheck()
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }) as RouteRecomputeHook
     });
     // Stopping must restore the machine: policy left in the kernel by an exited
@@ -147,6 +167,45 @@ pub(crate) fn build_runtime_deps(
             }
         }) as RouteRecomputeHook
     });
+
+    // The local resolver answers for the first signed-in user: a query reaches
+    // it with no trace of who asked.
+    let routing_principal =
+        nrr_service_runtime::dns_stack::routing_principal_from(Arc::new(LogindActivePrincipals));
+    let dns_resolver_controller = match (
+        state_conn.as_ref(),
+        cache_store.as_ref(),
+        recompute_hook.as_ref(),
+    ) {
+        (Some(conn), Some(cache), Some(hook)) => crate::dns_stack::resolver_controller(
+            dns_capture,
+            &artifacts.topology.data_dir,
+            nrr_service_runtime::dns_stack::DnsStackInputs {
+                settings_conn: Arc::clone(conn),
+                cache: Arc::clone(cache),
+                active_sid: Arc::clone(&routing_principal),
+                recompute_hook: hook.clone(),
+                known_direct: None,
+                block_all_armed: None,
+                fail_closed_armed: None,
+                fake_assembly: None,
+                fake_ip_running: None,
+                fake_ip_secondary_ready: None,
+                egress: None,
+                auto_rules: auto_rules.clone(),
+                signed_in: Some({
+                    let principal = Arc::clone(&routing_principal);
+                    Arc::new(move || principal().is_some())
+                }),
+                route_coordinator: None,
+            },
+        ),
+        _ => None,
+    };
+    let dns_resolver_boot_mode = state_conn
+        .as_ref()
+        .map(nrr_service_runtime::dns_stack::read_enforcement_mode)
+        .unwrap_or_default();
 
     let logs_dir: PathBuf = artifacts.topology.logs_dir.clone();
     // On Linux the two diverge, unlike Windows where both sit under the data
@@ -188,7 +247,7 @@ pub(crate) fn build_runtime_deps(
             Arc::new(
                 nrr_service_runtime::dns_refresh::DnsRefreshOrchestrator::new(
                     Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                        Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+                        Arc::new(crate::dns_stack::service_dns_resolver(dns_capture)),
                     )),
                     store,
                 ),
@@ -218,10 +277,9 @@ pub(crate) fn build_runtime_deps(
         // equivalent yet. `None` leaves the check to the GUI button.
         auto_rule_probe: None,
         secondary_external_address: None,
-        dns_resolver_controller: None,
-        // Reactive: the local resolver is a Windows mechanism today, so booting
-        // in `Resolver` mode would arm something that does not exist here.
-        dns_resolver_boot_mode: EnforcementMode::default(),
+        // `None` where systemd-resolved does not carry the machine's lookups.
+        dns_resolver_controller,
+        dns_resolver_boot_mode,
         // Same bus the socket server drains, so the adapter monitor's
         // `AdaptersChanged` actually reaches a subscribed GUI instead of being
         // published into nothing.
@@ -258,6 +316,8 @@ pub(crate) fn build_runtime_deps(
         app_observation: app_observations.as_ref().map(|store| AppObservationWiring {
             source: Arc::new(nrr_platform_linux::conn_observe::ProcfsConnectionObserver::new()),
             store: Arc::clone(store),
+            // The only drain of this source, so the trace panel reads it here.
+            trace: conn_trace.clone(),
         }),
         // The observer reports a socket once; this keeps the destinations of
         // sockets still open from ageing out under them.
@@ -323,6 +383,7 @@ pub(crate) fn build_ipc_server(
                 Some(Arc::clone(&stack.auto_rules)),
                 stack.traffic_sampler.clone(),
                 Arc::clone(&stack.cache_store),
+                stack.conn_trace.ring(),
             );
             let mut registry = nrr_service_runtime::IpcHandlerRegistry::new();
             nrr_service_runtime::ipc_handlers::register_production_handlers(
@@ -658,10 +719,15 @@ pub(crate) struct PolicyStack {
     /// get a look at it.
     pub dns_consumer_subject: Arc<std::sync::Mutex<Option<String>>>,
     pub cycle: Arc<PrincipalEnforcementCycle>,
+    /// The connection-trace panel: the app-destination tick writes it, the IPC
+    /// surface reads it.
+    pub conn_trace: Arc<nrr_service_runtime::conn_observation_consumer::ConnTraceTee>,
     /// The ledger both readers share: the housekeeping tick counts into it and
     /// the IPC surface reports from it. Two samplers would be two connections,
     /// one counting and the other answering. `None` leaves the counter off.
     pub traffic_sampler: Option<TrafficSamplerHandle>,
+    /// Whether the local DNS resolver can take the machine's lookups.
+    pub dns_capture: crate::dns_stack::DnsCapture,
 }
 
 /// Assemble the policy stack, or explain why the daemon cannot enforce.
@@ -676,6 +742,7 @@ pub(crate) fn build_policy_stack(
     // push bus: a user whose settings ask for more protection than the machine
     // can arm learns it from their own window, not from the service log.
     events: Arc<EventBus>,
+    dns_capture: crate::dns_stack::DnsCapture,
 ) -> Option<PolicyStack> {
     let conn = open_state_connection(&artifacts.topology.state_db_path)?;
     let state_conn = Arc::clone(&conn);
@@ -702,14 +769,15 @@ pub(crate) fn build_policy_stack(
     };
     let fqdn_cache = cache_lookup_over(Arc::clone(&cache_store));
 
-    // This daemon answers no DNS itself, so the canary that turns browser DoH
-    // off is never served: the lockdown is the only way to see those names.
     nrr_service_runtime::doh_seed::seed_shared_baseline(&conn);
-    let policy: Arc<dyn RoutePolicySource> = Arc::new(
-        ProductionRoutePolicySource::new(conn)
-            .with_fqdn_cache(Arc::clone(&fqdn_cache))
-            .with_doh_lockdown_forced(),
-    );
+    let mut policy_source =
+        ProductionRoutePolicySource::new(conn).with_fqdn_cache(Arc::clone(&fqdn_cache));
+    // Where our listener does not answer DNS, the canary that turns browser DoH
+    // off is never served: the lockdown is the only way to see those names.
+    if !dns_capture.answers_dns() {
+        policy_source = policy_source.with_doh_lockdown_forced();
+    }
+    let policy: Arc<dyn RoutePolicySource> = Arc::new(policy_source);
 
     // The same resolver the refresh task uses, pointed at the rule book instead
     // of at expiring cache rows: one asks "what is this name now", the other
@@ -726,7 +794,7 @@ pub(crate) fn build_policy_stack(
     let rule_seeder = Arc::new(
         RuleHostnameSeeder::new(
             Arc::new(nrr_platform_api::dns_budget::BudgetedDnsResolver::new(
-                Arc::new(nrr_platform_linux::dns_resolver::LinuxDnsResolver::new()),
+                Arc::new(crate::dns_stack::service_dns_resolver(dns_capture)),
             )),
             Arc::clone(&cache_store),
             Arc::clone(&fqdn_cache),
@@ -797,6 +865,7 @@ pub(crate) fn build_policy_stack(
 
     let bindings: Arc<dyn EgressBindingSource> =
         Arc::new(StoredEgressBindings::new(Arc::clone(&policy)));
+    let bindings_for_trace = Arc::clone(&bindings);
     // One source object behind every reader — the filter path, the route path
     // and the exemption reader must see the same machine.
     let adapter_port: Arc<dyn nrr_platform_api::adapters::AdapterEventSource> = adapters;
@@ -859,6 +928,7 @@ pub(crate) fn build_policy_stack(
     }
 
     Some(PolicyStack {
+        dns_capture,
         state_conn,
         cache_store,
         app_observations,
@@ -868,6 +938,15 @@ pub(crate) fn build_policy_stack(
         rule_seeder,
         dns_consumer,
         dns_consumer_subject,
+        conn_trace: Arc::new(
+            nrr_service_runtime::conn_observation_consumer::ConnTraceTee::new(
+                Arc::new(
+                    nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
+                ),
+                Arc::new(nrr_platform_linux::LinuxApi),
+                bindings_for_trace,
+            ),
+        ),
         cycle: Arc::new(
             PrincipalEnforcementCycle::new(Arc::new(LogindActivePrincipals), plans, enforcer)
                 .with_routes(routes)

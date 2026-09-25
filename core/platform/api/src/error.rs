@@ -113,7 +113,7 @@ pub enum PlatformError {
     },
     /// Persistent state corruption; manual recovery required.
     StateCorrupted { detail: String },
-    /// Feature not supported (e.g. IPv6 is out-of-scope for this product).
+    /// The capability does not exist on this OS or backend.
     NotSupported { reason: &'static str },
     /// A POSIX errno from a Unix mechanism (rtnetlink, nftables, sockets).
     ///

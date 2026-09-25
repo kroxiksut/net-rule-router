@@ -15,6 +15,8 @@ pub enum Command {
     Uninstall,
     /// `status` — print a one-shot banner and exit.
     Status,
+    /// The unit's stop hook: undo the DNS redirect a dead daemon left behind.
+    RestoreDns,
     /// `help` / `--help` / no arguments — print usage.
     Help,
     /// Any unrecognised verb — a hard error, never a daemon start.
@@ -36,6 +38,7 @@ pub fn parse_command(args: &[String]) -> Command {
         "install" => Command::Install,
         "uninstall" => Command::Uninstall,
         "status" => Command::Status,
+        "restore-dns" => Command::RestoreDns,
         "help" | "h" | "" => Command::Help,
         other => Command::Unknown(other.to_string()),
     }
@@ -48,6 +51,17 @@ mod tests {
     fn parse(args: &[&str]) -> Command {
         let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         parse_command(&owned)
+    }
+
+    /// The unit's stop hook writes this word; a mismatch is a hook that
+    /// silently restores nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_stop_hook_verb_is_the_one_the_unit_writes() {
+        assert_eq!(
+            parse(&[nrr_platform_linux::systemd::DAEMON_RESTORE_DNS_VERB]),
+            Command::RestoreDns
+        );
     }
 
     #[test]

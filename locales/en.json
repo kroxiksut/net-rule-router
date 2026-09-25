@@ -1486,7 +1486,7 @@
       "body": "These rules name a host that one of your wildcard rules already covers. Removing them changes nothing about where your traffic goes — it only shortens the list.",
       "group-spare": "Safe to remove",
       "group-deliberate": "Your call",
-      "deliberate-body": "These name a host under a wildcard but send it somewhere else, or block it. That is what an exception looks like, so nothing here is removed for you.",
+      "deliberate-body": "These name a host under a wildcard but block it, or apply only to one program. That is what an exception looks like, so nothing here is removed for you. Rules that send a host over the other route are listed under Rules → Overlaps.",
       "covered-by": "{host} — already covered by *.{apex}",
       "exception-line": "{host} ({coveredRoute}) under *.{apex} ({apexRoute})",
       "keep": "Keep",
@@ -1948,7 +1948,8 @@
     },
     "nav": {
       "list": "Rules list",
-      "check-sync": "Check rules match"
+      "check-sync": "Check rules match",
+      "pending-badge": "{n} item(s) in Rules waiting for an answer"
     },
     "auto-origin": {
       "site-companion": "Needed for {site} to work",
@@ -2019,7 +2020,8 @@
       "clean-overlaps": "Remove covered rules ({n})",
       "clean-overlaps-tooltip": "Some rules name a host one of your wildcard rules already covers. Review them and drop the spare ones.",
       "where-traffic-goes": "Where traffic is going",
-      "where-traffic-goes-tooltip": "Opens the connection trace: which application reached which destination, and over which connection it actually left."
+      "where-traffic-goes-tooltip": "Opens the connection trace: which application reached which destination, and over which connection it actually left.",
+      "send-over": "Send over {route}"
     },
     "bulk": {
       "selected-count": "{n} rule(s) selected",
@@ -2260,7 +2262,6 @@
         "show-dismissed": "Show answered ({n})",
         "show-dismissed-tooltip": "Also list the addresses you told the app not to suggest again, so you can change your mind about one.",
         "empty-but-answered": "Nothing is waiting for an answer. {n} address(es) you answered earlier are hidden — turn on \"Show answered\" to revisit one.",
-        "pending-badge": "{n} address(es) waiting for an answer",
         "show-served-by-main-link": "Show ones the main connection already handles ({n})",
         "show-served-by-main-link-tooltip": "These addresses answer over your main connection, so sending them through the additional one changes nothing. They are listed for completeness, not as work.",
         "ownership-third-party": "a third-party service the site pulls in",
@@ -2300,7 +2301,6 @@
       "route-now": "Every {hypervisor} machine goes over {route}.",
       "route-now-mixed": "The rules send {hypervisor}'s programs over different routes.",
       "route-now-block": "The rules block the traffic of every {hypervisor} machine.",
-      "route-button": "Send over {route}",
       "no-machines": "{hypervisor} has no machines yet.",
       "machine-label": "Machine",
       "no-adapters": "This machine has no network adapters.",
@@ -2321,6 +2321,34 @@
       "internal": "Traffic stays between virtual machines. Nothing to route.",
       "nat-network": "NAT Network is not supported yet, so this adapter is not covered here.",
       "other": "This adapter is not attached, or its kind is not supported yet."
+    },
+    "overlaps": {
+      "nav-label": "Overlaps",
+      "pending-badge": "{n} overlap(s) not confirmed",
+      "intro": "When rules of the two routes cover the same sites, the narrower rule wins: an exact name beats a wildcard, a wildcard beats a zone, a longer name beats a shorter one. Check that each site below goes where you want it to: confirm it, or send it over the other route. Changes go to your rules list, where you review and apply them.",
+      "rule": "{value} ({type})",
+      "nested": "{winner} goes over {winner-route}: it is narrower than {loser} on {loser-route}.",
+      "duplicate": "{winner} is set on both routes. It goes over {winner-route}: on a tie the main route wins.",
+      "block-note": "A block rule is part of this pair; change it in the rules list.",
+      "confirm": "Correct",
+      "confirm-all": "Confirm all",
+      "confirmed": "Confirmed",
+      "unconfirm": "Ask again",
+      "empty": "No rules of the two routes cover the same sites.",
+      "column": {
+        "winner": "Rule that wins",
+        "loser": "Overlaps with",
+        "reason": "Why it wins",
+        "decision": "Decision"
+      },
+      "reason": {
+        "nested": "Narrower rule",
+        "duplicate": "Same rule on both routes"
+      },
+      "via": "via {route}",
+      "send-over": "Send over {route} instead",
+      "show-resolved": "Show resolved",
+      "all-resolved": "Every overlap is resolved."
     }
   },
   "connection": {

@@ -50,9 +50,10 @@ QString NrrNativeBridge::rpcCanonicalRulesHash(const QString &rulesJson) {
                           obj);
 }
 
-QString NrrNativeBridge::rpcRulesOverlaps(const QString &rulesJson) {
+QString NrrNativeBridge::rpcRulesOverlaps(const QString &rulesJson, bool includeSubdomains) {
     QJsonObject obj;
     obj.insert(QStringLiteral("rules-json"), rulesJson);
+    obj.insert(QStringLiteral("include-subdomains"), includeSubdomains);
     return emitRpcRequest(QStringLiteral("local.rules-overlaps"), obj);
 }
 

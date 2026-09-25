@@ -198,6 +198,7 @@ pub(crate) fn build_ipc_surface(
     auto_rules: Option<Arc<nrr_service_runtime::auto_rules::AutoRulesEngine>>,
     traffic_sampler: Option<crate::runtime_deps::TrafficSamplerHandle>,
     cache_store: Arc<Mutex<dyn nrr_storage::repository::CacheRepository + Send>>,
+    conn_trace_ring: Arc<nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing>,
 ) -> IpcSurface {
     // Cloned before the facade takes ownership: storage usage counts the same
     // log directory the diagnostics reader serves from, and on Linux that lives
@@ -347,11 +348,7 @@ pub(crate) fn build_ipc_surface(
         )
         .with_system_info(nrr_platform_linux::system_info::collect())
         .with_file_handoff(Arc::new(nrr_platform_linux::file_handoff::ChownFileHandoff))
-        // No connection observer feeds it yet: the trace viewer answers
-        // "observer inactive" instead of an unimplemented operation.
-        .with_conn_trace_ring(Arc::new(
-            nrr_service_runtime::conn_observation_consumer::ConnectionTraceRing::new(1000),
-        ));
+        .with_conn_trace_ring(conn_trace_ring);
     // The SAME engine the observation consumer feeds. Without it the
     // `autorules.candidates.*` operations stay registered as unimplemented and
     // the GUI's suggestions page has nothing to read.

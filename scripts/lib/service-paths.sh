@@ -64,11 +64,6 @@ nrr_user_footprint_paths() {
   if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
     printf '%s\n' "$XDG_RUNTIME_DIR/$NRR_PRODUCT_NAME_UNIX"
   fi
-  # A development build keeps its per-user files in the checkout, next to the
-  # scripts themselves.
-  if [ -d "$NRR_REPO_ROOT/.devdata" ]; then
-    printf '%s\n' "$NRR_REPO_ROOT/.devdata"
-  fi
 }
 
 # Under sudo HOME is root's, so a per-user path set resolves for the wrong

@@ -151,6 +151,22 @@ list and add it if the site is not actually working for you.
 
 ![Suggested addresses: the whole list, with the site each address belongs to](images/suggested-addresses.png)
 
+### Overlapping rules
+
+When rules of the two routes cover the same sites — the zone `ru` on one
+route and `mail.example.ru` on the other, or `*.example.com` and
+`*.api.example.com` — the narrower rule wins: an exact name beats a
+wildcard, a wildcard beats a zone, a longer name beats a shorter one.
+
+**Rules → Overlaps** lists every such pair and says which route its sites
+take. Press **Correct** to confirm a pair, or send those sites over the other
+route. A confirmed pair leaves the list; **Show resolved** brings it back.
+The number next to the entry counts the pairs you have not confirmed yet; the
+entry is hidden while there are none. A change here is an ordinary edit of
+your rules list and takes effect after **Apply**.
+
+![Overlaps: which rule wins, over which route, and a decision for each pair](images/rule-overlaps.png)
+
 ### If you have no additional connection
 
 You may not have a VPN or a second line — then simply **do not assign** an

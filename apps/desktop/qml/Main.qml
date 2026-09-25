@@ -979,6 +979,7 @@ ApplicationWindow {
         if (id === "interfaces-routes") return tr("section.interfaces-routes", "Interfaces and routes")
         if (id === "rules") return tr("section.rules", "Rules")
         if (id === "rule-suggestions") return tr("rules.suggestions.inbox.nav-label", "Suggested addresses")
+        if (id === "rule-overlaps") return tr("rules.overlaps.nav-label", "Overlaps")
         if (id === "rule-virtual-machines") return tr("rules.vm.nav-label", "Virtual machines")
         if (id === "diagnostics") return tr("section.diagnostics", "Diagnostics")
         if (id === "conn-trace") return tr("diag.conn-trace.title", "Connection trace")
@@ -1001,6 +1002,8 @@ ApplicationWindow {
     /// Pairs from the last `local.rules-overlaps` pass.
     property var rulesOverlapPairs: []
     property bool _rulesOverlapInFlight: false
+    /// An edit landed while a pass was in flight; that pass read older rules.
+    property bool _rulesOverlapStale: false
 
     /// Stable key for one pair, as stored in `prefs.rulesOverlapKeepSig`.
     function overlapPairKey(pair) {
@@ -1043,7 +1046,10 @@ ApplicationWindow {
 
     /// Recompute the overlap set from the rules currently on screen.
     function refreshRulesOverlaps() {
-        if (_rulesOverlapInFlight) return
+        if (_rulesOverlapInFlight) {
+            _rulesOverlapStale = true
+            return
+        }
         if (!bridgeAvailable || typeof nrrNativeBridge === "undefined" || !nrrNativeBridge
                 || typeof nrrNativeBridge.rpcRulesOverlaps !== "function") {
             return
@@ -1051,10 +1057,13 @@ ApplicationWindow {
         var rulesJson = _buildRulesJsonFromModel()
         if (!rulesJson) return
         _rulesOverlapInFlight = true
-        var corr = nrrNativeBridge.rpcRulesOverlaps(rulesJson)
+        _rulesOverlapStale = false
+        var corr = nrrNativeBridge.rpcRulesOverlaps(rulesJson, prefs.routeIncludeSubdomains !== false)
         rpc.registerRpcCallback(corr, function(ok, payload) {
             _rulesOverlapInFlight = false
             rulesOverlapPairs = (ok && payload && payload.pairs) ? payload.pairs : []
+            ruleOverlapsController.update((ok && payload && payload["route-overlaps"]) || [])
+            if (_rulesOverlapStale) Qt.callLater(refreshRulesOverlaps)
         })
     }
 
@@ -2447,6 +2456,12 @@ ApplicationWindow {
     property alias autoRuleSuggestionsController: autoRuleSuggestionsController
     AutoRuleSuggestionsController {
         id: autoRuleSuggestionsController
+        root: window
+    }
+    // Rules of the two routes claiming the same hosts: Rules → Overlaps.
+    property alias ruleOverlapsController: ruleOverlapsController
+    RuleOverlapsController {
+        id: ruleOverlapsController
         root: window
     }
     // Hypervisors and their machines: the Rules → Virtual machines screen.
@@ -5496,6 +5511,9 @@ ApplicationWindow {
                 // Same reason: the offer the tray may have shown while this
                 // window was closed has to be countable the moment it opens.
                 autoRuleSuggestionsController.refreshAutoRuleCandidates()
+                // The Overlaps count shows on every screen, not only once the
+                // rules screen has been opened.
+                refreshRulesOverlaps()
                 // An explicit pull replaced the table with what the service
                 // enforces, so the linked file is now behind it — mirror it.
                 // Silent cold-start/post-connect refreshes deliberately do NOT:
@@ -6236,6 +6254,14 @@ ApplicationWindow {
                     active: StackLayout.isCurrentItem
                     asynchronous: window.sectionLoadsAsync
                     visible: StackLayout.isCurrentItem
+                    sourceComponent: Component { RuleOverlapsSection { root: window } }
+                }
+                Loader {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    active: StackLayout.isCurrentItem
+                    asynchronous: window.sectionLoadsAsync
+                    visible: StackLayout.isCurrentItem
                     sourceComponent: Component { VirtualMachinesSection { root: window } }
                 }
                 Loader {
@@ -6827,6 +6853,8 @@ ApplicationWindow {
         // edit on disk: the post-connect question is then asked from a marker
         // that outlives this window.
         if (!_routingBackendConnected()) _offlineRulesMarkerTimer.restart()
+        // The Overlaps count is shown on every screen, so it follows each edit.
+        Qt.callLater(refreshRulesOverlaps)
     }
 
     // Debounced so that typing a rule does not write the sidecar on every

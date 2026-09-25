@@ -7,14 +7,9 @@
 //! Per the policy/mechanism seam these DEFINITIONS live in the neutral
 //! `nrr-platform-api`; each OS backend consumes them and implements the ports.
 //!
-//! IPv6 routing is out-of-scope for the Free tier: per-destination V6 needs
-//! AAAA resolution (not supported), so an IPv6 destination in an ordinary rule
-//! is silently skipped by the apply layer with an audit note "skipped: IPv6
-//! destination not supported". The one exception is the **catch-all
-//! kill-switch**, which blocks ALL outbound IPv6 (except loopback + link-local)
-//! whenever it fires — see [`WfpLayerKey::AleAuthConnectV6`] /
-//! [`WfpFilterSpec::remote_subnet_v6`]. Everything else uses
-//! `std::net::Ipv4Addr`.
+//! Both families are enforced per destination: IPv6 hosts ride their own set
+//! (`remote_ip_set_v6`) on the v6 layers, the twin of the IPv4 one. A plan names
+//! IPv6 only while a link carries the family.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -157,8 +152,8 @@ impl WfpFilterId {
 
 /// The WFP layer a filter belongs to.
 ///
-/// `AleAuthConnectV4` is used for outbound TCP/UDP blocking.
-/// Packet-layer and IPv6 layers are out-of-scope (see module doc).
+/// The ALE connect layers classify TCP/UDP flows; the packet layers catch the
+/// protocols those cannot see.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WfpLayerKey {
     /// `FWPM_LAYER_ALE_AUTH_CONNECT_V4` — outbound per-flow IPv4 (TCP connect
@@ -325,16 +320,14 @@ pub struct WfpFilterSpec {
     /// off-tunnel).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_subnet: Option<(Ipv4Addr, u8)>,
-    /// IPv6 catch-all kill-switch (Free's only IPv6 handling) — match
-    /// condition: a remote IPv6 **subnet** as `(network, prefix_len)`, mapped
+    /// Match condition: a remote IPv6 **subnet** as `(network, prefix_len)`, mapped
     /// to `FWPM_CONDITION_IP_REMOTE_ADDRESS` — the same suffix-less field key
     /// as the IPv4 twin — with an `FWP_V6_ADDR_AND_MASK` value. `None` = no
     /// subnet condition. The IPv6 twin of [`remote_subnet`].
     ///
     /// The catch-all kill-switch uses this to carve the IPv6 system exemptions
     /// its block-everything must never cover: loopback `::1/128` and link-local
-    /// `fe80::/10`. The per-IP fail-closed path stays IPv4-only — selective V6
-    /// destinations need AAAA resolution, not supported.
+    /// `fe80::/10`. Single hosts go in [`Self::remote_ip_set_v6`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_subnet_v6: Option<(Ipv6Addr, u8)>,
     /// Match condition (multi-protocol kill-switch): IP protocol

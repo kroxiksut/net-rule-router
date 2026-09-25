@@ -173,7 +173,8 @@ The following priority order is fixed (highest to lowest):
    itself and any subdomain of it at any depth. Longest base domain wins
    among competing suffix rules. To route the apex differently from its
    subdomains, add an exact rule for the apex — it is a higher tier and wins.
-4. **IP** — exact IP address. CIDR range matching is not supported yet.
+4. **IP** — exact IP address. CIDR subnets and IP ranges arrive in the next
+   alpha.
 5. **Application** (`Windows` / `Linux` / `MacOS`) — matched by process
    filename (exact or glob). Exact names take precedence over glob patterns;
    among glob matches, the first rule in the file wins. Only the
@@ -265,7 +266,8 @@ subdomains one way and the bare domain the other.
 
 #### IP (`--- IP`)
 
-Exact IPv4 or IPv6 address. CIDR notation is not supported yet.
+Exact IPv4 or IPv6 address. CIDR subnets and IP ranges arrive in the next
+alpha.
 
 ```
 203.0.113.7

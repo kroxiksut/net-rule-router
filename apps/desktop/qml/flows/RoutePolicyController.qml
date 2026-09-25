@@ -159,6 +159,8 @@ QtObject {
         var want = enabled === true
         root.prefs.routeIncludeSubdomains = want
         root.emitPrefs()
+        // Coverage decides whether `x` and `*.x` are one rule or two.
+        root.refreshRulesOverlaps()
         _applyRoutePolicyKey("include-subdomains", want, {
             ok: want
                 ? root.tr("status.include-subdomains-on",

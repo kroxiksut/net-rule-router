@@ -22,12 +22,6 @@ pub fn product_dir_leaf() -> &'static str {
     }
 }
 
-/// Checkout-local root a development build keeps its per-user files in, so a
-/// tester can wipe a run with one `rm -rf` and never wonder whether something
-/// stayed behind in the profile.
-#[cfg(debug_assertions)]
-const DEV_DATA_FOLDER: &str = ".devdata";
-
 /// One candidate root, and whether a file written there survives a reboot.
 ///
 /// The flag is not decoration: a store that lands on the temp directory tells
@@ -56,11 +50,6 @@ pub fn user_app_roots() -> Vec<UserAppRoot> {
             is_profile_persistent,
         });
     };
-
-    #[cfg(debug_assertions)]
-    if let Some(dev) = dev_data_root() {
-        push(dev, true);
-    }
 
     #[cfg(windows)]
     {
@@ -93,17 +82,6 @@ pub fn user_app_roots() -> Vec<UserAppRoot> {
 /// [`user_app_roots`], which lets it fall to the next candidate.
 pub fn user_config_root() -> Option<PathBuf> {
     user_app_roots().into_iter().next().map(|root| root.path)
-}
-
-/// `<checkout>/.devdata`, or `None` when this binary was built somewhere that
-/// no longer exists (a copied debug build, a container). Never a guess: the
-/// path is the crate's own manifest directory, baked in at compile time.
-#[cfg(debug_assertions)]
-fn dev_data_root() -> Option<PathBuf> {
-    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    // shared/contracts -> shared -> repository root.
-    let repo_root = manifest_dir.parent()?.parent()?;
-    repo_root.is_dir().then(|| repo_root.join(DEV_DATA_FOLDER))
 }
 
 #[cfg(test)]

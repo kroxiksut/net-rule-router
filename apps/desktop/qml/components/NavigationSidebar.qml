@@ -166,7 +166,9 @@ Pane {
                             readonly property int pendingBadge:
                                 navEntry.isRulesEntry
                                     && (root.sidebarCollapsed || !navigationSidebar.rulesNavExpanded)
-                                ? root.autoRuleSuggestionsController.autoRuleCandidatesPending : 0
+                                ? root.autoRuleSuggestionsController.autoRuleCandidatesPending
+                                    + root.ruleOverlapsController.pendingCount
+                                : 0
                             Label {
                                 Layout.preferredWidth: 20
                                 Layout.fillWidth: root.sidebarCollapsed
@@ -205,8 +207,8 @@ Pane {
                                     text: String(navContent.pendingBadge)
                                     color: navButton.highlighted ? palette.highlightedText : root.accentColor
                                     font.bold: true
-                                    Accessible.name: root.tr("rules.suggestions.inbox.pending-badge",
-                                        "{n} address(es) waiting for an answer")
+                                    Accessible.name: root.tr("rules.nav.pending-badge",
+                                        "{n} item(s) in Rules waiting for an answer")
                                         .replace("{n}", String(navContent.pendingBadge))
                                 }
                                 Label {
@@ -503,6 +505,54 @@ Pane {
                                 visible: root.autoRuleSuggestionsController.autoRuleCandidatesPending > 0
                                 text: String(root.autoRuleSuggestionsController.autoRuleCandidatesPending)
                                 color: rulesSuggestionsInboxButton.highlighted ? palette.highlightedText : root.accentColor
+                                font.bold: true
+                            }
+                        }
+                    }
+                    // Rules of the two routes claiming the same hosts. Hidden
+                    // while there are none; the count is the unconfirmed ones.
+                    Button {
+                        id: rulesOverlapsButton
+                        Layout.fillWidth: true
+                        activeFocusOnTab: true
+                        visible: root.ruleOverlapsController.overlaps.length > 0
+                        highlighted: root.section === "rule-overlaps"
+                        Accessible.name: root.tr("rules.overlaps.nav-label", "Overlaps")
+                        Accessible.description: root.ruleOverlapsController.pendingCount > 0
+                            ? root.tr("rules.overlaps.pending-badge", "{n} overlap(s) not confirmed")
+                                .replace("{n}", String(root.ruleOverlapsController.pendingCount))
+                            : ""
+                        onClicked: root.ruleOverlapsController.open()
+                        background: PanelSurface {
+                            theme: root.uiTheme
+                            cornerRadius: root.uiTheme.radiusSm
+                            color: rulesOverlapsButton.highlighted ? root.accentColor
+                                : (rulesOverlapsButton.hovered ? root.uiTheme.stateHoverFill : root.panelColor)
+                            border.color: rulesOverlapsButton.highlighted ? root.uiTheme.stateSelectedBorder
+                                : (rulesOverlapsButton.activeFocus ? root.uiTheme.stateFocusedBorder : root.uiTheme.stateDefaultBorder)
+                        }
+                        contentItem: RowLayout {
+                            spacing: root.uiTheme.spacingXs
+                            Image {
+                                source: root.uiIconSource("routing")
+                                sourceSize.width: 16
+                                sourceSize.height: 16
+                                Layout.preferredWidth: 16
+                                Layout.preferredHeight: 16
+                                fillMode: Image.PreserveAspectFit
+                                asynchronous: true
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: root.tr("rules.overlaps.nav-label", "Overlaps")
+                                color: rulesOverlapsButton.highlighted ? palette.highlightedText : root.textColor
+                                elide: Text.ElideRight
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            Label {
+                                visible: root.ruleOverlapsController.pendingCount > 0
+                                text: String(root.ruleOverlapsController.pendingCount)
+                                color: rulesOverlapsButton.highlighted ? palette.highlightedText : root.accentColor
                                 font.bold: true
                             }
                         }

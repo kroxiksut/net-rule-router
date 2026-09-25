@@ -578,6 +578,7 @@ fn an_observed_connection_becomes_a_destination_the_rule_can_route() {
     let wiring = AppObservationWiring {
         source: source.clone(),
         store: Arc::clone(&store),
+        trace: None,
     };
 
     assert_eq!(fold_observations(&wiring), 1);

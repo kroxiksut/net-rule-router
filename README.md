@@ -16,9 +16,9 @@ Windows builds today; Linux is in progress, macOS next.
 ![Platform: Windows, Linux in progress](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20(in%20progress)-0078D6.svg)
 ![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red.svg)
 
-<img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
+**English** · [Русский](README_RU.md)
 
-[Russian version → README_RU.md](README_RU.md)
+<img src="docs/en/images/rules.png" alt="Rules: each rule names what it matches and which route it takes" width="900" />
 
 </div>
 
@@ -84,6 +84,7 @@ The full walkthrough, including what to do if you lose network access, is in
 - **Per-name routing** — sites that share one server address still go where their own rule says. Large platforms and CDNs put hundreds of names on a handful of addresses, and address-level routing cannot tell them apart; see [`docs/en/routing-modes.md`](docs/en/routing-modes.md).
 - **Fail-Closed** — if `secondary` goes down, matching traffic is held rather than silently leaking to `primary`.
 - **Suggested addresses** — a routed site often pulls in helper domains of its own. The app collects them, shows which of your sites needs each one, and proposes adding them. Nothing is added behind your back, and ignoring a suggestion simply leaves that address on the main route.
+- **Overlaps** — when rules of the two routes cover the same sites (a zone on one route, a site inside it on the other), the narrower rule wins, and the app lists every such pair with the route its sites actually take. Confirm each one, or send those sites over the other route in one click.
 - **Explain mode** — ask *"why did this host go where it went?"* and get the exact rule trace. A local SQLite cache backs FQDN/IP mapping.
 - **Open, text-based presets** — human-readable rule packs (incl. ready-made country splits) you can diff, edit, and share.
 - **Native desktop app** — a Qt/QML GUI plus a tray for daily control, and a background service that applies policy at startup. The tray menu and its notices are still being shaped ahead of the first release; what they contain and how they look may change between builds.
@@ -107,9 +108,10 @@ and stops at the first match:
 
 Notes:
 
-- The **Exact-IP vs Zone** order is configurable (by default a more specific exact IP wins over a zone).
+- An **exact IP** always wins over the zone it sits in: the narrower rule wins.
 - A rule may combine an address match **and** an app match — both must hold (logical **AND**).
-- **CIDR subnets, IP ranges, ports, and protocols are not supported yet.**
+- **CIDR subnets and IP ranges arrive in the next alpha.** Ports and protocols
+  are not supported.
 - IPv6 addresses work in rules. They travel the additional connection when it
   carries IPv6; when it does not, they are held back rather than slipping out
   over the main one.
@@ -249,8 +251,13 @@ then macOS.
 resolve to them, and route and protect them as they do IPv4; what remains is
 verifying it on real IPv6 networks before calling it finished.
 
+**Next alpha: CIDR subnets and IP ranges.** Route a whole network, such as
+the internal ranges a corporate VPN serves, with one rule instead of one rule
+per address. Very wide ranges are refused, so one rule cannot swallow a large
+share of the internet.
+
 **Explored for the future:** multiple saved profiles and scenario libraries,
-2+N adapters, richer rule types (CIDR, ports, protocols), per-site / per-app
+2+N adapters, richer rule types (ports, protocols), per-site / per-app
 routing across 3+ routes, and automated switching. The desktop UI stays a
 native Qt app throughout.
 

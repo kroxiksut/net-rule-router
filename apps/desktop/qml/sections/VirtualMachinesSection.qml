@@ -240,7 +240,7 @@ ColumnLayout {
                                             readonly property bool current: section.controller.rulesRevision >= 0
                                                 && section.controller.routeOf(hypervisorBlock.hypervisor) === route
                                             text: root.uiRevision >= 0
-                                                ? root.tr("rules.vm.route-button", "Send over {route}")
+                                                ? root.tr("rules.action.send-over", "Send over {route}")
                                                     .replace("{route}", root.routeLabel(route))
                                                 : ""
                                             highlighted: current

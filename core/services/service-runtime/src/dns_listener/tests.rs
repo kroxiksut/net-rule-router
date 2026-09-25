@@ -711,6 +711,81 @@ fn a_failed_forward_answers_servfail_instead_of_saying_nothing() {
     assert_eq!(buf[3] & 0x0F, RCODE_SERVFAIL);
 }
 
+// ── Short-name completion ─────────────────────────────────────────────────
+
+/// Answers every question from `answer`; stops after two quiet seconds.
+fn fake_resolver(answer: fn(&[u8], &str) -> Option<Vec<u8>>) -> SocketAddr {
+    let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("resolver socket");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("resolver timeout");
+    let addr = socket.local_addr().expect("resolver addr");
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 512];
+        while let Ok((n, from)) = socket.recv_from(&mut buf) {
+            let q = &buf[..n];
+            let Some(name) = parse_question(q).map(|p| p.qname) else {
+                continue;
+            };
+            if let Some(reply) = answer(q, name.trim_end_matches('.')) {
+                let _ = socket.send_to(&reply, from);
+            }
+        }
+    });
+    addr
+}
+
+fn short_name_listener(namespaces: bool) -> DnsInterceptListener {
+    let corporate = fake_resolver(|q, name| {
+        (name == "printer.branch.corp.example")
+            .then(|| build_a_response(q, &[Ipv4Addr::new(192, 0, 2, 31)], 60))
+            .flatten()
+    });
+    let l = DnsInterceptListener::new(
+        Arc::new(Oracle(Vec::new())),
+        Arc::new(Upstream(Ok(resolved(&[])))),
+        Arc::new(NoopSink),
+        Arc::new(OkReconciler),
+        "192.0.2.1:53".parse().expect("test-net address"),
+        Duration::from_millis(150),
+        Duration::from_millis(500),
+    )
+    .with_resolver_port(corporate.port());
+    if !namespaces {
+        return l;
+    }
+    l.with_claimed_namespaces(Arc::new(|| {
+        vec![nrr_platform_api::dns_redirect::DnsNamespaceExemption {
+            suffix: "branch.corp.example".to_string(),
+            servers: vec![Ipv4Addr::LOCALHOST],
+        }]
+    }))
+}
+
+/// The field case: a corporate host reached by its bare name, which the
+/// public upstream has already called non-existent.
+#[test]
+fn a_short_name_is_completed_with_the_namespace_its_connection_claims() {
+    let q = query("printer", QTYPE_A);
+    let budget = Duration::from_secs(2);
+    let reply = short_name_listener(true)
+        .complete_single_label(&q, "printer", budget)
+        .expect("the completed answer");
+    let id = u16::from_be_bytes([q[0], q[1]]);
+    match crate::dns_wire::parse_address_response(id, "printer", QTYPE_A, &reply) {
+        crate::dns_wire::AddressResponseOutcome::Answers { addresses, .. } => {
+            assert_eq!(addresses, vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 31))]);
+        }
+        other => panic!("answered against the original question, got {other:?}"),
+    }
+
+    // Positive control: the same resolver with no claim completes nothing.
+    assert_eq!(
+        short_name_listener(false).complete_single_label(&q, "printer", budget),
+        None
+    );
+}
+
 // ── Rule-host admission control ───────────────────────────────────────────
 
 /// Stands in for the FQDN cache: the addresses enforcement was built from.

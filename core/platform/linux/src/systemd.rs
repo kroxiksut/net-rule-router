@@ -109,6 +109,10 @@ pub enum UnitActivation {
 /// either is a unit that starts nothing.
 const DAEMON_RUN_VERB: &str = "run";
 
+/// The argument the stop hook passes: give the machine's DNS back even when the
+/// daemon died before it could. Internal, like `run`.
+pub const DAEMON_RESTORE_DNS_VERB: &str = "restore-dns";
+
 /// The `RuntimeDirectory=` / `StateDirectory=` leaf. Kept next to the paths in
 /// the IPC address (`/run/netrulerouter/…`) and the secrets store
 /// (`/var/lib/netrulerouter/…`) so all three agree on one directory name.
@@ -145,6 +149,12 @@ pub fn render_service_unit(cfg: &SystemdServiceConfig) -> String {
     s.push_str("Type=notify\n");
     s.push_str(&format!(
         "ExecStart={} {DAEMON_RUN_VERB}\n",
+        cfg.binary_path.display()
+    ));
+    // Runs after every exit, a crash included, so a dead daemon never leaves
+    // the machine's DNS pointed at its listener.
+    s.push_str(&format!(
+        "ExecStopPost={} {DAEMON_RESTORE_DNS_VERB}\n",
         cfg.binary_path.display()
     ));
     s.push_str("Restart=on-failure\n");
@@ -678,6 +688,10 @@ mod tests {
             ..sample_config()
         });
         assert!(unit.contains("Restart=on-failure"), "{unit}");
+        assert!(
+            unit.contains("ExecStopPost=/usr/lib/netrulerouter/nrr-serviced restore-dns"),
+            "{unit}"
+        );
         assert!(unit.contains("RestartSec=7"), "{unit}");
         // The bounds belong to [Unit]; without them `Restart=` is unbounded.
         assert!(unit.contains("StartLimitBurst=3"), "{unit}");

@@ -56,6 +56,7 @@ impl Default for UiPreferences {
             archive_log_budget_mib: 0,
             unenforced_apps_ack_signature: String::new(),
             rules_overlap_keep_signature: String::new(),
+            route_overlaps_confirmed_signature: String::new(),
             confirmed_vpn_exe_path: String::new(),
             confirmed_vpn_exe_paths: String::new(),
             selected_primary_interface_id: String::new(),

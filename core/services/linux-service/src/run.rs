@@ -132,10 +132,15 @@ pub fn run() -> ExitCode {
     // the moment a user approves a change. Two stacks would mean two readers of
     // one table, each replacing what the other just wrote.
     let adapter_source = Arc::new(nrr_platform_linux::adapters::LinuxAdapterSource);
+    // Decided before the policy stack: whether our listener answers DNS
+    // settles whether browser DoH must stay blocked and which servers the
+    // service's own lookups use.
+    let dns_capture = crate::dns_stack::prepare_dns_capture(&artifacts.topology.data_dir);
     let policy_stack = crate::runtime_deps::build_policy_stack(
         &artifacts,
         Arc::clone(&adapter_source),
         Arc::clone(&event_bus),
+        dns_capture,
     );
 
     let ipc = crate::runtime_deps::build_ipc_server(

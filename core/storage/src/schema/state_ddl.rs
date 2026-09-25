@@ -1241,12 +1241,9 @@ pub const STATE_DB_V55_DDL: &[&str] = &["CREATE TABLE IF NOT EXISTS refusing_anc
 
 /// "Cut IPv6 while leak protection is on" — v56.
 ///
-/// A rule names a HOST, and a host with an AAAA record has a second way out
-/// that the per-destination pins never covered: Free resolves and pins IPv4
-/// only, so the same site could travel the tunnel over v4 and the main link
-/// over v6. "Blocked by half" is worse than an honest "not supported", so the
-/// default is ON — and it is a per-principal switch because someone whose
-/// network genuinely needs v6 must be able to say so.
+/// A host with an AAAA record has a second way out when the tunnel carries no
+/// IPv6. Default ON; per-principal, because a network that needs v6 must be
+/// able to say so.
 pub const STATE_DB_V56_DDL: &[&str] = &["ALTER TABLE secondary_block_policy ADD COLUMN block_ipv6_when_protected INTEGER NOT NULL DEFAULT 1 CHECK(block_ipv6_when_protected IN (0, 1))"];
 
 /// Backlog of block notices raised with nobody listening — v57.

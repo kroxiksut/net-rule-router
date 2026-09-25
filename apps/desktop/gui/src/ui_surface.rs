@@ -708,6 +708,7 @@ pub fn write_qt_context_file_at(
             // Overlap pairs the user asked the rules screen to stop offering
             // for cleanup (`|`-joined).
             "rulesOverlapKeepSig": preferences.rules_overlap_keep_signature.clone(),
+            "routeOverlapsConfirmedSig": preferences.route_overlaps_confirmed_signature.clone(),
             // Device-local record of the executable the user pointed out as
             // their VPN in the onboarding dialog.
             "confirmedVpnExePath": preferences.confirmed_vpn_exe_path.clone(),
@@ -1263,6 +1264,9 @@ struct QtPreferencesPayload {
     // key keeps the stored value; an explicit empty string clears the list.
     #[serde(default)]
     rules_overlap_keep_sig: Option<String>,
+    // Same shape: overlaps between the routes the user confirmed.
+    #[serde(default)]
+    route_overlaps_confirmed_sig: Option<String>,
     // Confirmed VPN executable path. `Option` so a payload that OMITS the
     // key (older QML build) keeps the stored value; an explicit empty
     // string is an honest "not set" state.

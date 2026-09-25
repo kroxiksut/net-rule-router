@@ -199,9 +199,7 @@ fn decode_row(row: &MIB_IPFORWARD_ROW2) -> Option<RouteEntry> {
     })
 }
 
-/// Read the IPv4 address out of a `SOCKADDR_INET` union, returning
-/// `None` if the entry is not IPv4 (IPv6 routes are out of scope —
-/// see `core/platform/windows/src/types.rs` module doc).
+/// The address in a `SOCKADDR_INET` union, either family; `None` for any other.
 fn read_ip_from_inet(addr: &SOCKADDR_INET) -> Option<IpAddr> {
     read_ipv4_from_inet(addr)
         .map(IpAddr::V4)

@@ -20,6 +20,26 @@ fn main_window_sections_match_block_2_1_baseline() {
 }
 
 #[test]
+fn every_section_slug_parses_back_and_is_routed_by_the_qml_stack() {
+    let pure_js = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/desktop/qml/lib/pure.js"),
+    )
+    .expect("pure.js is readable");
+    for section in AppSection::ALL {
+        assert_eq!(section.slug().parse::<AppSection>(), Ok(section));
+        // Settings is the fall-through branch of `idxForSection`.
+        if section != AppSection::Settings {
+            let routed = format!("value === \"{}\"", section.slug());
+            assert!(
+                pure_js.contains(&routed),
+                "{} has no page in idxForSection",
+                section.slug()
+            );
+        }
+    }
+}
+
+#[test]
 fn tray_only_actions_are_security_sensitive_controls() {
     let shell = gui_shell_v1();
     assert_eq!(

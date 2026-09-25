@@ -33,11 +33,12 @@ function idxForSection(value) {
     if (value === "interfaces-routes") return 0
     if (value === "rules") return 1
     if (value === "rule-suggestions") return 2
-    if (value === "rule-virtual-machines") return 3
-    if (value === "diagnostics") return 4
-    if (value === "conn-trace") return 5
-    if (value === "logs") return 6
-    return 7
+    if (value === "rule-overlaps") return 3
+    if (value === "rule-virtual-machines") return 4
+    if (value === "diagnostics") return 5
+    if (value === "conn-trace") return 6
+    if (value === "logs") return 7
+    return 8
 }
 
 // ---- ListModel / array access helpers ----
