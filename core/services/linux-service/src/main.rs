@@ -15,6 +15,9 @@
 
 mod cli;
 
+// The local DNS resolver over systemd-resolved.
+#[cfg(target_os = "linux")]
+mod dns_stack;
 #[cfg(target_os = "linux")]
 mod install;
 // The provider bundle behind the daemon's full IPC surface.
@@ -54,8 +57,10 @@ fn main() -> ExitCode {
         Command::Install => install::install_service(),
         #[cfg(target_os = "linux")]
         Command::Uninstall => install::uninstall_service(),
+        #[cfg(target_os = "linux")]
+        Command::RestoreDns => restore_dns(),
         #[cfg(not(target_os = "linux"))]
-        Command::Run | Command::Install | Command::Uninstall => {
+        Command::Run | Command::Install | Command::Uninstall | Command::RestoreDns => {
             eprintln!(
                 "the `run`, `install` and `uninstall` verbs run only on Linux \
                  (this is the systemd daemon entrypoint)"
@@ -68,6 +73,22 @@ fn main() -> ExitCode {
                  run, install, uninstall, status, help"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+/// The stop hook. Quiet on success: it runs after every stop, most of them
+/// clean, where there is nothing left to undo.
+#[cfg(target_os = "linux")]
+fn restore_dns() -> ExitCode {
+    let Some(data_dir) = nrr_platform_api::paths::production_data_root() else {
+        return ExitCode::SUCCESS;
+    };
+    match dns_stack::clear_dns_redirect(&data_dir) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(reason) => {
+            eprintln!("could not give the machine's DNS back: {reason}");
+            ExitCode::FAILURE
         }
     }
 }

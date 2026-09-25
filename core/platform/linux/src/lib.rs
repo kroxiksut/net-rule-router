@@ -76,6 +76,10 @@ pub mod dns_message;
 #[cfg(target_os = "linux")]
 pub mod dns_observe;
 
+/// Points the machine's DNS at the product's listener through systemd-resolved,
+/// and takes it back. Compiled everywhere: the commands sit behind a seam.
+pub mod dns_redirect;
+
 /// The active DNS resolver: asks the machine's own nameservers over UDP (with
 /// the protocol's TCP retry) so an answer carries a TTL, which `getaddrinfo`
 /// discards.

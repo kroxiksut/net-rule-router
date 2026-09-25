@@ -301,6 +301,10 @@ pub struct UiPreferences {
     /// rule a wildcard already covers; a pair listed here is never offered
     /// again. Device-local UI state, never exported.
     pub rules_overlap_keep_signature: String,
+    /// Overlaps between the two routes the user confirmed, as the keys the
+    /// overlap detector reports joined with `|`. A confirmed pair drops out of
+    /// the Overlaps count. Device-local UI state, never exported.
+    pub route_overlaps_confirmed_signature: String,
     /// DISPLAY only: the first of [`confirmed_vpn_exe_paths`], shown as
     /// "Your VPN client" in Settings. Nothing keys behaviour on it — the set
     /// below is what reseeds the service. Kept because a single name reads

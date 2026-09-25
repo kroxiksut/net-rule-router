@@ -86,6 +86,9 @@ pub const TASK_ID_APP_OBSERVATION: &str = "app-observation-tick";
 pub struct AppObservationWiring {
     pub source: Arc<dyn nrr_platform_api::conn_observe::ConnectionObservationSource>,
     pub store: Arc<crate::app_observation_lookup::AppObservationStore>,
+    /// Where this tick is the only drain of the source, the connection-trace
+    /// panel reads the same batch through it.
+    pub trace: Option<Arc<crate::conn_observation_consumer::ConnTraceTee>>,
 }
 
 /// Fold observed connections into the destinations application rules route.
@@ -135,7 +138,11 @@ pub fn build_app_observation_task(
 /// be read from a log is a decision nothing checks.
 pub fn fold_observations(wiring: &AppObservationWiring) -> usize {
     let mut learnt = 0usize;
-    for observation in wiring.source.drain() {
+    let batch = wiring.source.drain();
+    if let Some(trace) = wiring.trace.as_ref() {
+        trace.record(&batch, crate::conn_observation_consumer::now_unix_ms());
+    }
+    for observation in batch {
         // Without a process there is nothing to attribute the address to, and an
         // address attributed to nobody would widen every app rule that happens
         // to be enabled.

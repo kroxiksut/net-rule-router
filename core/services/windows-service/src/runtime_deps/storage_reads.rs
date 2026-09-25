@@ -389,23 +389,7 @@ pub(super) fn read_service_stability_config(
     })
 }
 
-/// Read the persisted `enforcement_mode` from
-/// `service_stability_config`. Defaults to Reactive on any lock/read error or a
-/// missing row (same fail-safe posture as `read_service_stability_config`). The
-/// runtime `ServiceStabilityConfig` intentionally does not carry this field, so
-/// it is read straight off the storage record here.
-pub(super) fn read_enforcement_mode(
-    conn: &Arc<Mutex<Connection>>,
-) -> nrr_domain::enforcement_mode::EnforcementMode {
-    use nrr_storage::service_stability_config::ServiceStabilityConfigRepository;
-    let Ok(guard) = conn.lock() else {
-        return nrr_domain::enforcement_mode::EnforcementMode::default();
-    };
-    let repo = ServiceStabilityConfigRepository::new(&guard);
-    repo.get_or_default()
-        .map(|record| record.enforcement_mode)
-        .unwrap_or_default()
-}
+pub(super) use nrr_service_runtime::dns_stack::read_enforcement_mode;
 
 /// The ONE place the production fake-IP policy values come from: the scope
 /// (broad coverage, no user host-exclusions yet) and the pool geometry. Shared

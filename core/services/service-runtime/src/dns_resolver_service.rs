@@ -105,8 +105,13 @@ impl DnsResolverService {
 
     /// Wire the source of namespaces to stay out of. Re-read on the guard
     /// tick, so a VPN that connects later is honoured without a restart.
+    ///
+    /// The listener gets the same source: a short name reaches us with no
+    /// suffix, and a claimed namespace is what the OS would have completed it
+    /// with.
     #[must_use]
     pub fn with_namespace_exemptions(mut self, source: DnsNamespaceExemptionsFn) -> Self {
+        self.listener = self.listener.with_claimed_namespaces(Arc::clone(&source));
         self.exemptions = Some(source);
         self
     }
@@ -830,6 +835,20 @@ mod tests {
             redirect.exempted.lock().unwrap().clone(),
             vec![vec!["branch.corp.example".to_string()]],
         );
+    }
+
+    /// One source feeds both: the namespaces we step out of are the ones a
+    /// short name is completed with. Wired separately, the listener's half was
+    /// never wired at all.
+    #[test]
+    fn the_listener_completes_short_names_with_the_claimed_namespaces() {
+        let redirect = Arc::new(RecordingRedirect::default());
+        let bare =
+            DnsResolverService::new(listener(), redirect.clone(), "127.0.0.1:0".parse().unwrap());
+        assert!(!bare.listener.completes_short_names());
+        let wired =
+            bare.with_namespace_exemptions(Arc::new(|| vec![exemption("branch.corp.example")]));
+        assert!(wired.listener.completes_short_names());
     }
 
     /// A link that appears between guard ticks claims its namespace at once.

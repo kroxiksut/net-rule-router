@@ -400,6 +400,7 @@ fn vpn_client_app_learner_dedups_within_a_batch_across_rotated_ips() {
 /// the mock adapter table.
 struct OneSecondaryPolicy {
     stable_id: String,
+    primary_stable_id: Option<String>,
 }
 impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
     fn load_for_sid(
@@ -407,8 +408,14 @@ impl crate::per_sid_orchestrator::RoutePolicySource for OneSecondaryPolicy {
         _sid: &str,
     ) -> Option<crate::per_sid_orchestrator::PerSidPolicySnapshot> {
         use crate::per_sid_orchestrator::{PerSidBinding, PerSidPolicySnapshot};
+        let binding = |stable_id: &str| PerSidBinding {
+            stable_id: stable_id.to_string(),
+            display_name: String::new(),
+            user_confirmed: true,
+            known_stable_ids: Vec::new(),
+        };
         Some(PerSidPolicySnapshot {
-            primary: None,
+            primary: self.primary_stable_id.as_deref().map(binding),
             secondary: Some(PerSidBinding {
                 stable_id: self.stable_id.clone(),
                 display_name: String::new(),
@@ -464,8 +471,10 @@ fn test_consumer_with_live_secondary() -> ConnectionObservationConsumer {
         Arc::clone(&api),
         Arc::new(crate::per_sid_orchestrator::NoopRulesProvider)
             as Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
-        Arc::new(OneSecondaryPolicy { stable_id })
-            as Arc<dyn crate::per_sid_orchestrator::RoutePolicySource>,
+        Arc::new(OneSecondaryPolicy {
+            stable_id,
+            primary_stable_id: None,
+        }) as Arc<dyn crate::per_sid_orchestrator::RoutePolicySource>,
         Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new())
             as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
         Arc::new(|| false),
@@ -1250,4 +1259,120 @@ fn a_drop_whose_spec_id_fails_role_verification_still_reports_as_blocked_by_rule
     let got = notices.lock().unwrap_or_else(|p| p.into_inner());
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].reason, BlockReason::BlockedByRule);
+}
+
+// ── Application measure: which connections count as "works on the main link" ──
+
+/// Consumer with the active SID bound to a live Ethernet primary and a live
+/// tunnel, and an application-measure sink recording `(program, stalled)`.
+type AppVerdicts = Arc<Mutex<Vec<(String, bool)>>>;
+
+fn test_consumer_on_both_links() -> (ConnectionObservationConsumer, AppVerdicts) {
+    let adapter = |index, name: &str, ip: Ipv4Addr, gateway: Ipv4Addr| AdapterInfo {
+        index,
+        adapter_name: format!("{{{name}}}"),
+        description: name.into(),
+        friendly_name: name.into(),
+        mac: None,
+        interface_type: nrr_platform_api::adapters::InterfaceType::Ethernet,
+        oper_status: nrr_platform_api::adapters::IfOperStatus::Up,
+        ipv4_addresses: vec![ip],
+        ipv6_addresses: Vec::new(),
+        gateways: vec![gateway],
+    };
+    let ethernet = adapter(
+        ETHERNET,
+        "ethernet",
+        Ipv4Addr::new(192, 168, 0, 50),
+        Ipv4Addr::new(192, 168, 0, 1),
+    );
+    let vpn = adapter(
+        VPN,
+        "tunnel",
+        Ipv4Addr::new(10, 88, 1, 41),
+        Ipv4Addr::new(10, 88, 0, 1),
+    );
+    let policy = OneSecondaryPolicy {
+        stable_id: vpn.stable_id(),
+        primary_stable_id: Some(ethernet.stable_id()),
+    };
+    let mock = nrr_platform_api::windows_api::MockWindowsApi::new();
+    mock.set_adapter_infos(vec![ethernet, vpn]);
+    let api: Arc<dyn nrr_platform_api::route_table::RouteTablePort> = Arc::new(mock);
+    let coordinator = Arc::new(SecondaryRouteCoordinator::new(
+        Arc::clone(&api),
+        Arc::new(crate::per_sid_orchestrator::NoopRulesProvider)
+            as Arc<dyn crate::per_sid_orchestrator::RulesProvider>,
+        Arc::new(policy) as Arc<dyn crate::per_sid_orchestrator::RoutePolicySource>,
+        Arc::new(crate::fqdn_cache_lookup::MockFqdnCacheLookup::new())
+            as Arc<dyn crate::fqdn_cache_lookup::FqdnCacheLookup>,
+        Arc::new(|| false),
+    ));
+    let active_sid: ActiveSidFn = Arc::new(|| Some("S-1-5-21-TEST".to_string()));
+    let seen: AppVerdicts = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let consumer = ConnectionObservationConsumer::new(api, coordinator, active_sid, false)
+        .with_app_main_link(Arc::new(move |program, _ip, stalled, _named| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push((program.to_string(), stalled));
+        }));
+    (consumer, seen)
+}
+
+fn over_the_main_link(
+    verdict: ConnectionVerdict,
+    progress: ConnectionProgress,
+) -> ConnectionObservation {
+    ConnectionObservation {
+        pid: 4242,
+        verdict,
+        progress,
+        ..obs(
+            Ipv4Addr::new(192, 168, 0, 50),
+            Ipv4Addr::new(203, 0, 113, 9),
+        )
+    }
+}
+
+/// The stack's connect event is what marks a connection established. Left out
+/// of the stall tracker, no close ever counted, so every program that ever hit
+/// a slow host was offered for the tunnel and never withdrawn — Chrome included.
+#[test]
+fn a_connection_the_stack_reported_up_and_closed_in_order_counts_as_working() {
+    let (consumer, seen) = test_consumer_on_both_links();
+    consumer.consume(
+        &[
+            over_the_main_link(ConnectionVerdict::Unknown, ConnectionProgress::Attempt),
+            over_the_main_link(
+                ConnectionVerdict::Unknown,
+                ConnectionProgress::ClosedInOrder,
+            ),
+        ],
+        SystemTime::now(),
+    );
+    let seen = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(seen.len(), 1, "one completed connection: {seen:?}");
+    assert!(
+        !seen[0].1,
+        "an orderly close of an established connection is not a stall"
+    );
+}
+
+/// A filter classify fires before the handshake, so it must not make the
+/// close of a connection that never came up read as "this host answers".
+#[test]
+fn a_filter_classify_is_not_an_establishment() {
+    let (consumer, seen) = test_consumer_on_both_links();
+    consumer.consume(
+        &[
+            over_the_main_link(ConnectionVerdict::Permit, ConnectionProgress::Attempt),
+            over_the_main_link(
+                ConnectionVerdict::Unknown,
+                ConnectionProgress::ClosedInOrder,
+            ),
+        ],
+        SystemTime::now(),
+    );
+    assert!(seen.lock().unwrap_or_else(|p| p.into_inner()).is_empty());
 }

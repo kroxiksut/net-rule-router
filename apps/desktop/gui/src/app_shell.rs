@@ -89,10 +89,14 @@ where
         if let Some(value) = argument.strip_prefix("--section=") {
             match value.parse::<AppSection>() {
                 Ok(section) => request.section = Some(section),
-                Err(_) => eprintln!(
-                    "Unknown --section value '{}'. Use interfaces-routes|rules|diagnostics|logs|settings.",
-                    value
-                ),
+                Err(_) => {
+                    let known: Vec<&str> = AppSection::ALL.iter().map(|s| s.slug()).collect();
+                    eprintln!(
+                        "Unknown --section value '{}'. Use {}.",
+                        value,
+                        known.join("|")
+                    );
+                }
             }
             continue;
         }
@@ -174,6 +178,12 @@ mod tests {
             request.first_run_scenario_override,
             Some(FirstRunScenarioId::QuickStart)
         );
+    }
+
+    #[test]
+    fn launch_request_parser_opens_sub_sections() {
+        let request = parse_launch_request_arguments(["--section=conn-trace".to_string()]);
+        assert_eq!(request.section, Some(AppSection::ConnectionTrace));
     }
 
     #[test]

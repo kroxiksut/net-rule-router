@@ -81,6 +81,7 @@ pub mod dns_refresh;
 pub mod dns_resolver;
 pub mod dns_resolver_ports;
 pub mod dns_resolver_service;
+pub mod dns_stack;
 pub mod dns_upstream;
 pub mod dns_wire;
 pub mod doh_seed;

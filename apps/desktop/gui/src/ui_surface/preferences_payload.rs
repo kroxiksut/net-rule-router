@@ -218,6 +218,13 @@ impl QtPreferencesPayload {
                 current.rules_overlap_keep_signature,
             );
         }
+        if let Some(sig) = self.route_overlaps_confirmed_sig {
+            current.route_overlaps_confirmed_signature = storable_line_or(
+                "route_overlaps_confirmed_signature",
+                sig,
+                current.route_overlaps_confirmed_signature,
+            );
+        }
         // Key present → take the value (single line only, so the
         // line-oriented prefs file stays intact); key absent (older QML) →
         // keep stored.

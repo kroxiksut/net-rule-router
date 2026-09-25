@@ -495,7 +495,7 @@ public:
     /// Async wrapper over the launcher-local `local.rules-overlaps` RPC.
     /// The callback lands on `rpcResponse` with `{pairs, redundant-count}`
     /// — every exact rule a wildcard rule already covers.
-    Q_INVOKABLE QString rpcRulesOverlaps(const QString &rulesJson);
+    Q_INVOKABLE QString rpcRulesOverlaps(const QString &rulesJson, bool includeSubdomains = true);
 
     /// Async wrapper over the launcher-local
     /// `local.vpn.discover` RPC. Scans the machine (running processes +

@@ -44,14 +44,14 @@
 //!
 //! ## Operations manual
 //!
-//! ### Route table (IPv4 only; IPv6 out-of-scope — see `strategy.rs`)
+//! ### Route table (both families)
 //!
 //! | Operation | Win32 API | Notes |
 //! |-----------|-----------|-------|
-//! | Enumerate current routes | `GetIpForwardTable2(AF_INET, &table)` | Caller must `FreeMibTable(table)` |
+//! | Enumerate current routes | `GetIpForwardTable2(AF_UNSPEC, &table)` | Caller must `FreeMibTable(table)` |
 //! | Add route | `CreateIpForwardEntry2(&row)` | Requires admin token |
 //! | Delete route | `DeleteIpForwardEntry2(&row)` | Requires admin token |
-//! | Subscribe to changes | `NotifyRouteChange2(AF_INET, callback, ctx, false, &handle)` | |
+//! | Subscribe to changes | `NotifyRouteChange2(AF_UNSPEC, callback, ctx, false, &handle)` | |
 //! | Cancel subscription | `CancelMibChangeNotify2(handle)` | |
 //!
 //! ### WFP (Windows Filtering Platform)

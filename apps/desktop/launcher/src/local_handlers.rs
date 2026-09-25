@@ -11,7 +11,9 @@
 //! | Slug                            | Description                                                       |
 //! |---------------------------------|-------------------------------------------------------------------|
 //! | `local.rules-overlaps`          | Rules cleanup — every exact rule a wildcard already covers,       |
-//! |                                 | via `nrr_shared::rules_overlap::find_overlaps`.                    |
+//! |                                 | via `nrr_shared::rules_overlap::find_overlaps`; and the Overlaps  |
+//! |                                 | section — rules of the two routes claiming the same hosts, via    |
+//! |                                 | `find_route_overlaps`.                                            |
 //! | `local.canonical-rules-hash`    | Drift detection — canonicalise rules-json via                     |
 //! |                                 | `nrr_shared::rules_json::to_canonical_string` and SHA-256 the     |
 //! |                                 | result. GUI hashes file / rulesModel / service-baseline through   |
@@ -370,19 +372,27 @@ fn handle_canonical_rules_hash(payload: &Value) -> LocalHandlerResult {
 }
 
 /// Every exact rule already covered by a wildcard rule, so the rules screen
-/// can offer the redundant ones for removal. Local because it is a pure
-/// function of the rules the window already holds — asking the service would
-/// answer about the APPLIED set, not the one on screen.
+/// can offer the redundant ones for removal, and every pair of rules on the
+/// two routes that claim the same hosts. Local because it is a pure function
+/// of the rules the window already holds — asking the service would answer
+/// about the APPLIED set, not the one on screen.
 fn handle_rules_overlaps(payload: &Value) -> LocalHandlerResult {
     let rules_json = payload
         .get("rules-json")
         .and_then(Value::as_str)
         .ok_or(LocalHandlerError::MissingField("rules-json"))?;
     let dto: CanonicalRulesJsonV1 = serde_json::from_str(rules_json)?;
+    // Absent means on: that is the product default for subdomain coverage.
+    let include_subdomains = payload
+        .get("include-subdomains")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     let pairs = nrr_shared::rules_overlap::find_overlaps(&dto);
+    let route_overlaps = nrr_shared::rules_overlap::find_route_overlaps(&dto, include_subdomains);
     Ok(json!({
         "pairs": pairs,
         "redundant-count": pairs.iter().filter(|p| p.redundant).count(),
+        "route-overlaps": route_overlaps,
     }))
 }
 
@@ -549,6 +559,31 @@ mod tests {
         }))
         .expect_err("malformed json should fail");
         assert_eq!(err.wire_code(), "malformed-input");
+    }
+
+    #[test]
+    fn route_overlaps_follow_the_subdomain_setting() {
+        let rules = json!({
+            "schema-version": 1,
+            "primary": [{"id": "P1", "enabled": true,
+                "address-match": {"kind": "exact-fqdn", "value": "site.example"}}],
+            "secondary": [{"id": "S1", "enabled": true,
+                "address-match": {"kind": "exact-fqdn", "value": "www.site.example"}}],
+        })
+        .to_string();
+        let count = |include: Option<bool>| {
+            let mut payload = json!({ "rules-json": rules });
+            if let Some(include) = include {
+                payload["include-subdomains"] = json!(include);
+            }
+            handle_rules_overlaps(&payload).expect("ok")["route-overlaps"]
+                .as_array()
+                .expect("array")
+                .len()
+        };
+        assert_eq!(count(Some(false)), 0);
+        assert_eq!(count(Some(true)), 1);
+        assert_eq!(count(None), 1, "absent means the product default, on");
     }
 
     #[test]

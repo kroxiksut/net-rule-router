@@ -6,7 +6,7 @@
 
 use super::*;
 
-const MAIN_WINDOW_SECTIONS: [AppSection; 5] = AppSection::ALL;
+const MAIN_WINDOW_SECTIONS: [AppSection; 5] = AppSection::TOP_LEVEL;
 const TRAY_ONLY_ACTIONS: [AppAction; 2] = [
     AppAction::SafeRollback,
     AppAction::TemporarilyDisableProductImpact,

@@ -653,6 +653,9 @@ mod connection_facts;
 mod consume;
 mod drop_reporter;
 mod stall_evidence;
+mod trace_tee;
+
+pub use trace_tee::ConnTraceTee;
 
 use connection_facts::{
     block_reason_for, is_learnable_endpoint, process_basename_lower,

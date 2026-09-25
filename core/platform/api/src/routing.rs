@@ -23,11 +23,6 @@
 //! Best-effort: if a compensating action itself fails, we collect the error
 //! and continue with the remaining undo steps. The caller decides whether
 //! partial rollback is acceptable.
-//!
-//! ## IPv6
-//!
-//! IPv6 destinations never reach this module — they are skipped by the
-//! `compute_action_plan` caller.
 
 use std::sync::Arc;
 

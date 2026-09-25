@@ -103,9 +103,8 @@ fn fail_closed_mode_b_emits_v6_coverage() {
 
 #[test]
 fn per_ip_paths_never_emit_v6() {
-    // The per-destination / per-app fail-closed + kill-switch paths stay
-    // IPv4-only (selective V6 needs AAAA — not supported). None of them may
-    // ever emit a V6-layer filter.
+    // v6 hosts are pinned by the rule codegen's v6 chunks, not here: an IPv4
+    // pin must never turn into a V6-layer filter.
     assert!(v6_filters(&kill_switch_filters(
         "S",
         &v4_pins([ip(203, 0, 113, 5)]),
